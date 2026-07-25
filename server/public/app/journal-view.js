@@ -359,6 +359,7 @@ export async function openConversation(id, options = {}) {
   const nextConversationId = String(id || '').trim();
   if (previousConversationId && nextConversationId && previousConversationId !== nextConversationId) {
     await flushConversationDraft(previousConversationId);
+    window.clearImageEditTarget?.();
   }
   const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);

@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createPollingLoop, resolveEmptyFinalTextHandling } from './polling-loop.mjs';
+import {
+  createPollingLoop,
+  processSdkSessionDeleteRequest,
+  resolveEmptyFinalTextHandling,
+} from './polling-loop.mjs';
 import { createSessionIoHelpers } from '../runtime/session-io.mjs';
 
 test('resolveEmptyFinalTextHandling treats generated images as successful completion', () => {
@@ -78,6 +82,35 @@ test('session-io keeps same-prefix same-length generated images when tails diffe
   assert.equal(images.length, 2);
   assert.equal(images[0].data, first);
   assert.equal(images[1].data, second);
+});
+
+test('unsupported SDK session deletion is finalized without console warning or retry', async () => {
+  const apiCalls = [];
+  const logCalls = [];
+  const handled = await processSdkSessionDeleteRequest({
+    request: { sdkSessionId: 'sdk-1', conversationId: 'conv-1' },
+    api: async (method, route, body) => {
+      apiCalls.push({ method, route, body });
+      return { ok: true };
+    },
+    session: {
+      log: async (...args) => { logCalls.push(args); },
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(logCalls.length, 0);
+  assert.deepEqual(apiCalls, [{
+    method: 'POST',
+    route: '/api/sdk-session-delete/result',
+    body: {
+      sdk_session_id: 'sdk-1',
+      conversation_id: 'conv-1',
+      ok: false,
+      unsupported: true,
+      error: 'SDK deleteSession() is unavailable in this CLI runtime',
+    },
+  }]);
 });
 
 test('polling loop uses direct OpenAI image API path and skips SDK send', async () => {

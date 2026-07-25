@@ -91,7 +91,7 @@ function flushQueuedRepoBrowserReload() {
   void loadRepoBrowserTree();
 }
 
-export function renderAttachmentMarkup(attachments) {
+export function renderAttachmentMarkup(attachments, { messageId = '' } = {}) {
   return `<div class="msg-attachments">${
     attachments.map((att) => {
       const name = escHtml(att?.name || 'attachment');
@@ -104,6 +104,20 @@ export function renderAttachmentMarkup(attachments) {
       const isImage = String(att?.type || '').startsWith('image/');
       const isVideo = isVideoMimeType(att?.type);
       const sizeText = Number(att?.size || 0) > 0 ? ` · ${formatBytes(Number(att.size || 0))}` : '';
+      const continuity = att?.generatedImage?.continuity;
+      const continuityActions = continuity?.canEdit && messageId
+        ? `<div class="msg-image-continuity-actions">
+            <button type="button" onclick="setImageEditTarget(${escHtml(JSON.stringify({
+              messageId,
+              imageId: att.generatedImage.imageId,
+              nodeId: continuity.nodeId,
+              name: att.name || 'generated image',
+            }))})">Edit this image</button>
+            ${continuity.parentMessageId
+              ? `<button type="button" onclick="jumpToImageParent(${escHtml(JSON.stringify(continuity.parentMessageId))})">Edited from previous image</button>`
+              : ''}
+          </div>`
+        : '';
       if ((isImage || isVideo) && rawUrl) {
         const jsName = escHtml(JSON.stringify(att?.name || 'attachment'));
         const jsUrl = escHtml(JSON.stringify(rawUrl));
@@ -114,7 +128,7 @@ export function renderAttachmentMarkup(attachments) {
             ${isVideo
               ? `<div class="msg-attachment-video-chip">🎞️</div>`
               : `<img src="${escHtml(rawUrl)}" alt="${name}" loading="eager" decoding="async" onclick="${openHandler}">`}
-            <div class="msg-attachment-meta"><a href="#" onclick="${openHandler};return false;">${name}</a> · ${type}${sizeText} · <a href="#" onclick="${openHandler};return false;">open</a></div>
+            <div class="msg-attachment-meta"><a href="#" onclick="${openHandler};return false;">${name}</a> · ${type}${sizeText} · <a href="#" onclick="${openHandler};return false;">open</a>${continuityActions}</div>
           </div>`;
       }
       if (rawUrl) {

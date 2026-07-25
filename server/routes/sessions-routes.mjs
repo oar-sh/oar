@@ -2042,17 +2042,18 @@ export function registerSessionsRoutes(app, deps) {
     touchCli();
     const sdkSessionId = String(req.body?.sdk_session_id || '').trim();
     const ok = req.body?.ok === true;
+    const unsupported = req.body?.unsupported === true;
     const errorText = String(req.body?.error || '').trim() || 'Unknown SDK delete failure';
     if (!sdkSessionId) return res.status(400).json({ error: 'Missing sdk_session_id' });
 
-    if (ok) {
+    if (ok || unsupported) {
       stmts.deleteSdkDeleteRequest.run(sdkSessionId);
       const finalizedConversationIds = finalizeDeletedConversationsForSdkSession(sdkSessionId);
       sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
       if (!finalizedConversationIds.length) {
         io.emit('conversation_deleted', { conversationId: sdkSessionId });
       }
-      return res.json({ ok: true, finalizedConversationIds });
+      return res.json({ ok: true, unsupported, finalizedConversationIds });
     }
 
     const nowIso = new Date().toISOString();

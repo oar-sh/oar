@@ -39,6 +39,8 @@ import {
   clearSubagentCancelInFlight,
   isSubagentCancelInFlight,
   IS_SHARED_VIEW,
+  imageEditTarget,
+  setImageEditTarget as setStoredImageEditTarget,
 } from './store.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
@@ -80,6 +82,49 @@ let conversationHistoryState = {
   loadingOlder: false,
   loadingNewer: false,
 };
+
+function renderImageEditTarget() {
+  const chip = document.getElementById('image-edit-target');
+  if (!chip) return;
+  if (!imageEditTarget) {
+    chip.classList.remove('visible');
+    chip.innerHTML = '';
+    return;
+  }
+  chip.innerHTML = `<span>Editing <strong>${escHtml(imageEditTarget.name)}</strong></span><button type="button" onclick="clearImageEditTarget()" aria-label="Cancel image edit target">✕</button>`;
+  chip.classList.add('visible');
+}
+
+export function setImageEditTarget(target) {
+  if (IS_SHARED_VIEW) return;
+  setStoredImageEditTarget(target);
+  renderImageEditTarget();
+  const input = document.getElementById('msg-input');
+  if (input) {
+    input.placeholder = 'Describe how to edit this image…';
+    input.focus();
+  }
+}
+
+export function clearImageEditTarget() {
+  setStoredImageEditTarget(null);
+  renderImageEditTarget();
+  const input = document.getElementById('msg-input');
+  if (input) input.placeholder = 'Message Copilot…';
+}
+
+export function jumpToImageParent(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return;
+  const node = document.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
+  if (!node) {
+    showTransientRelayNotice('Load earlier messages to view the source image.');
+    return;
+  }
+  node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  node.classList.add('message-highlight');
+  window.setTimeout(() => node.classList.remove('message-highlight'), 1400);
+}
 
 const conversationHistoryLoader = createInfiniteLoader({
   fetchPage: async (cursor) => {
@@ -606,7 +651,7 @@ function createMessageNode(msg, msgId = null, force = false) {
   const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
   if (activities.length) div.classList.add('msg-with-activity');
   const thoughts = Array.isArray(msg.thoughts) ? msg.thoughts.filter((t) => t && String(t.text || '').trim()) : [];
-  const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments) : '';
+  const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments, { messageId: msgId }) : '';
   const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
   const thoughtsHtml = thoughts.length ? renderThoughtsMarkup(thoughts) : '';
   const hasVisibleText = Boolean(String(msg.text || '').trim());
@@ -1888,6 +1933,13 @@ export async function sendMessage() {
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,
       attachments,
+      imageTarget: imageEditTarget
+        ? {
+            messageId: imageEditTarget.messageId,
+            imageId: imageEditTarget.imageId,
+            nodeId: imageEditTarget.nodeId,
+          }
+        : undefined,
     };
 
     const r = await sendMessageApi(body);
@@ -1942,6 +1994,7 @@ export async function sendMessage() {
       const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
       setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
     }
+    if (imageEditTarget) clearImageEditTarget();
     if (isNew || !targetConversationId) {
       setCurrentConv(r.conversationId);
       conversations[r.conversationId] = {

@@ -209,6 +209,45 @@ test('resolveOpenAIImageEditAttachment rejects paths outside allowed upload root
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
 
+test('resolveOpenAIImageEditAttachment accepts persisted generated image paths', () => {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-generated-image-'));
+  const generatedPath = path.join(
+    stateRoot,
+    'session-1',
+    'generated-images',
+    'conversation-1',
+    'message-1',
+    'img-01.png',
+  );
+  fs.mkdirSync(path.dirname(generatedPath), { recursive: true });
+  fs.writeFileSync(generatedPath, Buffer.from('generated'));
+  const image = resolveOpenAIImageEditAttachment([
+    { name: 'img-01.png', type: 'image/png', path: generatedPath },
+  ], {
+    maxImageBytes: 1024,
+    allowedRootPath: path.join(stateRoot, 'uploads'),
+    allowedGeneratedImagesRootPath: stateRoot,
+  });
+  assert.equal(image.bytes.toString('utf8'), 'generated');
+  fs.rmSync(stateRoot, { recursive: true, force: true });
+});
+
+test('resolveOpenAIImageEditAttachment rejects non-generated files in session state', () => {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-session-state-'));
+  const unrelatedPath = path.join(stateRoot, 'session-1', 'files', 'private.txt');
+  fs.mkdirSync(path.dirname(unrelatedPath), { recursive: true });
+  fs.writeFileSync(unrelatedPath, Buffer.from('private'));
+  assert.throws(() => {
+    resolveOpenAIImageEditAttachment([
+      { name: 'private.png', type: 'image/png', path: unrelatedPath },
+    ], {
+      maxImageBytes: 1024,
+      allowedGeneratedImagesRootPath: stateRoot,
+    });
+  }, /outside the upload directory/i);
+  fs.rmSync(stateRoot, { recursive: true, force: true });
+});
+
 test('normalizeOpenAIImageApiGeneratedImages normalizes OpenAI image API output', () => {
   const normalized = normalizeOpenAIImageApiGeneratedImages({
     data: [

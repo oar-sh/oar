@@ -977,6 +977,7 @@ export function buildDequeuedRelayMessage({
     ownerSessionId: String(msg.owner_sdk_session_id || '').trim() || null,
     ownerAssignedAt: msg.owner_assigned_at || null,
     ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
+    imageOperationId: String(msg.image_operation_id || '').trim() || null,
   };
 }
 
@@ -1154,6 +1155,7 @@ function isOpenAIImageAttachment(raw) {
 export function resolveOpenAIImageEditAttachment(rawAttachments, {
   maxImageBytes = 20 * 1024 * 1024,
   allowedRootPath = '',
+  allowedGeneratedImagesRootPath = '',
 } = {}) {
   const attachments = Array.isArray(rawAttachments) ? rawAttachments : [];
   const firstImage = attachments.find((entry) => isOpenAIImageAttachment(entry));
@@ -1173,11 +1175,23 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
     const filePath = String(firstImage.path || '').trim();
     if (!filePath) throw new Error('Image attachment is missing file path or data URL');
     const allowedRoot = String(allowedRootPath || '').trim();
-    if (allowedRoot) {
-      const resolvedRoot = path.resolve(allowedRoot);
+    const generatedImagesRoot = String(allowedGeneratedImagesRootPath || '').trim();
+    if (allowedRoot || generatedImagesRoot) {
       const resolvedPath = path.resolve(filePath);
-      const rootPrefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
-      if (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(rootPrefix)) {
+      const isWithinRoot = (rootPath) => {
+        if (!rootPath) return false;
+        const resolvedRoot = path.resolve(rootPath);
+        const rootPrefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
+        return resolvedPath === resolvedRoot || resolvedPath.startsWith(rootPrefix);
+      };
+      const isGeneratedImagePath = (() => {
+        if (!generatedImagesRoot || !isWithinRoot(generatedImagesRoot)) return false;
+        const relativeParts = path.relative(path.resolve(generatedImagesRoot), resolvedPath).split(path.sep);
+        return relativeParts.length >= 3
+          && relativeParts[0] !== '..'
+          && relativeParts[1] === 'generated-images';
+      })();
+      if (!isWithinRoot(allowedRoot) && !isGeneratedImagePath) {
         throw new Error('Image attachment path is outside the upload directory');
       }
     }
@@ -1512,6 +1526,7 @@ export function registerMessagesRoutes(app, deps) {
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
     relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
+    imageOperationService = null,
   } = deps;
 
   const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
@@ -3430,6 +3445,7 @@ export function registerMessagesRoutes(app, deps) {
       providerType,
       provider,
       attachments: rawAttachments,
+      imageTarget: rawImageTarget,
     } = req.body;
     const sessionId = clientId || ensureSessionId(req, res);
     const requesterIdentity = readBridgeIdentity(req);
@@ -3441,6 +3457,20 @@ export function registerMessagesRoutes(app, deps) {
     const normalizedAttachments = normalizeAttachments(rawAttachments);
     const referenceResolution = collectReferenceAttachmentsFromText(trimmedText);
     const attachments = mergeMessageAttachments(normalizedAttachments, referenceResolution.attachments);
+    const imageTarget = rawImageTarget && typeof rawImageTarget === 'object'
+      ? {
+          messageId: String(rawImageTarget.messageId || '').trim(),
+          imageId: String(rawImageTarget.imageId || '').trim(),
+          nodeId: String(rawImageTarget.nodeId || '').trim() || null,
+        }
+      : null;
+    const imageContinuityEnabled = featureFlags?.IMAGE_CONVERSATION_CONTINUITY_ENABLED === true;
+    if (imageTarget && !imageContinuityEnabled) {
+      return res.status(409).json({
+        error: 'Conversational image editing is not enabled',
+        code: 'IMAGE_CONTINUITY_DISABLED',
+      });
+    }
 
     if (trimmedText.toLowerCase() === '/compact') {
       if (attachments.length) return res.status(400).json({ error: 'Compact command does not accept attachments' });
@@ -3594,6 +3624,12 @@ export function registerMessagesRoutes(app, deps) {
     const explicitReasoningEffort = String(reasoningEffort || '').trim();
     const requestedContextTier = String(contextTier || 'default').trim().toLowerCase();
     const openAIImageModel = useOpenAIProvider && isOpenAIImageModelId(requestedModel);
+    if (imageTarget && !openAIImageModel) {
+      return res.status(400).json({
+        error: 'Select an image model before editing a generated image',
+        code: 'IMAGE_TARGET_REQUIRES_IMAGE_MODEL',
+      });
+    }
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
       : resolveRequestedReasoningEffort(
@@ -3752,30 +3788,82 @@ export function registerMessagesRoutes(app, deps) {
       : trimmedText;
 
     const requestedModelOrigin = deriveModelOrigin(requestedModelVariantId || requestedModel);
-    stmts.insertMsg.run(
-      msgId,
-      convId,
-      'user',
-      trimmedText,
-      requestedModelVariantId,
-      requestedRelayMode,
-      attachments.length ? JSON.stringify(attachments) : null,
-      now,
-      requestedModelVariantId || null,
-      null,
-      requestedModelOrigin,
-    );
-    linkUploadReferences(convId, msgId, attachments);
-    stmts.updateConvTime.run(now, convId);
-    if (typeof stmts.updateConvDraft?.run === 'function') {
-      stmts.updateConvDraft.run(null, now, sessionId || null, convId);
-    } else {
-      db.prepare(`
-        UPDATE conversations
-        SET draft_text = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
-        WHERE id = ?
-      `).run(now, sessionId || null, convId);
-    }
+    let conversationPreferences;
+    let imageOperation = null;
+    const persistMessageAndQueue = db.transaction(() => {
+      stmts.insertMsg.run(
+        msgId,
+        convId,
+        'user',
+        trimmedText,
+        requestedModelVariantId,
+        requestedRelayMode,
+        attachments.length ? JSON.stringify(attachments) : null,
+        now,
+        requestedModelVariantId || null,
+        null,
+        requestedModelOrigin,
+      );
+      linkUploadReferences(convId, msgId, attachments);
+      stmts.updateConvTime.run(now, convId);
+      if (typeof stmts.updateConvDraft?.run === 'function') {
+        stmts.updateConvDraft.run(null, now, sessionId || null, convId);
+      } else {
+        db.prepare(`
+          UPDATE conversations
+          SET draft_text = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
+          WHERE id = ?
+        `).run(now, sessionId || null, convId);
+      }
+      conversationPreferences = persistConversationModeModelPreference(
+        convId,
+        requestedRelayMode,
+        requestedModel,
+        requestedReasoningEffort,
+        now,
+      );
+      stmts.insertQ.run(
+        msgId,
+        convId,
+        runtimeSession?.id || null,
+        (!conversationId || !!newConversation) ? 1 : 0,
+        requestedModel,
+        requestedModelVariantId,
+        requestedReasoningEffort,
+        normalizedContextTier,
+        requestedRelayMode,
+        queueText,
+        attachments.length ? JSON.stringify(attachments) : null,
+        now,
+        ownerSessionId,
+        ownerSessionId ? now : null,
+        null,
+        null,
+        null,
+      );
+      if (imageContinuityEnabled && openAIImageModel) {
+        if (!imageOperationService?.createEnqueuedOperation) {
+          throw new Error('Image operation service is unavailable');
+        }
+        imageOperation = imageOperationService.createEnqueuedOperation({
+          conversationId: convId,
+          sourceMessageId: msgId,
+          queueMessageId: msgId,
+          prompt: trimmedText,
+          selectedImageModel: requestedModel,
+          executionMode: 'direct_images',
+          parameters: {
+            quality: requestedReasoningEffort,
+            size: normalizedContextTier,
+            count: 1,
+          },
+          attachments,
+          imageTarget,
+          createdAt: now,
+        });
+      }
+    });
+    persistMessageAndQueue();
     io.emit('conversation_draft_updated', {
       conversationId: convId,
       draftText: '',
@@ -3783,31 +3871,6 @@ export function registerMessagesRoutes(app, deps) {
       draftUpdatedByClientId: sessionId || null,
       senderClientId: sessionId || null,
     });
-    const conversationPreferences = persistConversationModeModelPreference(
-      convId,
-      requestedRelayMode,
-      requestedModel,
-      requestedReasoningEffort,
-      now,
-    );
-    stmts.insertQ.run(
-      msgId,
-      convId,
-      runtimeSession?.id || null,
-      (!conversationId || !!newConversation) ? 1 : 0,
-      requestedModel,
-      requestedModelVariantId,
-      requestedReasoningEffort,
-      normalizedContextTier,
-      requestedRelayMode,
-      queueText,
-      attachments.length ? JSON.stringify(attachments) : null,
-      now,
-      ownerSessionId,
-      ownerSessionId ? now : null,
-      null,
-      null,
-    );
     if (ownerSessionId) {
       const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
       sessionWorkerRegistry?.upsertWorker?.({
@@ -3923,6 +3986,13 @@ export function registerMessagesRoutes(app, deps) {
       ...workspaceRootPayload(),
       referenceAttachmentCount: referenceResolution.attachments.length,
       skippedReferenceAttachments: referenceResolution.skipped,
+      imageOperation: imageOperation
+        ? {
+            id: imageOperation.id,
+            mode: imageOperation.mode,
+            kind: imageOperation.kind,
+          }
+        : null,
     });
   });
 
@@ -4517,6 +4587,253 @@ export function registerMessagesRoutes(app, deps) {
     return res.json({ ok: true, ...result });
   });
 
+  app.post('/api/image-operations/:operationId/execute', auth, async (req, res) => {
+    if (!isLoopbackRequest(req)) {
+      return res.status(403).json({ error: 'Image operation execution is localhost-only' });
+    }
+    if (featureFlags?.IMAGE_CONVERSATION_CONTINUITY_ENABLED !== true) {
+      return res.status(404).json({ error: 'Image continuity is not enabled' });
+    }
+    const operationId = String(req.params.operationId || '').trim();
+    const operation = operationId ? stmts.getOperation?.get(operationId) : null;
+    if (!operation) return res.status(404).json({ error: 'Image operation not found' });
+
+    const committedNodes = stmts.listNodesForOperation?.all(operationId) || [];
+    if (committedNodes.length) {
+      return res.json({ ok: true, outcome: 'completed', operationId, nodeCount: committedNodes.length });
+    }
+    const queueRow = stmts.findQById.get(operation.queue_message_id);
+    if (!queueRow || queueRow.image_operation_id !== operationId) {
+      return res.status(409).json({ error: 'Image operation queue linkage is unavailable' });
+    }
+
+    const now = new Date().toISOString();
+    const selfHeaders = {
+      Authorization: `Bearer ${config.authToken}`,
+      'Content-Type': 'application/json',
+    };
+    const selfBaseUrl = `http://127.0.0.1:${config.port}`;
+    const acquireAttempt = db.transaction(() => {
+      const current = stmts.getLatestAttempt.get(operationId);
+      if (current?.status === 'started') {
+        const attemptStartedAt = Date.parse(current.started_at);
+        const queueProcessingAt = Date.parse(queueRow.processing_at);
+        const recoveredAfterAttempt = Number.isFinite(attemptStartedAt)
+          && Number.isFinite(queueProcessingAt)
+          && queueProcessingAt > attemptStartedAt + 1_000;
+        if (!recoveredAfterAttempt) return { acquired: false, attempt: current };
+        stmts.finishAttempt.run({
+          id: current.id,
+          status: 'uncertain',
+          providerRequestId: null,
+          providerConversationId: null,
+          providerResponseId: null,
+          httpStatus: null,
+          errorCode: 'IMAGE_ATTEMPT_INTERRUPTED',
+          errorMessage: 'Image execution was interrupted after provider dispatch may have begun',
+          completedAt: now,
+        });
+        return { acquired: false, attempt: current, stale: true };
+      }
+      const attempt = {
+        id: `img_attempt_${uuidv4()}`,
+        operationId,
+        attemptNumber: Math.max(1, Number(current?.attempt_number || 0) + 1),
+        provider: operation.provider,
+        capabilitySnapshotJson: JSON.stringify({
+          executionMode: operation.execution_mode,
+          endpoint: 'images',
+        }),
+        startedAt: now,
+      };
+      stmts.insertAttempt.run(attempt);
+      return { acquired: true, attempt: stmts.getLatestAttempt.get(operationId) };
+    });
+    const acquired = acquireAttempt();
+    if (acquired.stale) {
+      await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
+        method: 'POST',
+        headers: selfHeaders,
+        body: JSON.stringify({
+          messageId: operation.queue_message_id,
+          conversationId: operation.conversation_id,
+          terminalFailure: {
+            code: 'IMAGE_ATTEMPT_INTERRUPTED',
+            message: 'Image generation may have completed before the relay was interrupted. It was not retried to avoid duplicate images.',
+            retryable: false,
+          },
+        }),
+      }).catch(() => null);
+      return res.status(409).json({
+        ok: false,
+        outcome: 'uncertain',
+        operationId,
+        error: 'The previous image attempt ended in an uncertain state and was not retried',
+      });
+    }
+    if (!acquired.acquired) {
+      return res.status(202).json({ ok: true, outcome: 'executing', operationId });
+    }
+
+    const requestAttachments = [];
+    if (operation.parent_node_id) {
+      const parentNode = stmts.getNode.get(operation.parent_node_id);
+      const parentMessage = parentNode
+        ? db.prepare(`SELECT attachments FROM messages WHERE id = ?`).get(parentNode.assistant_message_id)
+        : null;
+      const parentAttachment = parseAttachments(parentMessage?.attachments).find((attachment) => (
+        String(attachment?.generatedImage?.imageId || '').trim() === parentNode?.attachment_image_id
+      ));
+      const generatedImage = parentAttachment?.generatedImage;
+      const parentPath = resolveGeneratedImageReadPath({
+        resolveSessionStateRoot,
+        sessionId: generatedImage?.sessionId,
+        relativePath: generatedImage?.relativePath,
+      });
+      if (!parentPath) {
+        stmts.finishAttempt.run({
+          id: acquired.attempt.id,
+          status: 'failed_terminal',
+          providerRequestId: null,
+          providerConversationId: null,
+          providerResponseId: null,
+          httpStatus: 400,
+          errorCode: 'IMAGE_PARENT_UNAVAILABLE',
+          errorMessage: 'The parent generated image is unavailable',
+          completedAt: new Date().toISOString(),
+        });
+        return res.status(409).json({
+          ok: false,
+          outcome: 'terminal',
+          code: 'IMAGE_PARENT_UNAVAILABLE',
+          error: 'The parent generated image is unavailable',
+        });
+      }
+      requestAttachments.push({
+        name: parentAttachment.name,
+        type: parentAttachment.type,
+        path: parentPath,
+      });
+    } else {
+      for (const asset of stmts.listAssets.all(operationId)) {
+        requestAttachments.push({
+          name: asset.original_name || 'reference-image',
+          type: asset.media_type,
+          path: uploadPathForSha(asset.content_sha256),
+        });
+      }
+    }
+
+    let parameters = {};
+    try {
+      parameters = JSON.parse(operation.parameters_json || '{}');
+    } catch {}
+    const generationBody = {
+      messageId: operation.queue_message_id,
+      conversationId: operation.conversation_id,
+      model: operation.selected_image_model,
+      prompt: operation.prompt,
+      n: Number.isInteger(Number(parameters.count)) ? Number(parameters.count) : 1,
+      attachments: requestAttachments,
+    };
+    if (parameters.size === 'auto' || /^\d{2,5}x\d{2,5}$/i.test(String(parameters.size || ''))) {
+      generationBody.size = parameters.size;
+    }
+    if (/^(auto|standard|hd|low|medium|high)$/i.test(String(parameters.quality || ''))) {
+      generationBody.quality = parameters.quality;
+    }
+
+    let generatedPayload = null;
+    try {
+      const generatedResponse = await fetch(`${selfBaseUrl}${remotePath}/api/openai/images/generate`, {
+        method: 'POST',
+        headers: selfHeaders,
+        body: JSON.stringify(generationBody),
+      });
+      generatedPayload = await generatedResponse.json().catch(() => ({}));
+      if (!generatedResponse.ok) {
+        const error = new Error(generatedPayload?.error || `OpenAI image request failed (${generatedResponse.status})`);
+        error.status = generatedResponse.status;
+        throw error;
+      }
+      const finalizeResponse = await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
+        method: 'POST',
+        headers: selfHeaders,
+        body: JSON.stringify({
+          messageId: operation.queue_message_id,
+          conversationId: operation.conversation_id,
+          text: '',
+          generatedImages: generatedPayload.generatedImages,
+          model: generatedPayload.model || operation.selected_image_model,
+        }),
+      });
+      const finalized = await finalizeResponse.json().catch(() => ({}));
+      if (!finalizeResponse.ok) {
+        const error = new Error(finalized?.error || `Image finalization failed (${finalizeResponse.status})`);
+        error.status = finalizeResponse.status;
+        throw error;
+      }
+      return res.json({
+        ok: true,
+        outcome: 'completed',
+        operationId,
+        generatedImageCount: Array.isArray(generatedPayload.generatedImages)
+          ? generatedPayload.generatedImages.length
+          : 0,
+      });
+    } catch (error) {
+      const status = Number(error?.status || 0);
+      const terminal = status >= 400 && status < 500;
+      const uncertain = !!generatedPayload?.generatedImages;
+      const outcome = terminal ? 'terminal' : (uncertain ? 'uncertain' : 'retryable');
+      stmts.finishAttempt.run({
+        id: acquired.attempt.id,
+        status: terminal ? 'failed_terminal' : (uncertain ? 'uncertain' : 'failed_retryable'),
+        providerRequestId: null,
+        providerConversationId: null,
+        providerResponseId: null,
+        httpStatus: status || null,
+        errorCode: terminal ? 'IMAGE_PROVIDER_REJECTED' : (uncertain ? 'IMAGE_FINALIZATION_UNCERTAIN' : 'IMAGE_PROVIDER_UNAVAILABLE'),
+        errorMessage: String(error?.message || 'Image operation failed').slice(0, 500),
+        completedAt: new Date().toISOString(),
+      });
+      if (outcome === 'retryable') {
+        const requeueResponse = await fetch(`${selfBaseUrl}${remotePath}/api/requeue`, {
+          method: 'POST',
+          headers: selfHeaders,
+          body: JSON.stringify({ messageId: operation.queue_message_id }),
+        }).catch(() => null);
+        if (!requeueResponse?.ok) {
+          console.warn(`[${ts()}] IMAGE_OP  failed to requeue retryable operation=${operationId}`);
+        }
+      } else {
+        const failure = {
+          code: outcome === 'uncertain' ? 'IMAGE_FINALIZATION_UNCERTAIN' : 'IMAGE_PROVIDER_REJECTED',
+          message: String(error?.message || 'Image operation failed').slice(0, 500),
+          retryable: false,
+        };
+        const failResponse = await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
+          method: 'POST',
+          headers: selfHeaders,
+          body: JSON.stringify({
+            messageId: operation.queue_message_id,
+            conversationId: operation.conversation_id,
+            terminalFailure: failure,
+          }),
+        }).catch(() => null);
+        if (!failResponse?.ok) {
+          console.warn(`[${ts()}] IMAGE_OP  failed to finalize ${outcome} operation=${operationId}`);
+        }
+      }
+      return res.status(outcome === 'retryable' ? 503 : 409).json({
+        ok: false,
+        outcome,
+        operationId,
+        error: String(error?.message || 'Image operation failed'),
+      });
+    }
+  });
+
   app.post('/api/openai/images/generate', auth, async (req, res) => {
     touchCli();
     const settings = getOpenAIProviderSettings();
@@ -4542,6 +4859,7 @@ export function registerMessagesRoutes(app, deps) {
         editAttachment = resolveOpenAIImageEditAttachment(requestBody.attachments, {
           maxImageBytes: MAX_UPLOAD_BYTES,
           allowedRootPath: uploadsDir,
+          allowedGeneratedImagesRootPath: resolveSessionStateRoot?.() || '',
         });
       } catch (error) {
         return res.status(400).json({ error: error?.message || 'Invalid image attachment' });
@@ -4761,6 +5079,9 @@ export function registerMessagesRoutes(app, deps) {
     }
     const assistantAttachments = generatedImageAttachments.length ? JSON.stringify(generatedImageAttachments) : null;
     const now = new Date().toISOString();
+    const imageOperation = q?.image_operation_id
+      ? stmts.getOperation?.get(q.image_operation_id)
+      : null;
     const finalize = db.transaction(() => {
       const result = stmts.setDone.run(resolvedText, messageId);
       if (result.changes === 0) return false;
@@ -4782,6 +5103,58 @@ export function registerMessagesRoutes(app, deps) {
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
       stmts.linkThoughtsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, targetConversationId);
+      if (imageOperation && generatedImageAttachments.length) {
+        const previousAttempt = stmts.getLatestAttempt?.get(imageOperation.id) || null;
+        const attemptId = previousAttempt?.status === 'started'
+          ? previousAttempt.id
+          : `img_attempt_${uuidv4()}`;
+        if (previousAttempt?.status !== 'started') {
+          stmts.insertAttempt.run({
+            id: attemptId,
+            operationId: imageOperation.id,
+            attemptNumber: Math.max(1, Number(previousAttempt?.attempt_number || 0) + 1),
+            provider: imageOperation.provider,
+            capabilitySnapshotJson: JSON.stringify({
+              executionMode: imageOperation.execution_mode,
+              finalizer: 'response',
+            }),
+            startedAt: now,
+          });
+        }
+        for (const [outputIndex, attachment] of generatedImageAttachments.entries()) {
+          const nodeId = `img_node_${uuidv4()}`;
+          stmts.insertNode.run({
+            id: nodeId,
+            imageSessionId: imageOperation.image_session_id,
+            operationId: imageOperation.id,
+            assistantMessageId: responseId,
+            attachmentImageId: attachment.generatedImage.imageId,
+            outputIndex,
+            createdAt: now,
+          });
+          if (imageOperation.parent_node_id) {
+            stmts.insertEdgeChecked({
+              imageSessionId: imageOperation.image_session_id,
+              parentNodeId: imageOperation.parent_node_id,
+              childNodeId: nodeId,
+              operationId: imageOperation.id,
+              createdAt: now,
+            });
+          }
+        }
+        stmts.finishAttempt.run({
+          id: attemptId,
+          status: 'succeeded',
+          providerRequestId: null,
+          providerConversationId: null,
+          providerResponseId: responseId,
+          httpStatus: 200,
+          errorCode: null,
+          errorMessage: null,
+          completedAt: now,
+        });
+        stmts.touchSession.run(now, imageOperation.image_session_id);
+      }
       stmts.pruneQueue.run();
       return true;
     });
@@ -4917,6 +5290,7 @@ export function registerMessagesRoutes(app, deps) {
     }
     const activities = relayActivityForResponse(responseId);
     const thoughts = relayThoughtsForResponse ? relayThoughtsForResponse(responseId) : [];
+    const emittedImageAttachments = generatedImageAttachments.map(hydrateAttachment).filter(Boolean);
 
     const responseLogText = String(resolvedText || '');
     console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} conv=${targetConversationId?.slice(0,8)} mode=${relayMode} len=${responseLogText.length} preview="${responseLogText.slice(0,60)}"${generatedImageAttachments.length ? ` images=${generatedImageAttachments.length}` : ''}`);
@@ -4928,7 +5302,7 @@ export function registerMessagesRoutes(app, deps) {
       message: {
         role: 'assistant',
         text: resolvedText,
-        attachments: generatedImageAttachments.length ? generatedImageAttachments : undefined,
+        attachments: emittedImageAttachments.length ? emittedImageAttachments : undefined,
         model: resolvedAssistantModel,
         modelOrigin: modelOrigin || undefined,
         reasoningEffort: String(q?.reasoning_effort || '').trim() || null,

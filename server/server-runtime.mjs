@@ -21,6 +21,10 @@ import {
 import { createSessionRepository } from './repositories/session-repository.mjs';
 import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
+import {
+  createImageConversationRepository,
+  migrateImageConversationSchema,
+} from './repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { buildDequeuedRelayMessage, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
@@ -28,6 +32,7 @@ import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
+import { createImageOperationService } from './services/image-operation-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
   driveRootFromAbsolutePath as _driveRootFromAbsolutePath,
@@ -2439,6 +2444,7 @@ db.exec(`UPDATE queue SET relay_mode = 'agent' WHERE relay_mode IS NULL OR relay
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_next_attempt ON queue(status, next_attempt_at, timestamp)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_owner_pending ON queue(status, owner_sdk_session_id, next_attempt_at, timestamp)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, parked_transaction_id, parked_target_session_id, parked_at, timestamp)`);
+migrateImageConversationSchema(db);
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
 if (runtimeSessionColumns.length) {
@@ -2613,8 +2619,14 @@ const stmts = {
   ...createSessionRepository(db),
   ...createMessageRepository(db),
   ...createQuestionRepository(db),
+  ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+const imageOperationService = createImageOperationService({
+  db,
+  repository: stmts,
+  uuidv4,
+});
 
 modelSelectorSql = {
   listVariants: db.prepare(`
@@ -4611,6 +4623,40 @@ function hydrateAttachment(raw) {
     att.reference = `@${att.path}`;
     att.contentUrl = uploadContentUrlForSha(sha256);
   }
+  if (featureFlags.IMAGE_CONVERSATION_CONTINUITY_ENABLED === true && att.generatedImage) {
+    const messageId = String(att.generatedImage.messageId || '').trim();
+    const imageId = String(att.generatedImage.imageId || '').trim();
+    const node = messageId && imageId ? stmts.getNodeByAttachment?.get(messageId, imageId) : null;
+    if (node) {
+      const parentEdge = stmts.getParentEdge?.get(node.id) || null;
+      const parentNode = parentEdge ? stmts.getNode?.get(parentEdge.parent_node_id) : null;
+      att.generatedImage = {
+        ...att.generatedImage,
+        continuity: {
+          nodeId: node.id,
+          imageSessionId: node.image_session_id,
+          operationId: node.operation_id,
+          parentNodeId: parentNode?.id || null,
+          parentMessageId: parentNode?.assistant_message_id || null,
+          parentImageId: parentNode?.attachment_image_id || null,
+          canEdit: true,
+        },
+      };
+    } else {
+      att.generatedImage = {
+        ...att.generatedImage,
+        continuity: {
+          nodeId: null,
+          imageSessionId: null,
+          operationId: null,
+          parentNodeId: null,
+          parentMessageId: null,
+          parentImageId: null,
+          canEdit: true,
+        },
+      };
+    }
+  }
   return att;
 }
 
@@ -5743,6 +5789,7 @@ const sharedRouteDeps = {
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
+  imageOperationService,
   windowsAutostartService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);

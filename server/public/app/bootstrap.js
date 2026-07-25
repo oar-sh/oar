@@ -97,6 +97,9 @@ import {
   initConversationHistoryLazyLoading,
   initBubbleActionHandlers,
   isSendInFlight,
+  setImageEditTarget,
+  clearImageEditTarget,
+  jumpToImageParent,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
@@ -3070,6 +3073,9 @@ window.syncComposerControlState = syncComposerControlState;
 window.appendMessage = appendMessage;
 window.loadOlderConversationMessages = loadOlderConversationMessages;
 window.handleKey = handleKey;
+window.setImageEditTarget = setImageEditTarget;
+window.clearImageEditTarget = clearImageEditTarget;
+window.jumpToImageParent = jumpToImageParent;
 window.autoResize = autoResize;
 window.closeSummaryModal = closeSummaryModal;
 window.refreshSummaryModal = refreshSummaryModal;

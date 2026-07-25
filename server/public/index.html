@@ -1452,6 +1452,38 @@
   #attachment-preview.visible {
     display: flex;
   }
+  #image-edit-target {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--bg-secondary);
+    font-size: 12px;
+  }
+  #image-edit-target.visible { display: flex; }
+  #image-edit-target span { flex: 1; min-width: 0; }
+  #image-edit-target button {
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .msg-image-continuity-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 5px;
+  }
+  .msg-image-continuity-actions button {
+    border: 0;
+    padding: 0;
+    color: var(--accent);
+    background: transparent;
+    cursor: pointer;
+    font: inherit;
+  }
   .attachment-preview-item {
     position: relative; width: 88px; border: 1px solid var(--border); border-radius: 10px;
     overflow: hidden; background: var(--bg3);
@@ -3437,6 +3469,7 @@
         <button type="button" id="model-metadata-retry-btn">Refresh models</button>
       </div>
       <div id="attachment-preview"></div>
+      <div id="image-edit-target" aria-live="polite"></div>
       <div id="emoji-popup" aria-hidden="true"></div>
       <div class="input-row">
         <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">

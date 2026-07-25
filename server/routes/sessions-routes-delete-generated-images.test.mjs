@@ -205,3 +205,34 @@ test('POST /api/sdk-session-delete/result removes generated images when finalizi
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('POST /api/sdk-session-delete/result finalizes local deletion when SDK deletion is unsupported', async () => {
+  const deletedRequests = [];
+  const removedWorkers = [];
+  const app = createMockApp();
+  registerSessionsRoutes(app, buildDeps({
+    root: '',
+    sessionWorkerRegistry: { removeWorker: (id) => removedWorkers.push(id) },
+    stmts: {
+      deleteSdkDeleteRequest: { run: (id) => deletedRequests.push(id) },
+      listDeletedConversationsBySdkSessionId: { all: () => [] },
+    },
+  }));
+
+  const handlers = app.routes.get('POST /api/sdk-session-delete/result');
+  const response = await callRoute(handlers, {
+    body: {
+      sdk_session_id: 'sdk-unsupported',
+      ok: false,
+      unsupported: true,
+      error: 'SDK deleteSession() is unavailable in this CLI runtime',
+    },
+    headers: {},
+    params: {},
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body?.unsupported, true);
+  assert.deepEqual(deletedRequests, ['sdk-unsupported']);
+  assert.deepEqual(removedWorkers, ['sdk-unsupported']);
+});

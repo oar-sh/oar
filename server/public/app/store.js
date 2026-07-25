@@ -54,6 +54,7 @@ export let activeRuntimeSessionCount = 0;
 export let runtimeSessionBindingCount = 0;
 export let conversations = {};
 export let selectedAttachments = [];
+export let imageEditTarget = null;
 export const RELAY_QUESTION_POLL_MS = 3000;
 export const MAX_UPLOAD_ATTACHMENTS = 6;
 export const FILE_PREVIEW_MAX_BYTES = 512 * 1024;
@@ -727,6 +728,17 @@ export function setRelayOnline(value) {
   relayOnline = nextOnline;
   if (changed) recordRelayLifecycleEvent(nextOnline);
   updateCliStatus();
+}
+
+export function setImageEditTarget(value) {
+  imageEditTarget = value && typeof value === 'object'
+    ? {
+        messageId: String(value.messageId || '').trim(),
+        imageId: String(value.imageId || '').trim(),
+        nodeId: String(value.nodeId || '').trim() || null,
+        name: String(value.name || 'generated image').trim() || 'generated image',
+      }
+    : null;
 }
 
 function normalizeWorkerSessionId(value) {
