@@ -190,37 +190,62 @@ export function isSafePreviewUrl(url, allowDataImage = false) {
     const parsed = new URL(value, window.location.origin);
     const protocol = String(parsed.protocol || '').toLowerCase();
     if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') return true;
-    if (allowDataImage && protocol === 'data:' && /^data:image\//i.test(value)) return true;
+    if (allowDataImage && protocol === 'data:' && /^data:image\/(?:avif|gif|jpe?g|png|webp);/i.test(value)) return true;
   } catch {}
+  return false;
+}
+
+const PREVIEW_ALLOWED_TAGS = new Set([
+  'a', 'article', 'b', 'blockquote', 'br', 'code', 'del', 'details', 'div', 'em',
+  'figcaption', 'figure', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'i', 'img',
+  'kbd', 'li', 'mark', 'ol', 'p', 'pre', 's', 'small', 'span', 'strong', 'sub',
+  'summary', 'sup', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'u', 'ul',
+]);
+const PREVIEW_GLOBAL_ATTRIBUTES = new Set(['dir', 'lang', 'title']);
+const PREVIEW_ALIGNMENT_VALUES = new Set(['left', 'center', 'right', 'justify']);
+const PREVIEW_VERTICAL_ALIGNMENT_VALUES = new Set(['top', 'middle', 'bottom', 'baseline']);
+const PREVIEW_DIMENSION_VALUE = /^(?:[1-9]\d{0,3}|100(?:\.0+)?%)$/;
+const PREVIEW_SPAN_VALUE = /^[1-9]\d{0,2}$/;
+
+function isAllowedPreviewAttribute(tagName, name, value) {
+  if (PREVIEW_GLOBAL_ATTRIBUTES.has(name)) return true;
+  if (name === 'href') return tagName === 'a' && isSafePreviewUrl(value, false);
+  if (name === 'src') return tagName === 'img' && isSafePreviewUrl(value, true);
+  if (name === 'alt') return tagName === 'img';
+  if (name === 'target') return tagName === 'a' && value === '_blank';
+  if (name === 'rel') return tagName === 'a';
+  if (name === 'align') return ['div', 'p', 'table', 'td', 'th', 'tr'].includes(tagName)
+    && PREVIEW_ALIGNMENT_VALUES.has(value.toLowerCase());
+  if (name === 'valign') return ['td', 'th', 'tr'].includes(tagName)
+    && PREVIEW_VERTICAL_ALIGNMENT_VALUES.has(value.toLowerCase());
+  if (name === 'width' || name === 'height') return ['img', 'table', 'td', 'th'].includes(tagName)
+    && PREVIEW_DIMENSION_VALUE.test(value);
+  if (name === 'rowspan' || name === 'colspan') return ['td', 'th'].includes(tagName)
+    && PREVIEW_SPAN_VALUE.test(value);
+  if (name === 'cellspacing' || name === 'cellpadding') return tagName === 'table'
+    && /^(?:0|[1-9]\d{0,2})$/.test(value);
+  if (name === 'loading') return tagName === 'img' && ['eager', 'lazy'].includes(value.toLowerCase());
+  if (name === 'decoding') return tagName === 'img' && ['async', 'auto', 'sync'].includes(value.toLowerCase());
+  if (name === 'open') return tagName === 'details' && value === '';
   return false;
 }
 
 export function sanitizePreviewHtml(html) {
   const template = document.createElement('template');
   template.innerHTML = String(html || '');
-  const blockedTags = new Set(['script', 'iframe', 'object', 'embed', 'link', 'style', 'meta', 'base', 'form', 'input', 'button', 'textarea', 'select', 'option']);
   const nodes = Array.from(template.content.querySelectorAll('*'));
   for (const el of nodes) {
     const tagName = String(el.tagName || '').toLowerCase();
-    if (blockedTags.has(tagName)) {
+    if (!PREVIEW_ALLOWED_TAGS.has(tagName)) {
       el.replaceWith(document.createTextNode(el.textContent || ''));
       continue;
     }
     const attrs = Array.from(el.attributes || []);
     for (const attr of attrs) {
       const name = String(attr.name || '').toLowerCase();
-      const value = String(attr.value || '');
-      if (name.startsWith('on') || name === 'style' || name === 'srcdoc') {
+      const value = String(attr.value || '').trim();
+      if (!isAllowedPreviewAttribute(tagName, name, value)) {
         el.removeAttribute(attr.name);
-        continue;
-      }
-      if (name === 'href' && !isSafePreviewUrl(value, false)) {
-        el.removeAttribute(attr.name);
-        continue;
-      }
-      if (name === 'src' && !isSafePreviewUrl(value, true)) {
-        el.removeAttribute(attr.name);
-        continue;
       }
     }
     if (tagName === 'a') {
@@ -590,12 +615,14 @@ function resolveLocalAssetUrl(rawValue, { preferDrive = false } = {}) {
 export function rewriteLocalAssetUrlsInNode(root, options = {}) {
   if (!(root instanceof Element)) return;
   const preferDrive = options?.preferDrive === true;
+  const rewriteAnchors = options?.rewriteAnchors !== false;
   const images = Array.from(root.querySelectorAll('img[src]'));
   for (const img of images) {
     const rawSrc = img.getAttribute('src') || '';
     const nextSrc = resolveLocalAssetUrl(rawSrc, { preferDrive });
     if (nextSrc) img.setAttribute('src', nextSrc);
   }
+  if (!rewriteAnchors) return;
   const anchors = Array.from(root.querySelectorAll('a[href]'));
   for (const anchor of anchors) {
     const rawHref = anchor.getAttribute('href') || '';

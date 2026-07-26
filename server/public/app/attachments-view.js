@@ -28,11 +28,14 @@ import {
   workspacePreviewApiPath,
   drivePreviewApiPath,
   renderMarkdownPreview,
+  rewriteLocalAssetUrlsInNode,
   buildReferenceToken,
   copyTextToClipboard,
   copyReferenceTokenToClipboard,
   eventClosest,
 } from './router.js';
+import { markdownHeadingId, resolveFilePreviewLink } from './file-preview-navigation.mjs';
+import { openExternalNavigation } from './external-link-policy.mjs';
 
 function currentConversationId() {
   return String(currentConvId || '').trim();
@@ -70,6 +73,7 @@ function setRepoBrowserState(next) {
 }
 
 let repoBrowserReloadQueued = false;
+const filePreviewHistory = [];
 
 function resolveAttachmentContentUrl(rawValue) {
   const value = String(rawValue || '').trim();
@@ -231,8 +235,45 @@ function updateFilePreviewUiState() {
   rawBtn.classList.toggle('active', filePreviewState.mode === 'raw');
   htmlBtn.style.display = (!isUpload && isMarkdown && filePreviewState.mode === 'preview') ? 'inline-block' : 'none';
   htmlBtn.classList.toggle('active', filePreviewState.allowHtml);
-  htmlBtn.textContent = filePreviewState.allowHtml ? 'Disable embedded HTML' : 'Enable embedded HTML';
+  htmlBtn.textContent = filePreviewState.allowHtml ? 'Show literal HTML' : 'Show HTML layout';
   warning.classList.toggle('visible', isMarkdown && filePreviewState.allowHtml && filePreviewState.mode === 'preview');
+  const backBtn = document.getElementById('file-preview-back');
+  backBtn.hidden = filePreviewHistory.length === 0;
+  backBtn.disabled = filePreviewHistory.length === 0;
+}
+
+function snapshotFilePreviewState() {
+  const bodyEl = document.getElementById('file-preview-body');
+  return {
+    path: filePreviewState.path,
+    source: filePreviewState.source,
+    mode: filePreviewState.mode,
+    allowHtml: filePreviewState.allowHtml,
+    loading: filePreviewState.loading,
+    error: filePreviewState.error,
+    payload: filePreviewState.payload,
+    viewerOptions: filePreviewState.viewerOptions,
+    scrollTop: Number(bodyEl?.scrollTop || 0),
+  };
+}
+
+function scrollMarkdownPreviewToFragment(rawFragment) {
+  const fragment = markdownHeadingId(rawFragment);
+  if (!fragment) return;
+  const article = document.querySelector('#file-preview-body .file-preview-markdown');
+  const target = Array.from(article?.querySelectorAll('[id]') || []).find((element) => element.id === fragment);
+  target?.scrollIntoView({ block: 'start' });
+}
+
+function assignMarkdownHeadingIds(article) {
+  const counts = new Map();
+  for (const heading of article.querySelectorAll('h1, h2, h3, h4, h5, h6')) {
+    const baseId = markdownHeadingId(heading.textContent);
+    if (!baseId) continue;
+    const count = counts.get(baseId) || 0;
+    counts.set(baseId, count + 1);
+    heading.id = count ? `${baseId}-${count}` : baseId;
+  }
 }
 
 function teardownImageZoom() {
@@ -710,7 +751,15 @@ export function renderFilePreview() {
   if (payload.kind === 'markdown') {
     const html = renderMarkdownPreview(rawText, filePreviewState.allowHtml);
     bodyEl.innerHTML = `<article class="file-preview-markdown">${html}</article>`;
+    const article = bodyEl.querySelector('.file-preview-markdown');
+    rewriteLocalAssetUrlsInNode(article, {
+      preferDrive: filePreviewState.source === 'drives' || filePreviewState.source === 'session',
+      rewriteAnchors: false,
+    });
+    assignMarkdownHeadingIds(article);
     bodyEl.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+    const fragment = String(filePreviewState.viewerOptions?.fragment || '');
+    if (fragment) requestAnimationFrame(() => scrollMarkdownPreviewToFragment(fragment));
     return;
   }
 
@@ -722,12 +771,13 @@ export function renderFilePreview() {
 export async function openWorkspaceFilePreview(rawPath, options = {}) {
   const normalized = normalizeWorkspaceMentionPath(rawPath);
   if (!normalized) return;
-  const viewerOptions = normalizeVideoPreviewOptions(options);
+  const viewerOptions = { ...normalizeVideoPreviewOptions(options), fragment: String(options?.fragment || '') };
+  if (!options?.fromViewerLink) filePreviewHistory.length = 0;
   setFilePreviewState({
     path: normalized,
     source: 'workspace',
     mode: 'preview',
-    allowHtml: false,
+    allowHtml: true,
     loading: true,
     error: '',
     payload: null,
@@ -743,24 +793,26 @@ export async function openWorkspaceFilePreview(rawPath, options = {}) {
     filePreviewState.loading = false;
     filePreviewState.error = payload?.error || 'Failed to load file preview';
     renderFilePreview();
-    return;
+    return false;
   }
   filePreviewState.loading = false;
   filePreviewState.payload = payload;
   filePreviewState.path = String(payload.path || normalized);
   filePreviewState.viewerOptions = viewerOptions;
   renderFilePreview();
+  return true;
 }
 
 export async function openDriveFilePreview(rawPath, options = {}) {
   const normalized = normalizeDriveBrowserPath(rawPath);
   if (!normalized) return;
-  const viewerOptions = normalizeVideoPreviewOptions(options);
+  const viewerOptions = { ...normalizeVideoPreviewOptions(options), fragment: String(options?.fragment || '') };
+  if (!options?.fromViewerLink) filePreviewHistory.length = 0;
   setFilePreviewState({
     path: normalized,
     source: 'drives',
     mode: 'preview',
-    allowHtml: false,
+    allowHtml: true,
     loading: true,
     error: '',
     payload: null,
@@ -776,7 +828,7 @@ export async function openDriveFilePreview(rawPath, options = {}) {
     filePreviewState.loading = false;
     filePreviewState.error = payload?.error || 'Failed to load drive file preview';
     renderFilePreview();
-    return;
+    return false;
   }
   filePreviewState.loading = false;
   filePreviewState.payload = payload;
@@ -784,6 +836,7 @@ export async function openDriveFilePreview(rawPath, options = {}) {
   filePreviewState.source = 'drives';
   filePreviewState.viewerOptions = viewerOptions;
   renderFilePreview();
+  return true;
 }
 
 export async function openWorkspaceFilePreviewFromRepo(rawPath, options = {}) {
@@ -800,6 +853,38 @@ export function closeFilePreview() {
   const modal = document.getElementById('file-preview-modal');
   modal.classList.remove('visible');
   modal.setAttribute('aria-hidden', 'true');
+  filePreviewHistory.length = 0;
+}
+
+export function goBackFilePreview() {
+  const previous = filePreviewHistory.pop();
+  if (!previous) return;
+  setFilePreviewState(previous);
+  renderFilePreview();
+  requestAnimationFrame(() => {
+    const bodyEl = document.getElementById('file-preview-body');
+    if (bodyEl) bodyEl.scrollTop = Number(previous.scrollTop || 0);
+  });
+}
+
+async function openFilePreviewLink(anchor) {
+  const target = resolveFilePreviewLink(anchor.getAttribute('href'), filePreviewState.path);
+  if (target.kind === 'fragment') {
+    scrollMarkdownPreviewToFragment(target.fragment);
+    return;
+  }
+  if (target.kind !== 'file') return;
+
+  const snapshot = snapshotFilePreviewState();
+  filePreviewHistory.push(snapshot);
+  renderFilePreview();
+  const loaded = filePreviewState.source === 'workspace'
+    ? await openWorkspaceFilePreview(target.path, { fromViewerLink: true, fragment: target.fragment })
+    : await openDriveFilePreview(target.path, { fromViewerLink: true, fragment: target.fragment });
+  if (loaded) return;
+  filePreviewHistory.pop();
+  setFilePreviewState(snapshot);
+  renderFilePreview();
 }
 
 export function normalizeRepoPath(pathValue) {
@@ -1409,6 +1494,21 @@ document.addEventListener('click', (event) => {
 
 document.getElementById('file-preview-modal').addEventListener('click', (event) => {
   if (event.target.id === 'file-preview-modal') closeFilePreview();
+});
+
+document.getElementById('file-preview-body').addEventListener('click', (event) => {
+  const anchor = eventClosest(event, '.file-preview-markdown a[href]');
+  if (!anchor) return;
+  const target = resolveFilePreviewLink(anchor.getAttribute('href'), filePreviewState.path);
+  if (target.kind === 'external') {
+    event.preventDefault();
+    openExternalNavigation(anchor.href, (url) => {
+      window.dispatchEvent(new CustomEvent('copilot:external-link-fallback', { detail: { url } }));
+    });
+    return;
+  }
+  event.preventDefault();
+  void openFilePreviewLink(anchor);
 });
 
 document.getElementById('summary-modal').addEventListener('click', (event) => {

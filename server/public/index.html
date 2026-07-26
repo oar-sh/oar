@@ -1735,6 +1735,7 @@
     border-color: var(--accent);
     color: var(--accent);
   }
+  .file-preview-btn[hidden] { display: none; }
   .file-preview-warning {
     display: none;
     margin-left: auto;
@@ -1760,9 +1761,10 @@
   .file-preview-markdown p { margin-bottom: 0.55em; }
   .file-preview-markdown h1, .file-preview-markdown h2, .file-preview-markdown h3 { margin: 0.6em 0 0.35em; }
   .file-preview-markdown ul, .file-preview-markdown ol { margin-left: 1.3em; margin-bottom: 0.55em; }
-  .file-preview-markdown table { border-collapse: collapse; width: 100%; margin: 0.55em 0; font-size: 0.88em; }
+  .file-preview-markdown table { border-collapse: collapse; width: 100%; max-width: 100%; margin: 0.55em 0; font-size: 0.88em; }
   .file-preview-markdown th, .file-preview-markdown td { border: 1px solid var(--border); padding: 6px 9px; }
   .file-preview-markdown th { background: var(--bg3); }
+  .file-preview-markdown img { display: block; max-width: 100%; height: auto; }
   .file-preview-markdown pre,
   .file-preview-code pre {
     background: #0b0f14;
@@ -3732,11 +3734,12 @@
       <button class="file-preview-close" onclick="closeFilePreview()" aria-label="Close preview">×</button>
     </div>
     <div class="file-preview-toolbar">
+      <button id="file-preview-back" class="file-preview-btn" type="button" onclick="goBackFilePreview()" hidden disabled>← Back</button>
       <button id="file-preview-mode-preview" class="file-preview-btn active" onclick="setFilePreviewMode('preview')">Preview</button>
       <button id="file-preview-mode-raw" class="file-preview-btn" onclick="setFilePreviewMode('raw')">Raw</button>
-      <button id="file-preview-html-toggle" class="file-preview-btn" onclick="toggleFilePreviewHtml()">Enable embedded HTML</button>
+      <button id="file-preview-html-toggle" class="file-preview-btn" onclick="toggleFilePreviewHtml()">Show literal HTML</button>
       <a id="file-preview-open-raw" class="file-preview-btn" download>Download</a>
-      <span id="file-preview-warning" class="file-preview-warning">⚠ Embedded HTML enabled (scripts still blocked)</span>
+      <span id="file-preview-warning" class="file-preview-warning">⚠ Safe layout HTML enabled; active content is blocked</span>
     </div>
     <div id="file-preview-meta" class="file-preview-meta"></div>
     <div id="file-preview-body" class="file-preview-body"></div>

@@ -5,6 +5,7 @@ import {
   createPollingLoop,
   processSdkSessionDeleteRequest,
   resolveEmptyFinalTextHandling,
+  shouldUseDirectOpenAIImageApi,
 } from './polling-loop.mjs';
 import { createSessionIoHelpers } from '../runtime/session-io.mjs';
 
@@ -15,6 +16,19 @@ test('resolveEmptyFinalTextHandling treats generated images as successful comple
     hasGeneratedImages: true,
   });
   assert.equal(outcome.action, 'publish_generated_images_only');
+});
+
+test('direct OpenAI image execution supports all editable image model families', () => {
+  for (const model of ['gpt-image-1', 'gpt-image-2', 'dall-e-3']) {
+    assert.equal(shouldUseDirectOpenAIImageApi({
+      providerType: 'openai',
+      providerModel: model,
+    }), true);
+  }
+  assert.equal(shouldUseDirectOpenAIImageApi({
+    providerType: 'openai',
+    providerModel: 'gpt-5.4-mini',
+  }), false);
 });
 
 test('session-io extracts generated images from response envelope payloads', () => {

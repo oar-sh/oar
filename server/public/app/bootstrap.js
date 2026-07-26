@@ -102,7 +102,7 @@ import {
   jumpToImageParent,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
-import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import {
   resolveConversationComposerSelection,
@@ -132,6 +132,7 @@ import {
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics } from './status-store.mjs';
 import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
+import { installExternalLinkPolicy, openExternalNavigation } from './external-link-policy.mjs';
 import {
   initCwdPicker,
   openChangeCwdModal,
@@ -143,6 +144,38 @@ import {
   bindTapAction,
   bindMenuAction,
 } from './cwd-picker.js';
+
+let pendingExternalLinkUrl = '';
+
+function showExternalLinkFallback(url) {
+  pendingExternalLinkUrl = String(url || '').trim();
+  if (!pendingExternalLinkUrl) return;
+  openSummaryModal({
+    title: 'Open external link',
+    subtitle: 'Your browser blocked opening a separate tab',
+    bodyHtml: `
+      <p>The Copilot Remote app remains open. Copy this link and open it in your system browser:</p>
+      <pre><code>${escHtml(pendingExternalLinkUrl)}</code></pre>
+      <div class="summary-actions">
+        <button class="summary-btn" type="button" onclick="copyExternalLinkUrl()">Copy link</button>
+        <button class="summary-btn" type="button" onclick="retryExternalLinkOpen()">Open again</button>
+        <button class="summary-close" type="button" onclick="closeSummaryModal()">Close</button>
+      </div>
+    `,
+    kind: 'external-link-fallback',
+  });
+}
+
+async function copyExternalLinkUrl() {
+  if (!pendingExternalLinkUrl) return;
+  await copyTextToClipboard(pendingExternalLinkUrl);
+  showTransientRelayNotice('External link copied.');
+}
+
+function retryExternalLinkOpen() {
+  if (!pendingExternalLinkUrl) return;
+  openExternalNavigation(pendingExternalLinkUrl, showExternalLinkFallback);
+}
 import { initTmuxInspectorView, closeTmuxInspectorView } from './tmux-inspector-view.js';
 import {
   initTheme,
@@ -2696,6 +2729,7 @@ function showAuthGate(error = '') {
 
 async function initApp() {
   initClientDiagnostics();
+  installExternalLinkPolicy({ onFallback: showExternalLinkFallback });
   const sharedMode = isSharedReaderMode();
   appSharedMode = sharedMode;
   initNetworkLifecycleHandling();
@@ -3051,6 +3085,7 @@ window.openUploadedAttachmentViewer = openUploadedAttachmentViewer;
 window.setFilePreviewMode = setFilePreviewMode;
 window.toggleFilePreviewHtml = toggleFilePreviewHtml;
 window.closeFilePreview = closeFilePreview;
+window.goBackFilePreview = goBackFilePreview;
 window.openWorkspaceFilePreview = openWorkspaceFilePreview;
 window.openWorkspaceFilePreviewFromRepo = openWorkspaceFilePreviewFromRepo;
 window.setRepoBrowserRoot = setRepoBrowserRoot;
@@ -3091,5 +3126,11 @@ window.confirmSuspendHost = confirmSuspendHost;
 window.confirmEmptyQueue = confirmEmptyQueue;
 window.openMessageSearchModal = openMessageSearchModal;
 window.closeMessageSearchModal = closeMessageSearchModal;
+window.copyExternalLinkUrl = copyExternalLinkUrl;
+window.retryExternalLinkOpen = retryExternalLinkOpen;
+
+window.addEventListener('copilot:external-link-fallback', (event) => {
+  showExternalLinkFallback(event.detail?.url);
+});
 
 bootstrap();

@@ -95,7 +95,7 @@ export let filePreviewState = {
   path: '',
   source: 'workspace',
   mode: 'preview',
-  allowHtml: false,
+  allowHtml: true,
   loading: false,
   error: '',
   payload: null,
