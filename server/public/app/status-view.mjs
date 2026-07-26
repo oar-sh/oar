@@ -1,5 +1,6 @@
 import {
   activeRuntimeSessionCount,
+  runtimeSessionBindingCount,
   cliOnline,
   currentConvId,
   escHtml,
@@ -71,7 +72,14 @@ function renderStatusHeader() {
     title.innerHTML = `Web Relay Status: <span class="${relayOnline ? 'status-online' : 'status-offline'}">${relayOnline ? 'Reachable' : 'Unreachable'}</span> | CLI: <span class="${cliOnline ? 'status-online' : 'status-offline'}">${cliOnline ? 'Online' : 'Offline'}</span>`;
   }
   if (metadata) {
-    metadata.textContent = `Workers: ${sessionWorkerStates.size} | Active runtime sessions: ${Number(activeRuntimeSessionCount || 0)}`;
+    const allWorkers = Array.from(sessionWorkerStates.values());
+    const assignedOnline = Number(activeRuntimeSessionCount || 0);
+    const onlineTotal = allWorkers.reduce((count, worker) => {
+      const status = String(worker?.status || '').trim().toLowerCase();
+      return count + ((status === 'starting' || status === 'ready' || status === 'processing') ? 1 : 0);
+    }, 0);
+    const unassignedOnline = Math.max(0, onlineTotal - assignedOnline);
+    metadata.textContent = `Workers online: ${assignedOnline}${unassignedOnline ? ` (+${unassignedOnline} unassigned)` : ''} (total: ${sessionWorkerStates.size}) | Active runtime sessions: ${assignedOnline} | Total session bindings: ${Number(runtimeSessionBindingCount || 0)}`;
     metadata.hidden = false;
   }
   if (usage) {

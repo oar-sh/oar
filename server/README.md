@@ -34,15 +34,13 @@ is actively watching that session.
 > **Single-owner rule:** Use either extension-managed relay transport **or** standalone `relay.mjs`, never both at the same time.
 > Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 
-Tell the Copilot CLI agent: **"launch the server"**
-
-Or start Copilot with no manual prompt typing:
+Launch Copilot CLI from the repository root with extensions enabled and no initial user prompt:
 
 ```bash
 npm run copilot:relay
 ```
 
-That runs `gh copilot -- --allow-all -i "launch the server"` from the repo root, so the
+That runs `gh copilot -- --allow-all` from the repo root, so the
 extension is discovered and the relay starts immediately. If you installed the extension
 globally, plain `gh copilot` from any repository is enough.
 
@@ -212,6 +210,38 @@ Behavior notes:
   model state and shows a warning banner.
 - In extension-managed mode, the relay still switches model per message and
   reports the active model used in the response.
+
+### OpenAI API key
+
+Open **Settings → OpenAI API key** to save an OpenAI key and exact model ID
+(`gpt-4o` by default). Use the provider toggle to switch new conversations
+between OpenAI and GitHub Copilot without re-entering the saved key. While
+enabled, newly created extension-managed conversation workers start with Copilot
+CLI BYOK environment variables pointing to `https://api.openai.com/v1`.
+Zero-message conversations follow provider changes; started conversations keep
+their original provider and lock the composer to their assigned model.
+
+GPT-5 and OpenAI reasoning-model sessions use the Responses API automatically;
+other OpenAI models retain the broader-compatible Chat Completions wire format.
+OpenAI BYOK sessions currently use reasoning effort `none`; GitHub Copilot
+reasoning choices remain separate even when both providers expose the same model
+ID.
+
+Saving or re-enabling the key refreshes OpenAI's `/v1/models` list and adds
+candidate OpenAI model IDs to the composer picker. The Settings model-variant
+refresh performs the same discovery while OpenAI is enabled and retains the
+cached list if discovery fails. Starting a conversation uses the cached list; it
+does not make another discovery request. The model selected when creating a
+conversation is persisted on that conversation and used as its `COPILOT_MODEL`;
+the Settings model is only the default. Starting a chat from a locked OpenAI
+conversation opens an independent model chooser without changing the active
+conversation.
+
+Disabling OpenAI retains the key and cached model list. Removing the key is a
+separate destructive action and makes subsequent conversations use GitHub
+Copilot.
+An existing OpenAI-assigned conversation can continue while its worker remains
+running, but cannot launch a replacement worker until an OpenAI key is configured.
 
 ## Relay Mode Selection
 

@@ -12,7 +12,7 @@
     "start:server": "node server/server.js",
     "start:server:respawn": "server\\respawn.bat",
     "start:server:respawn:posix": "bash server/respawn.sh",
-    "copilot:relay": "gh copilot -- --allow-all -i \"launch the server\"",
+    "copilot:relay": "gh copilot -- --allow-all",
     "test:e2e": "node tests/run-e2e.mjs",
     "test:e2e:raw": "node ./node_modules/@playwright/test/cli.js test --config tests/playwright.config.mjs"
   },

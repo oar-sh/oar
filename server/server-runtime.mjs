@@ -21,6 +21,10 @@ import {
 import { createSessionRepository } from './repositories/session-repository.mjs';
 import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
+import {
+  createImageConversationRepository,
+  migrateImageConversationSchema,
+} from './repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { buildDequeuedRelayMessage, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
@@ -28,6 +32,7 @@ import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
+import { createImageOperationService } from './services/image-operation-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
   driveRootFromAbsolutePath as _driveRootFromAbsolutePath,
@@ -50,8 +55,9 @@ import {
   isModelCatalogRefreshStale,
   latestModelCatalogRefresh,
 } from '../shared/model-catalog-freshness.mjs';
-import { launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
+import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
 import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
@@ -65,7 +71,13 @@ import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
-import { filterValidModelIds, isValidModelId, canonicalizeModelId } from '../shared/model-id.mjs';
+import {
+  canonicalizeModelId,
+  filterValidModelIds,
+  isOpenAIModelId,
+  isSafeProviderModelId,
+  isValidModelId,
+} from '../shared/model-id.mjs';
 import { selectModelIdsForVariantRefresh } from '../shared/model-refresh.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -97,15 +109,165 @@ const SESSION_COOKIE = 'copilot_session';
 const AUTH_COOKIE = 'copilot_auth';
 
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+}
+if (process.platform !== 'win32') {
+  fs.chmodSync(DATA_DIR, 0o700);
 }
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+async function refreshOpenAIProviderModels() {
+  const settings = getOpenAIProviderSettings();
+  if (!settings.enabled) return { ok: false, models: [], error: 'OpenAI API key is not configured' };
+  let response;
+  try {
+    response = await fetch(`${settings.baseUrl}/models`, {
+      headers: {
+        Authorization: `Bearer ${settings.apiKey}`,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (error) {
+    return { ok: false, models: settings.models, error: error?.message || 'OpenAI model discovery failed' };
+  }
+  if (!response.ok) {
+    const detail = String(await response.text().catch(() => '')).trim().slice(0, 240);
+    return {
+      ok: false,
+      models: settings.models,
+      error: `OpenAI model discovery failed (${response.status})${detail ? `: ${detail}` : ''}`,
+    };
+  }
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    return { ok: false, models: settings.models, error: 'OpenAI model discovery returned invalid JSON' };
+  }
+  const models = Array.from(new Set([
+    settings.model,
+    ...(Array.isArray(payload?.data) ? payload.data : [])
+      .map((entry) => String(entry?.id || '').trim())
+      .filter((modelId) => isOpenAIModelId(modelId)),
+  ])).filter(Boolean);
+  stmts.upsertAppSetting.run(OPENAI_MODELS_SETTING_KEY, JSON.stringify(models), new Date().toISOString());
+  return { ok: true, models, error: null };
+}
+
+function getOpenAIProviderSettings() {
+  const apiKey = readAppSettingValue(OPENAI_API_KEY_SETTING_KEY);
+  const enabledSetting = readAppSettingValue(OPENAI_ENABLED_SETTING_KEY);
+  const enabled = !!apiKey && (enabledSetting === '' || enabledSetting === 'true');
+  const model = readAppSettingValue(OPENAI_MODEL_SETTING_KEY) || DEFAULT_OPENAI_MODEL;
+  let models = [];
+  try {
+    const parsed = JSON.parse(readAppSettingValue(OPENAI_MODELS_SETTING_KEY) || '[]');
+    if (Array.isArray(parsed)) {
+      models = parsed.map((value) => String(value || '').trim()).filter(Boolean);
+    }
+  } catch {
+    models = [];
+  }
+  return {
+    configured: !!apiKey,
+    enabled,
+    apiKey,
+    model,
+    models: Array.from(new Set([model, ...models])),
+    baseUrl: readAppSettingValue(OPENAI_BASE_URL_SETTING_KEY) || DEFAULT_OPENAI_BASE_URL,
+    providerType: 'openai',
+  };
+}
+
+function setOpenAIProviderSettings(update = {}) {
+  const payload = update && typeof update === 'object' ? update : {};
+  const apiKey = payload.apiKey;
+  const model = payload.model;
+  const enabled = payload.enabled;
+  const remove = payload.remove === true;
+  const hasBaseUrl = Object.prototype.hasOwnProperty.call(payload, 'baseUrl');
+  const baseUrl = hasBaseUrl ? payload.baseUrl : '';
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'OpenAI settings are unavailable' };
+  }
+  const existing = getOpenAIProviderSettings();
+  const normalizedModel = String(model || existing.model || '').trim() || DEFAULT_OPENAI_MODEL;
+  if (!isSafeProviderModelId(normalizedModel)) {
+    return { ok: false, error: 'Invalid OpenAI model ID' };
+  }
+  const nowIso = new Date().toISOString();
+  if (remove) {
+    const providerCandidates = Array.isArray(stmts?.listRuntimeSessionProviderCandidates?.all?.())
+      ? stmts.listRuntimeSessionProviderCandidates.all()
+      : [];
+    const startedConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'openai'
+      && Number(row?.message_count || 0) > 0
+    )).length;
+    const activeQueueConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'openai'
+      && Number(row?.active_queue_count || 0) > 0
+    )).length;
+    const activeConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'openai'
+      && (Number(row?.message_count || 0) > 0 || Number(row?.active_queue_count || 0) > 0)
+    )).length;
+    if (activeConversationCount > 0) {
+      return {
+        ok: false,
+        code: 'openai-key-removal-blocked',
+        error: `Cannot remove OpenAI API key while ${activeConversationCount} active OpenAI conversation(s) still exist. Disable OpenAI for new conversations instead.`,
+        activeConversationCount,
+        startedConversationCount,
+        activeQueueConversationCount,
+      };
+    }
+    stmts.deleteAppSetting.run(OPENAI_API_KEY_SETTING_KEY);
+    stmts.deleteAppSetting.run(OPENAI_MODELS_SETTING_KEY);
+    stmts.upsertAppSetting.run(OPENAI_ENABLED_SETTING_KEY, 'false', nowIso);
+    stmts.upsertAppSetting.run(OPENAI_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  } else {
+    const normalizedApiKey = String(apiKey || '').trim();
+    if (normalizedApiKey) {
+      stmts.deleteAppSetting.run(OPENAI_MODELS_SETTING_KEY);
+      stmts.upsertAppSetting.run(OPENAI_API_KEY_SETTING_KEY, normalizedApiKey, nowIso);
+    }
+    const hasApiKey = !!(normalizedApiKey || existing.apiKey);
+    const nextEnabled = typeof enabled === 'boolean' ? enabled : (normalizedApiKey ? true : existing.enabled);
+    if (nextEnabled && !hasApiKey) return { ok: false, error: 'OpenAI API key is not configured' };
+    stmts.upsertAppSetting.run(OPENAI_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
+    stmts.upsertAppSetting.run(OPENAI_MODEL_SETTING_KEY, normalizedModel, nowIso);
+    if (hasBaseUrl) {
+      const normalizedBaseUrl = String(baseUrl || '').trim();
+      if (normalizedBaseUrl && normalizedBaseUrl !== DEFAULT_OPENAI_BASE_URL) {
+        stmts.upsertAppSetting.run(OPENAI_BASE_URL_SETTING_KEY, normalizedBaseUrl, nowIso);
+      } else {
+        stmts.deleteAppSetting.run(OPENAI_BASE_URL_SETTING_KEY);
+      }
+    }
+  }
+  const current = getOpenAIProviderSettings();
+  return {
+    ok: true,
+    configured: current.configured,
+    enabled: current.enabled,
+    model: current.model,
+    baseUrl: current.baseUrl,
+  };
+}
+
 const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conversationSessionMode: 'isolated', localhostOnly: true };
 const DEFAULT_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MODEL = 'gpt-5.4-mini';
+const DEFAULT_OPENAI_MODEL = 'gpt-4o';
+const OPENAI_API_KEY_SETTING_KEY = 'openai_api_key';
+const OPENAI_ENABLED_SETTING_KEY = 'openai_enabled';
+const OPENAI_MODEL_SETTING_KEY = 'openai_model';
+const OPENAI_MODELS_SETTING_KEY = 'openai_models';
+const OPENAI_BASE_URL_SETTING_KEY = 'openai_base_url';
+const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const MODEL_CATALOG_STALE_MS = 2 * 60 * 1000;
 const MODEL_CATALOG_WARNING_MS = 10 * 60 * 1000;
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
@@ -127,8 +289,17 @@ const MAX_RECENT_WORKSPACE_ROOTS = 12;
 const WORKSPACE_RECURSIVE_WATCH_SUPPORTED = process.platform === 'win32' || process.platform === 'darwin';
 const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.md': 'text/markdown; charset=utf-8',
+  '.mdx': 'text/markdown; charset=utf-8',
+  '.markdown': 'text/markdown; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
+  '.rst': 'text/plain; charset=utf-8',
+  '.adoc': 'text/plain; charset=utf-8',
+  '.asciidoc': 'text/plain; charset=utf-8',
+  '.tex': 'text/plain; charset=utf-8',
+  '.bib': 'text/plain; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.jsonl': 'text/plain; charset=utf-8',
+  '.ndjson': 'text/plain; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
   '.cjs': 'text/javascript; charset=utf-8',
@@ -136,17 +307,36 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.tsx': 'text/plain; charset=utf-8',
   '.jsx': 'text/plain; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
+  '.scss': 'text/plain; charset=utf-8',
+  '.sass': 'text/plain; charset=utf-8',
+  '.less': 'text/plain; charset=utf-8',
+  '.vue': 'text/plain; charset=utf-8',
+  '.svelte': 'text/plain; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
   '.xml': 'application/xml; charset=utf-8',
   '.yml': 'text/yaml; charset=utf-8',
   '.yaml': 'text/yaml; charset=utf-8',
   '.toml': 'text/plain; charset=utf-8',
   '.ini': 'text/plain; charset=utf-8',
+  '.conf': 'text/plain; charset=utf-8',
+  '.cfg': 'text/plain; charset=utf-8',
+  '.properties': 'text/plain; charset=utf-8',
   '.csv': 'text/csv; charset=utf-8',
+  '.tsv': 'text/tab-separated-values; charset=utf-8',
   '.sql': 'text/plain; charset=utf-8',
+  '.graphql': 'text/plain; charset=utf-8',
+  '.gql': 'text/plain; charset=utf-8',
+  '.proto': 'text/plain; charset=utf-8',
+  '.thrift': 'text/plain; charset=utf-8',
+  '.sol': 'text/plain; charset=utf-8',
   '.ps1': 'text/plain; charset=utf-8',
+  '.psm1': 'text/plain; charset=utf-8',
   '.sh': 'text/plain; charset=utf-8',
+  '.bash': 'text/plain; charset=utf-8',
+  '.zsh': 'text/plain; charset=utf-8',
+  '.fish': 'text/plain; charset=utf-8',
   '.bat': 'text/plain; charset=utf-8',
+  '.cmd': 'text/plain; charset=utf-8',
   '.go': 'text/plain; charset=utf-8',
   '.py': 'text/plain; charset=utf-8',
   '.java': 'text/plain; charset=utf-8',
@@ -156,6 +346,36 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.h': 'text/plain; charset=utf-8',
   '.cpp': 'text/plain; charset=utf-8',
   '.hpp': 'text/plain; charset=utf-8',
+  '.cc': 'text/plain; charset=utf-8',
+  '.cxx': 'text/plain; charset=utf-8',
+  '.hh': 'text/plain; charset=utf-8',
+  '.hxx': 'text/plain; charset=utf-8',
+  '.cs': 'text/plain; charset=utf-8',
+  '.kt': 'text/plain; charset=utf-8',
+  '.kts': 'text/plain; charset=utf-8',
+  '.swift': 'text/plain; charset=utf-8',
+  '.m': 'text/plain; charset=utf-8',
+  '.mm': 'text/plain; charset=utf-8',
+  '.scala': 'text/plain; charset=utf-8',
+  '.groovy': 'text/plain; charset=utf-8',
+  '.dart': 'text/plain; charset=utf-8',
+  '.zig': 'text/plain; charset=utf-8',
+  '.ex': 'text/plain; charset=utf-8',
+  '.exs': 'text/plain; charset=utf-8',
+  '.erl': 'text/plain; charset=utf-8',
+  '.hrl': 'text/plain; charset=utf-8',
+  '.fs': 'text/plain; charset=utf-8',
+  '.fsx': 'text/plain; charset=utf-8',
+  '.vb': 'text/plain; charset=utf-8',
+  '.pl': 'text/plain; charset=utf-8',
+  '.pm': 'text/plain; charset=utf-8',
+  '.lua': 'text/plain; charset=utf-8',
+  '.r': 'text/plain; charset=utf-8',
+  '.clj': 'text/plain; charset=utf-8',
+  '.cljs': 'text/plain; charset=utf-8',
+  '.hs': 'text/plain; charset=utf-8',
+  '.ml': 'text/plain; charset=utf-8',
+  '.mli': 'text/plain; charset=utf-8',
   '.rs': 'text/plain; charset=utf-8',
   '.lock': 'text/plain; charset=utf-8',
   '.log': 'text/plain; charset=utf-8',
@@ -176,13 +396,36 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.wmv': 'video/x-ms-wmv',
   '.pdf': 'application/pdf',
 });
+const WORKSPACE_CONTENT_TYPES_BY_FILENAME = Object.freeze({
+  '.dockerignore': 'text/plain; charset=utf-8',
+  '.editorconfig': 'text/plain; charset=utf-8',
+  '.env': 'text/plain; charset=utf-8',
+  '.gitignore': 'text/plain; charset=utf-8',
+  '.npmrc': 'text/plain; charset=utf-8',
+  'authors': 'text/plain; charset=utf-8',
+  'changelog': 'text/plain; charset=utf-8',
+  'cmakelists.txt': 'text/plain; charset=utf-8',
+  'containerfile': 'text/plain; charset=utf-8',
+  'dockerfile': 'text/plain; charset=utf-8',
+  'gnumakefile': 'text/plain; charset=utf-8',
+  'license': 'text/plain; charset=utf-8',
+  'makefile': 'text/plain; charset=utf-8',
+  'readme': 'text/plain; charset=utf-8',
+});
 const WORKSPACE_MARKDOWN_EXTENSIONS = new Set(['.md', '.mdx', '.markdown']);
 const WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION = Object.freeze({
   '.md': 'markdown',
   '.mdx': 'markdown',
   '.markdown': 'markdown',
   '.txt': 'plaintext',
+  '.rst': 'plaintext',
+  '.adoc': 'plaintext',
+  '.asciidoc': 'plaintext',
+  '.tex': 'plaintext',
+  '.bib': 'plaintext',
   '.json': 'json',
+  '.jsonl': 'plaintext',
+  '.ndjson': 'plaintext',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -190,17 +433,36 @@ const WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION = Object.freeze({
   '.tsx': 'typescript',
   '.jsx': 'javascript',
   '.css': 'css',
+  '.scss': 'scss',
+  '.sass': 'scss',
+  '.less': 'less',
+  '.vue': 'xml',
+  '.svelte': 'xml',
   '.html': 'xml',
   '.xml': 'xml',
   '.yml': 'yaml',
   '.yaml': 'yaml',
   '.toml': 'toml',
   '.ini': 'ini',
+  '.conf': 'plaintext',
+  '.cfg': 'plaintext',
+  '.properties': 'plaintext',
   '.csv': 'plaintext',
+  '.tsv': 'plaintext',
   '.sql': 'sql',
+  '.graphql': 'graphql',
+  '.gql': 'graphql',
+  '.proto': 'plaintext',
+  '.thrift': 'plaintext',
+  '.sol': 'plaintext',
   '.ps1': 'powershell',
+  '.psm1': 'powershell',
   '.sh': 'bash',
+  '.bash': 'bash',
+  '.zsh': 'bash',
+  '.fish': 'bash',
   '.bat': 'dos',
+  '.cmd': 'dos',
   '.go': 'go',
   '.py': 'python',
   '.java': 'java',
@@ -210,9 +472,55 @@ const WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION = Object.freeze({
   '.h': 'c',
   '.cpp': 'cpp',
   '.hpp': 'cpp',
+  '.cc': 'cpp',
+  '.cxx': 'cpp',
+  '.hh': 'cpp',
+  '.hxx': 'cpp',
+  '.cs': 'csharp',
+  '.kt': 'kotlin',
+  '.kts': 'kotlin',
+  '.swift': 'swift',
+  '.m': 'objectivec',
+  '.mm': 'objectivec',
+  '.scala': 'plaintext',
+  '.groovy': 'plaintext',
+  '.dart': 'plaintext',
+  '.zig': 'plaintext',
+  '.ex': 'plaintext',
+  '.exs': 'plaintext',
+  '.erl': 'plaintext',
+  '.hrl': 'plaintext',
+  '.fs': 'plaintext',
+  '.fsx': 'plaintext',
+  '.vb': 'plaintext',
+  '.pl': 'plaintext',
+  '.pm': 'plaintext',
+  '.lua': 'lua',
+  '.r': 'r',
+  '.clj': 'plaintext',
+  '.cljs': 'plaintext',
+  '.hs': 'plaintext',
+  '.ml': 'plaintext',
+  '.mli': 'plaintext',
   '.rs': 'rust',
   '.lock': 'plaintext',
   '.log': 'plaintext',
+});
+const WORKSPACE_PREVIEW_LANGUAGE_BY_FILENAME = Object.freeze({
+  '.dockerignore': 'plaintext',
+  '.editorconfig': 'ini',
+  '.env': 'plaintext',
+  '.gitignore': 'plaintext',
+  '.npmrc': 'ini',
+  'authors': 'plaintext',
+  'changelog': 'plaintext',
+  'cmakelists.txt': 'plaintext',
+  'containerfile': 'plaintext',
+  'dockerfile': 'plaintext',
+  'gnumakefile': 'plaintext',
+  'license': 'plaintext',
+  'makefile': 'plaintext',
+  'readme': 'plaintext',
 });
 const WORKSPACE_CODE_EXTENSIONS = new Set(Object.keys(WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION)
   .filter((ext) => !WORKSPACE_MARKDOWN_EXTENSIONS.has(ext)));
@@ -796,7 +1104,13 @@ function isReasoningVariantEligibleModel(modelId) {
 function modelProviderForId(modelId) {
   const text = String(modelId || '').trim().toLowerCase();
   if (!text) return 'other';
-  if (text.startsWith('gpt-')) return 'openai';
+  if (
+    text.startsWith('gpt-')
+    || text.startsWith('o1-')
+    || text.startsWith('o3-')
+    || text.startsWith('codex-')
+    || text.startsWith('openai/')
+  ) return 'openai';
   if (text.startsWith('claude-')) return 'anthropic';
   if (text.startsWith('gemini-')) return 'google';
   if (text.startsWith('mai-')) return 'microsoft';
@@ -1615,8 +1929,16 @@ updateModelCatalog({ models: [DEFAULT_MODEL], currentModel: DEFAULT_MODEL, defau
 
 // ─── SQLite Setup ─────────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
+if (process.platform !== 'win32') {
+  fs.chmodSync(DB_PATH, 0o600);
+}
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+if (process.platform !== 'win32') {
+  for (const sqlitePath of [`${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
+    if (fs.existsSync(sqlitePath)) fs.chmodSync(sqlitePath, 0o600);
+  }
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS conversations (
@@ -1626,6 +1948,7 @@ db.exec(`
     sdk_session_id TEXT,
     preferred_relay_mode TEXT,
     preferred_models_by_mode TEXT,
+    preferred_reasoning_by_mode TEXT,
     configured_workspace_root_path TEXT,
     runtime_workspace_root_path TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
@@ -1722,6 +2045,8 @@ db.exec(`
     strategy        TEXT NOT NULL DEFAULT 'isolated',
     runtime_key     TEXT NOT NULL,
     model           TEXT,
+    provider_type   TEXT NOT NULL DEFAULT 'github',
+    provider_model  TEXT,
     status          TEXT NOT NULL DEFAULT 'active',
     created_at      TEXT NOT NULL,
     last_used_at    TEXT NOT NULL,
@@ -2119,6 +2444,7 @@ db.exec(`UPDATE queue SET relay_mode = 'agent' WHERE relay_mode IS NULL OR relay
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_next_attempt ON queue(status, next_attempt_at, timestamp)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_owner_pending ON queue(status, owner_sdk_session_id, next_attempt_at, timestamp)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, parked_transaction_id, parked_target_session_id, parked_at, timestamp)`);
+migrateImageConversationSchema(db);
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
 if (runtimeSessionColumns.length) {
@@ -2134,6 +2460,12 @@ if (runtimeSessionColumns.length) {
   }
   if (!runtimeSessionColumns.includes('model')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN model TEXT`);
+  }
+  if (!runtimeSessionColumns.includes('provider_type')) {
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'github'`);
+  }
+  if (!runtimeSessionColumns.includes('provider_model')) {
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN provider_model TEXT`);
   }
   if (!runtimeSessionColumns.includes('status')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
@@ -2158,6 +2490,9 @@ if (!conversationColumns.includes('preferred_relay_mode')) {
 }
 if (!conversationColumns.includes('preferred_models_by_mode')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN preferred_models_by_mode TEXT`);
+}
+if (!conversationColumns.includes('preferred_reasoning_by_mode')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_reasoning_by_mode TEXT`);
 }
 if (!conversationColumns.includes('configured_workspace_root_path')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN configured_workspace_root_path TEXT`);
@@ -2284,8 +2619,14 @@ const stmts = {
   ...createSessionRepository(db),
   ...createMessageRepository(db),
   ...createQuestionRepository(db),
+  ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+const imageOperationService = createImageOperationService({
+  db,
+  repository: stmts,
+  uuidv4,
+});
 
 modelSelectorSql = {
   listVariants: db.prepare(`
@@ -2436,7 +2777,7 @@ modelSelectorSql = {
   normalizeLegacyVariantIdsTx();
 }
 
-const deleteArchiveService = createDeleteArchiveService(db, null);
+const deleteArchiveService = createDeleteArchiveService(db, null, { resolveSessionStateRoot });
 void deleteArchiveService.retryPendingDeletesOnStartup()
   .then((result) => {
     if (result?.pendingCount > 0) {
@@ -2483,13 +2824,25 @@ function buildSessionWorkerLaunchEnv() {
       const candidate = path.join(versionDir, 'preloads', 'extension_bootstrap.mjs');
       if (fs.existsSync(candidate)) return candidate;
     }
+    const platformName = process.platform === 'linux'
+      ? (process.arch === 'x64' ? 'linux-x64' : `linux-${process.arch}`)
+      : `${process.platform}-${process.arch}`;
+    const cacheRoot = path.join(os.homedir(), '.cache', 'copilot', 'pkg', platformName);
+    try {
+      const versions = fs.readdirSync(cacheRoot)
+        .filter((entry) => fs.existsSync(path.join(cacheRoot, entry, 'preloads', 'extension_bootstrap.mjs')))
+        .sort()
+        .reverse();
+      if (versions.length) {
+        return path.join(cacheRoot, versions[0], 'preloads', 'extension_bootstrap.mjs');
+      }
+    } catch {
+      // The CLI cache is optional; retain the normal fallback when unavailable.
+    }
     return null;
   };
 
   const next = { ...process.env };
-  if (!String(next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || '').trim()) {
-    next.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS = 'true';
-  }
   if (!String(next.COPILOT_WEB_RELAY_ROOT || '').trim()) {
     next.COPILOT_WEB_RELAY_ROOT = REPO_ROOT;
   }
@@ -2505,17 +2858,63 @@ function buildSessionWorkerLaunchEnv() {
   if (!String(next.COPILOT_WEB_RELAY_LOG_DIR || '').trim()) {
     next.COPILOT_WEB_RELAY_LOG_DIR = path.join(__dirname, 'logs');
   }
+  if (!String(next.EXTENSION_PATH || '').trim()) {
+    const projectExtensionPath = path.join(REPO_ROOT, '.github', 'extensions', 'web-relay', 'extension.mjs');
+    if (fs.existsSync(projectExtensionPath)) {
+      next.EXTENSION_PATH = projectExtensionPath;
+    }
+  }
   const cliExecutable = normalizePathValue(config.cliPath);
   if (cliExecutable && !String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
     next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = cliExecutable;
+  }
+  if (!String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
+    try {
+      const loaderPath = fs.realpathSync('/usr/bin/copilot');
+      const packageRoot = path.dirname(loaderPath);
+      const nativePath = path.join(
+        packageRoot,
+        'node_modules',
+        `@github/copilot-${process.platform}-${process.arch}`,
+        'copilot',
+      );
+      if (fs.existsSync(nativePath)) {
+        next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = nativePath;
+      }
+    } catch {
+      // Fall back to the copilot executable resolved by PATH.
+    }
   }
   const bootstrapPath = resolveBootstrapPath();
   if (bootstrapPath && !String(next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH || '').trim()) {
     next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH = bootstrapPath;
   }
+  if (bootstrapPath && !String(next.COPILOT_SDK_PATH || '').trim()) {
+    const bundledSdkPath = path.join(path.dirname(path.dirname(bootstrapPath)), 'copilot-sdk');
+    if (fs.existsSync(path.join(bundledSdkPath, 'extension.js'))) {
+      next.COPILOT_SDK_PATH = bundledSdkPath;
+    }
+  }
   return next;
 }
 const sessionWorkerLaunchEnv = buildSessionWorkerLaunchEnv();
+function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
+  const normalizedTargetSessionId = String(targetSessionId || '').trim();
+  const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(normalizedTargetSessionId)
+    || stmts.getRuntimeSessionByConversation.get(normalizedTargetSessionId)
+    || null;
+  if (String(runtimeSession?.provider_type || 'github').trim().toLowerCase() !== 'openai') {
+    return applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv);
+  }
+  const settings = getOpenAIProviderSettings();
+  const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
+  return applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv, {
+    enabled: true,
+    apiKey: settings.apiKey,
+    model,
+    baseUrl: settings.baseUrl,
+  });
+}
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
   env: sessionWorkerLaunchEnv,
@@ -2535,10 +2934,11 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
     }
   }
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
+  const workerLaunchEnv = buildSessionWorkerLaunchEnvForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
     targetSessionId: normalizedTargetSessionId,
     cwd: resolvedWorkspaceRoot,
-    env: sessionWorkerLaunchEnv,
+    env: workerLaunchEnv,
     platform: process.platform,
     spawnImpl: spawn,
     execFileSyncImpl: execFileSync,
@@ -2559,6 +2959,218 @@ const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
 });
 const featureFlags = normalizeFeatureFlags(FEATURES);
+
+async function stopSessionWorkerForProviderRebind(sdkSessionId) {
+  const sessionId = String(sdkSessionId || '').trim();
+  if (!sessionId) return false;
+  const currentWorker = sessionWorkerRegistry?.getWorker?.(sessionId) || null;
+  sessionWorkerSupervisor?.markKilled?.(sessionId);
+  const cancelledStart = await sessionWorkerSupervisor?.cancelPendingStart?.(sessionId, { wait: true });
+  const discoveredProcesses = process.platform === 'win32'
+    ? (
+        sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sessionId)
+        || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sessionId)
+        || sessionWorkerProcessInspector?.findProcessesForSession?.(sessionId)
+        || []
+      )
+    : (sessionWorkerProcessInspector?.findProcessesForSession?.(sessionId) || []);
+  const currentWorkerPid = Number(currentWorker?.pid);
+  const hadActiveWorker = discoveredProcesses.some((entry) => isProcessAlive(Number(entry?.processId)))
+    || (Number.isInteger(currentWorkerPid) && currentWorkerPid > 0 && isProcessAlive(currentWorkerPid))
+    || cancelledStart?.hadPending === true;
+  if (!hadActiveWorker) {
+    sessionWorkerRegistry?.removeWorker?.(sessionId);
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sessionId, { resetKilledMarker: true });
+    sessionWorkerSupervisor?.resetHealth?.(sessionId, { clearFailureCount: false });
+    return false;
+  }
+
+  const pids = [...new Set([
+    ...discoveredProcesses.map((entry) => Number(entry?.processId)).filter((pid) => Number.isInteger(pid) && pid > 0),
+    currentWorkerPid,
+  ].filter((pid) => Number.isInteger(pid) && pid > 0))];
+
+  if (process.platform === 'win32') {
+    if (pids.length) sessionWorkerProcessInspector.stopWindowsPids(pids);
+  } else {
+    killTmuxSession(sessionId);
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch (error) {
+        if (String(error?.code || '') !== 'ESRCH') throw error;
+      }
+    }
+  }
+  const stopDeadline = Date.now() + 3_000;
+  while (pids.some((pid) => isProcessAlive(pid)) && Date.now() < stopDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const remainingPids = pids.filter((pid) => isProcessAlive(pid));
+  if (remainingPids.length) {
+    throw new Error(`worker-stop-timeout:${remainingPids.join(',')}`);
+  }
+
+  sessionWorkerRegistry?.removeWorker?.(sessionId);
+  sessionWorkerSupervisor?.clearRestartSchedule?.(sessionId);
+  sessionWorkerSupervisor?.resetHealth?.(sessionId, { clearFailureCount: false });
+  return true;
+}
+
+async function reconcileUnstartedConversationProviders({ enabled, model } = {}) {
+  const providerType = enabled === true ? 'openai' : 'github';
+  const providerModel = enabled === true
+    ? (String(model || '').trim() || DEFAULT_OPENAI_MODEL)
+    : null;
+  const runtimeModel = providerModel || DEFAULT_MODEL;
+  const candidates = stmts.listRuntimeSessionProviderCandidates.all();
+  const result = {
+    updatedUnstartedConversations: 0,
+    skippedStartedConversations: 0,
+    skippedActiveQueueConversations: 0,
+    failedConversations: [],
+  };
+  if (!stmts.runtimeSessionsSupportProviders || !stmts.updateRuntimeSessionProvider) {
+    return result;
+  }
+
+  for (const row of candidates) {
+    const currentProvider = String(row?.provider_type || 'github').trim().toLowerCase() || 'github';
+    const currentProviderModel = String(row?.provider_model || '').trim();
+    if (currentProvider === providerType && (providerType !== 'openai' || currentProviderModel === providerModel)) {
+      continue;
+    }
+    if (Number(row?.message_count || 0) > 0) {
+      result.skippedStartedConversations += 1;
+      continue;
+    }
+    if (Number(row?.active_queue_count || 0) > 0) {
+      result.skippedActiveQueueConversations += 1;
+      continue;
+    }
+
+    const conversationId = String(row?.conversation_id || '').trim();
+    const ownerSessionId = String(
+      row?.sdk_session_id
+      || row?.conversation_sdk_session_id
+      || conversationId,
+    ).trim();
+    let workerWasStopped = false;
+    let providerWasUpdated = false;
+    try {
+      if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+        workerWasStopped = await stopSessionWorkerForProviderRebind(ownerSessionId);
+      }
+      stmts.updateRuntimeSessionProvider.run(
+        providerType,
+        providerModel,
+        runtimeModel,
+        new Date().toISOString(),
+        row.id,
+      );
+      providerWasUpdated = true;
+      if (workerWasStopped && ownerSessionId) {
+        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+        const ensured = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+          allowProcessReuse: false,
+        });
+        if (!ensured?.ok) throw new Error(ensured?.error || 'worker-relaunch-failed');
+      }
+      result.updatedUnstartedConversations += 1;
+    } catch (error) {
+      let rollbackError = null;
+      const canRestorePreviousProvider = currentProvider !== 'openai'
+        || getOpenAIProviderSettings().configured === true;
+      if (providerWasUpdated && canRestorePreviousProvider) {
+        stmts.updateRuntimeSessionProvider.run(
+          currentProvider,
+          currentProviderModel || null,
+          String(row?.model || '').trim() || DEFAULT_MODEL,
+          new Date().toISOString(),
+          row.id,
+        );
+      }
+      if (workerWasStopped && ownerSessionId) {
+        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+        const restored = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+          allowProcessReuse: false,
+        });
+        if (!restored?.ok) rollbackError = String(restored?.error || 'worker-rollback-relaunch-failed');
+      }
+      result.failedConversations.push({
+        conversationId,
+        error: [
+          String(error?.message || error || 'provider-rebind-failed'),
+          rollbackError ? `rollback: ${rollbackError}` : '',
+        ].filter(Boolean).join('; '),
+      });
+    }
+  }
+  return result;
+}
+
+async function rebindUnstartedOpenAIConversationModel({ conversationId, model } = {}) {
+  const normalizedConversationId = String(conversationId || '').trim();
+  const nextModel = String(model || '').trim();
+  const runtimeSession = normalizedConversationId
+    ? stmts.getRuntimeSessionByConversation.get(normalizedConversationId)
+    : null;
+  if (!runtimeSession || String(runtimeSession.provider_type || '').trim().toLowerCase() !== 'openai') {
+    throw new Error('openai-runtime-session-not-found');
+  }
+  const previousModel = String(runtimeSession.provider_model || runtimeSession.model || '').trim();
+  if (!nextModel || nextModel === previousModel) return runtimeSession;
+  const messageCount = Number(stmts.getConversationMessageCount.get(normalizedConversationId)?.count || 0);
+  const activeQueueCount = Number(stmts.getConversationActiveQueueCount.get(normalizedConversationId)?.count || 0);
+  if (messageCount > 0 || activeQueueCount > 0) {
+    throw new Error('openai-session-model-locked');
+  }
+  const ownerSessionId = String(
+    runtimeSession.sdk_session_id
+    || stmts.getConv.get(normalizedConversationId)?.sdk_session_id
+    || normalizedConversationId,
+  ).trim();
+  let workerWasStopped = false;
+  let providerWasUpdated = false;
+  try {
+    if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+      workerWasStopped = await stopSessionWorkerForProviderRebind(ownerSessionId);
+    }
+    stmts.updateRuntimeSessionProvider.run(
+      'openai',
+      nextModel,
+      nextModel,
+      new Date().toISOString(),
+      runtimeSession.id,
+    );
+    providerWasUpdated = true;
+    if (workerWasStopped && ownerSessionId) {
+      sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+      const ensured = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+        allowProcessReuse: false,
+      });
+      if (!ensured?.ok) throw new Error(ensured?.error || 'worker-relaunch-failed');
+    }
+    return stmts.getRuntimeSessionByConversation.get(normalizedConversationId);
+  } catch (error) {
+    if (providerWasUpdated) {
+      stmts.updateRuntimeSessionProvider.run(
+        'openai',
+        previousModel,
+        previousModel,
+        new Date().toISOString(),
+        runtimeSession.id,
+      );
+    }
+    if (workerWasStopped && ownerSessionId) {
+      sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+      await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
+        allowProcessReuse: false,
+      });
+    }
+    throw error;
+  }
+}
 
 function queueCounts() {
   const rows = stmts.countStatus.all();
@@ -3387,7 +3999,10 @@ function uploadContentUrlForSha(sha256) {
 
 function workspaceContentType(filePath) {
   const ext = path.extname(String(filePath || '')).toLowerCase();
-  return WORKSPACE_CONTENT_TYPES[ext] || 'application/octet-stream';
+  const filename = path.basename(String(filePath || '')).toLowerCase();
+  return WORKSPACE_CONTENT_TYPES[ext]
+    || WORKSPACE_CONTENT_TYPES_BY_FILENAME[filename]
+    || 'application/octet-stream';
 }
 
 function normalizeWorkspaceRelativePath(rawPath) {
@@ -3457,7 +4072,10 @@ function readWorkspaceFileMeta(filePath) {
 
 function previewLanguageForWorkspaceFile(filePath) {
   const ext = path.extname(String(filePath || '')).toLowerCase();
-  return WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION[ext] || null;
+  const filename = path.basename(String(filePath || '')).toLowerCase();
+  return WORKSPACE_PREVIEW_LANGUAGE_BY_EXTENSION[ext]
+    || WORKSPACE_PREVIEW_LANGUAGE_BY_FILENAME[filename]
+    || null;
 }
 
 function readWorkspaceFilePreviewBuffer(filePath, size) {
@@ -3506,13 +4124,15 @@ function parseBooleanQueryFlag(value, fallback = false) {
   return fallback;
 }
 
-function workspacePreviewKindForMeta(ext, contentType) {
-  const normalizedExt = String(ext || '').toLowerCase();
+function workspacePreviewKindForMeta(filePath, contentType) {
+  const normalizedPath = String(filePath || '');
+  const normalizedExt = path.extname(normalizedPath).toLowerCase();
+  const filename = path.basename(normalizedPath).toLowerCase();
   const normalizedType = String(contentType || '').toLowerCase();
   if (WORKSPACE_MARKDOWN_EXTENSIONS.has(normalizedExt)) return 'markdown';
   if (WORKSPACE_IMAGE_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('image/')) return 'image';
   if (WORKSPACE_VIDEO_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('video/')) return 'video';
-  if (WORKSPACE_CODE_EXTENSIONS.has(normalizedExt)) return 'code';
+  if (WORKSPACE_CODE_EXTENSIONS.has(normalizedExt) || WORKSPACE_PREVIEW_LANGUAGE_BY_FILENAME[filename]) return 'code';
   if (isLikelyTextContentType(normalizedType)) return 'text';
   return 'binary';
 }
@@ -3572,7 +4192,7 @@ function mapDriveDirectoryEntry(entry) {
   node.ext = ext || null;
   node.size = Number(entry.size || 0);
   node.contentType = contentType;
-  node.previewKind = workspacePreviewKindForMeta(ext, contentType);
+  node.previewKind = workspacePreviewKindForMeta(absolutePath, contentType);
   return node;
 }
 
@@ -3713,7 +4333,7 @@ function mapLinuxDirectoryEntry(entry) {
   node.ext = ext || null;
   node.size = Number(entry.size || 0);
   node.contentType = contentType;
-  node.previewKind = workspacePreviewKindForMeta(ext, contentType);
+  node.previewKind = workspacePreviewKindForMeta(absolutePath, contentType);
   return node;
 }
 
@@ -3826,7 +4446,7 @@ function fetchWorkspaceDirectoryEntries(requestedPath, {
     childNode.ext = ext || null;
     childNode.size = Number(childStat.size || 0);
     childNode.contentType = contentType;
-    childNode.previewKind = workspacePreviewKindForMeta(ext, contentType);
+    childNode.previewKind = workspacePreviewKindForMeta(childAbsolutePath, contentType);
     children.push(childNode);
   }
 
@@ -3895,7 +4515,7 @@ function buildRepositoryTreeSnapshot({
       node.ext = ext || null;
       node.size = Number(stat.size || 0);
       node.contentType = contentType;
-      node.previewKind = workspacePreviewKindForMeta(ext, contentType);
+      node.previewKind = workspacePreviewKindForMeta(absolutePath, contentType);
       return node;
     }
 
@@ -4002,6 +4622,40 @@ function hydrateAttachment(raw) {
     att.path = uploadPathForSha(sha256);
     att.reference = `@${att.path}`;
     att.contentUrl = uploadContentUrlForSha(sha256);
+  }
+  if (featureFlags.IMAGE_CONVERSATION_CONTINUITY_ENABLED === true && att.generatedImage) {
+    const messageId = String(att.generatedImage.messageId || '').trim();
+    const imageId = String(att.generatedImage.imageId || '').trim();
+    const node = messageId && imageId ? stmts.getNodeByAttachment?.get(messageId, imageId) : null;
+    if (node) {
+      const parentEdge = stmts.getParentEdge?.get(node.id) || null;
+      const parentNode = parentEdge ? stmts.getNode?.get(parentEdge.parent_node_id) : null;
+      att.generatedImage = {
+        ...att.generatedImage,
+        continuity: {
+          nodeId: node.id,
+          imageSessionId: node.image_session_id,
+          operationId: node.operation_id,
+          parentNodeId: parentNode?.id || null,
+          parentMessageId: parentNode?.assistant_message_id || null,
+          parentImageId: parentNode?.attachment_image_id || null,
+          canEdit: true,
+        },
+      };
+    } else {
+      att.generatedImage = {
+        ...att.generatedImage,
+        continuity: {
+          nodeId: null,
+          imageSessionId: null,
+          operationId: null,
+          parentNodeId: null,
+          parentMessageId: null,
+          parentImageId: null,
+          canEdit: true,
+        },
+      };
+    }
   }
   return att;
 }
@@ -4991,6 +5645,10 @@ const runtimeState = {
   get featureFlags() { return featureFlags; },
   get sessionWorkerSupervisor() { return sessionWorkerSupervisor; },
 };
+const windowsAutostartService = createWindowsAutostartService({
+  packageRoot: REPO_ROOT,
+  configPath: CONFIG_PATH,
+});
 
 const sharedRouteDeps = {
   auth,
@@ -5041,6 +5699,11 @@ const sharedRouteDeps = {
   updateConversationConfiguredWorkspaceRoot,
   setWorkspaceRoot: applyWorkspaceRoot,
   setDefaultSessionWorkspaceRootPath,
+  getOpenAIProviderSettings,
+  setOpenAIProviderSettings,
+  refreshOpenAIProviderModels,
+  reconcileUnstartedConversationProviders,
+  rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,
   ensureRuntimeSessionBinding,
   linkUploadReferences,
@@ -5126,6 +5789,8 @@ const sharedRouteDeps = {
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
+  imageOperationService,
+  windowsAutostartService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
@@ -5237,7 +5902,13 @@ function getOrCreateConversation(id, firstLine) {
   return stmts.getConv.get(id);
 }
 
-function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().toISOString(), sdkSessionId = null) {
+function ensureRuntimeSessionBinding(
+  conversationId,
+  model,
+  nowIso = new Date().toISOString(),
+  sdkSessionId = null,
+  { assignConfiguredProvider = false, providerType = '', providerModel = null } = {},
+) {
   const normalizedConversationId = String(conversationId || '').trim();
   if (!normalizedConversationId) return null;
   const normalizedModel = String(model || '').trim() || null;
@@ -5265,8 +5936,18 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
   const runtimeSessionId = uuidv4();
   const strategy = configuredConversationSessionMode;
   const runtimeKey = runtimeSessionId;
+  const openAISettings = assignConfiguredProvider ? getOpenAIProviderSettings() : null;
+  const normalizedRequestedProviderType = String(providerType || '').trim().toLowerCase();
+  const resolvedProviderType = normalizedRequestedProviderType === 'openai'
+    ? 'openai'
+    : (normalizedRequestedProviderType === 'github'
+      ? 'github'
+      : (openAISettings?.enabled ? 'openai' : 'github'));
+  const resolvedProviderModel = resolvedProviderType === 'openai'
+    ? (String(providerModel || normalizedModel || '').trim() || null)
+    : null;
   try {
-    stmts.insertRuntimeSession.run(
+    const insertArgs = [
       runtimeSessionId,
       normalizedConversationId,
       strategy,
@@ -5275,7 +5956,9 @@ function ensureRuntimeSessionBinding(conversationId, model, nowIso = new Date().
       nowIso,
       nowIso,
       normalizedSdkSessionId,
-    );
+    ];
+    if (stmts.runtimeSessionsSupportProviders) insertArgs.push(resolvedProviderType, resolvedProviderModel);
+    stmts.insertRuntimeSession.run(...insertArgs);
   } catch (error) {
     if (String(error?.code || '') !== 'SQLITE_CONSTRAINT_UNIQUE') throw error;
     const byConversation = stmts.getRuntimeSessionByConversation.get(normalizedConversationId);

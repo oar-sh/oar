@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 function collectTextCandidates(value, out) {
   if (!value) return;
   if (typeof value === "string") {
@@ -101,6 +103,126 @@ function extractFinalText(finalEvent, _dbg) {
   return candidates.find((value) => typeof value === "string" && value.trim()) || "";
 }
 
+function parseGeneratedImageDataUrl(value) {
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
+  if (!raw.startsWith("data:")) return null;
+  const match = raw.match(/^data:([^;,]+);base64,(.+)$/i);
+  if (!match) return null;
+  const mimeType = String(match[1] || "").trim().toLowerCase();
+  const data = String(match[2] || "").trim();
+  if (!mimeType.startsWith("image/") || !data) return null;
+  return { mimeType, data };
+}
+
+function readGeneratedImageStringField(value, keys = []) {
+  if (!value || typeof value !== "object") return "";
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+function normalizeGeneratedImageCandidate(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  const type = String(value.type || value.output_type || value.kind || value.event || "").trim().toLowerCase();
+  const mimeType = String(
+    value.mime_type
+    || value.mimeType
+    || value.content_type
+    || value.contentType
+    || "",
+  ).trim().toLowerCase();
+
+  const dataUrlCandidate = parseGeneratedImageDataUrl(
+    readGeneratedImageStringField(value, [
+      "data_url",
+      "dataUrl",
+      "image_data_url",
+      "imageDataUrl",
+    ]),
+  );
+  const base64Data = readGeneratedImageStringField(value, [
+    "b64_json",
+    "b64Json",
+    "image_base64",
+    "imageBase64",
+    "base64",
+    "data",
+  ]);
+
+  const hasKnownType = type.includes("image_generation")
+    || type.includes("generated_image")
+    || type === "output_image"
+    || type === "image";
+  const fromDataUrl = dataUrlCandidate && dataUrlCandidate.data
+    ? {
+      data: dataUrlCandidate.data,
+      mimeType: dataUrlCandidate.mimeType,
+    }
+    : null;
+  const fromBase64 = base64Data && (hasKnownType || !!mimeType || "b64_json" in value || "image_base64" in value || "imageBase64" in value)
+    ? {
+      data: base64Data,
+      mimeType: mimeType.startsWith("image/") ? mimeType : "image/png",
+    }
+    : null;
+  const resolved = fromDataUrl || fromBase64;
+  if (!resolved?.data) return null;
+  return {
+    data: resolved.data,
+    mimeType: resolved.mimeType,
+    name: String(value.name || value.filename || value.fileName || "generated-image").trim() || "generated-image",
+  };
+}
+
+function collectGeneratedImageCandidates(value, out, depth = 0) {
+  if (depth > 12 || value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectGeneratedImageCandidates(item, out, depth + 1);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const direct = normalizeGeneratedImageCandidate(value);
+  if (direct) out.push(direct);
+
+  const CONTAINER_KEYS = [
+    "data",
+    "output",
+    "outputs",
+    "items",
+    "images",
+    "content",
+    "response",
+    "result",
+    "results",
+    "event",
+    "events",
+  ];
+  for (const key of CONTAINER_KEYS) {
+    if (!(key in value)) continue;
+    collectGeneratedImageCandidates(value[key], out, depth + 1);
+  }
+}
+
+function extractGeneratedImages(finalEvent) {
+  const candidates = [];
+  collectGeneratedImageCandidates(finalEvent, candidates);
+  const deduped = [];
+  const seen = new Set();
+  for (const item of candidates) {
+    const fingerprint = createHash("sha256").update(item.data).digest("hex");
+    const key = `${item.mimeType}:${fingerprint}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  return deduped.slice(0, 8);
+}
+
 export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
   const STREAM_WAIT_POLL_MS = 5_000;
   const WAIT_TICK = Symbol("relay-stream-wait-tick");
@@ -194,8 +316,22 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
     return result;
   }
 
+  function extractGeneratedImagesWithLogging(finalEvent) {
+    const images = extractGeneratedImages(finalEvent);
+    if (images.length) {
+      dbg(
+        "extractGeneratedImages: count=",
+        images.length,
+        "| mime=",
+        images.map((entry) => entry.mimeType).join(","),
+      );
+    }
+    return images;
+  }
+
   return {
     extractFinalText: extractFinalTextWithLogging,
+    extractGeneratedImages: extractGeneratedImagesWithLogging,
     sendAndWaitWithHardTimeout,
     sendWithBestEffortStreaming,
   };

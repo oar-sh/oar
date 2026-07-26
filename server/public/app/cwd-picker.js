@@ -11,7 +11,7 @@ import {
   setSummaryModalLoading,
   showTransientRelayNotice,
 } from './store.js';
-import { updateWorkspaceRoot, launchSessionWorker } from './api-client.js';
+import { updateWorkspaceRoot, relaunchSessionWorkerWithWorkspaceRoot } from './api-client.js';
 import { getRepoBrowserLaunchCwdPath } from './attachments-view.js';
 
 const LEGACY_KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
@@ -85,7 +85,7 @@ function renderKnownCwdMenuItems(options, selectedPath) {
     const optionPath = normalizeKnownCwdPath(option.path);
     const selected = optionPath.toLowerCase() === selectedKey;
     return `
-      <button class="change-cwd-menu-item${selected ? ' selected' : ''}" type="button" role="menuitemradio" aria-checked="${selected ? 'true' : 'false'}" data-path="${escHtml(optionPath)}" data-label="${escHtml(option.label || '')}" data-note="${escHtml(option.note || '')}" title="${escHtml(optionPath)}">
+      <button class="change-cwd-menu-item${selected ? ' selected' : ''}" type="button" role="menuitemradio" aria-checked="${selected ? 'true' : 'false'}" tabindex="-1" data-path="${escHtml(optionPath)}" data-label="${escHtml(option.label || '')}" data-note="${escHtml(option.note || '')}" title="${escHtml(optionPath)}">
         <span class="change-cwd-menu-item-primary">${escHtml(option.label || 'Known CWD')}</span>
         <span class="change-cwd-menu-item-secondary">${escHtml(optionPath)}</span>
       </button>
@@ -185,6 +185,28 @@ function bindChangeCwdPicker() {
     menu.hidden = !willOpen;
     trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
   });
+  trigger.addEventListener('keydown', (event) => {
+    if (!['Enter', ' ', 'Escape'].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === 'Escape') {
+      closeChangeCwdMenu();
+      return;
+    }
+    const willOpen = !!menu.hidden;
+    menu.hidden = !willOpen;
+    trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  });
+  menu.addEventListener('keydown', (event) => {
+    // This is a touch-first picker: keep virtual/mobile keyboard events from
+    // activating a menu item behind the browser's native focus handling.
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === 'Escape') {
+      closeChangeCwdMenu();
+      trigger.focus();
+    }
+  });
   for (const item of menu.querySelectorAll('.change-cwd-menu-item[data-path]')) {
     bindMenuAction(item, (event) => {
       event.preventDefault();
@@ -249,14 +271,14 @@ export function openChangeCwdModal() {
   const launchableSessionId = getCurrentLaunchableSessionId();
   const launchDisabledReason = !launchableSessionId
     ? 'Open a conversation with a bound session before launching.'
-    : (isSelectedSessionRunning() ? 'Selected CLI is already running.' : '');
+    : (isSelectedSessionRunning() ? 'Ready sessions will restart in the selected CWD. Active turns must finish first.' : '');
   openSummaryModal({
     title: 'Change CWD',
     subtitle: 'Select a known launch directory',
     kind: 'change-cwd',
     bodyHtml: `
       <p style="margin-bottom:10px;color:var(--muted);line-height:1.45">
-        Pick the selected session's persisted next-launch directory. Running CLIs keep their current CWD until the next launch.
+        Pick the selected session's launch directory. An idle CLI restarts in the selected CWD; active turns must finish first.
       </p>
       <div style="display:grid;gap:4px;margin-bottom:10px;font-size:0.78rem;color:var(--muted)">
         <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
@@ -270,14 +292,14 @@ export function openChangeCwdModal() {
         <span>Known CWDs</span>
         <input id="change-cwd-selected-path" type="hidden" value="${escHtml(defaultPath)}">
         <button id="change-cwd-menu-trigger" class="change-cwd-menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="change-cwd-menu">Select a known CWD</button>
-        <div id="change-cwd-menu" class="change-cwd-menu-panel" role="menu" hidden>
+        <div id="change-cwd-menu" class="change-cwd-menu-panel" role="menu" tabindex="-1" hidden>
           ${menuItemsHtml}
         </div>
       </label>
       <div id="change-cwd-details" style="margin-top:10px;font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
       <div class="summary-modal-actions" id="change-cwd-actions">
         <button class="summary-btn" type="button" onclick="confirmChangeCwd()">🗂️ Save next-launch CWD</button>
-        <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled'} title="${escHtml(launchDisabledReason || 'Set the CWD and launch the current session worker')}">🚀 Set new CWD and launch</button>
+        <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled'} title="${escHtml(launchDisabledReason || 'Set the CWD and (re)launch the current session worker')}">🚀 Set new CWD and (re)launch</button>
         <button class="summary-close" type="button" onclick="closeSummaryModal()">Cancel</button>
       </div>
     `,
@@ -314,14 +336,12 @@ async function submitChangeCwd(launchAfterChange = false) {
     alert('Open a conversation with a bound session before launching.');
     return;
   }
-  if (launchAfterChange && isSelectedSessionRunning()) {
-    alert('Selected CLI is already running.');
-    return;
-  }
   changeCwdInFlight = true;
   setSummaryModalLoading(true);
   try {
-    const result = await updateWorkspaceRoot(targetPath, currentConvId);
+    const result = launchAfterChange
+      ? await relaunchSessionWorkerWithWorkspaceRoot(currentConvId, targetPath)
+      : await updateWorkspaceRoot(targetPath, currentConvId);
     if (!result) {
       alert('Failed to update the launch CWD');
       return;
@@ -332,13 +352,8 @@ async function submitChangeCwd(launchAfterChange = false) {
     });
     const updatedPath = result.configuredWorkspaceRootPath || result.currentWorkspaceRootPath || result.workspaceRootPath || targetPath;
     if (launchAfterChange) {
-      const launchResult = await launchSessionWorker(launchableSessionId);
-      if (!launchResult) {
-        alert('Launch CWD updated, but the CLI launch request failed.');
-        return;
-      }
       closeSummaryModal();
-      showTransientRelayNotice(`Next launch CWD saved as ${updatedPath} and CLI launch requested.`);
+      showTransientRelayNotice(`CWD set to ${updatedPath} and CLI (re)launch requested.`);
       await deps.refreshSessionWorkerStatus().catch(() => {});
       return;
     }

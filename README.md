@@ -57,6 +57,7 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Per-message **mode** picker: `plan`, `ask`, `agent`, `autopilot`
 - Per-message **model** picker (live model discovery + fallback catalog)
 - Streaming tool/activity updates while a turn runs
+- Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
 - Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
 - Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
 - Conversation history stored in local SQLite
@@ -153,6 +154,8 @@ Do not run tests that spawn Copilot CLI clients unless the user explicitly permi
 In extension-managed mode, the worker WebSocket begins after the CLI session becomes active (typically after the first prompt), with HTTP dequeue kept only as fallback when the socket is unavailable.
 The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
 When the CLI extension connects, it also prints the relay info window (local/network/remote/auth URLs) directly in the Copilot CLI client.
+
+On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry. It opens a visible terminal at sign-in and runs the installed `node server\server.js` path. This starts only the web relay server; a Copilot CLI session using the extension must attach separately before queued turns can be processed. Turning the setting off removes the copilot-remote Startup entry.
 
 Respawner scripts (`start:server:respawn`*) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
 Do not use them for manual restarts; use `POST /api/relay/shutdown` instead.

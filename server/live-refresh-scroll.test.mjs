@@ -20,6 +20,6 @@ test('live refresh passes the captured bottom state through hydration', () => {
 test('in-flight hydration only follows activity when explicitly requested', () => {
   assert.match(conversationViewSource, /export function restoreInFlightThinking\(inFlight, autoScroll = true\)/);
   assert.match(conversationViewSource, /showThinking\(messageId, autoScroll\)/);
-  assert.match(conversationViewSource, /updateThinkingText\(streamState\.text, messageId, streamState\.done \|\| !!inFlight\?\.streamDone, autoScroll\)/);
+  assert.match(conversationViewSource, /updateThinkingStreamStatus\(messageId, streamState\.done \|\| !!inFlight\?\.streamDone, autoScroll\)/);
   assert.doesNotMatch(conversationViewSource, /restoreInFlightThinking[\s\S]*showThinking\(messageId\);/);
 });

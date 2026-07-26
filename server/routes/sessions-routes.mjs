@@ -1,4 +1,5 @@
 'use strict';
+import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 
 import fs from 'fs';
 import path from 'path';
@@ -9,6 +10,9 @@ import { createSdkSessionSyncService } from '../services/sdk-session-sync-servic
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
+import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
+import { isSafeProviderModelId } from '../../shared/model-id.mjs';
+import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -144,6 +148,123 @@ export function parseDefaultSessionWorkspaceRootUpdateRequest(body = {}) {
   };
 }
 
+export function parseOpenAISettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const remove = payload.remove === true;
+  const hasModel = Object.prototype.hasOwnProperty.call(payload, 'model');
+  const model = hasModel ? (String(payload.model || '').trim() || 'gpt-4o') : undefined;
+  const apiKey = String(payload.apiKey || '').trim();
+  const hasEnabled = typeof payload.enabled === 'boolean';
+  const hasBaseUrl = Object.prototype.hasOwnProperty.call(payload, 'baseUrl');
+  const baseUrl = hasBaseUrl ? String(payload.baseUrl || '').trim() : undefined;
+  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasBaseUrl) {
+    return { ok: false, error: 'No OpenAI settings update provided' };
+  }
+  if (hasModel && !isSafeProviderModelId(model)) {
+    return { ok: false, error: 'Invalid OpenAI model ID' };
+  }
+  if (remove) {
+    return {
+      ok: true,
+      remove: true,
+      apiKey: '',
+      ...(hasModel ? { model } : {}),
+      enabled: false,
+    };
+  }
+  return {
+    ok: true,
+    remove: false,
+    apiKey,
+    ...(hasModel ? { model } : {}),
+    ...(hasBaseUrl ? { baseUrl } : {}),
+    enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
+  };
+}
+
+export function buildModelCatalogWithOpenAIProvider(modelState = {}, openAISettings = {}) {
+  const configured = openAISettings?.enabled === true;
+  const model = String(openAISettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const baseModels = new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+  const openAIModels = Array.isArray(openAISettings?.models)
+    ? openAISettings.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const models = Array.from(new Set([model, ...openAIModels, ...(Array.isArray(modelState?.models) ? modelState.models : [])]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const openAIReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  for (const openAIModel of [model, ...openAIModels]) {
+    const providersKey = String(openAIModel || '').trim();
+    const lowerKey = providersKey.toLowerCase();
+    const reasoningKey = openAIModel.toLowerCase();
+    openAIReasoningByModel[reasoningKey] = openAIReasoningEffortsForModel(openAIModel);
+    if (!Array.isArray(reasoningByModel[reasoningKey]) || reasoningByModel[reasoningKey].length === 0) {
+      reasoningByModel[reasoningKey] = ['none'];
+    }
+    const existingProviders = Array.isArray(providersByModel[providersKey])
+      ? providersByModel[providersKey]
+      : (Array.isArray(providersByModel[lowerKey])
+          ? providersByModel[lowerKey]
+          : (modelMetadataByModel[providersKey]?.provider ? [modelMetadataByModel[providersKey].provider] : []));
+    providersByModel[providersKey] = Array.from(new Set([
+      ...existingProviders,
+      ...(baseModels.has(lowerKey) ? ['github-copilot'] : []),
+      'openai-byok',
+    ]));
+    modelMetadataByModel[providersKey] = {
+      ...(modelMetadataByModel[providersKey] || {}),
+      provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'openai-byok'),
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      github: { ...(modelState?.reasoningByModel || {}) },
+      openai: openAIReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
+function normalizeRequestedProviderType(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
+  if (normalized === 'github' || normalized === 'github-copilot') return 'github';
+  return '';
+}
+
+function isOpenAIImageModelId(model = '') {
+  const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
+  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
+}
+
+export function resolveOpenAISessionModel({
+  requestedModel = '',
+  configuredModel = 'gpt-4o',
+  availableModels = [],
+} = {}) {
+  const requested = String(requestedModel || '').trim();
+  const fallback = String(configuredModel || '').trim() || 'gpt-4o';
+  const available = new Set(
+    (Array.isArray(availableModels) ? availableModels : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+  );
+  if (requested === fallback || available.has(requested)) return requested;
+  return fallback;
+}
+
 function runHostSuspendToRam() {
   if (process.platform !== 'win32') {
     return { ok: false, statusCode: 501, error: 'Host suspend is only supported on Windows' };
@@ -220,6 +341,67 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
     };
   }
   return { ok: true, statusCode: 200, ...result };
+}
+
+export function evaluateWorkspaceRootRelaunch({
+  workerStatus = '',
+  activeQueueCount = 0,
+} = {}) {
+  const normalizedStatus = String(workerStatus || '').trim().toLowerCase();
+  if (Number(activeQueueCount) > 0 || normalizedStatus === 'processing' || normalizedStatus === 'starting') {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: 'Wait for the active turn to finish before changing CWD.',
+    };
+  }
+  return { ok: true, stopWorker: normalizedStatus === 'ready' };
+}
+
+async function stopIdleWorkspaceRootSession({
+  sdkSessionId,
+  worker,
+  sessionWorkerSupervisor,
+  sessionWorkerRegistry,
+  sessionWorkerProcessInspector,
+} = {}) {
+  const sid = String(sdkSessionId || '').trim();
+  if (!sid) return { ok: false, error: 'Missing session id' };
+  sessionWorkerSupervisor?.markKilled?.(sid);
+  await sessionWorkerSupervisor?.cancelPendingStart?.(sid, { wait: true });
+
+  const processRows = process.platform === 'win32'
+    ? (sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sid)
+      || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sid)
+      || [])
+    : (sessionWorkerProcessInspector?.findProcessesForSession?.(sid) || []);
+  const pids = [...new Set([
+    ...processRows.map((row) => Number(row?.processId)).filter(Number.isInteger),
+    Number(worker?.pid),
+  ].filter((pid) => Number.isInteger(pid) && pid > 0))];
+
+  try {
+    if (process.platform === 'win32') {
+      sessionWorkerProcessInspector?.stopWindowsPids?.(pids);
+    } else {
+      for (const pid of pids) {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch (error) {
+          if (error?.code !== 'ESRCH') throw error;
+        }
+      }
+      // The tmux session can retain the shell after its child has received SIGTERM.
+      killTmuxSession(sid);
+    }
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Failed to stop the idle CLI' };
+  }
+
+  sessionWorkerRegistry?.removeWorker?.(sid);
+  sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
+  sessionWorkerSupervisor?.resetHealth?.(sid, { clearFailureCount: false });
+  return { ok: true, stoppedPids: pids };
 }
 
 export function learnWorkspaceRootFromSessionSync({
@@ -368,6 +550,32 @@ export function normalizePreferredModelsByMode(value, {
   return normalized;
 }
 
+export function normalizePreferredReasoningByMode(value, {
+  supportedRelayModes = [],
+} = {}) {
+  const allowedModes = Array.isArray(supportedRelayModes)
+    ? supportedRelayModes.map((mode) => String(mode || '').trim()).filter(Boolean)
+    : [];
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    const trimmed = parsed.trim();
+    if (!trimmed) return {};
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const normalized = {};
+  for (const mode of allowedModes) {
+    const effort = String(parsed[mode] || '').trim().toLowerCase();
+    if (!effort) continue;
+    normalized[mode] = effort;
+  }
+  return normalized;
+}
+
 const MAX_CONVERSATION_DRAFT_LENGTH = 20_000;
 
 function normalizeConversationDraftText(value, { maxLength = MAX_CONVERSATION_DRAFT_LENGTH } = {}) {
@@ -404,6 +612,9 @@ function resolveConversationPreferences(row, {
       fallbackMode: defaultRelayMode,
     }),
     preferredModelsByMode: normalizePreferredModelsByMode(row?.preferred_models_by_mode, {
+      supportedRelayModes,
+    }),
+    preferredReasoningByMode: normalizePreferredReasoningByMode(row?.preferred_reasoning_by_mode, {
       supportedRelayModes,
     }),
   };
@@ -545,6 +756,24 @@ export function buildSessionWorkerStatusPayload({
     ? supervisorSnapshot
     : {};
   const workers = Array.isArray(snapshot.workers) ? snapshot.workers : [];
+  const onlineWorkerStatuses = new Set(['starting', 'ready', 'processing']);
+  const onlineCount = workers.reduce((count, worker) => {
+    const status = normalizeWorkerStatusText(worker?.status, 'new');
+    return count + (onlineWorkerStatuses.has(status) ? 1 : 0);
+  }, 0);
+  const onlineProcessCount = workers.reduce((count, worker) => {
+    const status = normalizeWorkerStatusText(worker?.status, 'new');
+    if (!onlineWorkerStatuses.has(status)) return count;
+    return count + (isPidAlive(worker?.pid) ? 1 : 0);
+  }, 0);
+  const onlineBoundProcessCount = workers.reduce((count, worker) => {
+    const status = normalizeWorkerStatusText(worker?.status, 'new');
+    if (!onlineWorkerStatuses.has(status)) return count;
+    if (!isPidAlive(worker?.pid)) return count;
+    const conversationId = normalizeWorkerStatusText(worker?.conversationId);
+    return count + (conversationId ? 1 : 0);
+  }, 0);
+  const onlineUnassignedProcessCount = Math.max(0, onlineProcessCount - onlineBoundProcessCount);
   const normalizedRows = Array.isArray(queueRows) ? queueRows : [];
   const workerBySession = new Map();
   for (const worker of workers) {
@@ -624,6 +853,10 @@ export function buildSessionWorkerStatusPayload({
     degradedReason: normalizeWorkerStatusText(snapshot?.health?.degradedReason, null),
     health: snapshot?.health && typeof snapshot.health === 'object' ? snapshot.health : null,
     workerCount: toSafeNonNegativeInt(snapshot.workerCount, workers.length),
+    onlineCount,
+    onlineProcessCount,
+    onlineBoundProcessCount,
+    onlineUnassignedProcessCount,
     counts: snapshot.counts && typeof snapshot.counts === 'object' ? snapshot.counts : {},
     workers,
     pendingStarts: toSafeNonNegativeInt(snapshot.pendingStarts, 0),
@@ -1211,6 +1444,7 @@ export function registerSessionsRoutes(app, deps) {
     createCompactedConversation,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
+    cleanupGeneratedImagesForConversation = cleanupGeneratedImagesForConversationDefault,
     queueCounts,
     getModelCatalogState,
     updateModelCatalog,
@@ -1222,6 +1456,15 @@ export function registerSessionsRoutes(app, deps) {
     workspaceRootPayload,
     setWorkspaceRoot,
     setDefaultSessionWorkspaceRootPath,
+    getOpenAIProviderSettings = () => ({ configured: false, enabled: false, model: 'gpt-4o' }),
+    setOpenAIProviderSettings = () => ({ ok: false, error: 'OpenAI settings are unavailable' }),
+    refreshOpenAIProviderModels = async () => ({ ok: false, models: [], error: 'OpenAI model discovery is unavailable' }),
+    reconcileUnstartedConversationProviders = async () => ({
+      updatedUnstartedConversations: 0,
+      skippedStartedConversations: 0,
+      skippedActiveQueueConversations: 0,
+      failedConversations: [],
+    }),
     resolveConversationWorkspaceState,
     updateConversationConfiguredWorkspaceRoot,
     learnConversationWorkspaceRoot,
@@ -1251,10 +1494,12 @@ export function registerSessionsRoutes(app, deps) {
     featureFlags,
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
+    sessionWorkerProcessInspector,
     resolveSessionStateRoot,
     markSharedViewerPresence,
     getSharedWatcherCount,
     statusEventService,
+    windowsAutostartService,
     isSha256,
     uploadPathForSha,
   } = deps;
@@ -1275,6 +1520,12 @@ export function registerSessionsRoutes(app, deps) {
     WHERE status = 'pending'
       AND sdk_session_id IS NOT NULL
       AND TRIM(sdk_session_id) <> ''
+  `);
+  const countActiveConversationQueueRows = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM queue
+    WHERE conversation_id = ?
+      AND status IN ('pending', 'processing', 'parked')
   `);
   const getConversationUsageSnapshotAggregate = db.prepare(`
     SELECT
@@ -1437,6 +1688,14 @@ export function registerSessionsRoutes(app, deps) {
     for (const row of rows) {
       const conversationId = String(row?.id || '').trim();
       if (!conversationId) continue;
+      cleanupGeneratedImagesForConversation({
+        conversationId,
+        sdkSessionId: sid,
+        messageRows: stmts.getMessages?.all?.(conversationId) || [],
+        parseAttachments,
+        hydrateAttachment,
+        resolveSessionStateRoot,
+      });
       const orphanedUploads = collectOrphanedUploadsFromConversation(conversationId);
       hardDeleteConversationRows(conversationId);
       deleteOrphanedUploads(orphanedUploads);
@@ -1477,6 +1736,14 @@ export function registerSessionsRoutes(app, deps) {
     return `${String(remotePath || '').replace(/\/+$/, '')}/api/shared/${shareToken}/upload/${normalizedSha}/content`.replace(/\/{2,}/g, '/');
   }
 
+  function buildSharedGeneratedImageContentUrl(token, messageId, imageId) {
+    const shareToken = normalizeShareToken(token);
+    const normalizedMessageId = String(messageId || '').trim();
+    const normalizedImageId = String(imageId || '').trim();
+    if (!shareToken || !normalizedMessageId || !normalizedImageId) return '';
+    return `${String(remotePath || '').replace(/\/+$/, '')}/api/shared/${shareToken}/generated-image/${encodeURIComponent(normalizedMessageId)}/${encodeURIComponent(normalizedImageId)}/content`.replace(/\/{2,}/g, '/');
+  }
+
   function conversationReferencesUploadSha(conversationId, sha256) {
     const convId = String(conversationId || '').trim();
     const normalizedSha = String(sha256 || '').trim().toLowerCase();
@@ -1498,6 +1765,22 @@ export function registerSessionsRoutes(app, deps) {
     const normalizedSha = String(attachment.sha256 || '').trim().toLowerCase();
     if (!isSha256(normalizedSha)) return attachment;
     const contentUrl = buildSharedUploadContentUrl(shareToken, normalizedSha);
+    if (!contentUrl) return attachment;
+    return {
+      ...attachment,
+      contentUrl,
+    };
+  }
+
+  function rewriteSharedGeneratedImageAttachmentContentUrl(attachment, shareToken) {
+    if (!attachment || typeof attachment !== 'object') return attachment;
+    const generatedImage = attachment.generatedImage && typeof attachment.generatedImage === 'object'
+      ? attachment.generatedImage
+      : null;
+    const messageId = String(generatedImage?.messageId || generatedImage?.responseMessageId || generatedImage?.parentMessageId || '').trim();
+    const imageId = String(generatedImage?.imageId || '').trim();
+    if (!messageId || !imageId) return attachment;
+    const contentUrl = buildSharedGeneratedImageContentUrl(shareToken, messageId, imageId);
     if (!contentUrl) return attachment;
     return {
       ...attachment,
@@ -1555,7 +1838,7 @@ export function registerSessionsRoutes(app, deps) {
         attachments: parseAttachments(message.attachments)
           .map(hydrateAttachment)
           .filter(Boolean)
-          .map((attachment) => rewriteSharedAttachmentContentUrl(attachment, shareToken)),
+          .map((attachment) => rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken)),
       })),
       transcriptMessages: [],
       relayActivitiesByMessageId,
@@ -1568,7 +1851,7 @@ export function registerSessionsRoutes(app, deps) {
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
       const nextMessage = sourceMessageId ? { ...message, sourceMessageId } : message;
       const attachments = Array.isArray(nextMessage?.attachments)
-        ? nextMessage.attachments.map((attachment) => rewriteSharedAttachmentContentUrl(attachment, shareToken))
+        ? nextMessage.attachments.map((attachment) => rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken))
         : nextMessage?.attachments;
       return attachments === nextMessage?.attachments
         ? nextMessage
@@ -1689,6 +1972,9 @@ export function registerSessionsRoutes(app, deps) {
         runtimeSessionStrategy: r.runtime_strategy || null,
         runtimeSessionStatus: r.runtime_status || null,
         runtimeSessionLastUsedAt: r.runtime_last_used_at || null,
+        runtimeModel: r.runtime_model || null,
+        runtimeProviderType: String(r.runtime_provider_type || 'github').trim().toLowerCase() || 'github',
+        runtimeProviderModel: r.runtime_provider_model || null,
         configuredWorkspaceRootPath: workspaceState?.configuredWorkspaceRootPath || null,
         configuredWorkspaceRootName: workspaceState?.configuredWorkspaceRootName || null,
         runtimeWorkspaceRootPath: workspaceState?.runtimeWorkspaceRootPath || null,
@@ -1700,6 +1986,7 @@ export function registerSessionsRoutes(app, deps) {
         messageCount: Number(r.message_count || 0),
         preferredRelayMode: preferences.preferredRelayMode,
         preferredModelsByMode: preferences.preferredModelsByMode,
+        preferredReasoningByMode: preferences.preferredReasoningByMode,
         draftText: String(r.draft_text || ''),
         draftUpdatedAt: r.draft_updated_at || null,
         draftUpdatedByClientId: r.draft_updated_by_client_id || null,
@@ -1755,17 +2042,18 @@ export function registerSessionsRoutes(app, deps) {
     touchCli();
     const sdkSessionId = String(req.body?.sdk_session_id || '').trim();
     const ok = req.body?.ok === true;
+    const unsupported = req.body?.unsupported === true;
     const errorText = String(req.body?.error || '').trim() || 'Unknown SDK delete failure';
     if (!sdkSessionId) return res.status(400).json({ error: 'Missing sdk_session_id' });
 
-    if (ok) {
+    if (ok || unsupported) {
       stmts.deleteSdkDeleteRequest.run(sdkSessionId);
       const finalizedConversationIds = finalizeDeletedConversationsForSdkSession(sdkSessionId);
       sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
       if (!finalizedConversationIds.length) {
         io.emit('conversation_deleted', { conversationId: sdkSessionId });
       }
-      return res.json({ ok: true, finalizedConversationIds });
+      return res.json({ ok: true, unsupported, finalizedConversationIds });
     }
 
     const nowIso = new Date().toISOString();
@@ -2246,6 +2534,8 @@ export function registerSessionsRoutes(app, deps) {
         strategy: runtimeSession.strategy || null,
         status: runtimeSession.status || null,
         model: runtimeSession.model || null,
+        providerType: String(runtimeSession.provider_type || 'github').trim().toLowerCase() || 'github',
+        providerModel: runtimeSession.provider_model || null,
         createdAt: runtimeSession.created_at || null,
         lastUsedAt: runtimeSession.last_used_at || null,
       } : null,
@@ -2255,6 +2545,7 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
+      preferredReasoningByMode: preferences.preferredReasoningByMode,
       draftText: String(conv.draft_text || ''),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
@@ -2432,6 +2723,57 @@ export function registerSessionsRoutes(app, deps) {
     stream.pipe(res);
   });
 
+  app.get('/api/shared/:token/generated-image/:messageId/:imageId/content', (req, res) => {
+    const token = normalizeShareToken(req.params.token);
+    const messageId = String(req.params.messageId || '').trim();
+    const imageId = String(req.params.imageId || '').trim();
+    if (!token || !messageId || !imageId) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const share = stmts.getConversationShareByToken?.get(token) || null;
+    if (!share || String(share.revoked_at || '').trim()) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const conversationId = String(share.conversation_id || '').trim();
+    if (!conversationId) return res.status(404).json({ error: 'Shared attachment not found' });
+    const rows = stmts.getMessages.all(conversationId);
+    const messageRow = rows.find((row) => String(row?.id || '').trim() === messageId);
+    if (!messageRow) return res.status(404).json({ error: 'Shared attachment not found' });
+    const attachments = parseAttachments(messageRow?.attachments).map(hydrateAttachment).filter(Boolean);
+    const attachment = attachments.find((entry) => String(entry?.generatedImage?.imageId || '').trim() === imageId);
+    if (!attachment) return res.status(404).json({ error: 'Shared attachment not found' });
+
+    const sessionId = String(attachment?.generatedImage?.sessionId || '').trim();
+    const relativePath = String(attachment?.generatedImage?.relativePath || '').replace(/\\/g, '/').trim();
+    const root = typeof resolveSessionStateRoot === 'function'
+      ? String(resolveSessionStateRoot() || '').trim()
+      : '';
+    if (!root || !sessionId || !relativePath) return res.status(404).json({ error: 'Shared attachment not found' });
+    const safeSession = sessionId.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    const normalizedRelative = path.posix.normalize(relativePath).replace(/^\/+/, '');
+    if (!safeSession || !normalizedRelative || normalizedRelative.startsWith('..') || normalizedRelative.includes('/../')) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    const baseDir = path.resolve(path.join(root, safeSession, 'generated-images'));
+    const filePath = path.resolve(path.join(baseDir, normalizedRelative));
+    if (!(filePath === baseDir || filePath.startsWith(`${baseDir}${path.sep}`))) {
+      return res.status(404).json({ error: 'Shared attachment not found' });
+    }
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Shared attachment not found' });
+    res.setHeader('Content-Type', attachment.type || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream shared attachment' });
+        return;
+      }
+      res.destroy();
+    });
+    stream.pipe(res);
+  });
+
   // GET /api/conversation/:id — get paginated conversation history
   app.get('/api/conversation/:id', auth, (req, res) => {
     const requestedId = String(req.params.id || '').trim();
@@ -2547,6 +2889,8 @@ export function registerSessionsRoutes(app, deps) {
         strategy: runtimeSession.strategy || null,
         status: runtimeSession.status || null,
         model: runtimeSession.model || null,
+        providerType: String(runtimeSession.provider_type || 'github').trim().toLowerCase() || 'github',
+        providerModel: runtimeSession.provider_model || null,
         createdAt: runtimeSession.created_at || null,
         lastUsedAt: runtimeSession.last_used_at || null,
       } : null,
@@ -2556,6 +2900,7 @@ export function registerSessionsRoutes(app, deps) {
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModelsByMode: preferences.preferredModelsByMode,
+      preferredReasoningByMode: preferences.preferredReasoningByMode,
       draftText: String(conv.draft_text || ''),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
@@ -2604,12 +2949,16 @@ export function registerSessionsRoutes(app, deps) {
     const preferredModelsByMode = normalizePreferredModelsByMode(req.body?.preferredModelsByMode, {
       supportedRelayModes: SUPPORTED_RELAY_MODES,
     });
+    const preferredReasoningByMode = normalizePreferredReasoningByMode(req.body?.preferredReasoningByMode, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+    });
     const persisted = persistConversationPreferences({
       db,
       stmts,
       conversationId,
       preferredRelayMode,
       preferredModelsByMode,
+      preferredReasoningByMode,
       updatedAt: now,
       createIfMissing: !existing,
       createTitle: 'Session',
@@ -2619,6 +2968,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       preferredRelayMode: persisted.preferredRelayMode,
       preferredModelsByMode: persisted.preferredModelsByMode,
+      preferredReasoningByMode: persisted.preferredReasoningByMode,
       updatedAt: persisted.updatedAt,
       senderClientId,
     });
@@ -2628,6 +2978,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       preferredRelayMode: persisted.preferredRelayMode,
       preferredModelsByMode: persisted.preferredModelsByMode,
+      preferredReasoningByMode: persisted.preferredReasoningByMode,
       updatedAt: persisted.updatedAt,
       created: persisted.created,
       senderClientId,
@@ -2715,6 +3066,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       rootPath: nextRootPath,
     });
+
     if (!result?.ok) {
       return res.status(400).json({ error: result?.error || 'Failed to update conversation workspace root' });
     }
@@ -2742,6 +3094,79 @@ export function registerSessionsRoutes(app, deps) {
       currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
       currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
       recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
+    });
+  });
+
+  app.post('/api/conversation/:id/relaunch-with-workspace-root', auth, async (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const rootPath = String(req.body?.rootPath || req.body?.workspaceRootPath || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    if (!rootPath) return res.status(400).json({ error: 'Missing rootPath' });
+    if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
+      return res.status(500).json({ error: 'Conversation workspace updates are unavailable' });
+    }
+
+    const workspaceState = resolveConversationWorkspaceState?.({ conversationId }) || null;
+    const sdkSessionId = String(workspaceState?.sdkSessionId || '').trim();
+    if (!sdkSessionId) {
+      return res.status(409).json({ error: 'Open a conversation with a bound session before relaunching.' });
+    }
+    const worker = sessionWorkerSupervisor?.getWorkerState?.(sdkSessionId)
+      || sessionWorkerRegistry?.getWorker?.(sdkSessionId)
+      || null;
+    const activeQueueCount = Number(countActiveConversationQueueRows.get(conversationId)?.count || 0);
+    const eligibility = evaluateWorkspaceRootRelaunch({
+      workerStatus: worker?.status,
+      activeQueueCount,
+    });
+    if (!eligibility.ok) return res.status(eligibility.statusCode).json({ ok: false, error: eligibility.error });
+
+    const updateResult = updateConversationConfiguredWorkspaceRoot({ conversationId, rootPath });
+    if (!updateResult?.ok) {
+      return res.status(400).json({ error: updateResult?.error || 'Failed to update conversation workspace root' });
+    }
+    if (eligibility.stopWorker) {
+      const stopped = await stopIdleWorkspaceRootSession({
+        sdkSessionId,
+        worker,
+        sessionWorkerSupervisor,
+        sessionWorkerRegistry,
+        sessionWorkerProcessInspector,
+      });
+      if (!stopped.ok) return res.status(500).json({ ok: false, error: stopped.error });
+    }
+    const launched = await launchWorkspaceRootSession(
+      runtimeState,
+      sessionWorkerSupervisor,
+      sdkSessionId,
+      sessionWorkerRegistry,
+    );
+    if (!launched?.ok) {
+      return res.status(launched?.statusCode || 409).json({
+        ok: false,
+        error: launched?.error || 'Failed to relaunch the CLI',
+      });
+    }
+    const state = updateResult.state || null;
+    const workspaceHints = workspaceRootPayload();
+    io.emit('conversation_workspace_root_updated', {
+      conversationId,
+      sdkSessionId,
+      configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: state?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: state?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
+      recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
+    });
+    return res.json({
+      ok: true,
+      conversationId,
+      sdkSessionId,
+      ...state,
+      worker: launched.worker || null,
+      lifecycle: launched.lifecycle || null,
     });
   });
 
@@ -2774,6 +3199,14 @@ export function registerSessionsRoutes(app, deps) {
       const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
       if (!sdkSessionId) {
         stmts.markDeletedSdkSession.run(id, new Date().toISOString());
+        cleanupGeneratedImagesForConversation({
+          conversationId: id,
+          sdkSessionId: null,
+          messageRows: stmts.getMessages?.all?.(id) || [],
+          parseAttachments,
+          hydrateAttachment,
+          resolveSessionStateRoot,
+        });
         const orphanedUploads = collectOrphanedUploadsFromConversation(id);
         hardDeleteConversationRows(id);
         deleteOrphanedUploads(orphanedUploads);
@@ -2834,16 +3267,92 @@ export function registerSessionsRoutes(app, deps) {
 
     const requestedTitle = String(req.body?.title || '').trim();
     const title = (requestedTitle || 'New Conversation').slice(0, 80);
-    const modelState = getModelCatalogState();
-    const selectedModel = resolveBootstrapModelSelection({
+    const openAISettings = getOpenAIProviderSettings();
+    const requestedProviderType = normalizeRequestedProviderType(req.body?.providerType || req.body?.provider);
+    const modelState = buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      openAISettings,
+    );
+    const catalogSelectedModel = resolveBootstrapModelSelection({
       requestedModel: req.body?.model,
       modelState,
       defaultModel: DEFAULT_MODEL,
     });
+    const requestedBootstrapModel = String(req.body?.model || '').trim();
+    const availableOpenAIModels = new Set([
+      String(openAISettings?.model || '').trim(),
+      ...(Array.isArray(openAISettings?.models) ? openAISettings.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean));
+    if (
+      (requestedProviderType === 'openai' || requestedProviderType === 'openai-image')
+      && requestedBootstrapModel
+      && requestedBootstrapModel.toLowerCase() !== 'auto'
+      && !availableOpenAIModels.has(requestedBootstrapModel)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: `OpenAI model "${requestedBootstrapModel}" is not available`,
+        code: 'OPENAI_MODEL_UNAVAILABLE',
+      });
+    }
+    const useOpenAIProvider = requestedProviderType === 'openai'
+      || requestedProviderType === 'openai-image'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableOpenAIModels.has(requestedBootstrapModel)
+      );
+    if (useOpenAIProvider && openAISettings?.configured !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'OpenAI API key is not configured',
+        code: 'OPENAI_NOT_CONFIGURED',
+      });
+    }
+
+    const selectedModel = useOpenAIProvider
+      ? resolveOpenAISessionModel({
+          requestedModel: catalogSelectedModel,
+          configuredModel: openAISettings.model,
+          availableModels: openAISettings.models,
+        })
+      : catalogSelectedModel;
+    if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
+      return res.status(400).json({
+        ok: false,
+        error: `OpenAI image provider requires an image model (received "${selectedModel}")`,
+        code: 'OPENAI_IMAGE_MODEL_REQUIRED',
+      });
+    }
+    if (!useOpenAIProvider) {
+      const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
+        ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
+        : [];
+      const openAIOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'openai-byok');
+      if (openAIOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the OpenAI provider`,
+          code: 'OPENAI_PROVIDER_REQUIRED',
+        });
+      }
+    }
 
     try {
       stmts.insertConv.run(conversationId, title, now, now);
-      const runtimeSession = ensureRuntimeSessionBinding(conversationId, selectedModel, now, conversationId);
+      const runtimeSession = ensureRuntimeSessionBinding(
+        conversationId,
+        selectedModel,
+        now,
+        conversationId,
+        {
+          assignConfiguredProvider: true,
+          providerType: useOpenAIProvider ? 'openai' : 'github',
+          providerModel: useOpenAIProvider ? selectedModel : null,
+        },
+      );
       const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
       const ownerSessionId = routingEnabled ? conversationId : null;
       if (ownerSessionId && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
@@ -2895,6 +3404,7 @@ export function registerSessionsRoutes(app, deps) {
         worker: ownerWorker,
         lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
         selectedModel,
+        selectedProviderType: useOpenAIProvider ? 'openai' : 'github',
         warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
         ...workspaceRootPayload(),
       });
@@ -2912,13 +3422,21 @@ export function registerSessionsRoutes(app, deps) {
     ensureSessionId(req, res);
     const { pendingCount, processingCount, parkedCount } = queueCounts();
     const modelState = getModelCatalogState();
-    const activeRuntimeSessionCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
+    const runtimeSessionBindingCount = Number(stmts.countRuntimeSessions.get()?.cnt || 0);
     const configuredContextIndicatorMode = String(config?.contextIndicatorMode || '').trim().toLowerCase();
     const contextIndicatorMode = configuredContextIndicatorMode === 'bar' ? 'bar' : 'default';
     const readyBanner = buildRelayReadyBannerData();
     const pendingQuestionSessionIds = listPendingQuestionSessionRows.all()
       .map((row) => normalizeWorkerStatusText(row?.sdk_session_id))
       .filter(Boolean);
+    const sessionWorkerStatus = buildSessionWorkerStatusPayload({
+      featureFlags,
+      supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
+      queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
+    });
+    const activeRuntimeSessionCount = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
+      ? Number(sessionWorkerStatus?.onlineBoundProcessCount || 0)
+      : runtimeSessionBindingCount;
     res.json({
       cliOnline: runtimeState.cliOnline,
       relayPaused: runtimeState.relayPaused,
@@ -2926,6 +3444,7 @@ export function registerSessionsRoutes(app, deps) {
       processingCount,
       parkedCount,
       activeRuntimeSessionCount,
+      runtimeSessionBindingCount,
       supportedModels: modelState.models,
       defaultModel: modelState.defaultModel,
       currentModel: modelState.currentModel,
@@ -2964,11 +3483,7 @@ export function registerSessionsRoutes(app, deps) {
       relayShutdown: runtimeState.relayShutdown || null,
       platform: process.platform,
       features: featureFlags || {},
-      sessionWorker: buildSessionWorkerStatusPayload({
-        featureFlags,
-        supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
-        queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
-      }),
+      sessionWorker: sessionWorkerStatus,
     });
   });
 
@@ -2994,6 +3509,121 @@ export function registerSessionsRoutes(app, deps) {
       defaultSessionWorkspaceRootWarning: payload.defaultSessionWorkspaceRootWarning || null,
       recentWorkspaceRoots: Array.isArray(payload.recentWorkspaceRoots) ? payload.recentWorkspaceRoots : [],
     });
+  });
+
+  app.get('/api/settings/openai', auth, (_req, res) => {
+    const settings = getOpenAIProviderSettings();
+    return res.json({
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'gpt-4o').trim() || 'gpt-4o',
+      baseUrl: String(settings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
+    });
+  });
+
+  app.post('/api/settings/openai', auth, async (req, res) => {
+    const parsed = parseOpenAISettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const previous = getOpenAIProviderSettings();
+    const result = setOpenAIProviderSettings(parsed);
+    if (!result?.ok) {
+      const statusCode = result?.code === 'openai-key-removal-blocked' ? 409 : 400;
+      return res.status(statusCode).json({
+        error: result?.error || 'Failed to update OpenAI settings',
+        code: result?.code || null,
+        activeConversationCount: Number(result?.activeConversationCount || 0),
+        startedConversationCount: Number(result?.startedConversationCount || 0),
+        activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
+      });
+    }
+    const shouldDiscover = result.enabled === true && (
+      !!parsed.apiKey
+      || previous?.enabled !== true
+      || previous?.model !== result.model
+      || (
+        Object.prototype.hasOwnProperty.call(parsed, 'baseUrl')
+        && String(previous?.baseUrl || '').trim() !== String(result?.baseUrl || '').trim()
+      )
+    );
+    const discovery = !shouldDiscover
+      ? { ok: true, models: [], error: null }
+      : await refreshOpenAIProviderModels();
+    const reconciliationResult = parsed.remove === true
+      ? await reconcileUnstartedConversationProviders({
+          enabled: false,
+          model: result.model,
+        })
+      : {
+          updatedUnstartedConversations: 0,
+          skippedStartedConversations: 0,
+          skippedActiveQueueConversations: 0,
+          failedConversations: [],
+        };
+    const reconciliation = {
+      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
+        ? reconciliationResult.failedConversations
+        : [],
+    };
+    const currentSettings = getOpenAIProviderSettings();
+    const settingsPayload = {
+      configured: currentSettings?.configured === true,
+      enabled: currentSettings?.enabled === true,
+      model: String(currentSettings?.model || result.model || 'gpt-4o').trim() || 'gpt-4o',
+      baseUrl: String(currentSettings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
+      reconciliation,
+    };
+    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      currentSettings,
+    ));
+    io.emit('openai_settings_updated', settingsPayload);
+    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
+      ? reconciliation.failedConversations
+      : [];
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      models: Array.isArray(discovery?.models) ? discovery.models : [],
+      warning: reconciliationFailures.length
+        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed')),
+    });
+  });
+
+  app.get('/api/settings/windows-autostart', auth, (_req, res) => {
+    if (!windowsAutostartService) {
+      return res.status(500).json({ error: 'Windows autostart settings are unavailable' });
+    }
+    try {
+      return res.json(windowsAutostartService.getState());
+    } catch {
+      return res.status(500).json({
+        error: 'Unable to read Windows autostart. Check access to your user Startup folder.',
+      });
+    }
+  });
+
+  app.post('/api/settings/windows-autostart', auth, (req, res) => {
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean' });
+    }
+    if (!windowsAutostartService) {
+      return res.status(500).json({ error: 'Windows autostart settings are unavailable' });
+    }
+    try {
+      const currentState = windowsAutostartService.getState();
+      if (!currentState.supported) {
+        return res.status(400).json({ error: 'Windows autostart is only available on Windows' });
+      }
+      return res.json(windowsAutostartService.setEnabled(req.body.enabled));
+    } catch {
+      return res.status(500).json({
+        error: 'Unable to update Windows autostart. Check access to your user Startup folder.',
+      });
+    }
   });
 
   app.post('/api/workspace-root', auth, (req, res) => {
@@ -3190,11 +3820,30 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(501).json({ error: 'Model refresh is unavailable' });
     }
     try {
-      await refreshModelVariantCatalogFromCli();
-      io.emit('models_updated', getModelCatalogState());
+      const openAISettings = getOpenAIProviderSettings();
+      const refreshTasks = [
+        refreshModelVariantCatalogFromCli(),
+        openAISettings?.enabled === true
+          ? refreshOpenAIProviderModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+      ];
+      const [cliRefresh, openAIRefresh] = await Promise.allSettled(refreshTasks);
+      if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
+      const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
+        ? openAIRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(openAISettings?.models) ? openAISettings.models : [],
+            error: openAIRefresh.reason?.message || 'OpenAI model discovery failed',
+          };
+      io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+        getModelCatalogState(),
+        getOpenAIProviderSettings(),
+      ));
       return res.json({
         ok: true,
         ...buildModelVariantCatalogPayloadForRoute(),
+        openAIModelDiscovery,
       });
     } catch (error) {
       return res.status(500).json({
@@ -3213,7 +3862,10 @@ export function registerSessionsRoutes(app, deps) {
       ? req.body.enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
       : [];
     setEnabledModelVariants(enabledVariantIds);
-    io.emit('models_updated', getModelCatalogState());
+    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      getOpenAIProviderSettings(),
+    ));
     return res.json({
       ok: true,
       ...buildModelVariantCatalogPayloadForRoute(),
@@ -3222,15 +3874,20 @@ export function registerSessionsRoutes(app, deps) {
 
   app.get('/api/models', auth, (req, res) => {
     ensureSessionId(req, res);
-    const modelState = getModelCatalogState();
+    const modelState = buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      getOpenAIProviderSettings(),
+    );
     res.json({
       models: modelState.models,
       currentModel: modelState.currentModel,
       defaultModel: modelState.defaultModel,
       reasoningByModel: modelState.reasoningByModel || {},
+      reasoningByProvider: modelState.reasoningByProvider || {},
       reasoningEfforts: modelState.reasoningEfforts || [],
       contextLimitsByModel: modelState.contextLimitsByModel || {},
       modelMetadataByModel: modelState.modelMetadataByModel || {},
+      providersByModel: modelState.providersByModel || {},
       stale: modelState.stale,
       metadataValid: modelState.metadataValid === true,
       reasoningMetadataValid: modelState.reasoningMetadataValid === true,
@@ -3253,7 +3910,10 @@ export function registerSessionsRoutes(app, deps) {
       source: source || 'relay-extension',
       error,
     });
-    io.emit('models_updated', getModelCatalogState());
+    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+      getModelCatalogState(),
+      getOpenAIProviderSettings(),
+    ));
     res.json({
       ok: true,
       ...getModelCatalogState(),

@@ -1,17 +1,26 @@
 'use strict';
 
 export function createSessionRepository(db) {
+    const runtimeSessionColumns = new Set(
+      db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((column) => String(column?.name || '').trim()),
+    );
+    const runtimeSessionsSupportProviders = runtimeSessionColumns.has('provider_type')
+      && runtimeSessionColumns.has('provider_model');
+    const runtimeProviderSelect = runtimeSessionsSupportProviders
+      ? 'rs.model AS runtime_model, rs.provider_type AS runtime_provider_type, rs.provider_model AS runtime_provider_model'
+      : 'rs.model AS runtime_model, NULL AS runtime_provider_type, NULL AS runtime_provider_model';
     return {
         // conversations
         getConv:        db.prepare(`SELECT * FROM conversations WHERE id = ? AND status != 'deleted'`),
         getConvAnyStatus: db.prepare(`SELECT * FROM conversations WHERE id = ?`),
         getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? AND status != 'deleted' ORDER BY updated_at DESC LIMIT 1`),
         listConvIdsMissingRuntimeSession: db.prepare(`SELECT c.id AS id FROM conversations c LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE rs.id IS NULL AND c.status != 'deleted'`),
-        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_models_by_mode, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
+        runtimeSessionsSupportProviders,
+        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_models_by_mode, c.preferred_reasoning_by_mode, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
         insertConv:     db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
         updateConvTime: db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`),
         updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`),
-        updateConvPreferences: db.prepare(`UPDATE conversations SET preferred_relay_mode = ?, preferred_models_by_mode = ?, updated_at = ? WHERE id = ?`),
+        updateConvPreferences: db.prepare(`UPDATE conversations SET preferred_relay_mode = ?, preferred_models_by_mode = ?, preferred_reasoning_by_mode = ?, updated_at = ? WHERE id = ?`),
         updateConvConfiguredWorkspaceRoot: db.prepare(`UPDATE conversations SET configured_workspace_root_path = ?, updated_at = ? WHERE id = ?`),
         updateConvRuntimeWorkspaceRoot: db.prepare(`UPDATE conversations SET runtime_workspace_root_path = ?, updated_at = ? WHERE id = ?`),
         seedConvConfiguredWorkspaceRootIfMissing: db.prepare(`UPDATE conversations SET configured_workspace_root_path = ?, updated_at = ? WHERE id = ? AND (configured_workspace_root_path IS NULL OR configured_workspace_root_path = '')`),
@@ -56,10 +65,29 @@ export function createSessionRepository(db) {
         getRuntimeSessionBySdkSessionId: db.prepare(`SELECT * FROM runtime_sessions WHERE sdk_session_id = ?`),
         getRuntimeSessionById: db.prepare(`SELECT * FROM runtime_sessions WHERE id = ?`),
         listRuntimeSessions: db.prepare(`SELECT rs.*, c.title AS conversation_title, c.updated_at AS conversation_updated_at FROM runtime_sessions rs LEFT JOIN conversations c ON c.id = rs.conversation_id ORDER BY rs.last_used_at DESC`),
-        insertRuntimeSession: db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`),
+        insertRuntimeSession: db.prepare(runtimeSessionsSupportProviders
+          ? `INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id, provider_type, provider_model) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`
+          : `INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`),
         setConvSdkSessionIdIfMissing: db.prepare(`UPDATE conversations SET sdk_session_id = ?, updated_at = ? WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')`),
         setRuntimeSessionSdkSessionIdIfMissing: db.prepare(`UPDATE runtime_sessions SET sdk_session_id = ?, last_used_at = ?, status = 'active' WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')`),
         touchRuntimeSession: db.prepare(`UPDATE runtime_sessions SET model = ?, last_used_at = ?, status = 'active' WHERE id = ?`),
+        listRuntimeSessionProviderCandidates: db.prepare(`
+          SELECT
+            rs.*,
+            c.sdk_session_id AS conversation_sdk_session_id,
+            (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
+            (SELECT COUNT(*) FROM queue q WHERE q.conversation_id = c.id AND q.status IN ('pending', 'processing', 'parked')) AS active_queue_count
+          FROM runtime_sessions rs
+          JOIN conversations c ON c.id = rs.conversation_id
+          WHERE c.status != 'deleted'
+        `),
+        updateRuntimeSessionProvider: runtimeSessionsSupportProviders
+          ? db.prepare(`
+              UPDATE runtime_sessions
+              SET provider_type = ?, provider_model = ?, model = ?, last_used_at = ?, status = 'active'
+              WHERE id = ?
+            `)
+          : null,
         deleteRuntimeSessionByConversation: db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`),
 
         // deleted sdk sessions tombstones (hide rediscovered SDK sessions after UI delete)

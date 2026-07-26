@@ -49,11 +49,50 @@ export function resolveRelayPaths(importMetaUrl) {
 
 export function loadTokenFromConfig(configPath) {
   try {
-    const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const cfg = loadRelayConfig(configPath);
     return String(cfg.authToken || "").trim();
   } catch {
     return "";
   }
+}
+
+export function loadRelayConfig(configPath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeLoopbackHost(value) {
+  const host = String(value || "").trim();
+  if (!host || host === "0.0.0.0" || host === "::") return "127.0.0.1";
+  if (host === "localhost") return "127.0.0.1";
+  return host;
+}
+
+export function resolveRelayServerUrl({ configPath, env = process.env } = {}) {
+  const explicitUrl = String(env.COPILOT_WEB_RELAY_SERVER_URL || "").trim();
+  if (explicitUrl) {
+    const url = new URL(explicitUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error(`invalid-relay-server-url:${url.protocol}`);
+    }
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  }
+
+  const config = loadRelayConfig(configPath);
+  const configuredPort = Number.parseInt(String(config.port || ""), 10);
+  const port = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65535
+    ? configuredPort
+    : 3333;
+  const host = normalizeLoopbackHost(config.host);
+  const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${formattedHost}:${port}`;
 }
 
 export function loadRelayInstructionsFromFile(relayToolsPath) {

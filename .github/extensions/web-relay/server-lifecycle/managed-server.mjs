@@ -10,6 +10,7 @@ export function createManagedServerLifecycle({
   serverDir,
   serverLogPath,
   serverErrPath,
+  relayPort = 3333,
   nodeBin,
   serverStartTimeoutMs,
 }) {
@@ -30,7 +31,9 @@ export function createManagedServerLifecycle({
   const RELAY_RESTART_EXIT_CODE = 75;
   const STARTUP_LOG_TAIL_BYTES = 24 * 1024;
   const STATUS_PATH = "/api/status";
-  const RELAY_PORT = 3333;
+  const RELAY_PORT = Number.isInteger(Number(relayPort)) && Number(relayPort) > 0
+    ? Number(relayPort)
+    : 3333;
   const persistentManagedServer = String(process.env.COPILOT_WEB_RELAY_PERSISTENT_SERVER || "true").trim().toLowerCase() !== "false";
   const legacyOwnerPidWatchdog = String(process.env.COPILOT_WEB_RELAY_USE_OWNER_PID || "false").trim().toLowerCase() === "true";
 
@@ -45,7 +48,7 @@ export function createManagedServerLifecycle({
       return {
         type: "token-mismatch",
         error: markNonRetryable(new Error(
-          "Web relay is running on :3333 but rejected this token (401). "
+          `Web relay is running on :${RELAY_PORT} but rejected this token (401). `
           + "Set matching authToken values in extension/server config or restart the relay with --token."
         )),
       };
@@ -58,7 +61,7 @@ export function createManagedServerLifecycle({
         type: "port-conflict",
         error: markNonRetryable(new Error(
           `Port ${RELAY_PORT} is already serving HTTP ${statusCode} for ${STATUS_PATH}. `
-          + "Another process is bound to :3333; stop it or change the relay port."
+          + `Another process is bound to :${RELAY_PORT}; stop it or change the relay port.`
         )),
       };
     }
@@ -68,9 +71,9 @@ export function createManagedServerLifecycle({
 
   function classifyStartupFailure(logText = "", fallbackError = null) {
     const text = String(logText || fallbackError?.message || "");
-    if (/EADDRINUSE|address already in use|bind .*:3333/i.test(text)) {
+    if (new RegExp(`EADDRINUSE|address already in use|bind .*:${RELAY_PORT}`, "i").test(text)) {
       return markNonRetryable(new Error(
-        "Managed web relay failed to start because port :3333 is already in use. "
+        `Managed web relay failed to start because port :${RELAY_PORT} is already in use. `
         + "Stop the conflicting process or run the relay on a different port."
       ));
     }

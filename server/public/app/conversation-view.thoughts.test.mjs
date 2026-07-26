@@ -32,7 +32,7 @@ globalThis.marked = {
   },
 };
 
-const { renderThoughtsMarkup } = await import('./conversation-view.js');
+const { renderThoughtsMarkup, setLiveThinkingThoughtState } = await import('./conversation-view.js');
 
 test('renders each final thought as markdown content under one collapsed thoughts panel', () => {
   const markup = renderThoughtsMarkup([
@@ -46,4 +46,13 @@ test('renders each final thought as markdown content under one collapsed thought
   assert.match(markup, /data-reasoning-id="section-2"/);
   assert.match(markup, /<strong>rendered<\/strong> First paragraph/);
   assert.match(markup, /<strong>rendered<\/strong> - one/);
+});
+
+test('keeps live thought rows expanded until the active turn is replaced', () => {
+  const row = { dataset: {}, open: false };
+
+  setLiveThinkingThoughtState(row, true);
+
+  assert.equal(row.dataset.done, '1');
+  assert.equal(row.open, true);
 });

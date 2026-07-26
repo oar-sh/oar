@@ -16,4 +16,6 @@ test('migrates legacy browser tokens without recreating script-readable credenti
   assert.doesNotMatch(source, /document\.cookie = `\$\{AUTH_COOKIE_NAME\}=\$\{encodeURIComponent/);
   assert.doesNotMatch(source, /setToken\((?:val|urlToken|persistedToken|bootstrapToken)\)/);
   assert.match(source, /if \(result\?\.ok\) \{\s*setToken\(''\);\s*tokenInput\.value = '';/);
+  assert.match(source, /const existingSession = await verifyExistingSession\(bootstrapToken\);/);
+  assert.match(source, /if \(bootstrapToken\) \{\s*setToken\(''\);\s*document\.getElementById\('token-input'\)\.value = '';\s*showAuthGate\(resolveAuthErrorMessage\(existingSession\)\);/);
 });

@@ -11,8 +11,15 @@ export function createModelSwitchingService({
   dbg,
   getSession,
   modelSnapshotMinIntervalMs,
+  modelSwitchConfirmAttempts = 4,
+  modelSwitchConfirmDelayMs = 50,
+  modelSwitchPendingTtlMs = 10_000,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   let lastModelSnapshotMs = 0;
+  let lastConfirmedModel = null;
+  let pendingModel = null;
+  let pendingModelUntilMs = 0;
   const cachedModelMetadataById = new Map();
   const MODEL_ALIAS_CANDIDATES = {
     "sonnet-4.6": ["sonnet-4.6", "claude-sonnet-4.6", "claude-sonnet-4-6", "anthropic/claude-sonnet-4.6"],
@@ -123,13 +130,69 @@ export function createModelSwitchingService({
     return models.map((entry) => entry.modelId);
   }
 
-  async function getCurrentModelId() {
+  function setConfirmedModel(modelId) {
+    const normalized = normalizeModelId(modelId);
+    if (!normalized) return null;
+    lastConfirmedModel = normalized;
+    pendingModel = null;
+    pendingModelUntilMs = 0;
+    return normalized;
+  }
+
+  function setPendingModel(modelId) {
+    const normalized = normalizeModelId(modelId);
+    if (!normalized) return null;
+    pendingModel = normalized;
+    pendingModelUntilMs = Date.now() + Math.max(250, Number(modelSwitchPendingTtlMs) || 10_000);
+    return normalized;
+  }
+
+  function activePendingModel() {
+    if (!pendingModel) return null;
+    if (Date.now() <= pendingModelUntilMs) return pendingModel;
+    pendingModel = null;
+    pendingModelUntilMs = 0;
+    return null;
+  }
+
+  async function readCurrentModelId() {
     try {
       const modelInfo = await getSession()?.rpc?.model?.getCurrent();
       return normalizeModelId(modelInfo);
     } catch {
       return null;
     }
+  }
+
+  async function getCurrentModelId() {
+    const current = await readCurrentModelId();
+    const pending = activePendingModel();
+    if (current) {
+      if (pending && canonicalModelId(current) !== canonicalModelId(pending)) {
+        return pending;
+      }
+      return setConfirmedModel(current);
+    }
+    return pending || lastConfirmedModel;
+  }
+
+  async function confirmRequestedModel(requested, targetModel) {
+    const attempts = Math.max(1, Number(modelSwitchConfirmAttempts) || 1);
+    let lastObserved = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const observed = await readCurrentModelId();
+      if (observed) lastObserved = observed;
+      if (
+        canonicalModelId(observed) === canonicalModelId(requested)
+        || canonicalModelId(observed) === canonicalModelId(targetModel)
+      ) {
+        return { confirmed: true, model: setConfirmedModel(observed) };
+      }
+      if (attempt + 1 < attempts) {
+        await sleep(Math.max(0, Number(modelSwitchConfirmDelayMs) || 0));
+      }
+    }
+    return { confirmed: false, model: lastObserved };
   }
 
   async function publishModelSnapshot(reason = "unspecified", force = false) {
@@ -219,17 +282,44 @@ export function createModelSwitchingService({
     }
     const errors = [];
 
-    for (const candidate of [targetModel, requested]) {
+    const candidates = [...new Set([targetModel, requested].filter(Boolean))];
+    for (const candidate of candidates) {
       try {
         const result = await getSession()?.rpc?.model?.switchTo({ modelId: candidate, contextTier });
-        const after = normalizeModelId(result) || await getCurrentModelId();
-        if (
-          canonicalModelId(after) === canonicalModelId(requested) ||
-          canonicalModelId(after) === canonicalModelId(targetModel)
-        ) {
-          return { requested, current, switched: true, after, via: `switchTo(${candidate})`, targetModel };
+        const resultModel = normalizeModelId(result);
+        if (resultModel) {
+          if (
+            canonicalModelId(resultModel) === canonicalModelId(requested)
+            || canonicalModelId(resultModel) === canonicalModelId(targetModel)
+          ) {
+            const after = setConfirmedModel(resultModel);
+            return { requested, current, switched: true, after, via: `switchTo(${candidate})`, targetModel };
+          }
+          errors.push(`switchTo(${candidate}) returned active=${resultModel}`);
+          continue;
         }
-        errors.push(`switchTo(${candidate}) returned active=${after || "unknown"}`);
+        const confirmation = await confirmRequestedModel(requested, targetModel);
+        if (confirmation.confirmed) {
+          return {
+            requested,
+            current,
+            switched: true,
+            after: confirmation.model,
+            via: `switchTo(${candidate})`,
+            targetModel,
+          };
+        }
+        const after = setPendingModel(targetModel);
+        return {
+          requested,
+          current,
+          switched: true,
+          after,
+          via: `switchTo(${candidate})`,
+          targetModel,
+          confirmationPending: true,
+          observedModel: confirmation.model || null,
+        };
       } catch (e) {
         errors.push(`switchTo(${candidate}) failed: ${e?.message || String(e)}`);
       }

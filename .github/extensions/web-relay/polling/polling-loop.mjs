@@ -83,6 +83,55 @@ function normalizeWorkerLivenessIssueReason(reason) {
   return normalized.replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "worker-unavailable";
 }
 
+export async function processSdkSessionDeleteRequest({
+  request,
+  api,
+  session,
+  dbg = () => {},
+  getActiveSessionFn = getActiveSession,
+} = {}) {
+  const sdkSessionId = String(request?.sdkSessionId || "").trim();
+  if (!sdkSessionId) return false;
+
+  if (!session || typeof session.deleteSession !== "function") {
+    const errorText = "SDK deleteSession() is unavailable in this CLI runtime";
+    dbg("sdk delete unsupported", `session=${sdkSessionId}`);
+    await api("POST", "/api/sdk-session-delete/result", {
+      sdk_session_id: sdkSessionId,
+      conversation_id: request?.conversationId || undefined,
+      ok: false,
+      unsupported: true,
+      error: errorText,
+    }).catch(() => {});
+    return true;
+  }
+
+  let ok = false;
+  let errorText = "";
+  try {
+    const activeSession = getActiveSessionFn();
+    const activeSdkSessionId = String(activeSession?.sdkSessionId || "").trim();
+    if (activeSdkSessionId && activeSdkSessionId === sdkSessionId) {
+      throw new Error("Refusing to delete the currently active SDK session");
+    }
+    await session.deleteSession(sdkSessionId);
+    ok = true;
+    await session.log(`🧹 Deleted SDK session ${sdkSessionId.slice(0, 8)} from relay request`, { ephemeral: true });
+  } catch (error) {
+    errorText = String(error?.message || error || "unknown delete failure").trim() || "unknown delete failure";
+    dbg("sdk delete failed", `session=${sdkSessionId}`, errorText);
+    await session.log(`⚠️ SDK session delete failed (${sdkSessionId.slice(0, 8)}): ${errorText}`);
+  }
+
+  await api("POST", "/api/sdk-session-delete/result", {
+    sdk_session_id: sdkSessionId,
+    conversation_id: request?.conversationId || undefined,
+    ok,
+    error: ok ? undefined : errorText,
+  }).catch(() => {});
+  return true;
+}
+
 function buildWorkerLivenessTerminalFailure({ message, ownerSessionId, issueReason, detail = "" } = {}) {
   const reason = normalizeWorkerLivenessIssueReason(issueReason);
   const detailParts = [
@@ -182,10 +231,13 @@ export function shouldEmitRelayStreamUpdate(nextText, previousText) {
   return false;
 }
 
-export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActivityText = "" } = {}) {
+export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActivityText = "", hasGeneratedImages = false } = {}) {
   const streamed = String(lastStreamedSent || "").trim();
   if (streamed) {
     return { action: "use_stream_text", text: streamed };
+  }
+  if (hasGeneratedImages) {
+    return { action: "publish_generated_images_only", reason: "empty-final-text:generated-images" };
   }
   const activity = String(lastActivityText || "").trim();
   return {
@@ -194,6 +246,28 @@ export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActiv
       ? `empty-final-text:last-activity:${activity.slice(0, 120)}`
       : "empty-final-text:no-stream-or-text",
   };
+}
+
+export function shouldUseDirectOpenAIImageApi(message = {}) {
+  const providerType = String(message?.providerType || "").trim().toLowerCase();
+  if (providerType !== "openai") return false;
+  const model = String(message?.providerModel || message?.model || "").trim().toLowerCase();
+  return model.startsWith("gpt-image-") || model.startsWith("dall-e-");
+}
+
+function isDirectOpenAIImageTerminalStatus(status) {
+  const numeric = Number(status);
+  if (!Number.isFinite(numeric)) return false;
+  return (
+    numeric === 400
+    || numeric === 401
+    || numeric === 403
+    || numeric === 404
+    || numeric === 409
+    || numeric === 422
+    || numeric === 429
+    || numeric === 503
+  );
 }
 
 export async function publishRelayStreamEvent({
@@ -347,6 +421,7 @@ export function createPollingLoop({
   sendAndWaitWithHardTimeout,
   sendWithBestEffortStreaming,
   extractFinalText,
+  extractGeneratedImages = () => [],
   getLastActivityText,
   getCurrentModelId,
   getPreferredConversationSessionMode,
@@ -428,38 +503,7 @@ export function createPollingLoop({
     if (status?.relayPaused) return false;
     const pending = await api("GET", "/api/sdk-session-delete/pending").catch(() => null);
     const request = pending?.request || null;
-    const sdkSessionId = String(request?.sdkSessionId || "").trim();
-    if (!sdkSessionId) return false;
-
-    let ok = false;
-    let errorText = "";
-    try {
-      const activeSession = getActiveSession();
-      const activeSdkSessionId = String(activeSession?.sdkSessionId || "").trim();
-      if (activeSdkSessionId && activeSdkSessionId === sdkSessionId) {
-        throw new Error("Refusing to delete the currently active SDK session");
-      }
-      if (!session || typeof session.deleteSession !== "function") {
-        throw new Error("SDK deleteSession() is unavailable in this CLI runtime");
-      }
-      await session.deleteSession(sdkSessionId);
-      ok = true;
-      await session.log(`🧹 Deleted SDK session ${sdkSessionId.slice(0, 8)} from relay request`, { ephemeral: true });
-    } catch (error) {
-      ok = false;
-      errorText = String(error?.message || error || "unknown delete failure").trim() || "unknown delete failure";
-      dbg("sdk delete failed", `session=${sdkSessionId}`, errorText);
-      await session.log(`⚠️ SDK session delete failed (${sdkSessionId.slice(0, 8)}): ${errorText}`, { level: "warn" });
-    }
-
-    await api("POST", "/api/sdk-session-delete/result", {
-      sdk_session_id: sdkSessionId,
-      conversation_id: request?.conversationId || undefined,
-      ok,
-      error: ok ? undefined : errorText,
-    }).catch(() => {});
-
-    return true;
+    return processSdkSessionDeleteRequest({ request, api, session, dbg });
   }
 
   async function checkActiveAbortControl(message, { force = false } = {}) {
@@ -515,7 +559,7 @@ export function createPollingLoop({
           ok: false,
           error: abortResult.error,
         }).catch(() => {});
-        await session?.log?.(`⚠️ Subagent stop request could not be executed (${targetRunId.slice(0, 8)}): ${abortResult.error}`, { level: "warn" });
+        await session?.log?.(`⚠️ Subagent stop request could not be executed (${targetRunId.slice(0, 8)}): ${abortResult.error}`);
         return false;
       }
 
@@ -535,7 +579,7 @@ export function createPollingLoop({
         ok: false,
         error,
       }).catch(() => {});
-      await session?.log?.(`⚠️ Stop request could not be executed: ${error}`, { level: "warn" });
+      await session?.log?.(`⚠️ Stop request could not be executed: ${error}`);
       return false;
     }
 
@@ -566,7 +610,7 @@ export function createPollingLoop({
     setActiveMsg(message);
     if (typeof ensureSessionForConversation !== "function") {
       dbg("session routing unavailable for msgId", message.id, "ensureSessionForConversation is not configured");
-      await session.log("⚠️ Session routing is unavailable for this turn", { level: "warn" });
+      await session.log("⚠️ Session routing is unavailable for this turn");
       await api("POST", "/api/response", {
         messageId: message.id,
         conversationId: message.conversationId,
@@ -596,7 +640,6 @@ export function createPollingLoop({
         detail
           ? `⚠️ Session unavailable for this turn: ${detail}`
           : "⚠️ Session unavailable for this turn",
-        { level: "warn" },
       );
       if (retryable) {
         await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
@@ -619,7 +662,7 @@ export function createPollingLoop({
     const synced = await syncActiveSession?.(source, true);
     if (!synced) {
       dbg("session sync failed before processing msgId", message.id, "- requeueing");
-      await session.log("⚠️ Session sync failed before processing; re-queuing turn", { level: "warn" });
+      await session.log("⚠️ Session sync failed before processing; re-queuing turn");
       await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
       setActiveMsg(null);
       return true;
@@ -648,12 +691,86 @@ export function createPollingLoop({
       if (!done && publish.ok) lastStreamedSent = value;
     };
     let sendAndWaitStartedAtMs = 0;
+    const processDirectOpenAIImageRequest = async () => {
+      if (!shouldUseDirectOpenAIImageApi(message)) return false;
+      if (message?.imageOperationId) {
+        const result = await api(
+          "POST",
+          `/api/image-operations/${encodeURIComponent(message.imageOperationId)}/execute`,
+          { messageId: message.id },
+        ).catch((error) => {
+          if (error?.status === 409 || error?.status === 503) {
+            return error?.payload || { outcome: error?.status === 503 ? "retryable" : "terminal" };
+          }
+          throw error;
+        });
+        const outcome = String(result?.outcome || "").trim().toLowerCase();
+        if (!["completed", "executing", "terminal", "uncertain", "retryable"].includes(outcome)) {
+          throw new Error("Image operation returned an invalid outcome");
+        }
+        await session.log(`Image operation ${outcome}`, {
+          ephemeral: true,
+        });
+        return true;
+      }
+      const directModel = String(message?.providerModel || requestedManualModelOrNull(message) || message?.model || "").trim();
+      const prompt = String(message?.text || "").trim();
+      if (!directModel) throw new Error("OpenAI image request is missing model");
+      if (!prompt) throw new Error("OpenAI image request is missing prompt");
+      await api("POST", "/api/activity", {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        mode: message.relayMode || "agent",
+        text: `Calling OpenAI image API directly (${directModel})`,
+      }).catch(() => {});
+      let directResult;
+      try {
+        directResult = await api("POST", "/api/openai/images/generate", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          model: directModel,
+          prompt,
+          n: message?.n,
+          size: message?.size || message?.contextTier,
+          quality: message?.quality || message?.reasoningEffort,
+          attachments: Array.isArray(message?.attachments) ? message.attachments : [],
+        });
+      } catch (error) {
+        if (isDirectOpenAIImageTerminalStatus(error?.status)) {
+          const terminalError = new Error(
+            `OpenAI image request failed: ${error?.detail || `HTTP ${error?.status || "error"}`}`,
+          );
+          terminalError.code = "RELAY_OPENAI_IMAGE_TERMINAL";
+          throw terminalError;
+        }
+        throw error;
+      }
+      const generatedImages = Array.isArray(directResult?.generatedImages) ? directResult.generatedImages : [];
+      if (!generatedImages.length) {
+        throw new Error("OpenAI image API returned no images");
+      }
+      await api("POST", "/api/response", {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        text: "",
+        generatedImages,
+        model: String(directResult?.model || directModel).trim() || directModel,
+        modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
+      });
+      await session.log(`✅ Sent generated image response (${generatedImages.length} image${generatedImages.length === 1 ? "" : "s"})`, { ephemeral: true });
+      return true;
+    };
 
     try {
+      const handledWithDirectImageApi = await processDirectOpenAIImageRequest();
+      if (handledWithDirectImageApi) return true;
+
       if (message.model && !isAutoRequestedModel(message.model)) {
         const modelSwitch = await setModelForMessage(message.model, message.contextTier);
         const activeModel = modelSwitch.after || modelSwitch.current || "unknown";
-        const switchText = modelSwitch.switched
+        const switchText = modelSwitch.confirmationPending
+          ? `Model switch requested: requested=${message.model} active=pending target=${activeModel} via=${modelSwitch.via || "switchTo"}`
+          : modelSwitch.switched
           ? `Model selected: requested=${message.model} active=${activeModel} via=${modelSwitch.via || "switchTo"}`
           : `Model switch failed: requested=${message.model} active=${activeModel}${modelSwitch.error ? ` error=${modelSwitch.error}` : ""}`;
         await publishModelSnapshot("model-switch", true);
@@ -770,6 +887,8 @@ export function createPollingLoop({
       dbg("session.sendAndWait: completed for msgId", message.id, sendAndWaitDurationMs ? `durationMs=${sendAndWaitDurationMs}` : "");
 
       const text = stripPromptContextPrefix(extractFinalText(finalEvent), message, "", prompt);
+      const generatedImagePayload = extractGeneratedImages(finalEvent);
+      const generatedImages = Array.isArray(generatedImagePayload) ? generatedImagePayload : [];
       const model = await resolveResponseModel(message, { finalEvent, unknownForAuto: true });
       const boardPayload = buildPlanReadyBoardPayload({
         finalEvent,
@@ -788,22 +907,34 @@ export function createPollingLoop({
         const emptyHandling = resolveEmptyFinalTextHandling({
           lastStreamedSent,
           lastActivityText: String(getLastActivityText?.() || ""),
+          hasGeneratedImages: generatedImages.length > 0,
         });
         if (emptyHandling.action === "use_stream_text") {
           const streamedText = String(emptyHandling.text || "");
           dbg("sendAndWait returned empty content; finalizing from streamed text msgId", message.id, `len=${streamedText.length}`);
-          await session.log("⚠️ Empty final envelope text — using streamed text as final reply", { level: "warn" });
+          await session.log("⚠️ Empty final envelope text — using streamed text as final reply");
           await pushRelayStream(streamedText, true);
           await api("POST", "/api/response", {
             messageId: message.id,
             conversationId: message.conversationId,
             text: streamedText,
+            generatedImages,
+            model,
+            modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
+          });
+        } else if (emptyHandling.action === "publish_generated_images_only") {
+          dbg("sendAndWait returned empty text but generated images were captured; finalizing msgId", message.id, `images=${generatedImages.length}`);
+          await api("POST", "/api/response", {
+            messageId: message.id,
+            conversationId: message.conversationId,
+            text: "",
+            generatedImages,
             model,
             modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
           });
         } else {
           dbg("sendAndWait returned empty content; re-queueing msgId", message.id, emptyHandling.reason || "empty-final-text");
-          await session.log("⚠️ Empty assistant response envelope — re-queuing instead of sending fallback", { level: "warn" });
+          await session.log("⚠️ Empty assistant response envelope — re-queuing instead of sending fallback");
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
         }
       } else {
@@ -812,6 +943,7 @@ export function createPollingLoop({
           messageId: message.id,
           conversationId: message.conversationId,
           text,
+          generatedImages,
           model,
           modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
         });
@@ -846,7 +978,7 @@ export function createPollingLoop({
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
         });
       } else if (e?.code === "RELAY_WORKER_UNAVAILABLE" && e?.terminalFailure) {
-        await session.log("⚠️ Session worker became unavailable during the turn — marking it failed", { level: "warn" }).catch((logError) => {
+        await session.log("⚠️ Session worker became unavailable during the turn — marking it failed").catch((logError) => {
           dbg("session.log failed while reporting worker-unavailable", message.id, logError?.message || String(logError));
         });
         await pushRelayStream(lastStreamedSent, true);
@@ -854,6 +986,16 @@ export function createPollingLoop({
           messageId: message.id,
           conversationId: message.conversationId,
           terminalError: e.terminalFailure,
+          model: await resolveResponseModel(message, { unknownForAuto: true }),
+        }).catch(async () => {
+          await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
+        });
+      } else if (String(e?.code || "").trim() === "RELAY_OPENAI_IMAGE_TERMINAL") {
+        await pushRelayStream(lastStreamedSent, true);
+        await api("POST", "/api/response", {
+          messageId: message.id,
+          conversationId: message.conversationId,
+          text: String(e?.message || "OpenAI image request failed").trim(),
           model: await resolveResponseModel(message, { unknownForAuto: true }),
         }).catch(async () => {
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});

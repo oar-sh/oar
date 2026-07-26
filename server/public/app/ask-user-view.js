@@ -11,6 +11,7 @@ import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 
 let relayQuestionRenderHash = '';
+let renderedRelayQuestionIds = new Set();
 const relayQuestionStructuredDrafts = new Map();
 const RELAY_QUESTION_AUTO_SCROLL_THRESHOLD_PX = 80;
 
@@ -186,6 +187,8 @@ export function renderRelayQuestions() {
   const questions = Array.from(relayQuestions.values())
     .filter((q) => q && q.conversationId === currentConvId && q.status === 'pending')
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const firstNewQuestionId = questions.find((question) => !renderedRelayQuestionIds.has(question.id))?.id || '';
+  const nextRenderedQuestionIds = new Set(questions.map((question) => question.id));
 
   const nextHash = JSON.stringify(
     questions.map((q) => ({
@@ -212,6 +215,7 @@ export function renderRelayQuestions() {
   }
   existingCards.forEach((node) => node.remove());
   if (!questions.length) {
+    renderedRelayQuestionIds = nextRenderedQuestionIds;
     if (!shouldAutoScroll) el.scrollTop = previousScrollTop;
     return;
   }
@@ -272,8 +276,12 @@ export function renderRelayQuestions() {
     el.appendChild(wrapper);
   }
 
+  renderedRelayQuestionIds = nextRenderedQuestionIds;
   restoreFocusedQuestionControl(el, focusedControl);
-  if (shouldAutoScroll) {
+  if (firstNewQuestionId) {
+    const target = el.querySelector(`.relay-question-container[data-question-id="${CSS.escape(firstNewQuestionId)}"]`);
+    target?.scrollIntoView({ block: 'start', inline: 'nearest' });
+  } else if (shouldAutoScroll) {
     window.scrollBottom?.();
   } else {
     el.scrollTop = previousScrollTop;

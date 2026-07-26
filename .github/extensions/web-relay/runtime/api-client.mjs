@@ -13,7 +13,22 @@ export function createApiClient({ serverUrl, token, getHeaders }) {
     };
 
     const res = await fetch(url, opts);
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${routePath}`);
+    if (!res.ok) {
+      const rawText = String(await res.text().catch(() => "")).trim();
+      let detail = rawText;
+      if (rawText) {
+        try {
+          const payload = JSON.parse(rawText);
+          detail = String(payload?.error || payload?.message || rawText).trim();
+        } catch {
+          detail = rawText;
+        }
+      }
+      const error = new Error(`HTTP ${res.status} ${routePath}${detail ? `: ${detail}` : ""}`);
+      error.status = res.status;
+      error.detail = detail;
+      throw error;
+    }
     return res.json();
   };
 }

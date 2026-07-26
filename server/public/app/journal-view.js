@@ -26,6 +26,8 @@ import {
   deleteConversation as deleteConversationApi,
   bootstrapConversationSession,
   scheduleContextUsageRefresh,
+  loadModelCatalog,
+  loadOpenAISettings,
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
@@ -33,16 +35,29 @@ import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
+import {
+  buildNewConversationModelChoices,
+  reasoningChoicesForProviderModel,
+  resolvePreferredReasoningEffort,
+} from './new-conversation-model-choice.mjs';
+import { isConversationUsingOpenAIProvider } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 1000;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const CONVERSATION_LIST_PAGE_SIZE = 40;
+const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
+const REASONING_BY_MODE_STORAGE_KEY = 'copilot_selected_reasoning_by_mode';
+const OPENAI_IMAGE_SIZE_STORAGE_KEY = 'copilot_openai_image_size';
+const FALLBACK_REASONING_EFFORT = 'none';
+const FALLBACK_MODE = 'agent';
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let openConversationVersion = 0;
 let newConversationInFlight = false;
+let newConversationCatalogCache = null;
+let newConversationOpenAISettingsCache = null;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -246,10 +261,13 @@ export function renderConvList() {
   list.innerHTML = `${sorted.map((c) => {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
+    const providerIndicatorHtml = isConversationUsingOpenAIProvider(c)
+      ? ' · <span class="conv-provider-indicator">OpenAI</span>'
+      : '';
     return `
     <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}" onclick="openConversation('${c.id}')">
       <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${c.archived ? ' <span style="font-size:0.68rem;color:var(--muted)">(archived)</span>' : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</div>
+      <div class="conv-meta">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}${providerIndicatorHtml}</div>
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
   }).join('')}${footerHtml}`;
@@ -282,12 +300,22 @@ export function applyLoadedConversationState(id, response, {
     updatedAt: response.updatedAt ?? existingConversation.updatedAt ?? new Date().toISOString(),
     preferredRelayMode: response.preferredRelayMode ?? existingConversation.preferredRelayMode,
     preferredModelsByMode: response.preferredModelsByMode ?? existingConversation.preferredModelsByMode,
+    preferredReasoningByMode: response.preferredReasoningByMode ?? existingConversation.preferredReasoningByMode,
     configuredWorkspaceRootPath: response.configuredWorkspaceRootPath ?? existingConversation.configuredWorkspaceRootPath ?? null,
     configuredWorkspaceRootName: response.configuredWorkspaceRootName ?? existingConversation.configuredWorkspaceRootName ?? null,
     runtimeWorkspaceRootPath: response.runtimeWorkspaceRootPath ?? existingConversation.runtimeWorkspaceRootPath ?? null,
     runtimeWorkspaceRootName: response.runtimeWorkspaceRootName ?? existingConversation.runtimeWorkspaceRootName ?? null,
     currentWorkspaceRootPath: response.currentWorkspaceRootPath ?? existingConversation.currentWorkspaceRootPath ?? null,
     currentWorkspaceRootName: response.currentWorkspaceRootName ?? existingConversation.currentWorkspaceRootName ?? null,
+    runtimeProviderType: response.runtimeSession?.providerType
+      ?? existingConversation.runtimeProviderType
+      ?? 'github',
+    runtimeProviderModel: response.runtimeSession?.providerModel
+      ?? existingConversation.runtimeProviderModel
+      ?? null,
+    runtimeModel: response.runtimeSession?.model
+      ?? existingConversation.runtimeModel
+      ?? null,
     sessionUsageSummary: response.sessionUsageSummary ?? existingConversation.sessionUsageSummary ?? null,
     messageCount: Array.isArray(response.messages)
       ? Math.max(existingConversation.messageCount || 0, response.messages.length)
@@ -297,6 +325,7 @@ export function applyLoadedConversationState(id, response, {
   window.applyConversationPreferences?.(id, {
     preferredRelayMode: response.preferredRelayMode,
     preferredModelsByMode: response.preferredModelsByMode,
+    preferredReasoningByMode: response.preferredReasoningByMode,
   });
   setRepoBrowserSessionInfo(response.sessionRootPath || '', response.sessionRootName || response.title || '');
   if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
@@ -330,6 +359,7 @@ export async function openConversation(id, options = {}) {
   const nextConversationId = String(id || '').trim();
   if (previousConversationId && nextConversationId && previousConversationId !== nextConversationId) {
     await flushConversationDraft(previousConversationId);
+    window.clearImageEditTarget?.();
   }
   const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);
@@ -413,17 +443,335 @@ export async function openConversation(id, options = {}) {
   }
 }
 
-export async function newConversation() {
-  if (IS_SHARED_VIEW) {
-    showTransientRelayNotice('Shared conversations are read-only.');
+function normalizeNewConversationProviderType(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
+  return 'github';
+}
+
+function bootstrapProviderType(providerType = 'github') {
+  const normalized = normalizeNewConversationProviderType(providerType);
+  return normalized === 'openai-image' ? 'openai' : normalized;
+}
+
+function isOpenAIImageModelId(modelId = '') {
+  const value = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
+  return value.startsWith('gpt-image-') || value.startsWith('dall-e-');
+}
+
+function isLikelyOpenAIModelId(modelId = '') {
+  const value = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
+  if (!value) return false;
+  return /^gpt-/.test(value) || /^o[134](?:[.-]|$)/.test(value) || /^codex(?:[.-]|$)/.test(value);
+}
+
+function modelProvidersForCatalogModel(catalog = {}, modelId = '') {
+  const key = String(modelId || '').trim().toLowerCase();
+  if (!key) return [];
+  const providers = catalog?.providersByModel?.[key];
+  if (!Array.isArray(providers)) return [];
+  return providers.map((provider) => String(provider || '').trim().toLowerCase()).filter(Boolean);
+}
+
+function modelMatchesNewConversationProvider(catalog = {}, modelId = '', providerType = 'github') {
+  const normalizedModelId = String(modelId || '').trim();
+  if (!normalizedModelId) return false;
+  const providers = modelProvidersForCatalogModel(catalog, modelId);
+  const normalizedProvider = normalizeNewConversationProviderType(providerType);
+  const wantsOpenAI = normalizedProvider === 'openai' || normalizedProvider === 'openai-image';
+  const hasOpenAIByok = providers.includes('openai-byok');
+  if (wantsOpenAI) {
+    if (hasOpenAIByok) return true;
+    const settingsModel = String(newConversationOpenAISettingsCache?.model || '').trim();
+    const settingsModels = Array.isArray(newConversationOpenAISettingsCache?.models)
+      ? newConversationOpenAISettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    if (normalizedModelId === settingsModel || settingsModels.includes(normalizedModelId)) return true;
+    // Fallback when provider metadata is temporarily stale/missing.
+    if (providers.length === 0 && isLikelyOpenAIModelId(normalizedModelId)) return true;
+    return false;
+  }
+  return providers.some((provider) => provider !== 'openai-byok') || !hasOpenAIByok;
+}
+
+function openAIImageSizesForModel(modelId = '') {
+  const normalizedModel = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
+  if (normalizedModel.startsWith('dall-e-2')) return ['256x256', '512x512', '1024x1024'];
+  if (normalizedModel.startsWith('dall-e-3')) return ['1024x1024', '1792x1024', '1024x1792'];
+  return ['auto', '1024x1024', '1536x1024', '1024x1536'];
+}
+
+function syncNewConversationReasoningLabel(providerType = 'github') {
+  const label = document.querySelector('label[for="new-conversation-reasoning-select"]');
+  if (!label) return;
+  label.textContent = normalizeNewConversationProviderType(providerType) === 'openai-image'
+    ? 'Quality'
+    : 'Reasoning effort';
+}
+
+function populateNewConversationSizeSelect(providerType = 'github', selectedModel = '') {
+  const select = document.getElementById('new-conversation-size-select');
+  const row = document.getElementById('new-conversation-size-row');
+  const status = document.getElementById('new-conversation-size-status');
+  if (!select || !row) return;
+  const normalizedProvider = normalizeNewConversationProviderType(providerType);
+  if (normalizedProvider !== 'openai-image') {
+    row.style.display = 'none';
+    select.innerHTML = '';
     return;
   }
+  row.style.display = 'block';
+  const sizes = openAIImageSizesForModel(selectedModel);
+  const preferred = String(localStorage.getItem(OPENAI_IMAGE_SIZE_STORAGE_KEY) || '').trim().toLowerCase();
+  select.innerHTML = '';
+  for (const size of sizes) {
+    const option = document.createElement('option');
+    option.value = size;
+    option.textContent = size;
+    select.appendChild(option);
+  }
+  select.value = sizes.includes(preferred) ? preferred : sizes[0];
+  if (status) status.textContent = 'Image size used for generated outputs in this chat.';
+}
+
+function readStoredReasoningByMode() {
+  let raw = '';
+  try {
+    raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
+  } catch {
+    raw = '';
+  }
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [mode, effort] of Object.entries(parsed)) {
+      const modeKey = String(mode || '').trim();
+      const effortValue = String(effort || '').trim().toLowerCase();
+      if (!modeKey || !effortValue) continue;
+      out[modeKey] = effortValue;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function selectedComposerMode() {
+  return String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
+}
+
+async function populateNewConversationReasoningSelect(selectedModel = '') {
+  const select = document.getElementById('new-conversation-reasoning-select');
+  const status = document.getElementById('new-conversation-reasoning-status');
+  if (!select) return;
+  const modelId = String(selectedModel || '').trim().toLowerCase();
+  if (!modelId) {
+    select.innerHTML = '';
+    select.disabled = true;
+    if (status) status.textContent = 'No model selected.';
+    return;
+  }
+  const provider = normalizeNewConversationProviderType(
+    String(document.getElementById('new-conversation-provider-select')?.value || '').trim().toLowerCase(),
+  );
+  syncNewConversationReasoningLabel(provider);
+  const catalog = newConversationCatalogCache || await loadModelCatalog() || {};
+  const efforts = reasoningChoicesForProviderModel(catalog || {}, {
+    provider: provider === 'openai-image' ? 'openai' : provider,
+    modelId,
+  });
+  select.innerHTML = '';
+  if (!efforts.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'Unavailable';
+    select.appendChild(option);
+    select.value = '';
+    select.disabled = true;
+    if (status) status.textContent = 'Reasoning metadata unavailable for this model.';
+    return;
+  }
+  for (const effort of efforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort;
+    select.appendChild(option);
+  }
+  const storedReasoningByMode = readStoredReasoningByMode();
+  const mode = selectedComposerMode();
+  const preferred = resolvePreferredReasoningEffort(efforts, [
+    storedReasoningByMode[mode],
+    localStorage.getItem(REASONING_STORAGE_KEY),
+  ]);
+  select.value = preferred || efforts[0];
+  select.disabled = false;
+  if (status) {
+    status.textContent = provider === 'openai-image'
+      ? 'Choose output quality for generated images.'
+      : 'Choose the effort used when this conversation starts.';
+  }
+}
+
+function updateNewConversationProviderHelp(provider = 'github') {
+  const help = document.getElementById('new-conversation-provider-help');
+  if (!help) return;
+  const normalizedProvider = normalizeNewConversationProviderType(provider);
+  if (normalizedProvider === 'openai-image') {
+    help.textContent = 'OpenAI image chats call the Images API directly using your BYOK key.';
+    return;
+  }
+  if (normalizedProvider === 'openai') {
+    help.textContent = 'OpenAI models use your saved BYOK API key.';
+    return;
+  }
+  help.textContent = 'Copilot models use your GitHub Copilot runtime.';
+}
+
+async function populateNewConversationModelSelect(providerType = 'github') {
+  const target = document.getElementById('new-conversation-model-select');
+  if (!target) return false;
+  target.innerHTML = '';
+  const source = document.getElementById('model-select');
+  const sourceLabelByValue = new Map(
+    Array.from(source?.options || []).map((option) => [
+      String(option.value || '').trim(),
+      String(option.textContent || option.value || '').trim(),
+    ]),
+  );
+  const catalog = newConversationCatalogCache || await loadModelCatalog();
+  if (!catalog || !Array.isArray(catalog.models)) return false;
+  const normalizedProvider = normalizeNewConversationProviderType(providerType);
+  const choices = buildNewConversationModelChoices(
+    catalog.models
+      .filter((modelId) => modelMatchesNewConversationProvider(catalog, modelId, normalizedProvider))
+      .filter((modelId) => (
+        normalizedProvider !== 'openai-image' || isOpenAIImageModelId(modelId)
+      ))
+      .map((modelId) => {
+        const value = String(modelId || '').trim();
+        return {
+          value,
+          label: sourceLabelByValue.get(value) || value,
+        };
+      }),
+  );
+  for (const choice of choices) {
+    const option = document.createElement('option');
+    option.value = choice.value;
+    option.textContent = choice.label;
+    target.appendChild(option);
+  }
+  if (!target.options.length) return false;
+  const storedModel = String(localStorage.getItem('copilot_model') || '').trim();
+  if (storedModel && Array.from(target.options).some((option) => option.value === storedModel)) {
+    target.value = storedModel;
+  } else if (normalizedProvider !== 'openai-image' && Array.from(target.options).some((option) => option.value === 'auto')) {
+    target.value = 'auto';
+  }
+  updateNewConversationProviderHelp(normalizedProvider);
+  syncNewConversationReasoningLabel(normalizedProvider);
+  populateNewConversationSizeSelect(normalizedProvider, target.value);
+  await populateNewConversationReasoningSelect(target.value);
+  return true;
+}
+
+async function openNewConversationModelModal() {
+  const [catalog, settings] = await Promise.all([
+    loadModelCatalog(),
+    loadOpenAISettings(),
+  ]);
+  newConversationCatalogCache = catalog || null;
+  newConversationOpenAISettingsCache = settings || null;
+  const providerSelect = document.getElementById('new-conversation-provider-select');
+  if (providerSelect) {
+    const options = [{ value: 'github', label: 'Copilot' }];
+    if (settings?.enabled === true) {
+      options.push({ value: 'openai', label: 'OpenAI (BYOK)' });
+      options.push({ value: 'openai-image', label: 'OpenAI Image (BYOK)' });
+    }
+    providerSelect.innerHTML = '';
+    for (const option of options) {
+      const entry = document.createElement('option');
+      entry.value = option.value;
+      entry.textContent = option.label;
+      providerSelect.appendChild(entry);
+    }
+    const preferredProvider = 'github';
+    providerSelect.value = options.some((option) => option.value === preferredProvider)
+      ? preferredProvider
+      : options[0].value;
+    if (providerSelect.dataset.modelsBound !== '1') {
+      providerSelect.dataset.modelsBound = '1';
+      providerSelect.addEventListener('change', () => {
+        void populateNewConversationModelSelect(providerSelect.value);
+      });
+    }
+  }
+
+  if (!(await populateNewConversationModelSelect(providerSelect?.value || 'github'))) {
+    showTransientRelayNotice('No model is currently available for a new conversation.', 5000);
+    return;
+  }
+  const modelSelect = document.getElementById('new-conversation-model-select');
+  if (modelSelect && modelSelect.dataset.reasoningBound !== '1') {
+    modelSelect.dataset.reasoningBound = '1';
+    modelSelect.addEventListener('change', () => {
+      const provider = String(document.getElementById('new-conversation-provider-select')?.value || '').trim();
+      populateNewConversationSizeSelect(provider, modelSelect.value);
+      void populateNewConversationReasoningSelect(modelSelect.value);
+    });
+  }
+  const modal = document.getElementById('new-conversation-model-modal');
+  if (!modal) return;
+  modal.classList.add('visible');
+  modal.setAttribute('aria-hidden', 'false');
+  setTimeout(() => document.getElementById('new-conversation-model-select')?.focus(), 0);
+}
+
+export function closeNewConversationModelModal() {
+  if (newConversationInFlight) return;
+  const modal = document.getElementById('new-conversation-model-modal');
+  modal?.classList.remove('visible');
+  modal?.setAttribute('aria-hidden', 'true');
+}
+
+function persistReasoningSelection(reasoningEffort = '') {
+  const effort = String(reasoningEffort || '').trim().toLowerCase();
+  if (!effort) return;
+  localStorage.setItem(REASONING_STORAGE_KEY, effort);
+  const mode = selectedComposerMode();
+  const reasoningByMode = {
+    ...readStoredReasoningByMode(),
+    [mode]: effort || FALLBACK_REASONING_EFFORT,
+  };
+  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(reasoningByMode));
+  const composerReasoningSelect = document.getElementById('reasoning-effort-select');
+  if (composerReasoningSelect && Array.from(composerReasoningSelect.options || []).some((option) => option.value === effort)) {
+    composerReasoningSelect.value = effort;
+  }
+}
+
+async function createNewConversation(selectedModel, selectedReasoningEffort = '') {
   if (newConversationInFlight) return;
   newConversationInFlight = true;
+  const confirmButton = document.getElementById('new-conversation-model-confirm');
+  if (confirmButton) confirmButton.disabled = true;
+  persistReasoningSelection(selectedReasoningEffort);
+  const selectedProvider = normalizeNewConversationProviderType(
+    String(document.getElementById('new-conversation-provider-select')?.value || '').trim(),
+  );
+  const selectedSize = String(document.getElementById('new-conversation-size-select')?.value || '').trim().toLowerCase();
+  if (selectedProvider === 'openai-image' && selectedSize) {
+    localStorage.setItem(OPENAI_IMAGE_SIZE_STORAGE_KEY, selectedSize);
+  }
   try {
-    const selectedModel = String(document.getElementById('model-select')?.value || '').trim();
     const result = await bootstrapConversationSession({
       model: selectedModel || undefined,
+      providerType: bootstrapProviderType(selectedProvider),
+      reasoningEffort: String(selectedReasoningEffort || '').trim().toLowerCase() || undefined,
       title: 'New Conversation',
     });
     const nextConversationId = String(result?.conversationId || '').trim();
@@ -431,8 +779,22 @@ export async function newConversation() {
       showTransientRelayNotice('Could not start a new conversation session. Please try again.');
       return;
     }
+    const bootstrappedModel = String(result?.selectedModel || '').trim();
+    if (bootstrappedModel) {
+      localStorage.setItem('copilot_model', bootstrappedModel);
+      const modelSelect = document.getElementById('model-select');
+      if (Array.from(modelSelect?.options || []).some((option) => option.value === bootstrappedModel)) {
+        modelSelect.value = bootstrappedModel;
+      }
+    }
     await refreshConversations();
     await openConversation(nextConversationId);
+    if (selectedProvider === 'openai-image') {
+      const contextTierSelect = document.getElementById('context-tier-select');
+      if (contextTierSelect && selectedSize && Array.from(contextTierSelect.options).some((option) => option.value === selectedSize)) {
+        contextTierSelect.value = selectedSize;
+      }
+    }
     if (result?.warning) {
       showTransientRelayNotice(String(result.warning), 6000);
     }
@@ -443,7 +805,34 @@ export async function newConversation() {
     showTransientRelayNotice(error?.message || 'Could not start a new conversation session.');
   } finally {
     newConversationInFlight = false;
+    if (confirmButton) confirmButton.disabled = false;
   }
+}
+
+export async function confirmNewConversationModel() {
+  if (newConversationInFlight) return;
+  const selectedModel = String(document.getElementById('new-conversation-model-select')?.value || '').trim();
+  const selectedReasoningEffort = String(document.getElementById('new-conversation-reasoning-select')?.value || '').trim().toLowerCase();
+  if (!selectedModel) return;
+  const modal = document.getElementById('new-conversation-model-modal');
+  modal?.classList.remove('visible');
+  modal?.setAttribute('aria-hidden', 'true');
+  await createNewConversation(selectedModel, selectedReasoningEffort);
+}
+
+export async function newConversation() {
+  if (IS_SHARED_VIEW) {
+    showTransientRelayNotice('Shared conversations are read-only.');
+    return;
+  }
+  if (newConversationInFlight) return;
+  const settings = await loadOpenAISettings();
+  if (settings?.enabled === true) {
+    void openNewConversationModelModal();
+    return;
+  }
+  const selectedModel = String(document.getElementById('model-select')?.value || '').trim();
+  await createNewConversation(selectedModel);
 }
 
 export function initConversationListLazyLoading() {

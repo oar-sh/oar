@@ -23,7 +23,9 @@ function createSdkDeleteSessionCaller(sdkClient) {
   };
 }
 
-export function createDeleteArchiveService(db, sdkClient) {
+import { cleanupGeneratedImagesForConversation } from './generated-image-cleanup-service.mjs';
+
+export function createDeleteArchiveService(db, sdkClient, { resolveSessionStateRoot = null } = {}) {
   const callDeleteSession = createSdkDeleteSessionCaller(sdkClient);
 
   const stmts = {
@@ -40,6 +42,12 @@ export function createDeleteArchiveService(db, sdkClient) {
       FROM conversations c
       WHERE c.status = 'deleted'
       ORDER BY c.updated_at ASC
+    `),
+    listConversationMessages: db.prepare(`
+      SELECT attachments
+      FROM messages
+      WHERE conversation_id = ?
+      ORDER BY timestamp ASC
     `),
     hardDeleteConversation: db.transaction((conversationId) => {
       db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(conversationId);
@@ -72,6 +80,13 @@ export function createDeleteArchiveService(db, sdkClient) {
   }
 
   async function hardDeleteConversation(conversationId) {
+    const row = stmts.getConversation.get(conversationId);
+    cleanupGeneratedImagesForConversation({
+      conversationId,
+      sdkSessionId: String(row?.sdk_session_id || '').trim() || null,
+      messageRows: stmts.listConversationMessages.all(conversationId),
+      resolveSessionStateRoot,
+    });
     stmts.hardDeleteConversation(conversationId);
   }
 

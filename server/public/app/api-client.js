@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setContextIndicatorMode, setServerPlatform } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform } from './store.js';
 
 let networkRequestsEnabled = true;
 let fetchOutageActive = false;
@@ -74,6 +74,7 @@ export async function verifyExistingSession(tokenCandidate = '') {
         setContextIndicatorMode(payload?.contextIndicatorMode);
         setCliOnline(!!payload?.cliOnline);
         setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+        setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
         if (payload?.platform) setServerPlatform(payload.platform);
       }
       if (response.ok) noteFetchSuccess();
@@ -128,6 +129,7 @@ export async function verifyToken(token) {
       setContextIndicatorMode(payload?.contextIndicatorMode);
       setCliOnline(!!payload?.cliOnline);
       setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+      setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
       if (payload?.platform) setServerPlatform(payload.platform);
     }
     if (response.ok) noteFetchSuccess();
@@ -155,6 +157,7 @@ export async function refreshWorkspaceRootHints() {
     setContextIndicatorMode(status?.contextIndicatorMode);
     setCliOnline(!!status?.cliOnline);
     setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
+    setRuntimeSessionBindingCount(status?.runtimeSessionBindingCount);
     if (status?.platform) setServerPlatform(status.platform);
   }
   return status;
@@ -189,11 +192,73 @@ export async function updateDefaultSessionWorkspaceRoot(rootPath, options = {}) 
   return response;
 }
 
+export async function loadOpenAISettings() {
+  return apiFetch('/api/settings/openai');
+}
+
+export async function updateOpenAISettings({
+  apiKey = '',
+  model = 'gpt-4o',
+  baseUrl = undefined,
+  enabled = undefined,
+  remove = false,
+} = {}) {
+  const payload = {
+    apiKey: String(apiKey || '').trim(),
+    model: String(model || '').trim() || 'gpt-4o',
+    remove: remove === true,
+  };
+  if (typeof baseUrl === 'string') payload.baseUrl = String(baseUrl).trim();
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}/api/settings/openai`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = String(result?.error || `Failed to update OpenAI settings (${response.status})`).trim();
+      throw new Error(message);
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure('/api/settings/openai', error);
+    throw error;
+  }
+}
+
+export async function loadWindowsAutostartSetting() {
+  return apiFetch('/api/settings/windows-autostart');
+}
+
+export async function updateWindowsAutostartSetting(enabled) {
+  return apiFetch('/api/settings/windows-autostart', {
+    method: 'POST',
+    body: JSON.stringify({ enabled: !!enabled }),
+  });
+}
+
 export async function launchSessionWorker(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return null;
   return apiFetch(`/api/session-worker/${encodeURIComponent(sessionId)}/launch`, {
     method: 'POST',
+  });
+}
+
+export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, rootPath) {
+  const convId = String(conversationId || '').trim();
+  const pathValue = String(rootPath || '').trim();
+  if (!convId || !pathValue) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/relaunch-with-workspace-root`, {
+    method: 'POST',
+    body: JSON.stringify({ rootPath: pathValue }),
   });
 }
 

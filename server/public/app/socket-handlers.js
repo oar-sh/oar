@@ -82,6 +82,7 @@ let deps = null;
  * @property {(conversationId: string, title: string, updatedAt?: string | number | null) => void} applyConversationTitleUpdate
  * @property {() => void} syncChatTitleControls
  * @property {(conversationId: string, payload?: object) => void} applyConversationPreferencesForConversation
+ * @property {(payload?: object) => void} applyOpenAISettingsState
  */
 
 /**
@@ -182,6 +183,14 @@ export async function connectSocket(overrideDeps) {
   socket.on('models_updated', (payload) => {
     updateModelCatalogState(payload || {});
     void reconcileOpenModelVariantModal();
+  });
+  socket.on('openai_settings_updated', (payload) => {
+    deps?.applyOpenAISettingsState?.(payload || {});
+    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
+      void Promise.resolve()
+        .then(() => deps?.refreshCurrentView?.())
+        .catch(() => {});
+    }
   });
   socket.on('shared_access', (event) => {
     publishStatusEvent(event);
@@ -341,7 +350,7 @@ export async function connectSocket(overrideDeps) {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModelsByMode, senderClientId }) => {
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModelsByMode, preferredReasoningByMode, senderClientId }) => {
     if (senderClientId && senderClientId === CLIENT_ID) return;
     const id = String(conversationId || '').trim();
     if (!id || !conversations[id]) return;
@@ -349,11 +358,13 @@ export async function connectSocket(overrideDeps) {
       ...conversations[id],
       preferredRelayMode: preferredRelayMode || conversations[id].preferredRelayMode || FALLBACK_MODE,
       preferredModelsByMode: preferredModelsByMode || conversations[id].preferredModelsByMode || {},
+      preferredReasoningByMode: preferredReasoningByMode || conversations[id].preferredReasoningByMode || {},
     };
     if (String(currentConvId || '').trim() === id) {
       applyConversationPreferencesForConversation(id, {
         preferredRelayMode,
         preferredModelsByMode,
+        preferredReasoningByMode,
       });
     }
   });

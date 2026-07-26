@@ -493,7 +493,7 @@ export function createSessionWorkerSupervisor({
     return registry.listWorkers();
   }
 
-  async function ensureWorker(sdkSessionId) {
+  async function ensureWorker(sdkSessionId, { allowProcessReuse = true } = {}) {
     const sessionId = normalizeSessionId(sdkSessionId);
     if (!sessionId) {
       return { ok: false, error: 'missing-session-id', worker: null };
@@ -512,7 +512,7 @@ export function createSessionWorkerSupervisor({
     const existing = registry.getWorker(sessionId);
     const existingLifecycle = getOrCreateLifecycle(sessionId);
     const blockedByStartupFailure = hasStartupFailureReason(existingLifecycle);
-    if (!blockedByStartupFailure && shouldReuseLiveWorker(existing)) {
+    if (allowProcessReuse && !blockedByStartupFailure && shouldReuseLiveWorker(existing)) {
       const nowAtMs = nowMs();
       const reusedWorker = setWorkerState(sessionId, {
         ...existing,
@@ -575,7 +575,7 @@ export function createSessionWorkerSupervisor({
             return buildStartBlockedResult();
           }
           const spawned = await spawnWorker(sessionId, {
-            allowProcessReuse: !blockedByStartupFailure,
+            allowProcessReuse: allowProcessReuse && !blockedByStartupFailure,
           });
           if (!isStartActive() || isKillBlocked(sessionId)) {
             return buildStartBlockedResult();

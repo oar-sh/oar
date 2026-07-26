@@ -2,10 +2,28 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  isValidModelId,
   canonicalizeModelId,
   filterValidModelIds,
+  isOpenAIModelId,
+  isSafeProviderModelId,
+  isValidModelId,
 } from './model-id.mjs';
+
+test('isOpenAIModelId recognizes OpenAI model families', () => {
+  assert.equal(isOpenAIModelId('gpt-4o'), true);
+  assert.equal(isOpenAIModelId('chatgpt-4o-latest'), true);
+  assert.equal(isOpenAIModelId('o1'), true);
+  assert.equal(isOpenAIModelId('o3-pro'), true);
+  assert.equal(isOpenAIModelId('codex-mini-latest'), true);
+  assert.equal(isOpenAIModelId('claude-sonnet-4.6'), false);
+});
+
+test('isSafeProviderModelId accepts short OpenAI IDs', () => {
+  assert.equal(isSafeProviderModelId('o1'), true);
+  assert.equal(isSafeProviderModelId('o3'), true);
+  assert.equal(isValidModelId('o1'), true);
+  assert.equal(isValidModelId('o3'), true);
+});
 
 test('isValidModelId accepts canonical model ids', () => {
   assert.equal(isValidModelId('gpt-5.4-mini'), true);

@@ -51,8 +51,10 @@ export const pendingUserMessageEntries = new Map();
 export let cliOnline = false;
 export let relayOnline = false;
 export let activeRuntimeSessionCount = 0;
+export let runtimeSessionBindingCount = 0;
 export let conversations = {};
 export let selectedAttachments = [];
+export let imageEditTarget = null;
 export const RELAY_QUESTION_POLL_MS = 3000;
 export const MAX_UPLOAD_ATTACHMENTS = 6;
 export const FILE_PREVIEW_MAX_BYTES = 512 * 1024;
@@ -93,7 +95,7 @@ export let filePreviewState = {
   path: '',
   source: 'workspace',
   mode: 'preview',
-  allowHtml: false,
+  allowHtml: true,
   loading: false,
   error: '',
   payload: null,
@@ -463,6 +465,12 @@ export function setActiveRuntimeSessionCount(value) {
   updateCliStatus();
 }
 
+export function setRuntimeSessionBindingCount(value) {
+  const numeric = Number(value);
+  runtimeSessionBindingCount = Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 0;
+  updateCliStatus();
+}
+
 export function clampContextUsageRatio(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
@@ -720,6 +728,17 @@ export function setRelayOnline(value) {
   relayOnline = nextOnline;
   if (changed) recordRelayLifecycleEvent(nextOnline);
   updateCliStatus();
+}
+
+export function setImageEditTarget(value) {
+  imageEditTarget = value && typeof value === 'object'
+    ? {
+        messageId: String(value.messageId || '').trim(),
+        imageId: String(value.imageId || '').trim(),
+        nodeId: String(value.nodeId || '').trim() || null,
+        name: String(value.name || 'generated image').trim() || 'generated image',
+      }
+    : null;
 }
 
 function normalizeWorkerSessionId(value) {

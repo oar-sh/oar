@@ -17,3 +17,10 @@ test('index auth gate uses resilient connect handler', () => {
   assert.match(source, /onclick="window\.__copilotAuthConnect\(event\)"/);
   assert.match(source, /onkeydown="if\(event\.key==='Enter'\)window\.__copilotAuthConnect\(event\)"/);
 });
+
+test('index keeps the auth gate hidden until bootstrap needs it', () => {
+  assert.match(source, /#auth-gate \{\s*display: none;/);
+  assert.match(source, /<div id="startup-loading" role="status" aria-live="polite">Connecting to Copilot Remote…<\/div>/);
+  assert.match(source, /document\.getElementById\('startup-loading'\)\?\.remove\(\);/);
+  assert.match(source, /document\.getElementById\('auth-gate'\)\.style\.display = 'flex';/);
+});

@@ -29,6 +29,31 @@ test('supervisor waits for startup heartbeat when launched pid is unknown', asyn
   assert.equal(afterTimeout?.uiState, 'yellow');
 });
 
+test('ensureWorker can force a fresh process launch', async () => {
+  const spawnOptions = [];
+  const registry = createSessionWorkerRegistry();
+  registry.upsertWorker({
+    sdkSessionId: 'fresh-session',
+    pid: process.pid,
+    status: 'ready',
+  });
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    isPidAlive: () => true,
+    spawnWorker: async (_sessionId, options) => {
+      spawnOptions.push(options);
+      return { workerId: 'worker-fresh', pid: 12345 };
+    },
+  });
+
+  const result = await supervisor.ensureWorker('fresh-session', {
+    allowProcessReuse: false,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.reused, false);
+  assert.deepEqual(spawnOptions, [{ allowProcessReuse: false }]);
+});
+
 test('supervisor marks stale pid when known launched pid is dead and work is pending', async () => {
   const registry = createSessionWorkerRegistry();
   const supervisor = createSessionWorkerSupervisor({

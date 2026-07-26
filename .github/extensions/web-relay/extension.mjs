@@ -12,7 +12,12 @@ import fs from "fs";
 import path from "path";
 import { generateHighEntropyToken } from "./utils/token-generation.mjs";
 import { delay, killProcessTree, sleep } from "./utils/process-utils.mjs";
-import { resolveRelayPaths, loadTokenFromConfig, loadRelayInstructionsFromFile } from "./runtime/config-loader.mjs";
+import {
+  resolveRelayPaths,
+  loadTokenFromConfig,
+  loadRelayInstructionsFromFile,
+  resolveRelayServerUrl,
+} from "./runtime/config-loader.mjs";
 import { createDebugLogger } from "./runtime/debug-log.mjs";
 import { createApiClient } from "./runtime/api-client.mjs";
 import {
@@ -43,7 +48,6 @@ import { syncSessionToServer, syncWorkspaceRootToServer } from "./runtime/sessio
 import { joinSessionWithRetry } from "./runtime/session-join-retry.mjs";
 import { resolveWorkspaceRootPath } from "./runtime/workspace-root.mjs";
 
-const SERVER_URL   = "http://localhost:3333";
 const POLL_MS      = 10_000;
 const HEARTBEAT_MS = 10_000;
 
@@ -57,6 +61,7 @@ const {
   SERVER_LOG_PATH,
   SERVER_ERR_PATH,
 } = resolveRelayPaths(import.meta.url);
+const SERVER_URL = resolveRelayServerUrl({ configPath: CONFIG_PATH });
 const SERVER_START_TIMEOUT_MS = 20_000;
 const NODE_BIN = process.env.COPILOT_WEB_RELAY_NODE || "node";
 
@@ -121,6 +126,7 @@ const managedServerLifecycle = createManagedServerLifecycle({
   serverDir: SERVER_DIR,
   serverLogPath: SERVER_LOG_PATH,
   serverErrPath: SERVER_ERR_PATH,
+  relayPort: Number(new URL(SERVER_URL).port) || 3333,
   nodeBin: NODE_BIN,
   serverStartTimeoutMs: SERVER_START_TIMEOUT_MS,
 });
@@ -520,6 +526,7 @@ async function startPolling() {
       sendAndWaitWithHardTimeout,
       sendWithBestEffortStreaming,
       extractFinalText,
+      extractGeneratedImages,
       getLastActivityText: () => getScopedLastActivityText(),
       getCurrentModelId,
       getPreferredConversationSessionMode: () => preferredConversationSessionMode,
@@ -974,5 +981,6 @@ async function ensureRelayActive(reason) {
 }
 
 const extractFinalText = sessionIo.extractFinalText;
+const extractGeneratedImages = sessionIo.extractGeneratedImages;
 const sendAndWaitWithHardTimeout = sessionIo.sendAndWaitWithHardTimeout;
 const sendWithBestEffortStreaming = sessionIo.sendWithBestEffortStreaming;

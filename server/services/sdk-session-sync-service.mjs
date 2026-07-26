@@ -13,6 +13,14 @@ function makeError(message, statusCode) {
 }
 
 export function createSdkSessionSyncService(db) {
+  const runtimeSessionColumns = new Set(
+    db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((column) => String(column?.name || '').trim()),
+  );
+  const runtimeSessionsSupportProviders = runtimeSessionColumns.has('provider_type')
+    && runtimeSessionColumns.has('provider_model');
+  const providerSelect = runtimeSessionsSupportProviders
+    ? 'provider_type, provider_model'
+    : `'github' AS provider_type, NULL AS provider_model`;
   const getConversation = db.prepare(`
     SELECT id, sdk_session_id, status
     FROM conversations
@@ -29,14 +37,14 @@ export function createSdkSessionSyncService(db) {
   `);
 
   const getRuntimeSessionByConversation = db.prepare(`
-    SELECT id, conversation_id, sdk_session_id, status, strategy, runtime_key, model
+    SELECT id, conversation_id, sdk_session_id, status, strategy, runtime_key, model, ${providerSelect}
     FROM runtime_sessions
     WHERE conversation_id = ?
     LIMIT 1
   `);
 
   const getRuntimeSessionBySdkSessionId = db.prepare(`
-    SELECT id, conversation_id, sdk_session_id, status, strategy, runtime_key, model
+    SELECT id, conversation_id, sdk_session_id, status, strategy, runtime_key, model, ${providerSelect}
     FROM runtime_sessions
     WHERE sdk_session_id = ?
     LIMIT 1
@@ -65,11 +73,17 @@ export function createSdkSessionSyncService(db) {
       AND conversation_id = ?
   `);
 
-  const insertRuntimeSession = db.prepare(`
-    INSERT INTO runtime_sessions (
-      id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id
-    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
-  `);
+  const insertRuntimeSession = db.prepare(runtimeSessionsSupportProviders
+    ? `
+      INSERT INTO runtime_sessions (
+        id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id, provider_type, provider_model
+      ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, 'github', NULL)
+    `
+    : `
+      INSERT INTO runtime_sessions (
+        id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id
+      ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+    `);
 
   const syncSessionTx = db.transaction((sdkSessionIdRaw, conversationIdRaw) => {
     const sdkSessionId = normalizeId(sdkSessionIdRaw);

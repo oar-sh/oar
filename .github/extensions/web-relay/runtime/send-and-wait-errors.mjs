@@ -40,7 +40,7 @@ function classifyTerminalError(text) {
       guidance: "Retry the message. If it repeats, restart the relay and include the error code.",
     };
   }
-  if ((lower.includes("capierror") || lower.includes("http 400") || lower.includes("status 400"))
+  if ((lower.includes("capierror") || lower.includes("http 400") || lower.includes("status 400") || /^400\b/.test(lower))
     && !lower.includes("timeout")
     && !lower.includes("temporar")
     && !lower.includes("rate limit")) {

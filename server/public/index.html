@@ -173,15 +173,23 @@
 <title>Copilot Remote</title>
 <script>document.write('<scr'+'ipt src="'+__APP_BASE+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/mhchem.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/nginx.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/powershell.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/x86asm.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.min.css">
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.10.0/lib/xterm-addon-fit.min.js"></script>
 <script>
   if (window.hljs && typeof window.hljs.registerAliases === 'function') {
     window.hljs.registerAliases(['pwsh', 'ps1'], { languageName: 'powershell' });
+    window.hljs.registerAliases(['caddy', 'caddyfile'], { languageName: 'nginx' });
+    window.hljs.registerAliases(['asm'], { languageName: 'x86asm' });
   }
 </script>
 <script>
@@ -330,8 +338,14 @@
 
   /* ── Auth Gate ── */
   #auth-gate {
+    display: none; align-items: center; justify-content: center;
+    height: var(--app-height); padding: 24px;
+  }
+  #startup-loading {
     display: flex; align-items: center; justify-content: center;
     height: var(--app-height); padding: 24px;
+    color: var(--muted);
+    font-size: var(--fs-core-subtitle);
   }
   .auth-box {
     background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
@@ -450,6 +464,24 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
+  #provider-status-pill {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    color: var(--muted);
+    background: var(--bg3);
+    font-size: var(--fs-meta-xs);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  #provider-status-pill[data-provider="openai"] {
+    color: #56d4a0;
+    border-color: rgba(86, 212, 160, 0.45);
+    background: rgba(86, 212, 160, 0.1);
+  }
   #cli-dot {
     width: 12px;
     height: 12px;
@@ -565,6 +597,19 @@
   .conv-item.active { background: var(--bg3); border-color: var(--border); }
   .conv-title { font-size: var(--fs-meta-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
   .conv-meta  { font-size: var(--fs-meta-xs); color: var(--muted); margin-top: 2px; padding-right: 24px; }
+  .conv-provider-indicator {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 6px;
+    border-radius: 999px;
+    border: 1px solid rgba(88, 166, 255, 0.4);
+    background: rgba(88, 166, 255, 0.14);
+    color: var(--accent);
+    font-size: var(--fs-ui-chip);
+    font-weight: 600;
+    line-height: 1.25;
+    vertical-align: middle;
+  }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
   .conv-item.worker-ui-ready .conv-title,
@@ -865,6 +910,9 @@
     font-size: var(--fs-meta-sm);
     line-height: 1.35;
   }
+  .settings-provider-status[data-state="active"] { color: #3fb950; }
+  .settings-provider-status[data-state="saved"] { color: var(--accent); }
+  .settings-provider-status[data-state="error"] { color: #f85149; }
   #pending-question-banner {
     display: none;
     border: 1px solid rgba(88, 166, 255, 0.45);
@@ -1059,6 +1107,24 @@
     display: block;
     white-space: inherit;
   }
+  .katex-display {
+    max-width: 100%;
+    margin: 0.65em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.1em 0;
+    -webkit-overflow-scrolling: touch;
+  }
+  .katex,
+  .katex * {
+    max-width: none;
+    overflow-wrap: normal;
+    word-break: normal;
+  }
+  .katex-error {
+    color: var(--danger);
+    white-space: pre-wrap;
+  }
   .msg-bubble code:not(pre code) {
     background: var(--inline-code-bg); padding: 2px 6px; border-radius: 4px; font-size: 0.875em;
     white-space: normal;
@@ -1146,24 +1212,11 @@
   .msg.user .bubble-action-btn:hover:not(:disabled) {
     background: rgba(255, 255, 255, 0.18);
   }
-  .thinking-text {
-    display: none;
-    margin-bottom: 8px;
-    font-size: var(--fs-core-composer);
-    line-height: 1.5;
-    color: var(--text);
-    min-width: 0;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-  }
-  .thinking-text.visible { display: block; }
-  .thinking-text p { margin: 0; }
   .thinking-thoughts-panel {
     margin-bottom: 8px;
     min-width: 0;
     color: var(--muted);
-    font-size: var(--fs-meta-sm);
+    font-size: var(--fs-meta-md);
   }
   .thinking-thoughts-panel > summary {
     cursor: pointer;
@@ -1293,6 +1346,7 @@
     font-style: italic;
     color: var(--muted);
     opacity: 0.92;
+    font-size: var(--fs-meta-md);
   }
   .thinking-thought > summary {
     cursor: pointer;
@@ -1302,6 +1356,7 @@
     word-break: break-word;
   }
   .thinking-thought > summary::-webkit-details-marker { display: none; }
+  .thinking-thought[open] > summary { display: none; }
   .thinking-thought-body {
     margin: 4px 0 6px 18px;
     font-style: normal;
@@ -1397,6 +1452,38 @@
   #attachment-preview.visible {
     display: flex;
   }
+  #image-edit-target {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--bg-secondary);
+    font-size: 12px;
+  }
+  #image-edit-target.visible { display: flex; }
+  #image-edit-target span { flex: 1; min-width: 0; }
+  #image-edit-target button {
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .msg-image-continuity-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 5px;
+  }
+  .msg-image-continuity-actions button {
+    border: 0;
+    padding: 0;
+    color: var(--accent);
+    background: transparent;
+    cursor: pointer;
+    font: inherit;
+  }
   .attachment-preview-item {
     position: relative; width: 88px; border: 1px solid var(--border); border-radius: 10px;
     overflow: hidden; background: var(--bg3);
@@ -1456,13 +1543,25 @@
     cursor: pointer;
   }
   #model-metadata-retry-btn:hover { background: rgba(210, 153, 34, 0.2); }
+  #model-lock-note {
+    margin-bottom: 6px;
+    color: #56d4a0;
+    font-size: var(--fs-meta-sm);
+    font-weight: 600;
+  }
   #model-select:disabled,
   #reasoning-effort-select:disabled {
     opacity: 0.55;
     cursor: not-allowed;
   }
 
-  .input-row { display: flex; gap: 10px; align-items: flex-end; }
+  .input-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+    grid-template-rows: auto auto;
+    gap: 10px;
+    align-items: stretch;
+  }
   #repo-browser-desktop-btn,
   #repo-browser-input-btn,
   #attach-btn,
@@ -1477,6 +1576,18 @@
   #repo-browser-input-btn {
     display: none;
   }
+  #emoji-btn {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    align-self: end;
+  }
+  #mode-select { grid-column: 3; grid-row: 1; }
+  #model-select { grid-column: 4; grid-row: 1; }
+  #repo-browser-desktop-btn { grid-column: 5; grid-row: 1; }
+  #attach-btn { grid-column: 6; grid-row: 1; justify-self: start; }
+  #context-tier-select { grid-column: 3; grid-row: 2; }
+  #reasoning-effort-select { grid-column: 4 / 6; grid-row: 2; }
+  #send-btn { grid-column: 6; grid-row: 2; justify-self: stretch; }
   #repo-browser-desktop-btn:hover,
   #repo-browser-input-btn:hover { border-color: var(--accent); color: var(--accent); }
   #emoji-btn:hover { border-color: var(--accent); }
@@ -1514,9 +1625,13 @@
     border-color: var(--accent);
   }
   #msg-input {
+    grid-column: 2;
+    grid-row: 1 / -1;
+    align-self: stretch;
     flex: 1; padding: 12px 16px; font-size: var(--fs-core-composer);
     background: var(--bg3); border: 1px solid var(--border); border-radius: 12px;
-    color: var(--text); resize: none; outline: none; min-height: 46px; max-height: 132px;
+    color: var(--text); resize: none; outline: none;
+    min-height: calc(46px + 10px + 46px); max-height: 132px;
     line-height: 1.4; font-family: inherit;
   }
   #msg-input:focus { border-color: var(--accent); }
@@ -1533,6 +1648,7 @@
     min-width: 140px; outline: none;
   }
   #context-tier-select { min-width: 70px; width: 70px; }
+  #reasoning-effort-select { min-width: 0; width: auto; }
   #model-select:focus,
   #reasoning-effort-select:focus,
   #context-tier-select:focus { border-color: var(--accent); }
@@ -1619,6 +1735,7 @@
     border-color: var(--accent);
     color: var(--accent);
   }
+  .file-preview-btn[hidden] { display: none; }
   .file-preview-warning {
     display: none;
     margin-left: auto;
@@ -1644,9 +1761,10 @@
   .file-preview-markdown p { margin-bottom: 0.55em; }
   .file-preview-markdown h1, .file-preview-markdown h2, .file-preview-markdown h3 { margin: 0.6em 0 0.35em; }
   .file-preview-markdown ul, .file-preview-markdown ol { margin-left: 1.3em; margin-bottom: 0.55em; }
-  .file-preview-markdown table { border-collapse: collapse; width: 100%; margin: 0.55em 0; font-size: 0.88em; }
+  .file-preview-markdown table { border-collapse: collapse; width: 100%; max-width: 100%; margin: 0.55em 0; font-size: 0.88em; }
   .file-preview-markdown th, .file-preview-markdown td { border: 1px solid var(--border); padding: 6px 9px; }
   .file-preview-markdown th { background: var(--bg3); }
+  .file-preview-markdown img { display: block; max-width: 100%; height: auto; }
   .file-preview-markdown pre,
   .file-preview-code pre {
     background: #0b0f14;
@@ -1737,7 +1855,7 @@
     margin-top: 10px;
   }
 
-  #settings-modal, #summary-modal, #tmux-inspector-modal {
+  #settings-modal, #summary-modal, #tmux-inspector-modal, #new-conversation-model-modal {
     position: fixed;
     inset: 0;
     z-index: 12050;
@@ -1747,7 +1865,17 @@
     background: rgba(0, 0, 0, 0.68);
     padding: 18px;
   }
-  #settings-modal.visible, #summary-modal.visible, #tmux-inspector-modal.visible { display: flex; }
+  #settings-modal.visible, #summary-modal.visible, #tmux-inspector-modal.visible, #new-conversation-model-modal.visible { display: flex; }
+  .new-conversation-model-dialog {
+    width: min(440px, 100%);
+  }
+  #new-conversation-provider-select,
+  #new-conversation-model-select,
+  #new-conversation-reasoning-select {
+    width: 100%;
+    min-height: 42px;
+    margin-top: 8px;
+  }
   .tmux-inspector-dialog {
     width: min(1120px, 100%);
     height: min(80vh, 760px);
@@ -1823,6 +1951,10 @@
     justify-content: flex-end;
     margin-top: 16px;
     flex-wrap: wrap;
+  }
+  .summary-modal-actions .summary-close {
+    width: auto;
+    min-width: 72px;
   }
   .summary-dialog {
     width: min(920px, 100%);
@@ -1986,6 +2118,10 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
+  .summary-btn.model-provider-tab.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
   .summary-close {
     width: 32px;
     padding: 0;
@@ -2061,23 +2197,30 @@
     display: none;
   }
   .change-cwd-menu-item {
+    box-sizing: border-box;
     border: 1px solid transparent;
     border-radius: 8px;
     background: transparent;
     color: var(--text);
     width: 100%;
-    min-height: 36px;
-    padding: 6px 8px;
+    min-height: 62px;
+    padding: 8px;
     font: inherit;
     text-align: left;
     cursor: pointer;
     display: flex;
     flex-direction: column;
     gap: 2px;
+    flex-shrink: 0;
   }
   .change-cwd-menu-item:hover {
     background: var(--bg2);
     border-color: var(--border);
+  }
+  .change-cwd-menu-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    background: var(--bg2);
   }
   .change-cwd-menu-item.selected {
     border-color: var(--accent);
@@ -2086,6 +2229,7 @@
   .change-cwd-menu-item-primary {
     font-size: var(--fs-meta-sm);
     color: var(--muted);
+    line-height: 1.35;
   }
   .change-cwd-menu-item-secondary {
     font-size: var(--fs-meta-sm);
@@ -2864,6 +3008,11 @@
     #chat-header-actions {
       margin-left: auto;
     }
+    #provider-status-pill {
+      max-width: 116px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     #pending-question-banner {
       order: 4;
       flex: 0 0 auto;
@@ -2922,9 +3071,38 @@
     }
     #pending-question-banner { font-size: var(--fs-ui-chip); padding: 3px 8px; }
     .header-icon-btn { width: 30px; height: 30px; border-radius: 8px; font-size: var(--fs-ui-icon); }
+    #provider-status-pill {
+      width: 9px;
+      min-width: 9px;
+      min-height: 9px;
+      height: 9px;
+      padding: 0;
+      border-radius: 50%;
+      color: transparent;
+      font-size: 0;
+    }
     #chat-actions-menu { min-width: 200px; }
     #input-area { padding: 2px 10px calc(6px + env(safe-area-inset-bottom, 0px)); }
-    .input-row { flex-wrap: wrap; gap: 6px; align-items: stretch; }
+    .input-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: stretch;
+    }
+    #emoji-btn,
+    #msg-input,
+    #mode-select,
+    #model-select,
+    #repo-browser-desktop-btn,
+    #attach-btn,
+    #context-tier-select,
+    #reasoning-effort-select,
+    #send-btn {
+      grid-column: auto;
+      grid-row: auto;
+      align-self: auto;
+      justify-self: auto;
+    }
     #repo-browser-input-btn,
     #attach-btn {
       display: inline-flex;
@@ -3041,7 +3219,7 @@
       justify-content: flex-start;
     }
 
-    #settings-modal, #summary-modal, #tmux-inspector-modal {
+    #settings-modal, #summary-modal, #tmux-inspector-modal, #new-conversation-model-modal {
       padding: 8px;
       align-items: stretch;
       justify-content: center;
@@ -3054,11 +3232,22 @@
       max-height: calc(var(--app-height) - 16px);
       border-radius: 10px;
     }
+    #new-conversation-model-modal {
+      align-items: center;
+    }
+    .new-conversation-model-dialog {
+      height: auto;
+      max-height: min(520px, calc(var(--app-height) - 16px));
+    }
     .summary-modal-actions {
       justify-content: stretch;
     }
     .summary-modal-actions > * {
       flex: 1 1 calc(50% - 5px);
+    }
+    .summary-modal-actions .summary-close {
+      width: auto;
+      min-width: 0;
     }
     .summary-header-actions {
       width: 100%;
@@ -3205,6 +3394,8 @@
   </div>
 </div>
 
+<div id="startup-loading" role="status" aria-live="polite">Connecting to Copilot Remote…</div>
+
 <!-- Sidebar overlay (mobile) -->
 <div id="sidebar-overlay" onclick="closeSidebar()"></div>
 <div id="chat-actions-menu-backdrop" onclick="window.closeChatActionsMenu && window.closeChatActionsMenu()"></div>
@@ -3237,6 +3428,7 @@
         </form>
       </div>
       <div id="chat-header-actions">
+        <span id="provider-status-pill" data-provider="github" title="GitHub Copilot is active">GitHub Copilot</span>
         <button id="message-search-btn" class="header-icon-btn" onclick="openMessageSearchModal()" title="Search messages" aria-label="Search messages">🔍</button>
         <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
         <div id="chat-actions-menu-wrap">
@@ -3273,11 +3465,13 @@
     <div id="input-area">
       <div id="offline-banner">⚠️ CLI is offline — messages will queue until it reconnects</div>
       <div id="model-banner"></div>
+      <div id="model-lock-note" hidden></div>
       <div id="model-metadata-blocker" aria-live="polite">
         <span id="model-metadata-blocker-text">Model metadata is unavailable. Refresh to choose a model and reasoning effort.</span>
         <button type="button" id="model-metadata-retry-btn">Refresh models</button>
       </div>
       <div id="attachment-preview"></div>
+      <div id="image-edit-target" aria-live="polite"></div>
       <div id="emoji-popup" aria-hidden="true"></div>
       <div class="input-row">
         <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">
@@ -3379,6 +3573,18 @@
         >
       </div>
       <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
+      <div id="windows-autostart-setting" hidden>
+        <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="windows-autostart-toggle">Autostart (Windows)</label>
+          <input
+            id="windows-autostart-toggle"
+            type="checkbox"
+            onchange="updateWindowsAutostartSettingFromToggle(this.checked)"
+            aria-label="Autostart on Windows sign-in"
+          >
+        </div>
+        <div class="settings-help" style="margin-top: 6px;">Open a visible terminal and start only the web relay server when you sign in. A Copilot CLI host must attach separately to process turns.</div>
+      </div>
       <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
         <label for="pwa-app-name-input">Install app name</label>
         <input
@@ -3401,6 +3607,76 @@
           onchange="updateDefaultSessionWorkspaceRootSetting(this.value)"
         >
         <div class="settings-help">Applies to newly created sessions. Leave blank to fallback to the relay workspace root.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="openai-api-key-input">OpenAI API key</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="openai-enabled-toggle">Enable OpenAI API key for New Chat model selection</label>
+          <input id="openai-enabled-toggle" type="checkbox" onchange="toggleOpenAIProvider(this.checked)" disabled>
+        </div>
+        <input
+          id="openai-api-key-input"
+          type="password"
+          autocomplete="off"
+          placeholder="sk-..."
+          aria-label="OpenAI API key"
+        >
+        <label for="openai-model-input" style="margin-top: 8px;">OpenAI model ID</label>
+        <input
+          id="openai-model-input"
+          type="text"
+          value="gpt-4o"
+          placeholder="gpt-4o"
+          aria-label="OpenAI model ID"
+        >
+        <label for="openai-base-url-input" style="margin-top: 8px;">Base URL <span style="font-weight:normal;opacity:.7;">(optional, default: https://api.openai.com/v1)</span></label>
+        <input
+          id="openai-base-url-input"
+          type="text"
+          placeholder="https://api.openai.com/v1"
+          aria-label="OpenAI base URL"
+        >
+        <div id="openai-settings-status" class="settings-help settings-provider-status">Loading OpenAI settings…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="openai-save-btn" type="button" class="summary-btn" onclick="saveOpenAISettings()">Save OpenAI settings</button>
+          <button id="openai-remove-btn" type="button" class="summary-btn" onclick="removeOpenAISettings()">Remove saved key</button>
+        </div>
+        <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="new-conversation-model-modal" aria-hidden="true">
+  <div class="summary-dialog new-conversation-model-dialog" role="dialog" aria-modal="true" aria-labelledby="new-conversation-model-title">
+    <div class="summary-header">
+      <div class="summary-header-copy">
+        <div id="new-conversation-model-title" class="summary-title">Choose model for new chat</div>
+        <div class="summary-subtitle">The active OpenAI chat stays locked to its current model.</div>
+      </div>
+      <div class="summary-header-actions">
+        <button class="summary-close" onclick="closeNewConversationModelModal()" aria-label="Cancel new chat">×</button>
+      </div>
+    </div>
+    <div class="summary-body" style="padding: 16px;">
+      <label for="new-conversation-provider-select">Provider</label>
+      <select id="new-conversation-provider-select">
+        <option value="github">Copilot</option>
+      </select>
+      <div id="new-conversation-provider-help" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Copilot models use your GitHub Copilot runtime.</div>
+      <label for="new-conversation-model-select">Model</label>
+      <select id="new-conversation-model-select"></select>
+      <label for="new-conversation-reasoning-select" style="display:block;margin-top:12px;">Reasoning effort</label>
+      <select id="new-conversation-reasoning-select"></select>
+      <div id="new-conversation-reasoning-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Choose the effort used when this conversation starts.</div>
+      <div id="new-conversation-size-row" style="display:none;">
+        <label for="new-conversation-size-select" style="display:block;margin-top:12px;">Size</label>
+        <select id="new-conversation-size-select"></select>
+        <div id="new-conversation-size-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Image size used for generated outputs in this chat.</div>
+      </div>
+      <div class="summary-modal-actions">
+        <button type="button" class="summary-btn" onclick="closeNewConversationModelModal()">Cancel</button>
+        <button id="new-conversation-model-confirm" type="button" class="summary-btn" onclick="confirmNewConversationModel()">Start chat</button>
       </div>
     </div>
   </div>
@@ -3458,11 +3734,12 @@
       <button class="file-preview-close" onclick="closeFilePreview()" aria-label="Close preview">×</button>
     </div>
     <div class="file-preview-toolbar">
+      <button id="file-preview-back" class="file-preview-btn" type="button" onclick="goBackFilePreview()" hidden disabled>← Back</button>
       <button id="file-preview-mode-preview" class="file-preview-btn active" onclick="setFilePreviewMode('preview')">Preview</button>
       <button id="file-preview-mode-raw" class="file-preview-btn" onclick="setFilePreviewMode('raw')">Raw</button>
-      <button id="file-preview-html-toggle" class="file-preview-btn" onclick="toggleFilePreviewHtml()">Enable embedded HTML</button>
+      <button id="file-preview-html-toggle" class="file-preview-btn" onclick="toggleFilePreviewHtml()">Show literal HTML</button>
       <a id="file-preview-open-raw" class="file-preview-btn" download>Download</a>
-      <span id="file-preview-warning" class="file-preview-warning">⚠ Embedded HTML enabled (scripts still blocked)</span>
+      <span id="file-preview-warning" class="file-preview-warning">⚠ Safe layout HTML enabled; active content is blocked</span>
     </div>
     <div id="file-preview-meta" class="file-preview-meta"></div>
     <div id="file-preview-body" class="file-preview-body"></div>
@@ -3471,6 +3748,8 @@
 
 <script>
   window.__loadCopilotApp().catch((error) => {
+    document.getElementById('startup-loading')?.remove();
+    document.getElementById('auth-gate').style.display = 'flex';
     const errorEl = document.getElementById('auth-error');
     if (errorEl) errorEl.textContent = `App failed to initialize: ${String(error?.message || error || 'unknown error')}`;
   });
