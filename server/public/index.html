@@ -1037,6 +1037,7 @@
   }
 
   .msg-bubble {
+    position: relative;
     display: inline-block; width: fit-content;
     padding: 12px 16px; border-radius: 16px; line-height: 1.5; font-size: var(--fs-core-chat-bubble);
     max-width: 100%; min-width: 0; box-sizing: border-box;
@@ -1212,6 +1213,45 @@
   .msg.user .bubble-action-btn:hover:not(:disabled) {
     background: rgba(255, 255, 255, 0.18);
   }
+  .msg-share-visibility {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 7px;
+    margin: -5px -7px 7px 8px;
+  }
+  .msg-hidden-label {
+    color: var(--muted);
+    font-size: var(--fs-ui-chip);
+  }
+  .msg-share-visibility-btn {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: var(--fs-ui-chip);
+    line-height: 1;
+    padding: 4px;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .msg-share-visibility-btn:hover:not(:disabled) { color: var(--accent); }
+  .msg-share-visibility-btn:disabled { cursor: wait; opacity: 0.55; }
+  .msg-share-visibility-btn[data-hidden-from-shares="false"] {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .msg-bubble:hover .msg-share-visibility-btn[data-hidden-from-shares="false"],
+  .msg-bubble:focus-within .msg-share-visibility-btn[data-hidden-from-shares="false"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .msg.user .msg-hidden-label,
+  .msg.user .msg-share-visibility-btn { color: var(--user-bubble-fg); opacity: 0.8; }
+  .msg.user .msg-share-visibility-btn[data-hidden-from-shares="false"] { opacity: 0; }
+  .msg.user .msg-bubble:hover .msg-share-visibility-btn[data-hidden-from-shares="false"],
+  .msg.user .msg-bubble:focus-within .msg-share-visibility-btn[data-hidden-from-shares="false"] { opacity: 0.8; }
   .thinking-thoughts-panel {
     margin-bottom: 8px;
     min-width: 0;

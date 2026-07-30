@@ -7,6 +7,9 @@ import {
   normalizeShareToken,
   buildConversationShareToken,
   normalizeSharedViewerId,
+  filterMessagesVisibleToSharedView,
+  buildConversationMessages,
+  selectConversationHistoryPage,
 } from './sessions-routes.mjs';
 
 test('normalizeShareToken accepts valid hex tokens', () => {
@@ -38,6 +41,79 @@ test('normalizeSharedViewerId sanitizes unsafe characters', () => {
 
 test('normalizeSharedViewerId limits identifier length', () => {
   assert.equal(normalizeSharedViewerId('x'.repeat(256)).length, 128);
+});
+
+test('shared message filtering excludes hidden rows without changing owner rows', () => {
+  const rows = [
+    { id: 'visible', hidden_from_shares: 0 },
+    { id: 'hidden', hidden_from_shares: 1 },
+  ];
+  assert.deepEqual(filterMessagesVisibleToSharedView(rows).map((row) => row.id), ['visible']);
+  assert.equal(rows.length, 2);
+});
+
+test('owner message payload retains shared visibility metadata', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [{
+      id: 'hidden',
+      role: 'user',
+      text: 'private',
+      hidden_from_shares: 1,
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }],
+  });
+  assert.equal(messages[0]?.hiddenFromShares, true);
+});
+
+test('shared lazy-load pagination never surfaces hidden messages on any page', () => {
+  const rows = [];
+  for (let index = 0; index < 8; index += 1) {
+    rows.push({
+      id: `m${index}`,
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      text: `message ${index}`,
+      hidden_from_shares: index === 2 || index === 5 ? 1 : 0,
+      timestamp: `2026-01-01T00:0${index}:00.000Z`,
+    });
+  }
+  const sharedMessages = filterMessagesVisibleToSharedView(rows);
+
+  // Newest page first, then paginate older with the returned cursor, exactly
+  // like the shared-view infinite loader does against /api/shared/:token.
+  const seenIds = [];
+  let cursor = {};
+  for (let guard = 0; guard < 10; guard += 1) {
+    const page = selectConversationHistoryPage(sharedMessages, { limit: 2, ...cursor });
+    seenIds.push(...page.messages.map((message) => message.id));
+    if (!page.pageInfo.hasMore || !page.pageInfo.nextCursor) break;
+    cursor = {
+      beforeMessageId: page.pageInfo.nextCursor.beforeMessageId,
+      beforeTimestamp: page.pageInfo.nextCursor.beforeTimestamp,
+    };
+  }
+
+  assert.deepEqual(seenIds.slice().sort(), ['m0', 'm1', 'm3', 'm4', 'm6', 'm7']);
+  assert.ok(!seenIds.includes('m2'));
+  assert.ok(!seenIds.includes('m5'));
+});
+
+test('shared conversation view paginates through the shared token endpoint, not the owner API', () => {
+  const filePath = fileURLToPath(new URL('../public/app/conversation-view.js', import.meta.url));
+  const source = fs.readFileSync(filePath, 'utf8');
+  assert.match(source, /async function loadConversationHistoryPage\(conversationId, options = \{\}\) \{\s*\n\s*if \(!IS_SHARED_VIEW\) \{\s*\n\s*return loadConversationApi\(conversationId, options\);/);
+  assert.match(source, /loadSharedConversation\(SHARED_CONVERSATION_TOKEN, options\)/);
+  const loaderCalls = source.match(/await loadConversationHistoryPage\(conversationId, \{/g) || [];
+  assert.equal(loaderCalls.length, 2, 'both history loaders must route through loadConversationHistoryPage');
+});
+
+test('authenticated message share visibility route is registered', () => {
+  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const source = fs.readFileSync(filePath, 'utf8');
+  assert.match(source, /app\.patch\('\/api\/conversation\/:id\/message\/:messageId\/share-visibility', auth/);
+  assert.match(source, /typeof req\.body\?\.hiddenFromShares !== 'boolean'/);
+  assert.match(source, /stmts\.getMessageByConversation\?\.get\(messageId, conversationId\)/);
+  assert.match(source, /getActiveQueueForMessage\.get\(conversationId, messageId, messageId\)/);
+  assert.match(source, /stmts\.setMessageShareVisibility\.run\(/);
 });
 
 test('shared upload route is registered at top level (not nested inside presence route)', () => {

@@ -39,10 +39,11 @@ import {
   clearSubagentCancelInFlight,
   isSubagentCancelInFlight,
   IS_SHARED_VIEW,
+  SHARED_CONVERSATION_TOKEN,
   imageEditTarget,
   setImageEditTarget as setStoredImageEditTarget,
 } from './store.js';
-import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
+import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
@@ -63,6 +64,7 @@ let thinkingMessageId = null;
 const relayStreamStateByMessageId = new Map();
 const completedMessageIds = new Set();
 const bubbleCancelInFlight = new Set();
+const shareVisibilityInFlight = new Set();
 const SUBAGENT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dropped', 'done']);
 let lastRenderedMessageSnapshotKey = '';
 let sendInFlight = false;
@@ -126,6 +128,18 @@ export function jumpToImageParent(messageId) {
   window.setTimeout(() => node.classList.remove('message-highlight'), 1400);
 }
 
+async function loadConversationHistoryPage(conversationId, options = {}) {
+  if (!IS_SHARED_VIEW) {
+    return loadConversationApi(conversationId, options);
+  }
+  // Shared mode must paginate through the token endpoint so hidden-from-share
+  // messages stay filtered even when an owner auth cookie is present.
+  const response = await loadSharedConversation(SHARED_CONVERSATION_TOKEN, options);
+  if (!response || response.ok === false) return null;
+  const { ok, status, error, shared, ...payload } = response;
+  return payload;
+}
+
 const conversationHistoryLoader = createInfiniteLoader({
   fetchPage: async (cursor) => {
     const conversationId = String(currentConvId || '').trim();
@@ -136,7 +150,7 @@ const conversationHistoryLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
-    const response = await loadConversationApi(conversationId, {
+    const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       beforeMessageId: String(cursor?.beforeMessageId || '').trim(),
       beforeTimestamp: String(cursor?.beforeTimestamp || '').trim(),
@@ -202,7 +216,7 @@ const conversationFutureLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
-    const response = await loadConversationApi(conversationId, {
+    const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       afterMessageId: String(cursor?.afterMessageId || '').trim(),
       afterTimestamp: String(cursor?.afterTimestamp || '').trim(),
@@ -661,12 +675,24 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   const isQueuedUserMessage = msg.role === 'user' && msgId && pendingUserMessageIds.has(msgId);
   const isCancelInFlight = isQueuedUserMessage && bubbleCancelInFlight.has(msgId);
+  const hiddenFromShares = msg?.hiddenFromShares === true;
+  const activeTurnMessageId = String(getActiveTurnForConversation(currentConvId)?.messageId || '').trim();
+  const sourceMessageId = String(msg?.sourceMessageId || '').trim();
+  const belongsToActiveTurn = !!activeTurnMessageId
+    && (activeTurnMessageId === msgId || activeTurnMessageId === sourceMessageId);
+  const canToggleShareVisibility = !IS_SHARED_VIEW && !!msgId && !isQueuedUserMessage && !belongsToActiveTurn;
+  const shareVisibilityActionHtml = canToggleShareVisibility
+    ? `<div class="msg-share-visibility">
+        ${hiddenFromShares ? '<span class="msg-hidden-label">Hidden from shared viewers</span>' : ''}
+        <button type="button" class="msg-share-visibility-btn" data-action="toggle-share-visibility" data-message-id="${escHtml(msgId)}" data-hidden-from-shares="${hiddenFromShares ? 'true' : 'false'}" title="${hiddenFromShares ? 'Shows this message in shared conversations' : 'Hides this message from shared conversations'}">${hiddenFromShares ? 'Unhide' : 'Hide'}</button>
+      </div>`
+    : '';
   const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${userBubbleActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${userBubbleActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -1603,12 +1629,55 @@ async function cancelSubagentByRunId(conversationId, subagentRunId) {
   updateSubagentStopButton(targetSubagentRunId, false);
 }
 
+async function toggleMessageShareVisibility(conversationId, messageId, hiddenFromShares) {
+  const conversationKey = String(conversationId || '').trim();
+  const targetMessageId = String(messageId || '').trim();
+  if (!conversationKey || !targetMessageId || shareVisibilityInFlight.has(targetMessageId)) return;
+
+  shareVisibilityInFlight.add(targetMessageId);
+  const button = document.querySelector(`.msg-share-visibility-btn[data-message-id="${CSS.escape(targetMessageId)}"]`);
+  if (button) {
+    button.disabled = true;
+    button.textContent = hiddenFromShares ? 'Unhiding…' : 'Hiding…';
+  }
+  const result = await updateMessageShareVisibility(conversationKey, targetMessageId, !hiddenFromShares);
+  shareVisibilityInFlight.delete(targetMessageId);
+  if (!result?.ok) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = hiddenFromShares ? 'Unhide' : 'Hide';
+    }
+    showTransientRelayNotice('Could not update shared-message visibility.');
+    return;
+  }
+
+  const response = await loadConversationApi(conversationKey, {
+    limit: Math.max(CONVERSATION_HISTORY_PAGE_SIZE, getConversationLoadedMessageCount()),
+  });
+  if (response?.messages) {
+    renderMessages(response.messages, false, response);
+  }
+  showTransientRelayNotice(result.hiddenFromShares
+    ? 'Message hidden from shared viewers.'
+    : 'Message visible to shared viewers.');
+}
+
 function handleBubbleActionClick(event) {
-  const btn = event.target.closest('.bubble-action-btn');
+  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn');
   if (!btn) return;
   const action = btn.dataset.action;
   const messageId = btn.dataset.messageId;
   const subagentRunId = btn.dataset.subagentRunId;
+
+  if (action === 'toggle-share-visibility' && messageId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void toggleMessageShareVisibility(
+      currentConvId,
+      messageId,
+      btn.dataset.hiddenFromShares === 'true',
+    );
+  }
 
   if (action === 'stop-turn' && messageId) {
     event.preventDefault();
@@ -1700,6 +1769,7 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
       model: String(item?.model || '').trim(),
       mode: String(item?.mode || '').trim(),
       attachments: Array.isArray(item?.attachments) ? item.attachments.length : 0,
+      hiddenFromShares: item?.hiddenFromShares === true,
       thoughts: (Array.isArray(item?.thoughts) ? item.thoughts : []).map((thought) => ({
         reasoningId: String(thought?.reasoningId || '').trim(),
         seq: Number.isFinite(Number(thought?.seq)) ? Number(thought.seq) : null,

@@ -25,12 +25,16 @@ function makeDb() {
       model_requested TEXT,
       model_actual TEXT,
       model_origin TEXT,
+      hidden_from_shares INTEGER NOT NULL DEFAULT 0,
+      share_hidden_at TEXT,
       timestamp TEXT NOT NULL
     );
     CREATE TABLE queue (
       id TEXT PRIMARY KEY,
       conversation_id TEXT NOT NULL,
-      status TEXT NOT NULL
+      status TEXT NOT NULL,
+      attachments TEXT,
+      timestamp TEXT
     );
     CREATE TABLE relay_activity (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +89,21 @@ function makeDb() {
       started_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       completed_at TEXT
+    );
+    CREATE TABLE uploaded_files (
+      sha256 TEXT PRIMARY KEY,
+      original_name TEXT,
+      mime_type TEXT,
+      size_bytes INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE upload_refs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      file_sha256 TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(file_sha256, message_id)
     );
   `);
   return db;
@@ -272,6 +291,258 @@ test('replaceRetrievableHistory swaps messages atomically', () => {
     text: 'retained structure',
     response_message_id: 'new-a',
   });
+});
+
+test('replaceRetrievableHistory remaps durable uploads when SDK message ids change', () => {
+    const db = makeDb();
+    const stmts = makeStmts(db);
+    const sha256 = 'a'.repeat(64);
+    const storedAttachments = JSON.stringify([{
+      name: 'panel.jpg',
+      type: 'image/jpeg',
+      size: 4321,
+      sha256,
+      contentUrl: `/api/upload/${sha256}/content`,
+    }]);
+    db.prepare(`INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at) VALUES ('conv-upload', 'Upload', 'conv-upload', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run();
+    db.prepare(`
+      INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
+      VALUES ('relay-message', 'conv-upload', 'done', ?, '2026-01-01T00:00:01Z')
+    `).run(storedAttachments);
+    db.prepare(`
+      INSERT INTO uploaded_files (sha256, original_name, mime_type, size_bytes, created_at)
+      VALUES (?, 'panel.jpg', 'image/jpeg', 4321, '2026-01-01T00:00:01Z')
+    `).run(sha256);
+    db.prepare(`
+      INSERT INTO upload_refs (file_sha256, conversation_id, message_id, created_at)
+      VALUES (?, 'conv-upload', 'relay-message', '2026-01-01T00:00:01Z')
+    `).run(sha256);
+
+    const service = createSessionHistoryRefreshService({ db, stmts });
+    service.replaceRetrievableHistory('conv-upload', [{
+      id: 'sdk-message',
+      role: 'user',
+      text: 'Inspect this image',
+      attachments: [{
+        name: 'panel.jpg',
+        type: 'image/jpeg',
+        size: 1000,
+        sdkAssetId: 'sha256:sdk-copy',
+      }],
+      timestamp: '2026-01-01T00:00:02Z',
+    }]);
+
+    assert.deepEqual(
+      JSON.parse(db.prepare(`SELECT attachments FROM messages WHERE id = 'sdk-message'`).get().attachments),
+      JSON.parse(storedAttachments),
+    );
+    assert.deepEqual(
+      db.prepare(`SELECT file_sha256, message_id FROM upload_refs WHERE message_id = 'sdk-message'`).get(),
+      { file_sha256: sha256, message_id: 'sdk-message' },
+    );
+});
+
+test('replaceRetrievableHistory restores full mixed attachment sets from image-only SDK hints', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  const imageSha = 'b'.repeat(64);
+  const documentSha = 'c'.repeat(64);
+  const storedAttachments = [{
+    name: 'panel.jpg',
+    type: 'image/jpeg',
+    size: 4321,
+    sha256: imageSha,
+  }, {
+    name: 'notes.pdf',
+    type: 'application/pdf',
+    size: 9876,
+    sha256: documentSha,
+  }];
+  db.prepare(`
+    INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
+    VALUES ('mixed-relay', 'conv-mixed', 'done', ?, '2026-01-01T00:00:01Z')
+  `).run(JSON.stringify(storedAttachments));
+
+  const service = createSessionHistoryRefreshService({ db, stmts });
+  service.replaceRetrievableHistory('conv-mixed', [{
+    id: 'mixed-sdk',
+    role: 'user',
+    text: 'Inspect these files',
+    attachments: [{ name: 'panel.jpg', type: 'image/jpeg', sdkAssetId: 'sha256:sdk-copy' }],
+    timestamp: '2026-01-01T00:00:02Z',
+  }]);
+
+  assert.deepEqual(
+    JSON.parse(db.prepare(`SELECT attachments FROM messages WHERE id = 'mixed-sdk'`).get().attachments),
+    storedAttachments,
+  );
+});
+
+test('replaceRetrievableHistory matches duplicate filenames one-to-one by nearest timestamp', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  const firstSha = 'd'.repeat(64);
+  const secondSha = 'e'.repeat(64);
+  db.prepare(`
+    INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
+    VALUES
+      ('relay-first', 'conv-duplicate', 'done', ?, '2026-01-01T00:00:01Z'),
+      ('relay-second', 'conv-duplicate', 'done', ?, '2026-01-01T00:10:01Z')
+  `).run(
+    JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', sha256: firstSha }]),
+    JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', sha256: secondSha }]),
+  );
+
+  const service = createSessionHistoryRefreshService({ db, stmts });
+  service.replaceRetrievableHistory('conv-duplicate', [{
+    id: 'sdk-first',
+    role: 'user',
+    text: 'First',
+    attachments: [{ name: 'photo.jpg', type: 'image/jpeg', sdkAssetId: 'sha256:sdk-first' }],
+    timestamp: '2026-01-01T00:00:02Z',
+  }, {
+    id: 'sdk-second',
+    role: 'user',
+    text: 'Second',
+    attachments: [{ name: 'photo.jpg', type: 'image/jpeg', sdkAssetId: 'sha256:sdk-second' }],
+    timestamp: '2026-01-01T00:10:02Z',
+  }]);
+
+  assert.equal(JSON.parse(db.prepare(`SELECT attachments FROM messages WHERE id = 'sdk-first'`).get().attachments)[0].sha256, firstSha);
+  assert.equal(JSON.parse(db.prepare(`SELECT attachments FROM messages WHERE id = 'sdk-second'`).get().attachments)[0].sha256, secondSha);
+});
+
+test('replaceRetrievableHistory preserves hidden-from-shares state by message id', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  const service = createSessionHistoryRefreshService({
+    db,
+    stmts,
+    inFlightStateForConversation: () => null,
+    parseSessionEventsToMessages: () => [],
+  });
+  db.prepare(`
+    INSERT INTO messages (
+      id, conversation_id, role, text, hidden_from_shares, share_hidden_at, timestamp
+    ) VALUES (?, ?, ?, ?, 1, ?, ?)
+  `).run(
+    'hidden-1',
+    'conv-hidden',
+    'user',
+    'private',
+    '2026-01-01T00:01:00.000Z',
+    '2026-01-01T00:00:00.000Z',
+  );
+
+  service.replaceRetrievableHistory('conv-hidden', [{
+    id: 'hidden-1',
+    role: 'user',
+    text: 'private',
+    timestamp: '2026-01-01T00:00:00.000Z',
+  }]);
+
+  const row = db.prepare(`
+    SELECT hidden_from_shares, share_hidden_at
+    FROM messages
+    WHERE id = 'hidden-1'
+  `).get();
+  assert.equal(row.hidden_from_shares, 1);
+  assert.equal(row.share_hidden_at, '2026-01-01T00:01:00.000Z');
+});
+
+test('replaceRetrievableHistory remaps hidden-from-shares state when SDK message ids change', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  db.prepare(`
+    INSERT INTO messages (
+      id, conversation_id, role, text, hidden_from_shares, share_hidden_at, timestamp
+    ) VALUES
+      ('relay-hidden', 'conv-remap', 'user', 'keep this private', 1, '2026-01-01T00:05:00.000Z', '2026-01-01T00:00:00.000Z'),
+      ('relay-visible', 'conv-remap', 'user', 'public note', 0, NULL, '2026-01-01T00:01:00.000Z')
+  `).run();
+
+  const service = createSessionHistoryRefreshService({ db, stmts });
+  service.replaceRetrievableHistory('conv-remap', [{
+    id: 'sdk-hidden',
+    role: 'user',
+    text: 'keep this private',
+    timestamp: '2026-01-01T00:00:01.000Z',
+  }, {
+    id: 'sdk-visible',
+    role: 'user',
+    text: 'public note',
+    timestamp: '2026-01-01T00:01:01.000Z',
+  }]);
+
+  const hiddenRow = db.prepare(`SELECT hidden_from_shares, share_hidden_at FROM messages WHERE id = 'sdk-hidden'`).get();
+  assert.equal(hiddenRow.hidden_from_shares, 1);
+  assert.equal(hiddenRow.share_hidden_at, '2026-01-01T00:05:00.000Z');
+  const visibleRow = db.prepare(`SELECT hidden_from_shares FROM messages WHERE id = 'sdk-visible'`).get();
+  assert.equal(visibleRow.hidden_from_shares, 0);
+});
+
+test('replaceRetrievableHistory maps two remapped hidden duplicates one-to-one by nearest timestamp', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  db.prepare(`
+    INSERT INTO messages (
+      id, conversation_id, role, text, hidden_from_shares, share_hidden_at, timestamp
+    ) VALUES
+      ('relay-early', 'conv-dup-hidden', 'user', 'same text', 1, '2026-01-01T00:20:00.000Z', '2026-01-01T00:00:00.000Z'),
+      ('relay-late', 'conv-dup-hidden', 'user', 'same text', 1, '2026-01-01T00:20:00.000Z', '2026-01-01T00:10:00.000Z')
+  `).run();
+
+  const service = createSessionHistoryRefreshService({ db, stmts });
+  service.replaceRetrievableHistory('conv-dup-hidden', [{
+    id: 'sdk-early',
+    role: 'user',
+    text: 'same text',
+    timestamp: '2026-01-01T00:00:01.000Z',
+  }, {
+    id: 'sdk-late',
+    role: 'user',
+    text: 'same text',
+    timestamp: '2026-01-01T00:10:01.000Z',
+  }]);
+
+  assert.equal(db.prepare(`SELECT hidden_from_shares FROM messages WHERE id = 'sdk-early'`).get().hidden_from_shares, 1);
+  assert.equal(db.prepare(`SELECT hidden_from_shares FROM messages WHERE id = 'sdk-late'`).get().hidden_from_shares, 1);
+});
+
+test('replaceRetrievableHistory keeps same-name candidates with distinct sha256 apart', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  const firstSha = 'f'.repeat(64);
+  const secondSha = '0'.repeat(63) + '1';
+  // Same filename, type, and timestamp: only sha256/size distinguish the
+  // candidate keys, so both sets must survive candidate collection.
+  db.prepare(`
+    INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
+    VALUES
+      ('relay-a', 'conv-sha', 'done', ?, '2026-01-01T00:00:01Z'),
+      ('relay-b', 'conv-sha', 'done', ?, '2026-01-01T00:10:01Z')
+  `).run(
+    JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', size: 111, sha256: firstSha }]),
+    JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', size: 999, sha256: secondSha }]),
+  );
+
+  const service = createSessionHistoryRefreshService({ db, stmts });
+  service.replaceRetrievableHistory('conv-sha', [{
+    id: 'sdk-a',
+    role: 'user',
+    text: 'first',
+    attachments: [{ name: 'photo.jpg', type: 'image/jpeg', size: 5, sdkAssetId: 'sha256:sdk-a' }],
+    timestamp: '2026-01-01T00:00:02Z',
+  }, {
+    id: 'sdk-b',
+    role: 'user',
+    text: 'second',
+    attachments: [{ name: 'photo.jpg', type: 'image/jpeg', size: 5, sdkAssetId: 'sha256:sdk-b' }],
+    timestamp: '2026-01-01T00:10:02Z',
+  }]);
+
+  assert.equal(JSON.parse(db.prepare(`SELECT attachments FROM messages WHERE id = 'sdk-a'`).get().attachments)[0].sha256, firstSha);
+  assert.equal(JSON.parse(db.prepare(`SELECT attachments FROM messages WHERE id = 'sdk-b'`).get().attachments)[0].sha256, secondSha);
 });
 
 test('replaceRetrievableHistory rolls back when inserting a malformed snapshot fails', () => {

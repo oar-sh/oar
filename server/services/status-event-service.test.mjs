@@ -38,6 +38,8 @@ test('persists minimized shared-access telemetry and replays it to later clients
     source: 'server',
     details: {
       shareId: 'ffe054fe7ae0',
+      viewerIp: '203.0.113.24',
+      conversationId: 'conversation-1',
     },
   }]);
 });

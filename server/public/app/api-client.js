@@ -368,6 +368,16 @@ export async function deleteConversation(id) {
   return apiFetch(`/api/conversation/${convId}`, { method: 'DELETE' });
 }
 
+export async function updateMessageShareVisibility(conversationId, messageId, hiddenFromShares) {
+  const convId = String(conversationId || '').trim();
+  const msgId = String(messageId || '').trim();
+  if (!convId || !msgId) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/message/${encodeURIComponent(msgId)}/share-visibility`, {
+    method: 'PATCH',
+    body: JSON.stringify({ hiddenFromShares: hiddenFromShares === true }),
+  });
+}
+
 export async function updateConversationTitle(id, title) {
   const convId = String(id || '').trim();
   if (!convId) return null;

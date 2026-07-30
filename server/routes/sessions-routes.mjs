@@ -1280,6 +1280,7 @@ export function buildConversationMessages({
           usage: message?.role === 'assistant' ? (usageByResponseMessageId.get(id) || undefined) : undefined,
           attachments: message?.attachments || [],
           mode: message?.mode || undefined,
+          hiddenFromShares: Number(message?.hidden_from_shares || 0) === 1,
           timestamp: message?.timestamp,
           sourceMessageId,
         };
@@ -1426,6 +1427,11 @@ export function buildConversationMessages({
   return Array.from(messagesById.values()).sort(compareConversationMessageOrder);
 }
 
+export function filterMessagesVisibleToSharedView(messages = []) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => Number(message?.hidden_from_shares || 0) !== 1);
+}
+
 export function registerSessionsRoutes(app, deps) {
   const {
     auth,
@@ -1508,6 +1514,14 @@ export function registerSessionsRoutes(app, deps) {
   const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
   const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = ? WHERE id = ?`);
+  const getActiveQueueForMessage = db.prepare(`
+    SELECT id
+    FROM queue
+    WHERE conversation_id = ?
+      AND status IN ('pending', 'processing', 'parked')
+      AND (id = ? OR response_message_id = ?)
+    LIMIT 1
+  `);
   const listSessionWorkerQueueRows = db.prepare(`
     SELECT id, conversation_id, runtime_session_id, owner_sdk_session_id, status
     FROM queue
@@ -1575,8 +1589,12 @@ export function registerSessionsRoutes(app, deps) {
   }
 
   function extractClientIp(req) {
-    const forwardedFor = String(req.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
-    if (forwardedFor) return forwardedFor.slice(0, 128);
+    const forwardedForHeader = String(req.headers?.['x-forwarded-for'] || '').trim();
+    if (forwardedForHeader) {
+      const firstHop = forwardedForHeader.split(',')[0].trim();
+      const forwardedFor = firstHop.replace(/^for=/i, '').replace(/^"|"$/g, '').trim();
+      if (forwardedFor) return forwardedFor.slice(0, 128);
+    }
     const realIp = String(req.headers?.['x-real-ip'] || '').trim();
     if (realIp) return realIp.slice(0, 128);
     const reqIp = String(req.ip || req.socket?.remoteAddress || '').trim();
@@ -1748,7 +1766,9 @@ export function registerSessionsRoutes(app, deps) {
     const convId = String(conversationId || '').trim();
     const normalizedSha = String(sha256 || '').trim().toLowerCase();
     if (!convId || !isSha256(normalizedSha)) return false;
-    const rows = stmts.getMessages.all(convId);
+    const rows = filterMessagesVisibleToSharedView(
+      (stmts.getSharedMessages || stmts.getMessages).all(convId),
+    );
     for (const row of rows) {
       const attachments = parseAttachments(row?.attachments);
       for (const attachment of attachments) {
@@ -1806,7 +1826,9 @@ export function registerSessionsRoutes(app, deps) {
     });
     const inFlight = inFlightStateForConversation(resolvedConversationId);
     const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
-    const dbMessages = stmts.getMessages.all(resolvedConversationId);
+    const dbMessages = filterMessagesVisibleToSharedView(
+      (stmts.getSharedMessages || stmts.getMessages).all(resolvedConversationId),
+    );
     const queueRows = db.prepare(`
       SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
       FROM queue
@@ -2624,10 +2646,11 @@ export function registerSessionsRoutes(app, deps) {
     const sharedAccess = statusEventService.recordSharedAccess({
       shareToken: token,
       viewerIp: extractClientIp(req),
+      conversationId: convId,
     });
     if (sharedAccess.event) {
       const details = sharedAccess.event.details;
-      console.log(`SHARED ACCESS shareId=${details.shareId}`);
+      console.log(`SHARED ACCESS shareId=${details.shareId} ip=${details.viewerIp || 'unknown'}`);
       io.emit('shared_access', sharedAccess.event);
     }
     const now = new Date().toISOString();
@@ -2736,7 +2759,9 @@ export function registerSessionsRoutes(app, deps) {
     }
     const conversationId = String(share.conversation_id || '').trim();
     if (!conversationId) return res.status(404).json({ error: 'Shared attachment not found' });
-    const rows = stmts.getMessages.all(conversationId);
+    const rows = filterMessagesVisibleToSharedView(
+      (stmts.getSharedMessages || stmts.getMessages).all(conversationId),
+    );
     const messageRow = rows.find((row) => String(row?.id || '').trim() === messageId);
     if (!messageRow) return res.status(404).json({ error: 'Shared attachment not found' });
     const attachments = parseAttachments(messageRow?.attachments).map(hydrateAttachment).filter(Boolean);
@@ -2906,6 +2931,49 @@ export function registerSessionsRoutes(app, deps) {
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
       pageInfo: history.pageInfo,
+    });
+  });
+
+  app.patch('/api/conversation/:id/message/:messageId/share-visibility', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const messageId = String(req.params.messageId || '').trim();
+    if (!conversationId || !messageId) {
+      return res.status(400).json({ error: 'Missing conversation or message id' });
+    }
+    if (typeof req.body?.hiddenFromShares !== 'boolean') {
+      return res.status(400).json({ error: 'hiddenFromShares must be a boolean' });
+    }
+
+    const conv = stmts.getConvAnyStatus.get(conversationId);
+    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    const message = stmts.getMessageByConversation?.get(messageId, conversationId) || null;
+    if (!message) return res.status(404).json({ error: 'Message not found' });
+    if (getActiveQueueForMessage.get(conversationId, messageId, messageId)) {
+      return res.status(409).json({ error: 'Message visibility can only change after the turn finishes' });
+    }
+
+    const hiddenFromShares = req.body.hiddenFromShares === true;
+    const currentlyHidden = Number(message.hidden_from_shares || 0) === 1;
+    if (currentlyHidden !== hiddenFromShares) {
+      if (!stmts.setMessageShareVisibility) {
+        return res.status(503).json({ error: 'Message share visibility is unavailable until the relay restarts' });
+      }
+      const now = new Date().toISOString();
+      stmts.setMessageShareVisibility.run(
+        hiddenFromShares ? 1 : 0,
+        hiddenFromShares ? now : null,
+        messageId,
+        conversationId,
+      );
+    }
+
+    return res.json({
+      ok: true,
+      conversationId,
+      messageId,
+      hiddenFromShares,
     });
   });
 

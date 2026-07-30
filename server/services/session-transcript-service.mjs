@@ -242,10 +242,27 @@ export function createSessionTranscriptService({ fs, path, resolveSessionStateRo
       if (event.type === 'user.message') {
         const text = normalizeEventContentText(data.content, { omitSystemReminders: true });
         if (!text) continue;
+        const attachments = (Array.isArray(data.attachments) ? data.attachments : [])
+          .map((attachment) => {
+            if (!attachment || typeof attachment !== 'object') return null;
+            const name = String(attachment.displayName || attachment.name || '').trim();
+            const type = String(attachment.mimeType || attachment.type || '').trim().toLowerCase();
+            const assetId = String(attachment.assetId || '').trim();
+            const size = Number(attachment.byteLength || attachment.size || 0);
+            if (!name && !type && !assetId) return null;
+            return {
+              name,
+              type,
+              size: Number.isFinite(size) && size >= 0 ? size : 0,
+              sdkAssetId: assetId || undefined,
+            };
+          })
+          .filter(Boolean);
         messages.push({
           id: String(event?.id || data?.interactionId || `user-${messages.length + 1}`),
           role: 'user',
           text,
+          attachments,
           timestamp,
         });
         continue;

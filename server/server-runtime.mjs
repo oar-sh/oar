@@ -1975,6 +1975,8 @@ db.exec(`
     model_requested TEXT,
     model_actual    TEXT,
     model_origin    TEXT,
+    hidden_from_shares INTEGER NOT NULL DEFAULT 0,
+    share_hidden_at TEXT,
     timestamp       TEXT NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
   );
@@ -2376,6 +2378,16 @@ if (!messageColumns.includes('model_actual')) {
 if (!messageColumns.includes('model_origin')) {
   db.exec(`ALTER TABLE messages ADD COLUMN model_origin TEXT`);
 }
+if (!messageColumns.includes('hidden_from_shares')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN hidden_from_shares INTEGER NOT NULL DEFAULT 0`);
+}
+if (!messageColumns.includes('share_hidden_at')) {
+  db.exec(`ALTER TABLE messages ADD COLUMN share_hidden_at TEXT`);
+}
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_messages_share_visibility
+  ON messages(conversation_id, hidden_from_shares, timestamp)
+`);
 
 const sdkSessionImportColumns = db.prepare(`PRAGMA table_info(sdk_session_imports)`).all().map((c) => c.name);
 if (!sdkSessionImportColumns.includes('source_started_at')) {

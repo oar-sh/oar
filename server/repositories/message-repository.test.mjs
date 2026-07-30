@@ -32,6 +32,8 @@ function createTestDb() {
       model_requested TEXT,
       model_actual TEXT,
       model_origin TEXT,
+      hidden_from_shares INTEGER NOT NULL DEFAULT 0,
+      share_hidden_at TEXT,
       timestamp TEXT
     );
 
@@ -104,6 +106,25 @@ function createTestDb() {
   `);
   return db;
 }
+
+test('message share visibility preserves owner history and filters shared history', () => {
+  const db = createTestDb();
+  const repository = createMessageRepository(db);
+  db.prepare('INSERT INTO conversations (id, title, status) VALUES (?, ?, ?)').run('conv-1', 'Demo', 'active');
+  db.prepare(`
+    INSERT INTO messages (
+      id, conversation_id, role, text, hidden_from_shares, timestamp
+    ) VALUES (?, ?, ?, ?, 0, ?)
+  `).run('msg-1', 'conv-1', 'user', 'private detail', '2026-01-01T00:00:00.000Z');
+
+  repository.setMessageShareVisibility.run(1, '2026-01-01T00:01:00.000Z', 'msg-1', 'conv-1');
+  assert.equal(repository.getMessages.all('conv-1').length, 1);
+  assert.equal(repository.getSharedMessages.all('conv-1').length, 0);
+  assert.equal(repository.getMessageByConversation.get('msg-1', 'conv-1')?.hidden_from_shares, 1);
+
+  repository.setMessageShareVisibility.run(0, null, 'msg-1', 'conv-1');
+  assert.equal(repository.getSharedMessages.all('conv-1').length, 1);
+});
 
 test('routed worker dequeue uses runtime session binding when queue owner is empty', () => {
   const db = createTestDb();

@@ -28,6 +28,7 @@ let unsubscribe = null;
 let statusViewGeneration = 0;
 let statusRenderFrame = 0;
 let statusScrollBound = false;
+let statusLinkBound = false;
 
 function isNearStatusBottom(host) {
   return !!host && (host.scrollHeight - host.clientHeight - host.scrollTop) <= STATUS_BOTTOM_THRESHOLD_PX;
@@ -58,9 +59,24 @@ function formatStatusEvent(event) {
   if (type === 'client-error') return `Error: ${formatValue(details.message || details.error)}`;
   if (type === 'unhandled-rejection') return `Unhandled rejection: ${formatValue(details.reason)}`;
   if (type === 'shared-access-opened') {
-    return `Shared conversation opened (${details.shareId || 'unknown share'})`;
+    return `Shared conversation opened (${details.shareId || 'unknown share'}) from ${details.viewerIp || 'unknown'}`;
   }
   return formatValue(details);
+}
+
+function formatStatusEventHtml(event) {
+  const details = event?.details || {};
+  const type = String(event?.type || 'event');
+  if (type === 'shared-access-opened') {
+    const shareId = String(details.shareId || 'unknown share').trim() || 'unknown share';
+    const viewerIp = String(details.viewerIp || 'unknown').trim() || 'unknown';
+    const conversationId = String(details.conversationId || '').trim();
+    const conversationAttr = conversationId
+      ? ` data-conversation-id="${escHtml(conversationId)}"`
+      : '';
+    return `Shared conversation opened (<a href="#" class="status-share-link"${conversationAttr}>${escHtml(shareId)}</a>) from ${escHtml(viewerIp)}`;
+  }
+  return escHtml(formatStatusEvent(event));
 }
 
 function renderStatusHeader() {
@@ -115,7 +131,7 @@ function renderStatusView({ prepend = false, restoreScrollTop = null } = {}) {
     <div class="status-event">
       <time>${new Date(Number(event.timestamp || 0)).toLocaleString()}</time>
       <span class="status-event-source">${escHtml(String(event.source || 'client'))}</span>
-      <code>${escHtml(formatStatusEvent(event))}</code>
+      <code>${formatStatusEventHtml(event)}</code>
     </div>
   `).join('');
   host.innerHTML = `
@@ -210,6 +226,20 @@ function initStatusScrollPersistence() {
   }, { passive: true });
 }
 
+function initStatusEventLinkActions() {
+  if (statusLinkBound) return;
+  statusLinkBound = true;
+  document.getElementById('messages')?.addEventListener('click', async (event) => {
+    const target = event.target instanceof Element ? event.target.closest('.status-share-link') : null;
+    if (!target) return;
+    event.preventDefault();
+    const conversationId = String(target.getAttribute('data-conversation-id') || '').trim();
+    if (!conversationId) return;
+    leaveStatusView();
+    await window.openConversation?.(conversationId, { restoreScroll: true });
+  });
+}
+
 export function isStatusViewActive() {
   return statusViewActive;
 }
@@ -257,6 +287,7 @@ export async function toggleStatusView() {
   document.getElementById('pending-question-banner')?.setAttribute('hidden', '');
   document.getElementById('input-area')?.setAttribute('hidden', '');
   initStatusScrollPersistence();
+  initStatusEventLinkActions();
   unsubscribe = subscribeStatusEvents((event) => {
     events = mergeStatusEvents(events, [event]);
     renderStatusView();

@@ -1,6 +1,9 @@
 'use strict';
 
+import { createShareVisibilityStatements } from './share-visibility-statements.mjs';
+
 export function createSessionRepository(db) {
+    const shareVisibility = createShareVisibilityStatements(db);
     const runtimeSessionColumns = new Set(
       db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((column) => String(column?.name || '').trim()),
     );
@@ -34,6 +37,9 @@ export function createSessionRepository(db) {
 
         // messages
         getMessages:    db.prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC`),
+        getSharedMessages: shareVisibility.getSharedMessages,
+        getMessageByConversation: db.prepare(`SELECT * FROM messages WHERE id = ? AND conversation_id = ? LIMIT 1`),
+        setMessageShareVisibility: shareVisibility.setMessageShareVisibility,
         getConversationMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`),
         getConversationActiveQueueCount: db.prepare(`SELECT COUNT(*) AS count FROM queue WHERE conversation_id = ? AND status IN ('pending', 'processing', 'parked')`),
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
