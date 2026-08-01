@@ -13,7 +13,29 @@ import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
 import { readStoredClaudeContextUsage } from '../services/claude-context-usage.mjs';
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
-import { isSafeClaudeModelId, isSafeProviderModelId } from '../../shared/model-id.mjs';
+import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
+import {
+  isWithinAllowedPrefix,
+  readWorkspaceRootPathFromBody,
+  validateRequestedWorkspaceRoot,
+} from '../services/workspace-root-path-policy.mjs';
+import { workspaceRootDisplayName } from '../workspace-root.mjs';
+import { createKeyedMutex } from '../services/keyed-mutex-service.mjs';
+import { createFixedWindowRateLimiter } from '../services/rate-limit-service.mjs';
+import {
+  RELAUNCH_COALESCE_WINDOW_MS,
+  buildRelaunchRequestKey,
+  createRelaunchCoalescer,
+  evaluateReuseCwdMismatch,
+  evaluateWorkspaceRootRelaunch,
+} from '../services/workspace-root-relaunch-service.mjs';
+import {
+  CLAUDE_DEFAULT_CONTEXT_LIMIT_TOKENS,
+  CLAUDE_LONG_CONTEXT_LIMIT_TOKENS,
+  CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN,
+  isSafeClaudeModelId,
+  isSafeProviderModelId,
+} from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import {
   DEFAULT_TURN_CEILING_MINUTES,
@@ -225,7 +247,22 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
   const claudeModels = Array.isArray(claudeSettings?.models)
     ? claudeSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
-  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), model, ...claudeModels]));
+  // "[1m]" long-context variants are not separate composer entries: fold each
+  // one into its base model as a long_context tier that the context-size
+  // dropdown offers, mirroring how the Copilot catalog models long context.
+  const longContextBases = new Set();
+  const claudeBaseModels = [];
+  const seenClaudeBases = new Set();
+  for (const claudeModelId of [model, ...claudeModels]) {
+    const isLongContextVariant = CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN.test(claudeModelId);
+    const baseId = claudeModelId.replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '');
+    if (!baseId) continue;
+    if (isLongContextVariant) longContextBases.add(baseId.toLowerCase());
+    if (seenClaudeBases.has(baseId.toLowerCase())) continue;
+    seenClaudeBases.add(baseId.toLowerCase());
+    claudeBaseModels.push(baseId);
+  }
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), ...claudeBaseModels]));
   const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
   const claudeReasoningByModel = {};
   const effortsByModel = claudeSettings?.effortsByModel && typeof claudeSettings.effortsByModel === 'object'
@@ -234,12 +271,15 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
   const defaultClaudeEfforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
   const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
   const providersByModel = { ...(modelState?.providersByModel || {}) };
-  for (const claudeModel of [model, ...claudeModels]) {
+  for (const claudeModel of claudeBaseModels) {
     const providersKey = String(claudeModel || '').trim();
     if (!providersKey) continue;
     const lowerKey = providersKey.toLowerCase();
-    const claudeEfforts = Array.isArray(effortsByModel[lowerKey]) && effortsByModel[lowerKey].length
+    const effortsForModel = Array.isArray(effortsByModel[lowerKey]) && effortsByModel[lowerKey].length
       ? effortsByModel[lowerKey]
+      : effortsByModel[`${lowerKey}[1m]`];
+    const claudeEfforts = Array.isArray(effortsForModel) && effortsForModel.length
+      ? effortsForModel
       : defaultClaudeEfforts;
     claudeReasoningByModel[lowerKey] = [...claudeEfforts];
     if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
@@ -259,6 +299,14 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
       ...(modelMetadataByModel[providersKey] || {}),
       provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'claude'),
     };
+    if (longContextBases.has(lowerKey)) {
+      modelMetadataByModel[providersKey] = {
+        ...modelMetadataByModel[providersKey],
+        defaultContextLimitTokens: modelMetadataByModel[providersKey]?.defaultContextLimitTokens
+          || CLAUDE_DEFAULT_CONTEXT_LIMIT_TOKENS,
+        longContextLimitTokens: CLAUDE_LONG_CONTEXT_LIMIT_TOKENS,
+      };
+    }
   }
   return {
     ...modelState,
@@ -394,7 +442,19 @@ export function canUpdateWorkspaceRoot(runtimeState = {}) {
   return true;
 }
 
-export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorkerSupervisor = null, sdkSessionId = '', sessionWorkerRegistry = null) {
+export async function launchWorkspaceRootSession(
+  runtimeState = {},
+  sessionWorkerSupervisor = null,
+  sdkSessionId = '',
+  sessionWorkerRegistry = null,
+  // Defaults preserve the behaviour of POST /api/session-worker/:id/launch.
+  // The CWD relaunch route passes { allowProcessReuse: false } so the new
+  // directory is actually applied, { resetKilledMarker: false } because it
+  // clears the kill block itself once the old CLI is verifiably dead, and
+  // { requireStoppedWorker: false } because it has already done that check —
+  // re-running it here would reject on stale registry state.
+  { allowProcessReuse = true, resetKilledMarker = true, requireStoppedWorker = true } = {},
+) {
   const sid = String(sdkSessionId || '').trim();
   if (!sid) {
     return { ok: false, statusCode: 400, error: 'Missing session id' };
@@ -407,13 +467,13 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
   const selectedWorkerHasPid = Number.isInteger(selectedWorkerPid) && selectedWorkerPid > 0;
   const selectedWorkerPidAlive = isPidAlive(selectedWorkerPid);
   const selectedWorkerStatus = String(selectedWorkerState?.status || '').trim().toLowerCase();
-  if (activeStatuses.includes(selectedWorkerStatus) && (!selectedWorkerHasPid || selectedWorkerPidAlive)) {
+  if (requireStoppedWorker && activeStatuses.includes(selectedWorkerStatus) && (!selectedWorkerHasPid || selectedWorkerPidAlive)) {
     return { ok: false, statusCode: 409, error: 'Selected CLI is already running' };
   }
   if (activeStatuses.includes(selectedWorkerStatus) && selectedWorkerHasPid && !selectedWorkerPidAlive) {
-    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker });
     sessionWorkerRegistry?.removeWorker?.(sid);
-  } else {
+  } else if (resetKilledMarker) {
     // Explicit user-triggered launch always clears the kill block so it is not
     // stuck behind the 30-second grace window from a prior kill.
     sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
@@ -422,7 +482,7 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
     return { ok: false, statusCode: 500, error: 'Session worker launcher is unavailable' };
   }
 
-  const result = await sessionWorkerSupervisor.ensureWorker(sid);
+  const result = await sessionWorkerSupervisor.ensureWorker(sid, { allowProcessReuse });
   if (!result?.ok) {
     return {
       ok: false,
@@ -435,20 +495,9 @@ export async function launchWorkspaceRootSession(runtimeState = {}, sessionWorke
   return { ok: true, statusCode: 200, ...result };
 }
 
-export function evaluateWorkspaceRootRelaunch({
-  workerStatus = '',
-  activeQueueCount = 0,
-} = {}) {
-  const normalizedStatus = String(workerStatus || '').trim().toLowerCase();
-  if (Number(activeQueueCount) > 0 || normalizedStatus === 'processing' || normalizedStatus === 'starting') {
-    return {
-      ok: false,
-      statusCode: 409,
-      error: 'Wait for the active turn to finish before changing CWD.',
-    };
-  }
-  return { ok: true, stopWorker: normalizedStatus === 'ready' };
-}
+// Lives in services/workspace-root-relaunch-service.mjs; re-exported here so the
+// existing import path keeps working.
+export { evaluateWorkspaceRootRelaunch };
 
 async function stopIdleWorkspaceRootSession({
   sdkSessionId,
@@ -462,38 +511,30 @@ async function stopIdleWorkspaceRootSession({
   sessionWorkerSupervisor?.markKilled?.(sid);
   await sessionWorkerSupervisor?.cancelPendingStart?.(sid, { wait: true });
 
-  const processRows = process.platform === 'win32'
-    ? (sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sid)
-      || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sid)
-      || [])
-    : (sessionWorkerProcessInspector?.findProcessesForSession?.(sid) || []);
-  const pids = [...new Set([
-    ...processRows.map((row) => Number(row?.processId)).filter(Number.isInteger),
-    Number(worker?.pid),
-  ].filter((pid) => Number.isInteger(pid) && pid > 0))];
-
-  try {
-    if (process.platform === 'win32') {
-      sessionWorkerProcessInspector?.stopWindowsPids?.(pids);
-    } else {
-      for (const pid of pids) {
-        try {
-          process.kill(pid, 'SIGTERM');
-        } catch (error) {
-          if (error?.code !== 'ESRCH') throw error;
-        }
-      }
-      // The tmux session can retain the shell after its child has received SIGTERM.
-      killTmuxSession(sid);
-    }
-  } catch (error) {
-    return { ok: false, error: error?.message || 'Failed to stop the idle CLI' };
+  const stopped = await stopSessionWorkerProcesses({
+    sdkSessionId: sid,
+    worker,
+    processInspector: sessionWorkerProcessInspector,
+    isPidAliveImpl: isPidAlive,
+    killTmuxSessionImpl: killTmuxSession,
+  });
+  // Only tear down the bookkeeping once every process is verifiably gone.
+  // Clearing it while a CLI is still alive is what lets the relaunch "succeed"
+  // by silently reusing that CLI in the old working directory.
+  if (!stopped.ok) {
+    return {
+      ok: false,
+      timedOut: stopped.timedOut === true,
+      remainingPids: stopped.remainingPids || [],
+      stoppedPids: stopped.pids || [],
+      error: stopped.error || 'Failed to stop the idle CLI',
+    };
   }
 
   sessionWorkerRegistry?.removeWorker?.(sid);
   sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
   sessionWorkerSupervisor?.resetHealth?.(sid, { clearFailureCount: false });
-  return { ok: true, stoppedPids: pids };
+  return { ok: true, stoppedPids: stopped.pids || [] };
 }
 
 export function learnWorkspaceRootFromSessionSync({
@@ -616,56 +657,12 @@ export function normalizeRelayModePreference(value, {
   return allowedModes.includes(mode) ? mode : fallback;
 }
 
-export function normalizePreferredModelsByMode(value, {
-  supportedRelayModes = [],
-} = {}) {
-  const allowedModes = Array.isArray(supportedRelayModes)
-    ? supportedRelayModes.map((mode) => String(mode || '').trim()).filter(Boolean)
-    : [];
-  let parsed = value;
-  if (typeof parsed === 'string') {
-    const trimmed = parsed.trim();
-    if (!trimmed) return {};
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      return {};
-    }
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-  const normalized = {};
-  for (const mode of allowedModes) {
-    const model = String(parsed[mode] || '').trim();
-    if (!model) continue;
-    normalized[mode] = model;
-  }
-  return normalized;
+export function normalizePreferredModel(value) {
+  return String(value || '').trim();
 }
 
-export function normalizePreferredReasoningByMode(value, {
-  supportedRelayModes = [],
-} = {}) {
-  const allowedModes = Array.isArray(supportedRelayModes)
-    ? supportedRelayModes.map((mode) => String(mode || '').trim()).filter(Boolean)
-    : [];
-  let parsed = value;
-  if (typeof parsed === 'string') {
-    const trimmed = parsed.trim();
-    if (!trimmed) return {};
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      return {};
-    }
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-  const normalized = {};
-  for (const mode of allowedModes) {
-    const effort = String(parsed[mode] || '').trim().toLowerCase();
-    if (!effort) continue;
-    normalized[mode] = effort;
-  }
-  return normalized;
+export function normalizePreferredReasoningEffort(value) {
+  return String(value || '').trim().toLowerCase();
 }
 
 const MAX_CONVERSATION_DRAFT_LENGTH = 20_000;
@@ -703,12 +700,8 @@ function resolveConversationPreferences(row, {
       supportedRelayModes,
       fallbackMode: defaultRelayMode,
     }),
-    preferredModelsByMode: normalizePreferredModelsByMode(row?.preferred_models_by_mode, {
-      supportedRelayModes,
-    }),
-    preferredReasoningByMode: normalizePreferredReasoningByMode(row?.preferred_reasoning_by_mode, {
-      supportedRelayModes,
-    }),
+    preferredModel: normalizePreferredModel(row?.preferred_model),
+    preferredReasoningEffort: normalizePreferredReasoningEffort(row?.preferred_reasoning_effort),
   };
 }
 
@@ -1598,6 +1591,10 @@ export function registerSessionsRoutes(app, deps) {
     learnConversationWorkspaceRoot,
     setPendingSessionCwd,
     consumePendingSessionCwd,
+    getPendingSessionCwd = () => null,
+    // Opt-in. An empty list disables the check entirely, which is the default
+    // and preserves the historical "any existing directory" behaviour.
+    workspaceRootAllowList = [],
     processingTimeoutMs,
     localhostOnly,
     listenHost,
@@ -1703,11 +1700,26 @@ export function registerSessionsRoutes(app, deps) {
     db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
   });
-  const SHARED_PRESENCE_RATE_WINDOW_MS = 10_000;
-  const SHARED_PRESENCE_RATE_LIMIT = 24;
-  const SHARED_PRESENCE_RATE_BUCKET_TTL_MS = 60_000;
-  const SHARED_PRESENCE_RATE_MAX_BUCKETS = 4_096;
-  const sharedPresenceRateBuckets = new Map();
+  const sharedPresenceRateLimiter = createFixedWindowRateLimiter({
+    windowMs: 10_000,
+    limit: 24,
+    bucketTtlMs: 60_000,
+    maxBuckets: 4_096,
+  });
+  // Changing a CWD stops and respawns a process tree; on Windows that runs a
+  // synchronous PowerShell round-trip, so this is an availability control as
+  // well as abuse protection. The real duplicate-request fix is the mutex below.
+  const WORKSPACE_ROOT_RATE_LIMIT = 6;
+  const workspaceRootRateLimiter = createFixedWindowRateLimiter({
+    windowMs: 10_000,
+    limit: WORKSPACE_ROOT_RATE_LIMIT,
+    bucketTtlMs: 60_000,
+    maxBuckets: 4_096,
+  });
+  // Serializes everything that reaches the session-worker launch path, keyed by
+  // sdkSessionId, plus a coalescer so a duplicated request replays one result.
+  const sessionLaunchMutex = createKeyedMutex();
+  const relaunchCoalescer = createRelaunchCoalescer({ windowMs: RELAUNCH_COALESCE_WINDOW_MS });
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1734,52 +1746,16 @@ export function registerSessionsRoutes(app, deps) {
     return reqIp.slice(0, 128) || 'unknown';
   }
 
-  function pruneSharedPresenceRateBuckets(nowMs = Date.now()) {
-    for (const [bucketKey, bucket] of sharedPresenceRateBuckets.entries()) {
-      const lastSeenAt = Number(bucket?.lastSeenAt || 0);
-      if (!Number.isFinite(lastSeenAt) || (nowMs - lastSeenAt) > SHARED_PRESENCE_RATE_BUCKET_TTL_MS) {
-        sharedPresenceRateBuckets.delete(bucketKey);
-      }
-    }
-    if (sharedPresenceRateBuckets.size <= SHARED_PRESENCE_RATE_MAX_BUCKETS) return;
-    const buckets = Array.from(sharedPresenceRateBuckets.entries());
-    buckets.sort((a, b) => Number(a[1]?.lastSeenAt || 0) - Number(b[1]?.lastSeenAt || 0));
-    const overflow = sharedPresenceRateBuckets.size - SHARED_PRESENCE_RATE_MAX_BUCKETS;
-    for (let index = 0; index < overflow; index += 1) {
-      const key = buckets[index]?.[0];
-      if (!key) continue;
-      sharedPresenceRateBuckets.delete(key);
-    }
-  }
-
   function consumeSharedPresenceRateLimit(token, req, nowMs = Date.now()) {
     const shareToken = String(token || '').trim();
     if (!shareToken) return { ok: false, retryAfterSeconds: 1 };
-    const clientIp = extractClientIp(req);
-    const bucketKey = `${shareToken}:${clientIp}`;
-    const existing = sharedPresenceRateBuckets.get(bucketKey) || {
-      windowStartAt: nowMs,
-      count: 0,
-      lastSeenAt: nowMs,
-    };
-    if (!Number.isFinite(existing.windowStartAt) || (nowMs - existing.windowStartAt) >= SHARED_PRESENCE_RATE_WINDOW_MS) {
-      existing.windowStartAt = nowMs;
-      existing.count = 0;
-    }
-    existing.lastSeenAt = nowMs;
-    if (existing.count >= SHARED_PRESENCE_RATE_LIMIT) {
-      sharedPresenceRateBuckets.set(bucketKey, existing);
-      const retryAfterMs = Math.max(250, SHARED_PRESENCE_RATE_WINDOW_MS - (nowMs - existing.windowStartAt));
-      pruneSharedPresenceRateBuckets(nowMs);
-      return {
-        ok: false,
-        retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
-      };
-    }
-    existing.count += 1;
-    sharedPresenceRateBuckets.set(bucketKey, existing);
-    pruneSharedPresenceRateBuckets(nowMs);
-    return { ok: true, retryAfterSeconds: 0 };
+    return sharedPresenceRateLimiter.consume(`${shareToken}:${extractClientIp(req)}`, nowMs);
+  }
+
+  function consumeWorkspaceRootRateLimit(scopeKey, req, nowMs = Date.now()) {
+    const scope = String(scopeKey || '').trim();
+    if (!scope) return { ok: false, retryAfterSeconds: 1 };
+    return workspaceRootRateLimiter.consume(`${scope}:${extractClientIp(req)}`, nowMs);
   }
 
   function readBridgeIdentity(req) {
@@ -2047,7 +2023,8 @@ export function registerSessionsRoutes(app, deps) {
       sessionUsageSummary: null,
       inFlight,
       preferredRelayMode: DEFAULT_RELAY_MODE,
-      preferredModelsByMode: {},
+      preferredModel: '',
+      preferredReasoningEffort: '',
       draftText: '',
       draftUpdatedAt: null,
       draftUpdatedByClientId: null,
@@ -2152,8 +2129,8 @@ export function registerSessionsRoutes(app, deps) {
         updatedAt:    normalizeConversationTimestampIso(r.updated_at, r.updated_at),
         messageCount: Number(r.message_count || 0),
         preferredRelayMode: preferences.preferredRelayMode,
-        preferredModelsByMode: preferences.preferredModelsByMode,
-        preferredReasoningByMode: preferences.preferredReasoningByMode,
+        preferredModel: preferences.preferredModel,
+        preferredReasoningEffort: preferences.preferredReasoningEffort,
         draftText: String(r.draft_text || ''),
         draftUpdatedAt: r.draft_updated_at || null,
         draftUpdatedByClientId: r.draft_updated_by_client_id || null,
@@ -2732,8 +2709,8 @@ export function registerSessionsRoutes(app, deps) {
       sessionUsageSummary,
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
-      preferredModelsByMode: preferences.preferredModelsByMode,
-      preferredReasoningByMode: preferences.preferredReasoningByMode,
+      preferredModel: preferences.preferredModel,
+      preferredReasoningEffort: preferences.preferredReasoningEffort,
       draftText: String(conv.draft_text || ''),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
@@ -3100,8 +3077,8 @@ export function registerSessionsRoutes(app, deps) {
       sessionUsageSummary,
       inFlight,
       preferredRelayMode: preferences.preferredRelayMode,
-      preferredModelsByMode: preferences.preferredModelsByMode,
-      preferredReasoningByMode: preferences.preferredReasoningByMode,
+      preferredModel: preferences.preferredModel,
+      preferredReasoningEffort: preferences.preferredReasoningEffort,
       draftText: String(conv.draft_text || ''),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
@@ -3190,19 +3167,15 @@ export function registerSessionsRoutes(app, deps) {
       supportedRelayModes: SUPPORTED_RELAY_MODES,
       fallbackMode: DEFAULT_RELAY_MODE,
     });
-    const preferredModelsByMode = normalizePreferredModelsByMode(req.body?.preferredModelsByMode, {
-      supportedRelayModes: SUPPORTED_RELAY_MODES,
-    });
-    const preferredReasoningByMode = normalizePreferredReasoningByMode(req.body?.preferredReasoningByMode, {
-      supportedRelayModes: SUPPORTED_RELAY_MODES,
-    });
+    const preferredModel = normalizePreferredModel(req.body?.preferredModel);
+    const preferredReasoningEffort = normalizePreferredReasoningEffort(req.body?.preferredReasoningEffort);
     const persisted = persistConversationPreferences({
       db,
       stmts,
       conversationId,
       preferredRelayMode,
-      preferredModelsByMode,
-      preferredReasoningByMode,
+      preferredModel,
+      preferredReasoningEffort,
       updatedAt: now,
       createIfMissing: !existing,
       createTitle: 'Session',
@@ -3211,8 +3184,8 @@ export function registerSessionsRoutes(app, deps) {
     io.emit('conversation_preferences_updated', {
       conversationId,
       preferredRelayMode: persisted.preferredRelayMode,
-      preferredModelsByMode: persisted.preferredModelsByMode,
-      preferredReasoningByMode: persisted.preferredReasoningByMode,
+      preferredModel: persisted.preferredModel,
+      preferredReasoningEffort: persisted.preferredReasoningEffort,
       updatedAt: persisted.updatedAt,
       senderClientId,
     });
@@ -3221,8 +3194,8 @@ export function registerSessionsRoutes(app, deps) {
       ok: true,
       conversationId,
       preferredRelayMode: persisted.preferredRelayMode,
-      preferredModelsByMode: persisted.preferredModelsByMode,
-      preferredReasoningByMode: persisted.preferredReasoningByMode,
+      preferredModel: persisted.preferredModel,
+      preferredReasoningEffort: persisted.preferredReasoningEffort,
       updatedAt: persisted.updatedAt,
       created: persisted.created,
       senderClientId,
@@ -3290,26 +3263,41 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  app.post('/api/conversation/:id/workspace-root', auth, (req, res) => {
+  app.post('/api/conversation/:id/workspace-root', auth, async (req, res) => {
     const conversationId = String(req.params.id || '').trim();
     if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
-    const nextRootPath = String(
-      req.body?.rootPath
-      || req.body?.workspaceRootPath
-      || req.body?.workspace_root_path
-      || req.body?.cwd
-      || '',
-    ).trim();
+    const nextRootPath = readWorkspaceRootPathFromBody(req.body);
     if (!nextRootPath) {
       return res.status(400).json({ error: 'Missing rootPath' });
     }
     if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
       return res.status(500).json({ error: 'Conversation workspace updates are unavailable' });
     }
-    const result = updateConversationConfiguredWorkspaceRoot({
-      conversationId,
-      rootPath: nextRootPath,
+    const validated = validateRequestedWorkspaceRoot(nextRootPath, {
+      allowList: workspaceRootAllowList,
     });
+    if (!validated.ok) {
+      return res.status(validated.code === 'root-path-not-allowed' ? 403 : 400)
+        .json({ ok: false, code: validated.code, error: validated.error });
+    }
+    const rateLimited = consumeWorkspaceRootRateLimit(conversationId, req);
+    if (!rateLimited.ok) {
+      res.set('Retry-After', String(rateLimited.retryAfterSeconds));
+      return res.status(429).json({ ok: false, code: 'rate-limited', error: 'Too many CWD updates. Try again shortly.' });
+    }
+
+    // Queue behind any in-flight relaunch for this session: otherwise this write
+    // can swap the configured root between that relaunch's stop and its spawn.
+    const lockSessionId = String(
+      resolveConversationWorkspaceState?.({ conversationId })?.sdkSessionId || '',
+    ).trim();
+    const result = await sessionLaunchMutex.runExclusive(
+      lockSessionId || `conv:${conversationId}`,
+      () => updateConversationConfiguredWorkspaceRoot({
+        conversationId,
+        rootPath: validated.realPath,
+      }),
+    );
 
     if (!result?.ok) {
       return res.status(400).json({ error: result?.error || 'Failed to update conversation workspace root' });
@@ -3341,34 +3329,34 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  app.post('/api/conversation/:id/relaunch-with-workspace-root', auth, async (req, res) => {
-    const conversationId = String(req.params.id || '').trim();
-    const rootPath = String(req.body?.rootPath || req.body?.workspaceRootPath || '').trim();
-    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
-    if (!rootPath) return res.status(400).json({ error: 'Missing rootPath' });
-    if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
-      return res.status(500).json({ error: 'Conversation workspace updates are unavailable' });
-    }
-
-    const workspaceState = resolveConversationWorkspaceState?.({ conversationId }) || null;
-    const sdkSessionId = String(workspaceState?.sdkSessionId || '').trim();
-    if (!sdkSessionId) {
-      return res.status(409).json({ error: 'Open a conversation with a bound session before relaunching.' });
-    }
+  // Performs one relaunch. Always runs under sessionLaunchMutex, so it may assume
+  // no other launch-path request is interleaving with it.
+  async function runWorkspaceRootRelaunch({ conversationId, sdkSessionId, rootPath }) {
     const worker = sessionWorkerSupervisor?.getWorkerState?.(sdkSessionId)
       || sessionWorkerRegistry?.getWorker?.(sdkSessionId)
       || null;
     const activeQueueCount = Number(countActiveConversationQueueRows.get(conversationId)?.count || 0);
+    // A session that is not 'ready' can still own a live process (status 'error',
+    // or no registry entry at all). Detect that, or the stop is skipped and the
+    // launch silently reuses the old process in the old directory.
+    const liveProcessDetected = !!sessionWorkerProcessInspector?.findProcessForSession?.(sdkSessionId);
     const eligibility = evaluateWorkspaceRootRelaunch({
       workerStatus: worker?.status,
       activeQueueCount,
+      workerPidAlive: isPidAlive(worker?.pid),
+      liveProcessDetected,
     });
-    if (!eligibility.ok) return res.status(eligibility.statusCode).json({ ok: false, error: eligibility.error });
+    if (!eligibility.ok) {
+      return { statusCode: eligibility.statusCode, body: { ok: false, code: 'relaunch-not-eligible', error: eligibility.error } };
+    }
 
     const updateResult = updateConversationConfiguredWorkspaceRoot({ conversationId, rootPath });
     if (!updateResult?.ok) {
-      return res.status(400).json({ error: updateResult?.error || 'Failed to update conversation workspace root' });
+      return { statusCode: 400, body: { ok: false, error: updateResult?.error || 'Failed to update conversation workspace root' } };
     }
+    const state = updateResult.state || null;
+
+    let stoppedPids = [];
     if (eligibility.stopWorker) {
       const stopped = await stopIdleWorkspaceRootSession({
         sdkSessionId,
@@ -3377,41 +3365,210 @@ export function registerSessionsRoutes(app, deps) {
         sessionWorkerRegistry,
         sessionWorkerProcessInspector,
       });
-      if (!stopped.ok) return res.status(500).json({ ok: false, error: stopped.error });
+      if (!stopped.ok) {
+        // Do not launch on top of a process we could not kill. The CWD is saved,
+        // so the next clean launch will pick it up.
+        return {
+          statusCode: stopped.timedOut ? 409 : 500,
+          body: {
+            ok: false,
+            code: stopped.timedOut ? 'worker-stop-timeout' : 'worker-stop-failed',
+            remainingPids: stopped.remainingPids || [],
+            configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
+            workspaceRootApplied: false,
+            error: stopped.timedOut
+              ? 'Could not stop the running CLI. The CWD is saved for the next launch.'
+              : (stopped.error || 'Failed to stop the running CLI'),
+          },
+        };
+      }
+      stoppedPids = stopped.stoppedPids || [];
     }
+
+    // Every process is verified dead, so lift the kill block exactly once, here,
+    // rather than letting the launch helper clear it as a side effect.
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId, { resetKilledMarker: true });
+
     const launched = await launchWorkspaceRootSession(
       runtimeState,
       sessionWorkerSupervisor,
       sdkSessionId,
       sessionWorkerRegistry,
+      { allowProcessReuse: false, resetKilledMarker: false, requireStoppedWorker: false },
     );
     if (!launched?.ok) {
-      return res.status(launched?.statusCode || 409).json({
-        ok: false,
-        error: launched?.error || 'Failed to relaunch the CLI',
-      });
+      return {
+        statusCode: launched?.statusCode || 409,
+        body: {
+          ok: false,
+          code: 'relaunch-failed',
+          configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
+          workspaceRootApplied: false,
+          error: launched?.error || 'Failed to relaunch the CLI',
+        },
+      };
     }
-    const state = updateResult.state || null;
+
+    // Belt and braces: if a process was reused anyway, or the "new" pid is one we
+    // just tried to kill, the requested directory did not take. Say so.
+    const launchedPid = Number(launched.worker?.pid) || null;
+    // `state` was resolved before the stop, so its runtime/pending values still
+    // describe the CLI we just killed. They are only meaningful for the reuse
+    // check — never as the directory we report back.
+    const preLaunchRootPath = state?.runtimeWorkspaceRootPath
+      || (typeof getPendingSessionCwd === 'function' ? getPendingSessionCwd(sdkSessionId) : '')
+      || '';
+    const reusedExistingProcess = launched.reused === true
+      || (launchedPid !== null && stoppedPids.includes(launchedPid));
+    const reuseCheck = reusedExistingProcess
+      ? evaluateReuseCwdMismatch({ requestedRootPath: rootPath, observedRootPath: preLaunchRootPath })
+      : { comparable: false, mismatch: false };
+    const workspaceRootApplied = !reusedExistingProcess && !(reuseCheck.comparable && reuseCheck.mismatch);
+
+    // A fresh process launched in the requested directory, so the stale runtime
+    // root (and the pending CWD reported by the dead CLI) must be replaced now.
+    // Waiting for the new CLI's session-sync leaves every client showing the old
+    // CWD in the header and the file explorer until the next turn.
+    let effectiveState = state;
+    if (workspaceRootApplied) {
+      if (typeof consumePendingSessionCwd === 'function') consumePendingSessionCwd(sdkSessionId);
+      const learned = typeof learnConversationWorkspaceRoot === 'function'
+        ? learnConversationWorkspaceRoot({
+          conversationId,
+          sdkSessionId,
+          rootPath,
+          seedConfigured: false,
+        })
+        : null;
+      effectiveState = (learned?.ok && learned.state)
+        ? learned.state
+        // The persist call is the only thing that can fail here, and the root was
+        // already validated as an existing directory. Report the applied CWD
+        // anyway so clients never render the directory of the process we killed.
+        : {
+          ...(state || {}),
+          runtimeWorkspaceRootPath: rootPath,
+          runtimeWorkspaceRootName: workspaceRootDisplayName(rootPath),
+          currentWorkspaceRootPath: rootPath,
+          currentWorkspaceRootName: workspaceRootDisplayName(rootPath),
+        };
+    }
+
     const workspaceHints = workspaceRootPayload();
     io.emit('conversation_workspace_root_updated', {
       conversationId,
       sdkSessionId,
-      configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
-      configuredWorkspaceRootName: state?.configuredWorkspaceRootName || null,
-      runtimeWorkspaceRootPath: state?.runtimeWorkspaceRootPath || null,
-      runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
-      currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
-      currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
+      configuredWorkspaceRootPath: effectiveState?.configuredWorkspaceRootPath || null,
+      configuredWorkspaceRootName: effectiveState?.configuredWorkspaceRootName || null,
+      runtimeWorkspaceRootPath: effectiveState?.runtimeWorkspaceRootPath || null,
+      runtimeWorkspaceRootName: effectiveState?.runtimeWorkspaceRootName || null,
+      currentWorkspaceRootPath: effectiveState?.currentWorkspaceRootPath || null,
+      currentWorkspaceRootName: effectiveState?.currentWorkspaceRootName || null,
+      workspaceRootApplied,
       recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
     });
-    return res.json({
-      ok: true,
+    return {
+      statusCode: 200,
+      body: {
+        ok: true,
+        conversationId,
+        sdkSessionId,
+        ...effectiveState,
+        relaunched: workspaceRootApplied,
+        workspaceRootApplied,
+        reusedExistingProcess,
+        stoppedPids,
+        launchedPid,
+        ...(workspaceRootApplied ? {} : {
+          warning: 'cwd-not-applied',
+          activeWorkspaceRootPath: preLaunchRootPath || null,
+          message: 'CWD saved for the next launch, but the running CLI kept its current directory.',
+        }),
+        worker: launched.worker || null,
+        lifecycle: launched.lifecycle || null,
+      },
+    };
+  }
+
+  app.post('/api/conversation/:id/relaunch-with-workspace-root', auth, async (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const rootPath = readWorkspaceRootPathFromBody(req.body);
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    if (!rootPath) return res.status(400).json({ error: 'Missing rootPath' });
+    if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
+      return res.status(500).json({ error: 'Conversation workspace updates are unavailable' });
+    }
+
+    const validated = validateRequestedWorkspaceRoot(rootPath, { allowList: workspaceRootAllowList });
+    if (!validated.ok) {
+      return res.status(validated.code === 'root-path-not-allowed' ? 403 : 400)
+        .json({ ok: false, code: validated.code, error: validated.error });
+    }
+
+    const workspaceState = resolveConversationWorkspaceState?.({ conversationId }) || null;
+    const sdkSessionId = String(workspaceState?.sdkSessionId || '').trim();
+    if (!sdkSessionId) {
+      return res.status(409).json({ error: 'Open a conversation with a bound session before relaunching.' });
+    }
+
+    const rateLimited = consumeWorkspaceRootRateLimit(sdkSessionId, req);
+    if (!rateLimited.ok) {
+      res.set('Retry-After', String(rateLimited.retryAfterSeconds));
+      return res.status(429).json({ ok: false, code: 'rate-limited', error: 'Too many relaunch requests. Try again shortly.' });
+    }
+
+    const requestKey = buildRelaunchRequestKey({
       conversationId,
-      sdkSessionId,
-      ...state,
-      worker: launched.worker || null,
-      lifecycle: launched.lifecycle || null,
+      rootPath: validated.realPath,
+      idempotencyKey: req.headers?.['idempotency-key'] || req.body?.idempotencyKey,
     });
+
+    // A duplicated request (mobile ghost tap, a second tab, a retried fetch) must
+    // replay one result rather than driving a second stop/spawn cycle.
+    const pending = relaunchCoalescer.peek(sdkSessionId, requestKey);
+    if (pending.state === 'in-flight') {
+      const shared = await pending.promise;
+      return res.status(shared.statusCode).json({ ...shared.body, coalesced: true });
+    }
+    if (pending.state === 'cached') {
+      return res.status(pending.result.statusCode).json({ ...pending.result.body, coalesced: true, cached: true });
+    }
+    if (pending.state === 'busy') {
+      return res.status(409).json({
+        ok: false,
+        code: 'relaunch_in_progress',
+        sdkSessionId,
+        retryAfterMs: RELAUNCH_COALESCE_WINDOW_MS,
+        error: 'A different CWD change is already running for this session.',
+      });
+    }
+
+    const { settle } = relaunchCoalescer.begin(sdkSessionId, requestKey);
+    let outcome;
+    try {
+      const attempt = await sessionLaunchMutex.tryRunExclusive(sdkSessionId, () => runWorkspaceRootRelaunch({
+        conversationId,
+        sdkSessionId,
+        rootPath: validated.realPath,
+      }));
+      outcome = attempt.busy
+        ? {
+          statusCode: 409,
+          body: {
+            ok: false,
+            code: 'relaunch_in_progress',
+            sdkSessionId,
+            retryAfterMs: RELAUNCH_COALESCE_WINDOW_MS,
+            error: 'A different CWD change is already running for this session.',
+          },
+        }
+        : attempt.result;
+    } catch (error) {
+      outcome = { statusCode: 500, body: { ok: false, code: 'relaunch-error', error: error?.message || 'Failed to relaunch the CLI' } };
+    }
+    relaunchCoalescer.settle(sdkSessionId, requestKey, outcome);
+    settle(outcome);
+    return res.status(outcome.statusCode).json(outcome.body);
   });
 
   app.post('/api/conversation/:id/compact', auth, (req, res) => {
@@ -3540,10 +3697,15 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
     const claudeSettings = getClaudeProviderSettings();
+    // Include base ids of "[1m]" long-context variants: the composer and the
+    // new-conversation modal only ever offer base ids (the 1M tier is picked
+    // via the context-size dropdown).
     const availableClaudeModels = new Set([
       String(claudeSettings?.model || '').trim(),
       ...(Array.isArray(claudeSettings?.models) ? claudeSettings.models : []),
-    ].map((value) => String(value || '').trim()).filter(Boolean));
+    ].map((value) => String(value || '').trim()).filter(Boolean)
+      .flatMap((value) => [value, value.replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '')])
+      .filter(Boolean));
     if (
       requestedProviderType === 'claude'
       && requestedBootstrapModel
@@ -3598,7 +3760,7 @@ export function registerSessionsRoutes(app, deps) {
         ? resolveOpenAISessionModel({
             requestedModel: catalogSelectedModel,
             configuredModel: claudeSettings.model,
-            availableModels: claudeSettings.models,
+            availableModels: Array.from(availableClaudeModels),
           })
         : catalogSelectedModel);
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
@@ -4040,7 +4202,20 @@ export function registerSessionsRoutes(app, deps) {
 
   app.post('/api/session-worker/:sdkSessionId/launch', auth, async (req, res) => {
     const sdkSessionId = String(req.params.sdkSessionId || '').trim();
-    const result = await launchWorkspaceRootSession(runtimeState, sessionWorkerSupervisor, sdkSessionId, sessionWorkerRegistry);
+    // Shares the launch path with the CWD relaunch route, so it must share the
+    // lock too — otherwise it can interleave between that route's stop and spawn.
+    const attempt = await sessionLaunchMutex.tryRunExclusive(
+      sdkSessionId,
+      () => launchWorkspaceRootSession(runtimeState, sessionWorkerSupervisor, sdkSessionId, sessionWorkerRegistry),
+    );
+    if (attempt.busy) {
+      return res.status(409).json({
+        ok: false,
+        code: 'relaunch_in_progress',
+        error: 'Another launch is already running for this session.',
+      });
+    }
+    const result = attempt.result;
     if (!result?.ok) {
       return res.status(result?.statusCode || 400).json({
         ok: false,
@@ -4299,7 +4474,6 @@ export function registerSessionsRoutes(app, deps) {
       stale: modelState.stale,
       metadataValid: modelState.metadataValid === true,
       reasoningMetadataValid: modelState.reasoningMetadataValid === true,
-      catalogAgeWarning: modelState.catalogAgeWarning === true,
       refreshedAt: modelState.refreshedAt,
       source: modelState.source,
       warning: modelState.warning,

@@ -94,6 +94,40 @@ test('claude catalog uses discovered per-model effort levels', () => {
   );
 });
 
+test('claude catalog folds [1m] variants into the base model as a long_context tier', () => {
+  const base = { models: [], providersByModel: {}, reasoningByModel: {}, modelMetadataByModel: {} };
+  const result = buildModelCatalogWithClaudeProvider(base, {
+    enabled: true,
+    model: 'claude-sonnet-5',
+    models: ['claude-sonnet-5', 'claude-opus-5', 'claude-opus-5[1m]'],
+  });
+  assert.ok(result.models.includes('claude-opus-5'));
+  assert.ok(!result.models.includes('claude-opus-5[1m]'), '[1m] ids must not be separate composer entries');
+  assert.equal(result.providersByModel['claude-opus-5[1m]'], undefined);
+  assert.equal(result.modelMetadataByModel['claude-opus-5'].longContextLimitTokens, 1000000);
+  assert.equal(result.modelMetadataByModel['claude-opus-5'].defaultContextLimitTokens, 200000);
+  // Models without a discovered [1m] variant get no long_context tier.
+  assert.equal(result.modelMetadataByModel['claude-sonnet-5'].longContextLimitTokens, undefined);
+});
+
+test('claude catalog surfaces the base model when only the [1m] variant is enabled', () => {
+  const base = { models: [], providersByModel: {}, reasoningByModel: {}, modelMetadataByModel: {} };
+  const result = buildModelCatalogWithClaudeProvider(base, {
+    enabled: true,
+    model: 'claude-sonnet-5',
+    models: ['claude-opus-5[1m]'],
+    effortsByModel: {
+      'claude-opus-5[1m]': ['none', 'low', 'medium'],
+    },
+  });
+  assert.ok(result.models.includes('claude-opus-5'));
+  assert.ok(!result.models.includes('claude-opus-5[1m]'));
+  assert.deepEqual(result.providersByModel['claude-opus-5'], ['claude']);
+  assert.equal(result.modelMetadataByModel['claude-opus-5'].longContextLimitTokens, 1000000);
+  // Effort metadata discovered for the variant applies to the base entry.
+  assert.deepEqual(result.reasoningByProvider.claude['claude-opus-5'], ['none', 'low', 'medium']);
+});
+
 test('claude catalog composes with the openai catalog', () => {
   const base = {
     models: ['gpt-5.4-mini'],

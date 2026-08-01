@@ -49,10 +49,7 @@ const PROCESSING_DOT_INTERVAL_MS = 1000;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const CONVERSATION_LIST_PAGE_SIZE = 40;
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
-const REASONING_BY_MODE_STORAGE_KEY = 'copilot_selected_reasoning_by_mode';
 const OPENAI_IMAGE_SIZE_STORAGE_KEY = 'copilot_openai_image_size';
-const FALLBACK_REASONING_EFFORT = 'none';
-const FALLBACK_MODE = 'agent';
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let openConversationVersion = 0;
@@ -312,8 +309,8 @@ export function applyLoadedConversationState(id, response, {
     compactedFrom: response.compactedFrom ?? existingConversation.compactedFrom ?? null,
     updatedAt: response.updatedAt ?? existingConversation.updatedAt ?? new Date().toISOString(),
     preferredRelayMode: response.preferredRelayMode ?? existingConversation.preferredRelayMode,
-    preferredModelsByMode: response.preferredModelsByMode ?? existingConversation.preferredModelsByMode,
-    preferredReasoningByMode: response.preferredReasoningByMode ?? existingConversation.preferredReasoningByMode,
+    preferredModel: response.preferredModel ?? existingConversation.preferredModel,
+    preferredReasoningEffort: response.preferredReasoningEffort ?? existingConversation.preferredReasoningEffort,
     configuredWorkspaceRootPath: response.configuredWorkspaceRootPath ?? existingConversation.configuredWorkspaceRootPath ?? null,
     configuredWorkspaceRootName: response.configuredWorkspaceRootName ?? existingConversation.configuredWorkspaceRootName ?? null,
     runtimeWorkspaceRootPath: response.runtimeWorkspaceRootPath ?? existingConversation.runtimeWorkspaceRootPath ?? null,
@@ -337,8 +334,8 @@ export function applyLoadedConversationState(id, response, {
   renderConvList();
   window.applyConversationPreferences?.(id, {
     preferredRelayMode: response.preferredRelayMode,
-    preferredModelsByMode: response.preferredModelsByMode,
-    preferredReasoningByMode: response.preferredReasoningByMode,
+    preferredModel: response.preferredModel,
+    preferredReasoningEffort: response.preferredReasoningEffort,
   });
   setRepoBrowserSessionInfo(response.sessionRootPath || '', response.sessionRootName || response.title || '');
   if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
@@ -560,34 +557,6 @@ function populateNewConversationSizeSelect(providerType = 'github', selectedMode
   if (status) status.textContent = 'Image size used for generated outputs in this chat.';
 }
 
-function readStoredReasoningByMode() {
-  let raw = '';
-  try {
-    raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
-  } catch {
-    raw = '';
-  }
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out = {};
-    for (const [mode, effort] of Object.entries(parsed)) {
-      const modeKey = String(mode || '').trim();
-      const effortValue = String(effort || '').trim().toLowerCase();
-      if (!modeKey || !effortValue) continue;
-      out[modeKey] = effortValue;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-function selectedComposerMode() {
-  return String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
-}
-
 async function populateNewConversationReasoningSelect(selectedModel = '') {
   const select = document.getElementById('new-conversation-reasoning-select');
   const status = document.getElementById('new-conversation-reasoning-status');
@@ -625,10 +594,7 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
     option.textContent = effort;
     select.appendChild(option);
   }
-  const storedReasoningByMode = readStoredReasoningByMode();
-  const mode = selectedComposerMode();
   const preferred = resolvePreferredReasoningEffort(efforts, [
-    storedReasoningByMode[mode],
     localStorage.getItem(REASONING_STORAGE_KEY),
   ]);
   select.value = preferred || efforts[0];
@@ -776,12 +742,6 @@ function persistReasoningSelection(reasoningEffort = '') {
   const effort = String(reasoningEffort || '').trim().toLowerCase();
   if (!effort) return;
   localStorage.setItem(REASONING_STORAGE_KEY, effort);
-  const mode = selectedComposerMode();
-  const reasoningByMode = {
-    ...readStoredReasoningByMode(),
-    [mode]: effort || FALLBACK_REASONING_EFFORT,
-  };
-  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(reasoningByMode));
   const composerReasoningSelect = document.getElementById('reasoning-effort-select');
   if (composerReasoningSelect && Array.from(composerReasoningSelect.options || []).some((option) => option.value === effort)) {
     composerReasoningSelect.value = effort;

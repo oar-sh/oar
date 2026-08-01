@@ -18,6 +18,13 @@ import {
   parseCdCommandTarget,
   resolveCdCommandPath,
 } from './workspace-root.mjs';
+import {
+  normalizeDriveLetterOnlyPath,
+  normalizeWorkspaceRootAllowList,
+  normalizeWorkspaceRootKey,
+} from './services/workspace-root-path-policy.mjs';
+import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
+import { rebuildRecentWorkspaceRootsTable } from './migrations/0002-recent-workspace-roots-path-key.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
 import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
@@ -52,10 +59,7 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
-import {
-  isModelCatalogRefreshStale,
-  latestModelCatalogRefresh,
-} from '../shared/model-catalog-freshness.mjs';
+import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
 import { applyClaudeProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
@@ -488,8 +492,6 @@ const CLAUDE_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max
 const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 const DEFAULT_CLAUDE_MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];
-const MODEL_CATALOG_STALE_MS = 2 * 60 * 1000;
-const MODEL_CATALOG_WARNING_MS = 10 * 60 * 1000;
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
 const DEFAULT_RELAY_MODE = 'agent';
 const AUTO_MODEL_SENTINEL = 'auto';
@@ -856,6 +858,16 @@ const restartRetryBackoffMs = Array.isArray(config.restartRetryBackoffMs)
   : [1_000, 3_000, 7_000];
 const localhostOnly = config.localhostOnly === true || String(config.localhostOnly || '').trim().toLowerCase() === 'true';
 const listenHost = localhostOnly ? '127.0.0.1' : '0.0.0.0';
+// Optional containment for client-chosen launch directories. Unset/empty/malformed
+// disables the check entirely, so existing deployments are unaffected. Entries
+// that do not resolve to a directory are warned about and dropped rather than
+// failing closed — a typo must not brick the relay.
+const workspaceRootAllowList = normalizeWorkspaceRootAllowList(
+  process.env.COPILOT_WORKSPACE_ROOT_ALLOW_LIST || config.workspaceRootAllowList,
+);
+if (workspaceRootAllowList.length) {
+  console.log(`[workspace-root] allow list active (${workspaceRootAllowList.length} prefix(es))`);
+}
 const OFFLINE_STALE_RECOVER_MS = 45_000;
 // Grace period between deciding to shut down and disconnecting sockets, so a
 // terminal message_status emitted just before an idle-deferred restart still
@@ -1006,7 +1018,9 @@ function rememberRecentWorkspaceRoot(rootPath) {
   if (!normalized) return null;
   if (!stmts?.upsertRecentWorkspaceRoot?.run || !stmts?.pruneRecentWorkspaceRoots?.run) return normalized;
   const nowIso = new Date().toISOString();
-  stmts.upsertRecentWorkspaceRoot.run(normalized, nowIso);
+  // The newest casing wins for display: it is what the user just typed or what
+  // the CLI just reported.
+  stmts.upsertRecentWorkspaceRoot.run(normalizeWorkspaceRootKey(normalized), normalized, nowIso);
   stmts.pruneRecentWorkspaceRoots.run(MAX_RECENT_WORKSPACE_ROOTS);
   return normalized;
 }
@@ -1214,12 +1228,11 @@ function resolveLaunchWorkspaceRootForSession(sdkSessionId) {
 }
 
 function normalizeWorkspaceRootPath(candidatePath) {
-  let value = String(candidatePath || '').trim();
+  // Lenient on purpose: this also normalizes paths a CLI reports about itself.
+  // Client-supplied launch directories go through validateRequestedWorkspaceRoot
+  // in services/workspace-root-path-policy.mjs instead.
+  const value = normalizeDriveLetterOnlyPath(candidatePath);
   if (!value) return null;
-  // Normalize Windows drive-letter-only paths: "C:" → "C:\" so that
-  // path.resolve("C:") (which would give the server's remembered CWD for drive C)
-  // is avoided and "C:\" (the drive root) is used instead.
-  if (/^[A-Za-z]:$/.test(value)) value = `${value}\\`;
   const resolved = path.resolve(value);
   try {
     if (!fs.statSync(resolved).isDirectory()) return null;
@@ -1562,12 +1575,6 @@ function normalizeContextLimitsByModel(value = {}) {
   return normalized;
 }
 
-function isModelCatalogRefreshedAtStale(refreshedAt) {
-  return isModelCatalogRefreshStale(refreshedAt, {
-    staleAfterMs: MODEL_CATALOG_STALE_MS,
-  });
-}
-
 function hasValidReasoningByModel(reasoningByModel = {}) {
   if (!reasoningByModel || typeof reasoningByModel !== 'object') return false;
   const modelIds = Object.keys(reasoningByModel).filter((modelId) => modelId !== AUTO_MODEL_SENTINEL);
@@ -1658,15 +1665,10 @@ function getModelCatalogState() {
   const reasoningMetadataValid = hasValidReasoningByModel(reasoningByModel);
   const inMemoryRefresh = modelCatalog.refreshedAt || null;
   const refreshedAt = latestModelCatalogRefresh(selectorState.refreshedAt, inMemoryRefresh);
-  const catalogRefreshedAtStale = isModelCatalogRefreshedAtStale(refreshedAt);
   const metadataError = !reasoningMetadataValid || !!selectorState.error || modelRows.length === 0;
   const stale = metadataError;
   const metadataValid = !metadataError;
-  const catalogAgeMs = Date.now() - Date.parse(refreshedAt || 0);
-  const ageWarning = catalogRefreshedAtStale && Number.isFinite(catalogAgeMs) && catalogAgeMs > MODEL_CATALOG_WARNING_MS
-    ? 'Model catalog may be out of date. Refresh models if selections look wrong.'
-    : null;
-  const warning = [selectorState.warning, ageWarning].filter(Boolean).join(' ').trim() || null;
+  const warning = selectorState.warning || null;
   const reasoningEfforts = uniqueStringList(
     Object.values(reasoningByModel)
       .flatMap((list) => Array.isArray(list) ? list : [])
@@ -1683,7 +1685,6 @@ function getModelCatalogState() {
     metadataValid,
     reasoningMetadataValid,
     warning,
-    catalogAgeWarning: Boolean(ageWarning),
     error: selectorState.error,
     reasoningByModel,
     reasoningEfforts,
@@ -2185,8 +2186,8 @@ db.exec(`
     title_source TEXT NOT NULL DEFAULT 'auto',
     sdk_session_id TEXT,
     preferred_relay_mode TEXT,
-    preferred_models_by_mode TEXT,
-    preferred_reasoning_by_mode TEXT,
+    preferred_model TEXT,
+    preferred_reasoning_effort TEXT,
     configured_workspace_root_path TEXT,
     runtime_workspace_root_path TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
@@ -2331,8 +2332,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sdk_session_imports_status
     ON sdk_session_imports(status, updated_at);
 
+  -- path_key is the dedupe key: on Windows it is the whole path lower-cased, so
+  -- "C:\Git\Repo" and "c:\git\repo" occupy one row instead of two. See
+  -- migrations/0002-recent-workspace-roots-path-key.mjs for existing databases.
   CREATE TABLE IF NOT EXISTS recent_workspace_roots (
-    path         TEXT PRIMARY KEY,
+    path_key     TEXT PRIMARY KEY,
+    path         TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
   );
 
@@ -2684,6 +2689,14 @@ if (!queueColumns.includes('parked_at')) {
 if (!queueColumns.includes('parked_target_session_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN parked_target_session_id TEXT`);
 }
+
+// recent_workspace_roots gained a case-normalized primary key (path_key). The
+// CREATE TABLE IF NOT EXISTS above only covers fresh databases, so upgrade an
+// existing one in place before any statement referencing path_key is prepared.
+const recentWorkspaceRootsRebuild = rebuildRecentWorkspaceRootsTable(db);
+if (recentWorkspaceRootsRebuild.applied) {
+  console.log(`[workspace-root] rebuilt recent CWD history: ${recentWorkspaceRootsRebuild.rowsBefore} row(s) -> ${recentWorkspaceRootsRebuild.rowsAfter} distinct directory/ies`);
+}
 if (!queueColumns.includes('parked_transaction_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN parked_transaction_id TEXT`);
 }
@@ -2753,11 +2766,31 @@ if (!conversationColumns.includes('sdk_session_id')) {
 if (!conversationColumns.includes('preferred_relay_mode')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN preferred_relay_mode TEXT`);
 }
-if (!conversationColumns.includes('preferred_models_by_mode')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_models_by_mode TEXT`);
+if (!conversationColumns.includes('preferred_model')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_model TEXT`);
 }
-if (!conversationColumns.includes('preferred_reasoning_by_mode')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_reasoning_by_mode TEXT`);
+if (!conversationColumns.includes('preferred_reasoning_effort')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_reasoning_effort TEXT`);
+  // One-time carry-over from the retired per-mode preference maps: seed the flat
+  // preference from the entry stored for the conversation's preferred mode.
+  if (conversationColumns.includes('preferred_models_by_mode')) {
+    const legacyRows = db.prepare(`
+      SELECT id, preferred_relay_mode, preferred_models_by_mode, preferred_reasoning_by_mode
+      FROM conversations
+      WHERE preferred_models_by_mode IS NOT NULL OR preferred_reasoning_by_mode IS NOT NULL
+    `).all();
+    const seedFlatPreference = db.prepare(`UPDATE conversations SET preferred_model = ?, preferred_reasoning_effort = ? WHERE id = ?`);
+    for (const legacyRow of legacyRows) {
+      let modelsByMode = {};
+      let reasoningByMode = {};
+      try { modelsByMode = JSON.parse(legacyRow.preferred_models_by_mode || '{}') || {}; } catch { modelsByMode = {}; }
+      try { reasoningByMode = JSON.parse(legacyRow.preferred_reasoning_by_mode || '{}') || {}; } catch { reasoningByMode = {}; }
+      const mode = String(legacyRow.preferred_relay_mode || '').trim() || DEFAULT_RELAY_MODE;
+      const model = String(modelsByMode?.[mode] || '').trim() || null;
+      const effort = String(reasoningByMode?.[mode] || '').trim().toLowerCase() || null;
+      if (model || effort) seedFlatPreference.run(model, effort, legacyRow.id);
+    }
+  }
 }
 if (!conversationColumns.includes('configured_workspace_root_path')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN configured_workspace_root_path TEXT`);
@@ -3259,30 +3292,17 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
     return false;
   }
 
-  const pids = [...new Set([
-    ...discoveredProcesses.map((entry) => Number(entry?.processId)).filter((pid) => Number.isInteger(pid) && pid > 0),
-    currentWorkerPid,
-  ].filter((pid) => Number.isInteger(pid) && pid > 0))];
-
-  if (process.platform === 'win32') {
-    if (pids.length) sessionWorkerProcessInspector.stopWindowsPids(pids);
-  } else {
-    killTmuxSession(sessionId);
-    for (const pid of pids) {
-      try {
-        process.kill(pid, 'SIGTERM');
-      } catch (error) {
-        if (String(error?.code || '') !== 'ESRCH') throw error;
-      }
-    }
-  }
-  const stopDeadline = Date.now() + 3_000;
-  while (pids.some((pid) => isProcessAlive(pid)) && Date.now() < stopDeadline) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  const remainingPids = pids.filter((pid) => isProcessAlive(pid));
-  if (remainingPids.length) {
-    throw new Error(`worker-stop-timeout:${remainingPids.join(',')}`);
+  const stopped = await stopSessionWorkerProcesses({
+    sdkSessionId: sessionId,
+    worker: currentWorker,
+    processInspector: sessionWorkerProcessInspector,
+    isPidAliveImpl: isProcessAlive,
+    killTmuxSessionImpl: killTmuxSession,
+  });
+  // This caller treats a surviving process as fatal; the CWD relaunch route
+  // instead reports it, so the shared service never throws on its own.
+  if (!stopped.ok) {
+    throw new Error(stopped.error || `worker-stop-timeout:${(stopped.remainingPids || []).join(',')}`);
   }
 
   sessionWorkerRegistry?.removeWorker?.(sessionId);
@@ -5992,6 +6012,8 @@ const sharedRouteDeps = {
   learnConversationWorkspaceRoot,
   setPendingSessionCwd,
   consumePendingSessionCwd,
+  getPendingSessionCwd,
+  workspaceRootAllowList,
   featureFlags,
   sessionWorkerSupervisor,
   sessionWorkerRegistry,

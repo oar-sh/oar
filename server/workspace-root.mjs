@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { normalizeDriveLetterOnlyPath } from './services/workspace-root-path-policy.mjs';
+
 function isDirectory(targetPath) {
   try {
     return fs.statSync(targetPath).isDirectory();
@@ -59,12 +61,8 @@ export function parseCdCommandTarget(text) {
 }
 
 export function resolveCdCommandPath(targetPath, currentRoot, homeDir = process.env.USERPROFILE || process.env.HOME || process.cwd()) {
-  let candidate = String(targetPath || '').trim();
+  let candidate = normalizeDriveLetterOnlyPath(targetPath);
   if (!candidate) return null;
-
-  if (/^[A-Za-z]:$/.test(candidate)) {
-    candidate = `${candidate}\\`;
-  }
 
   if (candidate === '~') {
     candidate = homeDir;

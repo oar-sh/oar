@@ -131,8 +131,9 @@ test('shared upload route is registered at top level (not nested inside presence
 test('shared presence route applies rate limit responses', () => {
   const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
-  assert.match(source, /const SHARED_PRESENCE_RATE_WINDOW_MS = 10_000;/);
-  assert.match(source, /const SHARED_PRESENCE_RATE_LIMIT = 24;/);
+  // The limiter itself now lives in services/rate-limit-service.mjs; the route
+  // keeps the same window/limit and the same 429 + Retry-After response.
+  assert.match(source, /const sharedPresenceRateLimiter = createFixedWindowRateLimiter\(\{[\s\S]*?windowMs: 10_000,[\s\S]*?limit: 24,/);
   assert.match(source, /res\.setHeader\('Retry-After', String\(rateLimit\.retryAfterSeconds \|\| 1\)\);/);
   assert.match(source, /return res\.status\(429\)\.json\(\{/);
 });

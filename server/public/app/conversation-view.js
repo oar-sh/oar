@@ -2255,8 +2255,8 @@ export async function sendMessage() {
         runtimeProviderType: r.runtimeProviderType || 'github',
         runtimeProviderModel: r.runtimeProviderModel || null,
         preferredRelayMode: r.preferredRelayMode || selectedMode,
-        preferredModelsByMode: r.preferredModelsByMode || { [selectedMode]: selectedModel },
-        preferredReasoningByMode: r.preferredReasoningByMode || { [selectedMode]: selectedReasoningEffort || 'none' },
+        preferredModel: r.preferredModel || selectedModel,
+        preferredReasoningEffort: r.preferredReasoningEffort || selectedReasoningEffort || 'none',
       };
       window.syncAutoModelAvailability?.();
       document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);

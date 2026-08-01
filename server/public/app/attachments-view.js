@@ -1502,6 +1502,30 @@ export function refreshRepoBrowser() {
   void loadRepoBrowserTree();
 }
 
+export function resetWorkspaceRepoBrowserForRootChange() {
+  // A CWD change repoints the workspace root, so every cached path (tree,
+  // selection, expansion) belongs to a directory the browser no longer shows.
+  // Dropping them is what stops the explorer from rendering the old CWD after a
+  // relaunch.
+  if (repoBrowserState.activeRoot !== 'workspace') return;
+  pendingRepoBrowserRestore = null;
+  repoBrowserState.expandedPaths = new Set();
+  repoBrowserState.collapsedPaths = new Set();
+  setRepoBrowserState({
+    tree: null,
+    nodeMap: new Map(),
+    currentPath: '',
+    loadingPath: '',
+    error: '',
+    rootName: 'repo',
+  });
+  if (repoBrowserState.open) {
+    void loadRepoBrowserTree();
+  } else {
+    renderRepoBrowser();
+  }
+}
+
 export function setRepoBrowserViewMode(mode) {
   const value = String(mode || '').toLowerCase();
   if (value !== 'list' && value !== 'grid') return;

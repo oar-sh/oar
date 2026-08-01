@@ -365,21 +365,21 @@ export async function connectSocket(overrideDeps) {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModelsByMode, preferredReasoningByMode, senderClientId }) => {
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, senderClientId }) => {
     if (senderClientId && senderClientId === CLIENT_ID) return;
     const id = String(conversationId || '').trim();
     if (!id || !conversations[id]) return;
     conversations[id] = {
       ...conversations[id],
       preferredRelayMode: preferredRelayMode || conversations[id].preferredRelayMode || FALLBACK_MODE,
-      preferredModelsByMode: preferredModelsByMode || conversations[id].preferredModelsByMode || {},
-      preferredReasoningByMode: preferredReasoningByMode || conversations[id].preferredReasoningByMode || {},
+      preferredModel: preferredModel || conversations[id].preferredModel || '',
+      preferredReasoningEffort: preferredReasoningEffort || conversations[id].preferredReasoningEffort || '',
     };
     if (String(currentConvId || '').trim() === id) {
       applyConversationPreferencesForConversation(id, {
         preferredRelayMode,
-        preferredModelsByMode,
-        preferredReasoningByMode,
+        preferredModel,
+        preferredReasoningEffort,
       });
     }
   });

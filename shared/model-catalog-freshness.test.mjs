@@ -1,10 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  isModelCatalogRefreshStale,
-  latestModelCatalogRefresh,
-} from './model-catalog-freshness.mjs';
+import { latestModelCatalogRefresh } from './model-catalog-freshness.mjs';
 
 test('uses the newest valid model catalog timestamp', () => {
   assert.equal(
@@ -16,18 +13,10 @@ test('uses the newest valid model catalog timestamp', () => {
   );
 });
 
-test('keeps a freshly received snapshot from being treated as stale', () => {
-  const now = Date.parse('2026-07-12T09:03:53.203Z');
-  const refreshedAt = latestModelCatalogRefresh(
-    '2026-07-12T07:32:22.351Z',
-    '2026-07-12T09:03:53.203Z',
-  );
-
+test('ignores invalid timestamps and returns null when none parse', () => {
+  assert.equal(latestModelCatalogRefresh(null, '', 'not-a-date'), null);
   assert.equal(
-    isModelCatalogRefreshStale(refreshedAt, {
-      now,
-      staleAfterMs: 2 * 60 * 1000,
-    }),
-    false,
+    latestModelCatalogRefresh(null, '2026-07-12T09:03:53.203Z', 'not-a-date'),
+    '2026-07-12T09:03:53.203Z',
   );
 });

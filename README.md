@@ -279,7 +279,7 @@ The composer's model picker is the union of every enabled provider's catalog, fi
 
 - **Copilot** models come from live snapshot updates published by the active CLI runtime, falling back to a curated set (`claude-sonnet-4.6`, `claude-haiku-4.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`).
 - **OpenAI (BYOK)** models are discovered from `/v1/models` when the key is saved or re-enabled.
-- **Claude** models are discovered from the Agent SDK when the provider is enabled, including bracketed capability variants such as `claude-opus-5[1m]`.
+- **Claude** models are discovered from the Agent SDK when the provider is enabled. Bracketed `[1m]` long-context variants (such as `claude-opus-5[1m]`) do not appear as separate entries; they surface as a 1M option in the composer's context-size dropdown for the base model.
 
 Use **Select Models** to choose which variants show up in the composer. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Anthropic** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
 

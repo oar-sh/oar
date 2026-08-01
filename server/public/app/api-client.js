@@ -299,13 +299,16 @@ export async function launchSessionWorker(sdkSessionId) {
   });
 }
 
-export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, rootPath) {
+export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, rootPath, idempotencyKey = '') {
   const convId = String(conversationId || '').trim();
   const pathValue = String(rootPath || '').trim();
   if (!convId || !pathValue) return null;
+  // One key per user gesture, so a duplicate delivery (retried fetch, second tab,
+  // stray touch event) is provably the same request and the relay replays it
+  // instead of running a second stop/spawn cycle.
   return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/relaunch-with-workspace-root`, {
     method: 'POST',
-    body: JSON.stringify({ rootPath: pathValue }),
+    body: JSON.stringify({ rootPath: pathValue, idempotencyKey: String(idempotencyKey || '') }),
   });
 }
 

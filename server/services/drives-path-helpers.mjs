@@ -1,5 +1,7 @@
 import path from 'node:path';
 
+import { normalizeDriveLetterOnlyPath } from './workspace-root-path-policy.mjs';
+
 // ---------------------------------------------------------------------------
 // Windows drive path helpers
 // ---------------------------------------------------------------------------
@@ -19,7 +21,7 @@ export function normalizeDriveAbsolutePath(rawPath) {
     .replace(/\\+/g, '\\')
     .trim();
   if (!normalized) return '';
-  if (/^[A-Za-z]:$/.test(normalized)) normalized = `${normalized}\\`;
+  normalized = normalizeDriveLetterOnlyPath(normalized);
   if (!/^[A-Za-z]:\\/.test(normalized)) return '';
   normalized = path.win32.normalize(normalized);
   if (!/^[A-Za-z]:\\/.test(normalized)) return '';

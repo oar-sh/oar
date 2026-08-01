@@ -58,6 +58,26 @@ export function isSafeClaudeModelId(value) {
   return MODEL_ID_TOKEN_PATTERN.test(base);
 }
 
+// The "[1m]" suffix marks the 1M-context variant of a Claude model. The UI
+// treats it as a context tier of the base model, not a separate model.
+export const CLAUDE_LONG_CONTEXT_SUFFIX = '[1m]';
+export const CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN = /\[1m\]$/i;
+export const CLAUDE_LONG_CONTEXT_LIMIT_TOKENS = 1_000_000;
+export const CLAUDE_DEFAULT_CONTEXT_LIMIT_TOKENS = 200_000;
+
+export function isClaudeLongContextModelId(value) {
+  return CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN.test(normalizeModelIdCandidate(value));
+}
+
+export function claudeBaseModelId(value) {
+  return normalizeModelIdCandidate(value).replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '');
+}
+
+export function claudeLongContextModelId(value) {
+  const base = claudeBaseModelId(value);
+  return base ? `${base}${CLAUDE_LONG_CONTEXT_SUFFIX}` : '';
+}
+
 export function isOpenAIModelId(value) {
   const candidate = normalizeModelIdCandidate(value).toLowerCase();
   if (candidate === 'o1' || candidate === 'o3') return true;

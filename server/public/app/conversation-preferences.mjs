@@ -12,21 +12,9 @@ function normalizeModelList(models = []) {
     : [];
 }
 
-export function normalizePreferredModelsByMode(value, { supportedModes = [] } = {}) {
-  const allowedModes = normalizeModeList(supportedModes);
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const normalized = {};
-  for (const mode of allowedModes) {
-    const model = String(value[mode] || '').trim();
-    if (!model) continue;
-    normalized[mode] = model;
-  }
-  return normalized;
-}
-
 export function resolveConversationComposerSelection({
   preferredRelayMode = '',
-  preferredModelsByMode = {},
+  preferredModel = '',
   selectedMode = '',
   selectedModel = '',
   supportedModes = [],
@@ -46,11 +34,8 @@ export function resolveConversationComposerSelection({
       ? String(selectedMode || '').trim()
       : modeFallback);
 
-  const normalizedMap = normalizePreferredModelsByMode(preferredModelsByMode, {
-    supportedModes: allowedModes,
-  });
   const modelCandidates = [
-    normalizedMap[nextMode],
+    String(preferredModel || '').trim(),
     String(selectedModel || '').trim(),
     String(fallbackModel || '').trim(),
     allowedModels[0] || '',
@@ -59,28 +44,8 @@ export function resolveConversationComposerSelection({
     ? (modelCandidates.find((candidate) => allowedModels.includes(candidate)) || allowedModels[0])
     : (modelCandidates[0] || '');
 
-  if (nextModel) normalizedMap[nextMode] = nextModel;
-
   return {
     mode: nextMode,
     model: nextModel,
-    preferredModelsByMode: normalizedMap,
   };
-}
-
-export function withUpdatedModelPreference({
-  preferredModelsByMode = {},
-  mode = '',
-  model = '',
-  supportedModes = [],
-} = {}) {
-  const allowedModes = normalizeModeList(supportedModes);
-  const nextMode = String(mode || '').trim();
-  const nextModel = String(model || '').trim();
-  const normalizedMap = normalizePreferredModelsByMode(preferredModelsByMode, {
-    supportedModes: allowedModes,
-  });
-  if (!allowedModes.includes(nextMode) || !nextModel) return normalizedMap;
-  normalizedMap[nextMode] = nextModel;
-  return normalizedMap;
 }

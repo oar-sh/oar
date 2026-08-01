@@ -624,6 +624,9 @@ test('launchSessionCli bypasses process reuse when disabled', async () => {
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4243);
   assert.equal(spawnCalls[0]?.command, 'copilot');
+  // The whole point of disabling reuse is that the requested directory actually
+  // applies; reusing the live process would silently keep the old one.
+  assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WORKSPACE_ROOT, '/repo');
 });
 
 test('launchSessionCli ignores a dead discovered pid and continues to launch', async () => {

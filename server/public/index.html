@@ -776,10 +776,10 @@
     border: 1px solid var(--border);
     border-radius: 10px;
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
-    padding: 6px;
+    padding: 4px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
     z-index: 60;
   }
   #chat-actions-menu[hidden] {
@@ -790,7 +790,7 @@
     align-items: center;
     gap: 8px;
     width: 100%;
-    min-height: 32px;
+    min-height: 28px;
     border: 1px solid transparent;
     background: transparent;
     color: var(--text);
@@ -822,7 +822,7 @@
     display: inline-flex;
     align-items: center;
     width: 100%;
-    min-height: 32px;
+    min-height: 28px;
     border: 1px solid transparent;
     color: var(--muted);
     border-radius: 8px;
@@ -836,9 +836,9 @@
     flex-direction: column;
     align-items: flex-start;
     justify-content: center;
-    min-height: 42px;
-    padding: 3px 8px;
-    gap: 1px;
+    min-height: 34px;
+    padding: 2px 8px;
+    gap: 0;
     line-height: 1.2;
   }
   .chat-actions-menu-meta-primary {
@@ -2298,10 +2298,14 @@
     gap: 8px;
     position: relative;
   }
+  .change-cwd-picker-label {
+    font-size: var(--fs-meta-sm);
+    color: var(--muted);
+  }
   .change-cwd-manual-input {
     width: 100%;
     min-width: 0;
-    height: 38px;
+    min-height: 38px;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg3);
@@ -2314,9 +2318,12 @@
     border-color: var(--accent);
   }
   .change-cwd-menu-trigger {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     width: 100%;
     min-width: 0;
-    height: 38px;
+    min-height: 44px;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg3);
@@ -2324,24 +2331,70 @@
     padding: 0 10px;
     font: inherit;
     text-align: left;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
     cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
   .change-cwd-menu-trigger:hover {
     border-color: var(--accent);
   }
+  .change-cwd-menu-trigger:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .change-cwd-menu-trigger[aria-expanded="true"] {
+    border-color: var(--accent);
+  }
+  .change-cwd-menu-trigger:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  .change-cwd-menu-trigger-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .change-cwd-menu-trigger-caret {
+    flex: 0 0 auto;
+    color: var(--muted);
+  }
+  /* Shield behind the open panel. It is part of the open state, never a timer,
+     so no click can reach the action buttons while the picker is expanded. */
+  .change-cwd-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 19;
+    background: transparent;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .change-cwd-menu-backdrop[hidden] {
+    display: none;
+  }
+  /* Fixed, not in-flow: opening/closing the panel must never reflow the action
+     row below it (that reflow is what slid a button under the user's finger).
+     position:fixed also escapes .summary-dialog{overflow:hidden} clipping and
+     .summary-body{overflow:auto} scrolling. */
   .change-cwd-menu-panel {
+    position: fixed;
+    z-index: 20;
+    top: 0;
+    left: 0;
+    width: 260px;
+    max-height: 300px;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg3);
-    max-height: 220px;
-    overflow-y: auto;
-    padding: 6px;
+    border-radius: 10px;
+    background: var(--bg2);
+    box-shadow: 0 14px 30px rgba(0, 0, 0, 0.42);
+    padding: 4px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
   }
   .change-cwd-menu-panel[hidden] {
     display: none;
@@ -2353,43 +2406,55 @@
     background: transparent;
     color: var(--text);
     width: 100%;
-    min-height: 62px;
-    padding: 8px;
+    /* Two short text lines; 44px keeps the recommended touch target while
+       fitting noticeably more entries than the old 62px row. Rows still grow
+       when a long path wraps. */
+    min-height: 44px;
+    padding: 4px 8px;
     font: inherit;
     text-align: left;
     cursor: pointer;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    justify-content: center;
+    gap: 0;
     flex-shrink: 0;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
   }
   .change-cwd-menu-item:hover {
-    background: var(--bg2);
+    background: var(--bg3);
     border-color: var(--border);
   }
-  .change-cwd-menu-item:focus-visible {
+  /* Keyboard "active option" (the aria-activedescendant target). DOM focus stays
+     on the trigger, so this is distinct from :focus-visible and from .selected. */
+  .change-cwd-menu-item.active {
+    background: var(--bg3);
+    border-color: var(--accent);
     outline: 2px solid var(--accent);
-    outline-offset: 1px;
-    background: var(--bg2);
+    outline-offset: -2px;
   }
   .change-cwd-menu-item.selected {
     border-color: var(--accent);
-    background: var(--bg2);
+    background: var(--bg3);
   }
   .change-cwd-menu-item-primary {
-    font-size: var(--fs-meta-sm);
+    font-size: var(--fs-meta-xs);
     color: var(--muted);
-    line-height: 1.35;
+    line-height: 1.25;
   }
   .change-cwd-menu-item-secondary {
     font-size: var(--fs-meta-sm);
+    font-weight: 600;
+    color: var(--text);
     word-break: break-word;
-    line-height: 1.35;
+    line-height: 1.25;
   }
   .change-cwd-menu-empty {
     font-size: var(--fs-meta-sm);
     color: var(--muted);
-    padding: 6px 8px;
+    padding: 8px;
   }
   .summary-loading,
   .summary-error {
@@ -3232,6 +3297,10 @@
       font-size: 0;
     }
     #chat-actions-menu { min-width: 200px; }
+    /* Slightly taller than desktop so the tap target barely changes; the row
+       pitch still drops from 36px to 32px thanks to the tighter menu gap. */
+    .chat-actions-menu-item,
+    .chat-actions-menu-meta { min-height: 30px; }
     #input-area { padding: 2px 10px calc(6px + env(safe-area-inset-bottom, 0px)); }
     .input-row {
       display: flex;
@@ -3394,6 +3463,30 @@
     }
     .summary-modal-actions > * {
       flex: 1 1 calc(50% - 5px);
+    }
+    /* Known-CWD picker becomes a bottom sheet. positionChangeCwdMenu() must clear
+       the inline left/top/width/maxHeight it sets on desktop, or those win here. */
+    .change-cwd-menu-backdrop {
+      background: rgba(0, 0, 0, 0.42);
+    }
+    .change-cwd-menu-panel {
+      left: 8px;
+      right: 8px;
+      top: auto;
+      bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+      width: auto;
+      max-height: min(56vh, 420px);
+      border-radius: 14px;
+      padding: 6px;
+      gap: 3px;
+    }
+    .change-cwd-menu-item {
+      min-height: 46px;
+      padding: 5px 8px;
+    }
+    .change-cwd-menu-trigger,
+    .change-cwd-manual-input {
+      min-height: 46px;
     }
     .summary-modal-actions .summary-close {
       width: auto;

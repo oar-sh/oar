@@ -1199,10 +1199,16 @@ export function setSummaryModalLoading(loading) {
     refreshBtn.disabled = summaryModalState.loading || !summaryModalState.refresh;
     refreshBtn.textContent = summaryModalState.loading ? 'Loading…' : 'Refresh';
   }
-  // Freeze/unfreeze all action buttons inside the modal body while a request is in flight
+  // Freeze/unfreeze all action buttons inside the modal body while a request is in flight.
+  // data-keep-disabled marks buttons that were rendered disabled for their own reason
+  // (e.g. no launchable session) and must not be re-enabled when loading clears.
   const bodyEl = document.getElementById('summary-modal-body');
   if (bodyEl) {
     for (const btn of bodyEl.querySelectorAll('button')) {
+      if (btn.dataset.keepDisabled === '1') {
+        btn.disabled = true;
+        continue;
+      }
       btn.disabled = summaryModalState.loading;
     }
   }

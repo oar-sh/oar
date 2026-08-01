@@ -102,14 +102,10 @@ import {
   clearImageEditTarget,
   jumpToImageParent,
 } from './conversation-view.js';
-import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
-import {
-  resolveConversationComposerSelection,
-  withUpdatedModelPreference,
-  normalizePreferredModelsByMode,
-} from './conversation-preferences.mjs';
+import { resolveConversationComposerSelection } from './conversation-preferences.mjs';
 import {
   modelSelectorOptionsEqual,
   normalizeModelSelectorOptions,
@@ -143,9 +139,8 @@ import {
   syncChatHeaderWorkspaceLabel,
   normalizeKnownCwdPath,
   clearLegacyKnownCwdHistoryStorage,
-  bindTapAction,
-  bindMenuAction,
 } from './cwd-picker.js';
+import { bindTapAction, bindMenuAction } from './tap-actions.js';
 
 let pendingExternalLinkUrl = '';
 
@@ -216,9 +211,10 @@ import {
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
-const MODELS_BY_MODE_STORAGE_KEY = 'copilot_selected_models_by_mode';
-const REASONING_BY_MODE_STORAGE_KEY = 'copilot_selected_reasoning_by_mode';
 const AUTO_MODEL_OPTION = 'auto';
+// Claude "[1m]" long-context variants surface as the base model plus the
+// long_context tier in the context-size dropdown, never as separate entries.
+const CLAUDE_LONG_CONTEXT_PATTERN = /\[1m\]$/i;
 const FALLBACK_MODEL = 'gpt-5.4-mini';
 const FALLBACK_REASONING_EFFORT = 'none';
 const FALLBACK_MODE = 'agent';
@@ -286,8 +282,6 @@ let modelVariantCatalogState = {
   reasoningEfforts: [],
 };
 let modelVariantCatalogProviderTab = 'copilot';
-let activeConversationPreferredModelsByMode = {};
-let activeConversationPreferredReasoningByMode = {};
 let suppressConversationPreferenceSync = false;
 let conversationPreferenceWriteVersion = 0;
 let latestQueueStatus = {
@@ -936,44 +930,6 @@ function clearModelMetadataHardFail() {
   }
 }
 
-function normalizePreferredReasoningByMode(value, { supportedModes = [] } = {}) {
-  const allowedModes = Array.isArray(supportedModes)
-    ? supportedModes.map((mode) => String(mode || '').trim()).filter(Boolean)
-    : [];
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const normalized = {};
-  for (const mode of allowedModes) {
-    const effort = String(value[mode] || '').trim().toLowerCase();
-    if (!effort) continue;
-    normalized[mode] = effort;
-  }
-  return normalized;
-}
-
-function readStoredReasoningByMode() {
-  let raw = '';
-  try {
-    raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
-  } catch {
-    raw = '';
-  }
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out = {};
-    for (const [mode, effort] of Object.entries(parsed)) {
-      const modeKey = String(mode || '').trim();
-      const effortValue = String(effort || '').trim().toLowerCase();
-      if (!modeKey || !effortValue) continue;
-      out[modeKey] = effortValue;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
 async function startAppWithErrorHandling() {
   try {
     await initApp();
@@ -1090,10 +1046,6 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
   select.title = isOpenAIImageModelId(modelId) ? 'Quality' : 'Reasoning effort';
   const options = reasoningOptionsForModel(modelId);
   const selectedBefore = String(select.value || '').trim().toLowerCase();
-  const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
-  const storedByMode = readStoredReasoningByMode();
-  const modeStored = String(storedByMode?.[mode] || '').trim().toLowerCase();
-  const modeInMemory = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
   const genericStored = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
   select.innerHTML = '';
   if (!options.length) {
@@ -1111,18 +1063,13 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
     select.appendChild(opt);
   }
   const preferred = String(preferredEffort || '').trim().toLowerCase();
-  const resolvedPreferred = [preferred, modeInMemory, modeStored, selectedBefore, genericStored]
+  const resolvedPreferred = [preferred, selectedBefore, genericStored]
     .find((value) => value && options.includes(value));
   const resolved = resolvedPreferred
     || options.find((value) => value !== 'none')
     || options[0];
   select.value = resolved;
   localStorage.setItem(REASONING_STORAGE_KEY, resolved);
-  activeConversationPreferredReasoningByMode = {
-    ...activeConversationPreferredReasoningByMode,
-    [mode]: resolved,
-  };
-  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
 }
 
 function updateModelCatalogState(payload) {
@@ -1175,7 +1122,6 @@ function updateModelCatalogState(payload) {
     stale: !!payload?.stale,
     metadataValid: payload?.metadataValid === true,
     reasoningMetadataValid: payload?.reasoningMetadataValid === true,
-    catalogAgeWarning: payload?.catalogAgeWarning === true,
     warning: payload?.warning ? String(payload.warning) : null,
     error: payload?.error ? String(payload.error) : null,
     refreshedAt: payload?.refreshedAt || null,
@@ -1229,8 +1175,6 @@ function updateModelCatalogState(payload) {
   }
 
   const selectedBefore = select.value;
-  const selectedMode = String(document.getElementById('mode-select')?.value || '').trim();
-  const preferredForMode = String(activeConversationPreferredModelsByMode?.[selectedMode] || '').trim();
   if (optionsChanged) {
     select.innerHTML = '';
     for (const option of nextOptions) {
@@ -1242,31 +1186,14 @@ function updateModelCatalogState(payload) {
   }
   select.dataset.providerScope = normalizeModelSelectorProviderType(activeProviderType);
 
-  const preferred = [preferredForMode, selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
+  const preferred = [selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
     .find((value) => value && nextModels.includes(value)) || nextModels[0];
   select.value = preferred;
   localStorage.setItem(MODEL_STORAGE_KEY, preferred);
-  const preferredReasoningForMode = String(activeConversationPreferredReasoningByMode?.[selectedMode] || '').trim().toLowerCase();
-  updateReasoningSelectorForModel(preferred, preferredReasoningForMode);
+  updateReasoningSelectorForModel(preferred);
   updateContextTierSelector(preferred);
-  if (selectedMode) {
-    activeConversationPreferredModelsByMode = withUpdatedModelPreference({
-      preferredModelsByMode: activeConversationPreferredModelsByMode,
-      mode: selectedMode,
-      model: preferred,
-      supportedModes: Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value),
-    });
-    localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
-    activeConversationPreferredReasoningByMode = {
-      ...activeConversationPreferredReasoningByMode,
-      [selectedMode]: selectedReasoningEffortValue(),
-    };
-    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
-  }
 
-  if (modelCatalogState.catalogAgeWarning && isModelMetadataHealthy(modelCatalogState)) {
-    setModelBanner(`⚠️ ${modelCatalogState.warning || 'Model catalog may be out of date. Refresh models if selections look wrong.'}`);
-  } else if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
+  if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
   } else if (modelCatalogState.stale && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('⚠️ Model list is cached from CLI; selection may be stale.');
@@ -1360,18 +1287,6 @@ function updateModelPricingDetails(modelId, tier) {
   details.style.display = grid.childElementCount ? '' : 'none';
 }
 
-function readStoredModelsByMode() {
-  const raw = String(localStorage.getItem(MODELS_BY_MODE_STORAGE_KEY) || '').trim();
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    return parsed;
-  } catch {
-    return {};
-  }
-}
-
 function modeOptions() {
   return Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value);
 }
@@ -1389,45 +1304,43 @@ async function persistCurrentConversationPreferences() {
   const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
   const model = String(modelSelect.value || '').trim();
   const reasoningEffort = selectedReasoningEffortValue();
-  const supportedModes = modeOptions();
-  activeConversationPreferredModelsByMode = withUpdatedModelPreference({
-    preferredModelsByMode: activeConversationPreferredModelsByMode,
-    mode,
-    model,
-    supportedModes,
-  });
-  localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
   localStorage.setItem(MODE_STORAGE_KEY, mode);
   if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
   if (reasoningEffort) localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
-  activeConversationPreferredReasoningByMode = {
-    ...activeConversationPreferredReasoningByMode,
-    [mode]: reasoningEffort || FALLBACK_REASONING_EFFORT,
-  };
-  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
+
+  // For Claude conversations the 1M context tier is stored as the "[1m]"
+  // variant of the preferred model, so it survives reopening the conversation.
+  const contextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim().toLowerCase();
+  const preferredModelWithTier = model
+    && contextTier === 'long_context'
+    && activeComposerProviderType() === 'claude'
+    && !CLAUDE_LONG_CONTEXT_PATTERN.test(model)
+    ? `${model}[1m]`
+    : model;
 
   const writeVersion = ++conversationPreferenceWriteVersion;
   const response = await updateConversationPreferences(convId, {
     clientId: CLIENT_ID,
     preferredRelayMode: mode,
-    preferredModelsByMode: activeConversationPreferredModelsByMode,
-    preferredReasoningByMode: activeConversationPreferredReasoningByMode,
+    preferredModel: preferredModelWithTier,
+    preferredReasoningEffort: reasoningEffort,
   });
   if (!response || writeVersion !== conversationPreferenceWriteVersion) return;
   if (conversations[convId]) {
     conversations[convId] = {
       ...conversations[convId],
       preferredRelayMode: response.preferredRelayMode,
-      preferredModelsByMode: response.preferredModelsByMode,
-      preferredReasoningByMode: response.preferredReasoningByMode || conversations[convId].preferredReasoningByMode || {},
+      preferredModel: response.preferredModel || conversations[convId].preferredModel || '',
+      preferredReasoningEffort: response.preferredReasoningEffort || conversations[convId].preferredReasoningEffort || '',
     };
   }
 }
 
 function applyConversationPreferences({
   preferredRelayMode = '',
-  preferredModelsByMode = {},
-  preferredReasoningByMode = {},
+  preferredModel = '',
+  preferredReasoningEffort = '',
+  preferredContextTier = 'default',
 } = {}) {
   const modeSelect = document.getElementById('mode-select');
   const modelSelect = document.getElementById('model-select');
@@ -1437,7 +1350,7 @@ function applyConversationPreferences({
   const supportedModels = modelOptions().length ? modelOptions() : modelCatalogState.models;
   const selection = resolveConversationComposerSelection({
     preferredRelayMode,
-    preferredModelsByMode: normalizePreferredModelsByMode(preferredModelsByMode, { supportedModes }),
+    preferredModel,
     selectedMode: modeSelect.value || localStorage.getItem(MODE_STORAGE_KEY) || FALLBACK_MODE,
     selectedModel: modelSelect.value || localStorage.getItem(MODEL_STORAGE_KEY) || FALLBACK_MODEL,
     supportedModes,
@@ -1449,26 +1362,19 @@ function applyConversationPreferences({
   modeSelect.value = selection.mode;
   if (selection.model) modelSelect.value = selection.model;
   syncAutoModelAvailability();
-  const normalizedPreferredReasoningByMode = normalizePreferredReasoningByMode(preferredReasoningByMode, { supportedModes });
-  const modeReasoning = String(
-    normalizedPreferredReasoningByMode?.[selection.mode]
-    || activeConversationPreferredReasoningByMode?.[selection.mode]
-    || '',
-  ).trim().toLowerCase();
-  updateReasoningSelectorForModel(selection.model || modelSelect.value, modeReasoning);
+  updateReasoningSelectorForModel(
+    selection.model || modelSelect.value,
+    String(preferredReasoningEffort || '').trim().toLowerCase(),
+  );
+  updateContextTierSelector(selection.model || modelSelect.value);
+  const tierSelect = document.getElementById('context-tier-select');
+  const desiredTier = String(preferredContextTier || 'default').trim().toLowerCase();
+  if (tierSelect && Array.from(tierSelect.options).some((option) => option.value === desiredTier)) {
+    tierSelect.value = desiredTier;
+    updateModelPricingDetails(selection.model || modelSelect.value, tierSelect.value);
+  }
   suppressConversationPreferenceSync = false;
 
-  activeConversationPreferredModelsByMode = {
-    ...readStoredModelsByMode(),
-    ...selection.preferredModelsByMode,
-  };
-  activeConversationPreferredReasoningByMode = {
-    ...readStoredReasoningByMode(),
-    ...activeConversationPreferredReasoningByMode,
-    ...normalizedPreferredReasoningByMode,
-  };
-  localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
-  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
   localStorage.setItem(MODE_STORAGE_KEY, selection.mode);
   if (selection.model) localStorage.setItem(MODEL_STORAGE_KEY, selection.model);
 }
@@ -1480,25 +1386,31 @@ function applyConversationPreferencesForConversation(conversationId, payload = {
     ?? conversation?.preferredRelayMode
     ?? localStorage.getItem(MODE_STORAGE_KEY)
     ?? FALLBACK_MODE;
-  const preferredModelsByMode = payload?.preferredModelsByMode
-    ?? conversation?.preferredModelsByMode
-    ?? readStoredModelsByMode();
-  const preferredReasoningByMode = payload?.preferredReasoningByMode
-    ?? conversation?.preferredReasoningByMode
-    ?? {};
+  const preferredModel = payload?.preferredModel
+    ?? conversation?.preferredModel
+    ?? localStorage.getItem(MODEL_STORAGE_KEY)
+    ?? '';
+  const preferredReasoningEffort = payload?.preferredReasoningEffort
+    ?? conversation?.preferredReasoningEffort
+    ?? '';
   const runtimeModel = String(
     payload?.runtimeModel
     ?? conversation?.runtimeModel
     ?? conversation?.runtime_model
     ?? '',
   ).trim();
-  const effectivePreferredModelsByMode = Number(conversation?.messageCount || 0) === 0 && runtimeModel
-    ? { ...preferredModelsByMode, [preferredRelayMode]: runtimeModel }
-    : preferredModelsByMode;
+  const effectivePreferredModel = String(
+    Number(conversation?.messageCount || 0) === 0 && runtimeModel
+      ? runtimeModel
+      : preferredModel,
+  ).trim();
+  // A stored "[1m]" id decomposes into the base model plus the 1M context tier.
+  const isLongContextModel = CLAUDE_LONG_CONTEXT_PATTERN.test(effectivePreferredModel);
   applyConversationPreferences({
     preferredRelayMode,
-    preferredModelsByMode: effectivePreferredModelsByMode,
-    preferredReasoningByMode,
+    preferredModel: effectivePreferredModel.replace(CLAUDE_LONG_CONTEXT_PATTERN, ''),
+    preferredReasoningEffort,
+    preferredContextTier: isLongContextModel ? 'long_context' : 'default',
   });
 }
 
@@ -1514,15 +1426,7 @@ function initModelSelector() {
         setModelBanner('⚠️ Auto model selection is available only for a new conversation.');
         return;
       }
-      const mode = String(document.getElementById('mode-select')?.value || '').trim();
-      activeConversationPreferredModelsByMode = withUpdatedModelPreference({
-        preferredModelsByMode: activeConversationPreferredModelsByMode,
-        mode,
-        model: select.value,
-        supportedModes: modeOptions(),
-      });
-      const preferredReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
-      updateReasoningSelectorForModel(select.value, preferredReasoning);
+      updateReasoningSelectorForModel(select.value);
       updateContextTierSelector(select.value);
       void persistCurrentConversationPreferences().catch(() => {});
     });
@@ -1540,7 +1444,11 @@ function initContextTierSelector() {
   const select = document.getElementById('context-tier-select');
   if (!select || select.dataset.bound === '1') return;
   select.dataset.bound = '1';
-  select.addEventListener('change', () => updateModelPricingDetails(selectedModelValue(), select.value));
+  select.addEventListener('change', () => {
+    updateModelPricingDetails(selectedModelValue(), select.value);
+    if (suppressConversationPreferenceSync) return;
+    void persistCurrentConversationPreferences().catch(() => {});
+  });
 }
 
 function initReasoningSelector() {
@@ -1549,12 +1457,6 @@ function initReasoningSelector() {
   select.dataset.bound = '1';
   select.addEventListener('change', () => {
     if (suppressConversationPreferenceSync) return;
-    const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
-    activeConversationPreferredReasoningByMode = {
-      ...activeConversationPreferredReasoningByMode,
-      [mode]: selectedReasoningEffortValue(),
-    };
-    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
     void persistCurrentConversationPreferences().catch(() => {});
   });
 }
@@ -1573,23 +1475,6 @@ function initModeSelector() {
   select.dataset.bound = '1';
   select.addEventListener('change', () => {
     if (suppressConversationPreferenceSync) return;
-    const modelSelect = document.getElementById('model-select');
-    if (modelSelect) {
-      const mode = String(select.value || '').trim();
-      const openAIModelLocked = modelSelect.dataset.runtimeModelLocked === '1';
-      if (!openAIModelLocked) {
-        const modeModel = String(activeConversationPreferredModelsByMode?.[mode] || '').trim();
-        if (modeModel && modelOptions().includes(modeModel)) {
-          suppressConversationPreferenceSync = true;
-          modelSelect.value = modeModel;
-          suppressConversationPreferenceSync = false;
-        }
-      } else {
-        syncAutoModelAvailability();
-      }
-      const modeReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
-      updateReasoningSelectorForModel(modelSelect.value, modeReasoning);
-    }
     void persistCurrentConversationPreferences().catch(() => {});
   });
 }
@@ -2755,20 +2640,32 @@ function applyConversationWorkspaceRootUpdate(payload = {}) {
   const conversationId = String(payload.conversationId || '').trim();
   if (!conversationId) return;
   const existing = conversations[conversationId] || { id: conversationId, archived: false, messageCount: 0 };
+  const previousCurrentPath = String(existing.currentWorkspaceRootPath || '').trim();
+  // A relaunch into a new CWD must not keep the old runtime root alive through
+  // the `existing` fallback: the payload is the post-relaunch truth.
+  const nextRuntimePath = Object.prototype.hasOwnProperty.call(payload, 'runtimeWorkspaceRootPath')
+    ? String(payload.runtimeWorkspaceRootPath || '').trim()
+    : String(existing.runtimeWorkspaceRootPath || '').trim();
+  const nextRuntimeName = Object.prototype.hasOwnProperty.call(payload, 'runtimeWorkspaceRootName')
+    ? String(payload.runtimeWorkspaceRootName || '').trim()
+    : String(existing.runtimeWorkspaceRootName || '').trim();
   conversations[conversationId] = {
     ...existing,
     configuredWorkspaceRootPath: String(payload.configuredWorkspaceRootPath || existing.configuredWorkspaceRootPath || '').trim() || null,
     configuredWorkspaceRootName: String(payload.configuredWorkspaceRootName || existing.configuredWorkspaceRootName || '').trim() || null,
-    runtimeWorkspaceRootPath: String(payload.runtimeWorkspaceRootPath || existing.runtimeWorkspaceRootPath || '').trim() || null,
-    runtimeWorkspaceRootName: String(payload.runtimeWorkspaceRootName || existing.runtimeWorkspaceRootName || '').trim() || null,
+    runtimeWorkspaceRootPath: nextRuntimePath || null,
+    runtimeWorkspaceRootName: nextRuntimeName || null,
     currentWorkspaceRootPath: String(payload.currentWorkspaceRootPath || existing.currentWorkspaceRootPath || '').trim() || null,
     currentWorkspaceRootName: String(payload.currentWorkspaceRootName || existing.currentWorkspaceRootName || '').trim() || null,
   };
-  if (currentConvId === conversationId) {
-    syncChatHeaderWorkspaceLabel();
-    if (repoBrowserState.activeRoot === 'workspace' && repoBrowserState.open) {
-      void loadRepoBrowserTree();
-    }
+  if (currentConvId !== conversationId) return;
+  syncChatHeaderWorkspaceLabel();
+  const nextCurrentPath = String(conversations[conversationId].currentWorkspaceRootPath || '').trim();
+  const rootChanged = nextCurrentPath.toLowerCase() !== previousCurrentPath.toLowerCase();
+  if (rootChanged) {
+    resetWorkspaceRepoBrowserForRootChange();
+  } else if (repoBrowserState.activeRoot === 'workspace' && repoBrowserState.open) {
+    void loadRepoBrowserTree();
   }
 }
 
@@ -2858,7 +2755,6 @@ async function initApp() {
   syncQueueStatusMenuEntry();
   if (!sharedMode) {
     syncSuspendHostVisibility();
-    activeConversationPreferredReasoningByMode = readStoredReasoningByMode();
   }
   setupViewportTracking();
   window.addEventListener('pagehide', () => {

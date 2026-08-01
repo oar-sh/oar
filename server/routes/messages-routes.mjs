@@ -9,7 +9,7 @@ import {
   releaseParkedQueueForReadyState,
 } from '../services/relay-queue-gate-service.mjs';
 import {
-  persistConversationModeModelPreference as persistConversationModeModelPreferenceTx,
+  persistConversationModelPreference as persistConversationModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 import {
@@ -19,6 +19,7 @@ import {
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
+import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -1650,27 +1651,24 @@ export function registerMessagesRoutes(app, deps) {
     return text || null;
   }
 
-  function persistConversationModeModelPreference(conversationId, relayMode, model, reasoningEffort = '', nowIso = new Date().toISOString()) {
+  function persistConversationModelPreference(conversationId, relayMode, model, reasoningEffort = '', nowIso = new Date().toISOString()) {
     const convId = String(conversationId || '').trim();
     const mode = normalizeRelayMode(relayMode) || DEFAULT_RELAY_MODE;
     const modelId = String(model || '').trim();
-    const normalizedReasoningEffort = String(reasoningEffort || '').trim().toLowerCase();
     if (!convId || !mode || !modelId) {
       return {
         preferredRelayMode: mode || DEFAULT_RELAY_MODE,
-        preferredModelsByMode: {},
-        preferredReasoningByMode: {},
+        preferredModel: '',
+        preferredReasoningEffort: '',
       };
     }
-    const persisted = persistConversationModeModelPreferenceTx({
+    const persisted = persistConversationModelPreferenceTx({
       db,
       stmts,
       conversationId: convId,
       relayMode: mode,
       model: modelId,
-      preferredReasoningByMode: normalizedReasoningEffort
-        ? { [mode]: normalizedReasoningEffort }
-        : {},
+      reasoningEffort,
       normalizeMode: (value) => normalizeRelayMode(value) || null,
       fallbackRelayMode: DEFAULT_RELAY_MODE,
       updatedAt: nowIso,
@@ -1678,8 +1676,8 @@ export function registerMessagesRoutes(app, deps) {
     });
     return {
       preferredRelayMode: persisted.preferredRelayMode || mode,
-      preferredModelsByMode: persisted.preferredModelsByMode || {},
-      preferredReasoningByMode: persisted.preferredReasoningByMode || {},
+      preferredModel: persisted.preferredModel || '',
+      preferredReasoningEffort: persisted.preferredReasoningEffort || '',
     };
   }
 
@@ -3610,11 +3608,29 @@ export function registerMessagesRoutes(app, deps) {
       String(existingRuntimeSession?.provider_model || '').trim(),
       ...(Array.isArray(configuredClaude?.availableModels) ? configuredClaude.availableModels : []),
       ...(Array.isArray(configuredClaude?.models) ? configuredClaude.models : []),
-    ].map((value) => String(value || '').trim()).filter(Boolean));
+    ].map((value) => String(value || '').trim()).filter(Boolean)
+      .flatMap((value) => [value, claudeBaseModelId(value)])
+      .filter(Boolean));
+    // The composer sends the base Claude model id plus a context tier; the
+    // "[1m]" long-context variant id is composed here so the worker (and the
+    // context-usage accounting) keep seeing the id the Agent SDK expects.
+    const applyClaudeContextTier = (modelId) => {
+      const requestedTier = String(contextTier || 'default').trim().toLowerCase();
+      const baseId = claudeBaseModelId(modelId);
+      if (requestedTier === 'long_context') {
+        const variantId = claudeLongContextModelId(modelId);
+        const variantMatch = Array.from(availableClaudeModels)
+          .find((id) => id.toLowerCase() === variantId.toLowerCase());
+        return variantMatch || modelId;
+      }
+      return baseId && (availableClaudeModels.has(baseId) || baseId === modelId) ? baseId : modelId;
+    };
     const claudeModel = runtimeUsesClaude
-      ? (availableClaudeModels.has(requestedClaudeModel)
-          ? requestedClaudeModel
-          : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredClaude?.model || '').trim()))
+      ? applyClaudeContextTier(
+          availableClaudeModels.has(requestedClaudeModel)
+            ? requestedClaudeModel
+            : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredClaude?.model || '').trim()),
+        )
       : '';
     const modelResolution = useOpenAIProvider
       ? {
@@ -3855,7 +3871,7 @@ export function registerMessagesRoutes(app, deps) {
           WHERE id = ?
         `).run(now, sessionId || null, convId);
       }
-      conversationPreferences = persistConversationModeModelPreference(
+      conversationPreferences = persistConversationModelPreference(
         convId,
         requestedRelayMode,
         requestedModel,
@@ -4015,8 +4031,8 @@ export function registerMessagesRoutes(app, deps) {
       runtimeProviderModel: runtimeSession?.provider_model || (useOpenAIProvider ? openAIModel : null),
       ownerSessionId: ownerSessionId || null,
       preferredRelayMode: conversationPreferences.preferredRelayMode,
-      preferredModelsByMode: conversationPreferences.preferredModelsByMode,
-      preferredReasoningByMode: conversationPreferences.preferredReasoningByMode,
+      preferredModel: conversationPreferences.preferredModel,
+      preferredReasoningEffort: conversationPreferences.preferredReasoningEffort,
       warning: modelResolution.warning || null,
       selectedModelVariantId: requestedModelVariantId,
       selectedBaseModel: requestedModel,

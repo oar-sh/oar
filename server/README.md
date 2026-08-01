@@ -287,6 +287,9 @@ Enabling (or changing the default model) triggers model discovery: a short-lived
 opened purely to serve a `supportedModels()` control request, with a 20 s timeout. Discovered
 `claude-*` IDs — including bracketed capability variants such as `claude-opus-5[1m]` — are stored and
 added to the model catalog. Bare aliases (`default`, `sonnet`) are dropped in favour of the explicit IDs.
+In the composer, `[1m]` variants are folded into their base model: the base ID is the only dropdown
+entry, and the variant is selected through the context-size dropdown (`long_context` composes the
+`[1m]` ID on send and in the persisted per-conversation model preference).
 
 Disabling Claude rebinds conversations that have not yet sent a message back to the default provider,
 mirroring the OpenAI key-removal reconciliation. Conversations that have already started keep their
@@ -769,6 +772,75 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - Traversal or non-file paths are rejected.
 - **Linux access scope** — on Linux the drives API currently allows any authenticated user to browse and read any path that the server process has OS-level read access to (i.e. the same permissions as the user running the relay). There is no additional allowlist restriction beyond requiring an absolute path.
   > **TODO:** add an optional `drivesAllowList` config key (array of absolute path prefixes) so operators can restrict drive access to a set of directories (e.g. home folder or workspace root). When the list is non-empty, requests whose resolved path does not start with one of the listed prefixes should be rejected with `403`.
+  >
+  > When implementing it, reuse `isWithinAllowedPrefix()` from `services/workspace-root-path-policy.mjs` rather than writing a second `startsWith` check — a bare prefix match would let `C:\work` admit `C:\work-secrets`. See `workspaceRootAllowList` below, which already follows this pattern.
+
+### Changing the launch CWD
+
+Two endpoints set a conversation's launch directory. Both accept the same aliases —
+`rootPath`, `workspaceRootPath`, `workspace_root_path`, `cwd` — and both validate the
+path before touching the database.
+
+| Endpoint | Effect |
+| --- | --- |
+| `POST /api/conversation/:id/workspace-root` | Saves the next-launch CWD. Does not touch the running CLI. |
+| `POST /api/conversation/:id/relaunch-with-workspace-root` | Saves the CWD, stops the CLI, and relaunches it in the new directory. |
+
+**Validation** (`services/workspace-root-path-policy.mjs`): the path must be absolute
+(drive-relative `C:foo` and extended-length `\\?\` forms are rejected), must not contain
+`; & | \0 \r \n` — the same characters the chat `cd` command already rejects — and must
+resolve, via `realpath`, to an existing directory. The resolved real path is what gets
+persisted and spawned, so a symlink cannot smuggle a request past the allow list.
+Failures return `400` with a `code` of `missing-root-path`, `invalid-root-path`,
+`relative-root-path`, or `root-path-not-found`.
+
+**`workspaceRootAllowList`** (optional, `server/config.json`, or the
+`COPILOT_WORKSPACE_ROOT_ALLOW_LIST` env var using the platform path delimiter): an array of
+absolute path prefixes. **Absent, `null`, `[]`, or not an array disables the check entirely**,
+which is the default and matches the historical "any existing directory" behaviour. When it is
+non-empty, a request outside every prefix is rejected with `403` and
+`code: "root-path-not-allowed"`. Matching is on segment boundaries and is case-insensitive on
+Windows. Entries that do not resolve to a directory are logged and dropped rather than failing
+closed, so a typo cannot brick the relay.
+
+**Concurrency.** All three endpoints that reach the session-worker launch path — the relaunch
+route, the save route, and `POST /api/session-worker/:sdkSessionId/launch` — share one mutex
+keyed by `sdkSessionId`. On top of that, the relaunch route coalesces duplicate requests
+(a mobile double-tap, a second tab, a retried fetch) within a 5 s window:
+
+- same request in flight → awaits it and returns the same body plus `coalesced: true`
+- same request just settled → replays the cached body with `coalesced: true, cached: true`
+- a *different* request in flight → `409` with `code: "relaunch_in_progress"`
+
+Request identity is `conversationId` + the normalized path, or an explicit `Idempotency-Key`
+header / `idempotencyKey` body field, which the web UI mints once per user gesture.
+Both endpoints are additionally rate limited to 6 requests per 10 s per session and client IP,
+returning `429` with `Retry-After`.
+
+**Stop semantics.** The relaunch stops every process in the session's tree, waits for them to
+exit, and escalates once (`SIGKILL` on POSIX; a re-enumerated forced pass on Windows, which
+catches children spawned after the first snapshot). If anything survives, the relay **does not
+launch** — it returns `409` with `code: "worker-stop-timeout"` and `remainingPids`, having still
+saved the CWD for the next clean launch. Launching on top of a survivor is what previously left
+two CLIs claiming one session.
+
+**Response fields.** A successful relaunch reports what actually happened rather than a bare
+`ok: true`:
+
+| Field | Meaning |
+| --- | --- |
+| `relaunched` | A fresh process was started in the requested directory. |
+| `workspaceRootApplied` | The running CLI is actually in the requested directory. |
+| `reusedExistingProcess` | An existing process was reused, so the new CWD did **not** take effect. |
+| `warning: "cwd-not-applied"` | Present with `activeWorkspaceRootPath` and a human-readable `message` whenever `workspaceRootApplied` is `false`. |
+| `stoppedPids` / `launchedPid` | Which processes were killed and which was started. |
+| `coalesced` / `cached` | This response was replayed from a duplicate request. |
+
+**Recent CWD history.** `recent_workspace_roots` is keyed by `path_key`, a case-normalized form
+of the path (lower-cased in full on Windows, untouched on POSIX), so `C:\Git\Repo` and
+`c:\git\repo` occupy one row and the 12-entry cap counts distinct directories. The runtime
+rebuilds an older table in place at startup; `server/migrations/0002-recent-workspace-roots-path-key.mjs`
+performs the same rebuild offline.
 - The web UI opens workspace mentions in an in-app preview dialog with **Preview / Raw** mode buttons.
 - Markdown preview supports optional embedded-HTML mode with script/event-handler stripping and a visible warning.
 - The floating **📁 Browse files** button opens the explorer with **Workspace**, **Drives**, and (when available) **Session** roots, tree navigation, list/icon folder views, and image thumbnails.

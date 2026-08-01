@@ -7,7 +7,7 @@ import {
   resolveOpenAISessionModel,
   resolveBootstrapModelSelection,
   parseDefaultSessionWorkspaceRootUpdateRequest,
-  normalizePreferredReasoningByMode,
+  normalizePreferredReasoningEffort,
 } from './sessions-routes.mjs';
 
 test('resolveOpenAISessionModel preserves selected OpenAI models', () => {
@@ -127,18 +127,8 @@ test('parseDefaultSessionWorkspaceRootUpdateRequest rejects missing payload valu
   assert.equal(parsed.error, 'Missing rootPath');
 });
 
-test('normalizePreferredReasoningByMode keeps only supported relay modes', () => {
-  assert.deepEqual(
-    normalizePreferredReasoningByMode({
-      agent: 'HIGH',
-      plan: 'low',
-      unknown: 'medium',
-    }, {
-      supportedRelayModes: ['plan', 'agent'],
-    }),
-    {
-      plan: 'low',
-      agent: 'high',
-    },
-  );
+test('normalizePreferredReasoningEffort trims and lowercases the value', () => {
+  assert.equal(normalizePreferredReasoningEffort(' HIGH '), 'high');
+  assert.equal(normalizePreferredReasoningEffort(''), '');
+  assert.equal(normalizePreferredReasoningEffort(null), '');
 });
