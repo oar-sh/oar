@@ -5,11 +5,15 @@ import {
   showTransientRelayNotice,
 } from './store.js';
 import {
+  loadClaudeSettings,
   loadOpenAISettings,
+  updateClaudeSettings,
   updateDefaultSessionWorkspaceRoot,
   updateOpenAISettings,
   loadWindowsAutostartSetting,
   updateWindowsAutostartSetting,
+  loadTurnCeilingSetting,
+  updateTurnCeilingSetting as requestTurnCeilingSetting,
 } from './api-client.js';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
@@ -40,6 +44,82 @@ function ensureOpenAISettingsInputTracking() {
 }
 let windowsAutostartUpdateInFlight = false;
 let windowsAutostartEnabled = false;
+
+// Mirrors shared/turn-ceiling.mjs, which the browser cannot import — only
+// server/public is served. The authoritative bounds come from the API response;
+// these are just the pre-response defaults.
+let turnCeilingMinutes = 60;
+let turnCeilingUpdateInFlight = false;
+
+function formatTurnCeilingLabel(minutes) {
+  const value = Math.max(0, Math.round(Number(minutes) || 0));
+  if (value === 0) return 'No limit';
+  if (value < 60) return `${value} min`;
+  const hours = Math.floor(value / 60);
+  const remainder = value % 60;
+  return remainder ? `${hours} h ${remainder} min` : `${hours} h`;
+}
+
+function syncTurnCeilingSlider() {
+  const slider = document.getElementById('turn-ceiling-slider');
+  const label = document.getElementById('turn-ceiling-value');
+  if (slider instanceof HTMLInputElement) {
+    slider.value = String(turnCeilingMinutes);
+    slider.disabled = turnCeilingUpdateInFlight;
+  }
+  if (label) label.textContent = formatTurnCeilingLabel(turnCeilingMinutes);
+}
+
+/** Live label feedback while dragging; nothing is persisted until change fires. */
+export function previewTurnCeilingSetting(value) {
+  const label = document.getElementById('turn-ceiling-value');
+  if (label) label.textContent = formatTurnCeilingLabel(value);
+}
+
+export async function refreshTurnCeilingSetting() {
+  syncTurnCeilingSlider();
+  try {
+    const result = await loadTurnCeilingSetting();
+    if (!result || !Number.isFinite(Number(result.ceilingMinutes))) return;
+    turnCeilingMinutes = Number(result.ceilingMinutes);
+    const slider = document.getElementById('turn-ceiling-slider');
+    if (slider instanceof HTMLInputElement) {
+      if (Number.isFinite(Number(result.minMinutes))) slider.min = String(result.minMinutes);
+      if (Number.isFinite(Number(result.maxMinutes))) slider.max = String(result.maxMinutes);
+      if (Number.isFinite(Number(result.stepMinutes))) slider.step = String(result.stepMinutes);
+    }
+  } catch {
+    // Leave the slider at its last known value; the setting is not critical.
+  } finally {
+    syncTurnCeilingSlider();
+  }
+}
+
+export async function updateTurnCeilingSetting(value) {
+  if (turnCeilingUpdateInFlight) {
+    syncTurnCeilingSlider();
+    return;
+  }
+  const requested = Math.max(0, Math.round(Number(value) || 0));
+  turnCeilingUpdateInFlight = true;
+  syncTurnCeilingSlider();
+  try {
+    const result = await requestTurnCeilingSetting(requested);
+    turnCeilingMinutes = Number.isFinite(Number(result?.ceilingMinutes))
+      ? Number(result.ceilingMinutes)
+      : requested;
+    showTransientRelayNotice(
+      turnCeilingMinutes === 0
+        ? 'Turns will run without a time limit.'
+        : `Max turn duration set to ${formatTurnCeilingLabel(turnCeilingMinutes)}.`,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to update the max turn duration.');
+  } finally {
+    turnCeilingUpdateInFlight = false;
+    syncTurnCeilingSlider();
+  }
+}
 
 function readLocalStorage(key) {
   try {
@@ -151,6 +231,122 @@ export async function refreshOpenAISettingsState() {
   const settings = await loadOpenAISettings();
   if (!settings) return null;
   return applyOpenAISettingsState(settings);
+}
+
+let claudeSettingsUpdateInFlight = false;
+let claudeSettingsState = {
+  configured: false,
+  enabled: false,
+  model: 'claude-sonnet-5',
+  models: [],
+};
+let claudeSettingsInputsDirty = false;
+
+function ensureClaudeSettingsInputTracking() {
+  const input = document.getElementById('claude-model-input');
+  if (!input || input.dataset.claudeDirtyTracking === '1') return;
+  input.dataset.claudeDirtyTracking = '1';
+  input.addEventListener('input', () => {
+    claudeSettingsInputsDirty = true;
+  });
+}
+
+function setClaudeSettingsControlsDisabled(disabled) {
+  for (const id of ['claude-model-input', 'claude-enabled-toggle', 'claude-save-btn']) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyClaudeSettingsState(settings = {}, { resetInputs = false } = {}) {
+  ensureClaudeSettingsInputTracking();
+  claudeSettingsState = {
+    configured: settings?.enabled === true,
+    enabled: settings?.enabled === true,
+    model: String(settings?.model || claudeSettingsState.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
+    models: Array.isArray(settings?.models) ? settings.models : claudeSettingsState.models,
+  };
+  const modelInput = document.getElementById('claude-model-input');
+  const toggle = document.getElementById('claude-enabled-toggle');
+  const status = document.getElementById('claude-settings-status');
+  if (modelInput && (!claudeSettingsInputsDirty || resetInputs)) modelInput.value = claudeSettingsState.model;
+  if (resetInputs) claudeSettingsInputsDirty = false;
+  if (toggle) {
+    toggle.checked = claudeSettingsState.enabled;
+    toggle.disabled = claudeSettingsUpdateInFlight;
+  }
+  if (status) {
+    status.textContent = claudeSettingsState.enabled
+      ? `Claude is enabled. Select Claude in New Chat to use model ${claudeSettingsState.model}. Uses the host machine's logged-in Claude credentials.`
+      : 'Not enabled. Enable to allow Claude selection in New Chat (requires a logged-in Claude Code CLI on the relay host).';
+    status.dataset.state = claudeSettingsState.enabled ? 'active' : 'unconfigured';
+  }
+  window.syncAutoModelAvailability?.();
+  return claudeSettingsState;
+}
+
+export async function refreshClaudeSettingsState() {
+  const settings = await loadClaudeSettings();
+  if (!settings) return null;
+  return applyClaudeSettingsState(settings);
+}
+
+async function syncClaudeSettingsInputs() {
+  const status = document.getElementById('claude-settings-status');
+  if (!status) return;
+  const settings = await refreshClaudeSettingsState();
+  if (!settings) {
+    status.textContent = 'Unable to load Claude settings.';
+    status.dataset.state = 'error';
+  }
+}
+
+export async function saveClaudeSettings() {
+  if (claudeSettingsUpdateInFlight) return;
+  const modelInput = document.getElementById('claude-model-input');
+  const model = String(modelInput?.value || '').trim() || 'claude-sonnet-5';
+  claudeSettingsUpdateInFlight = true;
+  setClaudeSettingsControlsDisabled(true);
+  try {
+    const result = await updateClaudeSettings({ model });
+    if (!result) throw new Error('Failed to save Claude settings.');
+    applyClaudeSettingsState(result, { resetInputs: true });
+    showTransientRelayNotice(
+      result.warning
+        ? `Claude settings saved. ${result.warning}`
+        : `Claude settings saved for ${result.model}.`,
+      result.warning ? 8000 : 4000,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to save Claude settings.');
+  } finally {
+    claudeSettingsUpdateInFlight = false;
+    setClaudeSettingsControlsDisabled(false);
+    applyClaudeSettingsState(claudeSettingsState);
+  }
+}
+
+export async function toggleClaudeProvider(enabled) {
+  if (claudeSettingsUpdateInFlight) return;
+  claudeSettingsUpdateInFlight = true;
+  setClaudeSettingsControlsDisabled(true);
+  try {
+    const result = await updateClaudeSettings({ enabled: enabled === true });
+    if (!result) throw new Error('Failed to update the Claude provider.');
+    applyClaudeSettingsState(result);
+    const providerLabel = result.enabled ? 'Claude provider enabled' : 'Claude provider disabled';
+    showTransientRelayNotice(
+      `${providerLabel}.${result.warning ? ` ${result.warning}` : ''}`,
+      result.warning ? 8000 : 4500,
+    );
+  } catch (error) {
+    applyClaudeSettingsState(claudeSettingsState);
+    alert(error?.message || 'Failed to update the Claude provider.');
+  } finally {
+    claudeSettingsUpdateInFlight = false;
+    setClaudeSettingsControlsDisabled(false);
+    applyClaudeSettingsState(claudeSettingsState);
+  }
 }
 
 async function syncOpenAISettingsInputs() {
@@ -419,8 +615,13 @@ export function openSettingsModal() {
   openAISettingsInputsDirty = false;
   ensureOpenAISettingsInputTracking();
   void syncOpenAISettingsInputs();
+  claudeSettingsInputsDirty = false;
+  ensureClaudeSettingsInputTracking();
+  void syncClaudeSettingsInputs();
   syncWindowsAutostartSetting();
   void refreshWindowsAutostartSetting();
+  syncTurnCeilingSlider();
+  void refreshTurnCeilingSetting();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }

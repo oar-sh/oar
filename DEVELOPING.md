@@ -56,6 +56,50 @@ On Linux/macOS, session workers prefer detached `tmux` sessions when `tmux` is a
 tmux attach -t <sdk-session-id>
 ```
 
+### Claude workers
+
+Claude conversations run `server/claude-worker/claude-session-worker.mjs` as a plain Node process
+rather than a Copilot CLI session. It uses the same tmux naming, but no `script`-based pseudo-TTY —
+so `tmux attach` shows the worker's own `[claude-worker …]` log lines directly.
+
+Prerequisite: the relay host must have a logged-in Claude Code CLI (`claude`). The relay stores no
+API key; a turn that cannot authenticate replies with a system note saying so.
+
+Run the worker manually against a live relay:
+
+```bash
+COPILOT_WEB_RELAY_WORKER_KIND=claude \
+COPILOT_WORKSPACE_ROOT=/path/to/workspace \
+CLAUDE_RELAY_MODEL=claude-sonnet-5 \
+node server/claude-worker/claude-session-worker.mjs --session-id <sdk-session-id>
+```
+
+Useful overrides: `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary),
+`COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH` (worker script location),
+`COPILOT_WEB_RELAY_CONFIG` (relay config used to resolve the server URL and auth token).
+
+## Tests
+
+Unit tests are colocated as `*.test.mjs` and run with the Node test runner. There is no `npm test`
+script — invoke the runner directly on the files or directories you changed:
+
+Match `*.test.mjs` explicitly — pointing the runner at a directory makes it try to execute the
+implementation modules alongside the tests, which fails:
+
+```bash
+node --test server/claude-worker/*.test.mjs
+node --test shared/*.test.mjs
+node --test server/services/context-usage-view.test.mjs
+```
+
+End-to-end Playwright tests have their own scripts:
+
+```bash
+npm run test:e2e
+```
+
+Do not run tests that spawn Copilot CLI clients unless explicitly permitted.
+
 ## Notes
 
 - In extension-managed mode, do not restart the relay by killing random processes.

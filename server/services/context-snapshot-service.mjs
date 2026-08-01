@@ -1,8 +1,12 @@
 'use strict';
 
 const CONTEXT_CACHE_MAX = 128;
+// Context window of a model id carrying the `[1m]` capability suffix, whatever
+// the base model's default window is.
+const LONG_CONTEXT_TOKENS = 1000000;
 const MODEL_FALLBACK_LIMITS = Object.freeze({
   // Anthropic Claude Sonnet
+  'claude-sonnet-5': 200000,
   'claude-sonnet-4.6': 200000,
   'claude-sonnet-4.5': 200000,
   // Anthropic Claude Haiku
@@ -10,6 +14,7 @@ const MODEL_FALLBACK_LIMITS = Object.freeze({
   // Anthropic Claude Fable
   'claude-fable-5': 200000,
   // Anthropic Claude Opus
+  'claude-opus-5': 200000,
   'claude-opus-4.8': 200000,
   'claude-opus-4.7': 200000,
   'claude-opus-4.6': 200000,
@@ -34,6 +39,24 @@ const MODEL_FALLBACK_LIMITS = Object.freeze({
 function normalizeText(value) {
   const text = String(value || '').trim();
   return text || '';
+}
+
+/**
+ * Resolve a fallback context window for a model id.
+ *
+ * Model ids may carry a bracketed capability suffix (see `isSafeClaudeModelId`),
+ * e.g. `claude-opus-5[1m]`. Those are a different context window than the base
+ * model, so they are resolved first — falling through to the base entry would
+ * report a 1M session as 200k.
+ */
+export function resolveFallbackContextLimitTokens(modelId) {
+  const model = normalizeText(modelId).toLowerCase();
+  if (!model) return null;
+  if (MODEL_FALLBACK_LIMITS[model]) return MODEL_FALLBACK_LIMITS[model];
+  const suffixMatch = model.match(/\[([^\]]+)\]\s*$/);
+  if (!suffixMatch) return null;
+  if (suffixMatch[1].trim() === '1m') return LONG_CONTEXT_TOKENS;
+  return MODEL_FALLBACK_LIMITS[model.slice(0, suffixMatch.index).trim()] || null;
 }
 
 function toNullableInt(value) {
@@ -99,7 +122,7 @@ function resolveContextLimitTokens(modelId, data, modelUsage, getModelContextLim
     ? toNullableInt(getModelContextLimitTokens(model))
     : null;
   if (catalogLimit !== null && catalogLimit > 0) return catalogLimit;
-  return MODEL_FALLBACK_LIMITS[model] || null;
+  return resolveFallbackContextLimitTokens(model);
 }
 
 function resolveExplicitContextLimitTokens(data, modelUsage) {
@@ -280,8 +303,11 @@ function buildEstimatedSnapshot({ estimate, eventsPath, sessionId, pathModule, g
   const model = normalizeText(estimate?.latestModel) || null;
   const contextLimitTokens = toNullableInt(estimate?.explicitContextLimitTokens)
     ?? resolveContextLimitTokens(model, null, null, getModelContextLimitTokens);
+  // Cumulative assistant output grows without bound while compaction keeps the
+  // real window in check, so this ratio can exceed 1. Clamp it: an occupancy
+  // gauge reading "340%" is worse than one pinned at 100%.
   const usedPercent = (contextLimitTokens !== null && contextLimitTokens > 0)
-    ? Math.round((totalCompletionTokens / contextLimitTokens) * 10000) / 100
+    ? Math.min(100, Math.round((totalCompletionTokens / contextLimitTokens) * 10000) / 100)
     : null;
   const freeTokens = (contextLimitTokens !== null)
     ? Math.max(0, contextLimitTokens - totalCompletionTokens)

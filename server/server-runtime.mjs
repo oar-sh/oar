@@ -44,6 +44,7 @@ import { createSdkSessionImportService } from './services/sdk-session-import-ser
 import { createInstalledCopilotClient } from './copilot-sdk-runtime.mjs';
 import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
+import { createClaudeSessionRootResolver } from './services/claude-session-root-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
@@ -55,7 +56,7 @@ import {
   isModelCatalogRefreshStale,
   latestModelCatalogRefresh,
 } from '../shared/model-catalog-freshness.mjs';
-import { applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
@@ -70,11 +71,17 @@ import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
+import {
+  parseTurnCeilingUpdate,
+  readTurnCeilingSetting,
+  turnCeilingMinutesToMs,
+} from '../shared/turn-ceiling.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
 import {
   canonicalizeModelId,
   filterValidModelIds,
   isOpenAIModelId,
+  isSafeClaudeModelId,
   isSafeProviderModelId,
   isValidModelId,
 } from '../shared/model-id.mjs';
@@ -258,8 +265,210 @@ function setOpenAIProviderSettings(update = {}) {
   };
 }
 
+function readClaudeModelListSetting(settingKey) {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(settingKey) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((value) => String(value || '').trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function readClaudeModelEffortsSetting() {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CLAUDE_MODEL_EFFORTS_SETTING_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [modelId, efforts] of Object.entries(parsed)) {
+      const key = String(modelId || '').trim().toLowerCase();
+      if (!key) continue;
+      const levels = (Array.isArray(efforts) ? efforts : [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => CLAUDE_EFFORT_LEVELS.has(value));
+      out[key] = levels;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function getClaudeProviderSettings() {
+  const enabledSetting = readAppSettingValue(CLAUDE_ENABLED_SETTING_KEY);
+  const enabled = enabledSetting === 'true';
+  const model = readAppSettingValue(CLAUDE_MODEL_SETTING_KEY) || DEFAULT_CLAUDE_MODEL;
+  const discovered = readClaudeModelListSetting(CLAUDE_MODELS_SETTING_KEY);
+  const modelsDiscovered = discovered.length > 0;
+  const availableModels = Array.from(new Set([
+    model,
+    ...(discovered.length ? discovered : DEFAULT_CLAUDE_MODELS),
+  ])).filter(Boolean);
+  const availableSet = new Set(availableModels);
+  const enabledSelection = readClaudeModelListSetting(CLAUDE_ENABLED_MODELS_SETTING_KEY)
+    .filter((modelId) => availableSet.has(modelId));
+  // The enabled subset (chosen in the Select Models modal) drives the model
+  // catalog and composers; an empty selection means "all available".
+  const models = Array.from(new Set([
+    model,
+    ...(enabledSelection.length ? enabledSelection : availableModels),
+  ])).filter(Boolean);
+  const storedEfforts = readClaudeModelEffortsSetting();
+  const effortsByModel = {};
+  for (const availableModel of availableModels) {
+    const key = String(availableModel || '').trim().toLowerCase();
+    if (!key) continue;
+    const discoveredEfforts = storedEfforts[key];
+    // 'none' (SDK default) is always offered; discovered levels follow. When a
+    // model was never discovered, offer the full ladder — the SDK silently
+    // downgrades unsupported levels.
+    effortsByModel[key] = Array.isArray(discoveredEfforts) && discoveredEfforts.length
+      ? ['none', ...discoveredEfforts]
+      : [...CLAUDE_REASONING_EFFORTS];
+  }
+  return {
+    // The Claude runtime authenticates through the host's logged-in Claude
+    // credentials (~/.claude); enablement is the only configuration step.
+    configured: enabled,
+    enabled,
+    model,
+    models,
+    availableModels,
+    enabledModels: models,
+    effortsByModel,
+    modelsDiscovered,
+    providerType: 'claude',
+  };
+}
+
+function setClaudeProviderSettings(update = {}) {
+  const payload = update && typeof update === 'object' ? update : {};
+  const enabled = payload.enabled;
+  const model = payload.model;
+  const models = payload.models;
+  const enabledModels = payload.enabledModels;
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Claude settings are unavailable' };
+  }
+  const existing = getClaudeProviderSettings();
+  const normalizedModel = String(model || existing.model || '').trim() || DEFAULT_CLAUDE_MODEL;
+  if (!isSafeClaudeModelId(normalizedModel)) {
+    return { ok: false, error: 'Invalid Claude model ID' };
+  }
+  const nowIso = new Date().toISOString();
+  const nextEnabled = typeof enabled === 'boolean' ? enabled : existing.enabled;
+  stmts.upsertAppSetting.run(CLAUDE_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
+  stmts.upsertAppSetting.run(CLAUDE_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  if (Array.isArray(models)) {
+    const normalizedModels = models
+      .map((value) => String(value || '').trim())
+      .filter((value) => value && isSafeClaudeModelId(value));
+    if (normalizedModels.length) {
+      stmts.upsertAppSetting.run(CLAUDE_MODELS_SETTING_KEY, JSON.stringify(normalizedModels), nowIso);
+    } else {
+      stmts.deleteAppSetting.run(CLAUDE_MODELS_SETTING_KEY);
+    }
+  }
+  if (Array.isArray(enabledModels)) {
+    const normalizedEnabledModels = enabledModels
+      .map((value) => String(value || '').trim())
+      .filter((value) => value && isSafeClaudeModelId(value));
+    if (normalizedEnabledModels.length) {
+      stmts.upsertAppSetting.run(CLAUDE_ENABLED_MODELS_SETTING_KEY, JSON.stringify(normalizedEnabledModels), nowIso);
+    } else {
+      stmts.deleteAppSetting.run(CLAUDE_ENABLED_MODELS_SETTING_KEY);
+    }
+  }
+  const current = getClaudeProviderSettings();
+  return {
+    ok: true,
+    configured: current.configured,
+    enabled: current.enabled,
+    model: current.model,
+    models: current.models,
+    availableModels: current.availableModels,
+  };
+}
+
+const CLAUDE_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
+
+// Discover the models the Claude Agent SDK can serve by asking a short-lived
+// idle query for `supportedModels()` (mirrors refreshOpenAIProviderModels).
+async function refreshClaudeProviderModels() {
+  const settings = getClaudeProviderSettings();
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, models: settings.models, error: 'Claude settings are unavailable' };
+  }
+  if (settings.enabled !== true) {
+    return { ok: false, models: settings.models, error: 'Claude provider is disabled' };
+  }
+  let claudeQuery = null;
+  let releaseInputGate = () => {};
+  try {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    const inputGate = new Promise((resolve) => { releaseInputGate = resolve; });
+    claudeQuery = query({
+      // Streaming-input mode with a gated (never-yielding) prompt keeps the
+      // CLI idle so the supportedModels control request can be served.
+      prompt: (async function* neverPrompt() { await inputGate; })(),
+      options: { cwd: os.tmpdir() },
+    });
+    const modelInfos = await Promise.race([
+      claudeQuery.supportedModels(),
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`timed out after ${CLAUDE_MODEL_DISCOVERY_TIMEOUT_MS}ms`)),
+          CLAUDE_MODEL_DISCOVERY_TIMEOUT_MS,
+        );
+        timer.unref?.();
+      }),
+    ]);
+    const discovered = [];
+    const effortsByModel = {};
+    for (const entry of (Array.isArray(modelInfos) ? modelInfos : [])) {
+      const effortLevels = entry?.supportsEffort !== false && Array.isArray(entry?.supportedEffortLevels)
+        ? entry.supportedEffortLevels
+            .map((value) => String(value || '').trim().toLowerCase())
+            .filter((value) => CLAUDE_EFFORT_LEVELS.has(value))
+        : [];
+      for (const candidate of [entry?.value, entry?.resolvedModel]) {
+        const modelId = String(candidate || '').trim();
+        // Keep explicit claude-* ids (including "[1m]" capability variants) and
+        // drop bare aliases like "default"/"sonnet" that duplicate them.
+        if (!modelId.toLowerCase().startsWith('claude-') || !isSafeClaudeModelId(modelId)) continue;
+        discovered.push(modelId);
+        const key = modelId.toLowerCase();
+        if (effortLevels.length && !(effortsByModel[key]?.length)) {
+          effortsByModel[key] = effortLevels;
+        }
+      }
+    }
+    if (!discovered.length) {
+      return { ok: false, models: settings.models, error: 'Claude model discovery returned no models' };
+    }
+    const nowIso = new Date().toISOString();
+    const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
+    stmts.upsertAppSetting.run(CLAUDE_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
+    stmts.upsertAppSetting.run(CLAUDE_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
+    return { ok: true, models, error: null };
+  } catch (error) {
+    return {
+      ok: false,
+      models: settings.models,
+      error: `Claude model discovery failed: ${String(error?.message || error || 'unknown error')}`,
+    };
+  } finally {
+    releaseInputGate();
+    try { claudeQuery?.close?.(); } catch { /* subprocess cleanup is best-effort */ }
+  }
+}
+
 const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conversationSessionMode: 'isolated', localhostOnly: true };
+// How long a turn may go without any sign of life from its worker before the
+// relay assumes the worker died. This is an inactivity window, not a cap on turn
+// length — see recoverStaleMessages.
 const DEFAULT_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
+const TURN_CEILING_SETTING_KEY = 'turn_ceiling_minutes';
 const DEFAULT_MODEL = 'gpt-5.4-mini';
 const DEFAULT_OPENAI_MODEL = 'gpt-4o';
 const OPENAI_API_KEY_SETTING_KEY = 'openai_api_key';
@@ -268,6 +477,17 @@ const OPENAI_MODEL_SETTING_KEY = 'openai_model';
 const OPENAI_MODELS_SETTING_KEY = 'openai_models';
 const OPENAI_BASE_URL_SETTING_KEY = 'openai_base_url';
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+const CLAUDE_ENABLED_SETTING_KEY = 'claude_enabled';
+const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
+const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
+const CLAUDE_ENABLED_MODELS_SETTING_KEY = 'claude_enabled_models';
+const CLAUDE_MODEL_EFFORTS_SETTING_KEY = 'claude_model_efforts';
+// 'none' = let the SDK use its default effort (high); the rest map straight
+// onto the Agent SDK's EffortLevel values.
+const CLAUDE_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
+const DEFAULT_CLAUDE_MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];
 const MODEL_CATALOG_STALE_MS = 2 * 60 * 1000;
 const MODEL_CATALOG_WARNING_MS = 10 * 60 * 1000;
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
@@ -637,6 +857,10 @@ const restartRetryBackoffMs = Array.isArray(config.restartRetryBackoffMs)
 const localhostOnly = config.localhostOnly === true || String(config.localhostOnly || '').trim().toLowerCase() === 'true';
 const listenHost = localhostOnly ? '127.0.0.1' : '0.0.0.0';
 const OFFLINE_STALE_RECOVER_MS = 45_000;
+// Grace period between deciding to shut down and disconnecting sockets, so a
+// terminal message_status emitted just before an idle-deferred restart still
+// reaches the browser.
+const SHUTDOWN_SOCKET_FLUSH_MS = 300;
 let runtimeShutdownStarted = false;
 const runtimeTimers = {
   cliStatus: null,
@@ -791,6 +1015,20 @@ function readAppSettingValue(key) {
   const normalizedKey = String(key || '').trim();
   if (!normalizedKey || typeof stmts?.getAppSetting?.get !== 'function') return '';
   return String(stmts.getAppSetting.get(normalizedKey)?.value || '').trim();
+}
+
+function getTurnCeilingMinutes() {
+  return readTurnCeilingSetting(readAppSettingValue(TURN_CEILING_SETTING_KEY));
+}
+
+function setTurnCeilingMinutes(value) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Turn ceiling settings are unavailable' };
+  }
+  const parsed = parseTurnCeilingUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(TURN_CEILING_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
+  return { ok: true, ceilingMinutes: parsed.minutes };
 }
 
 function resolveDefaultSessionWorkspaceRootState() {
@@ -2479,6 +2717,21 @@ if (runtimeSessionColumns.length) {
   if (!runtimeSessionColumns.includes('provider_model')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN provider_model TEXT`);
   }
+  if (!runtimeSessionColumns.includes('claude_native_session_id')) {
+    // Native Claude Agent SDK session id captured from the worker's first
+    // turn; passed back as `resume` so Claude conversations survive worker
+    // restarts.
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN claude_native_session_id TEXT`);
+  }
+  if (!runtimeSessionColumns.includes('context_usage_json')) {
+    // Latest context-window breakdown reported by the Claude Agent SDK. Claude
+    // sessions have no Copilot events.jsonl to tail, so this is the only source
+    // of context data for them.
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN context_usage_json TEXT`);
+  }
+  if (!runtimeSessionColumns.includes('context_usage_captured_at')) {
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN context_usage_captured_at TEXT`);
+  }
   if (!runtimeSessionColumns.includes('status')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
   }
@@ -2915,17 +3168,26 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(normalizedTargetSessionId)
     || stmts.getRuntimeSessionByConversation.get(normalizedTargetSessionId)
     || null;
-  if (String(runtimeSession?.provider_type || 'github').trim().toLowerCase() !== 'openai') {
-    return applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv);
+  const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+  if (providerType === 'claude') {
+    const claudeSettings = getClaudeProviderSettings();
+    const claudeModel = String(runtimeSession?.provider_model || runtimeSession?.model || claudeSettings.model).trim();
+    return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv), {
+      enabled: true,
+      model: claudeModel,
+    });
+  }
+  if (providerType !== 'openai') {
+    return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv));
   }
   const settings = getOpenAIProviderSettings();
   const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
-  return applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv, {
+  return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv, {
     enabled: true,
     apiKey: settings.apiKey,
     model,
     baseUrl: settings.baseUrl,
-  });
+  }));
 }
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
@@ -3029,10 +3291,12 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
   return true;
 }
 
-async function reconcileUnstartedConversationProviders({ enabled, model } = {}) {
-  const providerType = enabled === true ? 'openai' : 'github';
+async function reconcileUnstartedConversationProviders({ enabled, model, provider = 'openai' } = {}) {
+  const managedProvider = String(provider || 'openai').trim().toLowerCase() === 'claude' ? 'claude' : 'openai';
+  const managedDefaultModel = managedProvider === 'claude' ? DEFAULT_CLAUDE_MODEL : DEFAULT_OPENAI_MODEL;
+  const providerType = enabled === true ? managedProvider : 'github';
   const providerModel = enabled === true
-    ? (String(model || '').trim() || DEFAULT_OPENAI_MODEL)
+    ? (String(model || '').trim() || managedDefaultModel)
     : null;
   const runtimeModel = providerModel || DEFAULT_MODEL;
   const candidates = stmts.listRuntimeSessionProviderCandidates.all();
@@ -3049,7 +3313,12 @@ async function reconcileUnstartedConversationProviders({ enabled, model } = {}) 
   for (const row of candidates) {
     const currentProvider = String(row?.provider_type || 'github').trim().toLowerCase() || 'github';
     const currentProviderModel = String(row?.provider_model || '').trim();
-    if (currentProvider === providerType && (providerType !== 'openai' || currentProviderModel === providerModel)) {
+    // Only manage conversations belonging to the reconciled provider (or the
+    // github default it swaps with); other providers' bindings stay untouched.
+    if (currentProvider !== managedProvider && currentProvider !== 'github') {
+      continue;
+    }
+    if (currentProvider === providerType && (providerType !== managedProvider || currentProviderModel === providerModel)) {
       continue;
     }
     if (Number(row?.message_count || 0) > 0) {
@@ -3091,8 +3360,9 @@ async function reconcileUnstartedConversationProviders({ enabled, model } = {}) 
       result.updatedUnstartedConversations += 1;
     } catch (error) {
       let rollbackError = null;
-      const canRestorePreviousProvider = currentProvider !== 'openai'
-        || getOpenAIProviderSettings().configured === true;
+      const canRestorePreviousProvider = currentProvider === 'claude'
+        ? getClaudeProviderSettings().enabled === true
+        : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true);
       if (providerWasUpdated && canRestorePreviousProvider) {
         stmts.updateRuntimeSessionProvider.run(
           currentProvider,
@@ -3341,64 +3611,6 @@ function formatCompactTokens(value) {
   if (n === null) return 'unavailable';
   if (Math.abs(n) < 1000) return String(n);
   return `${(n / 1000).toFixed(1)}k`;
-}
-
-function getByPath(source, parts) {
-  let cur = source;
-  for (const part of parts) {
-    if (!cur || typeof cur !== 'object') return undefined;
-    cur = cur[part];
-  }
-  return cur;
-}
-
-function findFirstNumericByKey(obj, candidateKeys) {
-  if (!obj || typeof obj !== 'object') return null;
-  const wanted = new Set((candidateKeys || []).map((k) => String(k || '').trim()).filter(Boolean));
-  if (!wanted.size) return null;
-
-  const stack = [obj];
-  while (stack.length) {
-    const current = stack.pop();
-    if (!current || typeof current !== 'object') continue;
-    for (const [key, value] of Object.entries(current)) {
-      if (value && typeof value === 'object') {
-        stack.push(value);
-      }
-      if (!wanted.has(key)) continue;
-      const n = Number(value);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-  return null;
-}
-
-function resolveContextLimitTokens(modelId, data, modelUsage) {
-  const directCandidates = [
-    getByPath(data, ['maxContextTokens']),
-    getByPath(data, ['contextWindow']),
-    getByPath(data, ['maxTokens']),
-    getByPath(data, ['contextLimitTokens']),
-    getByPath(data, ['max_context_tokens']),
-    getByPath(data, ['tokenBudget']),
-    getByPath(modelUsage, ['maxContextTokens']),
-    getByPath(modelUsage, ['contextWindow']),
-    getByPath(modelUsage, ['maxTokens']),
-  ];
-  for (const value of directCandidates) {
-    const n = Number(value);
-    if (Number.isFinite(n) && n > 0) return Math.round(n);
-  }
-
-  const model = String(modelId || '').trim().toLowerCase();
-  const modelFallbackLimits = {
-    'claude-sonnet-4.6': 160000,
-    'claude-haiku-4.5': 160000,
-    'gpt-5.4': 256000,
-    'gpt-5.4-mini': 256000,
-    'gpt-5.3-codex': 256000,
-  };
-  return modelFallbackLimits[model] || null;
 }
 
 function buildUsageGrid({ systemPct, messagesPct, freePct, bufferPct }) {
@@ -4898,11 +5110,13 @@ function relayStreamEventsForQueueMessage(queueMessageId) {
   return rows
     .map((row) => {
       const seq = Math.max(0, Math.trunc(Number(row?.seq || 0)));
+      const subagentRunId = row?.subagent_run_id ? String(row.subagent_run_id).trim() : null;
       return {
         seq,
         text: String(row?.text || ''),
         done: Number(row?.done || 0) === 1,
         timestamp: row?.created_at || null,
+        subagentRunId: subagentRunId || null,
       };
     })
     .filter((row) => Number.isFinite(row.seq))
@@ -4930,6 +5144,11 @@ function relayThoughtsForResponse(responseMessageId) {
 function relayThoughtsForQueueMessage(queueMessageId) {
   const rows = stmts.listThoughtsByQueueMessage?.all(queueMessageId) || [];
   return normalizeRelayThoughtList(rows.map(mapRelayThoughtRow)).slice(0, 5000);
+}
+
+function subagentRunsForResponse(responseMessageId) {
+  const rows = stmts.listSubagentRunsByResponse?.all(responseMessageId, responseMessageId, responseMessageId) || [];
+  return rows.map(mapSubagentRunRow).filter(Boolean).slice(0, 96);
 }
 
 function mapSubagentRunRow(row) {
@@ -4968,12 +5187,13 @@ function inFlightStateForConversation(conversationId) {
   };
 }
 
-function recoverProcessingOlderThan(cutoffIso, requeueAtIso) {
-  const rows = stmts.listRecoverableProcessing.all(cutoffIso);
+function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso = null } = {}) {
+  const params = { inactiveBefore: cutoffIso, ceilingBefore: ceilingBeforeIso || null };
+  const rows = stmts.listRecoverableProcessing.all(params);
   if (!rows.length) return [];
 
   const tx = db.transaction(() => {
-    stmts.recoverProcessingBefore.run(requeueAtIso, cutoffIso);
+    stmts.recoverProcessingBefore.run({ ...params, requeueAt: requeueAtIso });
     const settleRecoveredAbortControls = db.prepare(`
       UPDATE relay_control_requests
       SET status = 'failed',
@@ -5212,6 +5432,9 @@ const contextSnapshotService = createContextSnapshotService({
   getModelContextLimitTokens,
 });
 const readContextFromSessionEvents = contextSnapshotService.readContextFromSessionEvents;
+// Claude-provider sessions live under the Agent SDK's project layout rather than
+// ~/.copilot/session-state, so their browsable session folder resolves separately.
+const claudeSessionRootResolver = createClaudeSessionRootResolver({ fs, path });
 
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
@@ -5714,6 +5937,9 @@ const sharedRouteDeps = {
   getOpenAIProviderSettings,
   setOpenAIProviderSettings,
   refreshOpenAIProviderModels,
+  getClaudeProviderSettings,
+  setClaudeProviderSettings,
+  refreshClaudeProviderModels,
   reconcileUnstartedConversationProviders,
   rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,
@@ -5755,6 +5981,7 @@ const sharedRouteDeps = {
   relayActivityForQueueMessage,
   relayThoughtsForResponse,
   relayThoughtsForQueueMessage,
+  subagentRunsForResponse,
   sanitizeActivityText,
   inFlightStateForConversation,
   emitToClientsExceptSessionId,
@@ -5797,6 +6024,9 @@ const sharedRouteDeps = {
   formatRelayBoardRow,
   relayRestartOrchestrator,
   resolveSessionStateRoot,
+  resolveClaudeSessionRoot: claudeSessionRootResolver.resolveClaudeSessionRoot,
+  getTurnCeilingMinutes,
+  setTurnCeilingMinutes,
   requestRelayShutdown,
   markSharedViewerPresence,
   getSharedWatcherCount,
@@ -5845,17 +6075,26 @@ if (managedOwnerPid) {
   }, 3000);
 }
 
-// Auto-recover messages stuck in 'processing' past the configured timeout (e.g. after CLI crash)
+// Auto-recover messages whose worker has gone silent (e.g. after a CLI crash).
+//
+// The window is measured from the last heartbeat that named the message, not
+// from when the turn began, so a turn stays alive for as long as its worker
+// keeps reporting it — however many minutes of tool calls and subagents that
+// takes. The separate, user-configurable ceiling is the only elapsed-time cap,
+// and both exempt a turn that is waiting on an unanswered question.
 function recoverStaleMessages() {
   const staleWindowMs = cliOnline
     ? processingTimeoutMs
     : Math.min(processingTimeoutMs, OFFLINE_STALE_RECOVER_MS);
   const cutoff = new Date(Date.now() - staleWindowMs).toISOString();
+  const ceilingMs = turnCeilingMinutesToMs(getTurnCeilingMinutes());
+  const ceilingBeforeIso = ceilingMs > 0 ? new Date(Date.now() - ceilingMs).toISOString() : null;
   const requeueAt = addMsIso(cliOnline ? 30_000 : 2_000);
-  const recoveredRows = recoverProcessingOlderThan(cutoff, requeueAt);
+  const recoveredRows = recoverProcessingOlderThan(cutoff, requeueAt, { ceilingBeforeIso });
   if (recoveredRows.length > 0) {
+    const ceilingNote = ceilingBeforeIso ? `, ceiling ${Math.round(ceilingMs / 60_000)}min` : '';
     console.log(
-      `${runtimeLogPrefix()}Recovered ${recoveredRows.length} stale message(s) older than ${Math.round(staleWindowMs / 1000)}s (cliOnline=${cliOnline})`
+      `${runtimeLogPrefix()}Recovered ${recoveredRows.length} stale message(s) after ${Math.round(staleWindowMs / 1000)}s without worker activity${ceilingNote} (cliOnline=${cliOnline})`
     );
   }
 }
@@ -5952,10 +6191,12 @@ function ensureRuntimeSessionBinding(
   const normalizedRequestedProviderType = String(providerType || '').trim().toLowerCase();
   const resolvedProviderType = normalizedRequestedProviderType === 'openai'
     ? 'openai'
-    : (normalizedRequestedProviderType === 'github'
-      ? 'github'
-      : (openAISettings?.enabled ? 'openai' : 'github'));
-  const resolvedProviderModel = resolvedProviderType === 'openai'
+    : (normalizedRequestedProviderType === 'claude'
+      ? 'claude'
+      : (normalizedRequestedProviderType === 'github'
+        ? 'github'
+        : (openAISettings?.enabled ? 'openai' : 'github')));
+  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude')
     ? (String(providerModel || normalizedModel || '').trim() || null)
     : null;
   try {
@@ -6189,17 +6430,27 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
     }, 2000);
     if (typeof forceExitTimer.unref === 'function') forceExitTimer.unref();
 
-    try { io.close(); } catch {}
+    const closeTransports = () => {
+      try { io.close(); } catch {}
 
-    try {
-      httpServer.close(() => {
+      try {
+        httpServer.close(() => {
+          try { clearTimeout(forceExitTimer); } catch {}
+          finish();
+        });
+      } catch {
         try { clearTimeout(forceExitTimer); } catch {}
         finish();
-      });
-    } catch {
-      try { clearTimeout(forceExitTimer); } catch {}
-      finish();
-    }
+      }
+    };
+
+    // io.close() disconnects clients immediately. A turn that finishes moments
+    // before an idle-deferred restart emits its terminal message_status right as
+    // we tear down, so give queued frames a beat to reach the browser. Well
+    // inside the 2s force-exit budget above.
+    // Deliberately not unref'd: this timer must fire for the process to exit
+    // cleanly. The unref'd force-exit timer above is the backstop if it does not.
+    setTimeout(closeTransports, SHUTDOWN_SOCKET_FLUSH_MS);
   });
 
   return runtimeShutdownPromise;

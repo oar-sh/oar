@@ -27,6 +27,7 @@ import {
   bootstrapConversationSession,
   scheduleContextUsageRefresh,
   loadModelCatalog,
+  loadClaudeSettings,
   loadOpenAISettings,
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
@@ -40,7 +41,7 @@ import {
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
 } from './new-conversation-model-choice.mjs';
-import { isConversationUsingOpenAIProvider } from './conversation-provider-indicator.mjs';
+import { conversationProviderIndicatorLabel } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
@@ -58,6 +59,7 @@ let openConversationVersion = 0;
 let newConversationInFlight = false;
 let newConversationCatalogCache = null;
 let newConversationOpenAISettingsCache = null;
+let newConversationClaudeSettingsCache = null;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -70,10 +72,20 @@ let conversationListPaginationState = {
 };
 
 function mergeConversationRecord(current, next) {
-  return {
+  const merged = {
     ...(current && typeof current === 'object' ? current : {}),
     ...(next && typeof next === 'object' ? next : {}),
   };
+  // localTurnStatus is optimistic client state driven by one-shot message_status
+  // socket events. If the socket drops between a turn finishing and the event
+  // being delivered — a relay restart is the obvious case — the flag would stay
+  // 'processing' until it aged out, leaving the list spinner running forever.
+  // The server's activeTurn flag is authoritative, so let it clear the flag.
+  if (next && typeof next === 'object' && next.activeTurn === false) {
+    delete merged.localTurnStatus;
+    delete merged.localTurnStatusUpdatedAt;
+  }
+  return merged;
 }
 
 function upsertConversationRecord(record) {
@@ -261,8 +273,9 @@ export function renderConvList() {
   list.innerHTML = `${sorted.map((c) => {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
-    const providerIndicatorHtml = isConversationUsingOpenAIProvider(c)
-      ? ' · <span class="conv-provider-indicator">OpenAI</span>'
+    const providerIndicatorLabel = conversationProviderIndicatorLabel(c);
+    const providerIndicatorHtml = providerIndicatorLabel
+      ? ` · <span class="conv-provider-indicator">${providerIndicatorLabel}</span>`
       : '';
     return `
     <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}" onclick="openConversation('${c.id}')">
@@ -447,6 +460,7 @@ function normalizeNewConversationProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
+  if (normalized === 'claude') return 'claude';
   return 'github';
 }
 
@@ -481,6 +495,7 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   const normalizedProvider = normalizeNewConversationProviderType(providerType);
   const wantsOpenAI = normalizedProvider === 'openai' || normalizedProvider === 'openai-image';
   const hasOpenAIByok = providers.includes('openai-byok');
+  const hasClaude = providers.includes('claude');
   if (wantsOpenAI) {
     if (hasOpenAIByok) return true;
     const settingsModel = String(newConversationOpenAISettingsCache?.model || '').trim();
@@ -492,7 +507,17 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
     if (providers.length === 0 && isLikelyOpenAIModelId(normalizedModelId)) return true;
     return false;
   }
-  return providers.some((provider) => provider !== 'openai-byok') || !hasOpenAIByok;
+  if (normalizedProvider === 'claude') {
+    if (hasClaude) return true;
+    const claudeModel = String(newConversationClaudeSettingsCache?.model || '').trim();
+    const claudeModels = Array.isArray(newConversationClaudeSettingsCache?.models)
+      ? newConversationClaudeSettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    return normalizedModelId === claudeModel || claudeModels.includes(normalizedModelId);
+  }
+  const claudeOnly = hasClaude && providers.every((provider) => provider === 'claude');
+  if (claudeOnly) return false;
+  return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude') || !hasOpenAIByok;
 }
 
 function openAIImageSizesForModel(modelId = '') {
@@ -627,6 +652,10 @@ function updateNewConversationProviderHelp(provider = 'github') {
     help.textContent = 'OpenAI models use your saved BYOK API key.';
     return;
   }
+  if (normalizedProvider === 'claude') {
+    help.textContent = "Claude chats run through the Claude Agent SDK with the relay host's Claude login.";
+    return;
+  }
   help.textContent = 'Copilot models use your GitHub Copilot runtime.';
 }
 
@@ -679,18 +708,23 @@ async function populateNewConversationModelSelect(providerType = 'github') {
 }
 
 async function openNewConversationModelModal() {
-  const [catalog, settings] = await Promise.all([
+  const [catalog, settings, claudeSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
+    loadClaudeSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
+  newConversationClaudeSettingsCache = claudeSettings || null;
   const providerSelect = document.getElementById('new-conversation-provider-select');
   if (providerSelect) {
     const options = [{ value: 'github', label: 'Copilot' }];
     if (settings?.enabled === true) {
       options.push({ value: 'openai', label: 'OpenAI (BYOK)' });
       options.push({ value: 'openai-image', label: 'OpenAI Image (BYOK)' });
+    }
+    if (claudeSettings?.enabled === true) {
+      options.push({ value: 'claude', label: 'Claude (Agent SDK)' });
     }
     providerSelect.innerHTML = '';
     for (const option of options) {

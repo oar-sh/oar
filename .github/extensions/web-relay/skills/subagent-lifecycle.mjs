@@ -197,6 +197,12 @@ export function createSubagentLifecycleHandlers({
         resolvedParent = resolvedParent || pending.parentSubagentId || null;
         resolvedName = resolvedName || pending.displayName || null;
       }
+    } else {
+      // Re-discovery of a known run (e.g. its next tool call) must not demote
+      // it to a root or rename it — keep the established parent/name.
+      const existing = knownRuns.get(id);
+      resolvedParent = resolvedParent || existing.parentSubagentId || null;
+      resolvedName = resolvedName || existing.displayName || null;
     }
 
     await registerSubagentRun(activeMsg, id, {

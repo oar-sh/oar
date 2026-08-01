@@ -62,6 +62,7 @@ function looksLikeCopilotWorkerProcess(proc) {
   if (name === 'copilot.exe') return true;
   if (name === 'gh.exe' && cmd.includes('gh') && cmd.includes('copilot')) return true;
   if (cmd.includes('gh copilot')) return true;
+  if (cmd.includes('claude-session-worker')) return true;
   return cmd.includes('copilot.cmd')
     || cmd.includes('copilot-win32')
     || cmd.includes('@github\\copilot')

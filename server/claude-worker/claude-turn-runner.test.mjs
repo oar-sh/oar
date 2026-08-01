@@ -1,0 +1,336 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { createClaudeTurnRunner, buildClaudePlanReadyBoardPayload } from './claude-turn-runner.mjs';
+
+function makeApiStub({ failRoutes = new Set() } = {}) {
+  const calls = [];
+  return {
+    calls,
+    api: async (method, routePath, body) => {
+      calls.push({ method, routePath, body });
+      if (failRoutes.has(routePath)) throw new Error(`stubbed failure for ${routePath}`);
+      return { ok: true };
+    },
+  };
+}
+
+function fakeTurn(messages) {
+  return {
+    async* [Symbol.asyncIterator]() {
+      for (const message of messages) yield message;
+    },
+  };
+}
+
+function initMessage(sessionId) {
+  return { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet-5' };
+}
+
+function resultMessage(text, sessionId) {
+  return { type: 'result', subtype: 'success', is_error: false, result: text, session_id: sessionId };
+}
+
+const baseMessage = {
+  id: 'q-1',
+  conversationId: 'conv-1',
+  relayMode: 'agent',
+  text: 'hello',
+  model: 'claude-sonnet-5',
+  attachments: [],
+};
+
+test('first turn persists the native session id and later turns resume it', async () => {
+  const stub = makeApiStub();
+  const capturedTurns = [];
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: (params) => {
+      capturedTurns.push(params);
+      return fakeTurn([initMessage('native-1'), resultMessage('done', 'native-1')]);
+    },
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, claudeNativeSessionId: null } });
+  assert.equal(capturedTurns[0].resume, '');
+  const persist = stub.calls.find((call) => call.routePath === '/api/claude-native-session');
+  assert.ok(persist, 'native session id must be persisted');
+  assert.deepEqual(persist.body, { conversationId: 'conv-1', claudeNativeSessionId: 'native-1' });
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'done');
+
+  // Second turn without a server-provided id resumes from the worker cache.
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', claudeNativeSessionId: null } });
+  assert.equal(capturedTurns[1].resume, 'native-1');
+});
+
+test('a respawned worker resumes from the server-persisted id (kill survival)', async () => {
+  const stub = makeApiStub();
+  const capturedTurns = [];
+  // Fresh runner = freshly spawned worker process after a kill.
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: (params) => {
+      capturedTurns.push(params);
+      return fakeTurn([initMessage('native-2'), resultMessage('resumed fine', 'native-2')]);
+    },
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, claudeNativeSessionId: 'native-1' } });
+  assert.equal(capturedTurns[0].resume, 'native-1');
+  // The (possibly new) session id from the resumed turn is persisted so the
+  // chain keeps working across further restarts.
+  const persist = stub.calls.find((call) => call.routePath === '/api/claude-native-session');
+  assert.equal(persist.body.claudeNativeSessionId, 'native-2');
+});
+
+test('failed persist is retried on the next turn instead of being cached', async () => {
+  const failRoutes = new Set(['/api/claude-native-session']);
+  const stub = makeApiStub({ failRoutes });
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => fakeTurn([initMessage('native-1'), resultMessage('ok', 'native-1')]),
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, claudeNativeSessionId: null } });
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/claude-native-session').length, 1);
+
+  failRoutes.clear();
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', claudeNativeSessionId: null } });
+  const persists = stub.calls.filter((call) => call.routePath === '/api/claude-native-session');
+  assert.equal(persists.length, 2, 'persist must be retried after a failure');
+});
+
+test('per-turn model and effort reach the SDK turn', async () => {
+  const stub = makeApiStub();
+  const capturedTurns = [];
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: (params) => {
+      capturedTurns.push(params);
+      return fakeTurn([initMessage('native-1'), resultMessage('ok', 'native-1')]);
+    },
+  });
+  await runner.handlePendingPayload({
+    message: {
+      ...baseMessage,
+      model: 'claude-opus-5[1m]',
+      providerModel: 'claude-sonnet-5',
+      reasoningEffort: 'xhigh',
+    },
+  });
+  assert.equal(capturedTurns[0].model, 'claude-opus-5[1m]');
+  assert.equal(capturedTurns[0].reasoningEffort, 'xhigh');
+});
+
+test('sdk failure publishes a terminal response instead of hanging the queue', async () => {
+  const stub = makeApiStub();
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => {
+      throw new Error('spawn failed');
+    },
+  });
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.ok(response);
+  assert.match(response.body.text, /spawn failed/);
+  assert.equal(response.body.terminalError.kind, 'claude-turn-failed');
+});
+
+test('subagent stream text never stands in for the answer', async () => {
+  const stub = makeApiStub();
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => fakeTurn([
+      initMessage('native-1'),
+      // Main thread narrates, then a subagent streams after it. The stream
+      // ends without a result envelope, so the fallback text is published.
+      {
+        type: 'stream_event',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Main thread answer.' } },
+      },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: 'toolu_sub',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Subagent chatter here.' } },
+      },
+    ]),
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.ok(response, 'a response must be published');
+  assert.equal(response.body.text, 'Main thread answer.');
+
+  // The subagent text still reached the stream channel, tagged to its run.
+  const subagentStream = stub.calls.find((call) => call.routePath === '/api/stream' && call.body.subagentRunId);
+  assert.equal(subagentStream.body.subagentRunId, 'toolu_sub');
+  assert.equal(subagentStream.body.text, 'Subagent chatter here.');
+});
+
+test('thoughts from the sdk stream reach the relay thought channel', async () => {
+  const stub = makeApiStub();
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => fakeTurn([
+      initMessage('native-1'),
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: {
+          content: [
+            { type: 'thinking', thinking: 'Weighing the options.' },
+            { type: 'text', text: 'Checking the config first.' },
+            { type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/etc/hosts' } },
+          ],
+        },
+      },
+      resultMessage('All set.', 'native-1'),
+    ]),
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const thoughts = stub.calls.filter((call) => call.routePath === '/api/thought');
+  assert.equal(thoughts.length, 2, 'thinking and interim narration both publish');
+  assert.equal(thoughts[0].body.text, 'Weighing the options.');
+  assert.equal(thoughts[1].body.text, 'Checking the config first.');
+  assert.ok(thoughts[0].body.reasoningId !== thoughts[1].body.reasoningId);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'All set.');
+});
+
+test('plan board payload requires plan text', () => {
+  assert.equal(buildClaudePlanReadyBoardPayload({ message: baseMessage, planText: '' }), null);
+  const payload = buildClaudePlanReadyBoardPayload({ message: baseMessage, planText: '1. a\n2. b' });
+  assert.equal(payload.boardType, 'plan_ready');
+  assert.equal(payload.messageId, 'q-1');
+});
+
+test('context usage is read while the query is still open and then published', async () => {
+  const stub = makeApiStub();
+  const events = [];
+  // A Query that only answers control requests until its iterator is drained,
+  // mirroring the SDK tearing down the transport when the turn ends.
+  function contextAwareTurn(messages) {
+    let closed = false;
+    return {
+      async getContextUsage() {
+        if (closed) throw new Error('transport closed');
+        events.push('getContextUsage');
+        return { totalTokens: 247100, maxTokens: 1000000, percentage: 24.71, categories: [] };
+      },
+      async* [Symbol.asyncIterator]() {
+        for (const message of messages) yield message;
+        closed = true;
+      },
+    };
+  }
+
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => contextAwareTurn([initMessage('native-1'), resultMessage('done', 'native-1')]),
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+
+  assert.deepEqual(events, ['getContextUsage'], 'read exactly once, before the transport closed');
+  const post = stub.calls.find((call) => call.routePath === '/api/claude-context-usage');
+  assert.ok(post, 'context usage must be published');
+  assert.equal(post.body.conversationId, 'conv-1');
+  assert.equal(post.body.sdkSessionId, 'sess-1');
+  assert.equal(post.body.contextUsage.totalTokens, 247100);
+});
+
+test('a runtime without the context control request still completes the turn', async () => {
+  const stub = makeApiStub();
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => fakeTurn([initMessage('native-1'), resultMessage('done', 'native-1')]),
+  });
+
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  assert.ok(stub.calls.find((call) => call.routePath === '/api/response'), 'response still published');
+  assert.ok(
+    !stub.calls.find((call) => call.routePath === '/api/claude-context-usage'),
+    'nothing to publish when the runtime cannot report context',
+  );
+});
+
+test('a failing context publish does not disturb the response', async () => {
+  const stub = makeApiStub({ failRoutes: new Set(['/api/claude-context-usage']) });
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => ({
+      async getContextUsage() {
+        return { totalTokens: 10, maxTokens: 100, percentage: 10, categories: [] };
+      },
+      async* [Symbol.asyncIterator]() {
+        yield initMessage('native-1');
+        yield resultMessage('done', 'native-1');
+      },
+    }),
+  });
+
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'done');
+});
+
+test('the input gate is released on success and on error paths', async () => {
+  const stub = makeApiStub();
+  let releasedOnSuccess = 0;
+  const successTurn = {
+    endInput: () => { releasedOnSuccess += 1; },
+    async getContextUsage() { return { totalTokens: 1, maxTokens: 100, percentage: 1, categories: [] }; },
+    async* [Symbol.asyncIterator]() {
+      yield initMessage('native-1');
+      yield resultMessage('done', 'native-1');
+    },
+  };
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => successTurn,
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.ok(releasedOnSuccess >= 1, 'gate must release after capture');
+
+  let releasedOnError = 0;
+  const errorTurn = {
+    endInput: () => { releasedOnError += 1; },
+    // eslint-disable-next-line require-yield
+    async* [Symbol.asyncIterator]() { throw new Error('boom'); },
+  };
+  const errorRunner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: () => errorTurn,
+  });
+  await errorRunner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.ok(releasedOnError >= 1, 'a throwing turn must still release the gate');
+});

@@ -196,6 +196,42 @@ export async function loadOpenAISettings() {
   return apiFetch('/api/settings/openai');
 }
 
+export async function loadClaudeSettings() {
+  return apiFetch('/api/settings/claude');
+}
+
+export async function updateClaudeSettings({
+  enabled = undefined,
+  model = undefined,
+  enabledModels = undefined,
+} = {}) {
+  const payload = {};
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}/api/settings/claude`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = String(result?.error || `Failed to update Claude settings (${response.status})`).trim();
+      throw new Error(message);
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure('/api/settings/claude', error);
+    throw error;
+  }
+}
+
 export async function updateOpenAISettings({
   apiKey = '',
   model = 'gpt-4o',
@@ -241,6 +277,17 @@ export async function updateWindowsAutostartSetting(enabled) {
   return apiFetch('/api/settings/windows-autostart', {
     method: 'POST',
     body: JSON.stringify({ enabled: !!enabled }),
+  });
+}
+
+export async function loadTurnCeilingSetting() {
+  return apiFetch('/api/settings/turn-ceiling');
+}
+
+export async function updateTurnCeilingSetting(ceilingMinutes) {
+  return apiFetch('/api/settings/turn-ceiling', {
+    method: 'POST',
+    body: JSON.stringify({ ceilingMinutes: Number(ceilingMinutes) }),
   });
 }
 
@@ -765,7 +812,15 @@ export async function refreshContextUsageBar(conversationId, requestSeq = ++cont
     return;
   }
   const lookupId = resolveContextLookupId(convId) || convId;
-  const payload = await apiFetch(`/api/context/${encodeURIComponent(lookupId)}`);
+  // Callers fire this without awaiting, so a rejection here would surface as an
+  // unhandled rejection. A miss is routine (a conversation with no turns yet):
+  // leave the bar as-is rather than blanking it.
+  let payload = null;
+  try {
+    payload = await apiFetch(`/api/context/${encodeURIComponent(lookupId)}`);
+  } catch {
+    return;
+  }
   if (!payload) return;
   if (requestSeq !== contextUsageRefreshSeq) return;
   if (String(currentConvId || '').trim() !== convId) return;

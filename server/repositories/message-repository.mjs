@@ -228,9 +228,45 @@ export function createMessageRepository(db) {
         findQById:      db.prepare(`SELECT * FROM queue WHERE id = ?`),
         pruneQueue:     db.prepare(`DELETE FROM queue WHERE status = 'done' AND id NOT IN (SELECT id FROM queue WHERE status = 'done' ORDER BY timestamp DESC LIMIT 200)`),
         recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_sdk_session_id = NULL, owner_assigned_at = NULL, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND processing_at < ?`),
-        listRecoverableProcessing: db.prepare(`SELECT id, conversation_id FROM queue WHERE status = 'processing' AND processing_at < ?`),
-        recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_sdk_session_id = NULL, owner_assigned_at = NULL, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND processing_at < ?`),
+        // Staleness is inactivity, not elapsed turn time: owner_last_claimed_at is
+        // refreshed by every worker heartbeat for the message it is working on, so a
+        // long-but-alive turn keeps moving the cutoff. processing_at is only the
+        // fallback for rows without an owner (session-worker routing disabled), and
+        // it is what the separate absolute ceiling measures.
+        //
+        // A turn blocked on an unanswered AskUserQuestion is never stale — it is
+        // waiting on the human, and relay_questions carries its own expiry.
+        listRecoverableProcessing: db.prepare(`
+          SELECT id, conversation_id
+          FROM queue
+          WHERE status = 'processing'
+            AND (
+              COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
+              OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
+            )
+            AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+        `),
+        recoverProcessingBefore: db.prepare(`
+          UPDATE queue
+          SET status = 'pending',
+              processing_at = NULL,
+              next_attempt_at = @requeueAt,
+              owner_sdk_session_id = NULL,
+              owner_assigned_at = NULL,
+              owner_lease_expires_at = NULL,
+              owner_last_claimed_at = NULL
+          WHERE status = 'processing'
+            AND (
+              COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
+              OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
+            )
+            AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+        `),
         listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
+        // Authoritative "is a turn in flight" signal for the conversation list.
+        // Clients otherwise track this from one-shot message_status socket events,
+        // which are lost if the socket drops between the final status and delivery.
+        listConversationIdsWithActiveQueue: db.prepare(`SELECT DISTINCT conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         deleteQueueById: db.prepare(`DELETE FROM queue WHERE id = ?`),
         getLatestProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) DESC LIMIT 1`),
         parkPendingQueueForRestart: db.prepare(`

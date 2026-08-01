@@ -221,6 +221,7 @@
     --text:      #e6edf3;
     --muted:     #8b949e;
     --accent:    #58a6ff;
+    --bubble-link: #79c0ff;
     --user-bg:   #1f6feb;
     --user-bubble-bg: #1c5ecc;
     --user-bubble-fg: #f8fbff;
@@ -275,6 +276,7 @@
     --text:      #1F2328;
     --muted:     #656d76;
     --accent:    #0969da;
+    --bubble-link: #0550ae;
     --user-bg:   #0969da;
     --user-bubble-bg: #e1ebfa;
     --user-bubble-fg: #1F2328;
@@ -1132,7 +1134,23 @@
     overflow-wrap: anywhere;
     word-break: break-word;
   }
-  .msg-bubble a { color: var(--accent); }
+  /* Links inside any conversation surface (message bubble, live thinking bubble,
+     subagent bubble, question card) need to read against the bubble background,
+     not fall back to the browser default blue. */
+  .msg-bubble a,
+  .thinking-bubble a,
+  .subagent-bubble a,
+  .relay-question-card a,
+  .workspace-file-link {
+    color: var(--bubble-link);
+    text-decoration-thickness: 1.2px;
+    text-underline-offset: 2px;
+  }
+  .msg-bubble a:visited,
+  .thinking-bubble a:visited,
+  .subagent-bubble a:visited,
+  .relay-question-card a:visited,
+  .workspace-file-link:visited { color: var(--bubble-link); }
   .msg.user .msg-bubble code:not(pre code) {
     background: var(--user-bubble-chip-bg);
     color: var(--user-bubble-chip-fg);
@@ -1273,6 +1291,18 @@
   }
   .thinking-thoughts-list:empty { display: none; }
   .thinking-thoughts-panel:not(:has(.thinking-thoughts-list > *)) { display: none; }
+  /* Live reply text, streamed while the turn runs. Reads as the answer, not as
+     metadata, so it uses body text colour rather than --muted. */
+  .thinking-stream {
+    margin-bottom: 8px;
+    min-width: 0;
+    color: var(--text);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .thinking-stream[hidden] { display: none; }
+  .thinking-stream > :first-child { margin-top: 0; }
+  .thinking-stream > :last-child { margin-bottom: 0; }
   .thinking-activity {
     margin-top: 8px; font-size: var(--fs-meta-md); color: var(--muted);
     display: flex; flex-direction: column; gap: 4px;
@@ -1338,6 +1368,17 @@
   .subagent-bubble-status[data-status="completed"] { color: var(--success); }
   .subagent-bubble-status[data-status="failed"],
   .subagent-bubble-status[data-status="cancelled"] { color: var(--error); }
+  .subagent-stream {
+    margin-bottom: 6px;
+    min-width: 0;
+    color: var(--text);
+    font-size: var(--fs-meta-md);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .subagent-stream[hidden] { display: none; }
+  .subagent-stream > :first-child { margin-top: 0; }
+  .subagent-stream > :last-child { margin-bottom: 0; }
   .subagent-activity {
     font-size: var(--fs-meta-sm);
     color: var(--muted);
@@ -1486,6 +1527,75 @@
     opacity: 1;
     transition: width 0.2s ease, background-size 0.2s ease, box-shadow 0.2s ease;
   }
+  /* ── Context usage modal ── */
+  .ctx-usage-model {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+  .ctx-usage-headline {
+    font-size: 0.95rem;
+    color: var(--text);
+    margin-bottom: 10px;
+  }
+  .ctx-usage-bar {
+    display: flex;
+    width: 100%;
+    height: 8px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--bg3);
+    margin-bottom: 14px;
+  }
+  .ctx-usage-bar-seg { height: 100%; }
+  .ctx-usage-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  .ctx-usage-table th {
+    text-align: left;
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .ctx-usage-table td {
+    padding: 7px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .ctx-usage-table tr:last-child td { border-bottom: none; }
+  .ctx-usage-num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ctx-usage-pct { color: var(--muted); }
+  .ctx-usage-cat { display: flex; align-items: center; gap: 9px; }
+  .ctx-usage-swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 2px;
+    flex: none;
+  }
+  .ctx-usage-swatch-empty { background: transparent; }
+  .ctx-usage-row-muted td { color: var(--muted); }
+  .ctx-usage-note {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin: -6px 0 12px;
+  }
+  .ctx-usage-raw {
+    margin-top: 14px;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .ctx-usage-raw summary { cursor: pointer; outline: none; }
+  .ctx-usage-raw pre {
+    margin-top: 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
   #attachment-preview {
     display: none; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
   }
@@ -3613,6 +3723,21 @@
         >
       </div>
       <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="turn-ceiling-slider">Max turn duration <span id="turn-ceiling-value">No limit</span></label>
+        <input
+          id="turn-ceiling-slider"
+          type="range"
+          min="0"
+          max="600"
+          step="5"
+          value="60"
+          aria-label="Maximum turn duration in minutes"
+          oninput="previewTurnCeilingSetting(this.value)"
+          onchange="updateTurnCeilingSetting(this.value)"
+        >
+      </div>
+      <div class="settings-help" style="margin-top: 6px;">A hard cap on how long one turn may run before the relay requeues it. Turns are already kept alive by worker heartbeats, and a turn waiting on your answer to a question is never cut off — so this only catches a worker that has hung. Set to 0 for no limit.</div>
       <div id="windows-autostart-setting" hidden>
         <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
           <label for="windows-autostart-toggle">Autostart (Windows)</label>
@@ -3682,6 +3807,26 @@
           <button id="openai-remove-btn" type="button" class="summary-btn" onclick="removeOpenAISettings()">Remove saved key</button>
         </div>
         <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="claude-model-input">Claude (Agent SDK)</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="claude-enabled-toggle">Enable Claude for New Chat model selection</label>
+          <input id="claude-enabled-toggle" type="checkbox" onchange="toggleClaudeProvider(this.checked)">
+        </div>
+        <label for="claude-model-input" style="margin-top: 8px;">Claude model ID</label>
+        <input
+          id="claude-model-input"
+          type="text"
+          value="claude-sonnet-5"
+          placeholder="claude-sonnet-5"
+          aria-label="Claude model ID"
+        >
+        <div id="claude-settings-status" class="settings-help settings-provider-status">Loading Claude settings…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
+        </div>
+        <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
       </div>
     </div>
   </div>

@@ -94,6 +94,20 @@ export function createSessionRepository(db) {
               WHERE id = ?
             `)
           : null,
+        updateRuntimeSessionClaudeNativeSessionId: runtimeSessionColumns.has('claude_native_session_id')
+          ? db.prepare(`
+              UPDATE runtime_sessions
+              SET claude_native_session_id = ?, last_used_at = ?
+              WHERE conversation_id = ?
+            `)
+          : null,
+        updateRuntimeSessionContextUsage: runtimeSessionColumns.has('context_usage_json')
+          ? db.prepare(`
+              UPDATE runtime_sessions
+              SET context_usage_json = ?, context_usage_captured_at = ?
+              WHERE conversation_id = ?
+            `)
+          : null,
         deleteRuntimeSessionByConversation: db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`),
 
         // deleted sdk sessions tombstones (hide rediscovered SDK sessions after UI delete)

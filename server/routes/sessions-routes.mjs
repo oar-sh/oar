@@ -10,9 +10,18 @@ import { createSdkSessionSyncService } from '../services/sdk-session-sync-servic
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
+import { readStoredClaudeContextUsage } from '../services/claude-context-usage.mjs';
+import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
-import { isSafeProviderModelId } from '../../shared/model-id.mjs';
+import { isSafeClaudeModelId, isSafeProviderModelId } from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
+import {
+  DEFAULT_TURN_CEILING_MINUTES,
+  TURN_CEILING_MAX_MINUTES,
+  TURN_CEILING_MIN_MINUTES,
+  TURN_CEILING_STEP_MINUTES,
+  parseTurnCeilingUpdate,
+} from '../../shared/turn-ceiling.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -182,6 +191,88 @@ export function parseOpenAISettingsUpdateRequest(body = {}) {
   };
 }
 
+export function parseClaudeSettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const hasEnabled = typeof payload.enabled === 'boolean';
+  const hasModel = Object.prototype.hasOwnProperty.call(payload, 'model');
+  const model = hasModel ? (String(payload.model || '').trim() || 'claude-sonnet-5') : undefined;
+  const hasModels = Array.isArray(payload.models);
+  const hasEnabledModels = Array.isArray(payload.enabledModels);
+  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels) {
+    return { ok: false, error: 'No Claude settings update provided' };
+  }
+  if (hasModel && !isSafeClaudeModelId(model)) {
+    return { ok: false, error: 'Invalid Claude model ID' };
+  }
+  return {
+    ok: true,
+    ...(hasEnabled ? { enabled: payload.enabled } : {}),
+    ...(hasModel ? { model } : {}),
+    ...(hasModels ? { models: payload.models } : {}),
+    ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+  };
+}
+
+export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSettings = {}) {
+  const configured = claudeSettings?.enabled === true;
+  const model = String(claudeSettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const baseModels = new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+  const claudeModels = Array.isArray(claudeSettings?.models)
+    ? claudeSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), model, ...claudeModels]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const claudeReasoningByModel = {};
+  const effortsByModel = claudeSettings?.effortsByModel && typeof claudeSettings.effortsByModel === 'object'
+    ? claudeSettings.effortsByModel
+    : {};
+  const defaultClaudeEfforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  for (const claudeModel of [model, ...claudeModels]) {
+    const providersKey = String(claudeModel || '').trim();
+    if (!providersKey) continue;
+    const lowerKey = providersKey.toLowerCase();
+    const claudeEfforts = Array.isArray(effortsByModel[lowerKey]) && effortsByModel[lowerKey].length
+      ? effortsByModel[lowerKey]
+      : defaultClaudeEfforts;
+    claudeReasoningByModel[lowerKey] = [...claudeEfforts];
+    if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
+      reasoningByModel[lowerKey] = [...claudeEfforts];
+    }
+    const existingProviders = Array.isArray(providersByModel[providersKey])
+      ? providersByModel[providersKey]
+      : (Array.isArray(providersByModel[lowerKey])
+          ? providersByModel[lowerKey]
+          : (modelMetadataByModel[providersKey]?.provider ? [modelMetadataByModel[providersKey].provider] : []));
+    providersByModel[providersKey] = Array.from(new Set([
+      ...existingProviders,
+      ...(baseModels.has(lowerKey) ? ['github-copilot'] : []),
+      'claude',
+    ]));
+    modelMetadataByModel[providersKey] = {
+      ...(modelMetadataByModel[providersKey] || {}),
+      provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'claude'),
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      claude: claudeReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
 export function buildModelCatalogWithOpenAIProvider(modelState = {}, openAISettings = {}) {
   const configured = openAISettings?.enabled === true;
   const model = String(openAISettings?.model || '').trim();
@@ -240,6 +331,7 @@ function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
+  if (normalized === 'claude' || normalized === 'claude-agent-sdk' || normalized === 'anthropic') return 'claude';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }
@@ -870,8 +962,29 @@ export function buildConversationSessionRootPayload({
   sdkSessionId = '',
   title = '',
   resolveSessionStateRoot = null,
+  providerType = '',
+  claudeNativeSessionId = '',
+  workspaceRootPath = '',
+  resolveClaudeSessionRoot = null,
 } = {}) {
   const sid = String(sdkSessionId || '').trim() || String(conversationId || '').trim();
+  // Claude sessions have no ~/.copilot/session-state entry — only the Copilot
+  // CLI creates those — so they resolve against the Agent SDK's own layout and
+  // never fall through to the branch below.
+  if (String(providerType || '').trim().toLowerCase() === 'claude') {
+    const nativeSessionId = String(claudeNativeSessionId || '').trim();
+    if (!nativeSessionId || typeof resolveClaudeSessionRoot !== 'function') return null;
+    const claudeRoot = resolveClaudeSessionRoot({
+      claudeNativeSessionId: nativeSessionId,
+      workspaceRootPath: String(workspaceRootPath || '').trim(),
+    });
+    if (!claudeRoot?.sessionRootPath) return null;
+    return {
+      sdkSessionId: sid,
+      sessionRootPath: claudeRoot.sessionRootPath,
+      sessionRootName: claudeRoot.sessionRootName || 'Session',
+    };
+  }
   if (!sid || typeof resolveSessionStateRoot !== 'function') return null;
   const root = String(resolveSessionStateRoot() || '').trim();
   if (!root) return null;
@@ -1250,6 +1363,7 @@ export function buildConversationMessages({
   transcriptMessages = [],
   relayActivitiesByMessageId = new Map(),
   relayThoughtsByMessageId = new Map(),
+  subagentRunsByMessageId = new Map(),
   responseMessageToSourceId = new Map(),
   queueRows = [],
   usageByResponseMessageId = new Map(),
@@ -1269,6 +1383,7 @@ export function buildConversationMessages({
         return {
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
           thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
+          subagentRuns: message?.role === 'assistant' ? (subagentRunsByMessageId.get(id) || []) : [],
           id,
           role: message?.role,
           text: stripRelayPromptContext(message?.text, message?.mode),
@@ -1302,6 +1417,9 @@ export function buildConversationMessages({
       thoughts: (Array.isArray(message?.thoughts) && message.thoughts.length)
         ? message.thoughts
         : (id ? (relayThoughtsByMessageId.get(id) || []) : []),
+      subagentRuns: (Array.isArray(message?.subagentRuns) && message.subagentRuns.length)
+        ? message.subagentRuns
+        : (id ? (subagentRunsByMessageId.get(id) || []) : []),
       text: stripRelayPromptContext(message?.text, message?.mode),
       sourceMessageId,
       modelOrigin: message?.modelOrigin
@@ -1444,6 +1562,7 @@ export function registerSessionsRoutes(app, deps) {
     hydrateAttachment,
     relayActivityForResponse,
     relayThoughtsForResponse,
+    subagentRunsForResponse,
     buildContextResponseText,
     readContextFromSessionEvents,
     inFlightStateForConversation,
@@ -1465,6 +1584,9 @@ export function registerSessionsRoutes(app, deps) {
     getOpenAIProviderSettings = () => ({ configured: false, enabled: false, model: 'gpt-4o' }),
     setOpenAIProviderSettings = () => ({ ok: false, error: 'OpenAI settings are unavailable' }),
     refreshOpenAIProviderModels = async () => ({ ok: false, models: [], error: 'OpenAI model discovery is unavailable' }),
+    getClaudeProviderSettings = () => ({ configured: false, enabled: false, model: 'claude-sonnet-5', models: [] }),
+    setClaudeProviderSettings = () => ({ ok: false, error: 'Claude settings are unavailable' }),
+    refreshClaudeProviderModels = async () => ({ ok: false, models: [], error: 'Claude model discovery is unavailable' }),
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -1502,6 +1624,9 @@ export function registerSessionsRoutes(app, deps) {
     sessionWorkerRegistry,
     sessionWorkerProcessInspector,
     resolveSessionStateRoot,
+    resolveClaudeSessionRoot = null,
+    getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
+    setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
     markSharedViewerPresence,
     getSharedWatcherCount,
     statusEventService,
@@ -1586,6 +1711,14 @@ export function registerSessionsRoutes(app, deps) {
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Layer every enabled provider's models onto the base Copilot catalog.
+  function buildModelCatalogWithProviders(modelState, openAISettings = getOpenAIProviderSettings()) {
+    return buildModelCatalogWithClaudeProvider(
+      buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
+      getClaudeProviderSettings(),
+    );
   }
 
   function extractClientIp(req) {
@@ -1849,6 +1982,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
     );
+    const subagentRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -1865,6 +2003,7 @@ export function registerSessionsRoutes(app, deps) {
       transcriptMessages: [],
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
+      subagentRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -1970,6 +2109,11 @@ export function registerSessionsRoutes(app, deps) {
       beforeConversationId,
       beforeUpdatedAt,
     });
+    const activeTurnConversationIds = new Set(
+      (stmts.listConversationIdsWithActiveQueue?.all() || [])
+        .map((row) => String(row?.conversation_id || '').trim())
+        .filter(Boolean),
+    );
     const conversations = page.rows.map((r) => {
       const sid = String(r.sdk_session_id || '').trim();
       const workspaceState = typeof resolveConversationWorkspaceState === 'function'
@@ -1987,6 +2131,7 @@ export function registerSessionsRoutes(app, deps) {
         id:           r.id,
         sdkSessionId: sid || null,
         title:        resolveConversationTitle({ title: r.title, titleSource: r.title_source }),
+        activeTurn:   activeTurnConversationIds.has(String(r.id || '').trim()),
         archived:     Number(r.archived || 0) === 1,
         compactedInto: r.compacted_into || null,
         compactedFrom: r.compacted_from || null,
@@ -2303,69 +2448,80 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  app.get('/api/context/:conversationId', auth, (req, res) => {
-    const conversationId = String(req.params.conversationId || '').trim();
-    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+  /**
+   * Resolve the context payload for a conversation id or sdk_session_id.
+   *
+   * Claude sessions are served from the breakdown their worker reported after
+   * the last turn; tailing Copilot's events.jsonl can only ever fail for them.
+   * Both providers get the same `contextUsage` view so one renderer serves both.
+   */
+  function resolveContextPayload(lookupId) {
     // Prefer canonical sdk_session_id routing when available; keep conversation-id lookup for compatibility.
-    const runtimeSessionBySdkSessionId = stmts.getRuntimeSessionBySdkSessionId.get(conversationId) || null;
+    const runtimeSessionBySdkSessionId = stmts.getRuntimeSessionBySdkSessionId.get(lookupId) || null;
     const runtimeSession = runtimeSessionBySdkSessionId
-      || stmts.getRuntimeSessionByConversation.get(conversationId)
+      || stmts.getRuntimeSessionByConversation.get(lookupId)
       || null;
     const copilotSessionId = String(runtimeSessionBySdkSessionId?.sdk_session_id || runtimeSession?.sdk_session_id || '').trim() || null;
-    const parsed = readContextFromSessionEvents(
-      runtimeSession?.id || null,
-      copilotSessionId || runtimeSession?.runtime_key || runtimeSession?.id || null,
-    );
+    const isClaude = String(runtimeSession?.provider_type || 'github').trim().toLowerCase() === 'claude';
 
-    res.json({
-      conversationId,
+    const parsed = isClaude
+      ? (() => {
+        const stored = readStoredClaudeContextUsage(runtimeSession);
+        return {
+          snapshot: stored.snapshot,
+          contextUsage: stored.contextUsage,
+          eventsPath: null,
+          error: stored.snapshot
+            ? null
+            : 'No context data captured yet for this Claude session; it is recorded when a turn completes.',
+        };
+      })()
+      : {
+        ...readContextFromSessionEvents(
+          runtimeSession?.id || null,
+          copilotSessionId || runtimeSession?.runtime_key || runtimeSession?.id || null,
+        ),
+        contextUsage: null,
+      };
+
+    return {
+      conversationId: lookupId,
       runtimeSessionId: runtimeSession?.id || null,
       copilotSessionId,
+      providerType: isClaude ? 'claude' : 'github',
       snapshot: parsed.snapshot || null,
+      contextUsage: buildContextUsageView({
+        snapshot: parsed.snapshot,
+        contextUsage: parsed.contextUsage,
+      }),
       eventsPath: parsed.eventsPath || null,
       error: parsed.error || null,
       text: buildContextResponseText({
         snapshot: parsed.snapshot,
         runtimeSession,
-        conversationId,
+        conversationId: lookupId,
         eventsPath: parsed.eventsPath,
         error: parsed.error,
       }),
-    });
+    };
+  }
+
+  app.get('/api/context/:conversationId', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    res.json(resolveContextPayload(conversationId));
   });
 
   app.get('/api/context', auth, (req, res) => {
     const explicitConversationId = String(req.query.conversationId || '').trim();
     if (explicitConversationId) {
-      const runtimeSessionBySdkSessionId = stmts.getRuntimeSessionBySdkSessionId.get(explicitConversationId) || null;
-      const runtimeSession = runtimeSessionBySdkSessionId
-        || stmts.getRuntimeSessionByConversation.get(explicitConversationId)
-        || null;
-      const copilotSessionId = String(runtimeSessionBySdkSessionId?.sdk_session_id || runtimeSession?.sdk_session_id || '').trim() || null;
-      const parsed = readContextFromSessionEvents(
-        runtimeSession?.id || null,
-        copilotSessionId || runtimeSession?.runtime_key || runtimeSession?.id || null,
-      );
-      return res.json({
-        conversationId: explicitConversationId,
-        runtimeSessionId: runtimeSession?.id || null,
-        copilotSessionId,
-        snapshot: parsed.snapshot || null,
-        eventsPath: parsed.eventsPath || null,
-        error: parsed.error || null,
-        text: buildContextResponseText({
-          snapshot: parsed.snapshot,
-          runtimeSession,
-          conversationId: explicitConversationId,
-          eventsPath: parsed.eventsPath,
-          error: parsed.error,
-        }),
-      });
+      return res.json(resolveContextPayload(explicitConversationId));
     }
     return res.json({
       conversationId: null,
       runtimeSessionId: null,
       snapshot: null,
+      contextUsage: null,
       eventsPath: null,
       error: 'Missing conversationId query parameter',
       text: 'Context is unavailable until a conversation is selected.',
@@ -2471,12 +2627,6 @@ export function registerSessionsRoutes(app, deps) {
       sdkSessionId,
       conversationId,
     });
-    const sessionRoot = buildConversationSessionRootPayload({
-      conversationId,
-      sdkSessionId: conv.sdk_session_id || conversationId,
-      title: resolvedTitle,
-      resolveSessionStateRoot,
-    });
     const workspaceState = typeof resolveConversationWorkspaceState === 'function'
       ? resolveConversationWorkspaceState({
         conversationId,
@@ -2484,6 +2634,16 @@ export function registerSessionsRoutes(app, deps) {
         discoveredWorkspaceRootPath: '',
       })
       : null;
+    const sessionRoot = buildConversationSessionRootPayload({
+      conversationId,
+      sdkSessionId: conv.sdk_session_id || conversationId,
+      title: resolvedTitle,
+      resolveSessionStateRoot,
+      providerType: runtimeSession?.provider_type || '',
+      claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
+      workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
+      resolveClaudeSessionRoot,
+    });
     const dbMessages = stmts.getMessages.all(conversationId);
     const queueRows = db.prepare(`
       SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
@@ -2505,6 +2665,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
     );
+    const subagentRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conversationId) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -2518,6 +2683,7 @@ export function registerSessionsRoutes(app, deps) {
       transcriptMessages: [],
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
+      subagentRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -2829,12 +2995,6 @@ export function registerSessionsRoutes(app, deps) {
       sdkSessionId,
       conversationId: resolvedConversationId,
     });
-    const sessionRoot = buildConversationSessionRootPayload({
-      conversationId: resolvedConversationId,
-      sdkSessionId: conv.sdk_session_id || resolvedConversationId,
-      title: resolvedTitle,
-      resolveSessionStateRoot,
-    });
     const workspaceState = typeof resolveConversationWorkspaceState === 'function'
       ? resolveConversationWorkspaceState({
         conversationId: resolvedConversationId,
@@ -2842,6 +3002,16 @@ export function registerSessionsRoutes(app, deps) {
         discoveredWorkspaceRootPath: '',
       })
       : null;
+    const sessionRoot = buildConversationSessionRootPayload({
+      conversationId: resolvedConversationId,
+      sdkSessionId: conv.sdk_session_id || resolvedConversationId,
+      title: resolvedTitle,
+      resolveSessionStateRoot,
+      providerType: runtimeSession?.provider_type || '',
+      claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
+      workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
+      resolveClaudeSessionRoot,
+    });
     const dbMessages = stmts.getMessages.all(resolvedConversationId);
     const queueRows = db.prepare(`
       SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
@@ -2863,6 +3033,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
     );
+    const subagentRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -2876,6 +3051,7 @@ export function registerSessionsRoutes(app, deps) {
       transcriptMessages: [],
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
+      subagentRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -3337,7 +3513,7 @@ export function registerSessionsRoutes(app, deps) {
     const title = (requestedTitle || 'New Conversation').slice(0, 80);
     const openAISettings = getOpenAIProviderSettings();
     const requestedProviderType = normalizeRequestedProviderType(req.body?.providerType || req.body?.provider);
-    const modelState = buildModelCatalogWithOpenAIProvider(
+    const modelState = buildModelCatalogWithProviders(
       getModelCatalogState(),
       openAISettings,
     );
@@ -3363,6 +3539,23 @@ export function registerSessionsRoutes(app, deps) {
         code: 'OPENAI_MODEL_UNAVAILABLE',
       });
     }
+    const claudeSettings = getClaudeProviderSettings();
+    const availableClaudeModels = new Set([
+      String(claudeSettings?.model || '').trim(),
+      ...(Array.isArray(claudeSettings?.models) ? claudeSettings.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean));
+    if (
+      requestedProviderType === 'claude'
+      && requestedBootstrapModel
+      && requestedBootstrapModel.toLowerCase() !== 'auto'
+      && !availableClaudeModels.has(requestedBootstrapModel)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: `Claude model "${requestedBootstrapModel}" is not available`,
+        code: 'CLAUDE_MODEL_UNAVAILABLE',
+      });
+    }
     const useOpenAIProvider = requestedProviderType === 'openai'
       || requestedProviderType === 'openai-image'
       || (
@@ -3371,11 +3564,27 @@ export function registerSessionsRoutes(app, deps) {
         && requestedBootstrapModel.toLowerCase() !== 'auto'
         && availableOpenAIModels.has(requestedBootstrapModel)
       );
+    const useClaudeProvider = !useOpenAIProvider && (
+      requestedProviderType === 'claude'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableClaudeModels.has(requestedBootstrapModel)
+      )
+    );
     if (useOpenAIProvider && openAISettings?.configured !== true) {
       return res.status(400).json({
         ok: false,
         error: 'OpenAI API key is not configured',
         code: 'OPENAI_NOT_CONFIGURED',
+      });
+    }
+    if (useClaudeProvider && claudeSettings?.enabled !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Claude provider is not enabled',
+        code: 'CLAUDE_NOT_CONFIGURED',
       });
     }
 
@@ -3385,7 +3594,13 @@ export function registerSessionsRoutes(app, deps) {
           configuredModel: openAISettings.model,
           availableModels: openAISettings.models,
         })
-      : catalogSelectedModel;
+      : (useClaudeProvider
+        ? resolveOpenAISessionModel({
+            requestedModel: catalogSelectedModel,
+            configuredModel: claudeSettings.model,
+            availableModels: claudeSettings.models,
+          })
+        : catalogSelectedModel);
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
       return res.status(400).json({
         ok: false,
@@ -3393,7 +3608,7 @@ export function registerSessionsRoutes(app, deps) {
         code: 'OPENAI_IMAGE_MODEL_REQUIRED',
       });
     }
-    if (!useOpenAIProvider) {
+    if (!useOpenAIProvider && !useClaudeProvider) {
       const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
         ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
         : [];
@@ -3404,6 +3619,15 @@ export function registerSessionsRoutes(app, deps) {
           ok: false,
           error: `Model "${selectedModel}" requires the OpenAI provider`,
           code: 'OPENAI_PROVIDER_REQUIRED',
+        });
+      }
+      const claudeOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'claude');
+      if (claudeOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the Claude provider`,
+          code: 'CLAUDE_PROVIDER_REQUIRED',
         });
       }
     }
@@ -3417,8 +3641,8 @@ export function registerSessionsRoutes(app, deps) {
         conversationId,
         {
           assignConfiguredProvider: true,
-          providerType: useOpenAIProvider ? 'openai' : 'github',
-          providerModel: useOpenAIProvider ? selectedModel : null,
+          providerType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : 'github'),
+          providerModel: (useOpenAIProvider || useClaudeProvider) ? selectedModel : null,
         },
       );
       const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
@@ -3472,7 +3696,7 @@ export function registerSessionsRoutes(app, deps) {
         worker: ownerWorker,
         lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
         selectedModel,
-        selectedProviderType: useOpenAIProvider ? 'openai' : 'github',
+        selectedProviderType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : 'github'),
         warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
         ...workspaceRootPayload(),
       });
@@ -3643,7 +3867,7 @@ export function registerSessionsRoutes(app, deps) {
       baseUrl: String(currentSettings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
       reconciliation,
     };
-    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+    io.emit('models_updated', buildModelCatalogWithProviders(
       getModelCatalogState(),
       currentSettings,
     ));
@@ -3658,6 +3882,103 @@ export function registerSessionsRoutes(app, deps) {
       warning: reconciliationFailures.length
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed')),
+    });
+  });
+
+  app.get('/api/settings/claude', auth, (_req, res) => {
+    const settings = getClaudeProviderSettings();
+    return res.json({
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
+      models: Array.isArray(settings?.models) ? settings.models : [],
+      availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+    });
+  });
+
+  app.post('/api/settings/claude', auth, async (req, res) => {
+    const parsed = parseClaudeSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const previous = getClaudeProviderSettings();
+    const result = setClaudeProviderSettings(parsed);
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update Claude settings' });
+    }
+    const shouldDiscover = result.enabled === true && (
+      previous?.enabled !== true
+      || previous?.model !== result.model
+      || previous?.modelsDiscovered !== true
+    );
+    const discovery = !shouldDiscover
+      ? { ok: true, models: [], error: null }
+      : await refreshClaudeProviderModels();
+    // Disabling Claude rebinds unstarted Claude conversations back to the
+    // default provider (mirrors the OpenAI key-removal reconciliation).
+    const reconciliationResult = parsed.enabled === false
+      ? await reconcileUnstartedConversationProviders({
+          enabled: false,
+          model: result.model,
+          provider: 'claude',
+        })
+      : {
+          updatedUnstartedConversations: 0,
+          skippedStartedConversations: 0,
+          skippedActiveQueueConversations: 0,
+          failedConversations: [],
+        };
+    const reconciliation = {
+      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
+        ? reconciliationResult.failedConversations
+        : [],
+    };
+    const currentSettings = getClaudeProviderSettings();
+    const settingsPayload = {
+      configured: currentSettings?.configured === true,
+      enabled: currentSettings?.enabled === true,
+      model: String(currentSettings?.model || result.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
+      reconciliation,
+    };
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('claude_settings_updated', settingsPayload);
+    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
+      ? reconciliation.failedConversations
+      : [];
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      warning: reconciliationFailures.length
+        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'Claude model discovery failed')),
+    });
+  });
+
+  app.get('/api/settings/turn-ceiling', auth, (_req, res) => {
+    res.json({
+      ceilingMinutes: getTurnCeilingMinutes(),
+      minMinutes: TURN_CEILING_MIN_MINUTES,
+      maxMinutes: TURN_CEILING_MAX_MINUTES,
+      stepMinutes: TURN_CEILING_STEP_MINUTES,
+      defaultMinutes: DEFAULT_TURN_CEILING_MINUTES,
+    });
+  });
+
+  app.post('/api/settings/turn-ceiling', auth, (req, res) => {
+    const parsed = parseTurnCeilingUpdate(req.body?.ceilingMinutes);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setTurnCeilingMinutes(parsed.minutes);
+    if (!result.ok) return res.status(500).json({ error: result.error });
+    return res.json({
+      ceilingMinutes: result.ceilingMinutes,
+      minMinutes: TURN_CEILING_MIN_MINUTES,
+      maxMinutes: TURN_CEILING_MAX_MINUTES,
+      stepMinutes: TURN_CEILING_STEP_MINUTES,
+      defaultMinutes: DEFAULT_TURN_CEILING_MINUTES,
     });
   });
 
@@ -3868,13 +4189,23 @@ export function registerSessionsRoutes(app, deps) {
   function buildModelVariantCatalogPayloadForRoute() {
     const rows = typeof listModelVariantRows === 'function' ? listModelVariantRows() : [];
     const modelState = getModelCatalogState();
-    return buildModelVariantCatalogPayload({
-      rows,
-      modelState,
-      reasoningEfforts: modelState.reasoningEfforts || [],
-      contextLimitsByModel: modelState.contextLimitsByModel || {},
-      modelMetadataByModel: modelState.modelMetadataByModel || {},
-    });
+    const claudeSettings = getClaudeProviderSettings();
+    return {
+      ...buildModelVariantCatalogPayload({
+        rows,
+        modelState,
+        reasoningEfforts: modelState.reasoningEfforts || [],
+        contextLimitsByModel: modelState.contextLimitsByModel || {},
+        modelMetadataByModel: modelState.modelMetadataByModel || {},
+      }),
+      claudeModels: claudeSettings?.enabled === true
+        ? {
+            defaultModel: claudeSettings.model,
+            availableModels: Array.isArray(claudeSettings.availableModels) ? claudeSettings.availableModels : [],
+            enabledModels: Array.isArray(claudeSettings.models) ? claudeSettings.models : [],
+          }
+        : null,
+    };
   }
 
   app.get('/api/model-variants', auth, (req, res) => {
@@ -3889,13 +4220,17 @@ export function registerSessionsRoutes(app, deps) {
     }
     try {
       const openAISettings = getOpenAIProviderSettings();
+      const claudeSettings = getClaudeProviderSettings();
       const refreshTasks = [
         refreshModelVariantCatalogFromCli(),
         openAISettings?.enabled === true
           ? refreshOpenAIProviderModels()
           : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        claudeSettings?.enabled === true
+          ? refreshClaudeProviderModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
       ];
-      const [cliRefresh, openAIRefresh] = await Promise.allSettled(refreshTasks);
+      const [cliRefresh, openAIRefresh, claudeRefresh] = await Promise.allSettled(refreshTasks);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
       const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
         ? openAIRefresh.value
@@ -3904,14 +4239,21 @@ export function registerSessionsRoutes(app, deps) {
             models: Array.isArray(openAISettings?.models) ? openAISettings.models : [],
             error: openAIRefresh.reason?.message || 'OpenAI model discovery failed',
           };
-      io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+      const claudeModelDiscovery = claudeRefresh.status === 'fulfilled'
+        ? claudeRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(claudeSettings?.models) ? claudeSettings.models : [],
+            error: claudeRefresh.reason?.message || 'Claude model discovery failed',
+          };
+      io.emit('models_updated', buildModelCatalogWithProviders(
         getModelCatalogState(),
-        getOpenAIProviderSettings(),
       ));
       return res.json({
         ok: true,
         ...buildModelVariantCatalogPayloadForRoute(),
         openAIModelDiscovery,
+        claudeModelDiscovery,
       });
     } catch (error) {
       return res.status(500).json({
@@ -3930,9 +4272,8 @@ export function registerSessionsRoutes(app, deps) {
       ? req.body.enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
       : [];
     setEnabledModelVariants(enabledVariantIds);
-    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+    io.emit('models_updated', buildModelCatalogWithProviders(
       getModelCatalogState(),
-      getOpenAIProviderSettings(),
     ));
     return res.json({
       ok: true,
@@ -3942,9 +4283,8 @@ export function registerSessionsRoutes(app, deps) {
 
   app.get('/api/models', auth, (req, res) => {
     ensureSessionId(req, res);
-    const modelState = buildModelCatalogWithOpenAIProvider(
+    const modelState = buildModelCatalogWithProviders(
       getModelCatalogState(),
-      getOpenAIProviderSettings(),
     );
     res.json({
       models: modelState.models,
@@ -3978,9 +4318,8 @@ export function registerSessionsRoutes(app, deps) {
       source: source || 'relay-extension',
       error,
     });
-    io.emit('models_updated', buildModelCatalogWithOpenAIProvider(
+    io.emit('models_updated', buildModelCatalogWithProviders(
       getModelCatalogState(),
-      getOpenAIProviderSettings(),
     ));
     res.json({
       ok: true,

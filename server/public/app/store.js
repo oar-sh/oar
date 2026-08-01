@@ -1,4 +1,5 @@
 import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
+import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -105,13 +106,16 @@ export let filePreviewState = {
     autoplay: false,
   },
 };
+// Toolbar filters are sticky per browser (all default off); the toggles in
+// attachments-view.js are the only writers.
+const repoBrowserPreferences = readRepoBrowserPreferences();
 export let repoBrowserState = {
   open: false,
   loading: false,
   activeRoot: 'workspace',
-  workspaceIncludeHidden: false,
-  workspaceIncludeHeavy: false,
-  drivesIncludeHidden: false,
+  workspaceIncludeHidden: repoBrowserPreferences.workspaceIncludeHidden,
+  workspaceIncludeHeavy: repoBrowserPreferences.workspaceIncludeHeavy,
+  drivesIncludeHidden: repoBrowserPreferences.drivesIncludeHidden,
   viewMode: 'list',
   rootName: 'repo',
   sessionRootPath: '',
@@ -127,8 +131,6 @@ export let repoBrowserState = {
   loadingPath: '',
   error: '',
 };
-export let contextUsageRefreshTimer = null;
-export let contextUsageRefreshSeq = 0;
 export let contextIndicatorMode = 'bar';
 export let compactInFlight = false;
 export let deferredInstallPrompt = null;
@@ -480,6 +482,11 @@ export function clampContextUsageRatio(value) {
 }
 
 export function readContextUsageRatio(payload) {
+  // The unified view payload is authoritative and already clamped; it is the
+  // only source Claude sessions have. Snapshot fields stay as the fallback.
+  const usagePct = Number(payload?.contextUsage?.percentage);
+  if (Number.isFinite(usagePct)) return clampContextUsageRatio(usagePct / 100);
+
   const snapshot = payload?.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : null;
   if (!snapshot) return null;
   const usedPct = Number(snapshot.used_percent);
@@ -1294,6 +1301,9 @@ export function upsertSubagentRun(payload) {
     updatedAt: payload?.timestamp || now,
     activities: existing?.activities || [],
     thoughts: existing?.thoughts || [],
+    // Cumulative streamed text for this run, replayed when its bubble is
+    // (re)built — bubbles can appear after the first stream frame arrives.
+    streamText: existing?.streamText || '',
   };
 
   subagentRuns.set(subagentRunId, entry);
@@ -1369,6 +1379,13 @@ export function addSubagentThought(subagentRunId, thoughtPayload) {
     done: !!thoughtPayload?.done,
     timestamp: thoughtPayload?.timestamp || new Date().toISOString(),
   });
+  return true;
+}
+
+export function setSubagentStreamText(subagentRunId, streamText) {
+  const entry = getSubagentRun(subagentRunId);
+  if (!entry) return false;
+  entry.streamText = String(streamText || '');
   return true;
 }
 

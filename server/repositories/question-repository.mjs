@@ -68,6 +68,18 @@ export function createQuestionRepository(db) {
           WHERE queue_message_id = ?
           ORDER BY started_at ASC, id ASC
         `),
+        listSubagentRunsByResponse: db.prepare(`
+          SELECT sr.id, sr.queue_message_id, sr.conversation_id, sr.parent_subagent_id, sr.display_name, sr.status, sr.started_at, sr.updated_at, sr.completed_at
+          FROM subagent_runs sr
+          WHERE sr.queue_message_id IN (
+            SELECT id FROM queue WHERE response_message_id = ?
+            UNION
+            SELECT DISTINCT queue_message_id FROM relay_activity WHERE response_message_id = ? AND queue_message_id IS NOT NULL
+            UNION
+            SELECT DISTINCT queue_message_id FROM relay_thought WHERE response_message_id = ? AND queue_message_id IS NOT NULL
+          )
+          ORDER BY sr.started_at ASC, sr.id ASC
+        `),
         deleteConvSubagentRuns: db.prepare(`DELETE FROM subagent_runs WHERE conversation_id = ?`),
 
         // relay boards

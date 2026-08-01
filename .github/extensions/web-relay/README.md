@@ -2,6 +2,10 @@
 
 The Copilot CLI extension that bridges local CLI sessions with the web relay server. This extension runs as a background agent in the CLI, polls the relay for pending turns, executes them, and streams activity back to the browser UI.
 
+> Scope: this extension serves the **GitHub Copilot** and **OpenAI (BYOK)** providers. Claude
+> conversations do not go through it — they run `server/claude-worker/claude-session-worker.mjs`,
+> a standalone Node worker that implements the same relay contracts. See `server/README.md`.
+
 ## Architecture Overview
 
 ```
@@ -65,6 +69,14 @@ The Copilot CLI extension that bridges local CLI sessions with the web relay ser
 - `store_memory` activity includes the available `subject`, `fact`, `citations`, `reason`, and `scope` metadata with preserved field content and line breaks
 - `vote_memory` activity includes the available `fact`, `direction`, `reason`, and `scope` metadata with preserved field content and line breaks
 - Activity is persisted by the relay and is therefore available to authorized shared viewers and replayed history
+
+### Subagent attribution
+
+The SDK `agentId` on a request is propagated as `subagentRunId` on question activity, tool-result
+activity, and `report_intent` thoughts. Without it, work done by a subagent would be rendered in the
+parent turn's bubble instead of the subagent's own. `skills/subagent-lifecycle.mjs` also preserves an
+already-known run's parent and display name when the run is re-discovered (for example on its next
+tool call), so a nested subagent is never demoted to a root or renamed mid-turn.
 
 ### Reasoning Stream (`skills/reasoning-stream.mjs`)
 
@@ -140,9 +152,10 @@ Test files located in:
 - `runtime/worker-websocket-link.test.mjs` — WebSocket bridge tests
 - `skills/*.test.mjs` — Skill handler tests
 
-Run tests with:
+Run them with the Node test runner (there is no `npm test` script). Match `*.test.mjs` explicitly —
+pointing the runner at a directory makes it try to execute the implementation modules too:
 ```bash
-npm test
+node --test .github/extensions/web-relay/skills/*.test.mjs
 ```
 
 ## Troubleshooting

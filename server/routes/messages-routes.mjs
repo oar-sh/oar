@@ -962,6 +962,7 @@ export function buildDequeuedRelayMessage({
     modelVariantId: String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
     providerType: String(runtimeSession?.provider_type || '').trim().toLowerCase() || null,
     providerModel: String(runtimeSession?.provider_model || '').trim() || null,
+    claudeNativeSessionId: String(runtimeSession?.claude_native_session_id || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
     quality: normalizeOpenAIImageQuality(msg.reasoning_effort),
@@ -1499,6 +1500,7 @@ export function registerMessagesRoutes(app, deps) {
     resolveRequestedModel,
     resolveRequestedReasoningEffort = () => ({ ok: false, error: 'Reasoning metadata unavailable', supported: [] }),
     getOpenAIProviderSettings = () => ({ enabled: false, model: '' }),
+    getClaudeProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
@@ -3597,6 +3599,23 @@ export function registerMessagesRoutes(app, deps) {
             ? requestedOpenAIModel
             : configuredOpenAIModel
         );
+    // Claude conversations resolve models against the Claude provider
+    // catalog (the Copilot catalog does not know these ids). Per-turn model
+    // switching is allowed: each Claude turn is a fresh query() with resume.
+    const runtimeUsesClaude = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase() === 'claude';
+    const configuredClaude = runtimeUsesClaude ? getClaudeProviderSettings() : null;
+    const requestedClaudeModel = runtimeUsesClaude ? String(model || '').trim() : '';
+    const availableClaudeModels = new Set([
+      String(configuredClaude?.model || '').trim(),
+      String(existingRuntimeSession?.provider_model || '').trim(),
+      ...(Array.isArray(configuredClaude?.availableModels) ? configuredClaude.availableModels : []),
+      ...(Array.isArray(configuredClaude?.models) ? configuredClaude.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean));
+    const claudeModel = runtimeUsesClaude
+      ? (availableClaudeModels.has(requestedClaudeModel)
+          ? requestedClaudeModel
+          : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredClaude?.model || '').trim()))
+      : '';
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -3605,7 +3624,15 @@ export function registerMessagesRoutes(app, deps) {
           reasoningEffort: null,
           error: openAIModel ? null : 'OpenAI model is not configured',
         }
-      : resolveRequestedModel(model);
+      : (runtimeUsesClaude
+        ? {
+            ok: !!claudeModel,
+            model: claudeModel,
+            modelVariantId: claudeModel,
+            reasoningEffort: null,
+            error: claudeModel ? null : 'Claude model is not configured',
+          }
+        : resolveRequestedModel(model));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -3630,12 +3657,25 @@ export function registerMessagesRoutes(app, deps) {
         code: 'IMAGE_TARGET_REQUIRES_IMAGE_MODEL',
       });
     }
+    // Claude conversations validate effort against the Claude provider's
+    // per-model levels ('none' = SDK default). Effort is per-turn: each Claude
+    // turn is a fresh query(), so it can change between messages.
+    const resolveClaudeReasoningEffort = () => {
+      const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
+      const supported = Array.isArray(configuredClaude?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
+        ? configuredClaude.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
+        : ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+      const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
+      return { ok: true, effort: effort === 'none' ? 'none' : effort, supported };
+    };
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
-      : resolveRequestedReasoningEffort(
-          requestedModel,
-          explicitReasoningEffort || modelResolution.reasoningEffort || null,
-        );
+      : (runtimeUsesClaude
+        ? resolveClaudeReasoningEffort()
+        : resolveRequestedReasoningEffort(
+            requestedModel,
+            explicitReasoningEffort || modelResolution.reasoningEffort || null,
+          ));
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
@@ -4043,6 +4083,72 @@ export function registerMessagesRoutes(app, deps) {
     relayBridgeOwnerService?.observe?.(requester);
     const { pendingCount } = queueCounts();
     res.json({ ok: true, pendingCount });
+  });
+
+  // POST /api/claude-native-session — Claude worker persists the native Agent
+  // SDK session id so later turns can resume it across worker restarts.
+  app.post('/api/claude-native-session', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const claudeNativeSessionId = String(req.body?.claudeNativeSessionId || '').trim();
+    if (!conversationId || !claudeNativeSessionId) {
+      return res.status(400).json({ error: 'Missing conversationId or claudeNativeSessionId' });
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'claude') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionClaudeNativeSessionId?.run !== 'function') {
+      return res.status(500).json({ error: 'Claude native session storage is unavailable' });
+    }
+    stmts.updateRuntimeSessionClaudeNativeSessionId.run(
+      claudeNativeSessionId,
+      new Date().toISOString(),
+      conversationId,
+    );
+    res.json({ ok: true });
+  });
+
+  // POST /api/claude-context-usage — Claude worker reports the session's
+  // context-window breakdown after a turn. Claude sessions have no Copilot
+  // events.jsonl to tail, so this is what feeds the composer indicator and the
+  // context-usage modal for them.
+  app.post('/api/claude-context-usage', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+
+    const contextUsage = req.body?.contextUsage && typeof req.body.contextUsage === 'object'
+      ? req.body.contextUsage
+      : null;
+    const modelUsage = req.body?.modelUsage && typeof req.body.modelUsage === 'object'
+      ? req.body.modelUsage
+      : null;
+    if (!contextUsage && !modelUsage) {
+      return res.status(400).json({ error: 'Missing contextUsage or modelUsage' });
+    }
+
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'claude') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
+      return res.status(500).json({ error: 'Context usage storage is unavailable' });
+    }
+
+    const payload = JSON.stringify({
+      model: String(req.body?.model || '').trim() || null,
+      contextUsage,
+      modelUsage,
+    });
+    stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
+    res.json({ ok: true });
   });
 
   // GET /api/pending — CLI fetches next pending message
@@ -5242,7 +5348,13 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
     let usageSnapshot = null;
-    if (typeof fetchUsageSummary === 'function' && stmts.upsertMessageUsageSnapshot) {
+    // `fetchUsageSummary` reads GitHub Copilot plan quota. Running it for a
+    // Claude or OpenAI turn costs a pointless round-trip and renders Copilot
+    // premium-request numbers under a reply that never touched Copilot.
+    const responseProviderType = String(
+      stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type || 'github',
+    ).trim().toLowerCase();
+    if (responseProviderType === 'github' && typeof fetchUsageSummary === 'function' && stmts.upsertMessageUsageSnapshot) {
       const previousUsageRow = stmts.getLatestMessageUsageSnapshotByConversation?.get(targetConversationId) || null;
       const previousUsageSnapshot = usageSnapshotFromRow(previousUsageRow);
       try {
