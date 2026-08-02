@@ -44,12 +44,14 @@ test('both the configured root and the home root are probed, deduped', () => {
   const roots = resolveClaudeProjectsRoots({
     env: { CLAUDE_CONFIG_DIR: '/custom/claude' },
     homedir: () => '/home/dev',
+    path: path.posix,
   });
   assert.deepEqual(roots, ['/custom/claude/projects', '/home/dev/.claude/projects']);
 
   const deduped = resolveClaudeProjectsRoots({
     env: { CLAUDE_CONFIG_DIR: '/home/dev/.claude' },
     homedir: () => '/home/dev',
+    path: path.posix,
   });
   assert.deepEqual(deduped, ['/home/dev/.claude/projects']);
 });

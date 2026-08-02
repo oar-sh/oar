@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 test('normal relay client retains its existing CLI tool defaults', () => {
-  const relaySource = fs.readFileSync(new URL('./relay.mjs', import.meta.url), 'utf8');
+  // Normalize CRLF so the section-divider anchors below match on Windows checkouts.
+  const relaySource = fs.readFileSync(new URL('./relay.mjs', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const optionsBuilder = relaySource.match(
     /export function buildCopilotClientOptions\([\s\S]*?\n}\n\n\/\/ ─── Client Init/,
   )?.[0] || '';

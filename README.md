@@ -163,6 +163,7 @@ Do not run extension-managed relay transport together with standalone relay runt
 Do not restart the web relay unless the user has explicitly given permission.
 If a manual restart is requested, use `POST /api/relay/shutdown` only.
 Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
+Unit tests (`npm test`) and e2e tests (`npm run test:e2e`) are isolated from a live relay and may run beside it; see `DEVELOPING.md` → Tests.
 
 In extension-managed mode, the worker WebSocket begins after the CLI session becomes active (typically after the first prompt), with HTTP dequeue kept only as fallback when the socket is unavailable.
 The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.

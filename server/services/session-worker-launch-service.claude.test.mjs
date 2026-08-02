@@ -1,5 +1,6 @@
 'use strict';
 
+import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -37,11 +38,11 @@ test('resolveClaudeWorkerScriptPath prefers explicit path, then repo root, then 
   );
   assert.equal(
     resolveClaudeWorkerScriptPath({ COPILOT_WEB_RELAY_ROOT: '/repo' }),
-    '/repo/server/claude-worker/claude-session-worker.mjs',
+    path.join('/repo', 'server', 'claude-worker', 'claude-session-worker.mjs'),
   );
   assert.equal(
     resolveClaudeWorkerScriptPath({ COPILOT_WEB_RELAY_SERVER_DIR: '/repo/server' }),
-    '/repo/server/claude-worker/claude-session-worker.mjs',
+    path.join('/repo/server', 'claude-worker', 'claude-session-worker.mjs'),
   );
 });
 
@@ -53,7 +54,9 @@ test('tmux shell command for claude workers runs node without the script PTY wra
     COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
   };
   const command = buildTmuxWorkerShellCommand('session-1', env);
-  assert.match(command, /exec 'node' '\/repo\/server\/claude-worker\/claude-session-worker\.mjs' --session-id 'session-1'$/);
+  const workerScript = path.join('/repo', 'server', 'claude-worker', 'claude-session-worker.mjs')
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  assert.match(command, new RegExp(`exec 'node' '${workerScript}' --session-id 'session-1'$`));
   assert.doesNotMatch(command, /script -q/);
   assert.match(command, /export COPILOT_WEB_RELAY_WORKER_KIND='claude';/);
   assert.match(command, /export CLAUDE_RELAY_MODEL='claude-sonnet-5';/);
@@ -93,7 +96,7 @@ test('launchSessionCli spawns node for claude workers when tmux is unavailable',
   assert.equal(spawnCalls.length, 1);
   assert.equal(spawnCalls[0].command, 'node');
   assert.deepEqual(spawnCalls[0].args, [
-    '/repo/server/claude-worker/claude-session-worker.mjs',
+    path.join('/repo', 'server', 'claude-worker', 'claude-session-worker.mjs'),
     '--session-id',
     'session-3',
   ]);

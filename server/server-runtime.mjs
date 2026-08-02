@@ -110,10 +110,14 @@ const ttyConsoleRuntime = await maybeStartTtyConsole({
 const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
   ? path.resolve(String(process.env.COPILOT_WEB_RELAY_CONFIG))
   : path.join(__dirname, 'config.json');
-const DATA_DIR       = path.join(__dirname, 'data');
+const DATA_DIR       = process.env.COPILOT_WEB_RELAY_DATA_DIR
+  ? path.resolve(String(process.env.COPILOT_WEB_RELAY_DATA_DIR))
+  : path.join(__dirname, 'data');
 const DB_PATH        = path.join(DATA_DIR, 'copilot.db');
 const RELAY_LOCK_PATH = path.join(DATA_DIR, 'relay-server.lock');
-const UPLOAD_DIR     = path.join(__dirname, 'uploads');
+const UPLOAD_DIR     = process.env.COPILOT_WEB_RELAY_DATA_DIR
+  ? path.join(DATA_DIR, 'uploads')
+  : path.join(__dirname, 'uploads');
 const INITIAL_WORKSPACE_ROOT = resolveStartupWorkspaceRoot(__dirname);
 const WORKSPACE_ROOT_LOCKED = true;
 const SESSION_COOKIE = 'copilot_session';

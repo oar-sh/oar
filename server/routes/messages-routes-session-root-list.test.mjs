@@ -5,47 +5,73 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { registerMessagesRoutes } from './messages-routes.mjs';
+import {
+  driveRootFromAbsolutePath,
+  normalizeDriveAbsolutePath,
+  normalizeLinuxAbsolutePath,
+  toDriveWebPath,
+} from '../services/drives-path-helpers.mjs';
 
 const NATIVE_ID = '11111111-2222-4333-8444-555555555555';
+const IS_WINDOWS = process.platform === 'win32';
+
+// The route serves web paths (C:/…) on Windows and native paths elsewhere.
+function nodePathFor(absolutePath) {
+  return IS_WINDOWS ? toDriveWebPath(absolutePath) : absolutePath;
+}
 
 // Stand-ins for the helpers server-runtime.mjs injects. server-runtime boots a
-// server on import, so the posix behaviour they contribute is reproduced here
-// rather than imported.
+// server on import, so their behaviour is reproduced here rather than imported.
+// The route branches on process.platform, so the deps cover both branches: the
+// real path helpers plus fs-backed directory listers over the temp fixtures.
+function fetchDirectoryEntries(joinImpl, dirPath, { includeHidden = false } = {}, cb) {
+  let names = [];
+  try {
+    names = fs.readdirSync(dirPath);
+  } catch (error) {
+    return cb(error);
+  }
+  const entries = names
+    .filter((name) => includeHidden || !name.startsWith('.'))
+    .map((name) => {
+      const fullPath = joinImpl(dirPath, name);
+      const stat = fs.statSync(fullPath);
+      return {
+        name,
+        fullPath,
+        type: stat.isDirectory() ? 'dir' : 'file',
+        size: stat.isDirectory() ? null : stat.size,
+        mtime: stat.mtime.toISOString(),
+      };
+    })
+    .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : (a.type === 'dir' ? -1 : 1)));
+  return cb(null, entries);
+}
+
 const routeDeps = {
   auth: (_req, _res, next) => next(),
   db: { prepare: () => ({ run() {}, get: () => null, all: () => [] }) },
+  MAX_UPLOAD_BYTES: 1024 * 1024,
   parseBooleanQueryFlag: (value, fallback) => {
     if (value === '1' || value === 'true') return true;
     if (value === '0' || value === 'false') return false;
     return fallback;
   },
-  normalizeLinuxAbsolutePath: (value) => {
-    const text = String(value || '').trim();
-    return text.startsWith('/') ? path.posix.normalize(text) : '';
+  normalizeLinuxAbsolutePath,
+  normalizeDriveAbsolutePath,
+  driveRootFromAbsolutePath,
+  toDriveWebPath,
+  fetchBrowsableDrives: (cb) => cb(null, [{ rootAbsolute: driveRootFromAbsolutePath(os.tmpdir()) }]),
+  fetchDriveDirectoryEntries: (dirPath, options, cb) => fetchDirectoryEntries(path.win32.join, dirPath, options, cb),
+  mapDriveDirectoryEntry: (entry) => {
+    const absolutePath = normalizeDriveAbsolutePath(entry?.fullPath);
+    const webPath = toDriveWebPath(absolutePath);
+    if (!webPath) return null;
+    return entry.type === 'dir'
+      ? { path: webPath, name: entry.name, type: 'dir', children: [], lazy: true, childrenLoaded: false }
+      : { path: webPath, name: entry.name, type: 'file', size: entry.size, previewKind: 'code' };
   },
-  fetchLinuxDirectoryEntries: (dirPath, { includeHidden = false } = {}, cb) => {
-    let names = [];
-    try {
-      names = fs.readdirSync(dirPath);
-    } catch (error) {
-      return cb(error);
-    }
-    const entries = names
-      .filter((name) => includeHidden || !name.startsWith('.'))
-      .map((name) => {
-        const fullPath = path.posix.join(dirPath, name);
-        const stat = fs.statSync(fullPath);
-        return {
-          name,
-          fullPath,
-          type: stat.isDirectory() ? 'dir' : 'file',
-          size: stat.isDirectory() ? null : stat.size,
-          mtime: stat.mtime.toISOString(),
-        };
-      })
-      .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : (a.type === 'dir' ? -1 : 1)));
-    return cb(null, entries);
-  },
+  fetchLinuxDirectoryEntries: (dirPath, options, cb) => fetchDirectoryEntries(path.posix.join, dirPath, options, cb),
   mapLinuxDirectoryEntry: (entry) => (entry?.type === 'dir'
     ? { path: entry.fullPath, name: entry.name, type: 'dir', children: [], lazy: true, childrenLoaded: false }
     : { path: entry.fullPath, name: entry.name, type: 'file', size: entry.size, previewKind: 'code' }),
@@ -88,7 +114,7 @@ test('a session root that does not exist yet lists as an empty folder, not a 404
   assert.equal(status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.exists, false);
-  assert.equal(body.node.path, sessionRootPath);
+  assert.equal(body.node.path, nodePathFor(sessionRootPath));
   assert.equal(body.node.name, NATIVE_ID);
   assert.equal(body.node.type, 'dir');
   assert.equal(body.node.childrenLoaded, true);
@@ -102,7 +128,7 @@ test('the sibling transcript is listed as a child of the session root', () => {
 
   const { body } = listSessionRoot(sessionRootPath);
   assert.equal(body.exists, false);
-  assert.deepEqual(body.node.children.map((child) => child.path), [transcriptPath]);
+  assert.deepEqual(body.node.children.map((child) => child.path), [nodePathFor(transcriptPath)]);
   assert.equal(body.node.children[0].type, 'file');
 });
 

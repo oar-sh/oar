@@ -312,6 +312,12 @@ export async function launchSessionCli({
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
 
+  // Kill switch for test/e2e servers: a relay started with this env var must
+  // never spawn real session workers (Copilot CLI clients or Claude workers).
+  if (String(env?.COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN || '').trim()) {
+    throw new Error('cli-spawn-disabled');
+  }
+
   if (allowProcessReuse) {
     const liveProcess = typeof processInspector?.findProcessForSession === 'function'
       ? processInspector.findProcessForSession(target)

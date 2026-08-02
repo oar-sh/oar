@@ -1,3 +1,4 @@
+import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -120,7 +121,7 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
       fsImpl,
       tempRoot: '/tmp',
     });
-    assert.equal(secret.filePath, '/tmp/copilot-relay-worker-test/provider.env');
+    assert.equal(secret.filePath, path.join('/tmp/copilot-relay-worker-test', 'provider.env'));
     assert.deepEqual(calls[1], ['chmod', '/tmp/copilot-relay-worker-test', 0o700]);
     assert.deepEqual(calls[2][3], { encoding: 'utf8', mode: 0o600 });
     assert.match(calls[2][2], /^export COPILOT_PROVIDER_API_KEY='sk-secret-'/);
