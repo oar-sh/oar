@@ -983,6 +983,7 @@ call `/api/usage` directly.
 | `sshTunnel.remotePort` | — | Port opened on the VPS |
 | `sshTunnel.identityFile` | *(optional)* | SSH private key path (`~` expanded); uses ssh-agent if omitted |
 | `sshTunnel.autoReclaimPort` | `true` | When remote bind fails, run a remote reclaim step before retrying |
+| `sshTunnel.reclaimStaleSshSessions` | `false` | Also kill your own childless `@notty` SSH sessions when the port stays held (see caveat below) |
 | `sshTunnel.remoteCleanupCommand` | *(optional)* | Override reclaim command (`ssh user@host <command>`) for custom VPS cleanup |
 
 ### SDK auto-detection behavior
@@ -1019,10 +1020,24 @@ exponential backoff (5 s → 10 s → 20 s → 40 s → 60 s cap, no retry limit
 The counter resets after a connection is stable for >30 s.
 
 **Remote stale-forward reclaim** — on `remote port forwarding failed for listen port`,
-the relay runs a one-shot remote cleanup over SSH (default: kill listeners
-for that remote port via `lsof`/`fuser` when available) and retries quickly on the same
+the relay runs a one-shot remote cleanup over SSH and retries quickly on the same
 fixed port. Set `sshTunnel.autoReclaimPort` to `false` to disable, or provide
 `sshTunnel.remoteCleanupCommand` for your own server-specific cleanup command.
+
+The reclaim reads the port state from `ss` / `/proc/net/tcp` rather than trusting
+`lsof`. This matters: when the port is held by a stale `ssh -R` forward, the owning
+`sshd` session has dropped privileges, so `/proc/<pid>/fd` is root-owned and both
+`lsof` and `fuser` report nothing even though the socket belongs to your own uid.
+The cleanup exits non-zero while the port is still bound, so a port that cannot be
+freed falls back to exponential backoff instead of respawning `ssh` every second.
+
+Killing such a forward requires killing the `sshd` session that owns it. That is
+off by default because the session cannot be identified precisely without root.
+Enabling `sshTunnel.reclaimStaleSshSessions` sweeps your own `sshd` sessions that
+have no child processes — the shape `ssh -N -R` leaves behind. Interactive shells,
+IDE remote servers (VS Code / Cursor) and the reclaim command itself all have
+children and are skipped, but any *other* `-N` forward you rely on for a different
+port would also be killed, so leave it off unless the relay owns the account.
 
 **Caddy VPS config:**
 
