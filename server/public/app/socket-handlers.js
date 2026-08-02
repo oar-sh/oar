@@ -41,6 +41,8 @@ import {
   removeThinking,
   collapseThinkingThoughts,
   renderThinkingActivities,
+  renderThinkingThoughts,
+  renderRestoredSubagentBubbles,
   appendThinkingActivity,
   appendThinkingThought,
   applyRelayStreamEvent,
@@ -83,6 +85,7 @@ let deps = null;
  * @property {() => void} syncChatTitleControls
  * @property {(conversationId: string, payload?: object) => void} applyConversationPreferencesForConversation
  * @property {(payload?: object) => void} applyOpenAISettingsState
+ * @property {(payload?: object) => void} applyClaudeSettingsState
  */
 
 /**
@@ -192,6 +195,14 @@ export async function connectSocket(overrideDeps) {
         .catch(() => {});
     }
   });
+  socket.on('claude_settings_updated', (payload) => {
+    deps?.applyClaudeSettingsState?.(payload || {});
+    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
+      void Promise.resolve()
+        .then(() => deps?.refreshCurrentView?.())
+        .catch(() => {});
+    }
+  });
   socket.on('shared_access', (event) => {
     publishStatusEvent(event);
   });
@@ -294,8 +305,11 @@ export async function connectSocket(overrideDeps) {
       appendThinkingActivity(entry.text, entry.subagentRunId, autoScroll);
     }
   });
-  socket.on('relay_stream', ({ conversationId, messageId, text, done, seq }) => {
+  socket.on('relay_stream', ({ conversationId, messageId, text, done, seq, subagentRunId }) => {
     if (!messageId) return;
+    if (subagentRunId) {
+      upsertSubagentRun({ subagentRunId: String(subagentRunId).trim(), messageId, conversationId });
+    }
     if (conversationId !== currentConvId) return;
     const autoScroll = isMessagesAtBottom();
     applyRelayStreamEvent({
@@ -303,6 +317,7 @@ export async function connectSocket(overrideDeps) {
       text: String(text || ''),
       done: !!done,
       seq,
+      subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
       autoScroll,
     });
   });
@@ -350,21 +365,21 @@ export async function connectSocket(overrideDeps) {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModelsByMode, preferredReasoningByMode, senderClientId }) => {
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, senderClientId }) => {
     if (senderClientId && senderClientId === CLIENT_ID) return;
     const id = String(conversationId || '').trim();
     if (!id || !conversations[id]) return;
     conversations[id] = {
       ...conversations[id],
       preferredRelayMode: preferredRelayMode || conversations[id].preferredRelayMode || FALLBACK_MODE,
-      preferredModelsByMode: preferredModelsByMode || conversations[id].preferredModelsByMode || {},
-      preferredReasoningByMode: preferredReasoningByMode || conversations[id].preferredReasoningByMode || {},
+      preferredModel: preferredModel || conversations[id].preferredModel || '',
+      preferredReasoningEffort: preferredReasoningEffort || conversations[id].preferredReasoningEffort || '',
     };
     if (String(currentConvId || '').trim() === id) {
       applyConversationPreferencesForConversation(id, {
         preferredRelayMode,
-        preferredModelsByMode,
-        preferredReasoningByMode,
+        preferredModel,
+        preferredReasoningEffort,
       });
     }
   });
@@ -414,6 +429,8 @@ export async function connectSocket(overrideDeps) {
       const autoScroll = isMessagesAtBottom();
       showThinking(messageId || null, autoScroll);
       renderThinkingActivities();
+      renderThinkingThoughts();
+      if (messageId) renderRestoredSubagentBubbles(messageId);
       if (messageId) removeUserBubbleCancelButton(messageId);
     }
     if (clearsProcessingStatus) {

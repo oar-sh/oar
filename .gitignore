@@ -8,7 +8,8 @@ server/uploads/*
 !server/uploads/README.md
 !server/uploads/image_input.md
 test-results/
-tests/
+playwright-report/
 tests/agents/
+*.local.md
 server.log
 server/config.json~

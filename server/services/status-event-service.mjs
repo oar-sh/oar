@@ -82,11 +82,13 @@ export function createStatusEventService(db, {
   function recordSharedAccess({
     shareToken,
     viewerIp,
+    conversationId,
     timestamp = Date.now(),
   } = {}) {
     const now = normalizeTimestamp(timestamp);
     const token = String(shareToken || '').trim();
     const ip = String(viewerIp || '').trim() || 'unknown';
+    const normalizedConversationId = String(conversationId || '').trim();
     const dedupeKey = `${token}:${ip}`;
     const previousSeenAt = sharedAccessDedupe.get(dedupeKey);
     sharedAccessDedupe.set(dedupeKey, now);
@@ -102,6 +104,8 @@ export function createStatusEventService(db, {
       source: 'server',
       details: {
         shareId: shareIdentifier(token),
+        viewerIp: ip,
+        conversationId: normalizedConversationId || undefined,
       },
     };
     const persist = db.transaction(() => {

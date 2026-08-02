@@ -54,6 +54,32 @@ test('ensureWorker can force a fresh process launch', async () => {
   assert.deepEqual(spawnOptions, [{ allowProcessReuse: false }]);
 });
 
+test('two concurrent ensureWorker calls spawn only once', async () => {
+  // The CWD relaunch route relies on this dedupe: a duplicated request must not
+  // produce a second process for the same session.
+  const registry = createSessionWorkerRegistry();
+  let spawnCalls = 0;
+  let releaseSpawn;
+  const spawnGate = new Promise((resolve) => { releaseSpawn = resolve; });
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    spawnWorker: async () => {
+      spawnCalls += 1;
+      await spawnGate;
+      return { workerId: 'worker-dedupe', pid: 5150 };
+    },
+  });
+
+  const first = supervisor.ensureWorker('dedupe-session');
+  const second = supervisor.ensureWorker('dedupe-session');
+  releaseSpawn();
+  const [a, b] = await Promise.all([first, second]);
+
+  assert.equal(spawnCalls, 1);
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+});
+
 test('supervisor marks stale pid when known launched pid is dead and work is pending', async () => {
   const registry = createSessionWorkerRegistry();
   const supervisor = createSessionWorkerSupervisor({

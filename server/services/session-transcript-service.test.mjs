@@ -43,3 +43,35 @@ test('preserves intermediate assistant tool-request content as structured though
     timestamp: '2026-01-01T00:00:02Z',
   }]);
 });
+
+test('maps SDK user attachment metadata into refreshable message hints', () => {
+  const service = createSessionTranscriptService({});
+  const messages = service.parseSessionEventsToMessages([{
+    id: 'user-1',
+    type: 'user.message',
+    timestamp: '2026-01-01T00:00:01Z',
+    data: {
+      content: 'Inspect these images',
+      attachments: [{
+        type: 'blob',
+        mimeType: 'image/jpeg',
+        displayName: 'panel.jpg',
+        assetId: 'sha256:sdk-copy',
+        byteLength: 1234,
+      }],
+    },
+  }]);
+
+  assert.deepEqual(messages, [{
+    id: 'user-1',
+    role: 'user',
+    text: 'Inspect these images',
+    attachments: [{
+      name: 'panel.jpg',
+      type: 'image/jpeg',
+      size: 1234,
+      sdkAssetId: 'sha256:sdk-copy',
+    }],
+    timestamp: '2026-01-01T00:00:01Z',
+  }]);
+});

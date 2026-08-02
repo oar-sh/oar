@@ -700,7 +700,6 @@ test('POST /api/models/snapshot forwards context limits and returns freshness me
       stale: false,
       metadataValid: true,
       reasoningMetadataValid: true,
-      catalogAgeWarning: false,
       refreshedAt: '2026-07-12T09:03:53.203Z',
       source: 'web-relay-extension:poll',
       warning: null,
@@ -724,5 +723,4 @@ test('POST /api/models/snapshot forwards context limits and returns freshness me
 
   assert.equal(response.statusCode, 200);
   assert.equal(response.body.contextLimitsByModel['gpt-5.6-terra'], 272000);
-  assert.equal(response.body.catalogAgeWarning, false);
 });

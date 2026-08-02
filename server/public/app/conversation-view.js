@@ -32,6 +32,7 @@ import {
   saveConversationLoadedMessageCount,
   getSubagentRun,
   upsertSubagentRun,
+  setSubagentStreamText,
   clearSubagentRunsForMessage,
   getRootSubagentRunsByMessage,
   getChildSubagentRuns,
@@ -39,16 +40,22 @@ import {
   clearSubagentCancelInFlight,
   isSubagentCancelInFlight,
   IS_SHARED_VIEW,
+  SHARED_CONVERSATION_TOKEN,
   imageEditTarget,
   setImageEditTarget as setStoredImageEditTarget,
 } from './store.js';
-import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, updateConversationDraft as updateConversationDraftApi } from './api-client.js';
+import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { renderRelayBoards } from './relay-board-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
-import { normalizeStreamSeq, deriveLatestInFlightStreamEvent, computeNextRelayStreamState } from './stream-state.mjs';
+import {
+  normalizeStreamSeq,
+  deriveLatestInFlightStreamEvent,
+  deriveInFlightStreamTextByThread,
+  computeNextRelayStreamState,
+} from './stream-state.mjs';
 import { mergeRelayActivityTexts, normalizeRelayActivityEntry, relayActivityEntryText } from './activity-replay-state.mjs';
 import { deriveComposerControlState, hasComposerDraft } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
@@ -61,8 +68,14 @@ const OPAQUE_RELAY_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89
 
 let thinkingMessageId = null;
 const relayStreamStateByMessageId = new Map();
+// Cumulative main-thread stream text per message. The seq/done state above is
+// shared across threads (the server numbers stream rows per queue message, not
+// per thread), so the text has to be tracked separately or a subagent frame
+// would clobber the reply preview.
+const relayStreamTextByMessageId = new Map();
 const completedMessageIds = new Set();
 const bubbleCancelInFlight = new Set();
+const shareVisibilityInFlight = new Set();
 const SUBAGENT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dropped', 'done']);
 let lastRenderedMessageSnapshotKey = '';
 let sendInFlight = false;
@@ -126,6 +139,18 @@ export function jumpToImageParent(messageId) {
   window.setTimeout(() => node.classList.remove('message-highlight'), 1400);
 }
 
+async function loadConversationHistoryPage(conversationId, options = {}) {
+  if (!IS_SHARED_VIEW) {
+    return loadConversationApi(conversationId, options);
+  }
+  // Shared mode must paginate through the token endpoint so hidden-from-share
+  // messages stay filtered even when an owner auth cookie is present.
+  const response = await loadSharedConversation(SHARED_CONVERSATION_TOKEN, options);
+  if (!response || response.ok === false) return null;
+  const { ok, status, error, shared, ...payload } = response;
+  return payload;
+}
+
 const conversationHistoryLoader = createInfiniteLoader({
   fetchPage: async (cursor) => {
     const conversationId = String(currentConvId || '').trim();
@@ -136,7 +161,7 @@ const conversationHistoryLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
-    const response = await loadConversationApi(conversationId, {
+    const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       beforeMessageId: String(cursor?.beforeMessageId || '').trim(),
       beforeTimestamp: String(cursor?.beforeTimestamp || '').trim(),
@@ -202,7 +227,7 @@ const conversationFutureLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
-    const response = await loadConversationApi(conversationId, {
+    const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       afterMessageId: String(cursor?.afterMessageId || '').trim(),
       afterTimestamp: String(cursor?.afterTimestamp || '').trim(),
@@ -652,8 +677,12 @@ function createMessageNode(msg, msgId = null, force = false) {
   if (activities.length) div.classList.add('msg-with-activity');
   const thoughts = Array.isArray(msg.thoughts) ? msg.thoughts.filter((t) => t && String(t.text || '').trim()) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments, { messageId: msgId }) : '';
-  const activityHtml = activities.length ? renderActivityMarkup(activities) : '';
-  const thoughtsHtml = thoughts.length ? renderThoughtsMarkup(thoughts) : '';
+  const subagentRuns = Array.isArray(msg.subagentRuns) ? msg.subagentRuns.filter(Boolean) : [];
+  const mainActivities = activities.filter((item) => !(normalizeRelayActivityEntry(item)?.subagentRunId));
+  const mainThoughts = thoughts.filter((t) => !t?.subagentRunId);
+  const activityHtml = mainActivities.length ? renderActivityMarkup(mainActivities) : '';
+  const thoughtsHtml = mainThoughts.length ? renderThoughtsMarkup(mainThoughts) : '';
+  const subagentHtml = renderSubagentRunsMarkup(subagentRuns, activities, thoughts);
   const hasVisibleText = Boolean(String(msg.text || '').trim());
   const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
     ? 'msg-bubble msg-bubble-media-only'
@@ -661,12 +690,24 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   const isQueuedUserMessage = msg.role === 'user' && msgId && pendingUserMessageIds.has(msgId);
   const isCancelInFlight = isQueuedUserMessage && bubbleCancelInFlight.has(msgId);
+  const hiddenFromShares = msg?.hiddenFromShares === true;
+  const activeTurnMessageId = String(getActiveTurnForConversation(currentConvId)?.messageId || '').trim();
+  const sourceMessageId = String(msg?.sourceMessageId || '').trim();
+  const belongsToActiveTurn = !!activeTurnMessageId
+    && (activeTurnMessageId === msgId || activeTurnMessageId === sourceMessageId);
+  const canToggleShareVisibility = !IS_SHARED_VIEW && !!msgId && !isQueuedUserMessage && !belongsToActiveTurn;
+  const shareVisibilityActionHtml = canToggleShareVisibility
+    ? `<div class="msg-share-visibility">
+        ${hiddenFromShares ? '<span class="msg-hidden-label">Hidden from shared viewers</span>' : ''}
+        <button type="button" class="msg-share-visibility-btn" data-action="toggle-share-visibility" data-message-id="${escHtml(msgId)}" data-hidden-from-shares="${hiddenFromShares ? 'true' : 'false'}" title="${hiddenFromShares ? 'Shows this message in shared conversations' : 'Hides this message from shared conversations'}">${hiddenFromShares ? 'Unhide' : 'Hide'}</button>
+      </div>`
+    : '';
   const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${userBubbleActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${userBubbleActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -812,6 +853,83 @@ export function renderActivityMarkup(activities) {
   return `${progressHtml}${toolsHtml}`;
 }
 
+// Persisted nested subagent sections: groups a finished message's activities
+// and thoughts by subagentRunId and renders one collapsible block per run,
+// nested by parentSubagentId — mirroring the live sub-bubbles.
+export function renderSubagentRunsMarkup(subagentRuns, activities, thoughts) {
+  const activityByRun = new Map();
+  for (const item of (Array.isArray(activities) ? activities : [])) {
+    const entry = normalizeRelayActivityEntry(item);
+    if (!entry?.subagentRunId) continue;
+    const list = activityByRun.get(entry.subagentRunId) || [];
+    list.push(entry.text);
+    activityByRun.set(entry.subagentRunId, list);
+  }
+  const thoughtsByRun = new Map();
+  for (const thought of (Array.isArray(thoughts) ? thoughts : [])) {
+    const runId = thought?.subagentRunId ? String(thought.subagentRunId).trim() : '';
+    const text = String(thought?.text || '').trim();
+    if (!runId || !text) continue;
+    const list = thoughtsByRun.get(runId) || [];
+    list.push({ reasoningId: String(thought?.reasoningId || '').trim(), text });
+    thoughtsByRun.set(runId, list);
+  }
+  const runsById = new Map();
+  for (const run of (Array.isArray(subagentRuns) ? subagentRuns : [])) {
+    const runId = String(run?.subagentRunId || '').trim();
+    if (!runId) continue;
+    runsById.set(runId, {
+      subagentRunId: runId,
+      parentSubagentId: run?.parentSubagentId ? String(run.parentSubagentId).trim() : null,
+      displayName: String(run?.displayName || '').trim() || `Subagent ${runId.slice(0, 8)}`,
+      status: String(run?.status || 'completed').trim().toLowerCase(),
+    });
+  }
+  // Items may reference runs whose metadata rows are unavailable; synthesize.
+  for (const runId of new Set([...activityByRun.keys(), ...thoughtsByRun.keys()])) {
+    if (!runsById.has(runId)) {
+      runsById.set(runId, {
+        subagentRunId: runId,
+        parentSubagentId: null,
+        displayName: `Subagent ${runId.slice(0, 8)}`,
+        status: 'completed',
+      });
+    }
+  }
+  if (!runsById.size) return '';
+  const childrenByParent = new Map();
+  const roots = [];
+  for (const run of runsById.values()) {
+    const parentId = run.parentSubagentId && runsById.has(run.parentSubagentId) ? run.parentSubagentId : null;
+    if (parentId) {
+      const children = childrenByParent.get(parentId) || [];
+      children.push(run);
+      childrenByParent.set(parentId, children);
+    } else {
+      roots.push(run);
+    }
+  }
+  const renderRun = (run) => {
+    const runActivities = activityByRun.get(run.subagentRunId) || [];
+    const runThoughts = thoughtsByRun.get(run.subagentRunId) || [];
+    const children = childrenByParent.get(run.subagentRunId) || [];
+    const thoughtsBlock = runThoughts.length
+      ? `<details class="msg-thoughts msg-subagent-thoughts"><summary>💭 Thoughts (${runThoughts.length})</summary><div class="msg-thoughts-list">${runThoughts.map((thought) => `<div class="msg-thought-item"${thought.reasoningId ? ` data-reasoning-id="${escHtml(thought.reasoningId)}"` : ''}>${renderMarkdownPreview(thought.text, false)}</div>`).join('')}</div></details>`
+      : '';
+    const activitiesBlock = runActivities.length
+      ? `<div class="msg-activity-list">${runActivities.map((text) => `<div class="msg-activity-item">${escHtml(decorateActivityText(text))}</div>`).join('')}</div>`
+      : '';
+    const childrenBlock = children.map(renderRun).join('');
+    const statusLabel = run.status && run.status !== 'completed' ? ` · ${escHtml(run.status)}` : '';
+    return `
+      <details class="msg-activity msg-subagent-run" data-subagent-run-id="${escHtml(run.subagentRunId)}">
+        <summary>🤖 ${escHtml(run.displayName)}${statusLabel}${runActivities.length ? ` (${runActivities.length})` : ''}</summary>
+        ${thoughtsBlock}${activitiesBlock}${childrenBlock}
+      </details>`;
+  };
+  return roots.map(renderRun).join('');
+}
+
 export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
   if (nextMessageId) thinkingMessageId = nextMessageId;
@@ -832,6 +950,7 @@ export function showThinking(messageId = null, autoScroll = true) {
         <summary>💭 Thoughts</summary>
         <div class="thinking-thoughts-list"></div>
       </details>
+      <div id="thinking-stream" class="thinking-stream" hidden></div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
       <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
@@ -845,6 +964,7 @@ export function showThinking(messageId = null, autoScroll = true) {
     el.appendChild(div);
   }
   renderThinkingThoughts();
+  renderThinkingStream();
   if (autoScroll) scrollBottom();
 }
 
@@ -866,9 +986,11 @@ function clearRelayStreamState(messageId = null) {
   const id = String(messageId || '').trim();
   if (!id) {
     relayStreamStateByMessageId.clear();
+    relayStreamTextByMessageId.clear();
     return;
   }
   relayStreamStateByMessageId.delete(id);
+  relayStreamTextByMessageId.delete(id);
 }
 
 function rememberRelayStreamState(messageId, seq, done = false) {
@@ -882,6 +1004,47 @@ function rememberRelayStreamState(messageId, seq, done = false) {
   };
   relayStreamStateByMessageId.set(id, next);
   return next;
+}
+
+// Live reply preview: the assistant's text as it streams, rendered with the
+// same markdown path the finished bubble uses. Replaced by the real assistant
+// message when the turn completes and `removeThinking()` drops this bubble.
+function renderThinkingStream() {
+  const box = document.getElementById('thinking-stream');
+  if (!box) return;
+  const text = thinkingMessageId ? String(relayStreamTextByMessageId.get(thinkingMessageId) || '') : '';
+  if (!text.trim()) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = renderMarkdownPreview(text, false);
+}
+
+function renderSubagentStream(subagentRunId, text) {
+  const id = String(subagentRunId || '').trim();
+  if (!id) return;
+  const bubble = ensureSubagentBubble(id);
+  if (!bubble) return;
+  let box = bubble.querySelector(':scope > .subagent-stream');
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'subagent-stream';
+    // Above the nested-children container so a subagent's own text stays with
+    // its bubble rather than reading as part of a child run.
+    const childrenContainer = bubble.querySelector(':scope > .subagent-bubbles-container');
+    if (childrenContainer) bubble.insertBefore(box, childrenContainer);
+    else bubble.appendChild(box);
+  }
+  const value = String(text || '');
+  if (!value.trim()) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = renderMarkdownPreview(value, false);
 }
 
 export function renderThinkingActivities() {
@@ -943,6 +1106,16 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
       conversationId: currentConvId,
     });
   }
+  // Seed the per-thread stream text before the bubbles are built so both the
+  // reply preview and each subagent bubble repaint on reload.
+  const streamTextByThread = deriveInFlightStreamTextByThread(inFlight);
+  if (streamTextByThread.main) {
+    relayStreamTextByMessageId.set(messageId, streamTextByThread.main.text);
+  }
+  for (const [runId, entry] of streamTextByThread.bySubagentRunId) {
+    upsertSubagentRun({ subagentRunId: runId, messageId, conversationId: currentConvId });
+    setSubagentStreamText(runId, entry.text);
+  }
   showThinking(messageId, autoScroll);
   renderThinkingActivities();
   renderThinkingThoughts();
@@ -977,8 +1150,10 @@ export function appendThinkingActivity(text, subagentRunId = null, autoScroll = 
         }
       }
       if (autoScroll) scrollBottom();
-      return;
     }
+    // Without a bubble the store still holds the entry; it replays when the
+    // bubble appears. Never demote subagent activity into the parent box.
+    return;
   }
 
   const box = document.getElementById('thinking-activity');
@@ -1022,11 +1197,16 @@ function getSubagentParentId(subagentRunId) {
   return entry?.parentSubagentId || null;
 }
 
-function findSubagentBubbleContainer(parentSubagentId) {
+function findSubagentBubbleContainer(parentSubagentId, depth = 0) {
   if (!parentSubagentId) {
     return document.querySelector('#thinking-indicator .subagent-bubbles-container[data-subagent-bubbles-root="1"]');
   }
-  const parentBubble = document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(parentSubagentId)}"]`);
+  let parentBubble = document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(parentSubagentId)}"]`);
+  if (!parentBubble && depth < 8) {
+    // Child events can arrive before the parent bubble exists; build the
+    // parent chain on demand so the child still nests correctly.
+    parentBubble = ensureSubagentBubble(parentSubagentId, depth + 1);
+  }
   if (!parentBubble) return null;
   let container = parentBubble.querySelector(':scope > .subagent-bubbles-container');
   if (!container) {
@@ -1037,7 +1217,7 @@ function findSubagentBubbleContainer(parentSubagentId) {
   return container;
 }
 
-function ensureSubagentBubble(subagentRunId) {
+function ensureSubagentBubble(subagentRunId, depth = 0) {
   const id = String(subagentRunId || '').trim();
   if (!id) return null;
 
@@ -1050,7 +1230,7 @@ function ensureSubagentBubble(subagentRunId) {
   }
 
   const parentSubagentId = getSubagentParentId(id);
-  const container = findSubagentBubbleContainer(parentSubagentId);
+  const container = findSubagentBubbleContainer(parentSubagentId, depth);
   if (!container) return null;
 
   bubble = document.createElement('div');
@@ -1123,6 +1303,9 @@ function ensureSubagentBubble(subagentRunId) {
       activityBox.appendChild(row);
     }
   }
+  if (entry?.streamText) {
+    renderSubagentStream(id, entry.streamText);
+  }
 
   return bubble;
 }
@@ -1177,7 +1360,7 @@ function renderSubagentBubbleRecursive(entry) {
   }
 }
 
-function renderRestoredSubagentBubbles(messageId) {
+export function renderRestoredSubagentBubbles(messageId) {
   const id = String(messageId || '').trim();
   if (!id) return;
   const rootRuns = getRootSubagentRunsByMessage(id);
@@ -1235,8 +1418,10 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
       renderThoughtBody(bodyEl, value);
       setLiveThinkingThoughtState(row, done);
       if (autoScroll) scrollBottom();
-      return;
     }
+    // Keep subagent thoughts out of the parent panel; the store replays them
+    // once the bubble exists.
+    return;
   }
 
   const box = document.querySelector('#thinking-thoughts > .thinking-thoughts-list');
@@ -1289,7 +1474,14 @@ export function updateThinkingStreamStatus(messageId = null, done = false, autoS
   if (autoScroll) scrollBottom();
 }
 
-export function applyRelayStreamEvent({ messageId, text, done = false, seq = null, autoScroll = true } = {}) {
+export function applyRelayStreamEvent({
+  messageId,
+  text,
+  done = false,
+  seq = null,
+  subagentRunId = null,
+  autoScroll = true,
+} = {}) {
   const id = String(messageId || '').trim();
   if (!id) return false;
   if (completedMessageIds.has(id)) return false;
@@ -1298,7 +1490,20 @@ export function applyRelayStreamEvent({ messageId, text, done = false, seq = nul
   if (!transition.accept) return false;
   rememberRelayStreamState(id, transition.state.seq, transition.state.done);
   if (isOpaqueRelayText(text)) return true;
+  const runId = String(subagentRunId || '').trim();
+  if (runId) {
+    // Subagent text belongs to its own bubble; the store keeps it so the bubble
+    // can replay it if it is built after this frame arrived.
+    setSubagentStreamText(runId, text);
+  } else {
+    relayStreamTextByMessageId.set(id, String(text || ''));
+  }
+  // Runs before rendering: it creates the thinking bubble when one is missing,
+  // and adopts `messageId` as the active thinking message.
   updateThinkingStreamStatus(id, !!done, autoScroll);
+  if (id !== thinkingMessageId) return true;
+  if (runId) renderSubagentStream(runId, text);
+  else renderThinkingStream();
   return true;
 }
 
@@ -1603,12 +1808,55 @@ async function cancelSubagentByRunId(conversationId, subagentRunId) {
   updateSubagentStopButton(targetSubagentRunId, false);
 }
 
+async function toggleMessageShareVisibility(conversationId, messageId, hiddenFromShares) {
+  const conversationKey = String(conversationId || '').trim();
+  const targetMessageId = String(messageId || '').trim();
+  if (!conversationKey || !targetMessageId || shareVisibilityInFlight.has(targetMessageId)) return;
+
+  shareVisibilityInFlight.add(targetMessageId);
+  const button = document.querySelector(`.msg-share-visibility-btn[data-message-id="${CSS.escape(targetMessageId)}"]`);
+  if (button) {
+    button.disabled = true;
+    button.textContent = hiddenFromShares ? 'Unhiding…' : 'Hiding…';
+  }
+  const result = await updateMessageShareVisibility(conversationKey, targetMessageId, !hiddenFromShares);
+  shareVisibilityInFlight.delete(targetMessageId);
+  if (!result?.ok) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = hiddenFromShares ? 'Unhide' : 'Hide';
+    }
+    showTransientRelayNotice('Could not update shared-message visibility.');
+    return;
+  }
+
+  const response = await loadConversationApi(conversationKey, {
+    limit: Math.max(CONVERSATION_HISTORY_PAGE_SIZE, getConversationLoadedMessageCount()),
+  });
+  if (response?.messages) {
+    renderMessages(response.messages, false, response);
+  }
+  showTransientRelayNotice(result.hiddenFromShares
+    ? 'Message hidden from shared viewers.'
+    : 'Message visible to shared viewers.');
+}
+
 function handleBubbleActionClick(event) {
-  const btn = event.target.closest('.bubble-action-btn');
+  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn');
   if (!btn) return;
   const action = btn.dataset.action;
   const messageId = btn.dataset.messageId;
   const subagentRunId = btn.dataset.subagentRunId;
+
+  if (action === 'toggle-share-visibility' && messageId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void toggleMessageShareVisibility(
+      currentConvId,
+      messageId,
+      btn.dataset.hiddenFromShares === 'true',
+    );
+  }
 
   if (action === 'stop-turn' && messageId) {
     event.preventDefault();
@@ -1700,6 +1948,7 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
       model: String(item?.model || '').trim(),
       mode: String(item?.mode || '').trim(),
       attachments: Array.isArray(item?.attachments) ? item.attachments.length : 0,
+      hiddenFromShares: item?.hiddenFromShares === true,
       thoughts: (Array.isArray(item?.thoughts) ? item.thoughts : []).map((thought) => ({
         reasoningId: String(thought?.reasoningId || '').trim(),
         seq: Number.isFinite(Number(thought?.seq)) ? Number(thought.seq) : null,
@@ -2006,8 +2255,8 @@ export async function sendMessage() {
         runtimeProviderType: r.runtimeProviderType || 'github',
         runtimeProviderModel: r.runtimeProviderModel || null,
         preferredRelayMode: r.preferredRelayMode || selectedMode,
-        preferredModelsByMode: r.preferredModelsByMode || { [selectedMode]: selectedModel },
-        preferredReasoningByMode: r.preferredReasoningByMode || { [selectedMode]: selectedReasoningEffort || 'none' },
+        preferredModel: r.preferredModel || selectedModel,
+        preferredReasoningEffort: r.preferredReasoningEffort || selectedReasoningEffort || 'none',
       };
       window.syncAutoModelAvailability?.();
       document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);

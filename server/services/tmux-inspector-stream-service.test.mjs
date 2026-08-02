@@ -148,6 +148,7 @@ test('tmux stream service emits true byte chunks when byte stream is available',
 
   const service = createTmuxInspectorStreamService({
     tmuxAvailable: true,
+    platform: 'linux',
     preferByteStream: true,
     spawnImpl(command, args) {
       assert.equal(command, 'script');

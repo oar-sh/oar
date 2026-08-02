@@ -1,0 +1,181 @@
+import { spawn } from "child_process";
+import { randomUUID } from "crypto";
+import fs from "fs";
+import net from "net";
+import os from "os";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, "..");
+const serverScript = path.join(repoRoot, "server", "server.js");
+const playwrightCli = path.join(repoRoot, "node_modules", "@playwright", "test", "cli.js");
+const token = randomUUID();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reserveFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = Number(addr?.port || 0);
+      server.close((error) => {
+        if (error) return reject(error);
+        if (!port) return reject(new Error("Unable to allocate free test port"));
+        resolve(port);
+      });
+    });
+  });
+}
+
+async function waitForServerReady(baseUrl, authToken, proc, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  const statusUrl = `${baseUrl}/api/status`;
+
+  while (Date.now() < deadline) {
+    if (proc.exitCode !== null) {
+      throw new Error(`Server exited before readiness (code=${proc.exitCode})`);
+    }
+    try {
+      const response = await fetch(statusUrl, {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (response.ok) return;
+    } catch {}
+    await sleep(250);
+  }
+
+  throw new Error(`Timed out waiting for server readiness at ${statusUrl}`);
+}
+
+function stopProcess(proc) {
+  if (!proc || proc.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
+    proc.once("exit", finish);
+    try { proc.kill("SIGTERM"); } catch {}
+
+    setTimeout(() => {
+      if (proc.exitCode === null) {
+        try { proc.kill("SIGKILL"); } catch {}
+      }
+      finish();
+    }, 2000);
+  });
+}
+
+async function main() {
+  const port = await reserveFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  let serverStdout = "";
+  let serverStderr = "";
+  let shutdownRequested = false;
+
+  // Isolate the test server's state (db, singleton lock, uploads, config) from a
+  // live relay running out of the same checkout.
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-remote-e2e-"));
+  const dataDir = path.join(stateRoot, "data");
+
+  // The test server must never spawn real Copilot CLI clients or Claude workers.
+  // Set RELAY_E2E_ALLOW_CLI=1 explicitly (with user permission) to test live turns.
+  const disableCliSpawn = String(process.env.RELAY_E2E_ALLOW_CLI || "").trim() ? "" : "1";
+
+  const serverProc = spawn(
+    process.execPath,
+    [serverScript, "--token", token, "--port", String(port), "--owner-pid", String(process.pid)],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        COPILOT_WORKSPACE_ROOT: repoRoot,
+        COPILOT_WEB_RELAY_DATA_DIR: dataDir,
+        COPILOT_WEB_RELAY_CONFIG: path.join(stateRoot, "config.json"),
+        ...(disableCliSpawn ? { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: disableCliSpawn } : {}),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+
+  serverProc.stdout?.on("data", (chunk) => {
+    serverStdout += String(chunk || "");
+    if (serverStdout.length > 10_000) serverStdout = serverStdout.slice(-10_000);
+  });
+  serverProc.stderr?.on("data", (chunk) => {
+    serverStderr += String(chunk || "");
+    if (serverStderr.length > 10_000) serverStderr = serverStderr.slice(-10_000);
+  });
+
+  const cleanupStateRoot = () => {
+    try { fs.rmSync(stateRoot, { recursive: true, force: true }); } catch {}
+  };
+
+  const shutdown = async (exitCode) => {
+    if (shutdownRequested) return;
+    shutdownRequested = true;
+    await stopProcess(serverProc);
+    cleanupStateRoot();
+    process.exit(exitCode);
+  };
+
+  const onSigInt = () => { void shutdown(130); };
+  const onSigTerm = () => { void shutdown(143); };
+  process.on("SIGINT", onSigInt);
+  process.on("SIGTERM", onSigTerm);
+
+  try {
+    await waitForServerReady(baseUrl, token, serverProc);
+  } catch (error) {
+    await stopProcess(serverProc);
+    cleanupStateRoot();
+    const suffix = [
+      "[run-e2e] Server startup failed.",
+      serverStdout ? `--- server stdout ---\n${serverStdout}` : "",
+      serverStderr ? `--- server stderr ---\n${serverStderr}` : "",
+    ].filter(Boolean).join("\n");
+    throw new Error(`${error?.message || String(error)}\n${suffix}`);
+  }
+
+  const testProc = spawn(
+    process.execPath,
+    [playwrightCli, "test", "--config", "tests/playwright.config.mjs", ...process.argv.slice(2)],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        PLAYWRIGHT_BASE_URL: baseUrl,
+        RELAY_TEST_TOKEN: token,
+        RELAY_TEST_DATA_DIR: dataDir,
+      },
+      stdio: "inherit",
+      windowsHide: false,
+    },
+  );
+
+  const testExitCode = await new Promise((resolve) => {
+    testProc.once("exit", (code) => resolve(Number.isFinite(Number(code)) ? Number(code) : 1));
+    testProc.once("error", () => resolve(1));
+  });
+
+  process.off("SIGINT", onSigInt);
+  process.off("SIGTERM", onSigTerm);
+  await stopProcess(serverProc);
+  cleanupStateRoot();
+  process.exit(testExitCode);
+}
+
+main().catch((error) => {
+  console.error(`[run-e2e] ${error?.message || String(error)}`);
+  process.exit(1);
+});

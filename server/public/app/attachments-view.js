@@ -20,6 +20,7 @@ import {
   loadRepoChildren,
   loadDrivesRoots,
   loadDriveChildren,
+  loadSessionRootTree,
 } from './api-client.js';
 import {
   normalizeWorkspaceMentionPath,
@@ -36,6 +37,15 @@ import {
 } from './router.js';
 import { markdownHeadingId, resolveFilePreviewLink } from './file-preview-navigation.mjs';
 import { openExternalNavigation } from './external-link-policy.mjs';
+import {
+  deepestExistingAncestor,
+  planRepoRehydration,
+  repoAncestorPaths,
+} from './repo-browser-tree-state.mjs';
+import {
+  writeRepoBrowserHeavyPreference,
+  writeRepoBrowserHiddenPreference,
+} from './repo-browser-preferences.mjs';
 
 function currentConversationId() {
   return String(currentConvId || '').trim();
@@ -73,7 +83,40 @@ function setRepoBrowserState(next) {
 }
 
 let repoBrowserReloadQueued = false;
+// A refresh (hidden/heavy toggle, Refresh button) refetches a lazy tree, so the
+// expansion it wants to restore has to be re-applied once the new root lands.
+// The restore is parked here rather than chained onto refreshRepoBrowser's own
+// await, because loadRepoBrowserTree returns immediately when another load is
+// already in flight — see the tail of loadRepoBrowserTree.
+let pendingRepoBrowserRestore = null;
+let repoBrowserRefreshSeq = 0;
+let repoBrowserRenderSuspended = 0;
+let repoBrowserRenderDirty = false;
 const filePreviewHistory = [];
+
+function takePendingRepoBrowserRestore() {
+  const restore = pendingRepoBrowserRestore;
+  pendingRepoBrowserRestore = null;
+  return restore;
+}
+
+/**
+ * Rehydrating a branch calls renderRepoBrowser twice per directory, so a deep
+ * restore would otherwise rebuild the tree's innerHTML dozens of times and
+ * flicker. Renders are collapsed into one at the end instead.
+ */
+async function withSuspendedRepoRender(fn) {
+  repoBrowserRenderSuspended += 1;
+  try {
+    return await fn();
+  } finally {
+    repoBrowserRenderSuspended -= 1;
+    if (repoBrowserRenderSuspended === 0 && repoBrowserRenderDirty) {
+      repoBrowserRenderDirty = false;
+      renderRepoBrowser();
+    }
+  }
+}
 
 function resolveAttachmentContentUrl(rawValue) {
   const value = String(rawValue || '').trim();
@@ -1031,25 +1074,7 @@ export function syncRepoTreeToCurrentPath(collapseOthers = false) {
   const currentPath = String(repoBrowserState.currentPath || '');
   const treeHost = document.getElementById('repo-tree');
   if (!treeHost) return;
-  const ancestorPaths = new Set(['']);
-  if (currentPath) {
-    if (currentPath.startsWith('/')) {
-      ancestorPaths.add('/');
-      const parts = currentPath.split('/').filter(Boolean);
-      let rolling = '';
-      for (const part of parts) {
-        rolling = rolling ? `${rolling}/${part}` : `/${part}`;
-        ancestorPaths.add(rolling);
-      }
-    } else {
-      const parts = currentPath.split('/').filter(Boolean);
-      let rolling = '';
-      for (const part of parts) {
-        rolling = rolling ? `${rolling}/${part}` : part;
-        ancestorPaths.add(rolling);
-      }
-    }
-  }
+  const ancestorPaths = new Set(repoAncestorPaths(currentPath));
   const details = treeHost.querySelectorAll('details.repo-tree-node[data-repo-dir-path]');
   details.forEach((el) => {
     const pathValue = String(el.getAttribute('data-repo-dir-path') || '');
@@ -1196,6 +1221,10 @@ export function renderRepoTree() {
 }
 
 export function renderRepoBrowser() {
+  if (repoBrowserRenderSuspended > 0) {
+    repoBrowserRenderDirty = true;
+    return;
+  }
   const title = document.querySelector('.repo-browser-title');
   if (title) {
     title.textContent = repoBrowserState.activeRoot === 'workspace'
@@ -1225,7 +1254,7 @@ export async function loadRepoBrowserTree() {
   const payload = workspaceRoot
     ? await loadRepoTree(repoBrowserState.workspaceIncludeHidden, repoBrowserState.workspaceIncludeHeavy, requestedConversationId)
     : (sessionRoot
-      ? await loadDriveChildren(normalizeDriveBrowserPath(repoBrowserState.sessionRootPath), repoBrowserState.drivesIncludeHidden)
+      ? await loadSessionRootTree(normalizeDriveBrowserPath(repoBrowserState.sessionRootPath), repoBrowserState.drivesIncludeHidden)
       : await loadDrivesRoots());
   if (workspaceRoot && requestedConversationId !== currentConversationId()) {
     repoBrowserState.loading = false;
@@ -1237,6 +1266,7 @@ export async function loadRepoBrowserTree() {
   if (!payload || payload.error || !rootNode) {
     repoBrowserState.loading = false;
     repoBrowserState.error = payload?.error || (workspaceRoot ? 'Failed to load repository tree.' : (sessionRoot ? 'Failed to load session tree.' : 'Failed to load drives.'));
+    pendingRepoBrowserRestore = null;
     renderRepoBrowser();
     flushQueuedRepoBrowserReload();
     return;
@@ -1265,7 +1295,13 @@ export async function loadRepoBrowserTree() {
     if (selectedPath) repoBrowserState.expandedPaths.add(selectedPath);
   }
   renderRepoBrowser();
+  // Read the queue flag before flushing: flushQueuedRepoBrowserReload re-enters
+  // this function synchronously. When another load is already queued, leave the
+  // restore parked so that load performs it against the tree it actually
+  // fetched — that is what makes a rapid double-toggle safe.
+  const restoreNow = repoBrowserReloadQueued ? null : takePendingRepoBrowserRestore();
   flushQueuedRepoBrowserReload();
+  if (restoreNow) void applyRepoBrowserRestore(restoreNow);
 }
 
 export async function ensureRepoChildrenLoaded(pathValue) {
@@ -1312,6 +1348,43 @@ export async function ensureRepoChildrenLoaded(pathValue) {
   return true;
 }
 
+/**
+ * Re-open, on the freshly fetched tree, whatever was open before a refresh.
+ *
+ * The chain is walked sequentially on purpose: ensureRepoChildrenLoaded rebuilds
+ * nodeMap on every success, and a child directory only becomes reachable once
+ * its parent's children have landed.
+ */
+async function applyRepoBrowserRestore({ path: keepPath = '', seq = 0 } = {}) {
+  const expandedPaths = repoBrowserState.expandedPaths instanceof Set
+    ? [...repoBrowserState.expandedPaths]
+    : [];
+  const plan = planRepoRehydration({ currentPath: keepPath, expandedPaths });
+  const pathAtStart = String(repoBrowserState.currentPath || '');
+
+  await withSuspendedRepoRender(async () => {
+    for (const nodePath of plan) {
+      if (seq !== repoBrowserRefreshSeq) return;
+      if (!nodePath) continue;
+      // A directory that vanished with the filter change is simply unknown to
+      // the new nodeMap, and this returns false without touching the network.
+      await ensureRepoChildrenLoaded(nodePath);
+    }
+  });
+
+  if (seq !== repoBrowserRefreshSeq) return;
+  if (String(repoBrowserState.currentPath || '') !== pathAtStart) {
+    renderRepoBrowser();
+    return;
+  }
+  const resolvedPath = deepestExistingAncestor(keepPath, (candidate) => {
+    const node = repoBrowserState.nodeMap.get(candidate);
+    return !!node && node.type === 'dir';
+  });
+  if (resolvedPath) await setRepoCurrentPath(resolvedPath);
+  else renderRepoBrowser();
+}
+
 export async function ensureDriveChildrenLoaded(pathValue) {
   return ensureRepoChildrenLoaded(pathValue);
 }
@@ -1326,6 +1399,9 @@ export function setRepoBrowserRoot(root) {
   if (nextRoot === 'session' && !repoBrowserState.sessionRootPath) return;
   if (repoBrowserState.activeRoot === nextRoot) return;
   repoBrowserState.activeRoot = nextRoot;
+  // A root switch invalidates any parked restore: the saved path belongs to the
+  // tree we are leaving. The Set wipes below are correct here for the same reason.
+  pendingRepoBrowserRestore = null;
   setRepoBrowserState({
     tree: null,
     nodeMap: new Map(),
@@ -1352,6 +1428,7 @@ export function setRepoBrowserSessionInfo(sessionRootPath, sessionRootName = '')
   repoBrowserState.sessionRootName = nextName;
   const sessionRootActive = repoBrowserState.activeRoot === 'session';
   if (pathChanged && sessionRootActive) {
+    pendingRepoBrowserRestore = null;
     setRepoBrowserState({
       tree: null,
       nodeMap: new Map(),
@@ -1409,20 +1486,45 @@ export function closeRepoBrowser() {
 }
 
 export function refreshRepoBrowser() {
-  const keepPath = String(repoBrowserState.currentPath || '');
+  // expandedPaths / collapsedPaths deliberately survive: a refresh refetches the
+  // same root, so the user's expansion is still meaningful. applyRepoBrowserRestore
+  // re-walks it once the new tree arrives.
+  pendingRepoBrowserRestore = {
+    path: String(repoBrowserState.currentPath || ''),
+    seq: (repoBrowserRefreshSeq += 1),
+  };
   setRepoBrowserState({
     tree: null,
     nodeMap: new Map(),
-    expandedPaths: new Set(),
-    collapsedPaths: new Set(),
     currentPath: '',
     loadingPath: '',
     error: '',
   });
-  void (async () => {
-    await loadRepoBrowserTree();
-    if (keepPath) await setRepoCurrentPath(keepPath);
-  })();
+  void loadRepoBrowserTree();
+}
+
+export function resetWorkspaceRepoBrowserForRootChange() {
+  // A CWD change repoints the workspace root, so every cached path (tree,
+  // selection, expansion) belongs to a directory the browser no longer shows.
+  // Dropping them is what stops the explorer from rendering the old CWD after a
+  // relaunch.
+  if (repoBrowserState.activeRoot !== 'workspace') return;
+  pendingRepoBrowserRestore = null;
+  repoBrowserState.expandedPaths = new Set();
+  repoBrowserState.collapsedPaths = new Set();
+  setRepoBrowserState({
+    tree: null,
+    nodeMap: new Map(),
+    currentPath: '',
+    loadingPath: '',
+    error: '',
+    rootName: 'repo',
+  });
+  if (repoBrowserState.open) {
+    void loadRepoBrowserTree();
+  } else {
+    renderRepoBrowser();
+  }
 }
 
 export function setRepoBrowserViewMode(mode) {
@@ -1434,17 +1536,22 @@ export function setRepoBrowserViewMode(mode) {
 }
 
 export function toggleRepoBrowserHidden() {
+  const nextValue = repoBrowserState.activeRoot === 'workspace'
+    ? !repoBrowserState.workspaceIncludeHidden
+    : !repoBrowserState.drivesIncludeHidden;
   if (repoBrowserState.activeRoot === 'workspace') {
-    repoBrowserState.workspaceIncludeHidden = !repoBrowserState.workspaceIncludeHidden;
+    repoBrowserState.workspaceIncludeHidden = nextValue;
   } else {
-    repoBrowserState.drivesIncludeHidden = !repoBrowserState.drivesIncludeHidden;
+    repoBrowserState.drivesIncludeHidden = nextValue;
   }
+  writeRepoBrowserHiddenPreference(repoBrowserState.activeRoot, nextValue);
   refreshRepoBrowser();
 }
 
 export function toggleRepoBrowserHeavy() {
   if (repoBrowserState.activeRoot !== 'workspace') return;
   repoBrowserState.workspaceIncludeHeavy = !repoBrowserState.workspaceIncludeHeavy;
+  writeRepoBrowserHeavyPreference(repoBrowserState.workspaceIncludeHeavy);
   refreshRepoBrowser();
 }
 
@@ -1457,21 +1564,8 @@ export async function setRepoCurrentPath(pathValue) {
   const node = repoBrowserState.nodeMap.get(targetPath);
   if (!node || node.type !== 'dir') return;
   if (repoBrowserState.expandedPaths instanceof Set) {
-    if (targetPath.startsWith('/')) {
-      repoBrowserState.expandedPaths.add('/');
-      const parts = targetPath.split('/').filter(Boolean);
-      let rolling = '';
-      for (const part of parts) {
-        rolling = rolling ? `${rolling}/${part}` : `/${part}`;
-        repoBrowserState.expandedPaths.add(rolling);
-      }
-    } else if (targetPath) {
-      const parts = targetPath.split('/').filter(Boolean);
-      let rolling = '';
-      for (const part of parts) {
-        rolling = rolling ? `${rolling}/${part}` : part;
-        repoBrowserState.expandedPaths.add(rolling);
-      }
+    for (const ancestor of repoAncestorPaths(targetPath)) {
+      if (ancestor) repoBrowserState.expandedPaths.add(ancestor);
     }
   }
   if (repoBrowserState.collapsedPaths instanceof Set) {

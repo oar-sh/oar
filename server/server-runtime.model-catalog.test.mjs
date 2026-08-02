@@ -3,10 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import {
-  isModelCatalogRefreshStale,
-  latestModelCatalogRefresh,
-} from '../shared/model-catalog-freshness.mjs';
+import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
 
 const sourcePath = fileURLToPath(new URL('./server-runtime.mjs', import.meta.url));
 const source = fs.readFileSync(sourcePath, 'utf8');
@@ -71,58 +68,33 @@ test('touchModelSelectorState calls upsertSelectorState.run', () => {
   );
 });
 
-// ── Freshness helper: 10-minute warning threshold ────────────────────────────
-
-test('no age warning when refreshedAt is within 10 minutes', () => {
-  const now = Date.now();
-  const fiveMinAgo = new Date(now - 5 * 60 * 1000).toISOString();
-  assert.equal(
-    isModelCatalogRefreshStale(fiveMinAgo, { now, staleAfterMs: 10 * 60 * 1000 }),
-    false,
-    'refresh 5 minutes ago should not be stale at 10-minute threshold',
-  );
-});
-
-test('age warning fires when refreshedAt exceeds 10 minutes', () => {
-  const now = Date.now();
-  const fifteenMinAgo = new Date(now - 15 * 60 * 1000).toISOString();
-  assert.equal(
-    isModelCatalogRefreshStale(fifteenMinAgo, { now, staleAfterMs: 10 * 60 * 1000 }),
-    true,
-    'refresh 15 minutes ago should be stale at 10-minute threshold',
-  );
-});
-
-test('null refreshedAt is treated as stale', () => {
-  assert.equal(
-    isModelCatalogRefreshStale(null, { staleAfterMs: 10 * 60 * 1000 }),
-    true,
-  );
-});
-
 // ── Freshness helper: max(mem, db) effective freshness ───────────────────────
 
 test('effective freshness picks newest of stale DB and fresh in-memory', () => {
   const now = Date.now();
   const staleDb = new Date(now - 20 * 60 * 1000).toISOString();
   const freshMem = new Date(now - 30 * 1000).toISOString();
-  const effective = latestModelCatalogRefresh(staleDb, freshMem);
-  assert.equal(effective, freshMem);
-  assert.equal(
-    isModelCatalogRefreshStale(effective, { now, staleAfterMs: 10 * 60 * 1000 }),
-    false,
-    'stale DB + fresh in-memory should suppress age warning',
-  );
+  assert.equal(latestModelCatalogRefresh(staleDb, freshMem), freshMem);
 });
 
 test('effective freshness picks newest of fresh DB and null in-memory', () => {
   const now = Date.now();
   const freshDb = new Date(now - 60 * 1000).toISOString();
-  const effective = latestModelCatalogRefresh(freshDb, null);
-  assert.equal(effective, freshDb);
-  assert.equal(
-    isModelCatalogRefreshStale(effective, { now, staleAfterMs: 10 * 60 * 1000 }),
-    false,
+  assert.equal(latestModelCatalogRefresh(freshDb, null), freshDb);
+});
+
+// ── Structural: no age-based catalog warning ─────────────────────────────────
+
+test('getModelCatalogState does not emit an age-based catalog warning', () => {
+  assert.doesNotMatch(
+    source,
+    /Model catalog may be out of date/,
+    'age-based catalog warning must not exist',
+  );
+  assert.doesNotMatch(
+    source,
+    /catalogAgeWarning/,
+    'catalogAgeWarning field must not exist',
   );
 });
 

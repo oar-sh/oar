@@ -196,6 +196,42 @@ export async function loadOpenAISettings() {
   return apiFetch('/api/settings/openai');
 }
 
+export async function loadClaudeSettings() {
+  return apiFetch('/api/settings/claude');
+}
+
+export async function updateClaudeSettings({
+  enabled = undefined,
+  model = undefined,
+  enabledModels = undefined,
+} = {}) {
+  const payload = {};
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}/api/settings/claude`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = String(result?.error || `Failed to update Claude settings (${response.status})`).trim();
+      throw new Error(message);
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure('/api/settings/claude', error);
+    throw error;
+  }
+}
+
 export async function updateOpenAISettings({
   apiKey = '',
   model = 'gpt-4o',
@@ -244,6 +280,17 @@ export async function updateWindowsAutostartSetting(enabled) {
   });
 }
 
+export async function loadTurnCeilingSetting() {
+  return apiFetch('/api/settings/turn-ceiling');
+}
+
+export async function updateTurnCeilingSetting(ceilingMinutes) {
+  return apiFetch('/api/settings/turn-ceiling', {
+    method: 'POST',
+    body: JSON.stringify({ ceilingMinutes: Number(ceilingMinutes) }),
+  });
+}
+
 export async function launchSessionWorker(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return null;
@@ -252,13 +299,16 @@ export async function launchSessionWorker(sdkSessionId) {
   });
 }
 
-export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, rootPath) {
+export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, rootPath, idempotencyKey = '') {
   const convId = String(conversationId || '').trim();
   const pathValue = String(rootPath || '').trim();
   if (!convId || !pathValue) return null;
+  // One key per user gesture, so a duplicate delivery (retried fetch, second tab,
+  // stray touch event) is provably the same request and the relay replays it
+  // instead of running a second stop/spawn cycle.
   return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/relaunch-with-workspace-root`, {
     method: 'POST',
-    body: JSON.stringify({ rootPath: pathValue }),
+    body: JSON.stringify({ rootPath: pathValue, idempotencyKey: String(idempotencyKey || '') }),
   });
 }
 
@@ -366,6 +416,16 @@ export async function deleteConversation(id) {
   const convId = String(id || '').trim();
   if (!convId) return null;
   return apiFetch(`/api/conversation/${convId}`, { method: 'DELETE' });
+}
+
+export async function updateMessageShareVisibility(conversationId, messageId, hiddenFromShares) {
+  const convId = String(conversationId || '').trim();
+  const msgId = String(messageId || '').trim();
+  if (!convId || !msgId) return null;
+  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/message/${encodeURIComponent(msgId)}/share-visibility`, {
+    method: 'PATCH',
+    body: JSON.stringify({ hiddenFromShares: hiddenFromShares === true }),
+  });
 }
 
 export async function updateConversationTitle(id, title) {
@@ -709,6 +769,14 @@ export async function loadDriveChildren(pathValue, includeHidden = false) {
   return apiFetch(`/api/drives/list?path=${encodeURIComponent(path)}&includeHidden=${includeHidden ? '1' : '0'}`);
 }
 
+// Distinct from loadDriveChildren: the session root may not exist on disk yet,
+// and its listing is augmented with the transcript that lives one level up.
+export async function loadSessionRootTree(pathValue, includeHidden = false) {
+  const path = String(pathValue || '').trim();
+  if (!path) return null;
+  return apiFetch(`/api/session-root/list?path=${encodeURIComponent(path)}&includeHidden=${includeHidden ? '1' : '0'}`);
+}
+
 export async function loadWorkspaceFilePreview(pathValue, conversationId = null) {
   const path = String(pathValue || '').trim();
   if (!path) return null;
@@ -755,7 +823,15 @@ export async function refreshContextUsageBar(conversationId, requestSeq = ++cont
     return;
   }
   const lookupId = resolveContextLookupId(convId) || convId;
-  const payload = await apiFetch(`/api/context/${encodeURIComponent(lookupId)}`);
+  // Callers fire this without awaiting, so a rejection here would surface as an
+  // unhandled rejection. A miss is routine (a conversation with no turns yet):
+  // leave the bar as-is rather than blanking it.
+  let payload = null;
+  try {
+    payload = await apiFetch(`/api/context/${encodeURIComponent(lookupId)}`);
+  } catch {
+    return;
+  }
   if (!payload) return;
   if (requestSeq !== contextUsageRefreshSeq) return;
   if (String(currentConvId || '').trim() !== convId) return;

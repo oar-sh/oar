@@ -44,6 +44,42 @@ When changing anything related to the web relay (`server/` or `.github/extension
 
 Do not consider relay-related work complete until restart + status + log checks pass.
 
+## Running Tests
+
+- **Unit tests:** run `npm test`. This is always safe while the live relay is running — unit
+  tests use in-memory SQLite, temp dirs, and injected process fakes; they never touch
+  `server/data`, port `3333`, or real processes. Never stop or restart the relay to run them.
+- The unit suite is green as of 2026-08-02; treat any failure after your change as a
+  regression to fix, not pre-existing noise. If you find already-failing tests, establish
+  the baseline (`npm test` on a clean tree) before concluding anything.
+- **E2E tests:** `npm run test:e2e` spawns its own isolated server (free port, temp
+  `COPILOT_WEB_RELAY_DATA_DIR`/`COPILOT_WEB_RELAY_CONFIG`, and
+  `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1` so no real CLI clients or workers are launched)
+  and may run beside a live relay. Playwright specs must get the relay URL, token, and DB
+  path from `tests/e2e-env.mjs` only — never read `server/config.json`, never open
+  `server/data/copilot.db`, and never target `http://127.0.0.1:3333` from a test.
+- **Never run `tests/agents/` smoke tests or anything that sends prompts through the live
+  relay or spawns Copilot CLI clients without explicit user permission** (see rule 11 above).
+  They are excluded from `npm test` on purpose.
+
+## Writing Tests
+
+- **Never put personal data, machine fingerprints, or secrets in test files:** no real
+  usernames, home directory paths, hostnames, e-mail addresses, IP addresses, auth tokens, or
+  API keys — including values read from the local machine or config files. Use fictional
+  fixtures instead: `C:\Users\dev`, `/home/dev`, `user@example.com`, clearly fake tokens.
+  `server/test-hygiene.test.mjs` enforces this and will fail the suite.
+- Do not branch on `process.platform` in tests. Inject platform/homedir/env/spawn dependencies
+  into the code under test and pass explicit values (`'win32'`, `'linux'`), so the suite runs
+  identically on every OS. If a test truly requires host OS behavior, either gate it with an
+  explicit `{ skip: process.platform !== '<os>' }` option (it then reports as *skipped* on the
+  other OS, never as failed), or — when the point of the test is real host behavior such as fs
+  semantics or path helpers — annotate the line with a `host-platform: <reason>` comment.
+  `server/test-hygiene.test.mjs` enforces this: any other `process.platform` reference in a
+  test file fails the suite.
+- The `tests/` directory is gitignored: files there never appear in `git status` and content
+  searches skip it by default — search it explicitly when tracing test behavior.
+
 ## Git Commit Policy
 
 - **Never commit on `main` without explicit user instruction.** The user decides when changes are committed to main.

@@ -3,11 +3,24 @@ import assert from 'node:assert/strict';
 
 import {
   canonicalizeModelId,
+  claudeBaseModelId,
+  claudeLongContextModelId,
   filterValidModelIds,
+  isClaudeLongContextModelId,
   isOpenAIModelId,
   isSafeProviderModelId,
   isValidModelId,
 } from './model-id.mjs';
+
+test('claude long-context helpers compose and strip the [1m] suffix', () => {
+  assert.equal(isClaudeLongContextModelId('claude-opus-5[1m]'), true);
+  assert.equal(isClaudeLongContextModelId('claude-opus-5'), false);
+  assert.equal(claudeBaseModelId('claude-opus-5[1m]'), 'claude-opus-5');
+  assert.equal(claudeBaseModelId('claude-opus-5'), 'claude-opus-5');
+  assert.equal(claudeLongContextModelId('claude-opus-5'), 'claude-opus-5[1m]');
+  assert.equal(claudeLongContextModelId('claude-opus-5[1m]'), 'claude-opus-5[1m]');
+  assert.equal(claudeLongContextModelId(''), '');
+});
 
 test('isOpenAIModelId recognizes OpenAI model families', () => {
   assert.equal(isOpenAIModelId('gpt-4o'), true);

@@ -7,6 +7,12 @@ import {
   summarizeStructuredAnswer,
 } from "../../../../shared/question-schema.mjs";
 
+function extractSubagentRunIdFromRequest(request) {
+  const agentId = request?.agentId || request?.data?.agentId || null;
+  const id = agentId ? String(agentId).trim() : "";
+  return id || null;
+}
+
 function isReportIntentTool(request) {
   const name = extractToolName(request).toLowerCase();
   return name.includes("report_intent") || name === "report_intent";
@@ -210,6 +216,7 @@ export function createQuestionRoutingHooks({
         conversationId: activeMsg.conversationId,
         mode: activeMsg.relayMode || "agent",
         text: "Tool (ask_user): clarification requested in web relay",
+        subagentRunId: extractSubagentRunIdFromRequest(request) || undefined,
       }).catch(() => {});
     }
 
@@ -222,6 +229,7 @@ export function createQuestionRoutingHooks({
         conversationId: activeMsg.conversationId,
         mode: activeMsg.relayMode || "agent",
         text: activityText,
+        subagentRunId: extractSubagentRunIdFromRequest(request) || undefined,
       }).catch(() => {});
     }
 
@@ -236,6 +244,7 @@ export function createQuestionRoutingHooks({
           reasoningId: `intent-${Date.now()}`,
           text: fullIntentText,
           done: true,
+          subagentRunId: extractSubagentRunIdFromRequest(request) || undefined,
         }).catch((error) => {
           dbg("report_intent thought publish failed", `msgId=${activeMsg.id}`, error?.message || String(error));
         });
@@ -257,6 +266,7 @@ export function createQuestionRoutingHooks({
       conversationId: activeMsg.conversationId,
       mode: activeMsg.relayMode || "agent",
       text: activityText,
+      subagentRunId: extractSubagentRunIdFromRequest(request) || undefined,
     }).catch((error) => {
       dbg("tool result activity publish failed", `msgId=${activeMsg.id}`, error?.message || String(error));
     });
@@ -290,6 +300,7 @@ export function createQuestionRoutingHooks({
       conversationId: activeMsg.conversationId,
       mode: activeMsg.relayMode || "agent",
       text: "Tool (ask_user): question posted; waiting for user answer",
+      subagentRunId: extractSubagentRunIdFromRequest(request) || undefined,
     }).catch(() => {});
 
     setPendingAskUserRequest?.(null); // Normal bridge is handling it — clear so autopilot path is skipped
@@ -306,6 +317,7 @@ export function createQuestionRoutingHooks({
       conversationId: activeMsg.conversationId,
       mode: activeMsg.relayMode || "agent",
       text: activity.text,
+      subagentRunId: extractSubagentRunIdFromRequest(request) || undefined,
     }).catch(() => {});
 
     dbg(

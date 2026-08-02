@@ -10,13 +10,34 @@ import {
   closeSummaryModal,
   setSummaryModalLoading,
   showTransientRelayNotice,
+  summaryModalState,
 } from './store.js';
 import { updateWorkspaceRoot, relaunchSessionWorkerWithWorkspaceRoot } from './api-client.js';
 import { getRepoBrowserLaunchCwdPath } from './attachments-view.js';
+import {
+  resolveActiveOptionIndex,
+  resolveCwdMenuPlacement,
+  resolveTypeaheadIndex,
+} from './cwd-menu-placement.mjs';
 
 const LEGACY_KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
+const MOBILE_PICKER_MEDIA_QUERY = '(max-width: 680px)';
+const TYPEAHEAD_RESET_MS = 700;
 
 let changeCwdInFlight = false;
+
+// --- Known-CWD picker state -------------------------------------------------
+// Invariant: nothing in this picker changes DOM layout, visibility or state on
+// pointerdown/pointerup. Every state change happens in a click or keydown
+// handler, so the synthetic click that follows a touch has nothing left to
+// trigger and can never land on the action buttons below the panel.
+let menuOpen = false;
+let activeIndex = -1;
+let typeaheadBuffer = '';
+let typeaheadAt = 0;
+let repositionBound = false;
+let modalBodyBound = false;
+let sawPointerDownInBody = false;
 
 let deps = {
   applyConversationWorkspaceRootUpdate: () => {},
@@ -35,6 +56,8 @@ export function initCwdPicker({
   }
 }
 
+// Mirrors normalizeDriveLetterOnlyPath in server/services/workspace-root-path-policy.mjs.
+// It cannot be imported: only server/public is served to the browser.
 export function normalizeKnownCwdPath(value) {
   const stripped = String(value || '').trim().replace(/[\\/]+$/, '');
   // Always restore the trailing backslash for Windows drive roots ("D:" → "D:\").
@@ -81,14 +104,16 @@ function renderKnownCwdMenuItems(options, selectedPath) {
     return '<div class="change-cwd-menu-empty">No known CWDs available</div>';
   }
   const selectedKey = normalizeKnownCwdPath(selectedPath).toLowerCase();
-  return options.map((option) => {
+  // role="option" divs, not buttons: a <button> is an invalid listbox child, and
+  // under aria-activedescendant the options must not be focusable.
+  return options.map((option, index) => {
     const optionPath = normalizeKnownCwdPath(option.path);
     const selected = optionPath.toLowerCase() === selectedKey;
     return `
-      <button class="change-cwd-menu-item${selected ? ' selected' : ''}" type="button" role="menuitemradio" aria-checked="${selected ? 'true' : 'false'}" tabindex="-1" data-path="${escHtml(optionPath)}" data-label="${escHtml(option.label || '')}" data-note="${escHtml(option.note || '')}" title="${escHtml(optionPath)}">
+      <div class="change-cwd-menu-item${selected ? ' selected' : ''}" role="option" id="change-cwd-option-${index}" aria-selected="${selected ? 'true' : 'false'}" data-path="${escHtml(optionPath)}" data-label="${escHtml(option.label || '')}" data-note="${escHtml(option.note || '')}" title="${escHtml(optionPath)}">
         <span class="change-cwd-menu-item-primary">${escHtml(option.label || 'Known CWD')}</span>
         <span class="change-cwd-menu-item-secondary">${escHtml(optionPath)}</span>
-      </button>
+      </div>
     `;
   }).join('');
 }
@@ -107,48 +132,259 @@ function getEffectiveChangeCwdPath() {
   return getManualChangeCwdPath() || getSelectedChangeCwdPath();
 }
 
-function closeChangeCwdMenu() {
-  const menu = document.getElementById('change-cwd-menu');
-  const trigger = document.getElementById('change-cwd-menu-trigger');
-  if (menu) menu.hidden = true;
-  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+function getPickerEls() {
+  return {
+    modalBody: document.getElementById('summary-modal-body'),
+    picker: document.getElementById('change-cwd-picker'),
+    trigger: document.getElementById('change-cwd-menu-trigger'),
+    triggerText: document.getElementById('change-cwd-trigger-text'),
+    panel: document.getElementById('change-cwd-menu'),
+    backdrop: document.getElementById('change-cwd-menu-backdrop'),
+    selectionInput: document.getElementById('change-cwd-selected-path'),
+    manualInput: document.getElementById('change-cwd-manual-path'),
+  };
+}
+
+function getOptionEls() {
+  const panel = document.getElementById('change-cwd-menu');
+  return Array.from(panel?.querySelectorAll('.change-cwd-menu-item[data-path]') || []);
+}
+
+function isMobilePickerViewport() {
+  try {
+    return !!window.matchMedia?.(MOBILE_PICKER_MEDIA_QUERY)?.matches;
+  } catch {
+    return false;
+  }
+}
+
+function positionChangeCwdMenu() {
+  const { trigger, panel } = getPickerEls();
+  if (!trigger || !panel || panel.hidden) return;
+  if (isMobilePickerViewport()) {
+    // The bottom-sheet layout comes entirely from the media query. Inline styles
+    // set by a previous desktop-width render would otherwise override it.
+    panel.style.removeProperty('left');
+    panel.style.removeProperty('top');
+    panel.style.removeProperty('width');
+    panel.style.removeProperty('max-height');
+    return;
+  }
+  const triggerRect = trigger.getBoundingClientRect();
+  const viewportWidth = window.innerWidth || 0;
+  const viewportHeight = window.innerHeight || 0;
+  // Two passes: size the panel first so its natural height can be measured,
+  // then anchor it (and possibly flip it above the trigger).
+  panel.style.left = `${Math.round(triggerRect.left)}px`;
+  panel.style.top = '0px';
+  panel.style.width = `${Math.round(triggerRect.width)}px`;
+  panel.style.removeProperty('max-height');
+  const placement = resolveCwdMenuPlacement({
+    triggerRect,
+    viewportWidth,
+    viewportHeight,
+    panelHeight: panel.scrollHeight,
+  });
+  panel.style.left = `${Math.round(placement.left)}px`;
+  panel.style.top = `${Math.round(placement.top)}px`;
+  panel.style.width = `${Math.round(placement.width)}px`;
+  panel.style.maxHeight = `${Math.round(placement.maxHeight)}px`;
+}
+
+function bindRepositionListeners() {
+  if (repositionBound) return;
+  repositionBound = true;
+  // Capture phase so scrolling inside .summary-body (which does not bubble) counts.
+  window.addEventListener('scroll', positionChangeCwdMenu, true);
+  window.addEventListener('resize', positionChangeCwdMenu);
+  window.visualViewport?.addEventListener?.('resize', positionChangeCwdMenu);
+  window.visualViewport?.addEventListener?.('scroll', positionChangeCwdMenu);
+}
+
+function unbindRepositionListeners() {
+  if (!repositionBound) return;
+  repositionBound = false;
+  window.removeEventListener('scroll', positionChangeCwdMenu, true);
+  window.removeEventListener('resize', positionChangeCwdMenu);
+  window.visualViewport?.removeEventListener?.('resize', positionChangeCwdMenu);
+  window.visualViewport?.removeEventListener?.('scroll', positionChangeCwdMenu);
+}
+
+function setActiveOption(index, { scroll = true } = {}) {
+  const { trigger } = getPickerEls();
+  const items = getOptionEls();
+  activeIndex = Number.isInteger(index) && index >= 0 && index < items.length ? index : -1;
+  items.forEach((item, itemIndex) => {
+    item.classList.toggle('active', itemIndex === activeIndex);
+  });
+  const activeItem = activeIndex >= 0 ? items[activeIndex] : null;
+  if (trigger) {
+    if (activeItem?.id) trigger.setAttribute('aria-activedescendant', activeItem.id);
+    else trigger.removeAttribute('aria-activedescendant');
+  }
+  if (activeItem && scroll) activeItem.scrollIntoView({ block: 'nearest' });
+}
+
+function getSelectedOptionIndex() {
+  const selectedPath = getSelectedChangeCwdPath().toLowerCase();
+  if (!selectedPath) return -1;
+  return getOptionEls().findIndex((item) => (
+    normalizeKnownCwdPath(item.getAttribute('data-path') || '').toLowerCase() === selectedPath
+  ));
+}
+
+function moveActiveOption(delta) {
+  setActiveOption(resolveActiveOptionIndex(activeIndex, delta, getOptionEls().length));
+}
+
+function openChangeCwdMenu() {
+  const { trigger, panel, backdrop, manualInput } = getPickerEls();
+  if (!trigger || !panel || !getOptionEls().length) return;
+  menuOpen = true;
+  panel.hidden = false;
+  if (backdrop) backdrop.hidden = false;
+  trigger.setAttribute('aria-expanded', 'true');
+  // Drop the virtual keyboard so it cannot resize the viewport under the sheet.
+  if (isMobilePickerViewport()) manualInput?.blur?.();
+  positionChangeCwdMenu();
+  const selectedIndex = getSelectedOptionIndex();
+  setActiveOption(selectedIndex >= 0 ? selectedIndex : 0);
+  bindRepositionListeners();
+}
+
+function closeChangeCwdMenu({ focusTrigger = false } = {}) {
+  const { trigger, panel, backdrop } = getPickerEls();
+  menuOpen = false;
+  typeaheadBuffer = '';
+  if (panel) panel.hidden = true;
+  if (backdrop) backdrop.hidden = true;
+  if (trigger) {
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.removeAttribute('aria-activedescendant');
+  }
+  for (const item of getOptionEls()) item.classList.remove('active');
+  activeIndex = -1;
+  unbindRepositionListeners();
+  if (focusTrigger) trigger?.focus?.({ preventScroll: true });
+}
+
+function commitOptionElement(item) {
+  const { selectionInput } = getPickerEls();
+  if (!item || !selectionInput) return;
+  selectionInput.value = normalizeKnownCwdPath(item.getAttribute('data-path') || '');
+  syncChangeCwdPickerView();
+  closeChangeCwdMenu({ focusTrigger: true });
+}
+
+function handleTriggerTypeahead(event) {
+  const now = Date.now();
+  if (now - typeaheadAt > TYPEAHEAD_RESET_MS) typeaheadBuffer = '';
+  typeaheadAt = now;
+  typeaheadBuffer += event.key.toLowerCase();
+  const entries = getOptionEls().map((item) => ({
+    label: item.getAttribute('data-label') || '',
+    path: item.getAttribute('data-path') || '',
+  }));
+  // Re-search from the current option when the buffer grows, so repeated
+  // keystrokes refine the match instead of skipping past it.
+  const from = typeaheadBuffer.length > 1 ? activeIndex - 1 : activeIndex;
+  const match = resolveTypeaheadIndex(entries, typeaheadBuffer, from);
+  if (match >= 0) setActiveOption(match);
+}
+
+function handleTriggerKeydown(event) {
+  const items = getOptionEls();
+  if (!items.length) return;
+  const key = event.key;
+
+  if (key === 'Escape') {
+    if (!menuOpen) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeChangeCwdMenu({ focusTrigger: true });
+    return;
+  }
+  if (key === 'Tab') {
+    // Let focus move naturally; just collapse without committing.
+    if (menuOpen) closeChangeCwdMenu();
+    return;
+  }
+  if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
+    // The trigger is a native <button>, so suppress the click it would emit.
+    event.preventDefault();
+    event.stopPropagation();
+    if (!menuOpen) openChangeCwdMenu();
+    else if (activeIndex >= 0) commitOptionElement(items[activeIndex]);
+    else closeChangeCwdMenu({ focusTrigger: true });
+    return;
+  }
+  if (key === 'ArrowDown' || key === 'ArrowUp') {
+    event.preventDefault();
+    event.stopPropagation();
+    if (key === 'ArrowUp' && event.altKey) {
+      if (menuOpen) closeChangeCwdMenu({ focusTrigger: true });
+      return;
+    }
+    if (!menuOpen) {
+      openChangeCwdMenu();
+      if (getSelectedOptionIndex() < 0) setActiveOption(key === 'ArrowUp' ? items.length - 1 : 0);
+      return;
+    }
+    moveActiveOption(key === 'ArrowDown' ? 1 : -1);
+    return;
+  }
+  if (key === 'Home' || key === 'End') {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!menuOpen) openChangeCwdMenu();
+    setActiveOption(key === 'Home' ? 0 : items.length - 1);
+    return;
+  }
+  if (key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!menuOpen) openChangeCwdMenu();
+    handleTriggerTypeahead(event);
+  }
 }
 
 function syncChangeCwdPickerView() {
-  const trigger = document.getElementById('change-cwd-menu-trigger');
+  const { triggerText, trigger } = getPickerEls();
   const details = document.getElementById('change-cwd-details');
-  const menu = document.getElementById('change-cwd-menu');
   const manualPath = getManualChangeCwdPath();
+  const manualKey = manualPath.toLowerCase();
   const selectedPath = getSelectedChangeCwdPath();
-  const itemNodes = Array.from(menu?.querySelectorAll('.change-cwd-menu-item[data-path]') || []);
+  const selectedKey = selectedPath.toLowerCase();
   let selectedItem = null;
-  for (const item of itemNodes) {
+  let manualMatchItem = null;
+  for (const item of getOptionEls()) {
     const itemPath = normalizeKnownCwdPath(item.getAttribute('data-path') || '');
-    const selected = itemPath && itemPath.toLowerCase() === selectedPath.toLowerCase();
-    item.classList.toggle('selected', selected);
-    item.setAttribute('aria-checked', selected ? 'true' : 'false');
+    const itemKey = itemPath.toLowerCase();
+    const selected = !!itemKey && itemKey === selectedKey;
+    const manualMatch = !!itemKey && !!manualKey && itemKey === manualKey;
+    item.classList.toggle('selected', selected || manualMatch);
+    item.setAttribute('aria-selected', selected ? 'true' : 'false');
     if (selected) selectedItem = item;
+    if (manualMatch) manualMatchItem = item;
   }
-  if (trigger) {
-    if (selectedPath) {
-      trigger.textContent = selectedPath;
-      trigger.title = selectedPath;
-    } else {
-      trigger.textContent = 'Select a known CWD';
-      trigger.title = 'Select a known CWD';
-    }
+  if (triggerText) {
+    triggerText.textContent = selectedPath || 'Select a known CWD';
+    if (trigger) trigger.title = selectedPath || 'Select a known CWD';
   }
   if (details) {
-    const label = String(selectedItem?.getAttribute('data-label') || '').trim();
-    const note = String(selectedItem?.getAttribute('data-note') || '').trim();
     if (manualPath) {
-      details.textContent = `Manual path: ${manualPath}`;
+      const matchLabel = String(manualMatchItem?.getAttribute('data-label') || '').trim();
+      details.textContent = matchLabel
+        ? `Manual path: ${manualPath} — same as "${matchLabel}"`
+        : `Manual path: ${manualPath}`;
       return;
     }
     if (!selectedPath) {
       details.textContent = 'No known CWDs are available yet.';
       return;
     }
+    const label = String(selectedItem?.getAttribute('data-label') || '').trim();
+    const note = String(selectedItem?.getAttribute('data-note') || '').trim();
     const labelPrefix = label ? `${label}: ` : '';
     const noteSuffix = note ? ` (${note})` : '';
     details.textContent = `${labelPrefix}${selectedPath}${noteSuffix}`;
@@ -156,73 +392,70 @@ function syncChangeCwdPickerView() {
 }
 
 function bindChangeCwdPicker() {
-  const modalBody = document.getElementById('summary-modal-body');
-  const manualInput = document.getElementById('change-cwd-manual-path');
-  const trigger = document.getElementById('change-cwd-menu-trigger');
-  const menu = document.getElementById('change-cwd-menu');
-  const selectionInput = document.getElementById('change-cwd-selected-path');
-  if (!modalBody || !trigger || !menu || !selectionInput) return;
-  if (modalBody.dataset.changeCwdPickerModalBound !== '1') {
-    modalBody.dataset.changeCwdPickerModalBound = '1';
+  const { modalBody, trigger, panel, backdrop, selectionInput, manualInput } = getPickerEls();
+  if (!modalBody || !trigger || !panel || !selectionInput) return;
+
+  // #summary-modal-body outlives every modal, so it is bound exactly once. Its
+  // handlers no-op unless the change-cwd picker is the modal currently mounted.
+  if (!modalBodyBound) {
+    modalBodyBound = true;
+    modalBody.addEventListener('pointerdown', () => { sawPointerDownInBody = true; }, true);
+    modalBody.addEventListener('pointercancel', () => { sawPointerDownInBody = false; }, true);
     modalBody.addEventListener('click', (event) => {
-      const picker = document.getElementById('change-cwd-picker');
-      if (!picker || picker.contains(event.target)) return;
-      closeChangeCwdMenu();
-    });
+      if (summaryModalState.kind !== 'change-cwd') return;
+      const armed = sawPointerDownInBody;
+      sawPointerDownInBody = false;
+      // event.detail === 0 means keyboard or programmatic activation.
+      if (event.detail === 0 || armed) return;
+      // A trusted click with no matching pointerdown in this modal is a ghost:
+      // the gesture that produced it started somewhere else (e.g. on the chat
+      // menu item that opened this modal). Drop it.
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+    }, true);
     modalBody.addEventListener('keydown', (event) => {
-      if (event.key !== 'Escape') return;
-      const activeMenu = document.getElementById('change-cwd-menu');
-      if (!activeMenu || activeMenu.hidden) return;
+      if (event.key !== 'Escape' || !menuOpen) return;
       event.preventDefault();
       event.stopPropagation();
-      closeChangeCwdMenu();
+      closeChangeCwdMenu({ focusTrigger: true });
     });
   }
-  bindTapAction(trigger, (event) => {
+
+  trigger.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
-    const willOpen = !!menu.hidden;
-    menu.hidden = !willOpen;
-    trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    if (menuOpen) closeChangeCwdMenu({ focusTrigger: true });
+    else openChangeCwdMenu();
   });
-  trigger.addEventListener('keydown', (event) => {
-    if (!['Enter', ' ', 'Escape'].includes(event.key)) return;
+  trigger.addEventListener('keydown', handleTriggerKeydown);
+
+  // Delegated: the only pointer-driven activation path in this picker.
+  panel.addEventListener('click', (event) => {
+    const item = event.target?.closest?.('.change-cwd-menu-item[data-path]');
+    if (!item) return;
     event.preventDefault();
     event.stopPropagation();
-    if (event.key === 'Escape') {
-      closeChangeCwdMenu();
-      return;
-    }
-    const willOpen = !!menu.hidden;
-    menu.hidden = !willOpen;
-    trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    commitOptionElement(item);
   });
-  menu.addEventListener('keydown', (event) => {
-    // This is a touch-first picker: keep virtual/mobile keyboard events from
-    // activating a menu item behind the browser's native focus handling.
+  panel.addEventListener('pointermove', (event) => {
+    if (event.pointerType !== 'mouse') return;
+    const item = event.target?.closest?.('.change-cwd-menu-item[data-path]');
+    if (!item) return;
+    const index = getOptionEls().indexOf(item);
+    if (index >= 0 && index !== activeIndex) setActiveOption(index, { scroll: false });
+  });
+
+  backdrop?.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
-    if (event.key === 'Escape') {
-      closeChangeCwdMenu();
-      trigger.focus();
-    }
+    closeChangeCwdMenu();
   });
-  for (const item of menu.querySelectorAll('.change-cwd-menu-item[data-path]')) {
-    bindMenuAction(item, (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const pathValue = normalizeKnownCwdPath(item.getAttribute('data-path') || '');
-      selectionInput.value = pathValue;
-      syncChangeCwdPickerView();
-      closeChangeCwdMenu();
-    });
-  }
-  if (manualInput && manualInput.dataset.changeCwdInputBound !== '1') {
-    manualInput.dataset.changeCwdInputBound = '1';
-    manualInput.addEventListener('input', () => {
-      syncChangeCwdPickerView();
-    });
-  }
+
+  manualInput?.addEventListener('input', () => {
+    syncChangeCwdPickerView();
+  });
+
   syncChangeCwdPickerView();
 }
 
@@ -284,36 +517,41 @@ export function openChangeCwdModal() {
         <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
         <div><strong style="color:var(--text)">Next launch:</strong> ${escHtml(nextLaunchCwd || currentCwd || 'Unknown')}</div>
       </div>
-      <label class="change-cwd-picker" style="margin-bottom:10px;font-size:0.84rem;color:var(--muted)">
-        <span>Manual path</span>
+      <label class="change-cwd-picker" for="change-cwd-manual-path" style="margin-bottom:10px">
+        <span class="change-cwd-picker-label">Manual path</span>
         <input id="change-cwd-manual-path" class="change-cwd-manual-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Manual path">
       </label>
-      <label id="change-cwd-picker" class="change-cwd-picker" style="font-size:0.84rem;color:var(--muted)">
-        <span>Known CWDs</span>
+      <div id="change-cwd-picker" class="change-cwd-picker">
+        <span id="change-cwd-picker-label" class="change-cwd-picker-label">Known CWDs</span>
         <input id="change-cwd-selected-path" type="hidden" value="${escHtml(defaultPath)}">
-        <button id="change-cwd-menu-trigger" class="change-cwd-menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="change-cwd-menu">Select a known CWD</button>
-        <div id="change-cwd-menu" class="change-cwd-menu-panel" role="menu" tabindex="-1" hidden>
+        <button id="change-cwd-menu-trigger" class="change-cwd-menu-trigger" type="button" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="change-cwd-menu" aria-labelledby="change-cwd-picker-label change-cwd-trigger-text"${options.length ? '' : ' disabled'}>
+          <span id="change-cwd-trigger-text" class="change-cwd-menu-trigger-text">Select a known CWD</span>
+          <span class="change-cwd-menu-trigger-caret" aria-hidden="true">▾</span>
+        </button>
+        <div id="change-cwd-menu-backdrop" class="change-cwd-menu-backdrop" hidden></div>
+        <div id="change-cwd-menu" class="change-cwd-menu-panel" role="listbox" aria-labelledby="change-cwd-picker-label" hidden>
           ${menuItemsHtml}
         </div>
-      </label>
+      </div>
       <div id="change-cwd-details" style="margin-top:10px;font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
       <div class="summary-modal-actions" id="change-cwd-actions">
         <button class="summary-btn" type="button" onclick="confirmChangeCwd()">🗂️ Save next-launch CWD</button>
-        <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled'} title="${escHtml(launchDisabledReason || 'Set the CWD and (re)launch the current session worker')}">🚀 Set new CWD and (re)launch</button>
+        <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled data-keep-disabled="1"'} title="${escHtml(launchDisabledReason || 'Set the CWD and (re)launch the current session worker')}">🚀 Set new CWD and (re)launch</button>
         <button class="summary-close" type="button" onclick="closeSummaryModal()">Cancel</button>
       </div>
     `,
   });
-  // Shield the action buttons from stray click events that arrive just after the
-  // modal opens (e.g. click fires after pointerup-triggered modal in some browsers,
-  // or the 300ms synthetic touch-click lands on a button at the same coordinates).
-  const cwdActionsEl = document.getElementById('change-cwd-actions');
-  if (cwdActionsEl) cwdActionsEl.style.pointerEvents = 'none';
-  window.setTimeout(() => {
-    bindChangeCwdPicker();
-    const el = document.getElementById('change-cwd-actions');
-    if (el) el.style.pointerEvents = '';
-  }, 350);
+  // Bind synchronously: the picker must be live from the first frame. Stray
+  // clicks are handled structurally (see bindChangeCwdPicker), not by a timer.
+  sawPointerDownInBody = false;
+  bindChangeCwdPicker();
+}
+
+function newChangeCwdRequestId() {
+  try {
+    if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID();
+  } catch {}
+  return `cwd-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export async function confirmChangeCwd() {
@@ -340,7 +578,7 @@ async function submitChangeCwd(launchAfterChange = false) {
   setSummaryModalLoading(true);
   try {
     const result = launchAfterChange
-      ? await relaunchSessionWorkerWithWorkspaceRoot(currentConvId, targetPath)
+      ? await relaunchSessionWorkerWithWorkspaceRoot(currentConvId, targetPath, newChangeCwdRequestId())
       : await updateWorkspaceRoot(targetPath, currentConvId);
     if (!result) {
       alert('Failed to update the launch CWD');
@@ -353,7 +591,9 @@ async function submitChangeCwd(launchAfterChange = false) {
     const updatedPath = result.configuredWorkspaceRootPath || result.currentWorkspaceRootPath || result.workspaceRootPath || targetPath;
     if (launchAfterChange) {
       closeSummaryModal();
-      showTransientRelayNotice(`CWD set to ${updatedPath} and CLI (re)launch requested.`);
+      showTransientRelayNotice(result.workspaceRootApplied === false
+        ? `CWD saved as ${updatedPath}, but the running CLI kept its current directory. Stop it and launch again to apply.`
+        : `CWD set to ${updatedPath} and CLI relaunched.`);
       await deps.refreshSessionWorkerStatus().catch(() => {});
       return;
     }
@@ -369,52 +609,3 @@ async function submitChangeCwd(launchAfterChange = false) {
   }
 }
 
-export function bindTapAction(element, handler) {
-  if (!element || element.dataset.tapBound === '1') return;
-  element.dataset.tapBound = '1';
-  let suppressClickUntil = 0;
-  const markSuppressed = (ms = 450) => {
-    suppressClickUntil = Date.now() + Math.max(200, Number(ms) || 450);
-  };
-  element.addEventListener('pointerup', (event) => {
-    if (event.pointerType === 'mouse' && event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    markSuppressed();
-    handler(event);
-  });
-  element.addEventListener('click', (event) => {
-    if (Date.now() < suppressClickUntil) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    handler(event);
-  });
-}
-
-export function bindMenuAction(element, handler) {
-  if (!element || element.dataset.menuTapBound === '1') return;
-  element.dataset.menuTapBound = '1';
-  let suppressClickUntil = 0;
-  const markSuppressed = (ms = 450) => {
-    suppressClickUntil = Date.now() + Math.max(200, Number(ms) || 450);
-  };
-  element.addEventListener('pointerup', (event) => {
-    if (event.pointerType === 'mouse' && event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-    markSuppressed();
-    handler(event);
-  }, true);
-  element.addEventListener('click', (event) => {
-    if (Date.now() < suppressClickUntil) {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      return;
-    }
-    handler(event);
-  }, true);
-}

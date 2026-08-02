@@ -9,7 +9,7 @@ import {
   releaseParkedQueueForReadyState,
 } from '../services/relay-queue-gate-service.mjs';
 import {
-  persistConversationModeModelPreference as persistConversationModeModelPreferenceTx,
+  persistConversationModelPreference as persistConversationModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 import {
@@ -19,6 +19,7 @@ import {
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
+import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -962,6 +963,7 @@ export function buildDequeuedRelayMessage({
     modelVariantId: String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
     providerType: String(runtimeSession?.provider_type || '').trim().toLowerCase() || null,
     providerModel: String(runtimeSession?.provider_model || '').trim() || null,
+    claudeNativeSessionId: String(runtimeSession?.claude_native_session_id || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
     quality: normalizeOpenAIImageQuality(msg.reasoning_effort),
@@ -1499,6 +1501,7 @@ export function registerMessagesRoutes(app, deps) {
     resolveRequestedModel,
     resolveRequestedReasoningEffort = () => ({ ok: false, error: 'Reasoning metadata unavailable', supported: [] }),
     getOpenAIProviderSettings = () => ({ enabled: false, model: '' }),
+    getClaudeProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
@@ -1648,27 +1651,24 @@ export function registerMessagesRoutes(app, deps) {
     return text || null;
   }
 
-  function persistConversationModeModelPreference(conversationId, relayMode, model, reasoningEffort = '', nowIso = new Date().toISOString()) {
+  function persistConversationModelPreference(conversationId, relayMode, model, reasoningEffort = '', nowIso = new Date().toISOString()) {
     const convId = String(conversationId || '').trim();
     const mode = normalizeRelayMode(relayMode) || DEFAULT_RELAY_MODE;
     const modelId = String(model || '').trim();
-    const normalizedReasoningEffort = String(reasoningEffort || '').trim().toLowerCase();
     if (!convId || !mode || !modelId) {
       return {
         preferredRelayMode: mode || DEFAULT_RELAY_MODE,
-        preferredModelsByMode: {},
-        preferredReasoningByMode: {},
+        preferredModel: '',
+        preferredReasoningEffort: '',
       };
     }
-    const persisted = persistConversationModeModelPreferenceTx({
+    const persisted = persistConversationModelPreferenceTx({
       db,
       stmts,
       conversationId: convId,
       relayMode: mode,
       model: modelId,
-      preferredReasoningByMode: normalizedReasoningEffort
-        ? { [mode]: normalizedReasoningEffort }
-        : {},
+      reasoningEffort,
       normalizeMode: (value) => normalizeRelayMode(value) || null,
       fallbackRelayMode: DEFAULT_RELAY_MODE,
       updatedAt: nowIso,
@@ -1676,8 +1676,8 @@ export function registerMessagesRoutes(app, deps) {
     });
     return {
       preferredRelayMode: persisted.preferredRelayMode || mode,
-      preferredModelsByMode: persisted.preferredModelsByMode || {},
-      preferredReasoningByMode: persisted.preferredReasoningByMode || {},
+      preferredModel: persisted.preferredModel || '',
+      preferredReasoningEffort: persisted.preferredReasoningEffort || '',
     };
   }
 
@@ -3235,6 +3235,120 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  // The Session root of the explorer, listed the way `/api/drives/list` lists a
+  // directory but with two differences that only make sense for a session:
+  //
+  //  - a not-yet-created root is an empty folder, not a 404. The Claude Agent
+  //    SDK creates `<nativeSessionId>/` lazily, the first time the session
+  //    writes a subagent or tool-result file, so a young session legitimately
+  //    has a root path that has no directory behind it yet.
+  //  - the sibling `<nativeSessionId>.jsonl` transcript is listed as a child.
+  //    It lives one level up, in the project directory, which is not browsable
+  //    on its own because it holds every session for the workspace.
+  //
+  // The transcript is derived from the requested path rather than accepted from
+  // the client, so this endpoint reaches nothing `/api/drives/list` would not.
+  app.get('/api/session-root/list', auth, (req, res) => {
+    const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
+    const requestedPath = String(req.query.path || '').trim();
+
+    function transcriptChild(absolutePath, mapEntry, basename) {
+      const transcriptPath = `${absolutePath}.jsonl`;
+      let stat = null;
+      try {
+        stat = fs.statSync(transcriptPath);
+      } catch {
+        return null;
+      }
+      if (!stat.isFile()) return null;
+      return mapEntry({
+        name: basename(transcriptPath),
+        fullPath: transcriptPath,
+        type: 'file',
+        size: stat.size,
+        mtime: stat.mtime ? stat.mtime.toISOString() : null,
+      });
+    }
+
+    function directoryState(absolutePath) {
+      try {
+        return fs.statSync(absolutePath).isDirectory() ? 'dir' : 'other';
+      } catch (error) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return 'missing';
+        return 'error';
+      }
+    }
+
+    if (process.platform !== 'win32') {
+      const absolutePath = normalizeLinuxAbsolutePath(requestedPath);
+      if (!absolutePath) return res.status(400).json({ error: 'Invalid Linux path' });
+
+      const state = directoryState(absolutePath);
+      if (state === 'error') return res.status(500).json({ error: 'Failed to read session root metadata' });
+      if (state === 'other') return res.status(400).json({ error: 'Session root must reference a directory' });
+
+      const respond = (children) => {
+        const transcript = transcriptChild(absolutePath, mapLinuxDirectoryEntry, path.posix.basename);
+        const node = {
+          path: absolutePath,
+          name: path.posix.basename(absolutePath) || absolutePath,
+          type: 'dir',
+          children: transcript ? [...children, transcript] : children,
+          childrenLoaded: true,
+          lazy: false,
+        };
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({ ok: true, node, includeHidden, exists: state === 'dir' });
+      };
+
+      if (state === 'missing') return respond([]);
+      return fetchLinuxDirectoryEntries(absolutePath, { includeHidden }, (listErr, entries) => {
+        if (listErr) return res.status(500).json({ error: listErr.message || 'Failed to list session root' });
+        return respond(entries.map(mapLinuxDirectoryEntry).filter((entry) => !!entry?.path));
+      });
+    }
+
+    return fetchBrowsableDrives((drivesErr, drives) => {
+      if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
+      const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
+      const absolutePath = normalizeDriveAbsolutePath(requestedPath);
+      const rootAbsolute = driveRootFromAbsolutePath(absolutePath).toUpperCase();
+      if (!absolutePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
+        return res.status(400).json({ error: 'Invalid drive path' });
+      }
+
+      const state = directoryState(absolutePath);
+      if (state === 'error') return res.status(500).json({ error: 'Failed to read session root metadata' });
+      if (state === 'other') return res.status(400).json({ error: 'Session root must reference a directory' });
+
+      const respond = (children) => {
+        const transcript = transcriptChild(absolutePath, mapDriveDirectoryEntry, path.win32.basename);
+        const nodePath = toDriveWebPath(absolutePath);
+        const node = {
+          path: nodePath,
+          name: path.win32.basename(absolutePath) || nodePath,
+          type: 'dir',
+          children: transcript ? [...children, transcript] : children,
+          childrenLoaded: true,
+          lazy: false,
+        };
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({ ok: true, node, includeHidden, exists: state === 'dir' });
+      };
+
+      if (state === 'missing') return respond([]);
+      return fetchDriveDirectoryEntries(absolutePath, { includeHidden }, (listErr, entries) => {
+        if (listErr) return res.status(500).json({ error: listErr.message || 'Failed to list session root' });
+        return respond(entries
+          .map(mapDriveDirectoryEntry)
+          .filter((entry) => {
+            if (!entry?.path) return false;
+            return allowedRoots.has(driveRootFromAbsolutePath(entry.path).toUpperCase());
+          }));
+      });
+    });
+  });
+
   app.get('/api/drives/file', auth, (req, res) => {
     const requestedPath = String(req.query.path || '').trim();
 
@@ -3597,6 +3711,41 @@ export function registerMessagesRoutes(app, deps) {
             ? requestedOpenAIModel
             : configuredOpenAIModel
         );
+    // Claude conversations resolve models against the Claude provider
+    // catalog (the Copilot catalog does not know these ids). Per-turn model
+    // switching is allowed: each Claude turn is a fresh query() with resume.
+    const runtimeUsesClaude = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase() === 'claude';
+    const configuredClaude = runtimeUsesClaude ? getClaudeProviderSettings() : null;
+    const requestedClaudeModel = runtimeUsesClaude ? String(model || '').trim() : '';
+    const availableClaudeModels = new Set([
+      String(configuredClaude?.model || '').trim(),
+      String(existingRuntimeSession?.provider_model || '').trim(),
+      ...(Array.isArray(configuredClaude?.availableModels) ? configuredClaude.availableModels : []),
+      ...(Array.isArray(configuredClaude?.models) ? configuredClaude.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean)
+      .flatMap((value) => [value, claudeBaseModelId(value)])
+      .filter(Boolean));
+    // The composer sends the base Claude model id plus a context tier; the
+    // "[1m]" long-context variant id is composed here so the worker (and the
+    // context-usage accounting) keep seeing the id the Agent SDK expects.
+    const applyClaudeContextTier = (modelId) => {
+      const requestedTier = String(contextTier || 'default').trim().toLowerCase();
+      const baseId = claudeBaseModelId(modelId);
+      if (requestedTier === 'long_context') {
+        const variantId = claudeLongContextModelId(modelId);
+        const variantMatch = Array.from(availableClaudeModels)
+          .find((id) => id.toLowerCase() === variantId.toLowerCase());
+        return variantMatch || modelId;
+      }
+      return baseId && (availableClaudeModels.has(baseId) || baseId === modelId) ? baseId : modelId;
+    };
+    const claudeModel = runtimeUsesClaude
+      ? applyClaudeContextTier(
+          availableClaudeModels.has(requestedClaudeModel)
+            ? requestedClaudeModel
+            : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredClaude?.model || '').trim()),
+        )
+      : '';
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -3605,7 +3754,15 @@ export function registerMessagesRoutes(app, deps) {
           reasoningEffort: null,
           error: openAIModel ? null : 'OpenAI model is not configured',
         }
-      : resolveRequestedModel(model);
+      : (runtimeUsesClaude
+        ? {
+            ok: !!claudeModel,
+            model: claudeModel,
+            modelVariantId: claudeModel,
+            reasoningEffort: null,
+            error: claudeModel ? null : 'Claude model is not configured',
+          }
+        : resolveRequestedModel(model));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -3630,12 +3787,25 @@ export function registerMessagesRoutes(app, deps) {
         code: 'IMAGE_TARGET_REQUIRES_IMAGE_MODEL',
       });
     }
+    // Claude conversations validate effort against the Claude provider's
+    // per-model levels ('none' = SDK default). Effort is per-turn: each Claude
+    // turn is a fresh query(), so it can change between messages.
+    const resolveClaudeReasoningEffort = () => {
+      const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
+      const supported = Array.isArray(configuredClaude?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
+        ? configuredClaude.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
+        : ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+      const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
+      return { ok: true, effort: effort === 'none' ? 'none' : effort, supported };
+    };
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
-      : resolveRequestedReasoningEffort(
-          requestedModel,
-          explicitReasoningEffort || modelResolution.reasoningEffort || null,
-        );
+      : (runtimeUsesClaude
+        ? resolveClaudeReasoningEffort()
+        : resolveRequestedReasoningEffort(
+            requestedModel,
+            explicitReasoningEffort || modelResolution.reasoningEffort || null,
+          ));
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
@@ -3815,7 +3985,7 @@ export function registerMessagesRoutes(app, deps) {
           WHERE id = ?
         `).run(now, sessionId || null, convId);
       }
-      conversationPreferences = persistConversationModeModelPreference(
+      conversationPreferences = persistConversationModelPreference(
         convId,
         requestedRelayMode,
         requestedModel,
@@ -3975,8 +4145,8 @@ export function registerMessagesRoutes(app, deps) {
       runtimeProviderModel: runtimeSession?.provider_model || (useOpenAIProvider ? openAIModel : null),
       ownerSessionId: ownerSessionId || null,
       preferredRelayMode: conversationPreferences.preferredRelayMode,
-      preferredModelsByMode: conversationPreferences.preferredModelsByMode,
-      preferredReasoningByMode: conversationPreferences.preferredReasoningByMode,
+      preferredModel: conversationPreferences.preferredModel,
+      preferredReasoningEffort: conversationPreferences.preferredReasoningEffort,
       warning: modelResolution.warning || null,
       selectedModelVariantId: requestedModelVariantId,
       selectedBaseModel: requestedModel,
@@ -4043,6 +4213,72 @@ export function registerMessagesRoutes(app, deps) {
     relayBridgeOwnerService?.observe?.(requester);
     const { pendingCount } = queueCounts();
     res.json({ ok: true, pendingCount });
+  });
+
+  // POST /api/claude-native-session — Claude worker persists the native Agent
+  // SDK session id so later turns can resume it across worker restarts.
+  app.post('/api/claude-native-session', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const claudeNativeSessionId = String(req.body?.claudeNativeSessionId || '').trim();
+    if (!conversationId || !claudeNativeSessionId) {
+      return res.status(400).json({ error: 'Missing conversationId or claudeNativeSessionId' });
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'claude') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionClaudeNativeSessionId?.run !== 'function') {
+      return res.status(500).json({ error: 'Claude native session storage is unavailable' });
+    }
+    stmts.updateRuntimeSessionClaudeNativeSessionId.run(
+      claudeNativeSessionId,
+      new Date().toISOString(),
+      conversationId,
+    );
+    res.json({ ok: true });
+  });
+
+  // POST /api/claude-context-usage — Claude worker reports the session's
+  // context-window breakdown after a turn. Claude sessions have no Copilot
+  // events.jsonl to tail, so this is what feeds the composer indicator and the
+  // context-usage modal for them.
+  app.post('/api/claude-context-usage', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+
+    const contextUsage = req.body?.contextUsage && typeof req.body.contextUsage === 'object'
+      ? req.body.contextUsage
+      : null;
+    const modelUsage = req.body?.modelUsage && typeof req.body.modelUsage === 'object'
+      ? req.body.modelUsage
+      : null;
+    if (!contextUsage && !modelUsage) {
+      return res.status(400).json({ error: 'Missing contextUsage or modelUsage' });
+    }
+
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'claude') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
+      return res.status(500).json({ error: 'Context usage storage is unavailable' });
+    }
+
+    const payload = JSON.stringify({
+      model: String(req.body?.model || '').trim() || null,
+      contextUsage,
+      modelUsage,
+    });
+    stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
+    res.json({ ok: true });
   });
 
   // GET /api/pending — CLI fetches next pending message
@@ -5242,7 +5478,13 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
     let usageSnapshot = null;
-    if (typeof fetchUsageSummary === 'function' && stmts.upsertMessageUsageSnapshot) {
+    // `fetchUsageSummary` reads GitHub Copilot plan quota. Running it for a
+    // Claude or OpenAI turn costs a pointless round-trip and renders Copilot
+    // premium-request numbers under a reply that never touched Copilot.
+    const responseProviderType = String(
+      stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type || 'github',
+    ).trim().toLowerCase();
+    if (responseProviderType === 'github' && typeof fetchUsageSummary === 'function' && stmts.upsertMessageUsageSnapshot) {
       const previousUsageRow = stmts.getLatestMessageUsageSnapshotByConversation?.get(targetConversationId) || null;
       const previousUsageSnapshot = usageSnapshotFromRow(previousUsageRow);
       try {

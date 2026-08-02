@@ -74,6 +74,11 @@ function makeDb() {
       updated_at TEXT NOT NULL,
       completed_at TEXT
     );
+    CREATE TABLE queue (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT,
+      response_message_id TEXT
+    );
     CREATE TABLE relay_boards (
       id TEXT PRIMARY KEY,
       queue_id TEXT,

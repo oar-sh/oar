@@ -1,6 +1,9 @@
 'use strict';
 
+import { createShareVisibilityStatements } from './share-visibility-statements.mjs';
+
 export function createSessionRepository(db) {
+    const shareVisibility = createShareVisibilityStatements(db);
     const runtimeSessionColumns = new Set(
       db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((column) => String(column?.name || '').trim()),
     );
@@ -16,11 +19,11 @@ export function createSessionRepository(db) {
         getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? AND status != 'deleted' ORDER BY updated_at DESC LIMIT 1`),
         listConvIdsMissingRuntimeSession: db.prepare(`SELECT c.id AS id FROM conversations c LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE rs.id IS NULL AND c.status != 'deleted'`),
         runtimeSessionsSupportProviders,
-        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_models_by_mode, c.preferred_reasoning_by_mode, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
+        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
         insertConv:     db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
         updateConvTime: db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`),
         updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`),
-        updateConvPreferences: db.prepare(`UPDATE conversations SET preferred_relay_mode = ?, preferred_models_by_mode = ?, preferred_reasoning_by_mode = ?, updated_at = ? WHERE id = ?`),
+        updateConvPreferences: db.prepare(`UPDATE conversations SET preferred_relay_mode = ?, preferred_model = ?, preferred_reasoning_effort = ?, updated_at = ? WHERE id = ?`),
         updateConvConfiguredWorkspaceRoot: db.prepare(`UPDATE conversations SET configured_workspace_root_path = ?, updated_at = ? WHERE id = ?`),
         updateConvRuntimeWorkspaceRoot: db.prepare(`UPDATE conversations SET runtime_workspace_root_path = ?, updated_at = ? WHERE id = ?`),
         seedConvConfiguredWorkspaceRootIfMissing: db.prepare(`UPDATE conversations SET configured_workspace_root_path = ?, updated_at = ? WHERE id = ? AND (configured_workspace_root_path IS NULL OR configured_workspace_root_path = '')`),
@@ -34,6 +37,9 @@ export function createSessionRepository(db) {
 
         // messages
         getMessages:    db.prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC`),
+        getSharedMessages: shareVisibility.getSharedMessages,
+        getMessageByConversation: db.prepare(`SELECT * FROM messages WHERE id = ? AND conversation_id = ? LIMIT 1`),
+        setMessageShareVisibility: shareVisibility.setMessageShareVisibility,
         getConversationMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`),
         getConversationActiveQueueCount: db.prepare(`SELECT COUNT(*) AS count FROM queue WHERE conversation_id = ? AND status IN ('pending', 'processing', 'parked')`),
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
@@ -88,6 +94,20 @@ export function createSessionRepository(db) {
               WHERE id = ?
             `)
           : null,
+        updateRuntimeSessionClaudeNativeSessionId: runtimeSessionColumns.has('claude_native_session_id')
+          ? db.prepare(`
+              UPDATE runtime_sessions
+              SET claude_native_session_id = ?, last_used_at = ?
+              WHERE conversation_id = ?
+            `)
+          : null,
+        updateRuntimeSessionContextUsage: runtimeSessionColumns.has('context_usage_json')
+          ? db.prepare(`
+              UPDATE runtime_sessions
+              SET context_usage_json = ?, context_usage_captured_at = ?
+              WHERE conversation_id = ?
+            `)
+          : null,
         deleteRuntimeSessionByConversation: db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`),
 
         // deleted sdk sessions tombstones (hide rediscovered SDK sessions after UI delete)
@@ -98,10 +118,13 @@ export function createSessionRepository(db) {
         deleteDeletedSdkSessions: db.prepare(`DELETE FROM deleted_sdk_sessions`),
 
         // recent workspace roots (relay-owned CWD history)
+        // Keyed by path_key (case-folded on Windows), so the LIMIT counts
+        // distinct directories rather than casing variants of the same one.
         upsertRecentWorkspaceRoot: db.prepare(`
-          INSERT INTO recent_workspace_roots (path, last_seen_at)
-          VALUES (?, ?)
-          ON CONFLICT(path) DO UPDATE SET
+          INSERT INTO recent_workspace_roots (path_key, path, last_seen_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(path_key) DO UPDATE SET
+            path = excluded.path,
             last_seen_at = excluded.last_seen_at
         `),
         listRecentWorkspaceRoots: db.prepare(`
@@ -112,8 +135,8 @@ export function createSessionRepository(db) {
         `),
         pruneRecentWorkspaceRoots: db.prepare(`
           DELETE FROM recent_workspace_roots
-          WHERE path NOT IN (
-            SELECT path
+          WHERE path_key NOT IN (
+            SELECT path_key
             FROM recent_workspace_roots
             ORDER BY last_seen_at DESC
             LIMIT ?

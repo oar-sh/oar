@@ -59,6 +59,7 @@ import {
   loadModelVariantCatalog,
   refreshModelVariantCatalog,
   saveEnabledModelVariants,
+  updateClaudeSettings,
   loadConversation,
   refreshConversationHistory,
   updateConversationTitle,
@@ -101,14 +102,10 @@ import {
   clearImageEditTarget,
   jumpToImageParent,
 } from './conversation-view.js';
-import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
-import {
-  resolveConversationComposerSelection,
-  withUpdatedModelPreference,
-  normalizePreferredModelsByMode,
-} from './conversation-preferences.mjs';
+import { resolveConversationComposerSelection } from './conversation-preferences.mjs';
 import {
   modelSelectorOptionsEqual,
   normalizeModelSelectorOptions,
@@ -129,6 +126,7 @@ import {
   registerPwaShell,
   updatePwaAppName,
 } from './pwa-install.js';
+import { renderContextUsageHtml } from './context-usage-view.mjs';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics } from './status-store.mjs';
 import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
@@ -141,9 +139,8 @@ import {
   syncChatHeaderWorkspaceLabel,
   normalizeKnownCwdPath,
   clearLegacyKnownCwdHistoryStorage,
-  bindTapAction,
-  bindMenuAction,
 } from './cwd-picker.js';
+import { bindTapAction, bindMenuAction } from './tap-actions.js';
 
 let pendingExternalLinkUrl = '';
 
@@ -191,7 +188,13 @@ import {
   toggleOpenAIProvider,
   applyOpenAISettingsState,
   refreshOpenAISettingsState,
+  saveClaudeSettings,
+  toggleClaudeProvider,
+  applyClaudeSettingsState,
+  refreshClaudeSettingsState,
   updateWindowsAutostartSettingFromToggle,
+  previewTurnCeilingSetting,
+  updateTurnCeilingSetting,
 } from './settings-modal.js';
 import {
   initActionConfirmations,
@@ -208,15 +211,17 @@ import {
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
-const MODELS_BY_MODE_STORAGE_KEY = 'copilot_selected_models_by_mode';
-const REASONING_BY_MODE_STORAGE_KEY = 'copilot_selected_reasoning_by_mode';
 const AUTO_MODEL_OPTION = 'auto';
+// Claude "[1m]" long-context variants surface as the base model plus the
+// long_context tier in the context-size dropdown, never as separate entries.
+const CLAUDE_LONG_CONTEXT_PATTERN = /\[1m\]$/i;
 const FALLBACK_MODEL = 'gpt-5.4-mini';
 const FALLBACK_REASONING_EFFORT = 'none';
 const FALLBACK_MODE = 'agent';
 const PROVIDER_LABELS = {
   openai: 'OpenAI',
   'openai-byok': 'OpenAI (BYOK)',
+  claude: 'Anthropic (Claude SDK)',
   'github-copilot': 'GitHub Copilot',
   anthropic: 'Anthropic',
   google: 'Google',
@@ -277,8 +282,6 @@ let modelVariantCatalogState = {
   reasoningEfforts: [],
 };
 let modelVariantCatalogProviderTab = 'copilot';
-let activeConversationPreferredModelsByMode = {};
-let activeConversationPreferredReasoningByMode = {};
 let suppressConversationPreferenceSync = false;
 let conversationPreferenceWriteVersion = 0;
 let latestQueueStatus = {
@@ -927,44 +930,6 @@ function clearModelMetadataHardFail() {
   }
 }
 
-function normalizePreferredReasoningByMode(value, { supportedModes = [] } = {}) {
-  const allowedModes = Array.isArray(supportedModes)
-    ? supportedModes.map((mode) => String(mode || '').trim()).filter(Boolean)
-    : [];
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const normalized = {};
-  for (const mode of allowedModes) {
-    const effort = String(value[mode] || '').trim().toLowerCase();
-    if (!effort) continue;
-    normalized[mode] = effort;
-  }
-  return normalized;
-}
-
-function readStoredReasoningByMode() {
-  let raw = '';
-  try {
-    raw = String(localStorage.getItem(REASONING_BY_MODE_STORAGE_KEY) || '').trim();
-  } catch {
-    raw = '';
-  }
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out = {};
-    for (const [mode, effort] of Object.entries(parsed)) {
-      const modeKey = String(mode || '').trim();
-      const effortValue = String(effort || '').trim().toLowerCase();
-      if (!modeKey || !effortValue) continue;
-      out[modeKey] = effortValue;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
 async function startAppWithErrorHandling() {
   try {
     await initApp();
@@ -990,6 +955,7 @@ function activeComposerProviderType() {
 function normalizeModelSelectorProviderType(providerType = '') {
   const normalized = String(providerType || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
+  if (normalized === 'claude') return 'claude';
   return 'github';
 }
 
@@ -1019,10 +985,12 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
   if (normalizedModelId === AUTO_MODEL_OPTION) return true;
   const providers = modelProvidersForId(normalizedModelId, providersByModel);
   const hasOpenAIByok = providers.includes('openai-byok');
-  const hasNonByokProvider = providers.some((provider) => provider !== 'openai-byok');
+  const hasClaude = providers.includes('claude');
+  const hasNonExclusiveProvider = providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude');
   const activeProvider = normalizeModelSelectorProviderType(activeProviderType);
   if (activeProvider === 'openai') return hasOpenAIByok;
-  return !(hasOpenAIByok && !hasNonByokProvider);
+  if (activeProvider === 'claude') return hasClaude;
+  return !((hasOpenAIByok || hasClaude) && !hasNonExclusiveProvider);
 }
 
 function buildModelSelectorOptions(models = [], providersByModel = {}, activeProviderType = '') {
@@ -1078,10 +1046,6 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
   select.title = isOpenAIImageModelId(modelId) ? 'Quality' : 'Reasoning effort';
   const options = reasoningOptionsForModel(modelId);
   const selectedBefore = String(select.value || '').trim().toLowerCase();
-  const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
-  const storedByMode = readStoredReasoningByMode();
-  const modeStored = String(storedByMode?.[mode] || '').trim().toLowerCase();
-  const modeInMemory = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
   const genericStored = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
   select.innerHTML = '';
   if (!options.length) {
@@ -1099,18 +1063,13 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
     select.appendChild(opt);
   }
   const preferred = String(preferredEffort || '').trim().toLowerCase();
-  const resolvedPreferred = [preferred, modeInMemory, modeStored, selectedBefore, genericStored]
+  const resolvedPreferred = [preferred, selectedBefore, genericStored]
     .find((value) => value && options.includes(value));
   const resolved = resolvedPreferred
     || options.find((value) => value !== 'none')
     || options[0];
   select.value = resolved;
   localStorage.setItem(REASONING_STORAGE_KEY, resolved);
-  activeConversationPreferredReasoningByMode = {
-    ...activeConversationPreferredReasoningByMode,
-    [mode]: resolved,
-  };
-  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
 }
 
 function updateModelCatalogState(payload) {
@@ -1163,7 +1122,6 @@ function updateModelCatalogState(payload) {
     stale: !!payload?.stale,
     metadataValid: payload?.metadataValid === true,
     reasoningMetadataValid: payload?.reasoningMetadataValid === true,
-    catalogAgeWarning: payload?.catalogAgeWarning === true,
     warning: payload?.warning ? String(payload.warning) : null,
     error: payload?.error ? String(payload.error) : null,
     refreshedAt: payload?.refreshedAt || null,
@@ -1217,8 +1175,6 @@ function updateModelCatalogState(payload) {
   }
 
   const selectedBefore = select.value;
-  const selectedMode = String(document.getElementById('mode-select')?.value || '').trim();
-  const preferredForMode = String(activeConversationPreferredModelsByMode?.[selectedMode] || '').trim();
   if (optionsChanged) {
     select.innerHTML = '';
     for (const option of nextOptions) {
@@ -1230,31 +1186,14 @@ function updateModelCatalogState(payload) {
   }
   select.dataset.providerScope = normalizeModelSelectorProviderType(activeProviderType);
 
-  const preferred = [preferredForMode, selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
+  const preferred = [selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
     .find((value) => value && nextModels.includes(value)) || nextModels[0];
   select.value = preferred;
   localStorage.setItem(MODEL_STORAGE_KEY, preferred);
-  const preferredReasoningForMode = String(activeConversationPreferredReasoningByMode?.[selectedMode] || '').trim().toLowerCase();
-  updateReasoningSelectorForModel(preferred, preferredReasoningForMode);
+  updateReasoningSelectorForModel(preferred);
   updateContextTierSelector(preferred);
-  if (selectedMode) {
-    activeConversationPreferredModelsByMode = withUpdatedModelPreference({
-      preferredModelsByMode: activeConversationPreferredModelsByMode,
-      mode: selectedMode,
-      model: preferred,
-      supportedModes: Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value),
-    });
-    localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
-    activeConversationPreferredReasoningByMode = {
-      ...activeConversationPreferredReasoningByMode,
-      [selectedMode]: selectedReasoningEffortValue(),
-    };
-    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
-  }
 
-  if (modelCatalogState.catalogAgeWarning && isModelMetadataHealthy(modelCatalogState)) {
-    setModelBanner(`⚠️ ${modelCatalogState.warning || 'Model catalog may be out of date. Refresh models if selections look wrong.'}`);
-  } else if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
+  if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
   } else if (modelCatalogState.stale && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner('⚠️ Model list is cached from CLI; selection may be stale.');
@@ -1348,18 +1287,6 @@ function updateModelPricingDetails(modelId, tier) {
   details.style.display = grid.childElementCount ? '' : 'none';
 }
 
-function readStoredModelsByMode() {
-  const raw = String(localStorage.getItem(MODELS_BY_MODE_STORAGE_KEY) || '').trim();
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    return parsed;
-  } catch {
-    return {};
-  }
-}
-
 function modeOptions() {
   return Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value);
 }
@@ -1377,45 +1304,43 @@ async function persistCurrentConversationPreferences() {
   const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
   const model = String(modelSelect.value || '').trim();
   const reasoningEffort = selectedReasoningEffortValue();
-  const supportedModes = modeOptions();
-  activeConversationPreferredModelsByMode = withUpdatedModelPreference({
-    preferredModelsByMode: activeConversationPreferredModelsByMode,
-    mode,
-    model,
-    supportedModes,
-  });
-  localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
   localStorage.setItem(MODE_STORAGE_KEY, mode);
   if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
   if (reasoningEffort) localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
-  activeConversationPreferredReasoningByMode = {
-    ...activeConversationPreferredReasoningByMode,
-    [mode]: reasoningEffort || FALLBACK_REASONING_EFFORT,
-  };
-  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
+
+  // For Claude conversations the 1M context tier is stored as the "[1m]"
+  // variant of the preferred model, so it survives reopening the conversation.
+  const contextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim().toLowerCase();
+  const preferredModelWithTier = model
+    && contextTier === 'long_context'
+    && activeComposerProviderType() === 'claude'
+    && !CLAUDE_LONG_CONTEXT_PATTERN.test(model)
+    ? `${model}[1m]`
+    : model;
 
   const writeVersion = ++conversationPreferenceWriteVersion;
   const response = await updateConversationPreferences(convId, {
     clientId: CLIENT_ID,
     preferredRelayMode: mode,
-    preferredModelsByMode: activeConversationPreferredModelsByMode,
-    preferredReasoningByMode: activeConversationPreferredReasoningByMode,
+    preferredModel: preferredModelWithTier,
+    preferredReasoningEffort: reasoningEffort,
   });
   if (!response || writeVersion !== conversationPreferenceWriteVersion) return;
   if (conversations[convId]) {
     conversations[convId] = {
       ...conversations[convId],
       preferredRelayMode: response.preferredRelayMode,
-      preferredModelsByMode: response.preferredModelsByMode,
-      preferredReasoningByMode: response.preferredReasoningByMode || conversations[convId].preferredReasoningByMode || {},
+      preferredModel: response.preferredModel || conversations[convId].preferredModel || '',
+      preferredReasoningEffort: response.preferredReasoningEffort || conversations[convId].preferredReasoningEffort || '',
     };
   }
 }
 
 function applyConversationPreferences({
   preferredRelayMode = '',
-  preferredModelsByMode = {},
-  preferredReasoningByMode = {},
+  preferredModel = '',
+  preferredReasoningEffort = '',
+  preferredContextTier = 'default',
 } = {}) {
   const modeSelect = document.getElementById('mode-select');
   const modelSelect = document.getElementById('model-select');
@@ -1425,7 +1350,7 @@ function applyConversationPreferences({
   const supportedModels = modelOptions().length ? modelOptions() : modelCatalogState.models;
   const selection = resolveConversationComposerSelection({
     preferredRelayMode,
-    preferredModelsByMode: normalizePreferredModelsByMode(preferredModelsByMode, { supportedModes }),
+    preferredModel,
     selectedMode: modeSelect.value || localStorage.getItem(MODE_STORAGE_KEY) || FALLBACK_MODE,
     selectedModel: modelSelect.value || localStorage.getItem(MODEL_STORAGE_KEY) || FALLBACK_MODEL,
     supportedModes,
@@ -1437,26 +1362,19 @@ function applyConversationPreferences({
   modeSelect.value = selection.mode;
   if (selection.model) modelSelect.value = selection.model;
   syncAutoModelAvailability();
-  const normalizedPreferredReasoningByMode = normalizePreferredReasoningByMode(preferredReasoningByMode, { supportedModes });
-  const modeReasoning = String(
-    normalizedPreferredReasoningByMode?.[selection.mode]
-    || activeConversationPreferredReasoningByMode?.[selection.mode]
-    || '',
-  ).trim().toLowerCase();
-  updateReasoningSelectorForModel(selection.model || modelSelect.value, modeReasoning);
+  updateReasoningSelectorForModel(
+    selection.model || modelSelect.value,
+    String(preferredReasoningEffort || '').trim().toLowerCase(),
+  );
+  updateContextTierSelector(selection.model || modelSelect.value);
+  const tierSelect = document.getElementById('context-tier-select');
+  const desiredTier = String(preferredContextTier || 'default').trim().toLowerCase();
+  if (tierSelect && Array.from(tierSelect.options).some((option) => option.value === desiredTier)) {
+    tierSelect.value = desiredTier;
+    updateModelPricingDetails(selection.model || modelSelect.value, tierSelect.value);
+  }
   suppressConversationPreferenceSync = false;
 
-  activeConversationPreferredModelsByMode = {
-    ...readStoredModelsByMode(),
-    ...selection.preferredModelsByMode,
-  };
-  activeConversationPreferredReasoningByMode = {
-    ...readStoredReasoningByMode(),
-    ...activeConversationPreferredReasoningByMode,
-    ...normalizedPreferredReasoningByMode,
-  };
-  localStorage.setItem(MODELS_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredModelsByMode));
-  localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
   localStorage.setItem(MODE_STORAGE_KEY, selection.mode);
   if (selection.model) localStorage.setItem(MODEL_STORAGE_KEY, selection.model);
 }
@@ -1468,25 +1386,31 @@ function applyConversationPreferencesForConversation(conversationId, payload = {
     ?? conversation?.preferredRelayMode
     ?? localStorage.getItem(MODE_STORAGE_KEY)
     ?? FALLBACK_MODE;
-  const preferredModelsByMode = payload?.preferredModelsByMode
-    ?? conversation?.preferredModelsByMode
-    ?? readStoredModelsByMode();
-  const preferredReasoningByMode = payload?.preferredReasoningByMode
-    ?? conversation?.preferredReasoningByMode
-    ?? {};
+  const preferredModel = payload?.preferredModel
+    ?? conversation?.preferredModel
+    ?? localStorage.getItem(MODEL_STORAGE_KEY)
+    ?? '';
+  const preferredReasoningEffort = payload?.preferredReasoningEffort
+    ?? conversation?.preferredReasoningEffort
+    ?? '';
   const runtimeModel = String(
     payload?.runtimeModel
     ?? conversation?.runtimeModel
     ?? conversation?.runtime_model
     ?? '',
   ).trim();
-  const effectivePreferredModelsByMode = Number(conversation?.messageCount || 0) === 0 && runtimeModel
-    ? { ...preferredModelsByMode, [preferredRelayMode]: runtimeModel }
-    : preferredModelsByMode;
+  const effectivePreferredModel = String(
+    Number(conversation?.messageCount || 0) === 0 && runtimeModel
+      ? runtimeModel
+      : preferredModel,
+  ).trim();
+  // A stored "[1m]" id decomposes into the base model plus the 1M context tier.
+  const isLongContextModel = CLAUDE_LONG_CONTEXT_PATTERN.test(effectivePreferredModel);
   applyConversationPreferences({
     preferredRelayMode,
-    preferredModelsByMode: effectivePreferredModelsByMode,
-    preferredReasoningByMode,
+    preferredModel: effectivePreferredModel.replace(CLAUDE_LONG_CONTEXT_PATTERN, ''),
+    preferredReasoningEffort,
+    preferredContextTier: isLongContextModel ? 'long_context' : 'default',
   });
 }
 
@@ -1502,15 +1426,7 @@ function initModelSelector() {
         setModelBanner('⚠️ Auto model selection is available only for a new conversation.');
         return;
       }
-      const mode = String(document.getElementById('mode-select')?.value || '').trim();
-      activeConversationPreferredModelsByMode = withUpdatedModelPreference({
-        preferredModelsByMode: activeConversationPreferredModelsByMode,
-        mode,
-        model: select.value,
-        supportedModes: modeOptions(),
-      });
-      const preferredReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
-      updateReasoningSelectorForModel(select.value, preferredReasoning);
+      updateReasoningSelectorForModel(select.value);
       updateContextTierSelector(select.value);
       void persistCurrentConversationPreferences().catch(() => {});
     });
@@ -1528,7 +1444,11 @@ function initContextTierSelector() {
   const select = document.getElementById('context-tier-select');
   if (!select || select.dataset.bound === '1') return;
   select.dataset.bound = '1';
-  select.addEventListener('change', () => updateModelPricingDetails(selectedModelValue(), select.value));
+  select.addEventListener('change', () => {
+    updateModelPricingDetails(selectedModelValue(), select.value);
+    if (suppressConversationPreferenceSync) return;
+    void persistCurrentConversationPreferences().catch(() => {});
+  });
 }
 
 function initReasoningSelector() {
@@ -1537,12 +1457,6 @@ function initReasoningSelector() {
   select.dataset.bound = '1';
   select.addEventListener('change', () => {
     if (suppressConversationPreferenceSync) return;
-    const mode = String(document.getElementById('mode-select')?.value || '').trim() || FALLBACK_MODE;
-    activeConversationPreferredReasoningByMode = {
-      ...activeConversationPreferredReasoningByMode,
-      [mode]: selectedReasoningEffortValue(),
-    };
-    localStorage.setItem(REASONING_BY_MODE_STORAGE_KEY, JSON.stringify(activeConversationPreferredReasoningByMode));
     void persistCurrentConversationPreferences().catch(() => {});
   });
 }
@@ -1561,23 +1475,6 @@ function initModeSelector() {
   select.dataset.bound = '1';
   select.addEventListener('change', () => {
     if (suppressConversationPreferenceSync) return;
-    const modelSelect = document.getElementById('model-select');
-    if (modelSelect) {
-      const mode = String(select.value || '').trim();
-      const openAIModelLocked = modelSelect.dataset.runtimeModelLocked === '1';
-      if (!openAIModelLocked) {
-        const modeModel = String(activeConversationPreferredModelsByMode?.[mode] || '').trim();
-        if (modeModel && modelOptions().includes(modeModel)) {
-          suppressConversationPreferenceSync = true;
-          modelSelect.value = modeModel;
-          suppressConversationPreferenceSync = false;
-        }
-      } else {
-        syncAutoModelAvailability();
-      }
-      const modeReasoning = String(activeConversationPreferredReasoningByMode?.[mode] || '').trim().toLowerCase();
-      updateReasoningSelectorForModel(modelSelect.value, modeReasoning);
-    }
     void persistCurrentConversationPreferences().catch(() => {});
   });
 }
@@ -1602,11 +1499,19 @@ function refreshModelCatalog(force = false) {
 
 function reportOpenAIModelDiscoveryFailure(payload) {
   const discovery = payload?.openAIModelDiscovery;
-  if (!discovery || discovery.ok !== false) return;
-  showTransientRelayNotice(
-    `GitHub models refreshed, but OpenAI model discovery failed. Cached OpenAI models were kept: ${discovery.error || 'unknown error'}`,
-    8000,
-  );
+  if (discovery && discovery.ok === false) {
+    showTransientRelayNotice(
+      `GitHub models refreshed, but OpenAI model discovery failed. Cached OpenAI models were kept: ${discovery.error || 'unknown error'}`,
+      8000,
+    );
+  }
+  const claudeDiscovery = payload?.claudeModelDiscovery;
+  if (claudeDiscovery && claudeDiscovery.ok === false && !claudeDiscovery.skipped) {
+    showTransientRelayNotice(
+      `Claude model discovery failed. Cached Claude models were kept: ${claudeDiscovery.error || 'unknown error'}`,
+      8000,
+    );
+  }
 }
 
 async function retryModelMetadataRefresh() {
@@ -1696,6 +1601,17 @@ function applyModelVariantCatalogState(payload) {
     reasoningEfforts: Array.isArray(payload?.reasoningEfforts)
       ? payload.reasoningEfforts.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
       : [],
+    claudeModels: payload?.claudeModels && typeof payload.claudeModels === 'object'
+      ? {
+        defaultModel: String(payload.claudeModels.defaultModel || '').trim(),
+        availableModels: Array.isArray(payload.claudeModels.availableModels)
+          ? payload.claudeModels.availableModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        enabledModels: Array.isArray(payload.claudeModels.enabledModels)
+          ? payload.claudeModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+      }
+      : null,
   };
 }
 
@@ -1750,13 +1666,22 @@ function renderModelVariantCatalogBody() {
   const variantBelongsToTab = (entry, tab) => {
     const activeTab = String(tab || 'copilot').trim().toLowerCase();
     const baseModelId = String(entry?.baseModelId || '').trim().toLowerCase();
+    const entryProvider = String(entry?.provider || '').trim().toLowerCase();
     const providers = modelProvidersForId(baseModelId, providersByModel);
     const hasOpenAIByok = providers.includes('openai-byok');
-    const hasNonByokProvider = providers.some((provider) => provider !== 'openai-byok');
-    if (activeTab === 'openai') {
-      return hasOpenAIByok || String(entry?.provider || '').trim().toLowerCase() === 'openai-byok';
+    // Each tab lists only rows sourced from that runtime: the Anthropic tab
+    // shows Claude-SDK rows exclusively, and Copilot never shows rows that a
+    // different runtime contributed (there is no cross-runtime switching).
+    if (activeTab === 'anthropic') {
+      return entryProvider === 'claude';
     }
-    if (hasOpenAIByok) return hasNonByokProvider;
+    if (entryProvider === 'claude') return false;
+    if (activeTab === 'openai') {
+      return hasOpenAIByok || entryProvider === 'openai-byok';
+    }
+    // Copilot tab: only models the Copilot CLI itself serves.
+    if (entryProvider === 'openai-byok') return false;
+    if (hasOpenAIByok) return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude');
     return true;
   };
   const grouped = new Map();
@@ -1792,6 +1717,30 @@ function renderModelVariantCatalogBody() {
     grouped.set('openai-byok', providerRows);
     openAIBaseModelsAlreadyListed.add(baseModelId);
   }
+  const claudeCatalog = modelVariantCatalogState.claudeModels;
+  if (claudeCatalog?.availableModels?.length) {
+    const claudeEnabledSet = new Set(claudeCatalog.enabledModels || []);
+    const claudeDefaultModel = String(claudeCatalog.defaultModel || '').trim();
+    const providerRows = [];
+    for (const [index, claudeModelId] of claudeCatalog.availableModels.entries()) {
+      const isDefaultModel = claudeModelId === claudeDefaultModel;
+      providerRows.push({
+        variantId: `${claudeModelId}--provider-claude`,
+        baseModelId: claudeModelId,
+        provider: 'claude',
+        label: humanizeModelLabel(claudeModelId),
+        releaseStatus: null,
+        reasoningEffort: null,
+        // The default model always stays enabled; deselecting it would leave
+        // Claude conversations without a model.
+        selectable: !isDefaultModel,
+        enabled: claudeEnabledSet.has(claudeModelId) || isDefaultModel,
+        claudeModelId,
+        sortOrder: index,
+      });
+    }
+    grouped.set('claude', providerRows);
+  }
   const selected = new Set(modelVariantCatalogState.enabledVariantIds);
   const selectedOrder = new Map(
     modelVariantCatalogState.enabledVariantIds.map((variantId, index) => [variantId, index]),
@@ -1824,13 +1773,19 @@ function renderModelVariantCatalogBody() {
   );
   const hasOpenAITab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'openai'));
   const hasCopilotTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'copilot'));
+  const hasAnthropicTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'anthropic'));
   if (modelVariantCatalogProviderTab === 'openai' && !hasOpenAITab) modelVariantCatalogProviderTab = 'copilot';
-  if (modelVariantCatalogProviderTab === 'copilot' && !hasCopilotTab && hasOpenAITab) modelVariantCatalogProviderTab = 'openai';
+  if (modelVariantCatalogProviderTab === 'anthropic' && !hasAnthropicTab) modelVariantCatalogProviderTab = 'copilot';
+  if (modelVariantCatalogProviderTab === 'copilot' && !hasCopilotTab) {
+    if (hasOpenAITab) modelVariantCatalogProviderTab = 'openai';
+    else if (hasAnthropicTab) modelVariantCatalogProviderTab = 'anthropic';
+  }
   const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
   const providerTabButtons = `
     <div class="summary-tab-strip" style="display:flex;gap:8px;align-items:center;">
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Anthropic</button>
     </div>
   `;
   const warnings = [
@@ -1876,7 +1831,9 @@ function renderModelVariantCatalogBody() {
       const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
       const variantRowsHtml = variantRows.map((row) => {
         const selectable = row.selectable !== false;
-        const checked = selectable && selected.has(row.variantId);
+        const checked = row.claudeModelId
+          ? row.enabled === true
+          : (selectable && selected.has(row.variantId));
         const effortChip = row.reasoningEffort
           ? ` <span class="model-reasoning-chip">${escHtml(row.reasoningEffort)}</span>`
           : '';
@@ -1885,11 +1842,13 @@ function renderModelVariantCatalogBody() {
           ? ' <span class="model-reasoning-chip model-reasoning-chip-warn">unavailable</span>'
           : '';
         const fixedChip = !selectable
-          ? ' <span class="model-reasoning-chip">managed in settings</span>'
+          ? (row.claudeModelId
+            ? ' <span class="model-reasoning-chip">default model</span>'
+            : ' <span class="model-reasoning-chip">managed in settings</span>')
           : '';
         return `
           <label class="model-variant-row">
-            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}" ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
+            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${row.claudeModelId ? ` data-claude-model="${escHtml(row.claudeModelId)}"` : ''} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
             <span class="model-variant-row-copy">
               <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}${fixedChip}</span>
             </span>
@@ -1997,21 +1956,36 @@ async function openSelectModelsModal() {
 async function saveSelectedModelsFromModal() {
   const body = document.getElementById('summary-modal-body');
   if (!body) return;
-  const selectedVariantIds = Array.from(body.querySelectorAll('.model-variant-checkbox:checked[data-selectable="1"]'))
+  const claudeCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-claude-model]'));
+  const selectedClaudeModels = claudeCheckboxes
+    .filter((input) => input.checked)
+    .map((input) => String(input.getAttribute('data-claude-model') || '').trim())
+    .filter(Boolean);
+  const selectedVariantIds = Array.from(body.querySelectorAll('.model-variant-checkbox:checked[data-selectable="1"]:not([data-claude-model])'))
     .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
     .filter(Boolean);
-  if (!selectedVariantIds.length) {
+  const hasVariantRows = !!body.querySelector('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model])');
+  if (hasVariantRows && !selectedVariantIds.length) {
     alert('Select at least one model variant.');
     return;
   }
   setSummaryModalLoading(true);
   try {
-    const saved = await saveEnabledModelVariants(selectedVariantIds);
-    if (!saved) throw new Error('Failed to save model selection');
-    applyModelVariantCatalogState(saved);
+    if (hasVariantRows) {
+      const saved = await saveEnabledModelVariants(selectedVariantIds);
+      if (!saved) throw new Error('Failed to save model selection');
+      applyModelVariantCatalogState(saved);
+    }
+    if (claudeCheckboxes.length) {
+      const savedClaude = await updateClaudeSettings({ enabledModels: selectedClaudeModels });
+      if (!savedClaude) throw new Error('Failed to save Claude model selection');
+      applyClaudeSettingsState(savedClaude);
+      const refreshedCatalog = await loadModelVariantCatalog();
+      if (refreshedCatalog) applyModelVariantCatalogState(refreshedCatalog);
+    }
     renderModelVariantCatalogBody();
     await refreshModelCatalog(true);
-    showTransientRelayNotice('Saved model selector variants.');
+    showTransientRelayNotice('Saved model selection.');
   } catch (error) {
     alert(error?.message || 'Failed to save model selection');
   } finally {
@@ -2040,16 +2014,27 @@ async function loadContextSummaryAndRender(convId) {
   const trimmedConvId = String(convId || '').trim();
   const payload = await loadContextSummary(trimmedConvId);
   if (!payload) throw new Error('Unable to load context');
-  const copilotSessionId = String(payload.copilotSessionId || payload.snapshot?.copilot_session_id || '').trim();
-  const refreshLookupId = copilotSessionId || trimmedConvId || null;
-  const title = trimmedConvId ? 'Current Context' : 'Latest Context';
-  const subtitle = copilotSessionId
-    ? `Copilot session ${copilotSessionId.slice(0, 8)}`
-    : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'Latest runtime session');
+  const sessionId = String(payload.copilotSessionId || payload.snapshot?.copilot_session_id || '').trim();
+  const refreshLookupId = sessionId || trimmedConvId || null;
+  const providerLabel = payload.providerType === 'claude' ? 'Claude' : 'Copilot';
+  const subtitle = sessionId
+    ? `${providerLabel} session ${sessionId.slice(0, 8)}`
+    : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
+
+  const usageHtml = renderContextUsageHtml(payload.contextUsage);
+  const detailText = String(payload.text || '').trim();
+  // The structured breakdown is the answer; the runtime's own text dump stays
+  // available underneath for the details it carries that categories don't.
+  const bodyHtml = usageHtml
+    ? `${usageHtml}${detailText
+      ? `<details class="ctx-usage-raw"><summary>Raw details</summary><pre>${escHtml(detailText)}</pre></details>`
+      : ''}`
+    : `<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
+
   renderSummaryModalContent({
-    title,
+    title: 'Context usage',
     subtitle,
-    bodyHtml: `<pre>${escHtml(payload.text || 'No context data available.')}</pre>`,
+    bodyHtml,
     refresh: () => loadContextSummaryAndRender(refreshLookupId),
     kind: 'context',
   });
@@ -2090,15 +2075,26 @@ async function showUsage() {
 async function showContext() {
   const btn = document.getElementById('context-btn');
   const convId = String(currentConvId || '').trim();
+  if (!convId) {
+    // /api/context has no data without a conversation, so say so rather than
+    // opening a modal that can only ever render an error.
+    openSummaryModal({
+      title: 'Context usage',
+      subtitle: 'No conversation selected',
+      bodyHtml: '<div class="summary-loading">Open a conversation to see its context usage.</div>',
+      kind: 'context',
+    });
+    return;
+  }
   if (btn) {
     btn.textContent = '⏳';
     btn.disabled = true;
   }
   openSummaryModal({
-    title: 'Current Context',
-    subtitle: convId ? `Conversation ${convId.slice(0, 8)}` : 'Latest runtime session',
+    title: 'Context usage',
+    subtitle: `Conversation ${convId.slice(0, 8)}`,
     bodyHtml: '<div class="summary-loading">Fetching context snapshot…</div>',
-    refresh: () => loadContextSummaryAndRender(convId || null),
+    refresh: () => loadContextSummaryAndRender(convId),
     kind: 'context',
   });
   setSummaryModalLoading(true);
@@ -2106,7 +2102,7 @@ async function showContext() {
     await loadContextSummaryAndRender(convId);
   } catch (e) {
     renderSummaryModalContent({
-      title: 'Current Context',
+      title: 'Context usage',
       subtitle: 'Unable to load',
       bodyHtml: `<div class="summary-error">Failed to fetch context: ${escHtml(e.message || 'Unknown error')}</div>`,
       refresh: () => loadContextSummaryAndRender(convId || null),
@@ -2644,20 +2640,32 @@ function applyConversationWorkspaceRootUpdate(payload = {}) {
   const conversationId = String(payload.conversationId || '').trim();
   if (!conversationId) return;
   const existing = conversations[conversationId] || { id: conversationId, archived: false, messageCount: 0 };
+  const previousCurrentPath = String(existing.currentWorkspaceRootPath || '').trim();
+  // A relaunch into a new CWD must not keep the old runtime root alive through
+  // the `existing` fallback: the payload is the post-relaunch truth.
+  const nextRuntimePath = Object.prototype.hasOwnProperty.call(payload, 'runtimeWorkspaceRootPath')
+    ? String(payload.runtimeWorkspaceRootPath || '').trim()
+    : String(existing.runtimeWorkspaceRootPath || '').trim();
+  const nextRuntimeName = Object.prototype.hasOwnProperty.call(payload, 'runtimeWorkspaceRootName')
+    ? String(payload.runtimeWorkspaceRootName || '').trim()
+    : String(existing.runtimeWorkspaceRootName || '').trim();
   conversations[conversationId] = {
     ...existing,
     configuredWorkspaceRootPath: String(payload.configuredWorkspaceRootPath || existing.configuredWorkspaceRootPath || '').trim() || null,
     configuredWorkspaceRootName: String(payload.configuredWorkspaceRootName || existing.configuredWorkspaceRootName || '').trim() || null,
-    runtimeWorkspaceRootPath: String(payload.runtimeWorkspaceRootPath || existing.runtimeWorkspaceRootPath || '').trim() || null,
-    runtimeWorkspaceRootName: String(payload.runtimeWorkspaceRootName || existing.runtimeWorkspaceRootName || '').trim() || null,
+    runtimeWorkspaceRootPath: nextRuntimePath || null,
+    runtimeWorkspaceRootName: nextRuntimeName || null,
     currentWorkspaceRootPath: String(payload.currentWorkspaceRootPath || existing.currentWorkspaceRootPath || '').trim() || null,
     currentWorkspaceRootName: String(payload.currentWorkspaceRootName || existing.currentWorkspaceRootName || '').trim() || null,
   };
-  if (currentConvId === conversationId) {
-    syncChatHeaderWorkspaceLabel();
-    if (repoBrowserState.activeRoot === 'workspace' && repoBrowserState.open) {
-      void loadRepoBrowserTree();
-    }
+  if (currentConvId !== conversationId) return;
+  syncChatHeaderWorkspaceLabel();
+  const nextCurrentPath = String(conversations[conversationId].currentWorkspaceRootPath || '').trim();
+  const rootChanged = nextCurrentPath.toLowerCase() !== previousCurrentPath.toLowerCase();
+  if (rootChanged) {
+    resetWorkspaceRepoBrowserForRootChange();
+  } else if (repoBrowserState.activeRoot === 'workspace' && repoBrowserState.open) {
+    void loadRepoBrowserTree();
   }
 }
 
@@ -2699,6 +2707,7 @@ initSocketHandlers({
   syncChatTitleControls,
   applyConversationPreferencesForConversation,
   applyOpenAISettingsState,
+  applyClaudeSettingsState,
 });
 
 initCwdPicker({
@@ -2746,7 +2755,6 @@ async function initApp() {
   syncQueueStatusMenuEntry();
   if (!sharedMode) {
     syncSuspendHostVisibility();
-    activeConversationPreferredReasoningByMode = readStoredReasoningByMode();
   }
   setupViewportTracking();
   window.addEventListener('pagehide', () => {
@@ -3034,8 +3042,12 @@ window.updateDefaultSessionWorkspaceRootSetting = updateDefaultSessionWorkspaceR
 window.saveOpenAISettings = saveOpenAISettings;
 window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
+window.saveClaudeSettings = saveClaudeSettings;
+window.toggleClaudeProvider = toggleClaudeProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;
+window.previewTurnCeilingSetting = previewTurnCeilingSetting;
+window.updateTurnCeilingSetting = updateTurnCeilingSetting;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 window.doAuth = doAuth;
