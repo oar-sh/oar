@@ -237,6 +237,11 @@
     --conversation-title-ready: #3fb950;
     --conversation-title-question: #f85149;
     --conversation-title-error: #d29922;
+    --provider-github: #58a6ff;
+    --provider-openai: #56d4a0;
+    --provider-openai-image: #d98cc4;
+    --provider-claude: #e0855a;
+    --provider-cursor: #a78bfa;
     --viewport-top-offset: 0px;
     --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     --chat-header-top-base-desktop: 14px;
@@ -292,6 +297,11 @@
     --conversation-title-ready: #1a7f37;
     --conversation-title-question: #cf222e;
     --conversation-title-error: #9a6700;
+    --provider-github: #0969da;
+    --provider-openai: #0f8a63;
+    --provider-openai-image: #a3468b;
+    --provider-claude: #b4531f;
+    --provider-cursor: #6b3fd4;
     --inline-code-bg: #eff1f3;
   }
   :root {
@@ -466,24 +476,6 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
-  #provider-status-pill {
-    display: inline-flex;
-    align-items: center;
-    min-height: 24px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 2px 8px;
-    color: var(--muted);
-    background: var(--bg3);
-    font-size: var(--fs-meta-xs);
-    font-weight: 600;
-    white-space: nowrap;
-  }
-  #provider-status-pill[data-provider="openai"] {
-    color: #56d4a0;
-    border-color: rgba(86, 212, 160, 0.45);
-    background: rgba(86, 212, 160, 0.1);
-  }
   #cli-dot {
     width: 12px;
     height: 12px;
@@ -598,20 +590,45 @@
   .conv-item:hover { background: var(--bg3); }
   .conv-item.active { background: var(--bg3); border-color: var(--border); }
   .conv-title { font-size: var(--fs-meta-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
-  .conv-meta  { font-size: var(--fs-meta-xs); color: var(--muted); margin-top: 2px; padding-right: 24px; }
+  .conv-meta  {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    margin-top: 2px;
+    padding-right: 24px;
+  }
+  /* The date/count text yields first so the provider chip never wraps onto its
+     own line once every conversation carries one. */
+  .conv-meta-primary {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The pill tints its border/background from its own text colour, so the
+     per-provider rules below only have to set `color` and stay in step with the
+     composer's session-lock note. */
   .conv-provider-indicator {
     display: inline-flex;
     align-items: center;
-    padding: 0 6px;
+    flex: 0 0 auto;
+    padding: 0 5px;
     border-radius: 999px;
-    border: 1px solid rgba(88, 166, 255, 0.4);
-    background: rgba(88, 166, 255, 0.14);
+    border: 1px solid color-mix(in srgb, currentColor 40%, transparent);
+    background: color-mix(in srgb, currentColor 14%, transparent);
     color: var(--accent);
     font-size: var(--fs-ui-chip);
     font-weight: 600;
     line-height: 1.25;
     vertical-align: middle;
   }
+  .conv-provider-indicator[data-provider="github"] { color: var(--provider-github); }
+  .conv-provider-indicator[data-provider="openai"] { color: var(--provider-openai); }
+  .conv-provider-indicator[data-provider="openai-image"] { color: var(--provider-openai-image); }
+  .conv-provider-indicator[data-provider="claude"] { color: var(--provider-claude); }
+  .conv-provider-indicator[data-provider="cursor"] { color: var(--provider-cursor); }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
   .conv-item.worker-ui-ready .conv-title,
@@ -1695,10 +1712,15 @@
   #model-metadata-retry-btn:hover { background: rgba(210, 153, 34, 0.2); }
   #model-lock-note {
     margin-bottom: 6px;
-    color: #56d4a0;
+    color: var(--muted);
     font-size: var(--fs-meta-sm);
     font-weight: 600;
   }
+  #model-lock-note[data-provider="github"] { color: var(--provider-github); }
+  #model-lock-note[data-provider="openai"] { color: var(--provider-openai); }
+  #model-lock-note[data-provider="openai-image"] { color: var(--provider-openai-image); }
+  #model-lock-note[data-provider="claude"] { color: var(--provider-claude); }
+  #model-lock-note[data-provider="cursor"] { color: var(--provider-cursor); }
   #model-select:disabled,
   #reasoning-effort-select:disabled {
     opacity: 0.55;
@@ -3223,11 +3245,6 @@
     #chat-header-actions {
       margin-left: auto;
     }
-    #provider-status-pill {
-      max-width: 116px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
     #pending-question-banner {
       order: 4;
       flex: 0 0 auto;
@@ -3286,16 +3303,6 @@
     }
     #pending-question-banner { font-size: var(--fs-ui-chip); padding: 3px 8px; }
     .header-icon-btn { width: 30px; height: 30px; border-radius: 8px; font-size: var(--fs-ui-icon); }
-    #provider-status-pill {
-      width: 9px;
-      min-width: 9px;
-      min-height: 9px;
-      height: 9px;
-      padding: 0;
-      border-radius: 50%;
-      color: transparent;
-      font-size: 0;
-    }
     #chat-actions-menu { min-width: 200px; }
     /* Slightly taller than desktop so the tap target barely changes; the row
        pitch still drops from 36px to 32px thanks to the tighter menu gap. */
@@ -3671,7 +3678,6 @@
         </form>
       </div>
       <div id="chat-header-actions">
-        <span id="provider-status-pill" data-provider="github" title="GitHub Copilot is active">GitHub Copilot</span>
         <button id="message-search-btn" class="header-icon-btn" onclick="openMessageSearchModal()" title="Search messages" aria-label="Search messages">🔍</button>
         <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
         <div id="chat-actions-menu-wrap">
@@ -3920,6 +3926,34 @@
           <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
         </div>
         <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="cursor-api-key-input">Cursor (Agent SDK)</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="cursor-enabled-toggle">Enable Cursor for New Chat model selection</label>
+          <input id="cursor-enabled-toggle" type="checkbox" onchange="toggleCursorProvider(this.checked)" disabled>
+        </div>
+        <input
+          id="cursor-api-key-input"
+          type="password"
+          autocomplete="off"
+          placeholder="Cursor API key…"
+          aria-label="Cursor API key"
+        >
+        <label for="cursor-model-input" style="margin-top: 8px;">Cursor model ID</label>
+        <input
+          id="cursor-model-input"
+          type="text"
+          value="composer-2.5"
+          placeholder="composer-2.5"
+          aria-label="Cursor model ID"
+        >
+        <div id="cursor-settings-status" class="settings-help settings-provider-status">Loading Cursor settings…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="cursor-save-btn" type="button" class="summary-btn" onclick="saveCursorSettings()">Save Cursor settings</button>
+          <button id="cursor-remove-btn" type="button" class="summary-btn" onclick="removeCursorSettings()">Remove saved key</button>
+        </div>
+        <div class="settings-help">Runs Cursor conversations through the Cursor Agent SDK using your saved Cursor API key. The key is stored on the relay host and never sent to browsers.</div>
       </div>
     </div>
   </div>

@@ -1,6 +1,13 @@
-import { buildClaudeUserContent } from './claude-attachments.mjs';
+import { buildCursorUserMessage } from './cursor-attachments.mjs';
+import { buildCursorContextUsage } from './cursor-context-usage.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
-import { startClaudeTurn, createCanUseTool, readContextUsage } from './claude-sdk-adapter.mjs';
+import {
+  createCursorAgentHandle,
+  startCursorRun,
+  classifyCursorError,
+  readModelContextWindow,
+} from './cursor-sdk-adapter.mjs';
+import { createAskUserTool } from './cursor-ask-user-tool.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 
@@ -10,7 +17,13 @@ const PLAN_BOARD_ACTIONS = [
   { id: 'exit_only', label: 'Stop here', mode: 'agent' },
 ];
 
-export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}) {
+// Cursor has no exit-plan tool, so the only board source is the plan-mode
+// text-shape fallback; the payload otherwise matches the Claude worker's.
+export function buildCursorPlanReadyBoardPayload({
+  message,
+  planText = '',
+  source = 'plan-mode-fallback',
+} = {}) {
   const summary = String(planText || '').trim();
   if (!summary) return null;
   return {
@@ -24,7 +37,7 @@ export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}
     actions: PLAN_BOARD_ACTIONS,
     recommendedAction: null,
     context: {
-      source: 'exit_plan_mode',
+      source,
       queueMessageId: message?.id || null,
       conversationId: message?.conversationId || null,
       relayMode: message?.relayMode || 'agent',
@@ -33,25 +46,56 @@ export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}
 }
 
 /**
- * Execute one delivered relay turn against the Claude Agent SDK, streaming
+ * Execute one delivered relay turn against the Cursor SDK, streaming
  * normalized events into the relay's activity channels and publishing the
- * final response. Mirrors the Copilot extension's `handlePendingPayload`
+ * final response. Mirrors the Claude worker's `handlePendingPayload`
  * contract (response / requeue / abort semantics).
  */
-export function createClaudeTurnRunner({
+export function createCursorTurnRunner({
   api,
   sdkSessionId,
   cwd,
   defaultModel = '',
+  apiKey = '',
+  storeDir = '',
   controlPoller,
-  pathToClaudeCodeExecutable = '',
-  startClaudeTurnImpl = startClaudeTurn,
-  readContextUsageImpl = readContextUsage,
+  createAgentHandleImpl = createCursorAgentHandle,
+  startCursorRunImpl = startCursorRun,
+  classifyErrorImpl = classifyCursorError,
+  readContextWindowImpl = readModelContextWindow,
+  createNormalizerImpl = createSdkMessageNormalizer,
+  buildUserMessageImpl = buildCursorUserMessage,
   dbg = () => {},
 } = {}) {
+  // Unlike the Claude worker, the agent handle (and the custom tools bound
+  // into it) outlives a single turn, so the ask_user tool is built once here
+  // and reaches the active turn's state through these closures.
+  let agentHandle = null;
+  let cursorAgentId = '';
   let activeMessage = null;
-  let claudeNativeSessionId = '';
   let waitingForTurn = false;
+  let currentAbortController = null;
+
+  const bridge = createAskUserBridge({
+    api,
+    getActiveMessage: () => activeMessage,
+    sdkSessionId,
+    questionSource: 'ask_user',
+    questionRationale: 'Cursor requested clarification to continue this turn.',
+    dbg,
+  });
+  const askUserTool = createAskUserTool({
+    bridge,
+    getAbortSignal: () => currentAbortController?.signal || null,
+    dbg,
+  });
+  const customTools = {
+    ask_user: {
+      description: askUserTool.description,
+      inputSchema: askUserTool.inputSchema,
+      execute: askUserTool.execute,
+    },
+  };
 
   function getActiveQueueMessageId() {
     return waitingForTurn ? String(activeMessage?.id || '') : '';
@@ -59,6 +103,54 @@ export function createClaudeTurnRunner({
 
   function isTurnActive() {
     return waitingForTurn;
+  }
+
+  async function dispose() {
+    try {
+      await agentHandle?.close?.();
+    } catch (error) {
+      dbg('cursor agent close failed on dispose', error?.message || String(error));
+    }
+    agentHandle = null;
+  }
+
+  async function persistAgentId(message, agentId) {
+    const normalized = String(agentId || '').trim();
+    if (!normalized || normalized === cursorAgentId) return;
+    try {
+      await api('POST', '/api/cursor-agent-id', {
+        conversationId: message.conversationId,
+        cursorAgentId: normalized,
+      });
+      // Only cache after the server accepted it, so a failed persist is
+      // retried on the next turn — resume across worker restarts depends on
+      // the server-side copy.
+      cursorAgentId = normalized;
+    } catch (error) {
+      dbg('cursor agent id persist failed', error?.message || String(error));
+    }
+  }
+
+  async function ensureAgentHandle(message, model) {
+    if (!agentHandle) {
+      const durableId = String(message.cursorAgentId || '').trim() || cursorAgentId;
+      const options = { apiKey, model, cwd, storeDir, sdkSessionId, customTools, dbg };
+      try {
+        agentHandle = await createAgentHandleImpl({ ...options, agentId: durableId });
+      } catch (error) {
+        if (!durableId) throw error;
+        // The durable agent may have been pruned server-side; fall back to a
+        // fresh agent rather than wedging the conversation.
+        dbg('cursor agent resume failed, creating fresh agent', error?.message || String(error));
+        agentHandle = await createAgentHandleImpl({ ...options, agentId: '' });
+      }
+    }
+    // Runs even when the handle is reused, so a persist that failed on an
+    // earlier turn is retried here.
+    if (agentHandle.agentId && agentHandle.agentId !== cursorAgentId) {
+      await persistAgentId(message, agentHandle.agentId);
+    }
+    return agentHandle;
   }
 
   async function postActivity(message, text, subagentRunId = null) {
@@ -72,35 +164,17 @@ export function createClaudeTurnRunner({
     }).catch(() => {});
   }
 
-  async function persistNativeSessionId(message, sessionId) {
-    const normalized = String(sessionId || '').trim();
-    if (!normalized || normalized === claudeNativeSessionId) return;
-    try {
-      await api('POST', '/api/claude-native-session', {
-        conversationId: message.conversationId,
-        claudeNativeSessionId: normalized,
-      });
-      // Only cache after the server accepted it, so a failed persist is
-      // retried on the next turn — resume across worker restarts depends on
-      // the server-side copy.
-      claudeNativeSessionId = normalized;
-    } catch (error) {
-      dbg('claude native session persist failed', error?.message || String(error));
-    }
-  }
-
-  async function dispatchAction(message, action, state) {
+  async function dispatchAction(message, action, state, normalizer) {
     const { channel, payload } = action;
     if (channel === 'init') {
+      // The durable agent id is persisted at handle creation, not from init.
       state.responseModel = payload.model || state.responseModel;
-      await persistNativeSessionId(message, payload.sessionId);
       return;
     }
     if (channel === 'stream') {
-      // Only the main thread's text can stand in for the answer. Subagent text
-      // is forwarded too (forwardSubagentText), and letting it land here would
-      // publish a subagent's prose as the reply on the abort / error / no-result
-      // fallback paths below.
+      // Only the main thread's text can stand in for the answer: subagent
+      // text landing here would publish a subagent's prose as the reply on
+      // the abort / error / no-result fallback paths below.
       if (!payload.subagentRunId) state.lastStreamedText = payload.text;
       await api('POST', '/api/stream', {
         messageId: message.id,
@@ -141,23 +215,32 @@ export function createClaudeTurnRunner({
     }
     if (channel === 'result') {
       state.result = payload;
-      state.modelUsage = payload.modelUsage || null;
+      state.lastUsage = payload.usage || state.lastUsage;
+      state.responseModel = state.responseModel || normalizer.model || '';
     }
   }
 
   /**
-   * Ship the turn's context-window breakdown to the relay, which serves it back
-   * to the UI as the composer indicator and the context-usage modal. Advisory
-   * data: a failure here must not disturb the turn's response.
+   * Ship the turn's token usage to the relay as a context-window breakdown.
+   * Advisory data: a failure here must not disturb the turn's response.
    */
   async function publishContextUsage(message, state, model) {
-    if (!state.contextUsage && !state.modelUsage) return;
-    await api('POST', '/api/claude-context-usage', {
+    if (!state.lastUsage) return;
+    const usageModel = state.responseModel || model || '';
+    const contextWindow = await readContextWindowImpl({ apiKey, model: usageModel, dbg })
+      .catch(() => null);
+    const built = buildCursorContextUsage({
+      usage: state.lastUsage,
+      model: usageModel,
+      contextWindow,
+    });
+    if (!built) return;
+    await api('POST', '/api/cursor-context-usage', {
       conversationId: message.conversationId,
       sdkSessionId,
-      model: state.responseModel || model || null,
-      contextUsage: state.contextUsage,
-      modelUsage: state.modelUsage,
+      model: usageModel,
+      contextUsage: built.contextUsage,
+      modelUsage: built.modelUsage,
     }).catch((error) => {
       dbg('context usage publish failed', error?.message || String(error));
     });
@@ -188,83 +271,73 @@ export function createClaudeTurnRunner({
   }
 
   async function runTurn(message) {
-    const abortController = new AbortController();
-    const normalizer = createSdkMessageNormalizer();
+    currentAbortController = new AbortController();
+    const abortController = currentAbortController;
+    const normalizer = createNormalizerImpl();
     const state = {
       result: null,
       lastStreamedText: '',
       responseModel: '',
-      contextUsage: null,
-      modelUsage: null,
+      lastUsage: null,
     };
     let aborted = false;
     let planBoardPosted = false;
 
-    const askUserBridge = createAskUserBridge({
-      api,
-      sdkSessionId,
-      getActiveMessage: () => message,
-      dbg,
-    });
-    const canUseTool = createCanUseTool({
-      askUserBridge,
-      dbg,
-      onExitPlanMode: async (input) => {
-        const planText = String(input?.plan || input?.summary || '').trim();
-        const boardPayload = buildClaudePlanReadyBoardPayload({ message, planText });
-        if (!boardPayload) return;
-        planBoardPosted = true;
-        await api('POST', '/api/relay-board', boardPayload).catch((error) => {
-          dbg('plan board publish failed', error?.message || String(error));
-        });
-      },
-    });
-
-    const resume = String(message.claudeNativeSessionId || claudeNativeSessionId || '').trim();
-    // Per-message model wins so the composer can switch Claude models between
-    // turns; the conversation's provider model and worker default are fallbacks.
+    // Per-message model wins so the composer can switch models between turns.
+    // Cursor model ids are unprefixed, so any non-auto value is accepted.
     const requestedModel = String(message.model || '').trim();
-    const perTurnModel = requestedModel.toLowerCase() !== 'auto' && requestedModel.toLowerCase().startsWith('claude-')
+    const perTurnModel = requestedModel && requestedModel.toLowerCase() !== 'auto'
       ? requestedModel
       : '';
     const model = perTurnModel
       || String(message.providerModel || '').trim()
       || defaultModel;
-    const content = buildClaudeUserContent(message);
 
+    await ensureAgentHandle(message, model);
+    const userMessage = buildUserMessageImpl(message);
+
+    let turn = null;
     const controlState = controlPoller?.start?.({
       queueMessageId: message.id,
       onAbortTurn: async () => {
         aborted = true;
         abortController.abort();
+        await turn?.cancel?.();
       },
     });
 
-    let turn = null;
     try {
-      turn = startClaudeTurnImpl({
-        content,
-        cwd,
-        model,
-        resume,
-        relayMode: message.relayMode || 'agent',
-        reasoningEffort: message.reasoningEffort || '',
-        abortController,
-        canUseTool,
-        pathToClaudeCodeExecutable,
-        dbg,
-      });
-      for await (const sdkMessage of turn) {
-        const actions = normalizer.normalize(sdkMessage);
-        for (const action of actions) {
-          await dispatchAction(message, action, state);
-        }
-        // The context breakdown has to be read here, while the input gate is
-        // still holding the CLI alive: once the gate releases and the result
-        // is consumed, the control transport is gone.
-        if (actions.some((action) => action.channel === 'result')) {
-          state.contextUsage = await readContextUsageImpl(turn, dbg);
-          turn.endInput?.();
+      let busyRetries = 0;
+      while (true) {
+        try {
+          turn = startCursorRunImpl({
+            agent: agentHandle.agent,
+            message: userMessage,
+            model,
+            relayMode: message.relayMode,
+            abortSignal: abortController.signal,
+            dbg,
+          });
+          for await (const event of turn) {
+            const actions = normalizer.normalize(event);
+            for (const action of actions) {
+              await dispatchAction(message, action, state, normalizer);
+            }
+          }
+          break;
+        } catch (error) {
+          // A stale handle whose previous run never settled server-side
+          // reports busy; one close-and-resume usually clears it. A second
+          // busy is terminal (classified cursor.agent_busy upstream).
+          if (busyRetries === 0 && classifyErrorImpl(error).isBusy) {
+            busyRetries += 1;
+            dbg('cursor agent busy, recreating handle for one retry');
+            await agentHandle?.close?.();
+            agentHandle = null;
+            await ensureAgentHandle(message, model);
+            continue;
+          }
+          throw error;
         }
       }
     } catch (error) {
@@ -275,11 +348,8 @@ export function createClaudeTurnRunner({
       }
       throw error;
     } finally {
-      // Release the input gate on every exit path (abort, error, no result) —
-      // a still-gated stream would keep the CLI process alive forever.
-      turn?.endInput?.();
       controlPoller?.stop?.(controlState);
-      // Runs on every exit path so a snapshot captured before the turn went
+      // Runs on every exit path so usage captured before the turn went
       // sideways still reaches the relay.
       await publishContextUsage(message, state, model);
     }
@@ -292,7 +362,7 @@ export function createClaudeTurnRunner({
     const result = state.result;
     const responseModel = state.responseModel || model || null;
     if (!result) {
-      // The SDK stream ended without a result envelope; surface what streamed.
+      // The run ended without a terminal status message; surface what streamed.
       const fallbackText = String(state.lastStreamedText || normalizer.finalStreamText() || '').trim();
       if (fallbackText) {
         await publishFinalStream(message, fallbackText);
@@ -305,15 +375,15 @@ export function createClaudeTurnRunner({
 
     if (result.isError) {
       const errorText = result.text
-        || `Claude turn failed (${result.subtype || 'unknown error'}).`;
+        || `Cursor turn failed (${result.subtype || 'unknown error'}).`;
       await publishFinalStream(message, state.lastStreamedText);
       await publishResponse(message, {
         text: errorText,
         model: responseModel,
         terminalError: {
-          kind: 'claude-turn-failed',
+          kind: 'cursor-turn-failed',
           code: result.subtype || 'unknown',
-          stableCode: `claude.${result.subtype || 'unknown'}`,
+          stableCode: `cursor.${result.subtype || 'unknown'}`,
           message: errorText,
           failedAt: new Date().toISOString(),
           queueMessageId: String(message.id || '') || null,
@@ -328,10 +398,10 @@ export function createClaudeTurnRunner({
       && String(message.relayMode || '').trim().toLowerCase() === 'plan'
       && countPlanLikeLines(finalText) >= 2
     ) {
-      const boardPayload = buildClaudePlanReadyBoardPayload({ message, planText: finalText });
+      const boardPayload = buildCursorPlanReadyBoardPayload({ message, planText: finalText });
       if (boardPayload) {
-        boardPayload.context.source = 'plan-mode-fallback';
         await api('POST', '/api/relay-board', boardPayload).catch(() => {});
+        planBoardPosted = true;
       }
     }
     if (!finalText) {
@@ -351,19 +421,18 @@ export function createClaudeTurnRunner({
     try {
       return await runTurn(message);
     } catch (error) {
-      const errorText = String(error?.message || error || 'unknown error');
-      dbg('claude turn failed', message.id, errorText);
-      const isAuthError = /authentication|logged in|login|credential|api key/i.test(errorText);
+      const classified = classifyErrorImpl(error);
+      dbg('cursor turn failed', message.id, classified.message);
       await publishResponse(message, {
-        text: isAuthError
-          ? `System note: the Claude runtime could not authenticate (${errorText}). Log in with the Claude CLI on the relay host (run \`claude\`), then retry.`
-          : `System note: the Claude turn failed (${errorText}). Retry or send a new message.`,
+        text: classified.isAuth
+          ? `System note: the Cursor runtime could not authenticate (${classified.message}). Set or renew the Cursor API key in provider settings, then retry.`
+          : `System note: the Cursor turn failed (${classified.message}).`,
         model: null,
         terminalError: {
-          kind: 'claude-turn-failed',
-          code: isAuthError ? 'authentication_failed' : 'turn-error',
-          stableCode: isAuthError ? 'claude.authentication_failed' : 'claude.turn-error',
-          message: errorText,
+          kind: 'cursor-turn-failed',
+          code: classified.code,
+          stableCode: classified.stableCode,
+          message: classified.message,
           failedAt: new Date().toISOString(),
           queueMessageId: String(message.id || '') || null,
         },
@@ -379,5 +448,6 @@ export function createClaudeTurnRunner({
     handlePendingPayload,
     getActiveQueueMessageId,
     isTurnActive,
+    dispose,
   };
 }

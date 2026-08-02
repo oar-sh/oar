@@ -6,14 +6,18 @@ function sleepDefault(ms) {
  * Poll the relay's control API while a turn is in flight, mirroring the
  * Copilot extension's `checkActiveAbortControl` semantics:
  * - `abort_turn`   → invoke `onAbortTurn()` and acknowledge the control.
- * - `abort_subagent` → report "not supported" (the Claude Agent SDK has no
- *   per-subagent cancellation); the full-turn Stop still works.
+ * - `abort_subagent` → report "not supported" (neither the Claude Agent SDK
+ *   nor the Cursor SDK expose per-subagent cancellation); the full-turn Stop
+ *   still works.
+ *
+ * Provider workers customize the acknowledgement note via `abortAckNote`.
  */
 export function createControlPoller({
   api,
   sdkSessionId,
   pollMs = 1200,
   sleep = sleepDefault,
+  abortAckNote = 'query aborted',
   dbg = () => {},
 } = {}) {
   let active = null;
@@ -44,7 +48,7 @@ export function createControlPoller({
       await onAbortTurn();
       await api('POST', `/api/control/${encodeURIComponent(control.id)}/result`, {
         ok: true,
-        note: 'claude query aborted',
+        note: abortAckNote,
       }).catch(() => {});
       return true;
     } catch (error) {

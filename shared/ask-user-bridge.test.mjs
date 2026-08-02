@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createAskUserBridge } from './ask-user-bridge.mjs';
-import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from '../../shared/question-timeout.mjs';
+import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from './question-timeout.mjs';
 
 function makeApiStub({ answers = [], statuses = [] } = {}) {
   const calls = [];
@@ -112,4 +112,37 @@ test('empty question input yields empty answers without API calls', async () => 
   const result = await bridge.handleAskUserQuestion({ questions: [] });
   assert.deepEqual(result.answers, {});
   assert.equal(stub.calls.length, 0);
+});
+
+test('question source and rationale default to the Claude wire payload and are overridable', async () => {
+  const question = {
+    questions: [{
+      question: 'Which one?',
+      header: 'Pick',
+      multiSelect: false,
+      options: [{ label: 'A', description: '' }, { label: 'B', description: '' }],
+    }],
+  };
+
+  const defaultStub = makeApiStub({ answers: ['A'] });
+  await createAskUserBridge({
+    api: defaultStub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  }).handleAskUserQuestion(question);
+  const defaultPost = defaultStub.calls.find((call) => call.routePath === '/api/relay-question');
+  assert.equal(defaultPost.body.context.source, 'AskUserQuestion');
+  assert.match(defaultPost.body.context.rationale, /Claude requested clarification/);
+
+  const cursorStub = makeApiStub({ answers: ['A'] });
+  await createAskUserBridge({
+    api: cursorStub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+    questionSource: 'ask_user',
+    questionRationale: 'Cursor requested clarification to continue this turn.',
+  }).handleAskUserQuestion(question);
+  const cursorPost = cursorStub.calls.find((call) => call.routePath === '/api/relay-question');
+  assert.equal(cursorPost.body.context.source, 'ask_user');
+  assert.equal(cursorPost.body.context.rationale, 'Cursor requested clarification to continue this turn.');
 });

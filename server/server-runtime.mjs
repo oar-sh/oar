@@ -60,7 +60,7 @@ import { createSessionWorkerRegistry } from './services/session-worker-registry-
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
-import { applyClaudeProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeProviderEnvironment, applyCursorProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
@@ -86,6 +86,7 @@ import {
   filterValidModelIds,
   isOpenAIModelId,
   isSafeClaudeModelId,
+  isSafeCursorModelId,
   isSafeProviderModelId,
   isValidModelId,
 } from '../shared/model-id.mjs';
@@ -471,6 +472,155 @@ async function refreshClaudeProviderModels() {
   }
 }
 
+function getCursorProviderSettings() {
+  const apiKey = readAppSettingValue(CURSOR_API_KEY_SETTING_KEY);
+  const enabledSetting = readAppSettingValue(CURSOR_ENABLED_SETTING_KEY);
+  const enabled = !!apiKey && (enabledSetting === '' || enabledSetting === 'true');
+  const model = readAppSettingValue(CURSOR_MODEL_SETTING_KEY) || DEFAULT_CURSOR_MODEL;
+  let models = [];
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_MODELS_SETTING_KEY) || '[]');
+    if (Array.isArray(parsed)) {
+      models = parsed
+        .map((value) => String(value || '').trim())
+        .filter((modelId) => isSafeCursorModelId(modelId));
+    }
+  } catch {
+    models = [];
+  }
+  return {
+    configured: !!apiKey,
+    enabled,
+    apiKey,
+    model,
+    models: Array.from(new Set([model, ...(models.length ? models : DEFAULT_CURSOR_MODELS)])),
+    providerType: 'cursor',
+  };
+}
+
+function setCursorProviderSettings(update = {}) {
+  const payload = update && typeof update === 'object' ? update : {};
+  const apiKey = payload.apiKey;
+  const model = payload.model;
+  const enabled = payload.enabled;
+  const remove = payload.remove === true;
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Cursor settings are unavailable' };
+  }
+  const existing = getCursorProviderSettings();
+  const normalizedModel = String(model || existing.model || '').trim() || DEFAULT_CURSOR_MODEL;
+  if (!isSafeCursorModelId(normalizedModel)) {
+    return { ok: false, error: 'Invalid Cursor model ID' };
+  }
+  const nowIso = new Date().toISOString();
+  if (remove) {
+    const providerCandidates = Array.isArray(stmts?.listRuntimeSessionProviderCandidates?.all?.())
+      ? stmts.listRuntimeSessionProviderCandidates.all()
+      : [];
+    const startedConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'cursor'
+      && Number(row?.message_count || 0) > 0
+    )).length;
+    const activeQueueConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'cursor'
+      && Number(row?.active_queue_count || 0) > 0
+    )).length;
+    const activeConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'cursor'
+      && (Number(row?.message_count || 0) > 0 || Number(row?.active_queue_count || 0) > 0)
+    )).length;
+    if (activeConversationCount > 0) {
+      return {
+        ok: false,
+        code: 'cursor-key-removal-blocked',
+        error: `Cannot remove Cursor API key while ${activeConversationCount} active Cursor conversation(s) still exist. Disable Cursor for new conversations instead.`,
+        activeConversationCount,
+        startedConversationCount,
+        activeQueueConversationCount,
+      };
+    }
+    stmts.deleteAppSetting.run(CURSOR_API_KEY_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
+    stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, 'false', nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  } else {
+    const normalizedApiKey = String(apiKey || '').trim();
+    if (normalizedApiKey) {
+      stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
+      stmts.upsertAppSetting.run(CURSOR_API_KEY_SETTING_KEY, normalizedApiKey, nowIso);
+    }
+    const hasApiKey = !!(normalizedApiKey || existing.apiKey);
+    const nextEnabled = typeof enabled === 'boolean' ? enabled : (normalizedApiKey ? true : existing.enabled);
+    if (nextEnabled && !hasApiKey) return { ok: false, error: 'Cursor API key is not configured' };
+    stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  }
+  const current = getCursorProviderSettings();
+  return {
+    ok: true,
+    configured: current.configured,
+    enabled: current.enabled,
+    model: current.model,
+  };
+}
+
+const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
+
+// Discover the models the Cursor Agent SDK can serve (mirrors
+// refreshClaudeProviderModels). The SDK's model-listing entry point is
+// normalized defensively (static list vs. client instance) pending spike
+// confirmation of the exact call form.
+async function refreshCursorProviderModels() {
+  const settings = getCursorProviderSettings();
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, models: settings.models, error: 'Cursor settings are unavailable' };
+  }
+  if (settings.enabled !== true) {
+    return { ok: false, models: settings.models, error: 'Cursor API key is not configured' };
+  }
+  try {
+    const mod = await import('@cursor/sdk');
+    const listModels = async () => {
+      try {
+        const listed = await mod.Cursor?.models?.list?.({ apiKey: settings.apiKey });
+        if (listed !== undefined) return listed;
+      } catch { /* fall through to the client-instance form */ }
+      const CursorClient = mod.Cursor || mod.default;
+      return new CursorClient({ apiKey: settings.apiKey }).models.list();
+    };
+    const payload = await Promise.race([
+      listModels(),
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`timed out after ${CURSOR_MODEL_DISCOVERY_TIMEOUT_MS}ms`)),
+          CURSOR_MODEL_DISCOVERY_TIMEOUT_MS,
+        );
+        timer.unref?.();
+      }),
+    ]);
+    const entries = Array.isArray(payload)
+      ? payload
+      : (Array.isArray(payload?.models)
+        ? payload.models
+        : (Array.isArray(payload?.data) ? payload.data : []));
+    const discovered = entries
+      .map((entry) => String(typeof entry === 'string' ? entry : (entry?.id || entry?.name || '')).trim())
+      .filter((modelId) => modelId && isSafeCursorModelId(modelId));
+    if (!discovered.length) {
+      return { ok: false, models: settings.models, error: 'Cursor model discovery returned no models' };
+    }
+    const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
+    stmts.upsertAppSetting.run(CURSOR_MODELS_SETTING_KEY, JSON.stringify(models), new Date().toISOString());
+    return { ok: true, models, error: null };
+  } catch (error) {
+    return {
+      ok: false,
+      models: settings.models,
+      error: `Cursor model discovery failed: ${String(error?.message || error || 'unknown error')}`,
+    };
+  }
+}
+
 const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conversationSessionMode: 'isolated', localhostOnly: true };
 // How long a turn may go without any sign of life from its worker before the
 // relay assumes the worker died. This is an inactivity window, not a cap on turn
@@ -496,6 +646,12 @@ const CLAUDE_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max
 const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 const DEFAULT_CLAUDE_MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];
+const CURSOR_API_KEY_SETTING_KEY = 'cursor_api_key';
+const CURSOR_ENABLED_SETTING_KEY = 'cursor_enabled';
+const CURSOR_MODEL_SETTING_KEY = 'cursor_model';
+const CURSOR_MODELS_SETTING_KEY = 'cursor_models';
+const DEFAULT_CURSOR_MODEL = 'composer-2.5';
+const DEFAULT_CURSOR_MODELS = ['composer-2.5'];
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
 const DEFAULT_RELAY_MODE = 'agent';
 const AUTO_MODEL_SENTINEL = 'auto';
@@ -2740,6 +2896,11 @@ if (runtimeSessionColumns.length) {
     // restarts.
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN claude_native_session_id TEXT`);
   }
+  if (!runtimeSessionColumns.includes('cursor_agent_id')) {
+    // Cursor Agent SDK durable agent id; replayed on queue messages so Cursor
+    // conversations survive worker restarts.
+    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN cursor_agent_id TEXT`);
+  }
   if (!runtimeSessionColumns.includes('context_usage_json')) {
     // Latest context-window breakdown reported by the Claude Agent SDK. Claude
     // sessions have no Copilot events.jsonl to tail, so this is the only source
@@ -3206,25 +3367,37 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
     || stmts.getRuntimeSessionByConversation.get(normalizedTargetSessionId)
     || null;
   const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+  // Clear every provider's variables first (the appliers' kind-guarded deletes
+  // keep the chained clears order-independent), then apply only the bound one.
+  const cleared = applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv)));
   if (providerType === 'claude') {
     const claudeSettings = getClaudeProviderSettings();
     const claudeModel = String(runtimeSession?.provider_model || runtimeSession?.model || claudeSettings.model).trim();
-    return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv), {
+    return applyClaudeProviderEnvironment(cleared, {
       enabled: true,
       model: claudeModel,
     });
   }
+  if (providerType === 'cursor') {
+    const cursorSettings = getCursorProviderSettings();
+    const cursorModel = String(runtimeSession?.provider_model || runtimeSession?.model || cursorSettings.model).trim();
+    return applyCursorProviderEnvironment(cleared, {
+      enabled: true,
+      model: cursorModel,
+      apiKey: cursorSettings.apiKey,
+    });
+  }
   if (providerType !== 'openai') {
-    return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv));
+    return cleared;
   }
   const settings = getOpenAIProviderSettings();
   const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
-  return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv, {
+  return applyOpenAIProviderEnvironment(cleared, {
     enabled: true,
     apiKey: settings.apiKey,
     model,
     baseUrl: settings.baseUrl,
-  }));
+  });
 }
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
@@ -3316,8 +3489,13 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
 }
 
 async function reconcileUnstartedConversationProviders({ enabled, model, provider = 'openai' } = {}) {
-  const managedProvider = String(provider || 'openai').trim().toLowerCase() === 'claude' ? 'claude' : 'openai';
-  const managedDefaultModel = managedProvider === 'claude' ? DEFAULT_CLAUDE_MODEL : DEFAULT_OPENAI_MODEL;
+  const normalizedProvider = String(provider || 'openai').trim().toLowerCase();
+  const managedProvider = ['claude', 'cursor'].includes(normalizedProvider) ? normalizedProvider : 'openai';
+  const managedDefaultModel = {
+    openai: DEFAULT_OPENAI_MODEL,
+    claude: DEFAULT_CLAUDE_MODEL,
+    cursor: DEFAULT_CURSOR_MODEL,
+  }[managedProvider];
   const providerType = enabled === true ? managedProvider : 'github';
   const providerModel = enabled === true
     ? (String(model || '').trim() || managedDefaultModel)
@@ -3386,7 +3564,9 @@ async function reconcileUnstartedConversationProviders({ enabled, model, provide
       let rollbackError = null;
       const canRestorePreviousProvider = currentProvider === 'claude'
         ? getClaudeProviderSettings().enabled === true
-        : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true);
+        : (currentProvider === 'cursor'
+          ? getCursorProviderSettings().configured === true
+          : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true));
       if (providerWasUpdated && canRestorePreviousProvider) {
         stmts.updateRuntimeSessionProvider.run(
           currentProvider,
@@ -5964,6 +6144,9 @@ const sharedRouteDeps = {
   getClaudeProviderSettings,
   setClaudeProviderSettings,
   refreshClaudeProviderModels,
+  getCursorProviderSettings,
+  setCursorProviderSettings,
+  refreshCursorProviderModels,
   reconcileUnstartedConversationProviders,
   rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,
@@ -6219,10 +6402,12 @@ function ensureRuntimeSessionBinding(
     ? 'openai'
     : (normalizedRequestedProviderType === 'claude'
       ? 'claude'
-      : (normalizedRequestedProviderType === 'github'
-        ? 'github'
-        : (openAISettings?.enabled ? 'openai' : 'github')));
-  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude')
+      : (normalizedRequestedProviderType === 'cursor'
+        ? 'cursor'
+        : (normalizedRequestedProviderType === 'github'
+          ? 'github'
+          : (openAISettings?.enabled ? 'openai' : 'github'))));
+  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor')
     ? (String(providerModel || normalizedModel || '').trim() || null)
     : null;
   try {

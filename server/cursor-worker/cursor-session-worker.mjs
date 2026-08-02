@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Claude session worker: a per-conversation Node process that speaks the same
+// Cursor session worker: a per-conversation Node process that speaks the same
 // relay contracts as the Copilot CLI workers (worker WebSocket, heartbeat,
-// control polling, activity channels) but executes turns through the Claude
-// Agent SDK using the host machine's logged-in Claude credentials.
+// control polling, activity channels) but executes turns through the Cursor
+// SDK using an API key from the environment.
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -14,7 +14,7 @@ import { createApiClient } from '../../.github/extensions/web-relay/runtime/api-
 import { createWorkerWebSocketLink } from '../../.github/extensions/web-relay/runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../.github/extensions/web-relay/polling/heartbeat.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
-import { createClaudeTurnRunner } from './claude-turn-runner.mjs';
+import { createCursorTurnRunner } from './cursor-turn-runner.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HEARTBEAT_MS = 10_000;
@@ -29,13 +29,13 @@ function parseSessionIdArg(argv = process.argv) {
 
 function dbg(...parts) {
   const timestamp = new Date().toISOString();
-  console.log(`[claude-worker ${timestamp}]`, ...parts);
+  console.log(`[cursor-worker ${timestamp}]`, ...parts);
 }
 
 async function main() {
   const sdkSessionId = parseSessionIdArg();
   if (!sdkSessionId) {
-    console.error('claude-session-worker: missing --session-id');
+    console.error('cursor-session-worker: missing --session-id');
     process.exit(2);
   }
 
@@ -44,8 +44,15 @@ async function main() {
   const serverUrl = resolveRelayServerUrl({ configPath });
   const token = loadTokenFromConfig(configPath);
   const cwd = String(process.env.COPILOT_WORKSPACE_ROOT || '').trim() || process.cwd();
-  const defaultModel = String(process.env.CLAUDE_RELAY_MODEL || '').trim();
-  const pathToClaudeCodeExecutable = String(process.env.CLAUDE_CODE_EXECUTABLE || '').trim();
+  const defaultModel = String(process.env.CURSOR_RELAY_MODEL || '').trim();
+  const apiKey = String(process.env.CURSOR_API_KEY || '').trim();
+  if (!apiKey) {
+    // Not fatal: the first turn surfaces cursor.authentication_failed with a
+    // renewal hint, which is more visible to the user than a dead worker.
+    console.warn('cursor-session-worker: CURSOR_API_KEY is not set; turns will fail until it is provided');
+  }
+  const storeDir = String(process.env.CURSOR_AGENT_STORE_DIR || '').trim()
+    || path.resolve(__dirname, '..', 'data', 'cursor-agents');
 
   const api = createApiClient({
     serverUrl,
@@ -58,14 +65,15 @@ async function main() {
     }),
   });
 
-  const controlPoller = createControlPoller({ api, sdkSessionId, abortAckNote: 'claude query aborted', dbg });
-  const turnRunner = createClaudeTurnRunner({
+  const controlPoller = createControlPoller({ api, sdkSessionId, abortAckNote: 'cursor run cancelled', dbg });
+  const turnRunner = createCursorTurnRunner({
     api,
     sdkSessionId,
     cwd,
     defaultModel,
+    apiKey,
+    storeDir,
     controlPoller,
-    pathToClaudeCodeExecutable,
     dbg,
   });
 
@@ -97,15 +105,17 @@ async function main() {
     },
   });
 
-  const shutdown = (signal) => {
+  const shutdown = async (signal) => {
     dbg(`shutting down (${signal})`);
     try { wsLink.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
+    // The agent handle owns a SQLite store; close it before exiting.
+    try { await turnRunner.dispose(); } catch {}
     process.exit(0);
   };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => { shutdown('SIGTERM'); });
+  process.on('SIGINT', () => { shutdown('SIGINT'); });
 
   dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}`);
   heartbeat.startHeartbeat();
@@ -113,6 +123,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error('claude-session-worker fatal:', error?.stack || error?.message || error);
+  console.error('cursor-session-worker fatal:', error?.stack || error?.message || error);
   process.exit(1);
 });

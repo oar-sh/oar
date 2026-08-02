@@ -34,6 +34,7 @@ import {
   CLAUDE_LONG_CONTEXT_LIMIT_TOKENS,
   CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN,
   isSafeClaudeModelId,
+  isSafeCursorModelId,
   isSafeProviderModelId,
 } from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
@@ -235,6 +236,37 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
   };
 }
 
+export function parseCursorSettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const remove = payload.remove === true;
+  const hasModel = Object.prototype.hasOwnProperty.call(payload, 'model');
+  const model = hasModel ? (String(payload.model || '').trim() || 'composer-2.5') : undefined;
+  const apiKey = String(payload.apiKey || '').trim();
+  const hasEnabled = typeof payload.enabled === 'boolean';
+  if (!remove && !hasModel && !apiKey && !hasEnabled) {
+    return { ok: false, error: 'No Cursor settings update provided' };
+  }
+  if (hasModel && !isSafeCursorModelId(model)) {
+    return { ok: false, error: 'Invalid Cursor model ID' };
+  }
+  if (remove) {
+    return {
+      ok: true,
+      remove: true,
+      apiKey: '',
+      ...(hasModel ? { model } : {}),
+      enabled: false,
+    };
+  }
+  return {
+    ok: true,
+    remove: false,
+    apiKey,
+    ...(hasModel ? { model } : {}),
+    enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
+  };
+}
+
 export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSettings = {}) {
   const configured = claudeSettings?.enabled === true;
   const model = String(claudeSettings?.model || '').trim();
@@ -375,11 +407,74 @@ export function buildModelCatalogWithOpenAIProvider(modelState = {}, openAISetti
   };
 }
 
+export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSettings = {}) {
+  const configured = cursorSettings?.enabled === true;
+  const model = String(cursorSettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const baseModels = new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+  const cursorModelList = Array.isArray(cursorSettings?.models)
+    ? cursorSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const cursorModels = [];
+  const seenCursorModels = new Set();
+  for (const cursorModelId of [model, ...cursorModelList]) {
+    const lowerId = cursorModelId.toLowerCase();
+    if (seenCursorModels.has(lowerId)) continue;
+    seenCursorModels.add(lowerId);
+    cursorModels.push(cursorModelId);
+  }
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), ...cursorModels]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const cursorReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  for (const cursorModel of cursorModels) {
+    const providersKey = String(cursorModel || '').trim();
+    if (!providersKey) continue;
+    const lowerKey = providersKey.toLowerCase();
+    // Cursor exposes no reasoning-effort tiers; every model runs at 'none'.
+    cursorReasoningByModel[lowerKey] = ['none'];
+    if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
+      reasoningByModel[lowerKey] = ['none'];
+    }
+    const existingProviders = Array.isArray(providersByModel[providersKey])
+      ? providersByModel[providersKey]
+      : (Array.isArray(providersByModel[lowerKey])
+          ? providersByModel[lowerKey]
+          : (modelMetadataByModel[providersKey]?.provider ? [modelMetadataByModel[providersKey].provider] : []));
+    providersByModel[providersKey] = Array.from(new Set([
+      ...existingProviders,
+      ...(baseModels.has(lowerKey) ? ['github-copilot'] : []),
+      'cursor',
+    ]));
+    modelMetadataByModel[providersKey] = {
+      ...(modelMetadataByModel[providersKey] || {}),
+      provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'cursor'),
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      cursor: cursorReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude' || normalized === 'claude-agent-sdk' || normalized === 'anthropic') return 'claude';
+  if (normalized === 'cursor') return 'cursor';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }
@@ -963,6 +1058,8 @@ export function buildConversationSessionRootPayload({
   resolveClaudeSessionRoot = null,
 } = {}) {
   const sid = String(sdkSessionId || '').trim() || String(conversationId || '').trim();
+  // Cursor sessions keep no on-disk session root at all, so there is nothing to expose.
+  if (String(providerType || '').trim().toLowerCase() === 'cursor') return null;
   // Claude sessions have no ~/.copilot/session-state entry — only the Copilot
   // CLI creates those — so they resolve against the Agent SDK's own layout and
   // never fall through to the branch below.
@@ -1582,6 +1679,9 @@ export function registerSessionsRoutes(app, deps) {
     getClaudeProviderSettings = () => ({ configured: false, enabled: false, model: 'claude-sonnet-5', models: [] }),
     setClaudeProviderSettings = () => ({ ok: false, error: 'Claude settings are unavailable' }),
     refreshClaudeProviderModels = async () => ({ ok: false, models: [], error: 'Claude model discovery is unavailable' }),
+    getCursorProviderSettings = () => ({ configured: false, enabled: false, model: 'composer-2.5', models: [] }),
+    setCursorProviderSettings = () => ({ ok: false, error: 'Cursor settings are unavailable' }),
+    refreshCursorProviderModels = async () => ({ ok: false, models: [], error: 'Cursor model discovery is unavailable' }),
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -1733,9 +1833,12 @@ export function registerSessionsRoutes(app, deps) {
 
   // Layer every enabled provider's models onto the base Copilot catalog.
   function buildModelCatalogWithProviders(modelState, openAISettings = getOpenAIProviderSettings()) {
-    return buildModelCatalogWithClaudeProvider(
-      buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
-      getClaudeProviderSettings(),
+    return buildModelCatalogWithCursorProvider(
+      buildModelCatalogWithClaudeProvider(
+        buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
+        getClaudeProviderSettings(),
+      ),
+      getCursorProviderSettings(),
     );
   }
 
@@ -2445,9 +2548,11 @@ export function registerSessionsRoutes(app, deps) {
       || stmts.getRuntimeSessionByConversation.get(lookupId)
       || null;
     const copilotSessionId = String(runtimeSessionBySdkSessionId?.sdk_session_id || runtimeSession?.sdk_session_id || '').trim() || null;
-    const isClaude = String(runtimeSession?.provider_type || 'github').trim().toLowerCase() === 'claude';
+    const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+    // The cursor worker posts the same Claude-shaped usage blob, so both providers share the stored reader.
+    const usesStoredContextUsage = providerType === 'claude' || providerType === 'cursor';
 
-    const parsed = isClaude
+    const parsed = usesStoredContextUsage
       ? (() => {
         const stored = readStoredClaudeContextUsage(runtimeSession);
         return {
@@ -2471,7 +2576,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId: lookupId,
       runtimeSessionId: runtimeSession?.id || null,
       copilotSessionId,
-      providerType: isClaude ? 'claude' : 'github',
+      providerType: usesStoredContextUsage ? providerType : 'github',
       snapshot: parsed.snapshot || null,
       contextUsage: buildContextUsageView({
         snapshot: parsed.snapshot,
@@ -3725,6 +3830,23 @@ export function registerSessionsRoutes(app, deps) {
         code: 'CLAUDE_MODEL_UNAVAILABLE',
       });
     }
+    const cursorSettings = getCursorProviderSettings();
+    const availableCursorModels = new Set([
+      String(cursorSettings?.model || '').trim(),
+      ...(Array.isArray(cursorSettings?.models) ? cursorSettings.models : []),
+    ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean));
+    if (
+      requestedProviderType === 'cursor'
+      && requestedBootstrapModel
+      && requestedBootstrapModel.toLowerCase() !== 'auto'
+      && !availableCursorModels.has(requestedBootstrapModel.toLowerCase())
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Requested Cursor model is not available',
+        code: 'CURSOR_MODEL_UNAVAILABLE',
+      });
+    }
     const useOpenAIProvider = requestedProviderType === 'openai'
       || requestedProviderType === 'openai-image'
       || (
@@ -3742,6 +3864,15 @@ export function registerSessionsRoutes(app, deps) {
         && availableClaudeModels.has(requestedBootstrapModel)
       )
     );
+    const useCursorProvider = !useOpenAIProvider && !useClaudeProvider && (
+      requestedProviderType === 'cursor'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableCursorModels.has(requestedBootstrapModel.toLowerCase())
+      )
+    );
     if (useOpenAIProvider && openAISettings?.configured !== true) {
       return res.status(400).json({
         ok: false,
@@ -3754,6 +3885,13 @@ export function registerSessionsRoutes(app, deps) {
         ok: false,
         error: 'Claude provider is not enabled',
         code: 'CLAUDE_NOT_CONFIGURED',
+      });
+    }
+    if (useCursorProvider && cursorSettings?.configured !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Cursor API key is not configured',
+        code: 'CURSOR_NOT_CONFIGURED',
       });
     }
 
@@ -3769,7 +3907,13 @@ export function registerSessionsRoutes(app, deps) {
             configuredModel: claudeSettings.model,
             availableModels: Array.from(availableClaudeModels),
           })
-        : catalogSelectedModel);
+        : (useCursorProvider
+          ? resolveOpenAISessionModel({
+              requestedModel: catalogSelectedModel,
+              configuredModel: cursorSettings.model,
+              availableModels: Array.from(availableCursorModels),
+            })
+          : catalogSelectedModel));
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
       return res.status(400).json({
         ok: false,
@@ -3777,7 +3921,7 @@ export function registerSessionsRoutes(app, deps) {
         code: 'OPENAI_IMAGE_MODEL_REQUIRED',
       });
     }
-    if (!useOpenAIProvider && !useClaudeProvider) {
+    if (!useOpenAIProvider && !useClaudeProvider && !useCursorProvider) {
       const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
         ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
         : [];
@@ -3799,6 +3943,15 @@ export function registerSessionsRoutes(app, deps) {
           code: 'CLAUDE_PROVIDER_REQUIRED',
         });
       }
+      const cursorOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'cursor');
+      if (cursorOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the Cursor provider`,
+          code: 'CURSOR_PROVIDER_REQUIRED',
+        });
+      }
     }
 
     try {
@@ -3810,8 +3963,8 @@ export function registerSessionsRoutes(app, deps) {
         conversationId,
         {
           assignConfiguredProvider: true,
-          providerType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : 'github'),
-          providerModel: (useOpenAIProvider || useClaudeProvider) ? selectedModel : null,
+          providerType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : (useCursorProvider ? 'cursor' : 'github')),
+          providerModel: (useOpenAIProvider || useClaudeProvider || useCursorProvider) ? selectedModel : null,
         },
       );
       const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
@@ -3865,7 +4018,7 @@ export function registerSessionsRoutes(app, deps) {
         worker: ownerWorker,
         lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
         selectedModel,
-        selectedProviderType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : 'github'),
+        selectedProviderType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : (useCursorProvider ? 'cursor' : 'github')),
         warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
         ...workspaceRootPayload(),
       });
@@ -4124,6 +4277,84 @@ export function registerSessionsRoutes(app, deps) {
       warning: reconciliationFailures.length
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'Claude model discovery failed')),
+    });
+  });
+
+  app.get('/api/settings/cursor', auth, (_req, res) => {
+    const settings = getCursorProviderSettings();
+    return res.json({
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'composer-2.5').trim() || 'composer-2.5',
+      models: Array.isArray(settings?.models) ? settings.models : [],
+    });
+  });
+
+  app.post('/api/settings/cursor', auth, async (req, res) => {
+    const parsed = parseCursorSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const previous = getCursorProviderSettings();
+    const result = setCursorProviderSettings(parsed);
+    if (!result?.ok) {
+      const statusCode = result?.code === 'cursor-key-removal-blocked' ? 409 : 400;
+      return res.status(statusCode).json({
+        error: result?.error || 'Failed to update Cursor settings',
+        code: result?.code || null,
+        activeConversationCount: Number(result?.activeConversationCount || 0),
+        startedConversationCount: Number(result?.startedConversationCount || 0),
+        activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
+      });
+    }
+    const shouldDiscover = result.enabled === true && (
+      !!parsed.apiKey
+      || previous?.enabled !== true
+      || previous?.model !== result.model
+    );
+    const discovery = !shouldDiscover
+      ? { ok: true, models: [], error: null }
+      : await refreshCursorProviderModels();
+    // Removing the Cursor key rebinds unstarted Cursor conversations back to
+    // the default provider (mirrors the OpenAI key-removal reconciliation).
+    const reconciliationResult = parsed.remove === true
+      ? await reconcileUnstartedConversationProviders({
+          enabled: false,
+          model: result.model,
+          provider: 'cursor',
+        })
+      : {
+          updatedUnstartedConversations: 0,
+          skippedStartedConversations: 0,
+          skippedActiveQueueConversations: 0,
+          failedConversations: [],
+        };
+    const reconciliation = {
+      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
+        ? reconciliationResult.failedConversations
+        : [],
+    };
+    const currentSettings = getCursorProviderSettings();
+    const settingsPayload = {
+      configured: currentSettings?.configured === true,
+      enabled: currentSettings?.enabled === true,
+      model: String(currentSettings?.model || result.model || 'composer-2.5').trim() || 'composer-2.5',
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      reconciliation,
+    };
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('cursor_settings_updated', settingsPayload);
+    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
+      ? reconciliation.failedConversations
+      : [];
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      models: Array.isArray(discovery?.models) ? discovery.models : [],
+      warning: reconciliationFailures.length
+        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'Cursor model discovery failed')),
     });
   });
 
@@ -4403,6 +4634,7 @@ export function registerSessionsRoutes(app, deps) {
     try {
       const openAISettings = getOpenAIProviderSettings();
       const claudeSettings = getClaudeProviderSettings();
+      const cursorSettings = getCursorProviderSettings();
       const refreshTasks = [
         refreshModelVariantCatalogFromCli(),
         openAISettings?.enabled === true
@@ -4411,8 +4643,11 @@ export function registerSessionsRoutes(app, deps) {
         claudeSettings?.enabled === true
           ? refreshClaudeProviderModels()
           : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        cursorSettings?.enabled === true
+          ? refreshCursorProviderModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
       ];
-      const [cliRefresh, openAIRefresh, claudeRefresh] = await Promise.allSettled(refreshTasks);
+      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh] = await Promise.allSettled(refreshTasks);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
       const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
         ? openAIRefresh.value
@@ -4428,6 +4663,13 @@ export function registerSessionsRoutes(app, deps) {
             models: Array.isArray(claudeSettings?.models) ? claudeSettings.models : [],
             error: claudeRefresh.reason?.message || 'Claude model discovery failed',
           };
+      const cursorModelDiscovery = cursorRefresh.status === 'fulfilled'
+        ? cursorRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(cursorSettings?.models) ? cursorSettings.models : [],
+            error: cursorRefresh.reason?.message || 'Cursor model discovery failed',
+          };
       io.emit('models_updated', buildModelCatalogWithProviders(
         getModelCatalogState(),
       ));
@@ -4436,6 +4678,7 @@ export function registerSessionsRoutes(app, deps) {
         ...buildModelVariantCatalogPayloadForRoute(),
         openAIModelDiscovery,
         claudeModelDiscovery,
+        cursorModelDiscovery,
       });
     } catch (error) {
       return res.status(500).json({

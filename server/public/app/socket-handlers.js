@@ -86,6 +86,7 @@ let deps = null;
  * @property {(conversationId: string, payload?: object) => void} applyConversationPreferencesForConversation
  * @property {(payload?: object) => void} applyOpenAISettingsState
  * @property {(payload?: object) => void} applyClaudeSettingsState
+ * @property {(payload?: object) => void} applyCursorSettingsState
  */
 
 /**
@@ -197,6 +198,14 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('claude_settings_updated', (payload) => {
     deps?.applyClaudeSettingsState?.(payload || {});
+    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
+      void Promise.resolve()
+        .then(() => deps?.refreshCurrentView?.())
+        .catch(() => {});
+    }
+  });
+  socket.on('cursor_settings_updated', (payload) => {
+    deps?.applyCursorSettingsState?.(payload || {});
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())

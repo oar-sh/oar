@@ -58,6 +58,13 @@ export function isSafeClaudeModelId(value) {
   return MODEL_ID_TOKEN_PATTERN.test(base);
 }
 
+// Cursor model ids ("composer-2.5", "gpt-5.5", "auto-smart") carry no fixed
+// prefix; the safe-chars token check is the whole validation today. Kept as a
+// named seam so cursor-specific rules can diverge without touching callers.
+export function isSafeCursorModelId(value) {
+  return isSafeProviderModelId(value);
+}
+
 // The "[1m]" suffix marks the 1M-context variant of a Claude model. The UI
 // treats it as a context tier of the base model, not a separate model.
 export const CLAUDE_LONG_CONTEXT_SUFFIX = '[1m]';

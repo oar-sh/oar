@@ -269,6 +269,45 @@ export async function updateOpenAISettings({
   }
 }
 
+export async function loadCursorSettings() {
+  return apiFetch('/api/settings/cursor');
+}
+
+export async function updateCursorSettings({
+  apiKey = '',
+  model = 'composer-2.5',
+  enabled = undefined,
+  remove = false,
+} = {}) {
+  const payload = {
+    apiKey: String(apiKey || '').trim(),
+    model: String(model || '').trim() || 'composer-2.5',
+    remove: remove === true,
+  };
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}/api/settings/cursor`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = String(result?.error || `Failed to update Cursor settings (${response.status})`).trim();
+      throw new Error(message);
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure('/api/settings/cursor', error);
+    throw error;
+  }
+}
+
 export async function loadWindowsAutostartSetting() {
   return apiFetch('/api/settings/windows-autostart');
 }

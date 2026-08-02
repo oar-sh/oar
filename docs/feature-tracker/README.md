@@ -11,7 +11,7 @@ that live in the relay itself (and apply to every provider) are tracked here.
 | **Copilot** | `@github/copilot-sdk`, driven by the CLI extension (foreground) or the standalone relay client | [copilot-sdk.md](copilot-sdk.md) |
 | **OpenAI (BYOK)** | Rides the Copilot worker via `COPILOT_PROVIDER_*` env vars; image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md) + the core rows below |
 | **Claude** | `@anthropic-ai/claude-agent-sdk` in `server/claude-worker/` | [claude-sdk.md](claude-sdk.md) |
-| **Cursor** | `@cursor/sdk` — *planned, not yet implemented* | [cursor-sdk.md](cursor-sdk.md) |
+| **Cursor** | `@cursor/sdk` in `server/cursor-worker/` — *implemented, pending live validation* | [cursor-sdk.md](cursor-sdk.md) |
 
 > **Evidence style:** rows cite files and exported symbols, not line ranges. Line numbers in this
 > document went stale silently and ended up pointing at unrelated code; symbol names survive edits
@@ -22,26 +22,25 @@ Status legend: **Implemented** | **Partial** | **Not implemented**
 ## Provider capability matrix
 
 The relay-facing contract a provider worker must deliver. This doubles as the implementation
-checklist for a new provider — the Cursor column maps each capability to the SDK primitive that
-would back it (details in [cursor-sdk.md](cursor-sdk.md)).
+checklist for a new provider (details per column in the per-SDK files).
 
-| Relay capability | Copilot | Claude | Cursor (planned) |
-| ---------------- | ------- | ------ | ---------------- |
-| Turn execution + live reply streaming | Implemented | Implemented | `agent.send()` → `run.stream()` / `onDelta` |
-| Thought / reasoning streaming | Implemented | Implemented | `thinking` events, `thinking-delta` updates |
-| Stop (whole turn) | Implemented | Implemented | `run.cancel()` / `Agent.cancelRun()` |
-| Targeted subagent abort | Partial (capability-probed) | Not implemented (SDK gap) | No primitive found — likely same gap |
-| Question cards (ask user) | Implemented (`onUserInputRequest`) | Implemented (`AskUserQuestion` via `canUseTool`) | **Gap** — no callback API; likely a custom-tool bridge |
-| Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | Unknown |
-| Plan boards (`plan_ready`) | Implemented (tool detection + text fallback) | Implemented (`ExitPlanMode` + text fallback) | `mode: "plan"` + text-fallback heuristic |
-| Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | `tool_call` events for the `Agent` tool |
-| Per-message model switch | Implemented | Implemented | `send({ model })` — sticky per run, must re-pin |
-| Model discovery / catalog | Implemented | Implemented | `Cursor.models.list()` |
-| Reasoning effort per turn | Implemented | Implemented | Model `params` — partial mapping only |
-| Attachments / images | Implemented | Implemented | `images` on `SDKUserMessage` |
-| Resume across worker restarts | Implemented | Implemented | Stable `agentId` + `Agent.resume()` + local store |
-| Context usage display | Not implemented | Implemented | Partial — token totals, no context-window fill |
-| Auth model | Relay host's CLI login | Relay host's `claude` login | **API key** (`CURSOR_API_KEY`) — a new pattern for the relay |
+| Relay capability | Copilot | Claude | Cursor |
+| ---------------- | ------- | ------ | ------ |
+| Turn execution + live reply streaming | Implemented | Implemented | Implemented (`run.stream()` + `onDelta` merged) |
+| Thought / reasoning streaming | Implemented | Implemented | Implemented (`thinking-delta` / `thinking` events) |
+| Stop (whole turn) | Implemented | Implemented | Implemented (`run.cancel()` + abort-signal race) |
+| Targeted subagent abort | Partial (capability-probed) | Not implemented (SDK gap) | Not implemented (SDK gap) |
+| Question cards (ask user) | Implemented (`onUserInputRequest`) | Implemented (`AskUserQuestion` via `canUseTool`) | Implemented (`ask_user` custom tool; 10/10 live compliance) |
+| Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | n/a |
+| Plan boards (`plan_ready`) | Implemented (tool detection + text fallback) | Implemented (`ExitPlanMode` + text fallback) | Implemented (text fallback only) |
+| Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | Implemented (inferred; lifecycle chips only, no text attribution) |
+| Per-message model switch | Implemented | Implemented | Implemented (re-pinned every send — sticky overrides) |
+| Model discovery / catalog | Implemented | Implemented | Implemented (`Cursor.models.list()`, defensive call-shape) |
+| Reasoning effort per turn | Implemented | Implemented | Not implemented (`['none']`; SDK has no effort option) |
+| Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) |
+| Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) |
+| Context usage display | Not implemented | Implemented | Partial (token totals + model window; no fill metric) |
+| Auth model | Relay host's CLI login | Relay host's `claude` login | API key via provider settings (secret-env-file delivery) |
 
 ## Relay core (provider-agnostic)
 
@@ -77,3 +76,7 @@ but are not Copilot SDK surface.
 - 2026-08-02: Corrections from a full re-audit: `availableTools` is now Partial (empty list passed on history-import resume); elicitation validation actually lives in `shared/question-schema.mjs`, not the schema view; `session.getEvents()` is called only by the import service; the Claude SDK has a second (dynamic) import site in `server-runtime.mjs` for model discovery; the extension path is allow-all via `onPreToolUse` `permissionDecision`, not via CLI posture alone.
 - 2026-08-02: Added newly landed Claude surface: `task_notification` system messages, the phantom zero-work result skip, `compact_boundary` activity, `modelUsage`/cost fields on results, and transcript-anchored Session roots.
 - 2026-08-02: Added [cursor-sdk.md](cursor-sdk.md) as the implementation reference for the planned Cursor provider.
+- 2026-08-02: Implemented the Cursor provider end-to-end: `server/cursor-worker/` (adapter, merged-stream normalizer, `ask_user` custom tool, turn runner, entry), relay integration (`provider_type 'cursor'`, settings routes + catalog layer, worker-kind launch routing with a generalized secret-env-file, `cursor_agent_id` column, `/api/cursor-agent-id` + `/api/cursor-context-usage`), and the full frontend. Live validation (spike checklist in cursor-sdk.md) pending.
+- 2026-08-02: Promoted `ask-user-bridge`, `control-poller`, and `countPlanLikeLines` from `server/claude-worker/` to `shared/` (parameterized for multi-provider use; Claude behavior unchanged).
+- 2026-08-02: New Chat now opens the provider picker when any managed provider is enabled — previously only an enabled OpenAI provider unlocked it, leaving Claude-only/Cursor-only setups without a path to the picker.
+- 2026-08-02: Live-validated the Cursor provider with a real key: model discovery (35 models), a streamed relay turn with thoughts, a full ask_user question-card round trip (10/10 tool compliance in the spike), context usage capture, and worker-kill resume via `cursor_agent_id`. Fixed `classifyCursorError` to match the live busy signal (`UnknownAgentError("… already has active run")`). Full results in [cursor-sdk.md](cursor-sdk.md).

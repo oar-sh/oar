@@ -1,7 +1,7 @@
 import {
   DEFAULT_QUESTION_TIMEOUT_MS,
   QUESTION_TIMEOUT_CONTINUATION_TEXT,
-} from '../../shared/question-timeout.mjs';
+} from './question-timeout.mjs';
 
 function sleepDefault(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -25,11 +25,13 @@ function normalizeQuestions(input) {
 }
 
 /**
- * Bridge Claude's native AskUserQuestion tool onto the relay question cards.
+ * Bridge a provider worker's ask-user tool onto the relay question cards.
  *
  * `handleAskUserQuestion(input, { signal })` posts one relay question per
- * AskUserQuestion entry, waits for the answers, and returns the tool input
- * with the collected `answers` map (question text -> answer string) filled in.
+ * question entry, waits for the answers, and returns the collected `answers`
+ * map (question text -> answer string). Provider workers identify themselves
+ * via `questionSource` / `questionRationale` (defaults preserve the Claude
+ * worker's original wire payload).
  */
 export function createAskUserBridge({
   api,
@@ -38,6 +40,8 @@ export function createAskUserBridge({
   sleep = sleepDefault,
   questionPollMs = 1500,
   questionTimeoutMs = DEFAULT_QUESTION_TIMEOUT_MS,
+  questionSource = 'AskUserQuestion',
+  questionRationale = 'Claude requested clarification to continue this turn.',
   dbg = () => {},
 } = {}) {
   async function waitForRelayQuestionAnswer(questionId, { signal } = {}) {
@@ -82,8 +86,8 @@ export function createAskUserBridge({
       sdk_session_id: sdkSessionId || undefined,
       timeout_ms: questionTimeoutMs,
       context: {
-        source: 'AskUserQuestion',
-        rationale: 'Claude requested clarification to continue this turn.',
+        source: questionSource,
+        rationale: questionRationale,
         queueMessageId: activeMsg?.id || null,
         conversationId: activeMsg?.conversationId || null,
         relayMode: activeMsg?.relayMode || 'agent',

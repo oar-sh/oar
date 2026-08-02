@@ -229,7 +229,7 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
 
 ## Providers
 
-The provider is chosen in **New Chat** and then fixed for that conversation: once a conversation has sent its first message it keeps that provider, and its composer is locked to that provider's models.
+The provider is chosen in **New Chat** and then fixed for that conversation: once a conversation has sent its first message it keeps that provider, and its composer is locked to that provider's models. The composer states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / Cursor SDK models.`, colour-coded per provider. OpenAI sessions also pin one exact model, which the note names in brackets and the model dropdown shows as a disabled `🔒` entry.
 
 Turning a provider **off** (or removing the OpenAI key) rebinds conversations that have not yet sent a message back to Copilot, so you are never left with a conversation pointing at a runtime that can no longer start. Conversations already in flight, and conversations belonging to a different provider, are left alone.
 

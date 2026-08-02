@@ -53,15 +53,21 @@ export function resolveOpenAIReasoningEffort(explicitReasoningEffort = '', model
   return { ok: true, effort: explicit || fallback, supported };
 }
 
+// runtimeBoundToOtherProvider covers sessions already pinned to a non-OpenAI
+// provider (Claude, Cursor). Those resolve model ids against their own catalog,
+// and providers reuse each other's ids, so matching the configured OpenAI model
+// id there says nothing about the request targeting OpenAI.
 export function shouldRequireNewOpenAIConversation({
   shouldCreateConversation = false,
   runtimeUsesOpenAI = false,
   requestedConfiguredOpenAIModel = false,
   githubModelAvailable = false,
+  runtimeBoundToOtherProvider = false,
 } = {}) {
   return (
     !shouldCreateConversation
     && !runtimeUsesOpenAI
+    && !runtimeBoundToOtherProvider
     && requestedConfiguredOpenAIModel
     && !githubModelAvailable
   );
@@ -71,6 +77,7 @@ function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok' || normalized === 'openai-image') return 'openai';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
+  if (normalized === 'cursor') return 'cursor';
   return '';
 }
 
@@ -964,6 +971,7 @@ export function buildDequeuedRelayMessage({
     providerType: String(runtimeSession?.provider_type || '').trim().toLowerCase() || null,
     providerModel: String(runtimeSession?.provider_model || '').trim() || null,
     claudeNativeSessionId: String(runtimeSession?.claude_native_session_id || '').trim() || null,
+    cursorAgentId: String(runtimeSession?.cursor_agent_id || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
     quality: normalizeOpenAIImageQuality(msg.reasoning_effort),
@@ -1502,6 +1510,7 @@ export function registerMessagesRoutes(app, deps) {
     resolveRequestedReasoningEffort = () => ({ ok: false, error: 'Reasoning metadata unavailable', supported: [] }),
     getOpenAIProviderSettings = () => ({ enabled: false, model: '' }),
     getClaudeProviderSettings = () => ({ enabled: false, model: '', models: [] }),
+    getCursorProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
@@ -3611,7 +3620,16 @@ export function registerMessagesRoutes(app, deps) {
       : (stmts.getRuntimeSessionByConversation.get(conversationId) || null);
     const configuredOpenAI = getOpenAIProviderSettings();
     const requestedProviderType = normalizeRequestedProviderType(providerType || provider);
-    const runtimeUsesOpenAI = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase() === 'openai';
+    const runtimeProviderType = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase();
+    const runtimeUsesOpenAI = runtimeProviderType === 'openai';
+    // Providers that resell each other's model ids ("claude-opus-5" is served by
+    // Claude, Copilot and Cursor alike) make a model id useless for deciding
+    // which provider a request targets. A session already bound to an explicit
+    // provider resolves ids against that provider's own catalog, so the
+    // cross-provider guards below must not infer a switch from the id alone.
+    const runtimeBoundToExplicitProvider = runtimeProviderType === 'openai'
+      || runtimeProviderType === 'claude'
+      || runtimeProviderType === 'cursor';
     const configuredOpenAIModel = String(configuredOpenAI?.model || '').trim();
     const availableOpenAIModels = new Set(
       (Array.isArray(configuredOpenAI?.models) ? configuredOpenAI.models : [])
@@ -3640,7 +3658,7 @@ export function registerMessagesRoutes(app, deps) {
       && requestedModelLooksOpenAI
       && (
         requestedProviderType === 'openai'
-        || !requestedModelAvailableInGitHub
+        || (!requestedModelAvailableInGitHub && !runtimeBoundToExplicitProvider)
       )
     ) {
       return res.status(409).json({
@@ -3661,11 +3679,40 @@ export function registerMessagesRoutes(app, deps) {
       runtimeUsesOpenAI,
       requestedConfiguredOpenAIModel,
       githubModelAvailable: requestedConfiguredOpenAIModel && requestedModelAvailableInGitHub,
+      runtimeBoundToOtherProvider: runtimeBoundToExplicitProvider && !runtimeUsesOpenAI,
     })) {
       return res.status(409).json({
         error: 'The configured OpenAI model is available only when creating a new conversation',
         code: 'OPENAI_MODEL_REQUIRES_NEW_CONVERSATION',
       });
+    }
+    // Cursor conversations are bootstrap-created only, so an existing
+    // github/openai/claude conversation cannot cross to the Cursor provider
+    // mid-conversation. Cursor settings are read lazily so the hot path stays
+    // untouched for non-Cursor requests.
+    const runtimeUsesCursor = runtimeProviderType === 'cursor';
+    if (!shouldCreateConversation && !runtimeUsesCursor) {
+      let requestTargetsCursor = requestedProviderType === 'cursor';
+      if (
+        !requestTargetsCursor
+        && !runtimeBoundToExplicitProvider
+        && requestedOpenAIModel
+        && !requestedModelAvailableInGitHub
+      ) {
+        const cursorSettings = getCursorProviderSettings();
+        const cursorOnlyModels = new Set([
+          String(cursorSettings?.model || '').trim(),
+          ...(Array.isArray(cursorSettings?.models) ? cursorSettings.models : [])
+            .map((value) => String(value || '').trim()),
+        ].filter(Boolean));
+        requestTargetsCursor = cursorSettings?.enabled === true && cursorOnlyModels.has(requestedOpenAIModel);
+      }
+      if (requestTargetsCursor) {
+        return res.status(409).json({
+          error: 'Cursor model selection requires creating a new Cursor conversation',
+          code: 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION',
+        });
+      }
     }
     if (
       useOpenAIProvider
@@ -3714,7 +3761,7 @@ export function registerMessagesRoutes(app, deps) {
     // Claude conversations resolve models against the Claude provider
     // catalog (the Copilot catalog does not know these ids). Per-turn model
     // switching is allowed: each Claude turn is a fresh query() with resume.
-    const runtimeUsesClaude = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase() === 'claude';
+    const runtimeUsesClaude = runtimeProviderType === 'claude';
     const configuredClaude = runtimeUsesClaude ? getClaudeProviderSettings() : null;
     const requestedClaudeModel = runtimeUsesClaude ? String(model || '').trim() : '';
     const availableClaudeModels = new Set([
@@ -3746,6 +3793,21 @@ export function registerMessagesRoutes(app, deps) {
             : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredClaude?.model || '').trim()),
         )
       : '';
+    // Cursor conversations resolve models against the Cursor provider catalog
+    // (the Copilot catalog does not know these ids). Per-turn model switching
+    // is allowed: each Cursor turn resumes the persisted agent.
+    const configuredCursor = runtimeUsesCursor ? getCursorProviderSettings() : null;
+    const requestedCursorModel = runtimeUsesCursor ? String(model || '').trim() : '';
+    const availableCursorModels = new Set([
+      String(configuredCursor?.model || '').trim(),
+      String(existingRuntimeSession?.provider_model || '').trim(),
+      ...(Array.isArray(configuredCursor?.models) ? configuredCursor.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean));
+    const cursorModel = runtimeUsesCursor
+      ? (availableCursorModels.has(requestedCursorModel)
+          ? requestedCursorModel
+          : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredCursor?.model || '').trim()))
+      : '';
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -3762,7 +3824,15 @@ export function registerMessagesRoutes(app, deps) {
             reasoningEffort: null,
             error: claudeModel ? null : 'Claude model is not configured',
           }
-        : resolveRequestedModel(model));
+        : (runtimeUsesCursor
+          ? {
+              ok: !!cursorModel,
+              model: cursorModel,
+              modelVariantId: cursorModel,
+              reasoningEffort: null,
+              error: cursorModel ? null : 'Cursor model is not configured',
+            }
+          : resolveRequestedModel(model)));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -3802,10 +3872,12 @@ export function registerMessagesRoutes(app, deps) {
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
       : (runtimeUsesClaude
         ? resolveClaudeReasoningEffort()
-        : resolveRequestedReasoningEffort(
-            requestedModel,
-            explicitReasoningEffort || modelResolution.reasoningEffort || null,
-          ));
+        : (runtimeUsesCursor
+          ? { ok: true, effort: 'none', supported: ['none'] }
+          : resolveRequestedReasoningEffort(
+              requestedModel,
+              explicitReasoningEffort || modelResolution.reasoningEffort || null,
+            )));
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
@@ -4267,6 +4339,72 @@ export function registerMessagesRoutes(app, deps) {
     }
     if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'claude') {
       return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
+      return res.status(500).json({ error: 'Context usage storage is unavailable' });
+    }
+
+    const payload = JSON.stringify({
+      model: String(req.body?.model || '').trim() || null,
+      contextUsage,
+      modelUsage,
+    });
+    stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
+    res.json({ ok: true });
+  });
+
+  // POST /api/cursor-agent-id — Cursor worker persists the Cursor agent id so
+  // later turns can resume the agent across worker restarts.
+  app.post('/api/cursor-agent-id', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const cursorAgentId = String(req.body?.cursorAgentId || '').trim();
+    if (!conversationId || !cursorAgentId) {
+      return res.status(400).json({ error: 'Missing conversationId or cursorAgentId' });
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'cursor') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Cursor provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionCursorAgentId?.run !== 'function') {
+      return res.status(500).json({ error: 'Cursor agent id storage is unavailable' });
+    }
+    stmts.updateRuntimeSessionCursorAgentId.run(
+      cursorAgentId,
+      new Date().toISOString(),
+      conversationId,
+    );
+    res.json({ ok: true });
+  });
+
+  // POST /api/cursor-context-usage — Cursor worker reports the session's
+  // context-window breakdown after a turn. Cursor sessions have no Copilot
+  // events.jsonl to tail, so this is what feeds the composer indicator and the
+  // context-usage modal for them.
+  app.post('/api/cursor-context-usage', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+
+    const contextUsage = req.body?.contextUsage && typeof req.body.contextUsage === 'object'
+      ? req.body.contextUsage
+      : null;
+    const modelUsage = req.body?.modelUsage && typeof req.body.modelUsage === 'object'
+      ? req.body.modelUsage
+      : null;
+    if (!contextUsage && !modelUsage) {
+      return res.status(400).json({ error: 'Missing contextUsage or modelUsage' });
+    }
+
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'cursor') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Cursor provider' });
     }
     if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
       return res.status(500).json({ error: 'Context usage storage is unavailable' });

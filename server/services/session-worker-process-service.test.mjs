@@ -27,6 +27,23 @@ test('process inspector finds posix session worker processes by session id', () 
   assert.match(def?.commandLine || '', /--resume=def-456/);
 });
 
+test('process inspector recognizes node session worker processes by session id', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'linux',
+    execFileSyncImpl(command, args) {
+      assert.equal(command, 'ps');
+      assert.deepEqual(args, ['-eo', 'pid=,ppid=,comm=,args=', '-ww']);
+      return Buffer.from([
+        `104 1 node node /x/server/claude-worker/claude-session-worker.mjs --session-id claude-1`,
+        `105 1 node node /x/server/cursor-worker/cursor-session-worker.mjs --session-id abc`,
+      ].join('\n'));
+    },
+  });
+
+  assert.equal(inspector.findProcessForSession('claude-1')?.processId, 104);
+  assert.equal(inspector.findProcessForSession('abc')?.processId, 105);
+});
+
 test('process inspector ignores relay server process on linux path form', () => {
   const inspector = createSessionWorkerProcessInspector({
     platform: 'linux',

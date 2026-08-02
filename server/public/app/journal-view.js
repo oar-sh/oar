@@ -28,6 +28,7 @@ import {
   scheduleContextUsageRefresh,
   loadModelCatalog,
   loadClaudeSettings,
+  loadCursorSettings,
   loadOpenAISettings,
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
@@ -41,7 +42,10 @@ import {
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
 } from './new-conversation-model-choice.mjs';
-import { conversationProviderIndicatorLabel } from './conversation-provider-indicator.mjs';
+import {
+  conversationProviderIndicatorKey,
+  conversationProviderIndicatorLabel,
+} from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
@@ -57,6 +61,7 @@ let newConversationInFlight = false;
 let newConversationCatalogCache = null;
 let newConversationOpenAISettingsCache = null;
 let newConversationClaudeSettingsCache = null;
+let newConversationCursorSettingsCache = null;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -271,13 +276,14 @@ export function renderConvList() {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
     const providerIndicatorLabel = conversationProviderIndicatorLabel(c);
+    const providerIndicatorKey = conversationProviderIndicatorKey(c);
     const providerIndicatorHtml = providerIndicatorLabel
-      ? ` · <span class="conv-provider-indicator">${providerIndicatorLabel}</span>`
+      ? `<span class="conv-provider-indicator"${providerIndicatorKey ? ` data-provider="${providerIndicatorKey}"` : ''}>${providerIndicatorLabel}</span>`
       : '';
     return `
     <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}" onclick="openConversation('${c.id}')">
       <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${c.archived ? ' <span style="font-size:0.68rem;color:var(--muted)">(archived)</span>' : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}${providerIndicatorHtml}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${providerIndicatorHtml}</div>
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
   }).join('')}${footerHtml}`;
@@ -458,6 +464,7 @@ function normalizeNewConversationProviderType(value = '') {
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude') return 'claude';
+  if (normalized === 'cursor') return 'cursor';
   return 'github';
 }
 
@@ -493,6 +500,7 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   const wantsOpenAI = normalizedProvider === 'openai' || normalizedProvider === 'openai-image';
   const hasOpenAIByok = providers.includes('openai-byok');
   const hasClaude = providers.includes('claude');
+  const hasCursor = providers.includes('cursor');
   if (wantsOpenAI) {
     if (hasOpenAIByok) return true;
     const settingsModel = String(newConversationOpenAISettingsCache?.model || '').trim();
@@ -512,9 +520,19 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
       : [];
     return normalizedModelId === claudeModel || claudeModels.includes(normalizedModelId);
   }
+  if (normalizedProvider === 'cursor') {
+    if (hasCursor) return true;
+    const cursorModel = String(newConversationCursorSettingsCache?.model || '').trim();
+    const cursorModels = Array.isArray(newConversationCursorSettingsCache?.models)
+      ? newConversationCursorSettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    return normalizedModelId === cursorModel || cursorModels.includes(normalizedModelId);
+  }
   const claudeOnly = hasClaude && providers.every((provider) => provider === 'claude');
   if (claudeOnly) return false;
-  return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude') || !hasOpenAIByok;
+  const cursorOnly = hasCursor && providers.every((provider) => provider === 'cursor');
+  if (cursorOnly) return false;
+  return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude' && provider !== 'cursor') || !hasOpenAIByok;
 }
 
 function openAIImageSizesForModel(modelId = '') {
@@ -622,6 +640,10 @@ function updateNewConversationProviderHelp(provider = 'github') {
     help.textContent = "Claude chats run through the Claude Agent SDK with the relay host's Claude login.";
     return;
   }
+  if (normalizedProvider === 'cursor') {
+    help.textContent = 'Cursor chats run through the Cursor Agent SDK using your saved Cursor API key.';
+    return;
+  }
   help.textContent = 'Copilot models use your GitHub Copilot runtime.';
 }
 
@@ -674,14 +696,16 @@ async function populateNewConversationModelSelect(providerType = 'github') {
 }
 
 async function openNewConversationModelModal() {
-  const [catalog, settings, claudeSettings] = await Promise.all([
+  const [catalog, settings, claudeSettings, cursorSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
     loadClaudeSettings(),
+    loadCursorSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
   newConversationClaudeSettingsCache = claudeSettings || null;
+  newConversationCursorSettingsCache = cursorSettings || null;
   const providerSelect = document.getElementById('new-conversation-provider-select');
   if (providerSelect) {
     const options = [{ value: 'github', label: 'Copilot' }];
@@ -691,6 +715,9 @@ async function openNewConversationModelModal() {
     }
     if (claudeSettings?.enabled === true) {
       options.push({ value: 'claude', label: 'Claude (Agent SDK)' });
+    }
+    if (cursorSettings?.enabled === true) {
+      options.push({ value: 'cursor', label: 'Cursor (Agent SDK)' });
     }
     providerSelect.innerHTML = '';
     for (const option of options) {
@@ -820,8 +847,17 @@ export async function newConversation() {
     return;
   }
   if (newConversationInFlight) return;
-  const settings = await loadOpenAISettings();
-  if (settings?.enabled === true) {
+  // The provider picker is only useful when a managed provider can actually be
+  // selected; with Copilot alone the plain model-select path suffices.
+  const [openAISettings, claudeSettings, cursorSettings] = await Promise.all([
+    loadOpenAISettings(),
+    loadClaudeSettings(),
+    loadCursorSettings(),
+  ]);
+  const anyManagedProviderEnabled = openAISettings?.enabled === true
+    || claudeSettings?.enabled === true
+    || cursorSettings?.enabled === true;
+  if (anyManagedProviderEnabled) {
     void openNewConversationModelModal();
     return;
   }

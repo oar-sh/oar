@@ -6,8 +6,10 @@ import {
 } from './store.js';
 import {
   loadClaudeSettings,
+  loadCursorSettings,
   loadOpenAISettings,
   updateClaudeSettings,
+  updateCursorSettings,
   updateDefaultSessionWorkspaceRoot,
   updateOpenAISettings,
   loadWindowsAutostartSetting,
@@ -186,7 +188,6 @@ export function applyOpenAISettingsState(settings = {}, { resetInputs = false } 
   const toggle = document.getElementById('openai-enabled-toggle');
   const removeButton = document.getElementById('openai-remove-btn');
   const status = document.getElementById('openai-settings-status');
-  const header = document.getElementById('provider-status-pill');
   if (keyInput && (!openAISettingsInputsDirty || resetInputs)) {
     keyInput.value = '';
     keyInput.placeholder = openAISettingsState.configured ? 'Saved API key (enter to replace)' : 'sk-...';
@@ -213,15 +214,6 @@ export function applyOpenAISettingsState(settings = {}, { resetInputs = false } 
     status.dataset.state = openAISettingsState.enabled
       ? 'active'
       : (openAISettingsState.configured ? 'saved' : 'unconfigured');
-  }
-  if (header) {
-    header.textContent = 'GitHub Copilot';
-    header.dataset.provider = 'github';
-    header.title = openAISettingsState.enabled
-      ? `GitHub Copilot is active by default; OpenAI is enabled for optional new-chat selection (${openAISettingsState.model})`
-      : (openAISettingsState.configured
-          ? 'GitHub Copilot is active; OpenAI API key is saved but currently disabled'
-          : 'GitHub Copilot is active');
   }
   window.syncAutoModelAvailability?.();
   return openAISettingsState;
@@ -346,6 +338,186 @@ export async function toggleClaudeProvider(enabled) {
     claudeSettingsUpdateInFlight = false;
     setClaudeSettingsControlsDisabled(false);
     applyClaudeSettingsState(claudeSettingsState);
+  }
+}
+
+let cursorSettingsUpdateInFlight = false;
+let cursorSettingsState = {
+  configured: false,
+  enabled: false,
+  model: 'composer-2.5',
+};
+let cursorSettingsInputsDirty = false;
+
+function ensureCursorSettingsInputTracking() {
+  for (const id of ['cursor-api-key-input', 'cursor-model-input']) {
+    const input = document.getElementById(id);
+    if (!input || input.dataset.cursorDirtyTracking === '1') continue;
+    input.dataset.cursorDirtyTracking = '1';
+    input.addEventListener('input', () => {
+      cursorSettingsInputsDirty = true;
+    });
+  }
+}
+
+function setCursorSettingsControlsDisabled(disabled) {
+  for (const id of [
+    'cursor-api-key-input',
+    'cursor-model-input',
+    'cursor-enabled-toggle',
+    'cursor-save-btn',
+    'cursor-remove-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyCursorSettingsState(settings = {}, { resetInputs = false } = {}) {
+  ensureCursorSettingsInputTracking();
+  cursorSettingsState = {
+    configured: settings?.configured === true,
+    enabled: settings?.configured === true && settings?.enabled === true,
+    model: String(settings?.model || cursorSettingsState.model || 'composer-2.5').trim() || 'composer-2.5',
+  };
+  const keyInput = document.getElementById('cursor-api-key-input');
+  const modelInput = document.getElementById('cursor-model-input');
+  const toggle = document.getElementById('cursor-enabled-toggle');
+  const removeButton = document.getElementById('cursor-remove-btn');
+  const status = document.getElementById('cursor-settings-status');
+  if (keyInput && (!cursorSettingsInputsDirty || resetInputs)) {
+    keyInput.value = '';
+    keyInput.placeholder = cursorSettingsState.configured ? 'Saved API key (enter to replace)' : 'Cursor API key…';
+  }
+  if (modelInput && (!cursorSettingsInputsDirty || resetInputs)) modelInput.value = cursorSettingsState.model;
+  if (resetInputs) cursorSettingsInputsDirty = false;
+  if (toggle) {
+    toggle.checked = cursorSettingsState.enabled;
+    toggle.disabled = cursorSettingsUpdateInFlight || !cursorSettingsState.configured;
+  }
+  if (removeButton) {
+    removeButton.disabled = cursorSettingsUpdateInFlight || !cursorSettingsState.configured;
+  }
+  if (status) {
+    status.textContent = cursorSettingsState.enabled
+      ? 'Cursor is enabled. Select Cursor in New Chat to use it.'
+      : (cursorSettingsState.configured
+          ? 'API key saved but currently disabled. Enable it to allow Cursor selection in New Chat.'
+          : 'Not configured. New conversations use GitHub Copilot.');
+    status.dataset.state = cursorSettingsState.enabled
+      ? 'active'
+      : (cursorSettingsState.configured ? 'saved' : 'unconfigured');
+  }
+  window.syncAutoModelAvailability?.();
+  return cursorSettingsState;
+}
+
+export async function refreshCursorSettingsState() {
+  const settings = await loadCursorSettings();
+  if (!settings) return null;
+  return applyCursorSettingsState(settings);
+}
+
+async function syncCursorSettingsInputs() {
+  const keyInput = document.getElementById('cursor-api-key-input');
+  const modelInput = document.getElementById('cursor-model-input');
+  const status = document.getElementById('cursor-settings-status');
+  if (!keyInput || !modelInput || !status) return;
+  const settings = await refreshCursorSettingsState();
+  if (!settings) {
+    status.textContent = 'Unable to load Cursor settings.';
+    status.dataset.state = 'error';
+    return;
+  }
+}
+
+export async function saveCursorSettings() {
+  if (cursorSettingsUpdateInFlight) return;
+  const keyInput = document.getElementById('cursor-api-key-input');
+  const modelInput = document.getElementById('cursor-model-input');
+  const apiKey = String(keyInput?.value || '').trim();
+  const model = String(modelInput?.value || '').trim() || 'composer-2.5';
+  if (!apiKey && !cursorSettingsState.configured) {
+    alert('Enter a Cursor API key.');
+    return;
+  }
+  cursorSettingsUpdateInFlight = true;
+  setCursorSettingsControlsDisabled(true);
+  try {
+    const result = await updateCursorSettings({
+      apiKey,
+      model,
+      enabled: cursorSettingsState.configured ? cursorSettingsState.enabled : true,
+    });
+    if (!result) throw new Error('Failed to save Cursor settings.');
+    applyCursorSettingsState(result, { resetInputs: true });
+    showTransientRelayNotice(
+      result.warning
+        ? `Cursor settings saved. ${result.warning}`
+        : `Cursor settings saved for ${result.model}.`,
+      result.warning ? 8000 : 4000,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to save Cursor settings.');
+  } finally {
+    cursorSettingsUpdateInFlight = false;
+    setCursorSettingsControlsDisabled(false);
+    applyCursorSettingsState(cursorSettingsState);
+  }
+}
+
+export async function toggleCursorProvider(enabled) {
+  if (cursorSettingsUpdateInFlight) return;
+  if (enabled && !cursorSettingsState.configured) {
+    applyCursorSettingsState(cursorSettingsState);
+    alert('Save a Cursor API key before enabling Cursor.');
+    return;
+  }
+  cursorSettingsUpdateInFlight = true;
+  setCursorSettingsControlsDisabled(true);
+  try {
+    const result = await updateCursorSettings({
+      model: cursorSettingsState.model,
+      enabled: enabled === true,
+    });
+    if (!result) throw new Error('Failed to update the Cursor provider.');
+    applyCursorSettingsState(result);
+    const providerLabel = result.enabled ? 'Cursor API key enabled' : 'Cursor API key disabled';
+    showTransientRelayNotice(
+      `${providerLabel}.${result.warning ? ` ${result.warning}` : ''}`,
+      result.warning ? 8000 : 4500,
+    );
+  } catch (error) {
+    applyCursorSettingsState(cursorSettingsState);
+    alert(error?.message || 'Failed to update the Cursor provider.');
+  } finally {
+    cursorSettingsUpdateInFlight = false;
+    setCursorSettingsControlsDisabled(false);
+    applyCursorSettingsState(cursorSettingsState);
+  }
+}
+
+export async function removeCursorSettings() {
+  if (cursorSettingsUpdateInFlight) return;
+  if (!cursorSettingsState.configured) return;
+  if (!confirm('Remove the saved Cursor API key?')) return;
+  const modelInput = document.getElementById('cursor-model-input');
+  const model = String(modelInput?.value || '').trim() || 'composer-2.5';
+  cursorSettingsUpdateInFlight = true;
+  setCursorSettingsControlsDisabled(true);
+  try {
+    const result = await updateCursorSettings({ model, remove: true });
+    if (!result) throw new Error('Failed to remove Cursor settings.');
+    applyCursorSettingsState(result, { resetInputs: true });
+    showTransientRelayNotice('Cursor API key removed. New conversations use GitHub Copilot.');
+  } catch (error) {
+    // A 409 'cursor-key-removal-blocked' rejection carries the active
+    // conversation counts inside the server's error message.
+    alert(error?.message || 'Failed to remove Cursor settings.');
+  } finally {
+    cursorSettingsUpdateInFlight = false;
+    setCursorSettingsControlsDisabled(false);
+    applyCursorSettingsState(cursorSettingsState);
   }
 }
 
@@ -618,6 +790,9 @@ export function openSettingsModal() {
   claudeSettingsInputsDirty = false;
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();
+  cursorSettingsInputsDirty = false;
+  ensureCursorSettingsInputTracking();
+  void syncCursorSettingsInputs();
   syncWindowsAutostartSetting();
   void refreshWindowsAutostartSetting();
   syncTurnCeilingSlider();

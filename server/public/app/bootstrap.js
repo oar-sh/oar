@@ -111,6 +111,11 @@ import {
   normalizeModelSelectorOptions,
 } from './model-selector-options.mjs';
 import {
+  isOpenAIImageModelId,
+  sessionLockNoteText,
+  sessionLockProviderKey,
+} from './conversation-provider-indicator.mjs';
+import {
   initMessageSearchView,
   openMessageSearchModal,
   closeMessageSearchModal,
@@ -192,6 +197,11 @@ import {
   toggleClaudeProvider,
   applyClaudeSettingsState,
   refreshClaudeSettingsState,
+  saveCursorSettings,
+  removeCursorSettings,
+  toggleCursorProvider,
+  applyCursorSettingsState,
+  refreshCursorSettingsState,
   updateWindowsAutostartSettingFromToggle,
   previewTurnCeilingSetting,
   updateTurnCeilingSetting,
@@ -222,6 +232,7 @@ const PROVIDER_LABELS = {
   openai: 'OpenAI',
   'openai-byok': 'OpenAI (BYOK)',
   claude: 'Anthropic (Claude SDK)',
+  cursor: 'Cursor (Agent SDK)',
   'github-copilot': 'GitHub Copilot',
   anthropic: 'Anthropic',
   google: 'Google',
@@ -848,7 +859,6 @@ function currentOpenAIModelLock() {
   const providerType = String(
     conversation?.runtimeProviderType
     || conversation?.runtime_provider_type
-    || document.getElementById('provider-status-pill')?.dataset?.provider
     || '',
   ).trim().toLowerCase();
   const providerIsOpenAI = providerType === 'openai' || providerType === 'openai-byok';
@@ -860,6 +870,32 @@ function currentOpenAIModelLock() {
       || '',
     ).trim(),
   };
+}
+
+// The runtime model decides the OpenAI/OpenAI Image distinction. Before the
+// first message the runtime model can still be rebound, so the composer
+// selection is the fresher source there.
+function sessionLockModelForCurrentConversation() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const runtimeModel = String(
+    conversation?.runtimeProviderModel
+    || conversation?.runtime_provider_model
+    || conversation?.runtimeModel
+    || conversation?.runtime_model
+    || '',
+  ).trim();
+  if (currentConversationHasMessages()) return runtimeModel;
+  return String(document.getElementById('model-select')?.value || '').trim() || runtimeModel;
+}
+
+function currentSessionProviderLock({ pinnedModel = '' } = {}) {
+  // Shared readers have no model picker, so a lock note would be noise.
+  if (!currentConvId || isSharedReaderMode()) return null;
+  const providerType = activeComposerProviderType();
+  const model = sessionLockModelForCurrentConversation();
+  const noteText = sessionLockNoteText({ providerType, model, pinnedModel });
+  if (!noteText) return null;
+  return { providerKey: sessionLockProviderKey({ providerType, model }), noteText };
 }
 
 function syncAutoModelAvailability() {
@@ -907,12 +943,19 @@ function syncAutoModelAvailability() {
   select.title = openAILock
     ? `Model locked to ${openAILock.model || 'the configured OpenAI model'} for this active OpenAI session`
     : (metadataBlocked ? 'Model metadata unavailable' : 'Model');
+  syncSessionLockNote({ pinnedModel: openAILock?.model || '' });
+}
+
+function syncSessionLockNote({ pinnedModel = '' } = {}) {
   const note = document.getElementById('model-lock-note');
-  if (note) {
-    note.hidden = !openAILock;
-    note.textContent = openAILock
-      ? `🔒 OpenAI session model locked${openAILock.model ? ` to ${openAILock.model}` : ''}.`
-      : '';
+  if (!note) return;
+  const providerLock = currentSessionProviderLock({ pinnedModel });
+  note.hidden = !providerLock;
+  note.textContent = providerLock?.noteText || '';
+  if (providerLock?.providerKey) {
+    note.dataset.provider = providerLock.providerKey;
+  } else {
+    delete note.dataset.provider;
   }
 }
 
@@ -947,7 +990,6 @@ function activeComposerProviderType() {
   return String(
     conversation?.runtimeProviderType
     || conversation?.runtime_provider_type
-    || document.getElementById('provider-status-pill')?.dataset?.provider
     || 'github',
   ).trim().toLowerCase();
 }
@@ -956,6 +998,7 @@ function normalizeModelSelectorProviderType(providerType = '') {
   const normalized = String(providerType || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'claude') return 'claude';
+  if (normalized === 'cursor') return 'cursor';
   return 'github';
 }
 
@@ -965,11 +1008,6 @@ function modelProvidersForId(modelId, providersByModel = {}) {
   const providers = providersByModel?.[key];
   if (!Array.isArray(providers)) return [];
   return providers.map((provider) => String(provider || '').trim().toLowerCase()).filter(Boolean);
-}
-
-function isOpenAIImageModelId(modelId = '') {
-  const normalized = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
-  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
 }
 
 function openAIImageSizesForModel(modelId = '') {
@@ -986,11 +1024,13 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
   const providers = modelProvidersForId(normalizedModelId, providersByModel);
   const hasOpenAIByok = providers.includes('openai-byok');
   const hasClaude = providers.includes('claude');
-  const hasNonExclusiveProvider = providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude');
+  const hasCursor = providers.includes('cursor');
+  const hasNonExclusiveProvider = providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude' && provider !== 'cursor');
   const activeProvider = normalizeModelSelectorProviderType(activeProviderType);
   if (activeProvider === 'openai') return hasOpenAIByok;
   if (activeProvider === 'claude') return hasClaude;
-  return !((hasOpenAIByok || hasClaude) && !hasNonExclusiveProvider);
+  if (activeProvider === 'cursor') return hasCursor;
+  return !((hasOpenAIByok || hasClaude || hasCursor) && !hasNonExclusiveProvider);
 }
 
 function buildModelSelectorOptions(models = [], providersByModel = {}, activeProviderType = '') {
@@ -1428,6 +1468,7 @@ function initModelSelector() {
       }
       updateReasoningSelectorForModel(select.value);
       updateContextTierSelector(select.value);
+      syncSessionLockNote({ pinnedModel: currentOpenAIModelLock()?.model || '' });
       void persistCurrentConversationPreferences().catch(() => {});
     });
     select.addEventListener('blur', () => {
@@ -1509,6 +1550,13 @@ function reportOpenAIModelDiscoveryFailure(payload) {
   if (claudeDiscovery && claudeDiscovery.ok === false && !claudeDiscovery.skipped) {
     showTransientRelayNotice(
       `Claude model discovery failed. Cached Claude models were kept: ${claudeDiscovery.error || 'unknown error'}`,
+      8000,
+    );
+  }
+  const cursorDiscovery = payload?.cursorModelDiscovery;
+  if (cursorDiscovery && cursorDiscovery.ok === false && !cursorDiscovery.skipped) {
+    showTransientRelayNotice(
+      `Cursor model discovery failed. Cached Cursor models were kept: ${cursorDiscovery.error || 'unknown error'}`,
       8000,
     );
   }
@@ -1676,12 +1724,15 @@ function renderModelVariantCatalogBody() {
       return entryProvider === 'claude';
     }
     if (entryProvider === 'claude') return false;
+    // Cursor rows stay out of this modal in v1; composer/new-chat filtering
+    // for Cursor comes from providersByModel instead.
+    if (entryProvider === 'cursor') return false;
     if (activeTab === 'openai') {
       return hasOpenAIByok || entryProvider === 'openai-byok';
     }
     // Copilot tab: only models the Copilot CLI itself serves.
     if (entryProvider === 'openai-byok') return false;
-    if (hasOpenAIByok) return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude');
+    if (hasOpenAIByok) return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude' && provider !== 'cursor');
     return true;
   };
   const grouped = new Map();
@@ -2016,7 +2067,9 @@ async function loadContextSummaryAndRender(convId) {
   if (!payload) throw new Error('Unable to load context');
   const sessionId = String(payload.copilotSessionId || payload.snapshot?.copilot_session_id || '').trim();
   const refreshLookupId = sessionId || trimmedConvId || null;
-  const providerLabel = payload.providerType === 'claude' ? 'Claude' : 'Copilot';
+  const providerLabel = payload.providerType === 'claude'
+    ? 'Claude'
+    : (payload.providerType === 'cursor' ? 'Cursor' : 'Copilot');
   const subtitle = sessionId
     ? `${providerLabel} session ${sessionId.slice(0, 8)}`
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
@@ -2708,6 +2761,7 @@ initSocketHandlers({
   applyConversationPreferencesForConversation,
   applyOpenAISettingsState,
   applyClaudeSettingsState,
+  applyCursorSettingsState,
 });
 
 initCwdPicker({
@@ -2958,6 +3012,7 @@ async function initApp() {
   syncQueueStatusMenuEntry(status);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshOpenAISettingsState();
+  await refreshCursorSettingsState();
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
@@ -3044,6 +3099,9 @@ window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.saveClaudeSettings = saveClaudeSettings;
 window.toggleClaudeProvider = toggleClaudeProvider;
+window.saveCursorSettings = saveCursorSettings;
+window.removeCursorSettings = removeCursorSettings;
+window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;
 window.previewTurnCeilingSetting = previewTurnCeilingSetting;

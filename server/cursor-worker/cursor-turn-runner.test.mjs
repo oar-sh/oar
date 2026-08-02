@@ -1,0 +1,472 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { createCursorTurnRunner, buildCursorPlanReadyBoardPayload } from './cursor-turn-runner.mjs';
+
+function makeApiStub({ failRoutes = new Set() } = {}) {
+  const calls = [];
+  return {
+    calls,
+    api: async (method, routePath, body) => {
+      calls.push({ method, routePath, body });
+      if (failRoutes.has(routePath)) throw new Error(`stubbed failure for ${routePath}`);
+      return { ok: true };
+    },
+  };
+}
+
+function fakeCursorTurn(events, cancels = []) {
+  return {
+    async* [Symbol.asyncIterator]() {
+      for (const event of events) yield event;
+    },
+    async cancel() { cancels.push('cancel'); },
+    get runId() { return 'run-1'; },
+  };
+}
+
+// The adapter surfaces send/stream failures by rejecting the first next().
+function rejectingTurn(error) {
+  return {
+    // eslint-disable-next-line require-yield
+    async* [Symbol.asyncIterator]() { throw error; },
+    async cancel() {},
+    get runId() { return ''; },
+  };
+}
+
+function queuedTurns(queue, started = []) {
+  return (options) => {
+    started.push(options);
+    const spec = queue.shift() || [];
+    if (typeof spec === 'function') return spec(options);
+    return fakeCursorTurn(spec);
+  };
+}
+
+function recordingHandleFactory({ createCalls, closes, agentIds = ['agent-new'] }) {
+  let index = 0;
+  return async (options) => {
+    createCalls.push(options);
+    const agentId = agentIds[Math.min(index, agentIds.length - 1)];
+    index += 1;
+    return {
+      agent: { label: `agent-obj-${index}` },
+      agentId,
+      close: async () => { closes.push(agentId); },
+    };
+  };
+}
+
+function baseRunnerOptions(stub, overrides = {}) {
+  return {
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/home/dev',
+    apiKey: 'cursor-test-key',
+    storeDir: '/home/dev/.cursor-agents',
+    defaultModel: 'default-cursor-model',
+    readContextWindowImpl: async () => null,
+    ...overrides,
+  };
+}
+
+const evDelta = (text) => ({ source: 'delta', update: { type: 'text-delta', text } });
+const evInit = (model = 'sonnet-4.5', sessionId = 'native-1') => ({
+  source: 'stream',
+  message: { type: 'system', subtype: 'init', session_id: sessionId, model },
+});
+const evUsage = (usage) => ({ source: 'stream', message: { type: 'usage', usage } });
+const evFinished = () => ({ source: 'stream', message: { type: 'status', status: 'FINISHED' } });
+const evError = (message) => ({ source: 'stream', message: { type: 'status', status: 'ERROR', message } });
+
+const busyError = () => Object.assign(new Error('agent is busy'), { name: 'AgentBusyError' });
+
+const baseMessage = {
+  id: 'q-1',
+  conversationId: 'conv-1',
+  relayMode: 'agent',
+  text: 'hello',
+  model: 'cheetah',
+  attachments: [],
+};
+
+test('first turn creates the agent, persists its id, and later turns reuse the live handle', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const closes = [];
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('first answer.'), evFinished()],
+      [evInit(), evDelta('second answer.'), evFinished()],
+    ], started),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(createCalls.length, 1);
+  assert.equal(createCalls[0].agentId, '', 'no durable id yet, so a fresh agent is created');
+  assert.equal(createCalls[0].apiKey, 'cursor-test-key');
+  assert.equal(createCalls[0].cwd, '/home/dev');
+  assert.ok(createCalls[0].customTools?.ask_user?.execute, 'ask_user must be registered at creation');
+  const persists = stub.calls.filter((call) => call.routePath === '/api/cursor-agent-id');
+  assert.equal(persists.length, 1);
+  assert.deepEqual(persists[0].body, { conversationId: 'conv-1', cursorAgentId: 'agent-new' });
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'first answer.');
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  assert.equal(createCalls.length, 1, 'the live handle must be reused across turns');
+  assert.equal(
+    stub.calls.filter((call) => call.routePath === '/api/cursor-agent-id').length,
+    1,
+    'an already-cached id is not re-persisted',
+  );
+});
+
+test('a fresh runner resumes from the server-provided durable agent id', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes: [], agentIds: ['agent-1'] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('resumed fine.'), evFinished()]]),
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage, cursorAgentId: 'agent-1' } });
+  assert.equal(createCalls[0].agentId, 'agent-1');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'resumed fine.');
+});
+
+test('failed persist is retried on the next turn instead of being cached', async () => {
+  const failRoutes = new Set(['/api/cursor-agent-id']);
+  const stub = makeApiStub({ failRoutes });
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('ok.'), evFinished()],
+      [evInit(), evDelta('ok again.'), evFinished()],
+    ]),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/cursor-agent-id').length, 1);
+
+  failRoutes.clear();
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  const persists = stub.calls.filter((call) => call.routePath === '/api/cursor-agent-id');
+  assert.equal(persists.length, 2, 'persist must be retried after a failure');
+});
+
+test('the model is re-pinned on every send and auto/empty falls back through providerModel', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('one.'), evFinished()],
+      [evInit(), evDelta('two.'), evFinished()],
+      [evInit(), evDelta('three.'), evFinished()],
+    ], started),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, model: 'cheetah' } });
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', model: 'auto', providerModel: 'sonnet-4.5' },
+  });
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-3', model: '', providerModel: '' },
+  });
+
+  assert.equal(started[0].model, 'cheetah');
+  assert.equal(started[1].model, 'sonnet-4.5', 'auto falls back to the conversation provider model');
+  assert.equal(started[2].model, 'default-cursor-model', 'empty falls back to the worker default');
+  const responses = stub.calls.filter((call) => call.routePath === '/api/response');
+  assert.equal(responses[1].body.modelOrigin, 'auto');
+  assert.equal(responses[0].body.modelOrigin, 'manual');
+});
+
+test('plan mode with a plan-shaped reply posts the plan_ready board via the fallback source', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('- step one\n- step two'), evFinished()],
+    ], started),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
+  assert.equal(started[0].relayMode, 'plan');
+  const board = stub.calls.find((call) => call.routePath === '/api/relay-board');
+  assert.ok(board, 'the plan board must be posted');
+  assert.equal(board.body.boardType, 'plan_ready');
+  assert.equal(board.body.title, 'Plan ready for review');
+  assert.equal(board.body.context.source, 'plan-mode-fallback');
+  assert.ok(stub.calls.find((call) => call.routePath === '/api/response'), 'response still published');
+
+  assert.equal(buildCursorPlanReadyBoardPayload({ message: baseMessage, planText: '' }), null);
+});
+
+test('agent creation failures publish classified terminal responses', async () => {
+  const authStub = makeApiStub();
+  const authRunner = createCursorTurnRunner(baseRunnerOptions(authStub, {
+    createAgentHandleImpl: async () => {
+      throw Object.assign(new Error('bad api key'), { name: 'AuthenticationError' });
+    },
+    startCursorRunImpl: queuedTurns([]),
+  }));
+  const handled = await authRunner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  const authResponse = authStub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(authResponse.body.terminalError.stableCode, 'cursor.authentication_failed');
+  assert.match(authResponse.body.text, /Set or renew the Cursor API key/);
+
+  const genericStub = makeApiStub();
+  const genericRunner = createCursorTurnRunner(baseRunnerOptions(genericStub, {
+    createAgentHandleImpl: async () => { throw new Error('store locked'); },
+    startCursorRunImpl: queuedTurns([]),
+  }));
+  await genericRunner.handlePendingPayload({ message: { ...baseMessage } });
+  const genericResponse = genericStub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(genericResponse.body.terminalError.stableCode, 'cursor.turn-error');
+  assert.match(genericResponse.body.text, /the Cursor turn failed \(store locked\)/);
+  assert.equal(genericResponse.body.terminalError.kind, 'cursor-turn-failed');
+});
+
+test('a busy agent is closed, recreated, and retried once; a second busy is terminal', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const closes = [];
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes, agentIds: ['agent-b'] }),
+    startCursorRunImpl: queuedTurns([
+      () => rejectingTurn(busyError()),
+      [evInit(), evDelta('recovered fine.'), evFinished()],
+    ], started),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(closes.length, 1, 'the busy handle must be closed');
+  assert.equal(createCalls.length, 2, 'a fresh handle must be created for the retry');
+  assert.equal(createCalls[1].agentId, 'agent-b', 'the retry resumes the persisted durable id');
+  assert.equal(started.length, 2);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'recovered fine.');
+  assert.equal(response.body.terminalError, undefined);
+
+  const busyStub = makeApiStub();
+  const busyStarted = [];
+  const busyRunner = createCursorTurnRunner(baseRunnerOptions(busyStub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      () => rejectingTurn(busyError()),
+      () => rejectingTurn(busyError()),
+    ], busyStarted),
+  }));
+  const handled = await busyRunner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  assert.equal(busyStarted.length, 2, 'exactly one retry');
+  const busyResponse = busyStub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(busyResponse.body.terminalError.stableCode, 'cursor.agent_busy');
+});
+
+test('abort cancels the run, republishes partial text as done, and skips the response', async () => {
+  const stub = makeApiStub();
+  let captured = null;
+  const controlPoller = {
+    start(options) { captured = options; return { id: 'ctl-1' }; },
+    stop() {},
+  };
+  const cancels = [];
+  const abortingTurn = {
+    async* [Symbol.asyncIterator]() {
+      yield evDelta('partial answer before stop.');
+      // Trigger the same path the control poller drives mid-turn; the real
+      // adapter then ends the merged stream on abort.
+      await captured.onAbortTurn();
+    },
+    async cancel() { cancels.push('cancel'); },
+    get runId() { return 'run-1'; },
+  };
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    controlPoller,
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: () => abortingTurn,
+  }));
+
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  assert.deepEqual(cancels, ['cancel'], 'turn.cancel must be invoked on abort');
+  const finalStream = stub.calls.find(
+    (call) => call.routePath === '/api/stream' && call.body.done === true,
+  );
+  assert.equal(finalStream.body.text, 'partial answer before stop.');
+  assert.ok(!stub.calls.find((call) => call.routePath === '/api/response'), 'no response after abort');
+});
+
+test('a stream that ends without a result falls back to streamed text or requeues', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('only streamed text.')],
+    ]),
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'only streamed text.');
+
+  const emptyStub = makeApiStub();
+  const emptyRunner = createCursorTurnRunner(baseRunnerOptions(emptyStub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[]]),
+  }));
+  await emptyRunner.handlePendingPayload({ message: { ...baseMessage } });
+  const requeue = emptyStub.calls.find((call) => call.routePath === '/api/requeue');
+  assert.deepEqual(requeue.body, { messageId: 'q-1' });
+  assert.ok(!emptyStub.calls.find((call) => call.routePath === '/api/response'));
+});
+
+test('result usage publishes the context breakdown without disturbing the response', async () => {
+  const stub = makeApiStub({ failRoutes: new Set(['/api/cursor-context-usage']) });
+  const windowCalls = [];
+  const usageEvents = [
+    evInit('sonnet-4.5'),
+    evDelta('usage answer.'),
+    evUsage({ inputTokens: 1200, outputTokens: 300, cacheReadTokens: 500, cacheWriteTokens: 100 }),
+    evFinished(),
+  ];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([usageEvents.slice()]),
+    readContextWindowImpl: async ({ model, apiKey }) => {
+      windowCalls.push({ model, apiKey });
+      return 200000;
+    },
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const failedPost = stub.calls.find((call) => call.routePath === '/api/cursor-context-usage');
+  assert.ok(failedPost, 'the publish was attempted');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'usage answer.', 'a failed usage publish must not disturb the response');
+
+  const okStub = makeApiStub();
+  const okRunner = createCursorTurnRunner(baseRunnerOptions(okStub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([usageEvents.slice()]),
+    readContextWindowImpl: async () => 200000,
+  }));
+  await okRunner.handlePendingPayload({ message: { ...baseMessage } });
+  const post = okStub.calls.find((call) => call.routePath === '/api/cursor-context-usage');
+  assert.equal(post.body.conversationId, 'conv-1');
+  assert.equal(post.body.sdkSessionId, 'sess-1');
+  assert.equal(post.body.model, 'sonnet-4.5');
+  assert.equal(post.body.contextUsage.totalTokens, 2100);
+  assert.equal(post.body.contextUsage.maxTokens, 200000);
+  assert.equal(post.body.modelUsage['sonnet-4.5'].contextWindow, 200000);
+  assert.deepEqual(windowCalls[0], { model: 'sonnet-4.5', apiKey: 'cursor-test-key' });
+
+  const noUsageStub = makeApiStub();
+  const noUsageRunner = createCursorTurnRunner(baseRunnerOptions(noUsageStub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('no usage.'), evFinished()]]),
+    readContextWindowImpl: async () => 200000,
+  }));
+  await noUsageRunner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.ok(
+    !noUsageStub.calls.find((call) => call.routePath === '/api/cursor-context-usage'),
+    'nothing to publish without usage',
+  );
+});
+
+test('an error result publishes a terminal response and republishes the partial text', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('partial work'), evError('model exploded')],
+    ]),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const finalStream = stub.calls.find(
+    (call) => call.routePath === '/api/stream' && call.body.done === true,
+  );
+  assert.equal(finalStream.body.text, 'partial work');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.terminalError.stableCode, 'cursor.error');
+  assert.equal(response.body.terminalError.code, 'error');
+  assert.equal(response.body.terminalError.kind, 'cursor-turn-failed');
+});
+
+test('thought, activity, and subagent actions pass subagentRunId through; subagent text never stands in for the answer', async () => {
+  const stub = makeApiStub();
+  const events = [
+    { actions: [{ channel: 'stream', payload: { text: 'Main thread answer.', done: false, subagentRunId: null } }] },
+    { actions: [{ channel: 'subagent', payload: { subagentRunId: 'call-9', parentSubagentId: null, displayName: 'Investigator', status: 'running' } }] },
+    { actions: [{ channel: 'thought', payload: { reasoningId: 'r-1', text: 'weighing options', done: true, subagentRunId: 'call-9' } }] },
+    { actions: [{ channel: 'activity', payload: { text: 'Tool (shell): ls', subagentRunId: 'call-9' } }] },
+    { actions: [{ channel: 'stream', payload: { text: 'Subagent chatter here.', done: false, subagentRunId: 'call-9' } }] },
+    { actions: [{ channel: 'result', payload: { text: '', isError: false, subtype: 'finished', usage: null, totalCostUsd: null } }] },
+  ];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([events]),
+    createNormalizerImpl: () => ({
+      normalize: (event) => (Array.isArray(event?.actions) ? event.actions : []),
+      finalStreamText: () => '',
+      get model() { return 'sonnet-4.5'; },
+    }),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const thought = stub.calls.find((call) => call.routePath === '/api/thought');
+  assert.equal(thought.body.reasoningId, 'r-1');
+  assert.equal(thought.body.subagentRunId, 'call-9');
+  const activity = stub.calls.find((call) => call.routePath === '/api/activity');
+  assert.equal(activity.body.subagentRunId, 'call-9');
+  const subagent = stub.calls.find((call) => call.routePath === '/api/subagent-run');
+  assert.equal(subagent.body.subagentRunId, 'call-9');
+  assert.equal(subagent.body.displayName, 'Investigator');
+  assert.equal(subagent.body.status, 'running');
+  const subagentStream = stub.calls.find(
+    (call) => call.routePath === '/api/stream' && call.body.subagentRunId,
+  );
+  assert.equal(subagentStream.body.subagentRunId, 'call-9');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'Main thread answer.', 'subagent text must not become the reply');
+  assert.equal(response.body.model, 'sonnet-4.5');
+});
+
+test('dispose closes the handle, and a failed resume falls back to create and persists the new id', async () => {
+  const stub = makeApiStub();
+  const closes = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('done.'), evFinished()]]),
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  await runner.dispose();
+  assert.deepEqual(closes, ['agent-new']);
+
+  const fallbackStub = makeApiStub();
+  const createCalls = [];
+  const fallbackRunner = createCursorTurnRunner(baseRunnerOptions(fallbackStub, {
+    createAgentHandleImpl: async (options) => {
+      createCalls.push(options);
+      if (createCalls.length === 1) throw new Error('agent not found');
+      return { agent: {}, agentId: 'agent-2', close: async () => {} };
+    },
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('fresh agent answer.'), evFinished()]]),
+  }));
+  await fallbackRunner.handlePendingPayload({ message: { ...baseMessage, cursorAgentId: 'agent-1' } });
+  assert.equal(createCalls[0].agentId, 'agent-1');
+  assert.equal(createCalls[1].agentId, '', 'resume failure falls back to a fresh agent');
+  const persist = fallbackStub.calls.find((call) => call.routePath === '/api/cursor-agent-id');
+  assert.deepEqual(persist.body, { conversationId: 'conv-1', cursorAgentId: 'agent-2' });
+  const response = fallbackStub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'fresh agent answer.');
+});

@@ -77,17 +77,21 @@ export function applyOpenAIProviderEnvironment(env = {}, {
   return next;
 }
 
+export function resolveWorkerKind(env = {}) {
+  const kind = String(env?.COPILOT_WEB_RELAY_WORKER_KIND || '').trim().toLowerCase();
+  if (kind === 'claude' || kind === 'cursor') return kind;
+  return 'copilot';
+}
+
 export function applyClaudeProviderEnvironment(env = {}, {
   enabled = false,
   model = '',
 } = {}) {
   const next = { ...env };
-  for (const key of [
-    'COPILOT_WEB_RELAY_WORKER_KIND',
-    'CLAUDE_RELAY_MODEL',
-  ]) {
-    delete next[key];
-  }
+  // Only clear the worker kind this provider owns so clear chains stay
+  // order-independent when multiple provider appliers run back to back.
+  if (resolveWorkerKind(next) === 'claude') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
+  delete next.CLAUDE_RELAY_MODEL;
   if (!enabled) return next;
   // The Claude worker authenticates through the host's logged-in Claude
   // credentials, so no API key flows through the environment here.
@@ -97,8 +101,31 @@ export function applyClaudeProviderEnvironment(env = {}, {
   return next;
 }
 
+export function applyCursorProviderEnvironment(env = {}, {
+  enabled = false,
+  model = '',
+  apiKey = '',
+} = {}) {
+  const next = { ...env };
+  if (resolveWorkerKind(next) === 'cursor') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
+  delete next.CURSOR_RELAY_MODEL;
+  delete next.CURSOR_API_KEY;
+  if (!enabled) return next;
+  const normalizedApiKey = normalizeText(apiKey);
+  if (!normalizedApiKey) throw new Error('cursor-api-key-not-configured');
+  next.COPILOT_WEB_RELAY_WORKER_KIND = 'cursor';
+  next.CURSOR_API_KEY = normalizedApiKey;
+  const normalizedModel = normalizeText(model);
+  if (normalizedModel) next.CURSOR_RELAY_MODEL = normalizedModel;
+  return next;
+}
+
 export function isClaudeWorkerEnvironment(env = {}) {
   return String(env?.COPILOT_WEB_RELAY_WORKER_KIND || '').trim().toLowerCase() === 'claude';
+}
+
+export function isCursorWorkerEnvironment(env = {}) {
+  return resolveWorkerKind(env) === 'cursor';
 }
 
 export function resolveClaudeWorkerScriptPath(env = {}) {
@@ -111,10 +138,37 @@ export function resolveClaudeWorkerScriptPath(env = {}) {
   return path.join(process.cwd(), 'server', 'claude-worker', 'claude-session-worker.mjs');
 }
 
+export function resolveCursorWorkerScriptPath(env = {}) {
+  const explicit = normalizeText(env?.COPILOT_WEB_RELAY_CURSOR_WORKER_PATH);
+  if (explicit) return explicit;
+  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
+  if (repoRoot) return path.join(repoRoot, 'server', 'cursor-worker', 'cursor-session-worker.mjs');
+  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
+  if (serverDir) return path.join(serverDir, 'cursor-worker', 'cursor-session-worker.mjs');
+  return path.join(process.cwd(), 'server', 'cursor-worker', 'cursor-session-worker.mjs');
+}
+
+// Workers that run as plain Node processes (no CLI, no pseudo-TTY). Copilot is
+// intentionally absent: its launch path must stay exactly as-is.
+const NODE_WORKER_DESCRIPTORS = Object.freeze({
+  claude: Object.freeze({ resolveScriptPath: resolveClaudeWorkerScriptPath, windowsTitle: 'Claude Worker' }),
+  cursor: Object.freeze({ resolveScriptPath: resolveCursorWorkerScriptPath, windowsTitle: 'Cursor Worker' }),
+});
+
+function resolveNodeWorkerDescriptor(env = {}) {
+  const descriptor = NODE_WORKER_DESCRIPTORS[resolveWorkerKind(env)];
+  if (!descriptor) return null;
+  return {
+    scriptPath: descriptor.resolveScriptPath(env),
+    windowsTitle: descriptor.windowsTitle,
+  };
+}
+
 function buildPosixWorkerLaunchCommand(targetSessionId, env = {}) {
-  if (isClaudeWorkerEnvironment(env)) {
+  const nodeWorker = resolveNodeWorkerDescriptor(env);
+  if (nodeWorker) {
     const nodeExecutable = normalizeText(env?.COPILOT_WEB_RELAY_NODE) || 'node';
-    return `${shellQuote(nodeExecutable)} ${shellQuote(resolveClaudeWorkerScriptPath(env))} --session-id ${shellQuote(targetSessionId)}`;
+    return `${shellQuote(nodeExecutable)} ${shellQuote(nodeWorker.scriptPath)} --session-id ${shellQuote(targetSessionId)}`;
   }
   const cliExecutable = normalizeText(env?.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
     || normalizeText(env?.COPILOT_CLI_EXECUTABLE)
@@ -188,18 +242,25 @@ export function getTmuxPanePid(sessionName, {
   }
 }
 
+export const WORKER_SECRET_ENV_VARS = Object.freeze(['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY']);
+
 export function createWorkerSecretEnvFile(env = {}, {
   fsImpl = fs,
   tempRoot = os.tmpdir(),
 } = {}) {
-  const apiKey = String(env?.COPILOT_PROVIDER_API_KEY || '').trim();
-  if (!apiKey) return null;
+  const secretLines = [];
+  for (const key of WORKER_SECRET_ENV_VARS) {
+    const value = String(env?.[key] || '').trim();
+    if (!value) continue;
+    secretLines.push(`export ${key}=${shellQuote(value)}\n`);
+  }
+  if (!secretLines.length) return null;
   const directoryPath = fsImpl.mkdtempSync(path.join(tempRoot, 'copilot-relay-worker-'));
   fsImpl.chmodSync(directoryPath, 0o700);
   const filePath = path.join(directoryPath, 'provider.env');
   fsImpl.writeFileSync(
     filePath,
-    `export COPILOT_PROVIDER_API_KEY=${shellQuote(apiKey)}\n`,
+    secretLines.join(''),
     { encoding: 'utf8', mode: 0o600 },
   );
   fsImpl.chmodSync(filePath, 0o600);
@@ -219,9 +280,10 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     ...env,
     SESSION_ID: String(targetSessionId || '').trim() || String(env?.SESSION_ID || '').trim(),
   };
-  const providerApiKey = String(launchEnv.COPILOT_PROVIDER_API_KEY || '').trim();
+  const hasSecretEnvValue = WORKER_SECRET_ENV_VARS
+    .some((key) => String(launchEnv[key] || '').trim());
   const normalizedSecretEnvFilePath = String(secretEnvFilePath || '').trim();
-  if (providerApiKey && !normalizedSecretEnvFilePath) {
+  if (hasSecretEnvValue && !normalizedSecretEnvFilePath) {
     throw new Error('worker-secret-env-file-required');
   }
   const exports = [];
@@ -243,6 +305,8 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     'COPILOT_MODEL',
     'COPILOT_WEB_RELAY_WORKER_KIND',
     'CLAUDE_RELAY_MODEL',
+    'CURSOR_RELAY_MODEL',
+    'CURSOR_AGENT_STORE_DIR',
     'SESSION_ID',
     'COPILOT_WORKSPACE_ROOT',
     'INIT_CWD',
@@ -256,8 +320,8 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     ? `. ${shellQuote(normalizedSecretEnvFilePath)} || exit $?; rm -f ${shellQuote(normalizedSecretEnvFilePath)}; rmdir ${shellQuote(path.dirname(normalizedSecretEnvFilePath))}; `
     : '';
   const workerCommand = buildPosixWorkerLaunchCommand(targetSessionId, launchEnv);
-  if (isClaudeWorkerEnvironment(launchEnv)) {
-    // The Claude worker is a plain Node process; it needs no pseudo-TTY.
+  if (resolveNodeWorkerDescriptor(launchEnv)) {
+    // Node workers (Claude, Cursor) are plain processes; no pseudo-TTY needed.
     return `${prefix}${secretPrefix}exec ${workerCommand}`;
   }
   // Use script to create a pseudo-TTY without GH_FORCE_TTY so the CLI routes
@@ -351,6 +415,7 @@ export async function launchSessionCli({
     delete tmuxEnv.TMUX;
     delete tmuxEnv.TMUX_PANE;
     delete tmuxEnv.COPILOT_PROVIDER_API_KEY;
+    delete tmuxEnv.CURSOR_API_KEY;
     if (allowProcessReuse) {
       const existingPanePid = getTmuxPanePid(sessionName, { execFileSyncImpl });
       if (existingPanePid && isPidAlive(existingPanePid)) {
@@ -412,26 +477,25 @@ export async function launchSessionCli({
     throw new Error('worker-spawn-unhealthy:tmux-pane-missing');
   }
 
-  const launchingClaudeWorker = isClaudeWorkerEnvironment(launchSessionEnv);
-  const claudeNodeExecutable = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_NODE) || 'node';
-  const claudeWorkerScriptPath = launchingClaudeWorker ? resolveClaudeWorkerScriptPath(launchSessionEnv) : '';
+  const nodeWorker = resolveNodeWorkerDescriptor(launchSessionEnv);
+  const nodeWorkerExecutable = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_NODE) || 'node';
   const posixCliExecutable = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
     || normalizeText(launchSessionEnv.COPILOT_CLI_EXECUTABLE)
     || normalizeText(launchSessionEnv.COPILOT_CLI_PATH)
     || 'copilot';
   const spawnCommand = platform === 'win32'
     ? (launchSessionEnv.ComSpec || process.env.ComSpec || 'cmd.exe')
-    : (launchingClaudeWorker ? claudeNodeExecutable : posixCliExecutable);
+    : (nodeWorker ? nodeWorkerExecutable : posixCliExecutable);
   const spawnArgs = platform === 'win32'
-    ? (launchingClaudeWorker
+    ? (nodeWorker
       ? [
         '/d',
         '/s',
         '/c',
         'start',
-        `Claude Worker ${target.slice(0, 8)}`,
-        claudeNodeExecutable,
-        claudeWorkerScriptPath,
+        `${nodeWorker.windowsTitle} ${target.slice(0, 8)}`,
+        nodeWorkerExecutable,
+        nodeWorker.scriptPath,
         '--session-id',
         target,
       ]
@@ -448,8 +512,8 @@ export async function launchSessionCli({
         '--session-id',
         target,
       ])
-    : (launchingClaudeWorker
-      ? [claudeWorkerScriptPath, '--session-id', target]
+    : (nodeWorker
+      ? [nodeWorker.scriptPath, '--session-id', target]
       : ['--allow-all', '--session-id', target]);
   const child = spawnImpl(spawnCommand, spawnArgs, {
     cwd: launchProcessCwd,

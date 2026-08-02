@@ -1,0 +1,449 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
+
+import { buildDequeuedRelayMessage, registerMessagesRoutes } from './messages-routes.mjs';
+
+const NOW = '2024-01-01T00:00:00.000Z';
+
+// Minimal replica of the runtime_sessions schema: only the columns the cursor
+// routes and the dequeue payload builder touch. The cursor_agent_id column is
+// optional so the column-gated 500 path can be exercised.
+function makeDb({ withCursorAgentIdColumn = true } = {}) {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE runtime_sessions (
+      id              TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL UNIQUE,
+      sdk_session_id  TEXT,
+      strategy        TEXT NOT NULL DEFAULT 'isolated',
+      runtime_key     TEXT NOT NULL,
+      model           TEXT,
+      provider_type   TEXT NOT NULL DEFAULT 'github',
+      provider_model  TEXT,
+      status          TEXT NOT NULL DEFAULT 'active',
+      created_at      TEXT NOT NULL,
+      last_used_at    TEXT NOT NULL,
+      claude_native_session_id TEXT,
+      context_usage_json TEXT,
+      context_usage_captured_at TEXT
+      ${withCursorAgentIdColumn ? ', cursor_agent_id TEXT' : ''}
+    );
+  `);
+  return db;
+}
+
+// Mirrors the session-repository statements the routes rely on, including the
+// column gate that leaves the cursor statement null on un-migrated databases.
+function makeStmts(db, { hasCursorAgentIdColumn = true } = {}) {
+  return {
+    getRuntimeSessionByConversation: db.prepare(`SELECT * FROM runtime_sessions WHERE conversation_id = ?`),
+    getRuntimeSessionById: db.prepare(`SELECT * FROM runtime_sessions WHERE id = ?`),
+    updateRuntimeSessionCursorAgentId: hasCursorAgentIdColumn
+      ? db.prepare(`
+          UPDATE runtime_sessions
+          SET cursor_agent_id = ?, last_used_at = ?
+          WHERE conversation_id = ?
+        `)
+      : null,
+    updateRuntimeSessionContextUsage: db.prepare(`
+      UPDATE runtime_sessions
+      SET context_usage_json = ?, context_usage_captured_at = ?
+      WHERE conversation_id = ?
+    `),
+  };
+}
+
+function insertRuntimeSession(db, {
+  id = 'rs-1',
+  conversationId = 'conv-1',
+  providerType = 'cursor',
+  providerModel = null,
+  cursorAgentId = null,
+} = {}) {
+  db.prepare(`
+    INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, provider_type, provider_model, status, created_at, last_used_at)
+    VALUES (?, ?, 'isolated', ?, ?, ?, ?, 'active', ?, ?)
+  `).run(id, conversationId, `key-${id}`, providerModel, providerType, providerModel, NOW, NOW);
+  if (cursorAgentId) {
+    db.prepare(`UPDATE runtime_sessions SET cursor_agent_id = ? WHERE id = ?`).run(cursorAgentId, id);
+  }
+}
+
+// Stand-ins for the deps server-runtime.mjs injects. server-runtime boots a
+// server on import, so the deps are reproduced here rather than imported.
+function baseRouteDeps(stmts, overrides = {}) {
+  return {
+    auth: (_req, _res, next) => next(),
+    db: { prepare: () => ({ run() {}, get: () => null, all: () => [] }) },
+    stmts,
+    MAX_UPLOAD_BYTES: 1024 * 1024,
+    touchCli: () => {},
+    ensureSessionId: () => 'session-1',
+    normalizeRelayMode: (value) => String(value || '').trim().toLowerCase() || null,
+    DEFAULT_RELAY_MODE: 'default',
+    DEFAULT_MODEL: 'gpt-5',
+    normalizeAttachments: () => [],
+    collectReferenceAttachmentsFromText: () => ({ attachments: [] }),
+    mergeMessageAttachments: (left, right) => [...(left || []), ...(right || [])],
+    resolveRequestedModel: (model) => ({
+      ok: false,
+      error: `Model "${String(model || '')}" is not supported`,
+      available: [],
+    }),
+    getOpenAIProviderSettings: () => ({ configured: false, enabled: false, model: '', models: [] }),
+    getCursorProviderSettings: () => ({ enabled: false, model: '', models: [] }),
+    featureFlags: {},
+    ...overrides,
+  };
+}
+
+function postHandler(routePath, deps) {
+  let handler = null;
+  const app = {
+    post(registeredPath, ...handlers) {
+      if (registeredPath === routePath) handler = handlers[handlers.length - 1];
+    },
+    get() {}, patch() {}, delete() {}, put() {}, use() {},
+  };
+  registerMessagesRoutes(app, deps);
+  assert.ok(handler, `${routePath} should be registered`);
+  return handler;
+}
+
+async function invokePost(routePath, deps, body) {
+  const handler = postHandler(routePath, deps);
+  const captured = { status: 200, body: null };
+  const res = {
+    setHeader() {},
+    status(code) { captured.status = code; return res; },
+    json(payload) { captured.body = payload; return res; },
+  };
+  await handler({ body, headers: {}, query: {} }, res);
+  return captured;
+}
+
+test('cursor-agent-id rejects a missing conversationId with 400', async () => {
+  const db = makeDb();
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-agent-id', deps, { cursorAgentId: 'agent-1' });
+  assert.equal(status, 400);
+  assert.equal(body.error, 'Missing conversationId or cursorAgentId');
+});
+
+test('cursor-agent-id rejects a missing cursorAgentId with 400', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-1', providerType: 'cursor' });
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-agent-id', deps, { conversationId: 'conv-1' });
+  assert.equal(status, 400);
+  assert.equal(body.error, 'Missing conversationId or cursorAgentId');
+});
+
+test('cursor-agent-id returns 404 when the conversation has no runtime session', async () => {
+  const db = makeDb();
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-agent-id', deps, {
+    conversationId: 'conv-missing',
+    cursorAgentId: 'agent-1',
+  });
+  assert.equal(status, 404);
+  assert.equal(body.error, 'Runtime session not found for conversation');
+});
+
+test('cursor-agent-id returns 409 for a conversation bound to another provider', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-agent-id', deps, {
+    conversationId: 'conv-gh',
+    cursorAgentId: 'agent-1',
+  });
+  assert.equal(status, 409);
+  assert.equal(body.error, 'Conversation is not bound to the Cursor provider');
+});
+
+test('cursor-agent-id returns 500 when the column-gated statement is unavailable', async () => {
+  const db = makeDb({ withCursorAgentIdColumn: false });
+  insertRuntimeSession(db, { conversationId: 'conv-1', providerType: 'cursor' });
+  const deps = baseRouteDeps(makeStmts(db, { hasCursorAgentIdColumn: false }));
+  const { status, body } = await invokePost('/api/cursor-agent-id', deps, {
+    conversationId: 'conv-1',
+    cursorAgentId: 'agent-1',
+  });
+  assert.equal(status, 500);
+  assert.equal(body.error, 'Cursor agent id storage is unavailable');
+});
+
+test('cursor-agent-id persists the agent id and touches last_used_at', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-1', providerType: 'cursor' });
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-agent-id', deps, {
+    conversationId: 'conv-1',
+    cursorAgentId: 'agent-abc-123',
+  });
+  assert.equal(status, 200);
+  assert.deepEqual(body, { ok: true });
+  const row = db.prepare(`SELECT cursor_agent_id, last_used_at FROM runtime_sessions WHERE conversation_id = ?`).get('conv-1');
+  assert.equal(row.cursor_agent_id, 'agent-abc-123');
+  assert.notEqual(row.last_used_at, NOW);
+});
+
+test('cursor-context-usage rejects a missing conversationId with 400', async () => {
+  const db = makeDb();
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-context-usage', deps, {
+    contextUsage: { used: 1 },
+  });
+  assert.equal(status, 400);
+  assert.equal(body.error, 'Missing conversationId');
+});
+
+test('cursor-context-usage rejects a payload without contextUsage and modelUsage with 400', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-1', providerType: 'cursor' });
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-context-usage', deps, {
+    conversationId: 'conv-1',
+    model: 'composer-1',
+  });
+  assert.equal(status, 400);
+  assert.equal(body.error, 'Missing contextUsage or modelUsage');
+});
+
+test('cursor-context-usage returns 404 when the conversation has no runtime session', async () => {
+  const db = makeDb();
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-context-usage', deps, {
+    conversationId: 'conv-missing',
+    contextUsage: { used: 1 },
+  });
+  assert.equal(status, 404);
+  assert.equal(body.error, 'Runtime session not found for conversation');
+});
+
+test('cursor-context-usage returns 409 for a conversation bound to another provider', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db));
+  const { status, body } = await invokePost('/api/cursor-context-usage', deps, {
+    conversationId: 'conv-gh',
+    contextUsage: { used: 1 },
+  });
+  assert.equal(status, 409);
+  assert.equal(body.error, 'Conversation is not bound to the Cursor provider');
+});
+
+test('cursor-context-usage stores the usage payload and stamps captured_at', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-1', providerType: 'cursor' });
+  const deps = baseRouteDeps(makeStmts(db));
+  const contextUsage = { usedTokens: 1200, maxTokens: 200000 };
+  const modelUsage = { 'composer-1': { inputTokens: 900, outputTokens: 300 } };
+  const { status, body } = await invokePost('/api/cursor-context-usage', deps, {
+    conversationId: 'conv-1',
+    model: 'composer-1',
+    contextUsage,
+    modelUsage,
+  });
+  assert.equal(status, 200);
+  assert.deepEqual(body, { ok: true });
+  const row = db.prepare(`SELECT context_usage_json, context_usage_captured_at FROM runtime_sessions WHERE conversation_id = ?`).get('conv-1');
+  assert.deepEqual(JSON.parse(row.context_usage_json), {
+    model: 'composer-1',
+    contextUsage,
+    modelUsage,
+  });
+  assert.ok(row.context_usage_captured_at, 'captured_at should be stamped');
+});
+
+test('buildDequeuedRelayMessage carries the persisted cursor agent id', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  insertRuntimeSession(db, {
+    id: 'rs-1',
+    conversationId: 'conv-1',
+    providerType: 'cursor',
+    providerModel: 'composer-1',
+    cursorAgentId: 'agent-9',
+  });
+  const message = buildDequeuedRelayMessage({
+    msg: {
+      id: 'q-1',
+      conversation_id: 'conv-1',
+      runtime_session_id: 'rs-1',
+      is_new_conversation: 0,
+      model: 'composer-1',
+      text: 'hello',
+      status: 'processing',
+      timestamp: NOW,
+    },
+    stmts,
+    normalizeRelayMode: (value) => String(value || '').trim() || null,
+    defaultRelayMode: 'default',
+    defaultModel: 'gpt-5',
+  });
+  assert.equal(message.cursorAgentId, 'agent-9');
+  assert.equal(message.providerType, 'cursor');
+});
+
+test('buildDequeuedRelayMessage yields a null cursorAgentId when the column is empty', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  insertRuntimeSession(db, { id: 'rs-1', conversationId: 'conv-1', providerType: 'cursor' });
+  const message = buildDequeuedRelayMessage({
+    msg: {
+      id: 'q-1',
+      conversation_id: 'conv-1',
+      runtime_session_id: 'rs-1',
+      is_new_conversation: 0,
+      model: 'composer-1',
+      text: 'hello',
+      status: 'processing',
+      timestamp: NOW,
+    },
+    stmts,
+    normalizeRelayMode: (value) => String(value || '').trim() || null,
+    defaultRelayMode: 'default',
+    defaultModel: 'gpt-5',
+  });
+  assert.equal(message.cursorAgentId, null);
+});
+
+test('a cursor-only model on an existing github conversation requires a new Cursor conversation', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db), {
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1', 'cursor-fast'] }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-gh',
+    text: 'hello there',
+    model: 'composer-1',
+    relayMode: 'default',
+  });
+  assert.equal(status, 409);
+  assert.equal(body.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.equal(body.error, 'Cursor model selection requires creating a new Cursor conversation');
+});
+
+test('an explicit cursor providerType on an existing github conversation requires a new Cursor conversation', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db), {
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1'] }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-gh',
+    text: 'hello there',
+    model: 'composer-1',
+    providerType: 'cursor',
+    relayMode: 'default',
+  });
+  assert.equal(status, 409);
+  assert.equal(body.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
+});
+
+// Cursor resells models the Claude provider serves under the same id, so the
+// id alone must never route a bound Claude session into the cursor rejection.
+test('a Claude session keeps sending a model the Cursor catalog also lists', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, {
+    conversationId: 'conv-claude',
+    providerType: 'claude',
+    providerModel: 'claude-opus-5',
+  });
+  const deps = baseRouteDeps({
+    ...makeStmts(db),
+    // Reached only once the provider guards let the request through; a missing
+    // conversation row is the first check after them.
+    getConvAnyStatus: { get: () => null },
+  }, {
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1', 'claude-opus-5'] }),
+    getClaudeProviderSettings: () => ({ enabled: true, model: 'claude-opus-5', models: ['claude-opus-5'] }),
+    maybeApplyWorkspaceRootFromMessage: () => ({ attempted: false, changed: false }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-claude',
+    text: 'hello there',
+    model: 'claude-opus-5',
+    relayMode: 'default',
+  });
+  assert.notEqual(body?.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.equal(status, 404);
+  assert.equal(body.error, 'Conversation not found');
+});
+
+test('an explicit cursor providerType still cannot cross into a Claude session', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, {
+    conversationId: 'conv-claude',
+    providerType: 'claude',
+    providerModel: 'claude-opus-5',
+  });
+  const deps = baseRouteDeps(makeStmts(db), {
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1', 'claude-opus-5'] }),
+    getClaudeProviderSettings: () => ({ enabled: true, model: 'claude-opus-5', models: ['claude-opus-5'] }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-claude',
+    text: 'hello there',
+    model: 'claude-opus-5',
+    providerType: 'cursor',
+    relayMode: 'default',
+  });
+  assert.equal(status, 409);
+  assert.equal(body.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
+});
+
+// The mirror case: an OpenAI BYOK catalog that lists a Cursor model id must not
+// push a bound Cursor session into the OpenAI rejection.
+test('a Cursor session keeps sending a model the OpenAI catalog also lists', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, {
+    conversationId: 'conv-cursor',
+    providerType: 'cursor',
+    providerModel: 'gpt-5.5',
+  });
+  const deps = baseRouteDeps({
+    ...makeStmts(db),
+    getConvAnyStatus: { get: () => null },
+  }, {
+    getOpenAIProviderSettings: () => ({ configured: true, enabled: true, model: 'gpt-5.5', models: ['gpt-5.5'] }),
+    getCursorProviderSettings: () => ({ enabled: true, model: 'gpt-5.5', models: ['gpt-5.5'] }),
+    maybeApplyWorkspaceRootFromMessage: () => ({ attempted: false, changed: false }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-cursor',
+    text: 'hello there',
+    model: 'gpt-5.5',
+    relayMode: 'default',
+  });
+  assert.notEqual(body?.code, 'OPENAI_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.equal(status, 404);
+  assert.equal(body.error, 'Conversation not found');
+});
+
+test('a disabled Cursor provider does not hijack unknown models into the cursor rejection', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db), {
+    getCursorProviderSettings: () => ({ enabled: false, model: 'composer-1', models: ['composer-1', 'cursor-fast'] }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-gh',
+    text: 'hello there',
+    model: 'composer-1',
+    relayMode: 'default',
+  });
+  assert.equal(status, 400);
+  assert.notEqual(body?.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.match(String(body.error), /not supported/);
+});
