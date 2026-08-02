@@ -309,3 +309,65 @@ test('summarizeToolInput prefers meaningful fields and falls back to JSON', () =
   assert.equal(summarizeToolInput('Custom', { foo: 'bar' }), '{"foo":"bar"}');
   assert.equal(summarizeToolInput('Empty', {}), '');
 });
+
+test('phantom zero-work result from an orphaned-task resume is skipped', () => {
+  // A resumed session with orphaned background tasks emits a bookkeeping
+  // result (num_turns 0, duration_api_ms 0) before the real turn. Emitting a
+  // result action for it would make the runner close the input gate and kill
+  // the control transport, so every later permission request fails with
+  // "AbortError: Stream closed".
+  const normalizer = createSdkMessageNormalizer();
+  const phantom = normalizer.normalize({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    num_turns: 0,
+    duration_api_ms: 0,
+    result: '',
+    session_id: 's1',
+    total_cost_usd: 0,
+  });
+  assert.deepEqual(phantom, []);
+
+  const real = normalizer.normalize({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    num_turns: 2,
+    duration_api_ms: 5173,
+    result: 'Done.',
+    session_id: 's1',
+  });
+  assert.equal(real.length, 1);
+  assert.equal(real[0].channel, 'result');
+  assert.equal(real[0].payload.text, 'Done.');
+});
+
+test('zero-turn error results still map to result actions', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const failure = normalizer.normalize({
+    type: 'result',
+    subtype: 'error_during_execution',
+    is_error: true,
+    num_turns: 0,
+    duration_api_ms: 0,
+    result: '',
+    session_id: 's1',
+  });
+  assert.equal(failure.length, 1);
+  assert.equal(failure[0].payload.isError, true);
+});
+
+test('task_notification system messages surface as activity', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const actions = normalizer.normalize({
+    type: 'system',
+    subtype: 'task_notification',
+    task_id: 'task-1',
+    status: 'stopped',
+    summary: 'No completion record was found for this background shell command.',
+  });
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].channel, 'activity');
+  assert.match(actions[0].payload.text, /Background task task-1 stopped/);
+});

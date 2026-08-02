@@ -392,7 +392,32 @@ export function createSdkMessageNormalizer() {
       }];
     }
 
+    if (type === 'system' && sdkMessage.subtype === 'task_notification') {
+      const taskId = String(sdkMessage.task_id || '').trim() || 'unknown';
+      const status = String(sdkMessage.status || '').trim() || 'unknown';
+      return [{
+        channel: 'activity',
+        payload: {
+          text: truncate(`Background task ${taskId} ${status}: ${String(sdkMessage.summary || '').trim()}`),
+          subagentRunId: null,
+        },
+      }];
+    }
+
     if (type === 'result') {
+      // A resumed session whose previous CLI process died with background tasks
+      // still tracked replays a bookkeeping turn for the orphaned-task
+      // notification and emits a zero-work result BEFORE the delivered user
+      // message's turn (num_turns 0, duration_api_ms 0). Treating that phantom
+      // as the turn result makes the runner release the input gate, which
+      // closes the CLI's control transport — every subsequent permission
+      // request in the real turn then fails with "AbortError: Stream closed"
+      // (canUseTool is never reached). Skip it; the real result follows.
+      const isPhantom = sdkMessage.subtype === 'success'
+        && sdkMessage.is_error !== true
+        && Number(sdkMessage.num_turns) === 0
+        && Number(sdkMessage.duration_api_ms) === 0;
+      if (isPhantom) return [];
       const isError = sdkMessage.subtype !== 'success' || sdkMessage.is_error === true;
       return [{
         channel: 'result',
