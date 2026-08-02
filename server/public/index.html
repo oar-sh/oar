@@ -1842,6 +1842,65 @@
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   #send-btn:not(:disabled):hover { opacity: 0.85; }
 
+  /* Shared reader composer: only the read-only input plus the GitHub pill. */
+  #shared-github-pill { display: none; }
+  body.shared-reader-mode #emoji-btn,
+  body.shared-reader-mode #mode-select,
+  body.shared-reader-mode #model-select,
+  body.shared-reader-mode #repo-browser-desktop-btn,
+  body.shared-reader-mode #repo-browser-input-btn,
+  body.shared-reader-mode #attach-btn,
+  body.shared-reader-mode #context-tier-select,
+  body.shared-reader-mode #reasoning-effort-select,
+  body.shared-reader-mode #send-btn,
+  body.shared-reader-mode #model-lock-note,
+  body.shared-reader-mode #model-pricing-details {
+    display: none !important;
+  }
+  body.shared-reader-mode .input-row {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 10px;
+  }
+  body.shared-reader-mode #msg-input {
+    min-height: 46px;
+    height: 46px;
+    max-height: 46px;
+  }
+  body.shared-reader-mode #shared-github-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 46px;
+    padding: 0 18px;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg3);
+    color: var(--text);
+    font-weight: 700;
+    font-size: var(--fs-core-control);
+    text-decoration: none;
+    transition: color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  }
+  body.shared-reader-mode #shared-github-pill svg {
+    width: 20px;
+    height: 20px;
+    fill: currentColor;
+    transition: transform 0.18s ease;
+  }
+  body.shared-reader-mode #shared-github-pill:hover,
+  body.shared-reader-mode #shared-github-pill:focus-visible {
+    color: var(--accent);
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+  }
+  body.shared-reader-mode #shared-github-pill:hover svg {
+    transform: rotate(-10deg) scale(1.12);
+  }
+
   .workspace-file-link { text-decoration: underline; }
   .workspace-file-link:hover { opacity: 0.9; }
 
@@ -3745,6 +3804,10 @@
           <option value="">Unavailable</option>
         </select>
         <button id="send-btn" onclick="sendMessage()">Send</button>
+        <a id="shared-github-pill" href="https://github.com/materia79/copilot-remote" target="_blank" rel="noopener" aria-label="Fork copilot-remote on GitHub">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          <span>Fork on GitHub</span>
+        </a>
       </div>
       <details id="model-pricing-details">
         <summary id="model-pricing-summary"></summary>

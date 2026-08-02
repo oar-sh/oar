@@ -826,6 +826,11 @@ function isModelMetadataHealthy(payload = modelCatalogState) {
 }
 
 function syncModelMetadataBlocker(message = '') {
+  // Shared readers have no model picker, so metadata problems are not actionable there.
+  if (isSharedReaderMode()) {
+    document.getElementById('model-metadata-blocker')?.classList.remove('visible');
+    return;
+  }
   const blocker = document.getElementById('model-metadata-blocker');
   const text = document.getElementById('model-metadata-blocker-text');
   const retryBtn = document.getElementById('model-metadata-retry-btn');
@@ -960,6 +965,7 @@ function syncSessionLockNote({ pinnedModel = '' } = {}) {
 }
 
 function applyModelMetadataHardFail(message = '') {
+  if (isSharedReaderMode()) return;
   modelMetadataBlocked = true;
   syncModelMetadataBlocker(message);
   setModelBanner(`⚠️ ${String(message || 'Model metadata is unavailable.').trim()}`);
@@ -1113,6 +1119,9 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
 }
 
 function updateModelCatalogState(payload) {
+  // Shared readers never load the catalog, so this would only surface
+  // "metadata unavailable" warnings for a picker they cannot see.
+  if (isSharedReaderMode()) return;
   const select = document.getElementById('model-select');
   if (!select) return;
   const models = Array.isArray(payload?.models)
