@@ -505,6 +505,7 @@ async function stopIdleWorkspaceRootSession({
   sessionWorkerSupervisor,
   sessionWorkerRegistry,
   sessionWorkerProcessInspector,
+  stopOverrides = null,
 } = {}) {
   const sid = String(sdkSessionId || '').trim();
   if (!sid) return { ok: false, error: 'Missing session id' };
@@ -517,6 +518,7 @@ async function stopIdleWorkspaceRootSession({
     processInspector: sessionWorkerProcessInspector,
     isPidAliveImpl: isPidAlive,
     killTmuxSessionImpl: killTmuxSession,
+    ...(stopOverrides || {}),
   });
   // Only tear down the bookkeeping once every process is verifiably gone.
   // Clearing it while a CLI is still alive is what lets the relaunch "succeed"
@@ -1620,6 +1622,10 @@ export function registerSessionsRoutes(app, deps) {
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
     sessionWorkerProcessInspector,
+    // Seams for stopSessionWorkerProcesses (platform, killImpl, isPidAliveImpl,
+    // killTmuxSessionImpl). Tests must inject these instead of relying on the
+    // host OS, so the suite behaves identically on Windows and POSIX.
+    sessionWorkerStopOverrides = null,
     resolveSessionStateRoot,
     resolveClaudeSessionRoot = null,
     getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
@@ -3364,6 +3370,7 @@ export function registerSessionsRoutes(app, deps) {
         sessionWorkerSupervisor,
         sessionWorkerRegistry,
         sessionWorkerProcessInspector,
+        stopOverrides: sessionWorkerStopOverrides,
       });
       if (!stopped.ok) {
         // Do not launch on top of a process we could not kill. The CWD is saved,

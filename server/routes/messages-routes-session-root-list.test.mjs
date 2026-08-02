@@ -13,7 +13,7 @@ import {
 } from '../services/drives-path-helpers.mjs';
 
 const NATIVE_ID = '11111111-2222-4333-8444-555555555555';
-const IS_WINDOWS = process.platform === 'win32';
+const IS_WINDOWS = process.platform === 'win32'; // host-platform: the real drive-path helpers of the host OS are under test
 
 // The route serves web paths (C:/…) on Windows and native paths elsewhere.
 function nodePathFor(absolutePath) {

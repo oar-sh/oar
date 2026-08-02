@@ -94,3 +94,33 @@ test('test files contain no personal data, machine fingerprints, or secrets', ()
   assert.deepEqual(violations, [],
     `Test files must use fictional data (e.g. C:\\Users\\dev, user@example.com, fake tokens). Violations:\n${violations.join('\n')}`);
 });
+
+// Guard: the suite must produce the same result on Windows and POSIX. Tests
+// therefore must not branch on the host OS implicitly — inject the platform
+// into the code under test ('win32', 'linux') instead. `process.platform` is
+// allowed in a test file only:
+//   - inside an explicit `skip` option, so the test is *reported as skipped*
+//     on the other OS rather than failing there, or
+//   - on a line carrying a `host-platform:` comment explaining why real host
+//     behavior (fs semantics, path helpers) is genuinely under test.
+const HOST_PLATFORM_ALLOWED_RE = /\bskip\b|host-platform:/;
+
+test('tests reference process.platform only behind a skip option or a host-platform note', () => {
+  const files = collectTestFiles(repoRoot);
+  const violations = [];
+
+  for (const file of files) {
+    const relPath = path.relative(repoRoot, file);
+    fs.readFileSync(file, 'utf8').split(/\r?\n/).forEach((line, idx) => {
+      const code = line.split('//')[0]; // a mention inside a comment is fine
+      if (code.includes('process.platform') && !HOST_PLATFORM_ALLOWED_RE.test(line)) {
+        violations.push(`${relPath}:${idx + 1} — ${line.trim()}`);
+      }
+    });
+  }
+
+  assert.deepEqual(violations, [],
+    'Tests must inject the platform into the code under test instead of reading the host OS. '
+    + 'If host behavior is genuinely required, gate the test with `{ skip: process.platform !== \'<os>\' }` '
+    + `or annotate the line with a \`host-platform:\` comment. Violations:\n${violations.join('\n')}`);
+});

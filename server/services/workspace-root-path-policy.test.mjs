@@ -150,13 +150,13 @@ test('symlinks resolve to their target before the allow list is applied', (t) =>
   t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
 
   const resolvedTarget = fs.realpathSync.native(target);
-  const viaAlias = validateRequestedWorkspaceRoot(alias, { platform: process.platform });
+  const viaAlias = validateRequestedWorkspaceRoot(alias, { platform: process.platform }); // host-platform: resolves a real symlink
   assert.equal(viaAlias.ok, true);
   assert.equal(viaAlias.realPath, resolvedTarget);
 
   // An allow list covering only the alias' parent must not admit the target.
   const blocked = validateRequestedWorkspaceRoot(alias, {
-    platform: process.platform,
+    platform: process.platform, // host-platform: resolves a real symlink
     allowList: [fs.realpathSync.native(aliasParent)],
   });
   assert.equal(blocked.ok, false);

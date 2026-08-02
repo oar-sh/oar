@@ -69,6 +69,10 @@ function setup(overrides = {}) {
     ensureWorkerImpl = null,
     stopWindowsPidsImpl = null,
     processAlive = () => false,
+    // The stop path branches on the platform. Pin it to win32 by default so the
+    // suite is deterministic on any host OS; the POSIX branch has its own test.
+    stopPlatform = 'win32',
+    stopOverrides = {},
     runtimeWorkspaceRootPath = '',
     pendingSessionCwd = '',
     workspaceRootAllowList = [],
@@ -180,6 +184,15 @@ function setup(overrides = {}) {
       findProcessesForSession: () => (liveProcess ? [liveProcess] : []),
       findWindowsProcessTreeForSession: () => (liveProcess ? [liveProcess] : []),
       stopWindowsPids: stopWindowsPidsImpl || ((pids) => calls.push(['stopWindowsPids', [...pids]])),
+    },
+    // Never let the stop service touch real processes: the mock PIDs may exist
+    // on the host. Every seam records into `calls` instead.
+    sessionWorkerStopOverrides: {
+      platform: stopPlatform,
+      isPidAliveImpl: () => false,
+      killImpl: (pid, signal) => calls.push(['killPid', pid, signal]),
+      killTmuxSessionImpl: (sid) => calls.push(['killTmuxSession', sid]),
+      ...stopOverrides,
     },
   };
 
@@ -306,24 +319,19 @@ test('a stop that times out refuses to launch but still saves the CWD', async ()
   const { app, getConfiguredRootPath } = setup({
     // The process never dies, so the stop escalates and then times out.
     stopWindowsPidsImpl: () => {},
+    stopOverrides: { isPidAliveImpl: () => true, gracefulTimeoutMs: 0, escalationTimeoutMs: 0 },
     ensureWorkerImpl: async () => {
       ensureCalls += 1;
       return { ok: true, worker: { pid: 1 }, lifecycle: {} };
     },
   });
-  const originalKill = process.kill;
-  process.kill = () => true; // isPidAlive(4242) -> true, forever
-  try {
-    const res = await relaunch(app, { rootPath: ROOT_A });
-    assert.equal(res.statusCode, 409);
-    assert.equal(res.body.code, 'worker-stop-timeout');
-    assert.deepEqual(res.body.remainingPids, [4242]);
-    assert.equal(res.body.workspaceRootApplied, false);
-    assert.equal(ensureCalls, 0, 'must not launch on top of a surviving process');
-    assert.equal(getConfiguredRootPath(), ROOT_A, 'the CWD is still saved for the next launch');
-  } finally {
-    process.kill = originalKill;
-  }
+  const res = await relaunch(app, { rootPath: ROOT_A });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, 'worker-stop-timeout');
+  assert.deepEqual(res.body.remainingPids, [4242]);
+  assert.equal(res.body.workspaceRootApplied, false);
+  assert.equal(ensureCalls, 0, 'must not launch on top of a surviving process');
+  assert.equal(getConfiguredRootPath(), ROOT_A, 'the CWD is still saved for the next launch');
 });
 
 // --- honest reporting ---------------------------------------------------------
@@ -419,6 +427,22 @@ test('the route disables process reuse and owns the kill-marker reset', async ()
   const stopIndex = calls.findIndex(([name]) => name === 'stopWindowsPids');
   const ensureIndex = calls.findIndex(([name]) => name === 'ensureWorker');
   assert.ok(stopIndex >= 0 && stopIndex < resetIndex, 'reset happens after the stop verified the process died');
+  assert.ok(resetIndex < ensureIndex, 'reset happens before the launch');
+});
+
+test('on POSIX the stop signals the PIDs and tmux session instead of the Windows inspector', async () => {
+  const { app, calls } = setup({ stopPlatform: 'linux' });
+  const res = await relaunch(app, { rootPath: ROOT_A });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls.filter(([name]) => name === 'stopWindowsPids').length, 0, 'the Windows path must stay cold');
+  assert.deepEqual(calls.find(([name]) => name === 'killPid'), ['killPid', 4242, 'SIGTERM']);
+  assert.deepEqual(calls.find(([name]) => name === 'killTmuxSession'), ['killTmuxSession', SID]);
+
+  const killIndex = calls.findIndex(([name]) => name === 'killPid');
+  const resetIndex = calls.findIndex(([name, didReset]) => name === 'clearRestartSchedule' && didReset === true);
+  const ensureIndex = calls.findIndex(([name]) => name === 'ensureWorker');
+  assert.ok(killIndex >= 0 && killIndex < resetIndex, 'reset happens after the stop verified the process died');
   assert.ok(resetIndex < ensureIndex, 'reset happens before the launch');
 });
 
