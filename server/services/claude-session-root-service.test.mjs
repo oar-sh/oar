@@ -68,22 +68,59 @@ test('the session directory is found from the workspace root without scanning', 
     sessionRootPath: path.join(projectDir, NATIVE_ID),
     sessionRootName: 'Session',
     projectDirPath: projectDir,
+    transcriptPath: '',
+    sessionRootExists: true,
   });
   assert.equal(readdirCalls, 0, 'the slug fast path should not scan');
 });
 
-test('a transcript with no session directory does not resolve', () => {
+test('a transcript with no session directory still resolves, flagged as not yet created', () => {
   const { configDir, projectsRoot } = makeConfigDir();
   const workspaceRootPath = '/home/dev/git/copilot-remote';
   const projectDir = path.join(projectsRoot, claudeProjectDirSlug(workspaceRootPath));
   fs.mkdirSync(projectDir, { recursive: true });
-  // The transcript always exists; the per-session folder only appears once the
-  // session writes subagent or tool-result files. The project dir is never
-  // offered as a stand-in — it holds every session for this workspace.
-  fs.writeFileSync(path.join(projectDir, `${NATIVE_ID}.jsonl`), '{}\n');
+  // The transcript exists from the first turn; the per-session folder only
+  // appears once the session writes subagent or tool-result files. The project
+  // dir is never offered as a stand-in — it holds every session for this
+  // workspace.
+  const transcriptPath = path.join(projectDir, `${NATIVE_ID}.jsonl`);
+  fs.writeFileSync(transcriptPath, '{}\n');
+
+  const { resolveClaudeSessionRoot } = makeResolver(configDir);
+  assert.deepEqual(resolveClaudeSessionRoot({ claudeNativeSessionId: NATIVE_ID, workspaceRootPath }), {
+    sessionRootPath: path.join(projectDir, NATIVE_ID),
+    sessionRootName: 'Session',
+    projectDirPath: projectDir,
+    transcriptPath,
+    sessionRootExists: false,
+  });
+});
+
+test('a session with neither a transcript nor a directory does not resolve', () => {
+  const { configDir, projectsRoot } = makeConfigDir();
+  const workspaceRootPath = '/home/dev/git/copilot-remote';
+  fs.mkdirSync(path.join(projectsRoot, claudeProjectDirSlug(workspaceRootPath)), { recursive: true });
 
   const { resolveClaudeSessionRoot } = makeResolver(configDir);
   assert.equal(resolveClaudeSessionRoot({ claudeNativeSessionId: NATIVE_ID, workspaceRootPath }), null);
+});
+
+test('a directory appearing later is reported without re-scanning, from the cached project dir', () => {
+  const { configDir, projectsRoot } = makeConfigDir();
+  const workspaceRootPath = '/home/dev/git/copilot-remote';
+  const projectDir = path.join(projectsRoot, claudeProjectDirSlug(workspaceRootPath));
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(path.join(projectDir, `${NATIVE_ID}.jsonl`), '{}\n');
+
+  let readdirCalls = 0;
+  const countingFs = { ...fs, readdirSync: (...args) => { readdirCalls += 1; return fs.readdirSync(...args); } };
+  const { resolveClaudeSessionRoot } = makeResolver(configDir, { fs: countingFs });
+  const args = { claudeNativeSessionId: NATIVE_ID, workspaceRootPath };
+
+  assert.equal(resolveClaudeSessionRoot(args)?.sessionRootExists, false);
+  fs.mkdirSync(path.join(projectDir, NATIVE_ID, 'subagents'), { recursive: true });
+  assert.equal(resolveClaudeSessionRoot(args)?.sessionRootExists, true);
+  assert.equal(readdirCalls, 0);
 });
 
 test('a stale or missing workspace hint falls back to a bounded scan', () => {
@@ -91,7 +128,9 @@ test('a stale or missing workspace hint falls back to a bounded scan', () => {
   const decoyDir = path.join(projectsRoot, '-home-dev-git-other');
   fs.mkdirSync(path.join(decoyDir, 'some-other-session'), { recursive: true });
   const realDir = path.join(projectsRoot, '-home-dev-git-copilot-remote-worktree');
-  fs.mkdirSync(path.join(realDir, NATIVE_ID), { recursive: true });
+  fs.mkdirSync(realDir, { recursive: true });
+  // Transcript-only, so the scan has to match on the same anchors the fast path does.
+  fs.writeFileSync(path.join(realDir, `${NATIVE_ID}.jsonl`), '{}\n');
 
   const { resolveClaudeSessionRoot } = makeResolver(configDir);
   assert.equal(
@@ -145,6 +184,28 @@ test('a resolved session survives in cache but is re-probed, not assumed', () =>
   const { resolveClaudeSessionRoot } = makeResolver(configDir);
   const args = { claudeNativeSessionId: NATIVE_ID, workspaceRootPath };
   assert.equal(resolveClaudeSessionRoot(args)?.sessionRootPath, sessionDir);
+
+  fs.rmSync(sessionDir, { recursive: true });
+  assert.equal(resolveClaudeSessionRoot(args), null);
+});
+
+test('a deleted transcript drops a session that still has a directory only if both are gone', () => {
+  const { configDir, projectsRoot } = makeConfigDir();
+  const workspaceRootPath = '/home/dev/git/copilot-remote';
+  const projectDir = path.join(projectsRoot, claudeProjectDirSlug(workspaceRootPath));
+  const sessionDir = path.join(projectDir, NATIVE_ID);
+  const transcriptPath = path.join(projectDir, `${NATIVE_ID}.jsonl`);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(transcriptPath, '{}\n');
+
+  const { resolveClaudeSessionRoot } = makeResolver(configDir);
+  const args = { claudeNativeSessionId: NATIVE_ID, workspaceRootPath };
+  assert.equal(resolveClaudeSessionRoot(args)?.transcriptPath, transcriptPath);
+
+  fs.rmSync(transcriptPath);
+  const afterTranscriptGone = resolveClaudeSessionRoot(args);
+  assert.equal(afterTranscriptGone?.sessionRootPath, sessionDir);
+  assert.equal(afterTranscriptGone?.transcriptPath, '');
 
   fs.rmSync(sessionDir, { recursive: true });
   assert.equal(resolveClaudeSessionRoot(args), null);

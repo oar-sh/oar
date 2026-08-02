@@ -769,6 +769,14 @@ export async function loadDriveChildren(pathValue, includeHidden = false) {
   return apiFetch(`/api/drives/list?path=${encodeURIComponent(path)}&includeHidden=${includeHidden ? '1' : '0'}`);
 }
 
+// Distinct from loadDriveChildren: the session root may not exist on disk yet,
+// and its listing is augmented with the transcript that lives one level up.
+export async function loadSessionRootTree(pathValue, includeHidden = false) {
+  const path = String(pathValue || '').trim();
+  if (!path) return null;
+  return apiFetch(`/api/session-root/list?path=${encodeURIComponent(path)}&includeHidden=${includeHidden ? '1' : '0'}`);
+}
+
 export async function loadWorkspaceFilePreview(pathValue, conversationId = null) {
   const path = String(pathValue || '').trim();
   if (!path) return null;

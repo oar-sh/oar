@@ -3235,6 +3235,120 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  // The Session root of the explorer, listed the way `/api/drives/list` lists a
+  // directory but with two differences that only make sense for a session:
+  //
+  //  - a not-yet-created root is an empty folder, not a 404. The Claude Agent
+  //    SDK creates `<nativeSessionId>/` lazily, the first time the session
+  //    writes a subagent or tool-result file, so a young session legitimately
+  //    has a root path that has no directory behind it yet.
+  //  - the sibling `<nativeSessionId>.jsonl` transcript is listed as a child.
+  //    It lives one level up, in the project directory, which is not browsable
+  //    on its own because it holds every session for the workspace.
+  //
+  // The transcript is derived from the requested path rather than accepted from
+  // the client, so this endpoint reaches nothing `/api/drives/list` would not.
+  app.get('/api/session-root/list', auth, (req, res) => {
+    const includeHidden = parseBooleanQueryFlag(req.query.includeHidden, false);
+    const requestedPath = String(req.query.path || '').trim();
+
+    function transcriptChild(absolutePath, mapEntry, basename) {
+      const transcriptPath = `${absolutePath}.jsonl`;
+      let stat = null;
+      try {
+        stat = fs.statSync(transcriptPath);
+      } catch {
+        return null;
+      }
+      if (!stat.isFile()) return null;
+      return mapEntry({
+        name: basename(transcriptPath),
+        fullPath: transcriptPath,
+        type: 'file',
+        size: stat.size,
+        mtime: stat.mtime ? stat.mtime.toISOString() : null,
+      });
+    }
+
+    function directoryState(absolutePath) {
+      try {
+        return fs.statSync(absolutePath).isDirectory() ? 'dir' : 'other';
+      } catch (error) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return 'missing';
+        return 'error';
+      }
+    }
+
+    if (process.platform !== 'win32') {
+      const absolutePath = normalizeLinuxAbsolutePath(requestedPath);
+      if (!absolutePath) return res.status(400).json({ error: 'Invalid Linux path' });
+
+      const state = directoryState(absolutePath);
+      if (state === 'error') return res.status(500).json({ error: 'Failed to read session root metadata' });
+      if (state === 'other') return res.status(400).json({ error: 'Session root must reference a directory' });
+
+      const respond = (children) => {
+        const transcript = transcriptChild(absolutePath, mapLinuxDirectoryEntry, path.posix.basename);
+        const node = {
+          path: absolutePath,
+          name: path.posix.basename(absolutePath) || absolutePath,
+          type: 'dir',
+          children: transcript ? [...children, transcript] : children,
+          childrenLoaded: true,
+          lazy: false,
+        };
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({ ok: true, node, includeHidden, exists: state === 'dir' });
+      };
+
+      if (state === 'missing') return respond([]);
+      return fetchLinuxDirectoryEntries(absolutePath, { includeHidden }, (listErr, entries) => {
+        if (listErr) return res.status(500).json({ error: listErr.message || 'Failed to list session root' });
+        return respond(entries.map(mapLinuxDirectoryEntry).filter((entry) => !!entry?.path));
+      });
+    }
+
+    return fetchBrowsableDrives((drivesErr, drives) => {
+      if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
+      const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
+      const absolutePath = normalizeDriveAbsolutePath(requestedPath);
+      const rootAbsolute = driveRootFromAbsolutePath(absolutePath).toUpperCase();
+      if (!absolutePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
+        return res.status(400).json({ error: 'Invalid drive path' });
+      }
+
+      const state = directoryState(absolutePath);
+      if (state === 'error') return res.status(500).json({ error: 'Failed to read session root metadata' });
+      if (state === 'other') return res.status(400).json({ error: 'Session root must reference a directory' });
+
+      const respond = (children) => {
+        const transcript = transcriptChild(absolutePath, mapDriveDirectoryEntry, path.win32.basename);
+        const nodePath = toDriveWebPath(absolutePath);
+        const node = {
+          path: nodePath,
+          name: path.win32.basename(absolutePath) || nodePath,
+          type: 'dir',
+          children: transcript ? [...children, transcript] : children,
+          childrenLoaded: true,
+          lazy: false,
+        };
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({ ok: true, node, includeHidden, exists: state === 'dir' });
+      };
+
+      if (state === 'missing') return respond([]);
+      return fetchDriveDirectoryEntries(absolutePath, { includeHidden }, (listErr, entries) => {
+        if (listErr) return res.status(500).json({ error: listErr.message || 'Failed to list session root' });
+        return respond(entries
+          .map(mapDriveDirectoryEntry)
+          .filter((entry) => {
+            if (!entry?.path) return false;
+            return allowedRoots.has(driveRootFromAbsolutePath(entry.path).toUpperCase());
+          }));
+      });
+    });
+  });
+
   app.get('/api/drives/file', auth, (req, res) => {
     const requestedPath = String(req.query.path || '').trim();
 

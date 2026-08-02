@@ -18,6 +18,14 @@ import os from 'os';
 // per-session directory is exposed — the project directory holds every session
 // for that workspace plus `memory/`, so pointing the browser at it would leak
 // unrelated conversations into a "Session" view.
+//
+// The transcript, not the directory, is what anchors a session here. The SDK
+// writes the `.jsonl` from the first turn but creates the directory lazily, only
+// once the session produces `subagents/` or `tool-results/` files — so requiring
+// the directory left the Session button dark for every conversation that had not
+// yet spawned a subagent. `sessionRootPath` is therefore returned for a
+// transcript-only session too, with `sessionRootExists: false` so the caller can
+// serve it as an empty folder rather than a 404.
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const PROJECT_SLUG_MAX_LENGTH = 200;
@@ -97,6 +105,33 @@ export function createClaudeSessionRootResolver({
     }
   }
 
+  function isFile(candidate) {
+    try {
+      return fs.statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The session's on-disk footprint inside one project directory, or null when
+   * the session does not live there at all.
+   *
+   * @returns {{ sessionRootPath: string, transcriptPath: string, sessionRootExists: boolean } | null}
+   */
+  function sessionAnchorsIn(projectDir, nativeSessionId) {
+    const sessionRootPath = path.join(projectDir, nativeSessionId);
+    const transcriptPath = path.join(projectDir, `${nativeSessionId}.jsonl`);
+    const sessionRootExists = isDirectory(sessionRootPath);
+    const transcriptExists = isFile(transcriptPath);
+    if (!sessionRootExists && !transcriptExists) return null;
+    return {
+      sessionRootPath,
+      transcriptPath: transcriptExists ? transcriptPath : '',
+      sessionRootExists,
+    };
+  }
+
   function findProjectDir(nativeSessionId, workspaceRootPath) {
     const roots = resolveClaudeProjectsRoots({ env, homedir, path });
     const workspaceRoot = normalizeText(workspaceRootPath);
@@ -106,13 +141,13 @@ export function createClaudeSessionRootResolver({
       const slug = claudeProjectDirSlug(workspaceRoot);
       for (const root of roots) {
         const projectDir = path.join(root, slug);
-        if (isDirectory(path.join(projectDir, nativeSessionId))) return projectDir;
+        if (sessionAnchorsIn(projectDir, nativeSessionId)) return projectDir;
       }
     }
 
     // Fallback: the slug can miss (symlinked or since-changed workspace root, a
     // git worktree, an SDK sanitizer change), so scan the project dirs. Bounded
-    // and never recursive — one readdir per root plus one stat per project.
+    // and never recursive — one readdir per root plus two stats per project.
     for (const root of roots) {
       let entries = [];
       try {
@@ -126,7 +161,7 @@ export function createClaudeSessionRootResolver({
         if (scanned >= maxProjectDirsScanned) break;
         scanned += 1;
         const projectDir = path.join(root, entry.name);
-        if (isDirectory(path.join(projectDir, nativeSessionId))) return projectDir;
+        if (sessionAnchorsIn(projectDir, nativeSessionId)) return projectDir;
       }
     }
     return '';
@@ -138,7 +173,13 @@ export function createClaudeSessionRootResolver({
   }
 
   /**
-   * @returns {{ sessionRootPath: string, sessionRootName: string, projectDirPath: string } | null}
+   * @returns {{
+   *   sessionRootPath: string,
+   *   sessionRootName: string,
+   *   projectDirPath: string,
+   *   transcriptPath: string,
+   *   sessionRootExists: boolean,
+   * } | null}
    */
   function resolveClaudeSessionRoot({ claudeNativeSessionId = '', workspaceRootPath = '' } = {}) {
     const nativeSessionId = normalizeText(claudeNativeSessionId);
@@ -148,9 +189,11 @@ export function createClaudeSessionRootResolver({
 
     const cachedProjectDir = projectDirCache.get(nativeSessionId);
     if (cachedProjectDir) {
-      const sessionRootPath = path.join(cachedProjectDir, nativeSessionId);
-      if (isDirectory(sessionRootPath)) {
-        return { sessionRootPath, sessionRootName: 'Session', projectDirPath: cachedProjectDir };
+      // Re-probed rather than assumed: the directory appears partway through a
+      // session's life, so a cache hit must still report the current state.
+      const anchors = sessionAnchorsIn(cachedProjectDir, nativeSessionId);
+      if (anchors) {
+        return { ...anchors, sessionRootName: 'Session', projectDirPath: cachedProjectDir };
       }
       projectDirCache.delete(nativeSessionId);
     }
@@ -166,13 +209,13 @@ export function createClaudeSessionRootResolver({
       missCache.set(nativeSessionId, now() + missTtlMs);
       return null;
     }
+    // Re-read rather than reuse what the scan matched on: the session can be
+    // deleted between the two, and a partial result would be worse than a miss.
+    const anchors = sessionAnchorsIn(projectDir, nativeSessionId);
+    if (!anchors) return null;
     missCache.delete(nativeSessionId);
     rememberProjectDir(nativeSessionId, projectDir);
-    return {
-      sessionRootPath: path.join(projectDir, nativeSessionId),
-      sessionRootName: 'Session',
-      projectDirPath: projectDir,
-    };
+    return { ...anchors, sessionRootName: 'Session', projectDirPath: projectDir };
   }
 
   function clearCache() {

@@ -20,6 +20,7 @@ import {
   loadRepoChildren,
   loadDrivesRoots,
   loadDriveChildren,
+  loadSessionRootTree,
 } from './api-client.js';
 import {
   normalizeWorkspaceMentionPath,
@@ -1253,7 +1254,7 @@ export async function loadRepoBrowserTree() {
   const payload = workspaceRoot
     ? await loadRepoTree(repoBrowserState.workspaceIncludeHidden, repoBrowserState.workspaceIncludeHeavy, requestedConversationId)
     : (sessionRoot
-      ? await loadDriveChildren(normalizeDriveBrowserPath(repoBrowserState.sessionRootPath), repoBrowserState.drivesIncludeHidden)
+      ? await loadSessionRootTree(normalizeDriveBrowserPath(repoBrowserState.sessionRootPath), repoBrowserState.drivesIncludeHidden)
       : await loadDrivesRoots());
   if (workspaceRoot && requestedConversationId !== currentConversationId()) {
     repoBrowserState.loading = false;
