@@ -126,19 +126,19 @@ test('keeps stream/activity session-bound while switching and avoids duplicate u
 
     await openConversation(page, convA);
     await expect(page.locator('#thinking-indicator')).toBeVisible();
-    await expect(page.locator('#thinking-text')).toContainText(streamA);
+    await expect(page.locator('#thinking-stream')).toContainText(streamA);
     await expect(page.locator('#thinking-activity .thinking-activity-item', { hasText: activityA })).toHaveCount(1);
 
     await openConversation(page, convB);
     await expect(page.locator('#thinking-indicator')).toBeVisible();
-    await expect(page.locator('#thinking-text')).toContainText(streamB);
-    await expect(page.locator('#thinking-text')).not.toContainText(streamA);
+    await expect(page.locator('#thinking-stream')).toContainText(streamB);
+    await expect(page.locator('#thinking-stream')).not.toContainText(streamA);
     await expect(page.locator('#thinking-activity .thinking-activity-item', { hasText: activityB })).toHaveCount(1);
     await expect(page.locator('#thinking-activity .thinking-activity-item', { hasText: activityA })).toHaveCount(0);
 
     await openConversation(page, convA);
-    await expect(page.locator('#thinking-text')).toContainText(streamA);
-    await expect(page.locator('#thinking-text')).not.toContainText(streamB);
+    await expect(page.locator('#thinking-stream')).toContainText(streamA);
+    await expect(page.locator('#thinking-stream')).not.toContainText(streamB);
 
     const firstFollowup = await createMessage(request, headers, { text: duplicateText, conversationId: convA });
     followupA = String(firstFollowup?.messageId || '').trim();

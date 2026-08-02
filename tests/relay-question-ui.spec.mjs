@@ -659,46 +659,87 @@ test("does not reuse the previous reply text in a new thinking bubble", async ({
   const stamp = Date.now();
   const firstSeed = `Thinking reset seed ${stamp}`;
   const secondSeed = `Thinking reset follow-up ${stamp}`;
+  const previousReplyText = `previous-reply-marker-${stamp}`;
   let conversationId = "";
-  let relayPaused = false;
 
   try {
-    await page.addInitScript(() => {
-      localStorage.removeItem("copilot_last_conv");
+    // Synthesize the first completed turn through the relay API; the isolated
+    // e2e server never spawns a CLI, so nothing else would answer the prompt.
+    const queued = await request.post("/api/message", {
+      headers,
+      data: {
+        text: firstSeed,
+        relayMode: "agent",
+        model: "gpt-5.4-mini",
+      },
     });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "").trim();
+    const messageId = String(queuedBody?.messageId || "").trim();
+    expect(conversationId).toBeTruthy();
+    expect(messageId).toBeTruthy();
+
+    const responded = await request.post("/api/response", {
+      headers,
+      data: {
+        messageId,
+        conversationId,
+        text: previousReplyText,
+        model: "gpt-5.4-mini",
+        mode: "agent",
+      },
+    });
+    expect(responded.ok()).toBeTruthy();
+
+    // Follow-up turns are only accepted on session-bound conversations.
+    const synced = await request.post("/api/session-sync", {
+      headers,
+      data: {
+        sdk_session_id: `pw-sid-think-${stamp}`,
+        conversation_id: conversationId,
+      },
+    });
+    expect(synced.ok()).toBeTruthy();
+
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
     await page.waitForFunction(() => typeof window.openConversation === "function");
-    await page.fill("#msg-input", firstSeed);
-    await page.click("#send-btn");
-    await expect(page.locator(".msg.assistant .msg-bubble")).toBeVisible({ timeout: 30000 });
-    conversationId = String(await page.evaluate(() => localStorage.getItem("copilot_last_conv") || "") || "").trim();
+    await page.evaluate(async (id) => {
+      if (id) await window.openConversation(id);
+    }, conversationId);
 
     const firstAssistantBubble = page.locator(".msg.assistant .msg-bubble").last();
-    const previousReplyText = String(await firstAssistantBubble.textContent() || "").trim();
-    expect(previousReplyText).toBeTruthy();
-
-    const paused = await request.post("/api/relay/pause", { headers });
-    expect(paused.ok()).toBeTruthy();
-    relayPaused = true;
+    await expect(firstAssistantBubble).toBeVisible({ timeout: 30000 });
+    await expect(firstAssistantBubble).toContainText(previousReplyText);
 
     await page.fill("#msg-input", secondSeed);
     await page.click("#send-btn");
+
+    // The thinking bubble renders when the queued turn moves to "processing";
+    // with CLI spawn disabled nothing dequeues it, so pull it ourselves.
+    await expect.poll(async () => {
+      const pending = await request.get("/api/pending", { headers });
+      if (!pending.ok()) return false;
+      const body = await pending.json();
+      return Boolean(body?.message?.id);
+    }, { timeout: 15000 }).toBeTruthy();
+
     await expect(page.locator("#thinking-indicator")).toBeVisible();
-    await expect(page.locator("#thinking-indicator .thinking-text")).not.toContainText(previousReplyText);
+    await expect(page.locator("#thinking-indicator .thinking-bubble")).not.toContainText(previousReplyText);
 
   } finally {
-    if (relayPaused) {
-      await request.post("/api/relay/resume", { headers }).catch(() => {});
-    }
     if (conversationId) {
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
   }
 });
 
-test("shows Copilot usage from the usage modal", async ({ page }) => {
+test("shows Copilot usage from the usage modal", async ({ page, request }) => {
   const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  let conversationId = "";
   let usageRequests = 0;
 
   await page.route("**/api/usage", async (route) => {
@@ -714,18 +755,57 @@ test("shows Copilot usage from the usage modal", async ({ page }) => {
     });
   });
 
-  await page.goto(`/?token=${encodeURIComponent(token)}`);
-  await page.waitForLoadState("networkidle");
+  try {
+    // The conversation actions menu button is hidden until a conversation is open.
+    const queued = await request.post("/api/message", {
+      headers,
+      data: {
+        text: `usage-modal-seed-${stamp}`,
+        relayMode: "agent",
+        model: "gpt-5.4-mini",
+      },
+    });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "").trim();
+    const messageId = String(queuedBody?.messageId || "").trim();
+    expect(conversationId).toBeTruthy();
+    expect(messageId).toBeTruthy();
 
-  await page.click("#chat-actions-menu-btn");
-  await expect(page.locator("#chat-actions-menu")).toBeVisible();
-  await page.click("#chat-menu-usage");
-  await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
-  await expect(page.locator("#summary-modal-title")).toHaveText("Copilot Usage");
-  await expect(page.locator("#summary-modal-subtitle")).toHaveText("Resets 2026-06-01");
-  await expect(page.locator("#summary-modal-body")).toContainText("12 remaining");
-  await expect(page.locator("#chat-menu-usage")).toContainText("Check Usage");
-  expect(usageRequests).toBe(1);
+    const responded = await request.post("/api/response", {
+      headers,
+      data: {
+        messageId,
+        conversationId,
+        text: "usage modal reply",
+        model: "gpt-5.4-mini",
+        mode: "agent",
+      },
+    });
+    expect(responded.ok()).toBeTruthy();
+
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await page.waitForFunction(() => typeof window.openConversation === "function");
+    await page.evaluate(async (id) => {
+      if (id) await window.openConversation(id);
+    }, conversationId);
+
+    await expect(page.locator("#chat-actions-menu-btn")).toBeEnabled();
+    await page.click("#chat-actions-menu-btn");
+    await expect(page.locator("#chat-actions-menu")).toBeVisible();
+    await page.click("#chat-menu-usage");
+    await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
+    await expect(page.locator("#summary-modal-title")).toHaveText("Copilot Usage");
+    await expect(page.locator("#summary-modal-subtitle")).toHaveText("Resets 2026-06-01");
+    await expect(page.locator("#summary-modal-body")).toContainText("12 remaining");
+    await expect(page.locator("#chat-menu-usage")).toContainText("Check Usage");
+    expect(usageRequests).toBe(1);
+  } finally {
+    if (conversationId) {
+      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
+    }
+  }
 });
 
 test("shows a compact CWD picker menu for long known CWD lists", async ({ page, request }) => {
@@ -859,8 +939,11 @@ test("shows a compact CWD picker menu for long known CWD lists", async ({ page, 
   }
 });
 
-test("shows current context from the context button", async ({ page }) => {
+test("shows current context from the context button", async ({ page, request }) => {
   const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  let conversationId = "";
   let contextRequests = 0;
   let refreshResolvedByCopilotSession = false;
 
@@ -884,25 +967,63 @@ test("shows current context from the context button", async ({ page }) => {
         },
         eventsPath: "/tmp/session-state/events.jsonl",
         error: null,
-        text: "Current Context\nPrompt/Input: 42,000 tokens\nCompletion/Output: 8,000 tokens",
+        text: "Context usage\nPrompt/Input: 42,000 tokens\nCompletion/Output: 8,000 tokens",
       }),
     });
   });
 
-  await page.goto(`/?token=${encodeURIComponent(token)}`);
-  await page.waitForLoadState("networkidle");
+  try {
+    // The context button only fetches when a conversation is active.
+    const queued = await request.post("/api/message", {
+      headers,
+      data: {
+        text: `context-modal-seed-${stamp}`,
+        relayMode: "agent",
+        model: "gpt-5.4-mini",
+      },
+    });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "").trim();
+    const messageId = String(queuedBody?.messageId || "").trim();
+    expect(conversationId).toBeTruthy();
+    expect(messageId).toBeTruthy();
 
-  await page.click("#context-btn");
-  await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
-  await expect(page.locator("#summary-modal-title")).toHaveText("Current Context");
-  await expect(page.locator("#summary-modal-subtitle")).toHaveText("Copilot session context-");
-  await expect(page.locator("#summary-modal-body")).toContainText("Prompt/Input: 42,000 tokens");
-  await expect(page.locator("#summary-modal-body")).not.toContainText("```text");
-  await page.click("#summary-modal-refresh");
-  await expect.poll(() => contextRequests).toBeGreaterThanOrEqual(2);
-  expect(refreshResolvedByCopilotSession).toBeTruthy();
-  await expect(page.locator("#context-btn")).toHaveText("🧠");
-  expect(contextRequests).toBeGreaterThanOrEqual(2);
+    const responded = await request.post("/api/response", {
+      headers,
+      data: {
+        messageId,
+        conversationId,
+        text: "context modal reply",
+        model: "gpt-5.4-mini",
+        mode: "agent",
+      },
+    });
+    expect(responded.ok()).toBeTruthy();
+
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await page.waitForFunction(() => typeof window.openConversation === "function");
+    await page.evaluate(async (id) => {
+      if (id) await window.openConversation(id);
+    }, conversationId);
+
+    await page.click("#context-btn");
+    await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
+    await expect(page.locator("#summary-modal-title")).toHaveText("Context usage");
+    await expect(page.locator("#summary-modal-subtitle")).toHaveText("Copilot session context-");
+    await expect(page.locator("#summary-modal-body")).toContainText("Prompt/Input: 42,000 tokens");
+    await expect(page.locator("#summary-modal-body")).not.toContainText("```text");
+    await page.click("#summary-modal-refresh");
+    await expect.poll(() => contextRequests).toBeGreaterThanOrEqual(2);
+    expect(refreshResolvedByCopilotSession).toBeTruthy();
+    await expect(page.locator("#context-btn")).toHaveText("🧠");
+    expect(contextRequests).toBeGreaterThanOrEqual(2);
+  } finally {
+    if (conversationId) {
+      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
+    }
+  }
 });
 
 test("updates the input context bar after assistant turns", async ({ page, request }) => {
@@ -1073,10 +1194,12 @@ test("uses integrated mobile explorer/upload controls beside mode/model rows", a
   expect(uploadBox).toBeTruthy();
   expect(modelBox).toBeTruthy();
 
+  // Since d93c089 ("Compact composer controls") the mobile order is
+  // mode(1) · model(2) · explorer(3) · upload(4) on the same flex row.
   expect(Math.abs(explorerBox.y - modeBox.y)).toBeLessThan(6);
-  expect(explorerBox.x).toBeLessThan(modeBox.x);
-  expect(Math.abs(uploadBox.y - modelBox.y)).toBeLessThan(6);
-  expect(uploadBox.x).toBeLessThan(modelBox.x);
+  expect(explorerBox.x).toBeGreaterThan(modelBox.x);
+  expect(Math.abs(uploadBox.y - explorerBox.y)).toBeLessThan(6);
+  expect(uploadBox.x).toBeGreaterThan(explorerBox.x);
 
   await explorerBtn.click();
   await expect(page.locator("#repo-browser-modal")).toHaveClass(/visible/);
@@ -1396,7 +1519,21 @@ test("keeps previously expanded tree branches open", async ({ page }) => {
   expect(secondDirPath).toBeTruthy();
 
   await topDirs.nth(0).click();
-  await topDirs.nth(1).click();
+  await expect(page.locator(`#repo-tree details.repo-tree-node[data-repo-dir-path="${firstDirPath}"]`)).toHaveJSProperty("open", true);
+
+  // Expanding a branch lazily loads its children and re-renders the whole tree
+  // via innerHTML; wait until the tree markup is stable so the second click
+  // cannot land on a node that gets detached mid-click.
+  await page.waitForFunction(() => {
+    const host = document.getElementById("repo-tree");
+    if (!host) return false;
+    const html = host.innerHTML;
+    if (window.__pwRepoTreeSnapshot === html && html.includes("repo-tree-node")) return true;
+    window.__pwRepoTreeSnapshot = html;
+    return false;
+  }, { polling: 400, timeout: 15000 });
+
+  await page.locator(`#repo-tree .repo-tree-summary[data-repo-open-dir="${secondDirPath}"]`).click();
 
   await expect(page.locator(`#repo-tree details.repo-tree-node[data-repo-dir-path="${firstDirPath}"]`)).toHaveJSProperty("open", true);
   await expect(page.locator(`#repo-tree details.repo-tree-node[data-repo-dir-path="${secondDirPath}"]`)).toHaveJSProperty("open", true);
@@ -1413,7 +1550,19 @@ test("copies folder and file reference tokens from explorer and preview", async 
   await expect(serverDir).toBeVisible();
   await serverDir.click();
 
-  const publicDir = page.locator('#repo-folder [data-repo-nav-dir="server/public"]').first();
+  // Directory navigation now lives in the tree; the folder pane lists files
+  // only. Wait for the lazy-loaded children re-render to settle, then drill
+  // into server/public from the tree.
+  await page.waitForFunction(() => {
+    const host = document.getElementById("repo-tree");
+    if (!host) return false;
+    const html = host.innerHTML;
+    if (window.__pwRepoTreeSnapshot === html && html.includes('data-repo-open-dir="server/public"')) return true;
+    window.__pwRepoTreeSnapshot = html;
+    return false;
+  }, { polling: 400, timeout: 15000 });
+
+  const publicDir = page.locator('#repo-tree .repo-tree-summary[data-repo-open-dir="server/public"]').first();
   await expect(publicDir).toBeVisible();
   await publicDir.click();
 

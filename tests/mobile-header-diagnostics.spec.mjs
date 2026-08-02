@@ -143,8 +143,12 @@ test.describe.serial("mobile header diagnostics", () => {
         await logDiagnostics(page, "landscape action menu after programmatic click", "#chat-actions-menu-btn");
       }
       await expect(menu).toBeVisible();
-      await page.locator("#chat-menu-compact").tap();
+      // #chat-menu-compact is intentionally hidden/disabled (commit 7b20b3a);
+      // use the title editor item to verify menu items are tappable in landscape.
+      await page.locator("#chat-menu-edit-title").tap();
       await expect(menu).toBeHidden();
+      await page.locator("#chat-title-cancel-btn").tap();
+      await expect(page.locator("#chat-title-input")).toBeHidden();
     } finally {
       if (conversationId) {
         await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
