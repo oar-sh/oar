@@ -257,11 +257,12 @@ When the Claude provider is enabled, discovered `claude-*` IDs join the same cat
 only offers models the active conversation's provider can serve, so Claude models are hidden in
 Copilot/OpenAI conversations and vice versa.
 
-**Select Models** has one tab per runtime — **Copilot**, **OpenAI**, **Anthropic** — and each tab
-lists only rows contributed by that runtime. The Claude tab writes its selection through
-`POST /api/settings/claude` (`enabledModels`) rather than the model-variant catalog; the configured
-default model is always enabled and cannot be deselected, since deselecting it would leave Claude
-conversations without a model. An empty selection means "all available".
+**Select Models** has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK** —
+and each tab lists only rows contributed by that runtime. The Claude and Cursor tabs write their
+selection through `POST /api/settings/claude` / `POST /api/settings/cursor` (`enabledModels`) rather
+than the model-variant catalog; the configured default model is always enabled and cannot be
+deselected, since deselecting it would leave that provider's conversations without a model. An empty
+selection means "all available".
 
 `POST /api/model-variants/refresh` refreshes all enabled providers concurrently and reports
 `openAIModelDiscovery` and `claudeModelDiscovery` separately, so one provider's failed discovery does
@@ -299,7 +300,7 @@ provider, and other providers' bindings are never touched.
 
 | Relay mode  | Claude mapping                                                              |
 | ----------- | --------------------------------------------------------------------------- |
-| `plan`      | SDK `permissionMode: 'plan'`; `ExitPlanMode` publishes a **plan_ready** board |
+| `plan`      | SDK `permissionMode: 'plan'`; `ExitPlanMode` publishes a **plan_ready** board, then the tool call is **denied** so the turn ends for review instead of rolling straight into implementation — the board's choice starts the next turn in the chosen mode |
 | `ask`       | System prompt appended to prefer `AskUserQuestion` before implementing        |
 | `agent`     | Default permission mode, unmodified preset prompt                            |
 | `autopilot` | System prompt appended to keep moving unless input is truly blocking          |
@@ -308,7 +309,9 @@ provider, and other providers' bindings are never touched.
   can change between messages. Effort levels are `none` (SDK default) plus whatever the model reports
   (`low`, `medium`, `high`, `xhigh`, `max`).
 - **Tools are auto-allowed**, matching the Copilot workers' `--allow-all` posture. Only two tools are
-  intercepted: `AskUserQuestion` (bridged to relay question cards) and `ExitPlanMode` (plan board).
+  intercepted: `AskUserQuestion` (bridged to relay question cards) and `ExitPlanMode` (plan board;
+  denied after the board posts — the plan text comes from the tool input, or from the CLI's
+  `planFilePath` when no inline plan is sent).
 - **Attachments** — images up to 5 MB are inlined as base64 content blocks; larger images and all
   non-image files are passed as absolute path references for Claude's `Read` tool.
 - **Subagents** — `forwardSubagentText` is on, so subagent text, thoughts, and activity stream into
@@ -354,6 +357,34 @@ On Windows it opens a `Claude Worker <id>` terminal window.
 `fetchUsageSummary` reads GitHub Copilot plan quota, so it is skipped entirely for OpenAI and Claude
 turns. Those replies carry no usage line rather than displaying Copilot premium-request numbers under
 a reply that never touched Copilot.
+
+## Cursor Agent SDK provider
+
+Cursor conversations run through `server/cursor-worker/cursor-session-worker.mjs`, a per-conversation
+Node worker like the Claude one, backed by the Cursor Agent SDK. Authentication uses a Cursor API key
+saved via **Settings → Cursor SDK** (`POST /api/settings/cursor`); saving or replacing the key resets
+and re-runs model discovery, which also records each model's supported reasoning-effort tiers
+(`effortsByModel`).
+
+Per-turn behavior:
+
+| Relay mode  | Cursor mapping                                                               |
+| ----------- | ---------------------------------------------------------------------------- |
+| `plan`      | SDK native plan mode; a plan-shaped final message publishes a **plan_ready** board |
+| `ask` / `autopilot` | The SDK's send options carry no per-turn instruction channel, so a `[Relay mode: …]` nudge is prepended to the user message — injected only when the mode changes, and a change away from a nudged mode sends an explicit cancellation |
+| `agent`     | Default behavior, no injection                                                |
+
+- **Model and reasoning effort are per turn.** Effort is validated against the model's discovered
+  tiers (`none` = model default); for `auto`/undiscovered models the request passes through and the
+  worker validates it against the resolved model's live params.
+- **Stale agent handles are retried once.** A cached agent handle whose exchanged auth expired fails
+  as a terminal error result even though the API key is still valid, so the worker recreates the
+  handle and retries a single time; a second auth failure is treated as a real key problem.
+- **Session root** — the worker keeps its per-session agent store at
+  `$CURSOR_AGENT_STORE_DIR` or `server/data/cursor-agents/<sdkSessionId>`, created on the first turn.
+  The explorer's Session root resolves to it via `resolveCursorSessionRoot`.
+- Cursor turns are skipped by `fetchUsageSummary` like OpenAI and Claude turns — no Copilot usage
+  line is attached.
 
 ## Turn recovery and the max turn duration
 
@@ -769,7 +800,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - Use `/api/repo/list?path=<repo-relative-dir>&includeHidden=0|1&includeHeavy=0|1` for lazy-loaded workspace directory browsing.
 - Use `/api/drives/roots` + `/api/drives/list?path=<path>&includeHidden=0|1` for lazy-loaded drive/root browsing (separate from workspace heavy mode).
 - Use `/api/drives/file?path=<path>` and `/api/drives/files-preview?path=<path>` for drive/root file raw/preview access.
-- Use `/api/session-root/list?path=<sessionRootPath>&includeHidden=0|1` for the explorer's Session root. Child directories below it lazy-load through `/api/drives/list` as usual. The Claude Agent SDK creates a session's directory lazily — only once the session writes `subagents/` or `tool-results/` files — so the root is served as an empty folder until then rather than 404ing, and the transcript that lives one level up in the project directory is listed as a child of it.
+- Use `/api/session-root/list?path=<sessionRootPath>&includeHidden=0|1` for the explorer's Session root. Child directories below it lazy-load through `/api/drives/list` as usual. The Claude Agent SDK creates a session's directory lazily — only once the session writes `subagents/` or `tool-results/` files — so the root is served as an empty folder until then rather than 404ing, and the transcript that lives one level up in the project directory is listed as a child of it. Cursor sessions resolve their Session root the same lazy way: the worker's per-session agent store (`$CURSOR_AGENT_STORE_DIR` or `server/data/cursor-agents/<sdkSessionId>`) exists only after the session's first turn, and the Session button stays disabled until it does.
 - Requests are auth-protected and restricted to files inside the workspace root.
 - **Platform split** — the drives API adapts automatically based on the server OS:
   - **Windows:** drive roots are discovered via `fsutil.exe`; paths use Windows drive-letter format (`C:/foo/bar`); directory listing uses PowerShell.
@@ -781,6 +812,25 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   > **TODO:** add an optional `drivesAllowList` config key (array of absolute path prefixes) so operators can restrict drive access to a set of directories (e.g. home folder or workspace root). When the list is non-empty, requests whose resolved path does not start with one of the listed prefixes should be rejected with `403`.
   >
   > When implementing it, reuse `isWithinAllowedPrefix()` from `services/workspace-root-path-policy.mjs` rather than writing a second `startsWith` check — a bare prefix match would let `C:\work` admit `C:\work-secrets`. See `workspaceRootAllowList` below, which already follows this pattern.
+
+### Git changes modal
+
+The **🌿 Git changes** entry in the conversation `⋯` menu opens a modal over the conversation's
+workspace root, backed by `services/git-changes-service.mjs` and `routes/git-routes.mjs`:
+
+- `GET /api/git/status?conversationId=…` — branch, upstream, ahead/behind, and every changed file
+  (staged, unstaged, and untracked; porcelain v1 parsing). The root is resolved server-side from the
+  conversation scope exactly like the file-preview routes — the client never sends a path — and a
+  workspace root that is not a git repository returns `isRepo: false` rather than an error.
+- `GET /api/git/diff?path=…&untracked=0|1&conversationId=…` — one full-context unified diff
+  (`-U999999`, untracked files via `git diff --no-index /dev/null`). The client renders both the
+  **Changes only** view (context collapsed to gap markers) and the **Full file** view from this
+  single patch; the parsing lives in `public/app/git-diff-model.mjs`.
+- `POST /api/git/pull?conversationId=…` — runs `git pull` in the workspace root and returns the
+  combined output.
+
+File paths passed to `/api/git/diff` go through the same `resolveWorkspaceFilePath` containment
+check as the file bridge, so traversal outside the workspace root is rejected.
 
 ### Changing the launch CWD
 

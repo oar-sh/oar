@@ -58,7 +58,7 @@ Copilot Remote is still under active development, so expect occasional rough edg
 
 ## Highlights
 
-- Remote chat UI for local coding agents — Copilot CLI, OpenAI (BYOK), or Claude (Agent SDK), chosen per conversation
+- Remote chat UI for local coding agents — Copilot CLI, OpenAI (BYOK), Claude (Agent SDK), or Cursor (Agent SDK), chosen per conversation
 - Per-message **mode** picker: `plan`, `ask`, `agent`, `autopilot`
 - Per-message **model** and **reasoning effort** pickers (live model discovery + fallback catalog)
 - Streaming tool/activity updates *and* live assistant reply text while a turn runs
@@ -73,6 +73,7 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Conversation delete requests are relayed to Copilot CLI SDK `deleteSession()` so web deletes can remove resumable CLI sessions
 - Conversation **compact** workflow (`/compact`) to continue with summary carry-over
 - Workspace + drives browser with file preview, raw file access, and sticky hidden/heavy filters
+- **Git changes** modal: branch + ahead/behind info, pull, and a per-file diff viewer with *Changes only* / *Full file* modes
 - `@file:` and `@folder:` reference tokens with copy-to-clipboard helpers
 - Uploads and image attachment relay support
 - Optional SSH reverse tunnel support for internet access
@@ -219,9 +220,10 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
 - Use **Compact** to branch to a fresh conversation seeded with summary context.
 - Use **Browse files** to inspect workspace/drives and open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.
 - Click file/folder copy controls to insert `@file:...` / `@folder:...` tokens.
+- Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes only** and **Full file** modes; closing it returns to the still-open list.
 - Answer clarification prompts in relay question cards (from `ask_user`, or Claude's `AskUserQuestion`).
 - Watch the reply arrive: assistant text streams into the pending bubble as it is generated, and any subagent the turn spawns gets its own nested bubble with its own thoughts, activity, and text.
-- Use the usage button (`📊`) for a live GitHub Copilot plan usage summary. It is recorded only for Copilot turns — OpenAI and Claude turns do not consume Copilot premium requests, and no usage line is attached to them.
+- Use the usage button (`📊`) for a live GitHub Copilot plan usage summary. It is recorded only for Copilot turns — OpenAI, Claude, and Cursor turns do not consume Copilot premium requests, and no usage line is attached to them.
 - Use the **Context** button for a per-category breakdown of the conversation's context window: a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets.
 - Use **Share** in the conversation menu to publish a read-only link. Hover any message and choose **Hide from shares** to keep it out of the shared view without deleting it; hidden messages stay fully visible to you and are marked as hidden.
 - External links in chat open in a new tab with `noopener`/`noreferrer`; workspace file mentions stay in the in-app preview.
@@ -239,13 +241,14 @@ Turning a provider **off** (or removing the OpenAI key) rebinds conversations th
 | **Copilot** (default) | always available                        | your `gh` / Copilot CLI login         | Full relay feature set; the only provider that reports Copilot usage   |
 | **OpenAI (BYOK)**     | ⚙️ Settings → OpenAI API key            | your API key, stored in the relay DB  | Runs the Copilot CLI in BYOK mode against an OpenAI-compatible endpoint |
 | **OpenAI Image (BYOK)** | ⚙️ Settings → OpenAI API key           | same key                              | Calls the OpenAI Images API directly; a chat whose replies are images  |
-| **Claude (Agent SDK)** | ⚙️ Settings → Claude (Agent SDK)        | the relay host's logged-in Claude CLI | No API key is stored; runs a dedicated Node worker per conversation    |
+| **Claude (Agent SDK)** | ⚙️ Settings → Claude SDK                | the relay host's logged-in Claude CLI | No API key is stored; runs a dedicated Node worker per conversation    |
+| **Cursor (Agent SDK)** | ⚙️ Settings → Cursor SDK                | your Cursor API key, stored in the relay DB | Runs a dedicated Node worker per conversation through the Cursor Agent SDK |
 
 ### Claude (Agent SDK)
 
-Turn on **⚙️ Settings → Claude (Agent SDK) → Enable Claude for New Chat model selection**. The relay authenticates through the Claude credentials already present on the host machine (`~/.claude`), so there is no key to enter — run `claude` once on the relay host and log in first.
+Turn on **⚙️ Settings → Claude SDK → Enable Claude for New Chat model selection**. The relay authenticates through the Claude credentials already present on the host machine (`~/.claude`), so there is no key to enter — run `claude` once on the relay host and log in first.
 
-Enabling it also runs model discovery against the Agent SDK and adds the discovered `claude-*` model IDs to the pickers. Use **Select Models → Anthropic** to choose which of them appear in the composer; the configured default model always stays enabled.
+Enabling it also runs model discovery against the Agent SDK and adds the discovered `claude-*` model IDs to the pickers. Use **Select Models → Claude SDK** to choose which of them appear in the composer; the configured default model always stays enabled.
 
 What Claude conversations support:
 
@@ -262,6 +265,20 @@ Differences from Copilot conversations:
 - Cancelling one individual subagent is not supported — **Stop** ends the whole turn instead
 - Claude turns are not included in the Copilot usage summary, and no usage line is attached to their replies
 - The browsable **Session** root points at the Agent SDK's project directory rather than a Copilot session-state folder
+
+### Cursor (Agent SDK)
+
+Turn on **⚙️ Settings → Cursor SDK**, paste your Cursor API key, and enable it for New Chat model selection. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model always stays enabled).
+
+What Cursor conversations support:
+
+- Per-message model and reasoning effort — effort tiers come from per-model discovery, and `none` means the model's default behavior
+- All four relay modes — `plan` uses the SDK's native plan mode and produces a **Plan ready** board; `ask` and `autopilot` ride as instructions on the message text, injected only when the mode changes
+- Live reply streaming, question cards, and **Stop** to abort the running turn
+- The browsable **Session** root points at the worker's per-session agent store, created on the session's first turn
+- Expired cached agent handles are recreated and retried automatically once — a second auth failure means the API key itself is invalid
+
+Like Claude, Cursor turns are not included in the Copilot usage summary and no usage line is attached to their replies.
 
 ## Relay modes
 
@@ -281,8 +298,9 @@ The composer's model picker is the union of every enabled provider's catalog, fi
 - **Copilot** models come from live snapshot updates published by the active CLI runtime, falling back to a curated set (`claude-sonnet-4.6`, `claude-haiku-4.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`).
 - **OpenAI (BYOK)** models are discovered from `/v1/models` when the key is saved or re-enabled.
 - **Claude** models are discovered from the Agent SDK when the provider is enabled. Bracketed `[1m]` long-context variants (such as `claude-opus-5[1m]`) do not appear as separate entries; they surface as a 1M option in the composer's context-size dropdown for the base model.
+- **Cursor** models (and their per-model reasoning-effort tiers) are discovered when the API key is saved or the provider is re-enabled.
 
-Use **Select Models** to choose which variants show up in the composer. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Anthropic** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
+Use **Select Models** to choose which variants show up in the composer. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
 
 Selection is persisted in browser storage and attached per message.
 
@@ -408,7 +426,7 @@ If the same extension is available both project-local (`.github/extensions/web-r
 Common routes:
 
 - Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`, `/api/context/:conversationId`
-- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
+- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/cursor`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
 - Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
 - Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`
@@ -416,6 +434,7 @@ Common routes:
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
 - Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
+- Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`
 - Uploads: `/api/upload`, `/api/upload/:sha256/content`
 
 All authenticated routes accept either:
@@ -435,11 +454,11 @@ For deeper implementation/API details, see `[server/README.md](server/README.md)
 | Wrong/old model shown              | Check `/api/models` and extension logs for model snapshot updates                |
 | Clarification card not progressing | Answer via the web card; relay resumes after question status becomes `answered`  |
 | File links fail                    | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
-| Claude missing from New Chat       | Enable it in **⚙️ Settings → Claude (Agent SDK)**; the toggle is off by default   |
+| Claude missing from New Chat       | Enable it in **⚙️ Settings → Claude SDK**; the toggle is off by default           |
 | Claude reply says it cannot authenticate | Run `claude` on the relay host and log in, then retry the turn             |
 | Claude model list empty or stale   | Re-save the Claude settings, or use **Select Models → Refresh** to rerun discovery |
 | Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
-| No usage line under a reply        | Expected for OpenAI and Claude turns; only Copilot turns record plan usage       |
+| No usage line under a reply        | Expected for OpenAI, Claude, and Cursor turns; only Copilot turns record plan usage |
 
 
 ## Security notes
@@ -457,6 +476,7 @@ copilot-remote/
 ├── .github/extensions/web-relay/   # Copilot CLI extension (worker WebSocket, ask_user bridge, model snapshotting)
 ├── server/
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
+│   ├── cursor-worker/              # Cursor Agent SDK session worker (turn runner, mode nudges, auth retry)
 │   ├── public/app/                 # Browser app modules
 │   ├── routes/                     # Express route registration
 │   ├── services/                   # Relay services (workers, context usage, images, tunnels)
