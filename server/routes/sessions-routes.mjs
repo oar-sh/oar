@@ -243,7 +243,8 @@ export function parseCursorSettingsUpdateRequest(body = {}) {
   const model = hasModel ? (String(payload.model || '').trim() || 'composer-2.5') : undefined;
   const apiKey = String(payload.apiKey || '').trim();
   const hasEnabled = typeof payload.enabled === 'boolean';
-  if (!remove && !hasModel && !apiKey && !hasEnabled) {
+  const hasEnabledModels = Array.isArray(payload.enabledModels);
+  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasEnabledModels) {
     return { ok: false, error: 'No Cursor settings update provided' };
   }
   if (hasModel && !isSafeCursorModelId(model)) {
@@ -263,6 +264,7 @@ export function parseCursorSettingsUpdateRequest(body = {}) {
     remove: false,
     apiKey,
     ...(hasModel ? { model } : {}),
+    ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
     enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
   };
 }
@@ -432,14 +434,21 @@ export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSetti
   const cursorReasoningByModel = {};
   const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
   const providersByModel = { ...(modelState?.providersByModel || {}) };
+  const cursorEffortsByModel = cursorSettings?.effortsByModel && typeof cursorSettings.effortsByModel === 'object'
+    ? cursorSettings.effortsByModel
+    : {};
   for (const cursorModel of cursorModels) {
     const providersKey = String(cursorModel || '').trim();
     if (!providersKey) continue;
     const lowerKey = providersKey.toLowerCase();
-    // Cursor exposes no reasoning-effort tiers; every model runs at 'none'.
-    cursorReasoningByModel[lowerKey] = ['none'];
+    // Discovered effort tiers ('none' = model default) drive the composer;
+    // models with no effort parameter stay at 'none' only.
+    const cursorEfforts = Array.isArray(cursorEffortsByModel[lowerKey]) && cursorEffortsByModel[lowerKey].length
+      ? cursorEffortsByModel[lowerKey]
+      : ['none'];
+    cursorReasoningByModel[lowerKey] = [...cursorEfforts];
     if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
-      reasoningByModel[lowerKey] = ['none'];
+      reasoningByModel[lowerKey] = [...cursorEfforts];
     }
     const existingProviders = Array.isArray(providersByModel[providersKey])
       ? providersByModel[providersKey]
@@ -1056,10 +1065,22 @@ export function buildConversationSessionRootPayload({
   claudeNativeSessionId = '',
   workspaceRootPath = '',
   resolveClaudeSessionRoot = null,
+  resolveCursorSessionRoot = null,
 } = {}) {
   const sid = String(sdkSessionId || '').trim() || String(conversationId || '').trim();
-  // Cursor sessions keep no on-disk session root at all, so there is nothing to expose.
-  if (String(providerType || '').trim().toLowerCase() === 'cursor') return null;
+  // Cursor sessions have no ~/.copilot/session-state entry either — their
+  // on-disk footprint is the worker's per-session agent store, created on the
+  // first turn.
+  if (String(providerType || '').trim().toLowerCase() === 'cursor') {
+    if (!sid || typeof resolveCursorSessionRoot !== 'function') return null;
+    const cursorRoot = resolveCursorSessionRoot({ sdkSessionId: sid });
+    if (!cursorRoot?.sessionRootPath) return null;
+    return {
+      sdkSessionId: sid,
+      sessionRootPath: cursorRoot.sessionRootPath,
+      sessionRootName: cursorRoot.sessionRootName || 'Session',
+    };
+  }
   // Claude sessions have no ~/.copilot/session-state entry — only the Copilot
   // CLI creates those — so they resolve against the Agent SDK's own layout and
   // never fall through to the branch below.
@@ -1728,6 +1749,7 @@ export function registerSessionsRoutes(app, deps) {
     sessionWorkerStopOverrides = null,
     resolveSessionStateRoot,
     resolveClaudeSessionRoot = null,
+    resolveCursorSessionRoot = null,
     getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
     markSharedViewerPresence,
@@ -2731,6 +2753,7 @@ export function registerSessionsRoutes(app, deps) {
       claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
       workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
       resolveClaudeSessionRoot,
+      resolveCursorSessionRoot,
     });
     const dbMessages = stmts.getMessages.all(conversationId);
     const queueRows = db.prepare(`
@@ -3099,6 +3122,7 @@ export function registerSessionsRoutes(app, deps) {
       claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
       workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
       resolveClaudeSessionRoot,
+      resolveCursorSessionRoot,
     });
     const dbMessages = stmts.getMessages.all(resolvedConversationId);
     const queueRows = db.prepare(`
@@ -4287,6 +4311,7 @@ export function registerSessionsRoutes(app, deps) {
       enabled: settings?.enabled === true,
       model: String(settings?.model || 'composer-2.5').trim() || 'composer-2.5',
       models: Array.isArray(settings?.models) ? settings.models : [],
+      availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
     });
   });
 
@@ -4309,6 +4334,7 @@ export function registerSessionsRoutes(app, deps) {
       !!parsed.apiKey
       || previous?.enabled !== true
       || previous?.model !== result.model
+      || previous?.effortsDiscovered !== true
     );
     const discovery = !shouldDiscover
       ? { ok: true, models: [], error: null }
@@ -4341,6 +4367,7 @@ export function registerSessionsRoutes(app, deps) {
       enabled: currentSettings?.enabled === true,
       model: String(currentSettings?.model || result.model || 'composer-2.5').trim() || 'composer-2.5',
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
       reconciliation,
     };
     io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
@@ -4351,7 +4378,7 @@ export function registerSessionsRoutes(app, deps) {
     return res.json({
       ok: true,
       ...settingsPayload,
-      models: Array.isArray(discovery?.models) ? discovery.models : [],
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
       warning: reconciliationFailures.length
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'Cursor model discovery failed')),
@@ -4603,6 +4630,7 @@ export function registerSessionsRoutes(app, deps) {
     const rows = typeof listModelVariantRows === 'function' ? listModelVariantRows() : [];
     const modelState = getModelCatalogState();
     const claudeSettings = getClaudeProviderSettings();
+    const cursorSettings = getCursorProviderSettings();
     return {
       ...buildModelVariantCatalogPayload({
         rows,
@@ -4616,6 +4644,13 @@ export function registerSessionsRoutes(app, deps) {
             defaultModel: claudeSettings.model,
             availableModels: Array.isArray(claudeSettings.availableModels) ? claudeSettings.availableModels : [],
             enabledModels: Array.isArray(claudeSettings.models) ? claudeSettings.models : [],
+          }
+        : null,
+      cursorModels: cursorSettings?.enabled === true
+        ? {
+            defaultModel: cursorSettings.model,
+            availableModels: Array.isArray(cursorSettings.availableModels) ? cursorSettings.availableModels : [],
+            enabledModels: Array.isArray(cursorSettings.models) ? cursorSettings.models : [],
           }
         : null,
     };

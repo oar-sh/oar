@@ -714,10 +714,10 @@ async function openNewConversationModelModal() {
       options.push({ value: 'openai-image', label: 'OpenAI Image (BYOK)' });
     }
     if (claudeSettings?.enabled === true) {
-      options.push({ value: 'claude', label: 'Claude (Agent SDK)' });
+      options.push({ value: 'claude', label: 'Claude SDK' });
     }
     if (cursorSettings?.enabled === true) {
-      options.push({ value: 'cursor', label: 'Cursor (Agent SDK)' });
+      options.push({ value: 'cursor', label: 'Cursor SDK' });
     }
     providerSelect.innerHTML = '';
     for (const option of options) {

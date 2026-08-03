@@ -60,6 +60,7 @@ import {
   refreshModelVariantCatalog,
   saveEnabledModelVariants,
   updateClaudeSettings,
+  updateCursorSettings,
   loadConversation,
   refreshConversationHistory,
   updateConversationTitle,
@@ -120,6 +121,14 @@ import {
   openMessageSearchModal,
   closeMessageSearchModal,
 } from './message-search-view.js';
+import {
+  initGitChangesView,
+  openGitChangesModal,
+  closeGitChangesModal,
+  openGitDiffViewer,
+  closeGitDiffViewer,
+  setGitDiffMode,
+} from './git-changes-view.js';
 
 import { initSocketHandlers, connectSocket, setSocketActivityEnabled } from './socket-handlers.js';
 import {
@@ -231,9 +240,10 @@ const FALLBACK_MODE = 'agent';
 const PROVIDER_LABELS = {
   openai: 'OpenAI',
   'openai-byok': 'OpenAI (BYOK)',
-  claude: 'Anthropic (Claude SDK)',
-  cursor: 'Cursor (Agent SDK)',
+  claude: 'Claude SDK',
+  cursor: 'Cursor SDK',
   'github-copilot': 'GitHub Copilot',
+  // Vendor grouping for Copilot-served rows, distinct from the Claude SDK runtime.
   anthropic: 'Anthropic',
   google: 'Google',
   microsoft: 'Microsoft',
@@ -906,6 +916,7 @@ function currentSessionProviderLock({ pinnedModel = '' } = {}) {
 function syncAutoModelAvailability() {
   const select = document.getElementById('model-select');
   if (!select) return;
+  updateModeSelectorForProvider();
   const currentProviderScope = normalizeModelSelectorProviderType(activeComposerProviderType());
   if (select.dataset.providerScope !== currentProviderScope) {
     updateModelCatalogState(modelCatalogState);
@@ -1336,6 +1347,48 @@ function updateModelPricingDetails(modelId, tier) {
   details.style.display = grid.childElementCount ? '' : 'none';
 }
 
+// Relay modes each provider backend actually honors. All four providers
+// currently support the full set — Copilot/OpenAI via prompt-context
+// injection, Claude via permissionMode + system-prompt appends, Cursor via
+// native plan mode plus message-text nudges for ask/autopilot — but the
+// composer builds its options from this table so a provider that loses (or
+// gains) a mode only needs a change here.
+const RELAY_MODE_LABELS = { agent: 'Agent', ask: 'Ask', plan: 'Plan', autopilot: 'Autopilot' };
+const RELAY_MODES_BY_PROVIDER = {
+  github: ['agent', 'ask', 'plan', 'autopilot'],
+  openai: ['agent', 'ask', 'plan', 'autopilot'],
+  claude: ['agent', 'ask', 'plan', 'autopilot'],
+  cursor: ['agent', 'ask', 'plan', 'autopilot'],
+};
+
+function relayModesForProvider(providerType = '') {
+  const scope = normalizeModelSelectorProviderType(providerType);
+  const modes = RELAY_MODES_BY_PROVIDER[scope];
+  return Array.isArray(modes) && modes.length ? modes : RELAY_MODES_BY_PROVIDER.github;
+}
+
+// Same cache-and-rebuild idiom as the model select: dataset.providerScope
+// remembers which provider the current options were built for.
+function updateModeSelectorForProvider() {
+  const select = document.getElementById('mode-select');
+  if (!select || isSharedReaderMode()) return;
+  const scope = normalizeModelSelectorProviderType(activeComposerProviderType());
+  if (select.dataset.providerScope === scope) return;
+  const modes = relayModesForProvider(scope);
+  const selectedBefore = String(select.value || '').trim().toLowerCase();
+  select.innerHTML = '';
+  for (const mode of modes) {
+    const option = document.createElement('option');
+    option.value = mode;
+    option.textContent = RELAY_MODE_LABELS[mode] || mode;
+    select.appendChild(option);
+  }
+  select.dataset.providerScope = scope;
+  select.value = modes.includes(selectedBefore)
+    ? selectedBefore
+    : (modes.includes(FALLBACK_MODE) ? FALLBACK_MODE : modes[0]);
+}
+
 function modeOptions() {
   return Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value);
 }
@@ -1395,6 +1448,8 @@ function applyConversationPreferences({
   const modelSelect = document.getElementById('model-select');
   if (!modeSelect || !modelSelect) return;
 
+  // Options first, so the preference clamp below sees the provider's modes.
+  updateModeSelectorForProvider();
   const supportedModes = modeOptions();
   const supportedModels = modelOptions().length ? modelOptions() : modelCatalogState.models;
   const selection = resolveConversationComposerSelection({
@@ -1669,6 +1724,17 @@ function applyModelVariantCatalogState(payload) {
           : [],
       }
       : null,
+    cursorModels: payload?.cursorModels && typeof payload.cursorModels === 'object'
+      ? {
+        defaultModel: String(payload.cursorModels.defaultModel || '').trim(),
+        availableModels: Array.isArray(payload.cursorModels.availableModels)
+          ? payload.cursorModels.availableModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        enabledModels: Array.isArray(payload.cursorModels.enabledModels)
+          ? payload.cursorModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+      }
+      : null,
   };
 }
 
@@ -1726,15 +1792,17 @@ function renderModelVariantCatalogBody() {
     const entryProvider = String(entry?.provider || '').trim().toLowerCase();
     const providers = modelProvidersForId(baseModelId, providersByModel);
     const hasOpenAIByok = providers.includes('openai-byok');
-    // Each tab lists only rows sourced from that runtime: the Anthropic tab
-    // shows Claude-SDK rows exclusively, and Copilot never shows rows that a
-    // different runtime contributed (there is no cross-runtime switching).
+    // Each tab lists only rows sourced from that runtime: the Claude SDK tab
+    // shows Claude-SDK rows exclusively, the Cursor SDK tab Cursor rows, and
+    // Copilot never shows rows that a different runtime contributed (there is
+    // no cross-runtime switching).
     if (activeTab === 'anthropic') {
       return entryProvider === 'claude';
     }
     if (entryProvider === 'claude') return false;
-    // Cursor rows stay out of this modal in v1; composer/new-chat filtering
-    // for Cursor comes from providersByModel instead.
+    if (activeTab === 'cursor') {
+      return entryProvider === 'cursor';
+    }
     if (entryProvider === 'cursor') return false;
     if (activeTab === 'openai') {
       return hasOpenAIByok || entryProvider === 'openai-byok';
@@ -1801,6 +1869,30 @@ function renderModelVariantCatalogBody() {
     }
     grouped.set('claude', providerRows);
   }
+  const cursorCatalog = modelVariantCatalogState.cursorModels;
+  if (cursorCatalog?.availableModels?.length) {
+    const cursorEnabledSet = new Set(cursorCatalog.enabledModels || []);
+    const cursorDefaultModel = String(cursorCatalog.defaultModel || '').trim();
+    const providerRows = [];
+    for (const [index, cursorModelId] of cursorCatalog.availableModels.entries()) {
+      const isDefaultModel = cursorModelId === cursorDefaultModel;
+      providerRows.push({
+        variantId: `${cursorModelId}--provider-cursor`,
+        baseModelId: cursorModelId,
+        provider: 'cursor',
+        label: humanizeModelLabel(cursorModelId),
+        releaseStatus: null,
+        reasoningEffort: null,
+        // The default model always stays enabled; deselecting it would leave
+        // Cursor conversations without a model.
+        selectable: !isDefaultModel,
+        enabled: cursorEnabledSet.has(cursorModelId) || isDefaultModel,
+        cursorModelId,
+        sortOrder: index,
+      });
+    }
+    grouped.set('cursor', providerRows);
+  }
   const selected = new Set(modelVariantCatalogState.enabledVariantIds);
   const selectedOrder = new Map(
     modelVariantCatalogState.enabledVariantIds.map((variantId, index) => [variantId, index]),
@@ -1834,18 +1926,22 @@ function renderModelVariantCatalogBody() {
   const hasOpenAITab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'openai'));
   const hasCopilotTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'copilot'));
   const hasAnthropicTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'anthropic'));
+  const hasCursorTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'cursor'));
   if (modelVariantCatalogProviderTab === 'openai' && !hasOpenAITab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'anthropic' && !hasAnthropicTab) modelVariantCatalogProviderTab = 'copilot';
+  if (modelVariantCatalogProviderTab === 'cursor' && !hasCursorTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'copilot' && !hasCopilotTab) {
     if (hasOpenAITab) modelVariantCatalogProviderTab = 'openai';
     else if (hasAnthropicTab) modelVariantCatalogProviderTab = 'anthropic';
+    else if (hasCursorTab) modelVariantCatalogProviderTab = 'cursor';
   }
   const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
   const providerTabButtons = `
     <div class="summary-tab-strip" style="display:flex;gap:8px;align-items:center;">
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
-      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Anthropic</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Claude SDK</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'cursor' ? ' active' : ''}" data-model-provider-tab="cursor" ${hasCursorTab ? '' : 'disabled'}>Cursor SDK</button>
     </div>
   `;
   const warnings = [
@@ -1891,7 +1987,10 @@ function renderModelVariantCatalogBody() {
       const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
       const variantRowsHtml = variantRows.map((row) => {
         const selectable = row.selectable !== false;
-        const checked = row.claudeModelId
+        // SDK-provider rows (Claude/Cursor) carry their own enabled flag; only
+        // Copilot variant rows read the enabledVariantIds selection.
+        const sdkProviderModelId = row.claudeModelId || row.cursorModelId || '';
+        const checked = sdkProviderModelId
           ? row.enabled === true
           : (selectable && selected.has(row.variantId));
         const effortChip = row.reasoningEffort
@@ -1902,13 +2001,16 @@ function renderModelVariantCatalogBody() {
           ? ' <span class="model-reasoning-chip model-reasoning-chip-warn">unavailable</span>'
           : '';
         const fixedChip = !selectable
-          ? (row.claudeModelId
+          ? (sdkProviderModelId
             ? ' <span class="model-reasoning-chip">default model</span>'
             : ' <span class="model-reasoning-chip">managed in settings</span>')
           : '';
+        const sdkModelAttr = row.claudeModelId
+          ? ` data-claude-model="${escHtml(row.claudeModelId)}"`
+          : (row.cursorModelId ? ` data-cursor-model="${escHtml(row.cursorModelId)}"` : '');
         return `
           <label class="model-variant-row">
-            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${row.claudeModelId ? ` data-claude-model="${escHtml(row.claudeModelId)}"` : ''} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
+            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${sdkModelAttr} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
             <span class="model-variant-row-copy">
               <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}${fixedChip}</span>
             </span>
@@ -2021,10 +2123,31 @@ async function saveSelectedModelsFromModal() {
     .filter((input) => input.checked)
     .map((input) => String(input.getAttribute('data-claude-model') || '').trim())
     .filter(Boolean);
-  const selectedVariantIds = Array.from(body.querySelectorAll('.model-variant-checkbox:checked[data-selectable="1"]:not([data-claude-model])'))
+  const cursorCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-cursor-model]'));
+  const selectedCursorModels = cursorCheckboxes
+    .filter((input) => input.checked)
+    .map((input) => String(input.getAttribute('data-cursor-model') || '').trim())
+    .filter(Boolean);
+  // Only the active provider tab's rows are in the DOM, but the PATCH
+  // replaces the WHOLE enabled set — so the save must only change rows the
+  // user could actually see. Off-screen variants keep their stored state,
+  // otherwise saving from e.g. the OpenAI tab silently disables every
+  // Copilot-only vendor group (Anthropic, Google, …).
+  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model])'));
+  const renderedVariantIds = new Set(renderedVariantCheckboxes
+    .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
+    .filter(Boolean));
+  const checkedVariantIds = renderedVariantCheckboxes
+    .filter((input) => input.checked)
     .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
     .filter(Boolean);
-  const hasVariantRows = !!body.querySelector('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model])');
+  const checkedVariantSet = new Set(checkedVariantIds);
+  const selectedVariantIds = (modelVariantCatalogState.enabledVariantIds || [])
+    .filter((variantId) => !renderedVariantIds.has(variantId) || checkedVariantSet.has(variantId));
+  for (const variantId of checkedVariantIds) {
+    if (!selectedVariantIds.includes(variantId)) selectedVariantIds.push(variantId);
+  }
+  const hasVariantRows = renderedVariantCheckboxes.length > 0;
   if (hasVariantRows && !selectedVariantIds.length) {
     alert('Select at least one model variant.');
     return;
@@ -2040,6 +2163,13 @@ async function saveSelectedModelsFromModal() {
       const savedClaude = await updateClaudeSettings({ enabledModels: selectedClaudeModels });
       if (!savedClaude) throw new Error('Failed to save Claude model selection');
       applyClaudeSettingsState(savedClaude);
+    }
+    if (cursorCheckboxes.length) {
+      const savedCursor = await updateCursorSettings({ enabledModels: selectedCursorModels });
+      if (!savedCursor) throw new Error('Failed to save Cursor model selection');
+      applyCursorSettingsState(savedCursor);
+    }
+    if (claudeCheckboxes.length || cursorCheckboxes.length) {
       const refreshedCatalog = await loadModelVariantCatalog();
       if (refreshedCatalog) applyModelVariantCatalogState(refreshedCatalog);
     }
@@ -2917,6 +3047,14 @@ async function initApp() {
       closeChatActionsMenu();
       openChangeCwdModal();
     });
+    const chatMenuGitChangesBtn = document.getElementById('chat-menu-git-changes');
+    bindMenuAction(chatMenuGitChangesBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openGitChangesModal();
+    });
     const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
     bindMenuAction(chatMenuSettingsBtn, (event) => {
       event.preventDefault();
@@ -3033,6 +3171,7 @@ async function initApp() {
   initBubbleActionHandlers();
   initMessageScrollPersistence();
   initMessageSearchView({ openConversation });
+  initGitChangesView();
   syncChatTitleControls();
   connectSocket();
   startRelayQuestionPolling();
@@ -3205,6 +3344,11 @@ window.confirmSuspendHost = confirmSuspendHost;
 window.confirmEmptyQueue = confirmEmptyQueue;
 window.openMessageSearchModal = openMessageSearchModal;
 window.closeMessageSearchModal = closeMessageSearchModal;
+window.openGitChangesModal = openGitChangesModal;
+window.closeGitChangesModal = closeGitChangesModal;
+window.openGitDiffViewer = openGitDiffViewer;
+window.closeGitDiffViewer = closeGitDiffViewer;
+window.setGitDiffMode = setGitDiffMode;
 window.copyExternalLinkUrl = copyExternalLinkUrl;
 window.retryExternalLinkOpen = retryExternalLinkOpen;
 

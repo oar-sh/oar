@@ -2662,6 +2662,263 @@
     padding: 8px 6px;
   }
 
+  #git-changes-modal,
+  #git-diff-modal {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.68);
+    padding: 18px;
+  }
+  #git-changes-modal { z-index: 10500; }
+  #git-diff-modal { z-index: 10800; }
+  #git-changes-modal.visible,
+  #git-diff-modal.visible { display: flex; }
+  .git-changes-dialog {
+    width: min(760px, 100%);
+    max-height: min(88vh, 860px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .git-diff-dialog {
+    width: min(1100px, 100%);
+    max-height: min(90vh, 900px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .git-changes-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+    flex-wrap: wrap;
+  }
+  .git-changes-title {
+    font-size: var(--fs-meta-md);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .git-diff-title {
+    font-size: var(--fs-meta-md);
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .git-changes-branch-wrap {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+  }
+  .git-changes-branch {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: var(--fs-meta-sm);
+    white-space: nowrap;
+  }
+  .git-changes-meta {
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-changes-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+  }
+  .git-changes-btn {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 8px;
+    height: 30px;
+    padding: 0 10px;
+    font-size: var(--fs-meta-sm);
+    cursor: pointer;
+  }
+  .git-changes-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .git-changes-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .git-changes-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .git-changes-close {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: var(--fs-ui-icon);
+    cursor: pointer;
+    line-height: 1;
+    padding: 2px 6px;
+  }
+  .git-changes-close:hover { color: var(--text); }
+  .git-changes-notice {
+    padding: 8px 14px;
+    font-size: var(--fs-meta-sm);
+    color: var(--muted);
+    border-bottom: 1px dashed var(--border);
+  }
+  .git-changes-notice.error { color: var(--danger); }
+  .git-changes-list {
+    flex: 1;
+    min-height: 240px;
+    overflow: auto;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .git-changes-empty {
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    padding: 10px 6px;
+  }
+  .git-changes-file {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    border-radius: 10px;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+    padding: 4px 12px;
+    min-width: 0;
+  }
+  .git-changes-file:hover { border-color: var(--accent); }
+  .git-changes-file-status {
+    flex: 0 0 auto;
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    font-size: var(--fs-meta-xs);
+    font-weight: 700;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .git-changes-file-status.status-M,
+  .git-changes-file-status.status-T { color: var(--warn); border-color: var(--warn); }
+  .git-changes-file-status.status-A,
+  .git-changes-file-status.status-U { color: var(--success); border-color: var(--success); }
+  .git-changes-file-status.status-D { color: var(--danger); border-color: var(--danger); }
+  .git-changes-file-status.status-R,
+  .git-changes-file-status.status-C { color: var(--accent); border-color: var(--accent); }
+  .git-changes-file-text {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    min-width: 0;
+    line-height: 1.3;
+  }
+  .git-changes-file-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-sm);
+    color: var(--text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-changes-file-name.deleted {
+    text-decoration: line-through;
+    color: var(--muted);
+  }
+  .git-changes-file-dir {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-changes-file-orig {
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-diff-body {
+    flex: 1;
+    min-height: 240px;
+    overflow: auto;
+    background: var(--bg);
+  }
+  .git-diff-lines {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-sm);
+    line-height: 1.45;
+    min-width: max-content;
+    padding: 6px 0 14px;
+  }
+  .git-diff-line {
+    display: flex;
+    align-items: stretch;
+    white-space: pre;
+  }
+  .git-diff-gutter {
+    flex: 0 0 44px;
+    text-align: right;
+    padding: 0 8px 0 4px;
+    color: var(--muted);
+    user-select: none;
+    border-right: 1px solid var(--border);
+    font-size: var(--fs-meta-xs);
+    line-height: inherit;
+  }
+  .git-diff-text {
+    padding: 0 12px 0 8px;
+  }
+  .git-diff-line.add { background: rgba(63, 185, 80, 0.14); }
+  .git-diff-line.add .git-diff-text { color: var(--success); }
+  .git-diff-line.del { background: rgba(248, 81, 73, 0.14); }
+  .git-diff-line.del .git-diff-text { color: var(--danger); }
+  .git-diff-line.gap {
+    color: var(--muted);
+    font-style: italic;
+    background: var(--bg2);
+  }
+  @media (max-width: 700px) {
+    #git-changes-modal,
+    #git-diff-modal { padding: 8px; }
+    .git-changes-dialog,
+    .git-diff-dialog { max-height: 96dvh; }
+  }
+
   #repo-browser-fab {
     display: none;
     position: fixed;
@@ -3753,6 +4010,7 @@
             <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
+            <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
             <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
@@ -3849,6 +4107,40 @@
         <div id="repo-folder"></div>
       </section>
     </div>
+  </div>
+</div>
+
+<div id="git-changes-modal" aria-hidden="true">
+  <div class="git-changes-dialog" role="dialog" aria-modal="true" aria-label="Git changes">
+    <div class="git-changes-header">
+      <div class="git-changes-title">🌿 Git changes</div>
+      <div class="git-changes-branch-wrap">
+        <span id="git-changes-branch" class="git-changes-branch"></span>
+        <span id="git-changes-meta" class="git-changes-meta"></span>
+      </div>
+      <div class="git-changes-actions">
+        <button id="git-changes-pull" class="git-changes-btn" type="button" title="Pull from upstream">⬇ Pull</button>
+        <button id="git-changes-refresh" class="git-changes-btn" type="button" title="Refresh status">↻</button>
+        <button id="git-changes-close" class="git-changes-close" type="button" aria-label="Close git changes">×</button>
+      </div>
+    </div>
+    <div id="git-changes-notice" class="git-changes-notice" hidden></div>
+    <div id="git-changes-list" class="git-changes-list"></div>
+  </div>
+</div>
+
+<div id="git-diff-modal" aria-hidden="true">
+  <div class="git-diff-dialog" role="dialog" aria-modal="true" aria-label="File diff">
+    <div class="git-changes-header">
+      <div id="git-diff-title" class="git-diff-title">Diff</div>
+      <span id="git-diff-meta" class="git-changes-meta"></span>
+      <div class="git-changes-actions">
+        <button id="git-diff-mode-changes" class="git-changes-btn active" type="button" title="Show only changed lines">Changes</button>
+        <button id="git-diff-mode-full" class="git-changes-btn" type="button" title="Show the whole file">Full file</button>
+        <button id="git-diff-close" class="git-changes-close" type="button" aria-label="Close diff viewer">×</button>
+      </div>
+    </div>
+    <div id="git-diff-body" class="git-diff-body"></div>
   </div>
 </div>
 
@@ -3971,7 +4263,7 @@
         <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
       </div>
       <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="claude-model-input">Claude (Agent SDK)</label>
+        <label for="claude-model-input">Claude SDK</label>
         <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
           <label for="claude-enabled-toggle">Enable Claude for New Chat model selection</label>
           <input id="claude-enabled-toggle" type="checkbox" onchange="toggleClaudeProvider(this.checked)">
@@ -3991,7 +4283,7 @@
         <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
       </div>
       <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="cursor-api-key-input">Cursor (Agent SDK)</label>
+        <label for="cursor-api-key-input">Cursor SDK</label>
         <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
           <label for="cursor-enabled-toggle">Enable Cursor for New Chat model selection</label>
           <input id="cursor-enabled-toggle" type="checkbox" onchange="toggleCursorProvider(this.checked)" disabled>

@@ -342,14 +342,17 @@ export function createSdkMessageNormalizer() {
       if (!terminal) return actions; // CREATING / RUNNING
       // Errored turns may end before any text streamed; the status message is
       // then the only human-readable explanation, so surface it as the result.
-      const text = finalStreamText()
-        || (terminal.isError ? String(message?.message || '').trim() : '');
+      const errorMessage = terminal.isError ? String(message?.message || '').trim() : '';
+      const text = finalStreamText() || errorMessage;
       actions.push({
         channel: 'result',
         payload: {
           text,
           isError: terminal.isError,
           subtype: terminal.subtype,
+          // Kept separate from text (which streamed prose can shadow) so the
+          // runner can classify the failure from the status message itself.
+          errorMessage: errorMessage || null,
           usage: lastUsage,
           totalCostUsd: null,
         },

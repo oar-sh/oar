@@ -47,6 +47,18 @@ test('parseCursorSettingsUpdateRequest enables the provider when a key arrives w
   assert.equal(parseCursorSettingsUpdateRequest({ apiKey: 'cur-test-key', enabled: false }).enabled, false);
 });
 
+test('parseCursorSettingsUpdateRequest accepts an enabled-models-only update', () => {
+  assert.deepEqual(parseCursorSettingsUpdateRequest({ enabledModels: ['composer-2.5', 'gpt-5.4'] }), {
+    ok: true,
+    remove: false,
+    apiKey: '',
+    enabledModels: ['composer-2.5', 'gpt-5.4'],
+    enabled: undefined,
+  });
+  // A non-array is not a recognized field.
+  assert.equal(parseCursorSettingsUpdateRequest({ enabledModels: 'composer-2.5' }).ok, false);
+});
+
 test('parseCursorSettingsUpdateRequest normalizes remove requests', () => {
   assert.deepEqual(parseCursorSettingsUpdateRequest({
     remove: true,
@@ -142,6 +154,41 @@ test('cursor catalog reports none-only reasoning and preserves other provider ma
   assert.deepEqual(result.reasoningByProvider.github, { 'gpt-5.4-mini': ['medium'] });
   assert.deepEqual(result.reasoningByProvider.openai, { 'gpt-4o': ['none'] });
   assert.deepEqual(result.reasoningByProvider.claude, { 'claude-sonnet-5': ['none', 'low'] });
+});
+
+test('cursor catalog uses discovered per-model efforts and falls back to none-only', () => {
+  const base = {
+    models: ['gpt-5.4-mini'],
+    providersByModel: {},
+    reasoningByModel: {},
+    modelMetadataByModel: {},
+  };
+  const result = buildModelCatalogWithCursorProvider(base, {
+    enabled: true,
+    model: 'composer-2.5',
+    models: ['composer-2.5', 'gpt-5.4', 'claude-opus-5'],
+    effortsByModel: {
+      'composer-2.5': ['none'],
+      'gpt-5.4': ['none', 'low', 'medium', 'high', 'xhigh'],
+      'claude-opus-5': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+      // An entry for a model that is not listed must not leak into the catalog.
+      'unlisted-model': ['none', 'low'],
+    },
+  });
+  assert.deepEqual(result.reasoningByProvider.cursor, {
+    'composer-2.5': ['none'],
+    'gpt-5.4': ['none', 'low', 'medium', 'high', 'xhigh'],
+    'claude-opus-5': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+  });
+  assert.deepEqual(result.reasoningByModel['gpt-5.4'], ['none', 'low', 'medium', 'high', 'xhigh']);
+
+  // Missing efforts metadata (never-discovered models) degrades to 'none'.
+  const fallback = buildModelCatalogWithCursorProvider(base, {
+    enabled: true,
+    model: 'composer-2.5',
+    models: ['composer-2.5'],
+  });
+  assert.deepEqual(fallback.reasoningByProvider.cursor, { 'composer-2.5': ['none'] });
 });
 
 test('cursor catalog composes onto the openai and claude layers', () => {

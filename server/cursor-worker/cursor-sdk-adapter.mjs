@@ -85,6 +85,7 @@ export function startCursorRun({
   agent,
   message,
   model,
+  modelParams = null,
   relayMode = 'agent',
   abortSignal = null,
   dbg = () => {},
@@ -127,7 +128,10 @@ export function startCursorRun({
     try {
       run = await agent.send(message, {
         // Model on EVERY send: per-run overrides are sticky across later runs.
-        model: { id: model },
+        model: {
+          id: model,
+          ...(Array.isArray(modelParams) && modelParams.length ? { params: modelParams } : {}),
+        },
         mode: modeForRelayMode(relayMode),
         onDelta: ({ update }) => push({ source: 'delta', update }),
       });
@@ -173,6 +177,18 @@ export function startCursorRun({
 }
 
 /**
+ * Backend auth rejections often arrive without an AuthenticationError type:
+ * as a terminal ERROR run status ("Authentication error If you are logged
+ * in, try logging out and back in.") or as a transport error whose code is
+ * not a string. Text matching is the only signal that works across all of
+ * these shapes.
+ */
+export function isCursorAuthErrorMessage(text) {
+  return /authentication error|unauthenticated|not authenticated|invalid api key|api key.*(?:expired|revoked)/i
+    .test(String(text || ''));
+}
+
+/**
  * Name/code checks rather than instanceof so classification works on
  * SDK-typed errors, transported plain objects, and test fixtures alike.
  */
@@ -180,7 +196,7 @@ export function classifyCursorError(error) {
   const message = String(error?.message || error);
   const isRetryable = error?.isRetryable === true;
   const name = String(error?.name || '');
-  if (name === 'AuthenticationError') {
+  if (name === 'AuthenticationError' || isCursorAuthErrorMessage(message)) {
     return {
       isAuth: true,
       isBusy: false,
@@ -237,6 +253,19 @@ async function defaultModelsList({ apiKey }) {
 
 const contextWindowCache = new Map();
 
+function modelEntriesFromListResponse(response) {
+  if (Array.isArray(response)) return response;
+  if (Array.isArray(response?.models)) return response.models;
+  if (Array.isArray(response?.data)) return response.data;
+  return [];
+}
+
+function modelEntryId(entry) {
+  return typeof entry === 'string'
+    ? entry
+    : String(entry?.id || entry?.name || entry?.model?.id || '');
+}
+
 function pickContextWindow(entry) {
   const value = Number(
     entry?.contextWindow
@@ -264,18 +293,10 @@ export async function readModelContextWindow({
   try {
     const listImpl = modelsListImpl || defaultModelsList;
     const response = await listImpl({ apiKey });
-    const entries = Array.isArray(response)
-      ? response
-      : Array.isArray(response?.models)
-        ? response.models
-        : Array.isArray(response?.data)
-          ? response.data
-          : [];
+    const entries = modelEntriesFromListResponse(response);
     const wantedLower = wanted.toLowerCase();
     for (const entry of entries) {
-      const id = typeof entry === 'string'
-        ? entry
-        : String(entry?.id || entry?.name || entry?.model?.id || '');
+      const id = modelEntryId(entry);
       if (id.toLowerCase() !== wantedLower) continue;
       if (typeof entry === 'string') break;
       const contextWindow = pickContextWindow(entry);
@@ -289,4 +310,71 @@ export async function readModelContextWindow({
     dbg('cursor models list failed', error?.message || String(error));
   }
   return null;
+}
+
+const modelParameterDefsCache = new Map();
+
+/**
+ * Map the composer's reasoning effort onto the model params Cursor expects on
+ * `agent.send`. Effort lives in a per-model parameter named 'effort' or
+ * 'reasoning' ('extra-high' is Cursor's spelling of 'xhigh'); models that also
+ * expose a boolean 'thinking' parameter only honor the higher tiers with
+ * thinking enabled, so an explicit effort turns thinking on and 'none' turns it
+ * off. Best-effort like readModelContextWindow: null on any failure or when the
+ * model has no matching parameter, which sends the model's default variant.
+ */
+export async function resolveCursorReasoningParams({
+  apiKey,
+  model,
+  reasoningEffort,
+  modelsListImpl = null,
+  dbg = () => {},
+} = {}) {
+  const wanted = String(model || '').trim();
+  const effort = String(reasoningEffort || '').trim().toLowerCase();
+  if (!wanted || !effort) return null;
+  let parameters = modelParameterDefsCache.get(wanted);
+  if (parameters === undefined) {
+    try {
+      const listImpl = modelsListImpl || defaultModelsList;
+      const response = await listImpl({ apiKey });
+      const wantedLower = wanted.toLowerCase();
+      for (const entry of modelEntriesFromListResponse(response)) {
+        if (modelEntryId(entry).toLowerCase() !== wantedLower) continue;
+        parameters = typeof entry === 'object' && Array.isArray(entry?.parameters) ? entry.parameters : [];
+        break;
+      }
+      // Successful lookups are cached (including "model has no parameters");
+      // failures are not, so a transient list error is retried next turn.
+      if (parameters !== undefined) modelParameterDefsCache.set(wanted, parameters);
+    } catch (error) {
+      dbg('cursor models list failed', error?.message || String(error));
+      return null;
+    }
+  }
+  if (!Array.isArray(parameters) || !parameters.length) return null;
+  const paramsById = new Map(
+    parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]),
+  );
+  const effortParam = paramsById.get('effort') || paramsById.get('reasoning');
+  const hasThinkingParam = paramsById.has('thinking');
+  const effortValues = new Set(
+    (Array.isArray(effortParam?.values) ? effortParam.values : [])
+      .map((value) => String((value && typeof value === 'object' ? value.value : value) || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (effort === 'none') {
+    if (hasThinkingParam) return [{ id: 'thinking', value: 'false' }];
+    if (effortParam && effortValues.has('none')) return [{ id: String(effortParam.id), value: 'none' }];
+    return null;
+  }
+  if (!effortParam) return null;
+  const nativeValue = effortValues.has(effort)
+    ? effort
+    : (effort === 'xhigh' && effortValues.has('extra-high') ? 'extra-high' : '');
+  if (!nativeValue) return null;
+  return [
+    ...(hasThinkingParam ? [{ id: 'thinking', value: 'true' }] : []),
+    { id: String(effortParam.id), value: nativeValue },
+  ];
 }

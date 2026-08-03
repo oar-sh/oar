@@ -214,6 +214,39 @@ test('thoughts from the sdk stream reach the relay thought channel', async () =>
   assert.equal(response.body.text, 'All set.');
 });
 
+test('ExitPlanMode board falls back to the plan file when input.plan is empty', async (t) => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const planFilePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'plan-board-')), 'plan.md');
+  fs.writeFileSync(planFilePath, '# Plan\n1. first\n2. second\n');
+  t.after(() => fs.rmSync(path.dirname(planFilePath), { recursive: true, force: true }));
+
+  const stub = makeApiStub();
+  let capturedCanUseTool = null;
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    startClaudeTurnImpl: (params) => {
+      capturedCanUseTool = params.canUseTool;
+      return fakeTurn([initMessage('native-1'), resultMessage('Plan is ready for review.', 'native-1')]);
+    },
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
+  // Give runTurn a tick to hand canUseTool to the SDK stub, then fire the
+  // interception the way the CLI would mid-turn.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(capturedCanUseTool, 'runner must wire canUseTool into the turn');
+  const decision = await capturedCanUseTool('ExitPlanMode', { plan: '', planFilePath }, {});
+  assert.equal(decision.behavior, 'deny', 'plan approval must come from the board, not the turn');
+  await pending;
+  const board = stub.calls.find((call) => call.routePath === '/api/relay-board');
+  assert.ok(board, 'plan board must be posted');
+  assert.match(board.body.body, /1\. first/);
+  assert.equal(board.body.boardType, 'plan_ready');
+});
+
 test('plan board payload requires plan text', () => {
   assert.equal(buildClaudePlanReadyBoardPayload({ message: baseMessage, planText: '' }), null);
   const payload = buildClaudePlanReadyBoardPayload({ message: baseMessage, planText: '1. a\n2. b' });

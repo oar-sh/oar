@@ -85,6 +85,96 @@ test('cursor model discovery is timeout-guarded around @cursor/sdk', () => {
   assert.match(source, /const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;/);
 });
 
+test('cursor model discovery persists per-model effort tiers', () => {
+  const refreshSource = sliceBetween(
+    'async function refreshCursorProviderModels(',
+    '\nconst DEFAULT_CONFIG',
+  );
+  assert.match(refreshSource, /cursorEntryEffortLevels\(entry\)/);
+  assert.match(refreshSource, /CURSOR_MODEL_EFFORTS_SETTING_KEY, JSON\.stringify\(effortsByModel\)/);
+  assert.match(source, /const CURSOR_MODEL_EFFORTS_SETTING_KEY = 'cursor_model_efforts';/);
+});
+
+test('cursorEntryEffortLevels maps effort/reasoning params into composer tiers', () => {
+  // The mapper is pure, so evaluate its source directly against live-shaped
+  // models.list entries rather than asserting on its text.
+  const mapperSource = sliceBetween(
+    'function cursorEntryEffortLevels(entry) {',
+    '\nasync function refreshCursorProviderModels(',
+  );
+  const cursorEntryEffortLevels = new Function(
+    'CURSOR_EFFORT_LEVELS',
+    `${mapperSource}\nreturn cursorEntryEffortLevels;`,
+  )(new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']));
+
+  assert.deepEqual(cursorEntryEffortLevels({
+    id: 'gpt-5.4',
+    parameters: [
+      { id: 'context', values: [{ value: '272k' }] },
+      { id: 'reasoning', values: [{ value: 'none' }, { value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'extra-high' }] },
+    ],
+  }), ['none', 'low', 'medium', 'high', 'xhigh']);
+  assert.deepEqual(cursorEntryEffortLevels({
+    id: 'claude-opus-5',
+    parameters: [
+      { id: 'thinking', values: [{ value: 'false' }, { value: 'true' }] },
+      { id: 'effort', values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }, { value: 'max' }] },
+    ],
+  }), ['low', 'medium', 'high', 'xhigh', 'max']);
+  // Values with no composer tier (e.g. 'minimal') drop instead of remapping.
+  assert.deepEqual(cursorEntryEffortLevels({
+    id: 'gemini-3.6-flash',
+    parameters: [{ id: 'effort', values: [{ value: 'minimal' }, { value: 'low' }, { value: 'high' }] }],
+  }), ['low', 'high']);
+  assert.deepEqual(cursorEntryEffortLevels({ id: 'composer-2.5', parameters: [{ id: 'fast', values: [{ value: 'true' }] }] }), []);
+  assert.deepEqual(cursorEntryEffortLevels({ id: 'plain' }), []);
+  assert.deepEqual(cursorEntryEffortLevels('string-entry'), []);
+});
+
+test('cursor settings expose per-model efforts with a none-first ladder', () => {
+  const settingsSource = sliceBetween(
+    'function getCursorProviderSettings() {',
+    '\nfunction setCursorProviderSettings(',
+  );
+  assert.match(settingsSource, /readCursorModelEffortsSetting\(\)/);
+  assert.match(settingsSource, /effortsByModel\[key\] = \['none',[\s\S]*?discoveredEfforts\.filter\([\s\S]*?!== 'none'/);
+  // Key rotation and removal both invalidate the discovered efforts.
+  const updateSource = sliceBetween(
+    'function setCursorProviderSettings(',
+    '\nconst CURSOR_MODEL_DISCOVERY_TIMEOUT_MS',
+  );
+  const effortDeletes = updateSource.match(/stmts\.deleteAppSetting\.run\(CURSOR_MODEL_EFFORTS_SETTING_KEY\);/g) || [];
+  assert.equal(effortDeletes.length, 2);
+});
+
+test('cursor settings honor the Select Models enabled subset', () => {
+  assert.match(source, /const CURSOR_ENABLED_MODELS_SETTING_KEY = 'cursor_enabled_models';/);
+  const settingsSource = sliceBetween(
+    'function getCursorProviderSettings() {',
+    '\nfunction setCursorProviderSettings(',
+  );
+  // The enabled subset is filtered against the discovered list, and an empty
+  // selection falls back to every available model (mirrors Claude).
+  assert.match(settingsSource, /isSafeCursorModelId\(modelId\) && availableSet\.has\(modelId\)/);
+  assert.match(settingsSource, /\.\.\.\(enabledSelection\.length \? enabledSelection : availableModels\),/);
+  assert.match(settingsSource, /availableModels,[\s\S]{0,80}?enabledModels: resolvedModels,/);
+  const updateSource = sliceBetween(
+    'function setCursorProviderSettings(',
+    '\nconst CURSOR_MODEL_DISCOVERY_TIMEOUT_MS',
+  );
+  assert.match(updateSource, /CURSOR_ENABLED_MODELS_SETTING_KEY, JSON\.stringify\(normalizedEnabledModels\)/);
+  // Key removal clears the subset along with the discovered models.
+  assert.match(updateSource, /stmts\.deleteAppSetting\.run\(CURSOR_ENABLED_MODELS_SETTING_KEY\);\n\s*stmts\.deleteAppSetting\.run\(CURSOR_MODEL_EFFORTS_SETTING_KEY\);/);
+});
+
+test('shared route deps export the cursor session-root resolver', () => {
+  const depsSource = sliceBetween(
+    'const sharedRouteDeps = {',
+    '\nregisterMessagesRoutes(app, sharedRouteDeps);',
+  );
+  assert.match(depsSource, /resolveCursorSessionRoot: cursorSessionRootResolver\.resolveCursorSessionRoot,/);
+});
+
 // ─── updateRuntimeSessionCursorAgentId column gating ─────────────────────────
 
 const BASE_SCHEMA = `

@@ -37,6 +37,7 @@ import { buildDequeuedRelayMessage, dequeuePendingMessageForWorkerLoop, register
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
+import { registerGitRoutes } from './routes/git-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
@@ -52,6 +53,8 @@ import { createInstalledCopilotClient } from './copilot-sdk-runtime.mjs';
 import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
 import { createClaudeSessionRootResolver } from './services/claude-session-root-service.mjs';
+import { createCursorSessionRootResolver } from './services/cursor-session-root-service.mjs';
+import { createGitChangesService } from './services/git-changes-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
@@ -472,6 +475,25 @@ async function refreshClaudeProviderModels() {
   }
 }
 
+function readCursorModelEffortsSetting() {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_MODEL_EFFORTS_SETTING_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [modelId, efforts] of Object.entries(parsed)) {
+      const key = String(modelId || '').trim().toLowerCase();
+      if (!key) continue;
+      const levels = (Array.isArray(efforts) ? efforts : [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => CURSOR_EFFORT_LEVELS.has(value));
+      out[key] = levels;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 function getCursorProviderSettings() {
   const apiKey = readAppSettingValue(CURSOR_API_KEY_SETTING_KEY);
   const enabledSetting = readAppSettingValue(CURSOR_ENABLED_SETTING_KEY);
@@ -488,12 +510,49 @@ function getCursorProviderSettings() {
   } catch {
     models = [];
   }
+  const availableModels = Array.from(new Set([model, ...(models.length ? models : DEFAULT_CURSOR_MODELS)]));
+  const availableSet = new Set(availableModels);
+  let enabledSelection = [];
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_ENABLED_MODELS_SETTING_KEY) || '[]');
+    if (Array.isArray(parsed)) {
+      enabledSelection = parsed
+        .map((value) => String(value || '').trim())
+        .filter((modelId) => isSafeCursorModelId(modelId) && availableSet.has(modelId));
+    }
+  } catch {
+    enabledSelection = [];
+  }
+  // The enabled subset (chosen in the Select Models modal) drives the model
+  // catalog and composers; an empty selection means "all available".
+  const resolvedModels = Array.from(new Set([
+    model,
+    ...(enabledSelection.length ? enabledSelection : availableModels),
+  ])).filter(Boolean);
+  const storedEfforts = readCursorModelEffortsSetting();
+  const effortsByModel = {};
+  for (const availableModel of availableModels) {
+    const key = String(availableModel || '').trim().toLowerCase();
+    if (!key) continue;
+    const discoveredEfforts = storedEfforts[key] || [];
+    // 'none' is always offered; discovered tiers follow. The worker maps
+    // 'none' to an explicit off-switch where the model can express it
+    // (thinking=false / reasoning='none') and to the model default otherwise.
+    // A model with no discovered effort parameter stays at 'none' only.
+    effortsByModel[key] = ['none', ...discoveredEfforts.filter((value) => value !== 'none')];
+  }
   return {
     configured: !!apiKey,
     enabled,
     apiKey,
     model,
-    models: Array.from(new Set([model, ...(models.length ? models : DEFAULT_CURSOR_MODELS)])),
+    models: resolvedModels,
+    availableModels,
+    enabledModels: resolvedModels,
+    effortsByModel,
+    // Pre-effort installs have models but no efforts setting; the settings
+    // route uses this to re-run discovery once and backfill the tiers.
+    effortsDiscovered: readAppSettingValue(CURSOR_MODEL_EFFORTS_SETTING_KEY) !== '',
     providerType: 'cursor',
   };
 }
@@ -503,6 +562,7 @@ function setCursorProviderSettings(update = {}) {
   const apiKey = payload.apiKey;
   const model = payload.model;
   const enabled = payload.enabled;
+  const enabledModels = payload.enabledModels;
   const remove = payload.remove === true;
   if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
     return { ok: false, error: 'Cursor settings are unavailable' };
@@ -541,12 +601,15 @@ function setCursorProviderSettings(update = {}) {
     }
     stmts.deleteAppSetting.run(CURSOR_API_KEY_SETTING_KEY);
     stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY);
     stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, 'false', nowIso);
     stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
   } else {
     const normalizedApiKey = String(apiKey || '').trim();
     if (normalizedApiKey) {
       stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
+      stmts.deleteAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY);
       stmts.upsertAppSetting.run(CURSOR_API_KEY_SETTING_KEY, normalizedApiKey, nowIso);
     }
     const hasApiKey = !!(normalizedApiKey || existing.apiKey);
@@ -554,6 +617,16 @@ function setCursorProviderSettings(update = {}) {
     if (nextEnabled && !hasApiKey) return { ok: false, error: 'Cursor API key is not configured' };
     stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
     stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
+    if (Array.isArray(enabledModels)) {
+      const normalizedEnabledModels = enabledModels
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && isSafeCursorModelId(value));
+      if (normalizedEnabledModels.length) {
+        stmts.upsertAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY, JSON.stringify(normalizedEnabledModels), nowIso);
+      } else {
+        stmts.deleteAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY);
+      }
+    }
   }
   const current = getCursorProviderSettings();
   return {
@@ -561,10 +634,33 @@ function setCursorProviderSettings(update = {}) {
     configured: current.configured,
     enabled: current.enabled,
     model: current.model,
+    models: current.models,
+    availableModels: current.availableModels,
   };
 }
 
 const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
+
+// Reasoning tiers for one discovered Cursor model, in composer vocabulary.
+// Cursor exposes effort as a per-model parameter named 'effort' or 'reasoning'
+// whose value list varies by model; 'extra-high' is Cursor's spelling of the
+// composer's 'xhigh'. Values with no composer equivalent (e.g. 'minimal') are
+// dropped rather than remapped onto a tier the model does not actually have.
+function cursorEntryEffortLevels(entry) {
+  const parameters = Array.isArray(entry?.parameters) ? entry.parameters : [];
+  const effortParam = parameters.find((param) => {
+    const paramId = String(param?.id || '').trim().toLowerCase();
+    return paramId === 'effort' || paramId === 'reasoning';
+  });
+  if (!effortParam) return [];
+  const levels = [];
+  for (const value of (Array.isArray(effortParam.values) ? effortParam.values : [])) {
+    const raw = String((value && typeof value === 'object' ? value.value : value) || '').trim().toLowerCase();
+    const level = raw === 'extra-high' ? 'xhigh' : raw;
+    if (CURSOR_EFFORT_LEVELS.has(level) && !levels.includes(level)) levels.push(level);
+  }
+  return levels;
+}
 
 // Discover the models the Cursor Agent SDK can serve (mirrors
 // refreshClaudeProviderModels). The SDK's model-listing entry point is
@@ -603,14 +699,22 @@ async function refreshCursorProviderModels() {
       : (Array.isArray(payload?.models)
         ? payload.models
         : (Array.isArray(payload?.data) ? payload.data : []));
-    const discovered = entries
-      .map((entry) => String(typeof entry === 'string' ? entry : (entry?.id || entry?.name || '')).trim())
-      .filter((modelId) => modelId && isSafeCursorModelId(modelId));
+    const discovered = [];
+    const effortsByModel = {};
+    for (const entry of entries) {
+      const modelId = String(typeof entry === 'string' ? entry : (entry?.id || entry?.name || '')).trim();
+      if (!modelId || !isSafeCursorModelId(modelId)) continue;
+      discovered.push(modelId);
+      const effortLevels = cursorEntryEffortLevels(entry);
+      if (effortLevels.length) effortsByModel[modelId.toLowerCase()] = effortLevels;
+    }
     if (!discovered.length) {
       return { ok: false, models: settings.models, error: 'Cursor model discovery returned no models' };
     }
+    const nowIso = new Date().toISOString();
     const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
-    stmts.upsertAppSetting.run(CURSOR_MODELS_SETTING_KEY, JSON.stringify(models), new Date().toISOString());
+    stmts.upsertAppSetting.run(CURSOR_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
     return { ok: true, models, error: null };
   } catch (error) {
     return {
@@ -650,6 +754,9 @@ const CURSOR_API_KEY_SETTING_KEY = 'cursor_api_key';
 const CURSOR_ENABLED_SETTING_KEY = 'cursor_enabled';
 const CURSOR_MODEL_SETTING_KEY = 'cursor_model';
 const CURSOR_MODELS_SETTING_KEY = 'cursor_models';
+const CURSOR_ENABLED_MODELS_SETTING_KEY = 'cursor_enabled_models';
+const CURSOR_MODEL_EFFORTS_SETTING_KEY = 'cursor_model_efforts';
+const CURSOR_EFFORT_LEVELS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_CURSOR_MODEL = 'composer-2.5';
 const DEFAULT_CURSOR_MODELS = ['composer-2.5'];
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
@@ -5639,6 +5746,7 @@ const readContextFromSessionEvents = contextSnapshotService.readContextFromSessi
 // Claude-provider sessions live under the Agent SDK's project layout rather than
 // ~/.copilot/session-state, so their browsable session folder resolves separately.
 const claudeSessionRootResolver = createClaudeSessionRootResolver({ fs, path });
+const cursorSessionRootResolver = createCursorSessionRootResolver({ fs, path, serverDir: __dirname });
 
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
@@ -6089,8 +6197,11 @@ const windowsAutostartService = createWindowsAutostartService({
   configPath: CONFIG_PATH,
 });
 
+const gitChangesService = createGitChangesService();
 const sharedRouteDeps = {
   auth,
+  gitChangesService,
+  currentWorkspaceRootPath,
   io,
   db,
   stmts,
@@ -6234,6 +6345,7 @@ const sharedRouteDeps = {
   relayRestartOrchestrator,
   resolveSessionStateRoot,
   resolveClaudeSessionRoot: claudeSessionRootResolver.resolveClaudeSessionRoot,
+  resolveCursorSessionRoot: cursorSessionRootResolver.resolveCursorSessionRoot,
   getTurnCeilingMinutes,
   setTurnCeilingMinutes,
   requestRelayShutdown,
@@ -6248,6 +6360,7 @@ registerSessionsRoutes(app, sharedRouteDeps);
 registerAskUserRoutes(app, sharedRouteDeps);
 registerRelayBoardRoutes(app, sharedRouteDeps);
 registerCacheRoutes(app, sharedRouteDeps);
+registerGitRoutes(app, sharedRouteDeps);
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   cliLastSeen = null;
   const wasOnline = cliOnline;

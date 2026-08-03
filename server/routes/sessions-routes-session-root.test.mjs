@@ -113,6 +113,54 @@ test('a claude conversation with an unresolved or missing resolver is null, not 
   );
 });
 
+test('a cursor conversation resolves through the agent-store layout', () => {
+  const sessionRootPath = '/srv/relay/server/data/cursor-agents/' + SDK_SESSION_ID;
+  const resolveCursorSessionRoot = spyResolver({ sessionRootPath, sessionRootName: 'Session' });
+  const resolveSessionStateRoot = spyResolver('/should/not/be/used');
+
+  const payload = buildConversationSessionRootPayload({
+    conversationId: 'conv-1',
+    sdkSessionId: SDK_SESSION_ID,
+    resolveSessionStateRoot,
+    providerType: 'cursor',
+    resolveCursorSessionRoot,
+  });
+
+  assert.deepEqual(payload, {
+    sdkSessionId: SDK_SESSION_ID,
+    sessionRootPath,
+    sessionRootName: 'Session',
+  });
+  assert.deepEqual(resolveCursorSessionRoot.calls, [{ sdkSessionId: SDK_SESSION_ID }]);
+  assert.equal(resolveSessionStateRoot.calls.length, 0);
+});
+
+test('a cursor conversation never falls through to a same-named session-state directory', () => {
+  const root = makeSessionStateRoot();
+  assert.equal(buildConversationSessionRootPayload({
+    conversationId: 'conv-1',
+    sdkSessionId: SDK_SESSION_ID,
+    resolveSessionStateRoot: () => root,
+    providerType: 'cursor',
+    resolveCursorSessionRoot: spyResolver(null),
+  }), null);
+});
+
+test('a cursor conversation with an unresolved or missing resolver is null, not an error', () => {
+  const base = {
+    conversationId: 'conv-1',
+    sdkSessionId: SDK_SESSION_ID,
+    resolveSessionStateRoot: () => makeSessionStateRoot(),
+    providerType: 'cursor',
+  };
+  assert.equal(buildConversationSessionRootPayload({ ...base, resolveCursorSessionRoot: null }), null);
+  assert.equal(buildConversationSessionRootPayload({ ...base, resolveCursorSessionRoot: spyResolver(null) }), null);
+  assert.equal(
+    buildConversationSessionRootPayload({ ...base, resolveCursorSessionRoot: spyResolver({ sessionRootPath: '' }) }),
+    null,
+  );
+});
+
 test('the provider check is case-insensitive', () => {
   const resolveClaudeSessionRoot = spyResolver({ sessionRootPath: '/claude/session' });
   const payload = buildConversationSessionRootPayload({

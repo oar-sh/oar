@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createCursorTurnRunner, buildCursorPlanReadyBoardPayload } from './cursor-turn-runner.mjs';
+import { createCursorTurnRunner, buildCursorPlanReadyBoardPayload, cursorModeNudge } from './cursor-turn-runner.mjs';
 
 function makeApiStub({ failRoutes = new Set() } = {}) {
   const calls = [];
@@ -67,6 +67,7 @@ function baseRunnerOptions(stub, overrides = {}) {
     storeDir: '/home/dev/.cursor-agents',
     defaultModel: 'default-cursor-model',
     readContextWindowImpl: async () => null,
+    resolveModelParamsImpl: async () => null,
     ...overrides,
   };
 }
@@ -186,6 +187,33 @@ test('the model is re-pinned on every send and auto/empty falls back through pro
   assert.equal(responses[0].body.modelOrigin, 'manual');
 });
 
+test('the reasoning effort resolves to model params per turn and reaches the run', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const resolveCalls = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('one.'), evFinished()],
+      [evInit(), evDelta('two.'), evFinished()],
+    ], started),
+    resolveModelParamsImpl: async (args) => {
+      resolveCalls.push(args);
+      return args.reasoningEffort === 'high' ? [{ id: 'reasoning', value: 'high' }] : null;
+    },
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, reasoningEffort: 'high' } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', reasoningEffort: 'none' } });
+
+  assert.equal(resolveCalls.length, 2);
+  assert.equal(resolveCalls[0].model, 'cheetah');
+  assert.equal(resolveCalls[0].apiKey, 'cursor-test-key');
+  assert.equal(resolveCalls[0].reasoningEffort, 'high');
+  assert.deepEqual(started[0].modelParams, [{ id: 'reasoning', value: 'high' }]);
+  assert.equal(started[1].modelParams, null, 'an unmapped effort sends the model default');
+});
+
 test('plan mode with a plan-shaped reply posts the plan_ready board via the fallback source', async () => {
   const stub = makeApiStub();
   const started = [];
@@ -270,6 +298,77 @@ test('a busy agent is closed, recreated, and retried once; a second busy is term
   assert.equal(busyStarted.length, 2, 'exactly one retry');
   const busyResponse = busyStub.calls.find((call) => call.routePath === '/api/response');
   assert.equal(busyResponse.body.terminalError.stableCode, 'cursor.agent_busy');
+});
+
+// Stale handles surface backend auth rejections as terminal ERROR results,
+// not thrown AuthenticationErrors; the API key is usually still valid.
+const authErrorResult = () => evError('Authentication error If you are logged in, try logging out and back in.');
+
+test('an auth error result closes and recreates the handle, and the retry recovers', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const closes = [];
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes, agentIds: ['agent-a'] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), authErrorResult()],
+      [evInit(), evDelta('recovered on a fresh handle.'), evFinished()],
+    ], started),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(closes.length, 1, 'the stale handle must be closed');
+  assert.equal(createCalls.length, 2, 'a fresh handle must be created for the retry');
+  assert.equal(createCalls[1].agentId, 'agent-a', 'the retry resumes the persisted durable id');
+  assert.equal(started.length, 2);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'recovered on a fresh handle.');
+  assert.equal(response.body.terminalError, undefined);
+});
+
+test('a second auth error result is terminal with the key renewal hint', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), authErrorResult()],
+      [evInit(), authErrorResult()],
+    ], started),
+  }));
+
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  assert.equal(started.length, 2, 'exactly one retry');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.terminalError.stableCode, 'cursor.authentication_failed');
+  assert.equal(response.body.terminalError.code, 'authentication_failed');
+  assert.match(response.body.text, /Set or renew the Cursor API key/);
+});
+
+test('an auth error hidden behind streamed text still triggers the handle retry', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const closes = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes, agentIds: ['agent-a'] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('partial before auth died'), authErrorResult()],
+      [evInit(), evDelta('clean second attempt.'), evFinished()],
+    ], started),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(closes.length, 1);
+  assert.equal(started.length, 2);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(
+    response.body.text,
+    'clean second attempt.',
+    'the failed attempt\'s partial text must not leak into the retried turn',
+  );
+  assert.equal(response.body.terminalError, undefined);
 });
 
 test('abort cancels the run, republishes partial text as done, and skips the response', async () => {
@@ -469,4 +568,93 @@ test('dispose closes the handle, and a failed resume falls back to create and pe
   assert.deepEqual(persist.body, { conversationId: 'conv-1', cursorAgentId: 'agent-2' });
   const response = fallbackStub.calls.find((call) => call.routePath === '/api/response');
   assert.equal(response.body.text, 'fresh agent answer.');
+});
+
+test('cursorModeNudge injects on mode entry and cancels on mode exit', () => {
+  assert.match(cursorModeNudge('ask', ''), /^\[Relay mode: ask\]/);
+  assert.match(cursorModeNudge('autopilot', 'ask'), /^\[Relay mode: autopilot\]/);
+  assert.equal(cursorModeNudge('ask', 'ask'), '');
+  assert.match(cursorModeNudge('agent', 'autopilot'), /no longer apply/);
+  // No standing instruction to cancel: agent/plan need no injection.
+  assert.equal(cursorModeNudge('agent', ''), '');
+  assert.equal(cursorModeNudge('plan', 'agent'), '');
+});
+
+test('ask/autopilot nudges ride on the message text and dedupe until the mode changes', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('a.'), evFinished()],
+      [evInit(), evDelta('b.'), evFinished()],
+      [evInit(), evDelta('c.'), evFinished()],
+    ], started),
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+  assert.match(started[0].message.text, /^\[Relay mode: ask\][\s\S]*hello$/);
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'ask' } });
+  assert.equal(started[1].message.text, 'hello', 'same mode must not re-inject');
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', relayMode: 'agent' } });
+  assert.match(started[2].message.text, /^\[Relay mode: agent\][\s\S]*hello$/);
+});
+
+test('auth vocabulary in the model prose does not trigger the auth retry when the error has no message', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const closes = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes }),
+    startCursorRunImpl: queuedTurns([
+      // The model was *talking about* auth failures; the bare ERROR status
+      // carries no message, so nothing here is an auth classification.
+      [evInit(), evDelta('The log shows "invalid api key" from the previous run.'), evError('')],
+    ], started),
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(started.length, 1, 'no silent re-run on prose-only auth vocabulary');
+  assert.equal(closes.length, 0, 'the handle must not be recreated');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.notEqual(response.body.terminalError?.code, 'authentication_failed');
+  assert.doesNotMatch(response.body.text, /Set or renew the Cursor API key/);
+});
+
+test('the auth retry clears the failed attempt\'s stream and leaves an activity trace', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [], agentIds: ['agent-a', 'agent-b'] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('partial before auth died'), authErrorResult()],
+      [evInit(), evDelta('clean second attempt.'), evFinished()],
+    ]),
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const streams = stub.calls.filter((call) => call.routePath === '/api/stream');
+  const reset = streams.find((call) => call.body.text === '' && call.body.done === true);
+  assert.ok(reset, 'an empty done stream snapshot must clear the failed attempt');
+  const lastStream = streams[streams.length - 1];
+  assert.equal(lastStream.body.text, 'clean second attempt.');
+  const note = stub.calls.find((call) => call.routePath === '/api/activity'
+    && /re-authenticated; retrying/.test(call.body.text));
+  assert.ok(note, 'the retry must leave an activity trace');
+});
+
+test('a mode nudge swallowed by a failed turn is re-injected on the next attempt', async () => {
+  const stub = makeApiStub();
+  const started = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([
+      () => rejectingTurn(new Error('transport exploded')),
+      [evInit(), evDelta('ok now.'), evFinished()],
+    ], started),
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+  assert.match(started[0].message.text, /^\[Relay mode: ask\]/, 'first attempt carries the nudge');
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'ask' } });
+  assert.match(
+    started[1].message.text,
+    /^\[Relay mode: ask\]/,
+    'the failed turn must not consume the mode change; the nudge is re-injected',
+  );
 });

@@ -212,6 +212,7 @@ test('terminal statuses map onto result subtypes', () => {
       text: 'Answer text.',
       isError,
       subtype,
+      errorMessage: null,
       usage: null,
       totalCostUsd: null,
     });
@@ -223,6 +224,19 @@ test('error status without streamed text falls back to the status message', () =
   const actions = normalizer.normalize(stream({ type: 'status', status: 'ERROR', message: 'model overloaded' }));
   assert.equal(actions[0].payload.text, 'model overloaded');
   assert.equal(actions[0].payload.isError, true);
+});
+
+test('the raw status message survives on errorMessage even when streamed text shadows text', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize(delta({ type: 'text-delta', text: 'Partial prose.' }));
+  const actions = normalizer.normalize(
+    stream({ type: 'status', status: 'ERROR', message: 'Authentication error If you are logged in, try logging out and back in.' }),
+  );
+  assert.equal(actions[0].payload.text, 'Partial prose.');
+  assert.equal(
+    actions[0].payload.errorMessage,
+    'Authentication error If you are logged in, try logging out and back in.',
+  );
 });
 
 test('usage is captured last-wins from both surfaces and exposed on the result', () => {

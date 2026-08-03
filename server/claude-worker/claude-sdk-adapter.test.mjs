@@ -93,14 +93,23 @@ test('canUseTool bridges AskUserQuestion answers into updatedInput', async () =>
   assert.deepEqual(result.updatedInput.questions, input.questions);
 });
 
-test('canUseTool posts plan board on ExitPlanMode and allows', async () => {
+test('canUseTool posts plan board on ExitPlanMode and denies so the turn ends', async () => {
   let planInput = null;
   const canUseTool = createCanUseTool({
     onExitPlanMode: async (input) => { planInput = input; },
   });
   const result = await canUseTool('ExitPlanMode', { plan: '1. do\n2. done' }, {});
-  assert.equal(result.behavior, 'allow');
+  // Allowing ExitPlanMode approves the plan and the same turn implements it;
+  // deny ends the turn so the plan board's choice drives the next turn.
+  assert.equal(result.behavior, 'deny');
+  assert.match(result.message, /review/i);
   assert.deepEqual(planInput, { plan: '1. do\n2. done' });
+});
+
+test('canUseTool allows ExitPlanMode untouched when no board handler is wired', async () => {
+  const canUseTool = createCanUseTool({});
+  const result = await canUseTool('ExitPlanMode', { plan: '1. do' }, {});
+  assert.equal(result.behavior, 'allow');
 });
 
 test('canUseTool allows every other tool (allow-all parity)', async () => {
@@ -154,4 +163,13 @@ test('normalizeClaudeEffort accepts exactly the SDK effort ladder', () => {
   }
   assert.equal(normalizeClaudeEffort('none'), '');
   assert.equal(normalizeClaudeEffort('extreme'), '');
+});
+
+test('canUseTool tells the model to restate the plan when no board was surfaced', async () => {
+  const canUseTool = createCanUseTool({
+    onExitPlanMode: async () => false,
+  });
+  const result = await canUseTool('ExitPlanMode', { plan: '' }, {});
+  assert.equal(result.behavior, 'deny');
+  assert.match(result.message, /Restate the complete plan/);
 });

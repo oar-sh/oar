@@ -3868,12 +3868,29 @@ export function registerMessagesRoutes(app, deps) {
       const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort: effort === 'none' ? 'none' : effort, supported };
     };
+    // Cursor conversations validate effort against the discovered per-model
+    // tiers ('none' = reasoning/thinking off where the model can express it,
+    // model default otherwise). Effort is per-turn: it maps onto model params
+    // on each agent.send, so it can change between messages.
+    const resolveCursorReasoningEffort = () => {
+      const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
+      const discovered = configuredCursor?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()];
+      if (!Array.isArray(discovered)) {
+        // 'auto' / undiscovered model: pass the request through untouched —
+        // the worker validates it against the resolved model's live params
+        // and falls back to the model default on any mismatch. Clamping to
+        // 'none' here would actively disable thinking on the resolved model.
+        return { ok: true, effort: requestedEffort, supported: [] };
+      }
+      const effort = discovered.includes(requestedEffort) ? requestedEffort : 'none';
+      return { ok: true, effort, supported: discovered };
+    };
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
       : (runtimeUsesClaude
         ? resolveClaudeReasoningEffort()
         : (runtimeUsesCursor
-          ? { ok: true, effort: 'none', supported: ['none'] }
+          ? resolveCursorReasoningEffort()
           : resolveRequestedReasoningEffort(
               requestedModel,
               explicitReasoningEffort || modelResolution.reasoningEffort || null,

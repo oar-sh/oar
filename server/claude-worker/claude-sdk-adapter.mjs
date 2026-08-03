@@ -159,7 +159,23 @@ export async function readContextUsage(turn, dbg = () => {}, { timeoutMs = 10000
  * (parity with the Copilot workers' `--allow-all` posture); the only
  * interceptions are AskUserQuestion (bridged to relay question cards) and
  * ExitPlanMode (surfaces the plan_ready board).
+ *
+ * ExitPlanMode is DENIED after the board is posted: allowing it tells the CLI
+ * the user approved the plan, and the same turn rolls straight into
+ * implementation while the board is still waiting for a choice (verified
+ * against the live SDK). Denying with a review note ends the turn cleanly —
+ * the board action then starts the next turn in the chosen mode via resume,
+ * which matches direct Claude Code UX.
  */
+const EXIT_PLAN_DENY_MESSAGE = 'Plan received — it is shown to the user in the relay for review. '
+  + 'End the turn now with a short closing message and do not start implementing; '
+  + 'the user\'s decision will arrive as a new message.';
+// When the handler could not surface a board (no plan text reached it), the
+// model must restate the plan as its final message: plan-shaped final text
+// triggers the runner's fallback board, so the user still gets the review UI.
+const EXIT_PLAN_DENY_NO_BOARD_MESSAGE = 'Plan received, but it could not be shown for review. '
+  + 'Restate the complete plan as your final message, then end the turn without implementing; '
+  + 'the user\'s decision will arrive as a new message.';
 export function createCanUseTool({
   askUserBridge,
   onExitPlanMode,
@@ -176,8 +192,13 @@ export function createCanUseTool({
         };
       }
       if (normalizedToolName === 'ExitPlanMode' && typeof onExitPlanMode === 'function') {
-        await onExitPlanMode(input);
-        return { behavior: 'allow', updatedInput: input };
+        // The handler reports whether a review board was actually surfaced;
+        // treat a bare undefined (legacy handlers) as posted.
+        const posted = await onExitPlanMode(input);
+        return {
+          behavior: 'deny',
+          message: posted === false ? EXIT_PLAN_DENY_NO_BOARD_MESSAGE : EXIT_PLAN_DENY_MESSAGE,
+        };
       }
     } catch (error) {
       dbg('canUseTool bridge failed', normalizedToolName, error?.message || String(error));

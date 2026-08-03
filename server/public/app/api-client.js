@@ -275,16 +275,20 @@ export async function loadCursorSettings() {
 
 export async function updateCursorSettings({
   apiKey = '',
-  model = 'composer-2.5',
+  model = undefined,
   enabled = undefined,
+  enabledModels = undefined,
   remove = false,
 } = {}) {
   const payload = {
     apiKey: String(apiKey || '').trim(),
-    model: String(model || '').trim() || 'composer-2.5',
     remove: remove === true,
   };
+  // Only send the model when the caller chose one: an enabled-models-only save
+  // must not reset the configured default model.
+  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}/api/settings/cursor`, {
@@ -823,6 +827,40 @@ export async function loadWorkspaceFilePreview(pathValue, conversationId = null)
   const convId = String(conversationId || '').trim();
   const suffix = convId ? `?conversationId=${encodeURIComponent(convId)}` : '';
   return apiFetch(`/api/files-preview/${encodedPath}${suffix}`);
+}
+
+export async function loadGitStatus(conversationId = null) {
+  const params = new URLSearchParams();
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  const suffix = params.toString();
+  return apiFetch(`/api/git/status${suffix ? `?${suffix}` : ''}`);
+}
+
+export async function loadGitDiff(pathValue, { conversationId = null, untracked = false } = {}) {
+  const path = String(pathValue || '').trim();
+  if (!path) return null;
+  const params = new URLSearchParams();
+  params.set('path', path);
+  if (untracked) params.set('untracked', '1');
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  return apiFetch(`/api/git/diff?${params.toString()}`);
+}
+
+export async function requestGitPull(conversationId = null) {
+  const params = new URLSearchParams();
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  const suffix = params.toString();
+  const response = await fetch(`${BASE}/api/git/pull${suffix ? `?${suffix}` : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+  }).catch(() => null);
+  if (!response) return { ok: false, error: 'Network error' };
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, error: payload?.error || `Pull failed (${response.status})` };
+  return payload || { ok: false, error: 'Empty response' };
 }
 
 export async function loadDriveFilePreview(pathValue) {

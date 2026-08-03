@@ -651,6 +651,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/session-root/list` | List the explorer's Session root (`path`, optional `includeHidden`) — like `/api/drives/list`, but a not-yet-created root returns an empty folder (`exists: false`) instead of 404, and the sibling `<path>.jsonl` transcript is appended as a child |
 | GET | `/api/drives/file` | Stream a file by path — Windows drive path or Linux absolute path depending on server platform |
 | GET | `/api/drives/files-preview` | Return structured preview JSON for a file — Windows drive path or Linux absolute path depending on server platform |
+| GET | `/api/git/status` | Git status for the conversation's workspace root (`branch`, `upstream`, `ahead`, `behind`, `files[]` incl. untracked); a non-repo root returns `isRepo: false` rather than an error |
+| GET | `/api/git/diff` | Full-context unified diff for one changed file (`path`, optional `untracked=1`); the client renders both "changes only" and "full file" views from this single patch |
+| POST | `/api/git/pull` | Run `git pull` in the conversation's workspace root and return the combined output |
 | GET | `/api/conversations` | List all conversations |
 | GET | `/api/sessions` | List runtime sessions bound 1:1 to conversations |
 | GET | `/api/conversation/:id` | Get conversation message windows (`before*`, `after*`, or `aroundMessageId`) plus session-root metadata |
@@ -686,6 +689,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/usage` | Live Copilot usage snapshot |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`) |
 | POST | `/api/settings/claude` | Enable/disable Claude, set the default model or the enabled model subset; triggers discovery and unstarted-conversation reconciliation |
+| GET | `/api/settings/cursor` | Read Cursor provider settings — same shape as Claude's: `models` is the enabled subset, `availableModels` the full discovered list, plus per-model `efforts` |
+| POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
 | POST | `/api/claude-native-session` | (Claude worker) Persist the native Agent SDK session id for resume |

@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { buildClaudeUserContent } from './claude-attachments.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
 import { startClaudeTurn, createCanUseTool, readContextUsage } from './claude-sdk-adapter.mjs';
@@ -210,13 +211,28 @@ export function createClaudeTurnRunner({
       askUserBridge,
       dbg,
       onExitPlanMode: async (input) => {
-        const planText = String(input?.plan || input?.summary || '').trim();
+        // The CLI sends both `plan` and `planFilePath`; the inline plan is
+        // authoritative, the plan file covers CLI versions that stop inlining
+        // it. When neither yields text the plan-shaped-final-text fallback
+        // below still gets a chance to post the board.
+        let planText = String(input?.plan || input?.summary || '').trim();
+        if (!planText) {
+          const planFilePath = String(input?.planFilePath || '').trim();
+          if (planFilePath) {
+            try {
+              planText = String(fs.readFileSync(planFilePath, 'utf8') || '').trim();
+            } catch (error) {
+              dbg('plan file read failed', planFilePath, error?.message || String(error));
+            }
+          }
+        }
         const boardPayload = buildClaudePlanReadyBoardPayload({ message, planText });
-        if (!boardPayload) return;
+        if (!boardPayload) return false;
         planBoardPosted = true;
         await api('POST', '/api/relay-board', boardPayload).catch((error) => {
           dbg('plan board publish failed', error?.message || String(error));
         });
+        return true;
       },
     });
 

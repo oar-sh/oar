@@ -5,7 +5,9 @@ import {
   createCursorAgentHandle,
   startCursorRun,
   classifyCursorError,
+  isCursorAuthErrorMessage,
   readModelContextWindow,
+  resolveCursorReasoningParams,
 } from './cursor-sdk-adapter.mjs';
 import { createAskUserTool } from './cursor-ask-user-tool.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
@@ -16,6 +18,28 @@ const PLAN_BOARD_ACTIONS = [
   { id: 'interactive', label: 'Stop here and prompt myself', mode: 'agent' },
   { id: 'exit_only', label: 'Stop here', mode: 'agent' },
 ];
+
+// The Cursor SDK's SendOptions carries only model/mode/callbacks — there is
+// no per-turn instruction channel — so ask/autopilot steering rides on the
+// user message text, mirroring the Copilot extension's prompt-context
+// injection. Injected only when the mode changes so the session transcript
+// is not spammed with repeated instructions.
+const MODE_NUDGES = {
+  ask: '[Relay mode: ask] Prioritize clarification questions before implementation work; '
+    + 'do not make broad assumptions when a question would materially change the result.',
+  autopilot: '[Relay mode: autopilot] Keep moving unless user input is truly blocking; avoid unnecessary questions.',
+};
+
+export function cursorModeNudge(relayMode, previousMode = '') {
+  const mode = String(relayMode || 'agent').trim().toLowerCase();
+  const previous = String(previousMode || '').trim().toLowerCase();
+  if (mode === previous) return '';
+  if (MODE_NUDGES[mode]) return MODE_NUDGES[mode];
+  // Leaving a nudged mode must cancel the standing instruction; before any
+  // nudge was sent there is nothing to cancel.
+  if (MODE_NUDGES[previous]) return `[Relay mode: ${mode}] Previous relay-mode instructions no longer apply.`;
+  return '';
+}
 
 // Cursor has no exit-plan tool, so the only board source is the plan-mode
 // text-shape fallback; the payload otherwise matches the Claude worker's.
@@ -63,6 +87,7 @@ export function createCursorTurnRunner({
   startCursorRunImpl = startCursorRun,
   classifyErrorImpl = classifyCursorError,
   readContextWindowImpl = readModelContextWindow,
+  resolveModelParamsImpl = resolveCursorReasoningParams,
   createNormalizerImpl = createSdkMessageNormalizer,
   buildUserMessageImpl = buildCursorUserMessage,
   dbg = () => {},
@@ -75,6 +100,9 @@ export function createCursorTurnRunner({
   let activeMessage = null;
   let waitingForTurn = false;
   let currentAbortController = null;
+  // Mirrors the Copilot extension's lastPromptedRelayMode: full mode
+  // instructions ride on the first message of a mode and on mode changes only.
+  let lastNudgedRelayMode = '';
 
   const bridge = createAskUserBridge({
     api,
@@ -273,7 +301,7 @@ export function createCursorTurnRunner({
   async function runTurn(message) {
     currentAbortController = new AbortController();
     const abortController = currentAbortController;
-    const normalizer = createNormalizerImpl();
+    let normalizer = createNormalizerImpl();
     const state = {
       result: null,
       lastStreamedText: '',
@@ -295,6 +323,20 @@ export function createCursorTurnRunner({
 
     await ensureAgentHandle(message, model);
     const userMessage = buildUserMessageImpl(message);
+    const modeNudge = cursorModeNudge(message.relayMode, lastNudgedRelayMode);
+    if (modeNudge) userMessage.text = [modeNudge, userMessage.text].filter(Boolean).join('\n\n');
+    // Committed only once the send reached the transport (before the loop's
+    // break below) — a turn that dies before delivery must re-inject the
+    // nudge next time, or a mode change would be silently swallowed.
+    const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
+    // Per-turn like the model: the composer's effort maps onto Cursor model
+    // params, and null (no mapping / lookup failure) sends the model default.
+    const modelParams = await resolveModelParamsImpl({
+      apiKey,
+      model,
+      reasoningEffort: message.reasoningEffort || '',
+      dbg,
+    });
 
     let turn = null;
     const controlState = controlPoller?.start?.({
@@ -308,12 +350,14 @@ export function createCursorTurnRunner({
 
     try {
       let busyRetries = 0;
+      let staleAuthRetries = 0;
       while (true) {
         try {
           turn = startCursorRunImpl({
             agent: agentHandle.agent,
             message: userMessage,
             model,
+            modelParams,
             relayMode: message.relayMode,
             abortSignal: abortController.signal,
             dbg,
@@ -324,6 +368,39 @@ export function createCursorTurnRunner({
               await dispatchAction(message, action, state, normalizer);
             }
           }
+          // A long-lived handle whose exchanged auth expired fails as a
+          // terminal ERROR result, not a thrown AuthenticationError, and the
+          // API key itself is usually still valid — so recreate the handle
+          // and retry once. A second auth failure is a real key problem and
+          // falls through to the isError publish below.
+          if (
+            staleAuthRetries === 0
+            && !aborted
+            && !abortController.signal.aborted
+            && state.result?.isError
+            // Classify on the SDK status message only: result.text is the
+            // model's own prose and mentioning "invalid api key" in an answer
+            // must never trigger a silent re-run.
+            && isCursorAuthErrorMessage(state.result.errorMessage)
+          ) {
+            staleAuthRetries += 1;
+            dbg('cursor auth error result, recreating handle for one retry');
+            await agentHandle?.close?.();
+            agentHandle = null;
+            await ensureAgentHandle(message, model);
+            normalizer = createNormalizerImpl();
+            state.result = null;
+            state.lastStreamedText = '';
+            state.responseModel = '';
+            state.lastUsage = null;
+            // The failed attempt already streamed partial text to the relay;
+            // clear it and leave a trace so the retry doesn't read as the
+            // same turn silently rewriting itself.
+            await publishFinalStream(message, '');
+            await postActivity(message, 'Cursor session re-authenticated; retrying this message on a fresh agent handle.');
+            continue;
+          }
+          lastNudgedRelayMode = pendingNudgedRelayMode;
           break;
         } catch (error) {
           // A stale handle whose previous run never settled server-side
@@ -374,16 +451,23 @@ export function createCursorTurnRunner({
     }
 
     if (result.isError) {
-      const errorText = result.text
-        || `Cursor turn failed (${result.subtype || 'unknown error'}).`;
+      // Reaching here with an auth error means the fresh-handle retry above
+      // already failed too, so the key itself needs renewing. Only the SDK
+      // status message is auth-classified — result.text is model prose.
+      const authMessage = String(result.errorMessage || '').trim();
+      const isAuthFailure = isCursorAuthErrorMessage(authMessage);
+      const errorText = isAuthFailure
+        ? `System note: the Cursor runtime could not authenticate (${authMessage}). Set or renew the Cursor API key in provider settings, then retry.`
+        : result.text || `Cursor turn failed (${result.subtype || 'unknown error'}).`;
+      const code = isAuthFailure ? 'authentication_failed' : result.subtype || 'unknown';
       await publishFinalStream(message, state.lastStreamedText);
       await publishResponse(message, {
         text: errorText,
         model: responseModel,
         terminalError: {
           kind: 'cursor-turn-failed',
-          code: result.subtype || 'unknown',
-          stableCode: `cursor.${result.subtype || 'unknown'}`,
+          code,
+          stableCode: `cursor.${code}`,
           message: errorText,
           failedAt: new Date().toISOString(),
           queueMessageId: String(message.id || '') || null,
