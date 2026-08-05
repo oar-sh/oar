@@ -358,7 +358,7 @@ test('zero-turn error results still map to result actions', () => {
   assert.equal(failure[0].payload.isError, true);
 });
 
-test('task_notification system messages surface as activity', () => {
+test('task_notification system messages surface as settled edge plus activity', () => {
   const normalizer = createSdkMessageNormalizer();
   const actions = normalizer.normalize({
     type: 'system',
@@ -367,7 +367,35 @@ test('task_notification system messages surface as activity', () => {
     status: 'stopped',
     summary: 'No completion record was found for this background shell command.',
   });
-  assert.equal(actions.length, 1);
-  assert.equal(actions[0].channel, 'activity');
-  assert.match(actions[0].payload.text, /Background task task-1 stopped/);
+  assert.equal(actions.length, 2);
+  assert.equal(actions[0].channel, 'background_task_settled');
+  assert.deepEqual(actions[0].payload, { taskId: 'task-1', status: 'stopped' });
+  assert.equal(actions[1].channel, 'activity');
+  assert.match(actions[1].payload.text, /Background task task-1 stopped/);
+});
+
+test('background_tasks_changed maps the live set with replace semantics', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const populated = normalizer.normalize({
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: [
+      { task_id: 'agent-1', task_type: 'local_agent', description: 'Implement feature' },
+      { task_id: '', task_type: 'local_bash', description: 'id-less entry is dropped' },
+    ],
+    session_id: 's1',
+  });
+  assert.equal(populated.length, 1);
+  assert.equal(populated[0].channel, 'background_tasks');
+  assert.deepEqual(populated[0].payload.tasks, [
+    { taskId: 'agent-1', taskType: 'local_agent', description: 'Implement feature' },
+  ]);
+
+  const emptied = normalizer.normalize({
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: [],
+    session_id: 's1',
+  });
+  assert.deepEqual(emptied, [{ channel: 'background_tasks', payload: { tasks: [] } }]);
 });

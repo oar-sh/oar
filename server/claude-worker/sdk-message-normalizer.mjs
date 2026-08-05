@@ -81,6 +81,9 @@ export function shouldEmitStreamUpdate(nextText, previousText) {
  *   server upserts rather than duplicating)
  * - `activity` → `{ text, subagentRunId? }`
  * - `subagent` → `{ subagentRunId, parentSubagentId, displayName, status }`
+ * - `background_tasks` → `{ tasks: [{ taskId, taskType, description }] }`
+ *   (REPLACE semantics: the full live set after each membership change)
+ * - `background_task_settled` → `{ taskId, status }`
  * - `result`   → `{ text, isError, subtype, sessionId, model, usage }`
  */
 export function createSdkMessageNormalizer() {
@@ -392,16 +395,37 @@ export function createSdkMessageNormalizer() {
       }];
     }
 
+    // The live background-task set, emitted on every membership change with
+    // REPLACE semantics. The turn runner gates the input-gate release on it: a
+    // released gate closes the CLI's control transport, and background agents
+    // that outlive the visible turn then lose every permission request.
+    if (type === 'system' && sdkMessage.subtype === 'background_tasks_changed') {
+      const tasks = (Array.isArray(sdkMessage.tasks) ? sdkMessage.tasks : [])
+        .map((task) => ({
+          taskId: String(task?.task_id || '').trim(),
+          taskType: String(task?.task_type || '').trim(),
+          description: String(task?.description || '').trim(),
+        }))
+        .filter((task) => task.taskId);
+      return [{ channel: 'background_tasks', payload: { tasks } }];
+    }
+
     if (type === 'system' && sdkMessage.subtype === 'task_notification') {
       const taskId = String(sdkMessage.task_id || '').trim() || 'unknown';
       const status = String(sdkMessage.status || '').trim() || 'unknown';
-      return [{
-        channel: 'activity',
-        payload: {
-          text: truncate(`Background task ${taskId} ${status}: ${String(sdkMessage.summary || '').trim()}`),
-          subagentRunId: null,
+      return [
+        // Settling is the edge the runner pairs with the level signal above: a
+        // settled session-level task means a continuation turn is about to be
+        // dequeued, so the gate must stay held even though the set is empty.
+        { channel: 'background_task_settled', payload: { taskId, status } },
+        {
+          channel: 'activity',
+          payload: {
+            text: truncate(`Background task ${taskId} ${status}: ${String(sdkMessage.summary || '').trim()}`),
+            subagentRunId: null,
+          },
         },
-      }];
+      ];
     }
 
     if (type === 'result') {

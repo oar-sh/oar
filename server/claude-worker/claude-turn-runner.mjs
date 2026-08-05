@@ -50,6 +50,12 @@ export function createClaudeTurnRunner({
   startClaudeTurnImpl = startClaudeTurn,
   readContextUsageImpl = readContextUsage,
   relocateTranscriptImpl = relocateClaudeTranscriptForCwd,
+  // Ceiling on how long a turn's input gate may stay held for background work.
+  backgroundLingerCapMs = 30 * 60_000,
+  // With no gating tasks left, how much stream silence means no continuation
+  // turn is coming (the CLI dequeues a settled task's notification within ~1s).
+  backgroundIdleReleaseMs = 60_000,
+  backgroundLingerPollMs = 5_000,
   dbg = () => {},
 } = {}) {
   let activeMessage = null;
@@ -145,6 +151,10 @@ export function createClaudeTurnRunner({
     if (channel === 'result') {
       state.result = payload;
       state.modelUsage = payload.modelUsage || null;
+      // One relay turn can carry several results when background tasks
+      // auto-continue the session; every segment belongs in the reply.
+      const text = String(payload.text || '').trim();
+      if (text) state.resultTexts.push(text);
     }
   }
 
@@ -195,6 +205,7 @@ export function createClaudeTurnRunner({
     const normalizer = createSdkMessageNormalizer();
     const state = {
       result: null,
+      resultTexts: [],
       lastStreamedText: '',
       responseModel: '',
       contextUsage: null,
@@ -202,6 +213,44 @@ export function createClaudeTurnRunner({
     };
     let aborted = false;
     let planBoardPosted = false;
+
+    // Background-task bookkeeping for the input-gate hold. Releasing the gate
+    // ends the CLI's stdin — the control transport that carries canUseTool
+    // permission decisions — so it must stay held while background agents (and
+    // the continuation turns their task notifications trigger) still need it.
+    // Otherwise every mutating tool call after the first result fails with
+    // "Tool permission request failed: AbortError: Stream closed".
+    const linger = {
+      live: new Map(), // taskId -> taskType, REPLACEd on each background_tasks action
+      known: new Set(), // every session-level task id ever seen in the live set
+      // A session-level task settled; its notification is queued and the CLI
+      // is about to dequeue a continuation turn — hold the gate for it even
+      // though the live set may already be empty. Cleared when the
+      // continuation's own init arrives (the notification got delivered).
+      notificationPending: false,
+      startedAt: 0,
+      lastMessageAt: Date.now(),
+      timer: null,
+      finalized: false,
+    };
+    // Backgrounded bash never gates: a dev server may run forever and its
+    // death is tied to this CLI process either way. Its *settling* still sets
+    // notificationPending above, so finite bash tasks get their continuation.
+    const hasGatingTasks = () => [...linger.live.values()].some((type) => type !== 'local_bash');
+    const shouldHoldGate = () => hasGatingTasks() || linger.notificationPending;
+
+    function observeLinger(action) {
+      if (action.channel === 'background_tasks') {
+        linger.live = new Map(action.payload.tasks.map((task) => [task.taskId, task.taskType]));
+        for (const task of action.payload.tasks) linger.known.add(task.taskId);
+        return;
+      }
+      if (action.channel === 'background_task_settled') {
+        if (linger.known.has(action.payload.taskId)) linger.notificationPending = true;
+        return;
+      }
+      if (action.channel === 'init') linger.notificationPending = false;
+    }
 
     const askUserBridge = createAskUserBridge({
       api,
@@ -263,6 +312,39 @@ export function createClaudeTurnRunner({
     });
 
     let turn = null;
+    // The context breakdown has to be read here, while the input gate is
+    // still holding the CLI alive: once the gate releases and the result
+    // is consumed, the control transport is gone.
+    async function finalizeTurn(reason) {
+      if (linger.finalized) return;
+      linger.finalized = true;
+      if (linger.timer) {
+        clearInterval(linger.timer);
+        linger.timer = null;
+      }
+      if (reason !== 'result') dbg('releasing held input gate', reason, message.id);
+      state.contextUsage = await readContextUsageImpl(turn, dbg);
+      turn?.endInput?.();
+    }
+
+    // Runs only while the gate is held past a result. The idle release covers
+    // a settled task whose continuation never materializes; the cap covers a
+    // background agent that never finishes. Both end the turn the same way a
+    // normal result would — the CLI exits once its stdin closes.
+    function startLingerMonitor() {
+      if (!linger.startedAt) linger.startedAt = Date.now();
+      if (linger.timer) return;
+      linger.timer = setInterval(() => {
+        if (linger.finalized) return;
+        const now = Date.now();
+        const capped = now - linger.startedAt >= backgroundLingerCapMs;
+        const idle = !hasGatingTasks() && now - linger.lastMessageAt >= backgroundIdleReleaseMs;
+        if (!capped && !idle) return;
+        finalizeTurn(capped ? 'linger-cap' : 'idle-release').catch(() => {});
+      }, backgroundLingerPollMs);
+      linger.timer.unref?.();
+    }
+
     try {
       turn = startClaudeTurnImpl({
         content,
@@ -277,16 +359,27 @@ export function createClaudeTurnRunner({
         dbg,
       });
       for await (const sdkMessage of turn) {
+        linger.lastMessageAt = Date.now();
         const actions = normalizer.normalize(sdkMessage);
         for (const action of actions) {
+          observeLinger(action);
           await dispatchAction(message, action, state);
         }
-        // The context breakdown has to be read here, while the input gate is
-        // still holding the CLI alive: once the gate releases and the result
-        // is consumed, the control transport is gone.
-        if (actions.some((action) => action.channel === 'result')) {
-          state.contextUsage = await readContextUsageImpl(turn, dbg);
-          turn.endInput?.();
+        if (actions.some((action) => action.channel === 'result') && !linger.finalized) {
+          if (shouldHoldGate()) {
+            // Background work outlives this result; the CLI will run the
+            // settled tasks' notifications as further turns, each ending in
+            // its own result. Release only when nothing is left to continue.
+            dbg(
+              'holding input gate past result',
+              message.id,
+              `liveTasks=${linger.live.size}`,
+              `notificationPending=${linger.notificationPending}`,
+            );
+            startLingerMonitor();
+          } else {
+            await finalizeTurn('result');
+          }
         }
       }
     } catch (error) {
@@ -299,6 +392,11 @@ export function createClaudeTurnRunner({
     } finally {
       // Release the input gate on every exit path (abort, error, no result) —
       // a still-gated stream would keep the CLI process alive forever.
+      linger.finalized = true;
+      if (linger.timer) {
+        clearInterval(linger.timer);
+        linger.timer = null;
+      }
       turn?.endInput?.();
       controlPoller?.stop?.(controlState);
       // Runs on every exit path so a snapshot captured before the turn went
@@ -344,7 +442,11 @@ export function createClaudeTurnRunner({
       return true;
     }
 
-    const finalText = String(result.text || state.lastStreamedText || '').trim();
+    // A turn that lingered for background work carries one text segment per
+    // result; all of them are the answer, not just the last continuation's.
+    const finalText = String(
+      state.resultTexts.join('\n\n') || result.text || state.lastStreamedText || '',
+    ).trim();
     if (
       !planBoardPosted
       && String(message.relayMode || '').trim().toLowerCase() === 'plan'

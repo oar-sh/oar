@@ -35,6 +35,37 @@ function resultMessage(text, sessionId) {
   return { type: 'result', subtype: 'success', is_error: false, result: text, session_id: sessionId };
 }
 
+function backgroundTasksMessage(tasks) {
+  return { type: 'system', subtype: 'background_tasks_changed', tasks };
+}
+
+function taskNotificationMessage(taskId, status = 'completed') {
+  return { type: 'system', subtype: 'task_notification', task_id: taskId, status, summary: 'settled' };
+}
+
+// Mirrors the real CLI's lifetime: the message stream only ends after the
+// input gate is released (endInput), never on its own. `onYield` observes the
+// runner's state at the moment each message is handed over.
+function gatedFakeTurn(messages, { onYield } = {}) {
+  let release = () => {};
+  const gate = new Promise((resolve) => { release = resolve; });
+  const turn = {
+    endInputCalls: 0,
+    async* [Symbol.asyncIterator]() {
+      for (const message of messages) {
+        onYield?.(message, turn);
+        yield message;
+      }
+      await gate;
+    },
+  };
+  turn.endInput = () => {
+    turn.endInputCalls += 1;
+    release();
+  };
+  return turn;
+}
+
 const baseMessage = {
   id: 'q-1',
   conversationId: 'conv-1',
@@ -392,6 +423,151 @@ test('a failing context publish does not disturb the response', async () => {
   assert.equal(handled, true);
   const response = stub.calls.find((call) => call.routePath === '/api/response');
   assert.equal(response.body.text, 'done');
+});
+
+test('a live background agent holds the input gate across its continuation turn', async () => {
+  const stub = makeApiStub();
+  const contextReads = [];
+  let releasesAtNotification = -1;
+  const turn = gatedFakeTurn([
+    initMessage('native-1'),
+    backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'impl' }]),
+    resultMessage('dispatched', 'native-1'),
+    backgroundTasksMessage([]),
+    taskNotificationMessage('agent-1'),
+    initMessage('native-1'), // the CLI dequeues the notification as a new turn
+    resultMessage('followed up', 'native-1'),
+  ], {
+    onYield: (message, self) => {
+      // The gate must still be held when the settled notification arrives —
+      // a released gate is the "Stream closed" permission staleness bug.
+      if (message.subtype === 'task_notification') releasesAtNotification = self.endInputCalls;
+    },
+  });
+  turn.getContextUsage = async () => {
+    contextReads.push('read');
+    return { totalTokens: 1, maxTokens: 100, percentage: 1, categories: [] };
+  };
+
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => turn,
+  });
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+
+  assert.equal(handled, true);
+  assert.equal(releasesAtNotification, 0, 'gate must stay held while the agent runs');
+  assert.equal(contextReads.length, 1, 'context is read once, at the real end of the turn');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'dispatched\n\nfollowed up', 'every result segment is the answer');
+});
+
+test('backgrounded bash alone does not hold the gate', async () => {
+  const stub = makeApiStub();
+  const turn = gatedFakeTurn([
+    initMessage('native-1'),
+    // A dev server: never settles, must not wedge the turn.
+    backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'npm run dev' }]),
+    resultMessage('server started', 'native-1'),
+  ]);
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => turn,
+  });
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  assert.ok(turn.endInputCalls >= 1, 'result must release the gate immediately');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'server started');
+});
+
+test('a task that settles before the result still holds the gate for its continuation', async () => {
+  const stub = makeApiStub();
+  let initsSeen = 0;
+  let releasesAtContinuationInit = -1;
+  const turn = gatedFakeTurn([
+    initMessage('native-1'),
+    backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'quick job' }]),
+    backgroundTasksMessage([]),
+    taskNotificationMessage('agent-1'),
+    // The fast-completion race: the live set is already empty when the main
+    // turn's result arrives, but the notification's continuation is queued.
+    resultMessage('dispatched', 'native-1'),
+    initMessage('native-1'),
+    resultMessage('followed up', 'native-1'),
+  ], {
+    onYield: (message, self) => {
+      if (message.subtype !== 'init') return;
+      initsSeen += 1;
+      if (initsSeen === 2) releasesAtContinuationInit = self.endInputCalls;
+    },
+  });
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => turn,
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(releasesAtContinuationInit, 0, 'gate must still be held when the continuation starts');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'dispatched\n\nfollowed up');
+});
+
+test('a held gate is released after stream silence when no continuation comes', async () => {
+  const stub = makeApiStub();
+  const turn = gatedFakeTurn([
+    initMessage('native-1'),
+    backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]),
+    backgroundTasksMessage([]),
+    taskNotificationMessage('agent-1'),
+    resultMessage('dispatched', 'native-1'),
+    // Stream then hangs: the promised continuation never materializes.
+  ]);
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => turn,
+    backgroundIdleReleaseMs: 30,
+    backgroundLingerPollMs: 10,
+  });
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true, 'idle backstop must end the turn');
+  assert.ok(turn.endInputCalls >= 1);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'dispatched');
+});
+
+test('the linger cap releases the gate even while an agent is still live', async () => {
+  const stub = makeApiStub();
+  const turn = gatedFakeTurn([
+    initMessage('native-1'),
+    backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'wedged job' }]),
+    resultMessage('dispatched', 'native-1'),
+    // Stream hangs with the agent forever "running".
+  ]);
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => turn,
+    backgroundLingerCapMs: 40,
+    backgroundLingerPollMs: 10,
+  });
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true, 'linger cap must end the turn');
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'dispatched');
 });
 
 test('the input gate is released on success and on error paths', async () => {
