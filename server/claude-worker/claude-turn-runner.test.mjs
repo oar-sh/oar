@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 
 import { createClaudeTurnRunner, buildClaudePlanReadyBoardPayload } from './claude-turn-runner.mjs';
 
+// Keeps the turn tests off the real `~/.claude/projects`; transcript
+// relocation has its own suite in claude-transcript-relocator.test.mjs.
+const noopRelocate = () => ({ status: 'skipped' });
+
 function makeApiStub({ failRoutes = new Set() } = {}) {
   const calls = [];
   return {
@@ -47,6 +51,7 @@ test('first turn persists the native session id and later turns resume it', asyn
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: (params) => {
       capturedTurns.push(params);
       return fakeTurn([initMessage('native-1'), resultMessage('done', 'native-1')]);
@@ -74,6 +79,7 @@ test('a respawned worker resumes from the server-persisted id (kill survival)', 
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: (params) => {
       capturedTurns.push(params);
       return fakeTurn([initMessage('native-2'), resultMessage('resumed fine', 'native-2')]);
@@ -87,6 +93,53 @@ test('a respawned worker resumes from the server-persisted id (kill survival)', 
   assert.equal(persist.body.claudeNativeSessionId, 'native-2');
 });
 
+test('a resuming turn relocates the transcript into the current CWD first', async () => {
+  const stub = makeApiStub();
+  const relocations = [];
+  const order = [];
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    // A worker respawned by the CWD relaunch runs in the new workspace root,
+    // while the session id still points at the old root's transcript.
+    cwd: '/tmp/new-root',
+    relocateTranscriptImpl: (params) => {
+      relocations.push(params);
+      order.push('relocate');
+      return { status: 'moved' };
+    },
+    startClaudeTurnImpl: () => {
+      order.push('turn');
+      return fakeTurn([initMessage('native-1'), resultMessage('ok', 'native-1')]);
+    },
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, claudeNativeSessionId: 'native-1' } });
+
+  assert.deepEqual(order, ['relocate', 'turn']);
+  assert.equal(relocations[0].nativeSessionId, 'native-1');
+  assert.equal(relocations[0].cwd, '/tmp/new-root');
+});
+
+test('a first turn has no transcript to relocate', async () => {
+  const stub = makeApiStub();
+  const relocations = [];
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: (params) => {
+      relocations.push(params);
+      return { status: 'skipped' };
+    },
+    startClaudeTurnImpl: () => fakeTurn([initMessage('native-1'), resultMessage('ok', 'native-1')]),
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, claudeNativeSessionId: null } });
+
+  assert.deepEqual(relocations, []);
+});
+
 test('failed persist is retried on the next turn instead of being cached', async () => {
   const failRoutes = new Set(['/api/claude-native-session']);
   const stub = makeApiStub({ failRoutes });
@@ -94,6 +147,7 @@ test('failed persist is retried on the next turn instead of being cached', async
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => fakeTurn([initMessage('native-1'), resultMessage('ok', 'native-1')]),
   });
   await runner.handlePendingPayload({ message: { ...baseMessage, claudeNativeSessionId: null } });
@@ -112,6 +166,7 @@ test('per-turn model and effort reach the SDK turn', async () => {
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: (params) => {
       capturedTurns.push(params);
       return fakeTurn([initMessage('native-1'), resultMessage('ok', 'native-1')]);
@@ -135,6 +190,7 @@ test('sdk failure publishes a terminal response instead of hanging the queue', a
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => {
       throw new Error('spawn failed');
     },
@@ -153,6 +209,7 @@ test('subagent stream text never stands in for the answer', async () => {
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => fakeTurn([
       initMessage('native-1'),
       // Main thread narrates, then a subagent streams after it. The stream
@@ -187,6 +244,7 @@ test('thoughts from the sdk stream reach the relay thought channel', async () =>
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => fakeTurn([
       initMessage('native-1'),
       {
@@ -228,6 +286,7 @@ test('ExitPlanMode board falls back to the plan file when input.plan is empty', 
     api: stub.api,
     sdkSessionId: 'conv-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: (params) => {
       capturedCanUseTool = params.canUseTool;
       return fakeTurn([initMessage('native-1'), resultMessage('Plan is ready for review.', 'native-1')]);
@@ -278,6 +337,7 @@ test('context usage is read while the query is still open and then published', a
     api: stub.api,
     sdkSessionId: 'sess-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => contextAwareTurn([initMessage('native-1'), resultMessage('done', 'native-1')]),
   });
 
@@ -297,6 +357,7 @@ test('a runtime without the context control request still completes the turn', a
     api: stub.api,
     sdkSessionId: 'sess-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => fakeTurn([initMessage('native-1'), resultMessage('done', 'native-1')]),
   });
 
@@ -315,6 +376,7 @@ test('a failing context publish does not disturb the response', async () => {
     api: stub.api,
     sdkSessionId: 'sess-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => ({
       async getContextUsage() {
         return { totalTokens: 10, maxTokens: 100, percentage: 10, categories: [] };
@@ -347,6 +409,7 @@ test('the input gate is released on success and on error paths', async () => {
     api: stub.api,
     sdkSessionId: 'sess-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => successTurn,
   });
   await runner.handlePendingPayload({ message: { ...baseMessage } });
@@ -362,6 +425,7 @@ test('the input gate is released on success and on error paths', async () => {
     api: stub.api,
     sdkSessionId: 'sess-1',
     cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
     startClaudeTurnImpl: () => errorTurn,
   });
   await errorRunner.handlePendingPayload({ message: { ...baseMessage } });

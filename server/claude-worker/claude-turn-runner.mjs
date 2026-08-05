@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { buildClaudeUserContent } from './claude-attachments.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
 import { startClaudeTurn, createCanUseTool, readContextUsage } from './claude-sdk-adapter.mjs';
+import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 
@@ -48,6 +49,7 @@ export function createClaudeTurnRunner({
   pathToClaudeCodeExecutable = '',
   startClaudeTurnImpl = startClaudeTurn,
   readContextUsageImpl = readContextUsage,
+  relocateTranscriptImpl = relocateClaudeTranscriptForCwd,
   dbg = () => {},
 } = {}) {
   let activeMessage = null;
@@ -237,6 +239,10 @@ export function createClaudeTurnRunner({
     });
 
     const resume = String(message.claudeNativeSessionId || claudeNativeSessionId || '').trim();
+    // The CLI resolves `resume` inside the project directory for *this* CWD, so
+    // a session whose workspace root changed has to bring its transcript along
+    // or every turn from here on fails with "No conversation found".
+    if (resume) relocateTranscriptImpl({ nativeSessionId: resume, cwd, dbg });
     // Per-message model wins so the composer can switch Claude models between
     // turns; the conversation's provider model and worker default are fallbacks.
     const requestedModel = String(message.model || '').trim();
