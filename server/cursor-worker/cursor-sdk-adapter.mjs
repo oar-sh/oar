@@ -318,6 +318,18 @@ function modelEntryId(entry) {
     : String(entry?.id || entry?.name || entry?.model?.id || '');
 }
 
+/** Parse a Cursor `context` parameter value: '300k' → 300000, '1m' → 1000000. */
+export function parseContextWindowValue(value) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw) return null;
+  const match = raw.match(/^(\d+(?:\.\d+)?)([km])?$/);
+  if (!match) return null;
+  const base = Number(match[1]);
+  if (!Number.isFinite(base) || base <= 0) return null;
+  const scale = match[2] === 'm' ? 1_000_000 : (match[2] === 'k' ? 1_000 : 1);
+  return Math.round(base * scale);
+}
+
 function pickContextWindow(entry) {
   const value = Number(
     entry?.contextWindow
@@ -325,7 +337,31 @@ function pickContextWindow(entry) {
       ?? entry?.contextLength
       ?? entry?.maxContextTokens,
   );
-  return Number.isFinite(value) && value > 0 ? value : null;
+  if (Number.isFinite(value) && value > 0) return value;
+
+  // Current SDK builds expose no window field; the window is encoded in the
+  // model's 'context' parameter values ('300k', '1m'). The default variant's
+  // choice is what an unmodified send runs with; models without a flagged
+  // default fall back to the largest advertised context.
+  const parameters = Array.isArray(entry?.parameters) ? entry.parameters : [];
+  const contextParam = parameters.find(
+    (param) => String(param?.id || '').trim().toLowerCase() === 'context',
+  );
+  if (!contextParam) return null;
+
+  const variants = Array.isArray(entry?.variants) ? entry.variants : [];
+  const defaultVariant = variants.find((variant) => variant?.isDefault === true);
+  const defaultContext = (Array.isArray(defaultVariant?.params) ? defaultVariant.params : [])
+    .find((param) => String(param?.id || '').trim().toLowerCase() === 'context');
+  const fromDefault = parseContextWindowValue(defaultContext?.value);
+  if (fromDefault !== null) return fromDefault;
+
+  const candidates = (Array.isArray(contextParam.values) ? contextParam.values : [])
+    .map((entryValue) => parseContextWindowValue(
+      entryValue && typeof entryValue === 'object' ? entryValue.value : entryValue,
+    ))
+    .filter((parsed) => parsed !== null);
+  return candidates.length ? Math.max(...candidates) : null;
 }
 
 /**

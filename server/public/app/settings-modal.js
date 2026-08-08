@@ -9,6 +9,8 @@ import {
   loadCursorSettings,
   loadCursorAllowanceSettings,
   updateCursorAllowanceSettings,
+  loadCursorDashboardTokenSettings,
+  updateCursorDashboardTokenSettings,
   loadGrokAllowanceSettings,
   updateGrokAllowanceSettings,
   loadGrokSettings,
@@ -674,6 +676,93 @@ export async function resetCursorAllowanceAccounting() {
   await saveCursorAllowanceSettings({ resetAccounting: true });
 }
 
+// ── Cursor dashboard session token ──
+// Unlocks the live plan-quota bars on the Check Usage card. Only a
+// configured/not-configured flag ever comes back from the server.
+let cursorDashboardTokenUpdateInFlight = false;
+
+function setCursorDashboardTokenControlsDisabled(disabled) {
+  for (const id of [
+    'cursor-dashboard-token-input',
+    'cursor-dashboard-token-save-btn',
+    'cursor-dashboard-token-remove-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyCursorDashboardTokenState(settings = {}) {
+  const status = document.getElementById('cursor-dashboard-token-status');
+  const input = document.getElementById('cursor-dashboard-token-input');
+  const configured = settings?.configured === true;
+  const source = String(settings?.source || '');
+  if (input) input.value = '';
+  if (input) input.placeholder = source === 'manual' ? 'Token saved — paste a new one to replace it' : 'WorkosCursorSessionToken cookie value';
+  if (status) {
+    status.textContent = source === 'ide'
+      ? "Using this machine's Cursor IDE login automatically — nothing to configure. Paste a token only to override it."
+      : (configured
+        ? 'Dashboard token saved. The usage card shows live plan bars while it stays valid.'
+        : 'No Cursor IDE login found on the relay host and no token pasted — the usage card shows local spend estimates only.');
+    status.dataset.state = configured ? 'active' : 'unconfigured';
+  }
+  setCursorDashboardTokenControlsDisabled(cursorDashboardTokenUpdateInFlight);
+  return settings;
+}
+
+export async function refreshCursorDashboardTokenState() {
+  try {
+    const settings = await loadCursorDashboardTokenSettings();
+    if (!settings) return null;
+    return applyCursorDashboardTokenState(settings);
+  } catch {
+    const status = document.getElementById('cursor-dashboard-token-status');
+    if (status) {
+      status.textContent = 'Unable to load the Cursor dashboard token state.';
+      status.dataset.state = 'error';
+    }
+    return null;
+  }
+}
+
+export async function saveCursorDashboardToken() {
+  if (cursorDashboardTokenUpdateInFlight) return;
+  const input = document.getElementById('cursor-dashboard-token-input');
+  const sessionToken = String(input?.value || '').trim();
+  if (!sessionToken) {
+    alert('Paste the WorkosCursorSessionToken cookie value first.');
+    return;
+  }
+  cursorDashboardTokenUpdateInFlight = true;
+  setCursorDashboardTokenControlsDisabled(true);
+  try {
+    const result = await updateCursorDashboardTokenSettings({ sessionToken });
+    cursorDashboardTokenUpdateInFlight = false;
+    applyCursorDashboardTokenState(result);
+  } catch (error) {
+    cursorDashboardTokenUpdateInFlight = false;
+    setCursorDashboardTokenControlsDisabled(false);
+    alert(error?.message || 'Failed to save the Cursor dashboard token.');
+  }
+}
+
+export async function removeCursorDashboardToken() {
+  if (cursorDashboardTokenUpdateInFlight) return;
+  if (!confirm('Remove the stored Cursor dashboard token?')) return;
+  cursorDashboardTokenUpdateInFlight = true;
+  setCursorDashboardTokenControlsDisabled(true);
+  try {
+    const result = await updateCursorDashboardTokenSettings({ remove: true });
+    cursorDashboardTokenUpdateInFlight = false;
+    applyCursorDashboardTokenState(result);
+  } catch (error) {
+    cursorDashboardTokenUpdateInFlight = false;
+    setCursorDashboardTokenControlsDisabled(false);
+    alert(error?.message || 'Failed to remove the Cursor dashboard token.');
+  }
+}
+
 // ── Grok manual plan allowance ──
 // Grok ACP reports per-turn cost/tokens but no remaining plan credits.
 let grokAllowanceUpdateInFlight = false;
@@ -1153,6 +1242,7 @@ export function openSettingsModal() {
   ensureCursorSettingsInputTracking();
   void syncCursorSettingsInputs();
   void refreshCursorAllowanceState();
+  void refreshCursorDashboardTokenState();
   void refreshGrokAllowanceState();
   syncWindowsAutostartSetting();
   void refreshWindowsAutostartSetting();

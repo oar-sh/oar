@@ -1827,6 +1827,11 @@ export function registerSessionsRoutes(app, deps) {
     // tests and when the host CLI is not logged in, in which case the Grok
     // card degrades to the local estimated view.
     fetchGrokBillingUsage = null,
+    // Optional live Cursor plan quota (dashboard session token); same
+    // degradation contract as the Grok fetcher.
+    fetchCursorDashboardUsage = null,
+    getCursorDashboardTokenSettings = () => ({ configured: false }),
+    setCursorDashboardTokenSettings = () => ({ ok: false, error: 'Cursor dashboard token settings are unavailable' }),
     planUsageService = null,
     getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
     setCursorPlanAllowanceSettings = () => ({ ok: false, error: 'Cursor allowance settings are unavailable' }),
@@ -5138,6 +5143,15 @@ export function registerSessionsRoutes(app, deps) {
         grokBilling = null;
       }
     }
+    // Live Cursor plan quota (dashboard session token) — same best-effort rule.
+    let cursorBilling = null;
+    if (cursorSettings?.enabled === true && typeof fetchCursorDashboardUsage === 'function') {
+      try {
+        cursorBilling = await fetchCursorDashboardUsage();
+      } catch {
+        cursorBilling = null;
+      }
+    }
     const report = planUsageService.buildReport({
       copilotSummary: summary,
       copilotError: summaryError,
@@ -5145,6 +5159,7 @@ export function registerSessionsRoutes(app, deps) {
       claudeConfigured: claudeSettings?.enabled === true,
       cursorConfigured: cursorSettings?.enabled === true,
       cursorAllowances: getCursorPlanAllowanceSettings(),
+      cursorBilling,
       grokConfigured: grokSettings?.enabled === true,
       grokAllowances: getGrokPlanAllowanceSettings(),
       grokBilling,
@@ -5169,6 +5184,25 @@ export function registerSessionsRoutes(app, deps) {
     });
     if (!result?.ok) {
       return res.status(400).json({ error: result?.error || 'Failed to update Cursor allowances' });
+    }
+    return res.json(result);
+  });
+
+  // The Cursor dashboard session token unlocks the live plan-quota bars on
+  // the Check Usage card. GET only reports whether one is configured — the
+  // token itself is never echoed back.
+  app.get('/api/settings/cursor-dashboard-token', auth, (_req, res) => {
+    res.json({ ok: true, ...getCursorDashboardTokenSettings() });
+  });
+
+  app.post('/api/settings/cursor-dashboard-token', auth, (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = setCursorDashboardTokenSettings({
+      sessionToken: body.sessionToken,
+      remove: body.remove === true,
+    });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update the Cursor dashboard token' });
     }
     return res.json(result);
   });

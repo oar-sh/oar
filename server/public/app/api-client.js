@@ -427,6 +427,17 @@ export async function updateCursorAllowanceSettings(payload = {}) {
   });
 }
 
+export async function loadCursorDashboardTokenSettings() {
+  return apiFetch('/api/settings/cursor-dashboard-token');
+}
+
+export async function updateCursorDashboardTokenSettings(payload = {}) {
+  return apiFetch('/api/settings/cursor-dashboard-token', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function loadGrokAllowanceSettings() {
   return apiFetch('/api/settings/grok-allowance');
 }

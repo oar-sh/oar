@@ -24,6 +24,7 @@
  */
 
 import {
+  SOURCE_LIVE,
   SOURCE_MANUAL,
   STATUS_NOT_CONFIGURED,
   STATUS_OK,
@@ -280,6 +281,9 @@ export function buildCursorPlanCard({
   capturedAt = null,
   configured = true,
   message = null,
+  // normalizeCursorDashboardUsage() — live plan quota from cursor.com's
+  // dashboard API (requires the user-provided session token).
+  dashboard = null,
 } = {}) {
   if (!configured) {
     return buildUnavailableCard({
@@ -302,6 +306,46 @@ export function buildCursorPlanCard({
   };
 
   const meters = [];
+  const hasLiveQuota = toFiniteNumber(dashboard?.totalPercentUsed) !== null
+    || toFiniteNumber(dashboard?.apiPercentUsed) !== null
+    || toFiniteNumber(dashboard?.autoPercentUsed) !== null;
+  if (hasLiveQuota) {
+    const resetAt = dashboard.billingCycleEnd || null;
+    if (toFiniteNumber(dashboard.totalPercentUsed) !== null) {
+      meters.push(buildMeter({
+        id: 'cursor-plan-total',
+        label: 'Plan usage (total)',
+        unit: 'percent',
+        utilization: dashboard.totalPercentUsed,
+        resetAt,
+        estimated: false,
+        emphasis: 'primary',
+        note: 'Live from the Cursor dashboard.',
+      }));
+    }
+    if (toFiniteNumber(dashboard.autoPercentUsed) !== null) {
+      meters.push(buildMeter({
+        id: 'cursor-plan-auto',
+        label: 'Auto + Composer',
+        unit: 'percent',
+        utilization: dashboard.autoPercentUsed,
+        resetAt,
+        estimated: false,
+        emphasis: 'secondary',
+      }));
+    }
+    if (toFiniteNumber(dashboard.apiPercentUsed) !== null) {
+      meters.push(buildMeter({
+        id: 'cursor-plan-api',
+        label: 'API',
+        unit: 'percent',
+        utilization: dashboard.apiPercentUsed,
+        resetAt,
+        estimated: false,
+        emphasis: 'secondary',
+      }));
+    }
+  }
   let unclassifiedSpend = 0;
   for (const pool of CURSOR_POOLS) {
     const entry = poolTotals(resolvedTotals, pool);
@@ -321,6 +365,9 @@ export function buildCursorPlanCard({
       }));
       continue;
     }
+    // Local pool estimates step back to secondary once the dashboard supplies
+    // the authoritative plan percentages.
+    if (hasLiveQuota && entry.rawCostUsd <= 0 && allowance === null) continue;
     meters.push(buildMeter({
       id: `cursor-${pool}`,
       label: POOL_LABELS[pool],
@@ -329,7 +376,8 @@ export function buildCursorPlanCard({
       allowance,
       resetAt: resolvedCycle.endsAt,
       estimated: true,
-      note: allowance === null
+      emphasis: hasLiveQuota ? 'secondary' : 'primary',
+      note: allowance === null && !hasLiveQuota
         ? 'Set this pool’s monthly allowance in Settings to track what is left.'
         : null,
     }));
@@ -404,18 +452,57 @@ export function buildCursorPlanCard({
   });
   if (totalsSection) details.push(totalsSection);
 
+  if (hasLiveQuota) {
+    const planRows = [];
+    const includedSpend = toFiniteNumber(dashboard.includedSpendCents);
+    const limit = toFiniteNumber(dashboard.limitCents);
+    if (includedSpend !== null) {
+      planRows.push({
+        label: 'Included spend',
+        value: formatUsd(includedSpend / 100) ?? '$0.00',
+        hint: limit !== null ? `of ${formatUsd(limit / 100)} included` : null,
+      });
+    }
+    const onDemandUsed = toFiniteNumber(dashboard.onDemand?.usedCents);
+    if (onDemandUsed !== null) {
+      const onDemandLimit = toFiniteNumber(dashboard.onDemand?.limitCents);
+      planRows.push({
+        label: 'On-demand spend',
+        value: formatUsd(onDemandUsed / 100) ?? '$0.00',
+        hint: onDemandLimit !== null ? `cap ${formatUsd(onDemandLimit / 100)}` : null,
+      });
+    }
+    if (dashboard.displayMessage) {
+      planRows.push({ label: 'Cursor says', value: dashboard.displayMessage });
+    }
+    const planSection = buildDetailSection({
+      id: 'cursor-plan',
+      label: 'Plan (live)',
+      rows: planRows,
+    });
+    if (planSection) details.push(planSection);
+  }
+
+  const cycleStartsAt = (hasLiveQuota && dashboard.billingCycleStart) || resolvedCycle.startsAt;
+  const cycleEndsAt = (hasLiveQuota && dashboard.billingCycleEnd) || resolvedCycle.endsAt;
   const cycleSection = buildDetailSection({
     id: 'cursor-cycle',
     label: 'Billing cycle',
     rows: [
-      { label: 'Cycle started', value: resolvedCycle.startsAt.slice(0, 10) },
-      { label: 'Resets', value: resolvedCycle.endsAt.slice(0, 10), hint: `Day ${resolvedCycle.resetDay} of each month` },
+      { label: 'Cycle started', value: cycleStartsAt.slice(0, 10) },
+      {
+        label: 'Resets',
+        value: cycleEndsAt.slice(0, 10),
+        hint: hasLiveQuota && dashboard.billingCycleEnd
+          ? 'From the Cursor dashboard'
+          : `Day ${resolvedCycle.resetDay} of each month`,
+      },
     ],
   });
   if (cycleSection) details.push(cycleSection);
 
   const notes = [];
-  if (settings.cursorModelsUsd === null && settings.otherModelsUsd === null) {
+  if (!hasLiveQuota && settings.cursorModelsUsd === null && settings.otherModelsUsd === null) {
     notes.push('No monthly allowance configured — showing spend only.');
   }
   if (unclassifiedSpend > 0) {
@@ -423,14 +510,20 @@ export function buildCursorPlanCard({
   }
   const explicitMessage = toTrimmedString(message);
 
+  const planName = hasLiveQuota
+    ? (dashboard.membershipType
+      ? `Cursor ${dashboard.membershipType}`
+      : 'Cursor plan')
+    // Everything else on this card is locally reconstructed, so the plan name
+    // says so rather than implying Cursor reported a tier.
+    : 'Manual allowance';
+
   return buildProviderCard({
     provider: CURSOR_PROVIDER_ID,
     label: CURSOR_LABEL,
     status: meters.filter(Boolean).length ? STATUS_OK : STATUS_PARTIAL,
-    // Everything on this card is locally reconstructed, so the plan name says
-    // so rather than implying Cursor reported a tier.
-    planName: 'Manual allowance',
-    source: SOURCE_MANUAL,
+    planName,
+    source: hasLiveQuota ? SOURCE_LIVE : SOURCE_MANUAL,
     capturedAt,
     message: [explicitMessage, ...notes].filter(Boolean).join(' ') || null,
     meters: meters.filter(Boolean),

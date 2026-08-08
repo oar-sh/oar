@@ -385,6 +385,39 @@ test('readModelContextWindow normalizes response shapes and field names', async 
   assert.equal(fromMax, 64000);
 });
 
+test('readModelContextWindow derives the window from the context parameter', async () => {
+  // Current SDK builds ship no window field; the window is encoded in the
+  // 'context' parameter values ('300k' / '1m'), with the default variant
+  // deciding what an unmodified send runs with.
+  const entry = {
+    id: 'param-model',
+    parameters: [
+      { id: 'thinking', values: [{ value: 'false' }, { value: 'true' }] },
+      { id: 'context', values: [{ value: '300k', displayName: '300K' }, { value: '1m', displayName: '1M' }] },
+    ],
+    variants: [
+      { params: [{ id: 'context', value: '300k' }], displayName: 'Param Model' },
+      { params: [{ id: 'context', value: '1m' }], displayName: 'Param Model', isDefault: true },
+    ],
+  };
+  assert.equal(await readModelContextWindow({
+    apiKey: 'cursor-test-key',
+    model: 'param-model',
+    modelsListImpl: async () => [entry],
+  }), 1_000_000);
+
+  // No flagged default: fall back to the largest advertised context.
+  assert.equal(await readModelContextWindow({
+    apiKey: 'cursor-test-key',
+    model: 'param-model-nodefault',
+    modelsListImpl: async () => [{
+      id: 'param-model-nodefault',
+      parameters: [{ id: 'context', values: [{ value: '128k' }, { value: '300k' }] }],
+      variants: [],
+    }],
+  }), 300_000);
+});
+
 test('readModelContextWindow caches per model', async () => {
   let calls = 0;
   const modelsListImpl = async () => {

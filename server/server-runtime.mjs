@@ -56,6 +56,7 @@ import { createPlanUsageService } from './services/plan-usage-service.mjs';
 import { normalizeCursorAllowanceSettings } from './services/plan-usage-cursor.mjs';
 import { normalizeGrokAllowanceSettings } from './services/plan-usage-grok.mjs';
 import { createGrokBillingUsageFetcher } from './services/grok-billing-usage.mjs';
+import { createCursorDashboardUsageFetcher, readCursorIdeSessionToken } from './services/cursor-dashboard-usage.mjs';
 import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
@@ -573,6 +574,37 @@ function getCursorProviderSettings() {
  * no included-pool balance or billing reset date, so these are the only source
  * for the "how much is left" side of the Cursor usage card.
  */
+// Session cookie for cursor.com's dashboard API (live plan-quota bars). The
+// API key has no plan/usage surface; the token comes from the host's Cursor
+// IDE login automatically, with a user-pasted cookie as the override for
+// headless hosts.
+function getCursorDashboardTokenSettings() {
+  if (readAppSettingValue(CURSOR_SESSION_TOKEN_SETTING_KEY) !== '') {
+    return { configured: true, source: 'manual' };
+  }
+  if (readCursorIdeSessionToken()) {
+    return { configured: true, source: 'ide' };
+  }
+  return { configured: false, source: null };
+}
+
+function setCursorDashboardTokenSettings({ sessionToken, remove = false } = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Cursor dashboard token settings are unavailable' };
+  }
+  if (remove) {
+    stmts.deleteAppSetting.run(CURSOR_SESSION_TOKEN_SETTING_KEY);
+    return { ok: true, configured: false };
+  }
+  const normalized = String(sessionToken || '').trim();
+  if (!normalized) return { ok: false, error: 'Missing sessionToken' };
+  if (/\s/.test(normalized) || normalized.length > 8192) {
+    return { ok: false, error: 'That does not look like a WorkosCursorSessionToken cookie value' };
+  }
+  stmts.upsertAppSetting.run(CURSOR_SESSION_TOKEN_SETTING_KEY, normalized, new Date().toISOString());
+  return { ok: true, configured: true };
+}
+
 function getCursorPlanAllowanceSettings() {
   const readNumeric = (key) => {
     const raw = readAppSettingValue(key);
@@ -1123,6 +1155,7 @@ const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 const DEFAULT_CLAUDE_MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];
 const CURSOR_API_KEY_SETTING_KEY = 'cursor_api_key';
+const CURSOR_SESSION_TOKEN_SETTING_KEY = 'cursor_session_token';
 const CURSOR_ENABLED_SETTING_KEY = 'cursor_enabled';
 const CURSOR_MODEL_SETTING_KEY = 'cursor_model';
 const CURSOR_MODELS_SETTING_KEY = 'cursor_models';
@@ -6895,6 +6928,11 @@ const sharedRouteDeps = {
   fetchUsageSummary,
   fetchCopilotBillingUsage,
   fetchGrokBillingUsage: createGrokBillingUsageFetcher(),
+  fetchCursorDashboardUsage: createCursorDashboardUsageFetcher({
+    getSessionToken: () => readAppSettingValue(CURSOR_SESSION_TOKEN_SETTING_KEY),
+  }),
+  getCursorDashboardTokenSettings,
+  setCursorDashboardTokenSettings,
   planUsageService,
   getCursorPlanAllowanceSettings,
   setCursorPlanAllowanceSettings,

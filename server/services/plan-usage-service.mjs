@@ -396,6 +396,7 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     claudeConfigured = true,
     cursorConfigured = true,
     cursorAllowances = null,
+    cursorBilling = null,
     grokConfigured = false,
     grokAllowances = null,
     grokBilling = null,
@@ -432,6 +433,7 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
         cycle: cursorCycle.cycle,
         capturedAt: cursorCycle.capturedAt,
         configured: cursorConfigured !== false,
+        dashboard: cursorBilling,
       }),
     ];
 

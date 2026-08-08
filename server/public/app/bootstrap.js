@@ -224,6 +224,8 @@ import {
   removeCursorSettings,
   saveCursorAllowanceSettings,
   resetCursorAllowanceAccounting,
+  saveCursorDashboardToken,
+  removeCursorDashboardToken,
   saveGrokAllowanceSettings,
   resetGrokAllowanceAccounting,
   toggleCursorProvider,
@@ -3618,6 +3620,8 @@ window.saveCursorSettings = saveCursorSettings;
 window.removeCursorSettings = removeCursorSettings;
 window.saveCursorAllowanceSettings = saveCursorAllowanceSettings;
 window.resetCursorAllowanceAccounting = resetCursorAllowanceAccounting;
+window.saveCursorDashboardToken = saveCursorDashboardToken;
+window.removeCursorDashboardToken = removeCursorDashboardToken;
 window.saveGrokAllowanceSettings = saveGrokAllowanceSettings;
 window.resetGrokAllowanceAccounting = resetGrokAllowanceAccounting;
 window.toggleCursorProvider = toggleCursorProvider;

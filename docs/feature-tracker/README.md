@@ -40,7 +40,7 @@ checklist for a new provider (details per column in the per-SDK files).
 | Reasoning effort per turn | Implemented | Implemented | Not implemented (`['none']`; SDK has no effort option) |
 | Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) |
 | Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) |
-| Context usage display | Not implemented | Implemented | Partial (token totals + model window; no fill metric) |
+| Context usage display | Not implemented | Implemented | Implemented (window parsed from the model's `context` parameter since 2026-08-09; models without one show totals only) |
 | Auth model | Relay host's CLI login | Relay host's `claude` login | API key via provider settings (secret-env-file delivery) |
 
 ## Relay core (provider-agnostic)
@@ -61,6 +61,7 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-08-09: Fixed the Cursor context gauge (SDK `models.list()` dropped the window field; it now lives in the `context` parameter values, which `readModelContextWindow` parses from the default variant) and added live Cursor plan-quota bars (Total/Auto/API % + reset date) to Check Usage via the dashboard API. The session cookie resolves automatically from the relay host's Cursor IDE login (`state.vscdb` access token, read in place — never copied; the db can be multi-GB), with a user-pasted `WorkosCursorSessionToken` as the headless-host override (new `cursor-dashboard-usage.mjs` + settings field). `agent.getUsage()` is 403 feature-gated for individual accounts, which is why the local spend ledger stayed empty.
 - 2026-08-08: Grok Check Usage now shows the live weekly SuperGrok quota bar with its reset date — fetched from the CLI chat proxy's `/v1/billing?format=credits` using the relay host's own `~/.grok/auth.json` login (`server/services/grok-billing-usage.mjs`), best-effort per request, estimated meters demoted to secondary when live data is present.
 - 2026-08-08: Grok audit fixes before first deploy: guarded the ACP client's `'error'` emit (a missing `grok` CLI could crash the relay server via `ERR_UNHANDLED_ERROR`), spawn cwd now honors the conversation workspace, model locked per conversation (409 `GROK_MODEL_REQUIRES_NEW_CONVERSATION` + composer pin), reasoning effort forwarded on prompt `_meta`, context usage gauge implemented (`/api/grok-context-usage`), plan boards + busy retry + requeue-on-empty + terminal-error field parity in the worker, discovery timeout no longer leaks agents and the CLI fallback is async, plan-usage hardening (negative-value rejection, full-precision accumulation, binding-validated route, worker source badge).
 - 2026-08-08: Grok plan usage on Check Usage — per-turn tokens/cost from ACP prompt `_meta`, optional monthly allowance meter, card hidden when Grok disabled, billing link `console.x.ai`.

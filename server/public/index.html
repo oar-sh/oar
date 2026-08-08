@@ -4566,6 +4566,20 @@
           <button id="cursor-allowance-reset-btn" type="button" class="summary-btn" onclick="resetCursorAllowanceAccounting()">Reset tracked spend</button>
         </div>
         <div class="settings-help">Reset tracked spend after changing plan or account: tracking re-baselines from each agent's current totals, so past spend is never counted twice.</div>
+        <label for="cursor-dashboard-token-input" style="margin-top: 12px;">Dashboard session token (live plan bars)</label>
+        <input
+          id="cursor-dashboard-token-input"
+          type="password"
+          autocomplete="off"
+          placeholder="WorkosCursorSessionToken cookie value"
+          aria-label="Cursor dashboard session token"
+        >
+        <div id="cursor-dashboard-token-status" class="settings-help settings-provider-status">Loading dashboard token state…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="cursor-dashboard-token-save-btn" type="button" class="summary-btn" onclick="saveCursorDashboardToken()">Save token</button>
+          <button id="cursor-dashboard-token-remove-btn" type="button" class="summary-btn" onclick="removeCursorDashboardToken()">Remove</button>
+        </div>
+        <div class="settings-help">Unlocks the live "Included in plan" percentage bars on Check Usage. Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Tokens stay on the relay.</div>
       </div>
       <div id="push-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
         <label>Push notifications</label>
