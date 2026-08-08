@@ -668,11 +668,25 @@ export async function sendMessage(body) {
   return apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
 }
 
+// Raw fetch instead of apiFetch: a rejected bootstrap (bad CWD, unavailable
+// model) must surface the server's error message so the New Chat modal can
+// show it and keep the user's selection editable.
 export async function bootstrapConversationSession(body = {}) {
-  return apiFetch('/api/conversation/bootstrap', {
+  if (!areNetworkRequestsEnabled()) return null;
+  const response = await fetch(`${BASE}/api/conversation/bootstrap`, {
     method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(),
+    },
     body: JSON.stringify(body || {}),
   });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = String(payload?.error || '').trim();
+    throw new Error(message || `Could not start a new conversation session (HTTP ${response.status}).`);
+  }
+  return payload;
 }
 
 export async function cancelConversationTurn(conversationId, body = {}) {

@@ -102,7 +102,9 @@ import {
   setImageEditTarget,
   clearImageEditTarget,
   jumpToImageParent,
+  flushDeferredMessageRender,
 } from './conversation-view.js';
+import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
 import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
@@ -2398,6 +2400,9 @@ async function pollAuthenticatedCurrentConversationLive() {
   const isProcessing = String(currentConversation?.localTurnStatus || '').trim().toLowerCase() === 'processing'
     || !!document.getElementById('thinking-indicator');
   if (!isProcessing) return;
+  // Refreshing while the user selects or drags in the chat would rebuild the
+  // DOM under the selection; the guard's release callback re-polls right away.
+  if (isChatInteractionHeld()) return;
 
   liveConversationPollInFlight = true;
   try {
@@ -2437,6 +2442,33 @@ function setupViewportTracking() {
     window.visualViewport.addEventListener('resize', update, { passive: true });
     window.visualViewport.addEventListener('scroll', update, { passive: true });
   }
+
+  // The page root must never scroll: #app is viewport-sized and body hides its
+  // scrollbar, but programmatic scrolls (scrollIntoView, focus reveals) can
+  // still shift the root and push the header off-screen with no way back.
+  const clampRootScroll = () => {
+    if (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop) {
+      window.scrollTo(0, 0);
+    }
+  };
+  clampRootScroll();
+  window.addEventListener('scroll', clampRootScroll, { passive: true });
+
+  // The relay question cards create their reply controls dynamically, so the
+  // keyboard-open bookkeeping is delegated instead of bound per input.
+  const isQuestionTextControl = (node) => node instanceof Element
+    && (node.tagName === 'TEXTAREA' || node.tagName === 'INPUT')
+    && !!node.closest('.relay-question-container');
+  document.addEventListener('focusin', (event) => {
+    if (!isQuestionTextControl(event.target)) return;
+    document.body.classList.add('keyboard-open');
+    syncViewportMetrics();
+  });
+  document.addEventListener('focusout', (event) => {
+    if (!isQuestionTextControl(event.target)) return;
+    document.body.classList.remove('keyboard-open');
+    syncViewportMetrics();
+  });
 
   const input = document.getElementById('msg-input');
   if (input && input.dataset.viewportBound !== '1') {
@@ -2857,7 +2889,9 @@ function applyConversationWorkspaceRootUpdate(payload = {}) {
   if (rootChanged) {
     resetWorkspaceRepoBrowserForRootChange();
   } else if (repoBrowserState.activeRoot === 'workspace' && repoBrowserState.open) {
-    void loadRepoBrowserTree();
+    // Same root: refresh through the restoring path so open folders and the
+    // current selection survive.
+    refreshRepoBrowser();
   }
 }
 
@@ -2950,6 +2984,11 @@ async function initApp() {
     syncSuspendHostVisibility();
   }
   setupViewportTracking();
+  bindChatSelectionGuard();
+  chatSelectionGuard.onRelease(() => {
+    flushDeferredMessageRender();
+    pollAuthenticatedCurrentConversationLive().catch(() => {});
+  });
   window.addEventListener('pagehide', () => {
     stopSharedModeTimers();
     void flushConversationDraft(currentConvId);

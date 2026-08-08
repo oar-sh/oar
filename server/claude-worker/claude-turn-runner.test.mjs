@@ -570,6 +570,131 @@ test('the linger cap releases the gate even while an agent is still live', async
   assert.equal(response.body.text, 'dispatched');
 });
 
+test('a pending AskUserQuestion blocks the idle release until the human answers', async () => {
+  // Reproduces the 2026-08-07 incident: background agents drained, the user
+  // was still typing an answer, and the 60s idle backstop closed the CLI's
+  // stdin — rejecting the pending permission with "Tool permission stream
+  // closed" and timing the question card out mid-typing.
+  const calls = [];
+  let questionAnswered = false;
+  let questionPolls = 0;
+  const api = async (method, routePath, body) => {
+    calls.push({ method, routePath, body });
+    if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+    if (routePath === '/api/relay-question/rq-1') {
+      questionPolls += 1;
+      // Stay pending well past the idle-release window before answering.
+      if (questionPolls >= 12) questionAnswered = true;
+      return { question: { id: 'rq-1', status: questionAnswered ? 'answered' : 'pending', answer: 'option A' } };
+    }
+    return { ok: true };
+  };
+
+  let capturedCanUseTool = null;
+  let endInputsWhenAnswered = -1;
+  let release = () => {};
+  const gate = new Promise((resolve) => { release = resolve; });
+  const turn = {
+    endInputCalls: 0,
+    async* [Symbol.asyncIterator]() {
+      yield initMessage('native-1');
+      yield backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]);
+      yield resultMessage('dispatched', 'native-1');
+      yield backgroundTasksMessage([]);
+      // The background agent asks a question after the first result — the
+      // stream then goes silent while the human thinks.
+      const decision = await capturedCanUseTool('AskUserQuestion', {
+        questions: [{ question: 'Proceed?', options: [{ label: 'option A' }, { label: 'option B' }] }],
+      }, {});
+      endInputsWhenAnswered = turn.endInputCalls;
+      assert.equal(decision.behavior, 'allow');
+      yield resultMessage('acted on option A', 'native-1');
+      await gate;
+    },
+  };
+  turn.endInput = () => {
+    turn.endInputCalls += 1;
+    release();
+  };
+
+  const runner = createClaudeTurnRunner({
+    api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: (params) => {
+      capturedCanUseTool = params.canUseTool;
+      return turn;
+    },
+    backgroundIdleReleaseMs: 20,
+    backgroundLingerPollMs: 5,
+    askUserBridgeOptions: { questionPollMs: 10 },
+  });
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+
+  assert.equal(handled, true);
+  assert.equal(endInputsWhenAnswered, 0, 'the gate must still be held when the answer arrives');
+  assert.ok(questionPolls >= 12, 'the question stayed pending well past the idle window');
+  const timeouts = calls.filter((call) => call.routePath === '/api/relay-question/rq-1/timeout');
+  assert.equal(timeouts.length, 0, 'the question must never be timed out by the gate');
+  const response = calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'dispatched\n\nacted on option A');
+});
+
+test('a pending question also holds off the linger cap until it resolves', async () => {
+  const calls = [];
+  let questionPolls = 0;
+  const api = async (method, routePath, body) => {
+    calls.push({ method, routePath, body });
+    if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+    if (routePath === '/api/relay-question/rq-1') {
+      questionPolls += 1;
+      return { question: { id: 'rq-1', status: questionPolls >= 10 ? 'answered' : 'pending', answer: 'ok' } };
+    }
+    return { ok: true };
+  };
+  let capturedCanUseTool = null;
+  let endInputsWhenAnswered = -1;
+  let release = () => {};
+  const gate = new Promise((resolve) => { release = resolve; });
+  const turn = {
+    endInputCalls: 0,
+    async* [Symbol.asyncIterator]() {
+      yield initMessage('native-1');
+      yield backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]);
+      yield resultMessage('dispatched', 'native-1');
+      const decision = await capturedCanUseTool('AskUserQuestion', {
+        questions: [{ question: 'Proceed?', options: [{ label: 'ok' }] }],
+      }, {});
+      endInputsWhenAnswered = turn.endInputCalls;
+      assert.equal(decision.behavior, 'allow');
+      yield resultMessage('done', 'native-1');
+      await gate;
+    },
+  };
+  turn.endInput = () => {
+    turn.endInputCalls += 1;
+    release();
+  };
+  const runner = createClaudeTurnRunner({
+    api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: (params) => {
+      capturedCanUseTool = params.canUseTool;
+      return turn;
+    },
+    // The cap elapses long before the question resolves.
+    backgroundLingerCapMs: 15,
+    backgroundLingerPollMs: 5,
+    askUserBridgeOptions: { questionPollMs: 10 },
+  });
+  const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(handled, true);
+  assert.equal(endInputsWhenAnswered, 0, 'the cap must not close stdin under a pending question');
+});
+
 test('the input gate is released on success and on error paths', async () => {
   const stub = makeApiStub();
   let releasedOnSuccess = 0;

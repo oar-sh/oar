@@ -56,6 +56,8 @@ export function createClaudeTurnRunner({
   // turn is coming (the CLI dequeues a settled task's notification within ~1s).
   backgroundIdleReleaseMs = 60_000,
   backgroundLingerPollMs = 5_000,
+  // Test seam: overrides for the ask-user bridge (poll cadence, timeouts).
+  askUserBridgeOptions = {},
   dbg = () => {},
 } = {}) {
   let activeMessage = null;
@@ -237,7 +239,13 @@ export function createClaudeTurnRunner({
     // death is tied to this CLI process either way. Its *settling* still sets
     // notificationPending above, so finite bash tasks get their continuation.
     const hasGatingTasks = () => [...linger.live.values()].some((type) => type !== 'local_bash');
-    const shouldHoldGate = () => hasGatingTasks() || linger.notificationPending;
+    // In-flight canUseTool round-trips (AskUserQuestion, permission prompts)
+    // gate too: a pending question produces no stream traffic while the human
+    // thinks, and releasing the gate under it rejects the request with
+    // "Tool permission stream closed". The question's own timeout bounds the
+    // wait, so this cannot wedge the turn.
+    let pendingControlRequests = 0;
+    const shouldHoldGate = () => hasGatingTasks() || linger.notificationPending || pendingControlRequests > 0;
 
     function observeLinger(action) {
       if (action.channel === 'background_tasks') {
@@ -257,8 +265,9 @@ export function createClaudeTurnRunner({
       sdkSessionId,
       getActiveMessage: () => message,
       dbg,
+      ...askUserBridgeOptions,
     });
-    const canUseTool = createCanUseTool({
+    const baseCanUseTool = createCanUseTool({
       askUserBridge,
       dbg,
       onExitPlanMode: async (input) => {
@@ -286,6 +295,17 @@ export function createClaudeTurnRunner({
         return true;
       },
     });
+    const canUseTool = async (toolName, input, options) => {
+      pendingControlRequests += 1;
+      try {
+        return await baseCanUseTool(toolName, input, options);
+      } finally {
+        pendingControlRequests -= 1;
+        // Restart the idle countdown from the answer, not from the last
+        // stream message before the human started thinking.
+        linger.lastMessageAt = Date.now();
+      }
+    };
 
     const resume = String(message.claudeNativeSessionId || claudeNativeSessionId || '').trim();
     // The CLI resolves `resume` inside the project directory for *this* CWD, so
@@ -336,6 +356,10 @@ export function createClaudeTurnRunner({
       if (linger.timer) return;
       linger.timer = setInterval(() => {
         if (linger.finalized) return;
+        // A human is deciding a pending question/permission: neither backstop
+        // may close the control transport under it. The question's own
+        // timeout resumes the countdown when it fires.
+        if (pendingControlRequests > 0) return;
         const now = Date.now();
         const capped = now - linger.startedAt >= backgroundLingerCapMs;
         const idle = !hasGatingTasks() && now - linger.lastMessageAt >= backgroundIdleReleaseMs;
@@ -375,6 +399,7 @@ export function createClaudeTurnRunner({
               message.id,
               `liveTasks=${linger.live.size}`,
               `notificationPending=${linger.notificationPending}`,
+              `pendingControlRequests=${pendingControlRequests}`,
             );
             startLingerMonitor();
           } else {

@@ -1,5 +1,6 @@
 import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
 import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
+import { isChatInteractionHeld } from './selection-guard.mjs';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -546,6 +547,9 @@ export function applyContextUsageBar(ratio) {
 export function scrollBottom() {
   const el = document.getElementById('messages');
   if (!el) return;
+  // Programmatic scrolling during a drag makes the browser extend the live
+  // selection over everything that moves under the cursor.
+  if (isChatInteractionHeld()) return;
   el.scrollTop = el.scrollHeight;
   saveConversationScrollTop(currentConvId, el.scrollTop);
 }

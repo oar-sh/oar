@@ -9,6 +9,7 @@ import {
 import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion, answerRelayQuestionStructured } from './api-client.js';
 import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
+import { isChatInteractionHeld } from './selection-guard.mjs';
 
 let relayQuestionRenderHash = '';
 let renderedRelayQuestionIds = new Set();
@@ -178,6 +179,17 @@ export async function openPendingQuestionFromBanner() {
   window.scrollBottom?.();
 }
 
+// Scoped to #messages on purpose: scrollIntoView walks every ancestor
+// scroller, and when a short last card cannot align to the container's top the
+// leftover scroll spills onto the page root — shifting the header off-screen
+// with no user-visible way back (the body hides its scrollbar).
+function scrollQuestionCardIntoMessages(el, target) {
+  if (!el || !target) return;
+  if (isChatInteractionHeld()) return;
+  const top = target.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
+  el.scrollTop = Math.max(0, Math.min(top, el.scrollHeight - el.clientHeight));
+}
+
 export function renderRelayQuestions() {
   const el = document.getElementById('messages');
   if (!el) return;
@@ -280,7 +292,7 @@ export function renderRelayQuestions() {
   restoreFocusedQuestionControl(el, focusedControl);
   if (firstNewQuestionId) {
     const target = el.querySelector(`.relay-question-container[data-question-id="${CSS.escape(firstNewQuestionId)}"]`);
-    target?.scrollIntoView({ block: 'start', inline: 'nearest' });
+    scrollQuestionCardIntoMessages(el, target);
   } else if (shouldAutoScroll) {
     window.scrollBottom?.();
   } else {

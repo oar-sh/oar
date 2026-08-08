@@ -56,7 +56,7 @@ import {
   removeUserBubbleCancelButton,
   updateSubagentBubbleFromStatus,
 } from './conversation-view.js';
-import { loadRepoBrowserTree } from './attachments-view.js';
+import { loadRepoBrowserTree, refreshRepoBrowserIfWorkspaceOpen } from './attachments-view.js';
 import { clearMessageSearchRuntimeState } from './message-search-view.js';
 import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
@@ -417,6 +417,9 @@ export async function connectSocket(overrideDeps) {
   socket.on('message_status', ({ messageId, conversationId, status }) => {
     const normalizedStatus = String(status || '').trim().toLowerCase();
     const clearsProcessingStatus = ['done', 'failed', 'dropped', 'pending', 'parked', 'cancelled'].includes(normalizedStatus);
+    // pending/parked fire mid-turn (queueing, park/re-queue); only genuinely
+    // terminal statuses may tear down the live bubble and reload the view.
+    const isTerminalStatus = ['done', 'failed', 'dropped', 'cancelled'].includes(normalizedStatus);
     applyConversationTurnStatus({ conversationId, messageId, status });
     if (conversationId && conversations[conversationId]) {
       const conversation = conversations[conversationId];
@@ -448,12 +451,15 @@ export async function connectSocket(overrideDeps) {
       if (messageId) clearBubbleCancelState(messageId);
       if (messageId) removeUserBubbleCancelButton(messageId);
     }
-    if (conversationId === currentConvId && clearsProcessingStatus) {
+    if (conversationId === currentConvId && isTerminalStatus) {
       collapseThinkingThoughts();
       removeThinking();
       void refreshCurrentView().catch(() => {});
       scheduleContextUsageRefresh(conversationId, 220);
       refreshSessionWorkerStatus().catch(() => {});
+      // Files the agent created during the turn appear now, via the restoring
+      // path that keeps open folders and the current selection.
+      refreshRepoBrowserIfWorkspaceOpen();
     }
     renderConvList();
   });

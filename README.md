@@ -215,7 +215,7 @@ Roadmap for later launcher modes:
 
 On startup, the relay imports locally persisted Copilot sessions through the installed Copilot SDK into its database. Session lists, details, sharing, and history refreshes use that database; an unavailable SDK runtime is reported as an import failure and is not replaced with filesystem discovery.
 
-- Start a chat with **New Chat**, which asks for the **provider**, **model**, and **reasoning effort** (or **quality** and **size**, for image chats) before the conversation exists.
+- Start a chat with **New Chat**, which asks for the **working directory**, **provider**, **model**, and **reasoning effort** (or **quality** and **size**, for image chats) before the conversation exists. The working directory picker lists the known CWDs (current session, relay workspace, browser folder, recent roots) plus a **Custom path…** entry, defaults to the last directory you picked, and the chosen directory is applied before the session worker first launches. With Copilot as the only provider the provider row is hidden.
 - Choose **mode** and **model** per message in the composer.
 - Use **Compact** to branch to a fresh conversation seeded with summary context.
 - Use **Browse files** to inspect workspace/drives and open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.

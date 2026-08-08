@@ -61,12 +61,17 @@ import { deriveComposerControlState, hasComposerDraft } from './composer-control
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
+import { isChatInteractionHeld, selectionIntersectsNode } from './selection-guard.mjs';
+import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
+import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
 const OPAQUE_RELAY_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let thinkingMessageId = null;
+let lastInFlightSnapshotKey = '';
+let deferredMessageRender = null;
 const relayStreamStateByMessageId = new Map();
 // Cumulative main-thread stream text per message. The seq/done state above is
 // shared across threads (the server numbers stream rows per queue message, not
@@ -831,10 +836,43 @@ function enhanceThoughtMarkup(root) {
   });
 }
 
+// Streamed markdown grows at the tail, so only nodes from the first divergent
+// top-level block onward are replaced. Signatures are cached on the container:
+// enhancement passes (hljs, link rewriting) mutate the rendered nodes, so
+// re-deriving signatures from the DOM would break the stable prefix at the
+// first code block. Returns the appended nodes for scoped enhancement.
+function patchRenderedMarkdown(box, html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const nextNodes = [...template.content.childNodes];
+  const signatureOf = (node) => (node.nodeType === 1 ? node.outerHTML : `#text:${node.textContent}`);
+  const nextSignatures = nextNodes.map(signatureOf);
+  const cached = box.__streamSignatures;
+  const prevSignatures = Array.isArray(cached) && cached.length === box.childNodes.length
+    ? cached
+    : [...box.childNodes].map(signatureOf);
+  const stable = computeStablePrefixLength(prevSignatures, nextSignatures);
+  while (box.childNodes.length > stable) box.lastChild.remove();
+  const appended = [];
+  for (let i = stable; i < nextNodes.length; i += 1) {
+    box.appendChild(nextNodes[i]);
+    appended.push(nextNodes[i]);
+  }
+  box.__streamSignatures = nextSignatures;
+  return appended;
+}
+
 function renderThoughtBody(body, text) {
   if (!body) return;
-  body.innerHTML = renderMarkdownPreview(String(text || ''), false);
-  enhanceThoughtMarkup(body);
+  if (selectionIntersectsNode(body)) return;
+  const value = String(text || '');
+  const fingerprint = `${value.length}:${value.slice(-32)}`;
+  if (body.dataset.thoughtFingerprint === fingerprint) return;
+  body.dataset.thoughtFingerprint = fingerprint;
+  const appended = patchRenderedMarkdown(body, renderMarkdownPreview(value, false));
+  for (const node of appended) {
+    if (node.nodeType === 1) enhanceThoughtMarkup(node);
+  }
 }
 
 export function renderActivityMarkup(activities) {
@@ -933,7 +971,21 @@ export function renderSubagentRunsMarkup(subagentRuns, activities, thoughts) {
 export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
   if (nextMessageId) thinkingMessageId = nextMessageId;
-  document.getElementById('thinking-indicator')?.remove();
+  const existing = document.getElementById('thinking-indicator');
+  if (existing && (!nextMessageId || String(existing.dataset.messageId || '') === nextMessageId)) {
+    // Reuse the live bubble: rebuilding it every poll tick destroys any text
+    // selection anchored inside and drops in-progress subagent bubbles.
+    const stopBtn = existing.querySelector('[data-action="stop-turn"]');
+    if (stopBtn && nextMessageId) {
+      const stopping = bubbleCancelInFlight.has(nextMessageId);
+      stopBtn.disabled = stopping;
+      stopBtn.textContent = stopping ? 'Stopping…' : 'Stop';
+      stopBtn.classList.toggle('stopping', stopping);
+    }
+    if (autoScroll) scrollBottom();
+    return;
+  }
+  existing?.remove();
   const el = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg assistant';
@@ -970,6 +1022,7 @@ export function showThinking(messageId = null, autoScroll = true) {
 
 export function removeThinking() {
   thinkingMessageId = null;
+  lastInFlightSnapshotKey = '';
   document.getElementById('thinking-indicator')?.remove();
 }
 
@@ -1012,6 +1065,9 @@ function rememberRelayStreamState(messageId, seq, done = false) {
 function renderThinkingStream() {
   const box = document.getElementById('thinking-stream');
   if (!box) return;
+  // The store keeps the latest text; the next frame after the selection is
+  // released repaints, so skipping here never loses content.
+  if (selectionIntersectsNode(box)) return;
   const text = thinkingMessageId ? String(relayStreamTextByMessageId.get(thinkingMessageId) || '') : '';
   if (!text.trim()) {
     box.hidden = true;
@@ -1019,7 +1075,7 @@ function renderThinkingStream() {
     return;
   }
   box.hidden = false;
-  box.innerHTML = renderMarkdownPreview(text, false);
+  patchRenderedMarkdown(box, renderMarkdownPreview(text, false));
 }
 
 function renderSubagentStream(subagentRunId, text) {
@@ -1037,6 +1093,7 @@ function renderSubagentStream(subagentRunId, text) {
     if (childrenContainer) bubble.insertBefore(box, childrenContainer);
     else bubble.appendChild(box);
   }
+  if (selectionIntersectsNode(box)) return;
   const value = String(text || '');
   if (!value.trim()) {
     box.hidden = true;
@@ -1044,31 +1101,73 @@ function renderSubagentStream(subagentRunId, text) {
     return;
   }
   box.hidden = false;
-  box.innerHTML = renderMarkdownPreview(value, false);
+  patchRenderedMarkdown(box, renderMarkdownPreview(value, false));
+}
+
+function patchActivityList(box, expectedTexts, className) {
+  const current = Array.from(box.children, (row) => row.textContent || '');
+  const plan = planListPatch(current, expectedTexts);
+  if (plan.reset) box.innerHTML = '';
+  for (const text of plan.appends) {
+    const row = document.createElement('div');
+    row.className = className;
+    row.textContent = text;
+    box.appendChild(row);
+  }
 }
 
 export function renderThinkingActivities() {
   const items = thinkingMessageId ? (relayActivities.get(thinkingMessageId) || []) : [];
   const box = document.getElementById('thinking-activity');
   if (!box) return;
-  box.innerHTML = '';
+  // Idempotent replay: the live bubble is reused across poll ticks, so a
+  // clear-and-replay (or the append path's last-row-only dedupe) would either
+  // wipe selections or duplicate rows on every changed payload.
+  const mainExpected = [];
+  const bySubagentRun = new Map();
   for (const item of items) {
     const entry = normalizeRelayActivityEntry(item);
     if (!entry) continue;
-    appendThinkingActivity(entry.text, entry.subagentRunId, false);
+    const decorated = decorateActivityText(entry.text);
+    if (entry.subagentRunId) {
+      const list = bySubagentRun.get(entry.subagentRunId) || [];
+      if (list[list.length - 1] !== decorated) list.push(decorated);
+      bySubagentRun.set(entry.subagentRunId, list);
+    } else if (mainExpected[mainExpected.length - 1] !== decorated) {
+      mainExpected.push(decorated);
+    }
+  }
+  if (!selectionIntersectsNode(box)) {
+    patchActivityList(box, mainExpected, 'thinking-activity-item');
+  }
+  for (const [subagentRunId, expected] of bySubagentRun) {
+    const bubble = ensureSubagentBubble(subagentRunId);
+    const runBox = bubble?.querySelector('.subagent-activity');
+    if (runBox && !selectionIntersectsNode(runBox)) {
+      patchActivityList(runBox, expected, 'subagent-activity-item');
+    }
   }
 }
 
 export function restoreInFlightThinking(inFlight, autoScroll = true) {
-  clearRelayStreamState();
   const messageId = String(inFlight?.messageId || '').trim();
   const status = String(inFlight?.status || '').trim().toLowerCase();
   if (!messageId || status !== 'processing') {
+    clearRelayStreamState();
     setConversationTurnState(currentConvId, null);
     thinkingMessageId = null;
     removeThinking();
     return;
   }
+  // Skip the rebuild when the payload matches the previous tick: the 900ms
+  // live poll would otherwise churn the DOM (and the user's selection) with
+  // identical content.
+  const snapshotKey = buildInFlightSnapshotKey(inFlight);
+  if (snapshotKey === lastInFlightSnapshotKey && document.getElementById('thinking-indicator')) {
+    return;
+  }
+  lastInFlightSnapshotKey = snapshotKey;
+  clearRelayStreamState();
   setConversationTurnState(currentConvId, { messageId, status: 'processing' });
   const activities = mergeRelayActivityTexts(
     relayActivities.get(messageId) || [],
@@ -1505,6 +1604,15 @@ export function applyRelayStreamEvent({
   if (runId) renderSubagentStream(runId, text);
   else renderThinkingStream();
   return true;
+}
+
+export function flushDeferredMessageRender() {
+  if (!deferredMessageRender) return;
+  const { msgs, scroll, meta } = deferredMessageRender;
+  deferredMessageRender = null;
+  const deferredConversationId = String(meta?.conversationId || '').trim();
+  if (deferredConversationId && deferredConversationId !== String(currentConvId || '').trim()) return;
+  renderMessages(msgs, scroll, meta);
 }
 
 export function clearRelayStreamStateForMessage(messageId) {
@@ -1970,8 +2078,16 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   if (snapshotKey && snapshotKey === lastRenderedMessageSnapshotKey && !statusViewMounted) {
     renderRelayQuestions();
     renderRelayBoards();
+    deferredMessageRender = null;
     return false;
   }
+  if (isChatInteractionHeld()) {
+    // A full rebuild wipes the user's selection; park the latest payload and
+    // replay it once the selection/drag is released.
+    deferredMessageRender = { msgs, scroll, meta };
+    return false;
+  }
+  deferredMessageRender = null;
   const messageById = new Map(
     ordered
       .map((item) => [String(item?.id || '').trim(), item])
@@ -2224,8 +2340,9 @@ export async function sendMessage() {
     if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
       updateWorkspaceRootHints(r);
       if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
-        repoBrowserState.currentPath = '';
-        await window.loadRepoBrowserTree?.();
+        // Restoring refresh: if the root really changed, the restore walk
+        // finds nothing to re-open and falls back to the new root on its own.
+        window.refreshRepoBrowser?.();
       }
     }
     if (r.compactedConversationId) {

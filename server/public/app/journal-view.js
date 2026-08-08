@@ -1,6 +1,10 @@
 import {
   conversations,
   currentConvId,
+  workspaceRootPath,
+  defaultSessionWorkspaceRootPath,
+  getConversationCurrentWorkspaceRootPath,
+  getRecentWorkspaceRoots,
   fmtDate,
   parseTimestampMs,
   escHtml,
@@ -34,7 +38,8 @@ import {
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
-import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
+import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRepoBrowserLaunchCwdPath } from './attachments-view.js';
+import { buildKnownCwdOptions, normalizeKnownCwdPath } from './known-cwd-options.mjs';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import {
@@ -54,8 +59,11 @@ const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const CONVERSATION_LIST_PAGE_SIZE = 40;
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
 const OPENAI_IMAGE_SIZE_STORAGE_KEY = 'copilot_openai_image_size';
+const NEW_CHAT_CWD_STORAGE_KEY = 'copilot_new_chat_cwd';
+const NEW_CHAT_CUSTOM_CWD_VALUE = '__custom__';
 let processingDotFrame = 0;
 let processingDotTimer = null;
+let lastConvListHtml = '';
 let openConversationVersion = 0;
 let newConversationInFlight = false;
 let newConversationCatalogCache = null;
@@ -197,7 +205,12 @@ function ensureProcessingDotTimer(enabled) {
     if (processingDotTimer) return;
     processingDotTimer = setInterval(() => {
       processingDotFrame = (processingDotFrame + 1) % PROCESSING_DOT_FRAMES.length;
-      renderConvList();
+      // Touch only the dot spans: rewriting the whole list every second kills
+      // sidebar selections and burns battery for a spinner frame.
+      const frame = PROCESSING_DOT_FRAMES[processingDotFrame];
+      document.querySelectorAll('#conv-list .conv-processing-dots').forEach((el) => {
+        el.textContent = ` ${frame}`;
+      });
     }, PROCESSING_DOT_INTERVAL_MS);
     return;
   }
@@ -257,6 +270,7 @@ export function renderConvList() {
   if (sorted.length === 0) {
     ensureProcessingDotTimer(false);
     list.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">No conversations yet</div>';
+    lastConvListHtml = '';
     return;
   }
   const conversationView = (conversation) => {
@@ -272,7 +286,7 @@ export function renderConvList() {
     if (processing) hasProcessingConversation = true;
     return { visualState, processing };
   };
-  list.innerHTML = `${sorted.map((c) => {
+  const listHtml = `${sorted.map((c) => {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
     const providerIndicatorLabel = conversationProviderIndicatorLabel(c);
@@ -287,6 +301,10 @@ export function renderConvList() {
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
   }).join('')}${footerHtml}`;
+  if (listHtml !== lastConvListHtml) {
+    list.innerHTML = listHtml;
+    lastConvListHtml = listHtml;
+  }
   ensureProcessingDotTimer(hasProcessingConversation);
   window.syncChatTitleControls?.();
   scheduleConversationListBoundaryCheck();
@@ -344,9 +362,10 @@ export function applyLoadedConversationState(id, response, {
     preferredReasoningEffort: response.preferredReasoningEffort,
   });
   setRepoBrowserSessionInfo(response.sessionRootPath || '', response.sessionRootName || response.title || '');
-  if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
-    void loadRepoBrowserTree();
-  }
+  // The repo tree deliberately does NOT reload here: this runs on the 900ms
+  // live poll, and the bare loadRepoBrowserTree path resets loaded folders and
+  // deep selections. The end-of-turn message_status handler refreshes the tree
+  // through the restoring path instead.
   const didRenderMessages = renderMessages(response.messages, !restoreScroll, response);
   hydrateConversationDraft(id, {
     draftText: response.draftText,
@@ -695,6 +714,97 @@ async function populateNewConversationModelSelect(providerType = 'github') {
   return true;
 }
 
+function resolveNewConversationDefaultCwd() {
+  return normalizeKnownCwdPath(defaultSessionWorkspaceRootPath || workspaceRootPath || '');
+}
+
+function getNewConversationSelectedCwd() {
+  const select = document.getElementById('new-conversation-cwd-select');
+  if (!select) return '';
+  if (select.value === NEW_CHAT_CUSTOM_CWD_VALUE) {
+    return normalizeKnownCwdPath(document.getElementById('new-conversation-cwd-manual')?.value || '');
+  }
+  return normalizeKnownCwdPath(select.value || '');
+}
+
+function syncNewConversationCwdControls() {
+  const select = document.getElementById('new-conversation-cwd-select');
+  const manual = document.getElementById('new-conversation-cwd-manual');
+  const status = document.getElementById('new-conversation-cwd-status');
+  if (!select) return;
+  const isCustom = select.value === NEW_CHAT_CUSTOM_CWD_VALUE;
+  if (manual) manual.hidden = !isCustom;
+  if (!status) return;
+  if (isCustom) {
+    const manualPath = normalizeKnownCwdPath(manual?.value || '');
+    status.textContent = manualPath
+      ? `This chat starts in ${manualPath}.`
+      : 'Enter the full path of the launch directory on the relay host.';
+    return;
+  }
+  const selectedPath = normalizeKnownCwdPath(select.value || '');
+  if (selectedPath) {
+    status.textContent = `This chat starts in ${selectedPath}.`;
+    return;
+  }
+  const defaultPath = resolveNewConversationDefaultCwd();
+  status.textContent = defaultPath
+    ? `This chat starts in ${defaultPath} (relay default).`
+    : 'This chat starts in the relay default directory.';
+}
+
+function populateNewConversationCwdSelect() {
+  const select = document.getElementById('new-conversation-cwd-select');
+  if (!select) return;
+  const options = buildKnownCwdOptions({
+    currentSessionCwd: getConversationCurrentWorkspaceRootPath(currentConvId) || '',
+    workspaceRootPath,
+    browserCwd: getRepoBrowserLaunchCwdPath(),
+    recentRoots: getRecentWorkspaceRoots(),
+  });
+  select.innerHTML = '';
+  const defaultPath = resolveNewConversationDefaultCwd();
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  defaultOption.textContent = defaultPath ? `Default (${defaultPath})` : 'Default';
+  select.appendChild(defaultOption);
+  for (const option of options) {
+    const entry = document.createElement('option');
+    entry.value = option.path;
+    entry.textContent = option.path;
+    entry.title = option.note ? `${option.label} (${option.note})` : option.label;
+    select.appendChild(entry);
+  }
+  const customOption = document.createElement('option');
+  customOption.value = NEW_CHAT_CUSTOM_CWD_VALUE;
+  customOption.textContent = 'Custom path…';
+  select.appendChild(customOption);
+  const storedCwd = normalizeKnownCwdPath(localStorage.getItem(NEW_CHAT_CWD_STORAGE_KEY) || '');
+  if (storedCwd) {
+    const storedKey = storedCwd.toLowerCase();
+    const match = Array.from(select.options).find((option) => (
+      option.value !== NEW_CHAT_CUSTOM_CWD_VALUE
+      && normalizeKnownCwdPath(option.value).toLowerCase() === storedKey
+    ));
+    if (match) select.value = match.value;
+  }
+  if (select.dataset.cwdBound !== '1') {
+    select.dataset.cwdBound = '1';
+    select.addEventListener('change', () => {
+      syncNewConversationCwdControls();
+      if (select.value === NEW_CHAT_CUSTOM_CWD_VALUE) {
+        document.getElementById('new-conversation-cwd-manual')?.focus?.();
+      }
+    });
+  }
+  const manual = document.getElementById('new-conversation-cwd-manual');
+  if (manual && manual.dataset.cwdBound !== '1') {
+    manual.dataset.cwdBound = '1';
+    manual.addEventListener('input', syncNewConversationCwdControls);
+  }
+  syncNewConversationCwdControls();
+}
+
 async function openNewConversationModelModal() {
   const [catalog, settings, claudeSettings, cursorSettings] = await Promise.all([
     loadModelCatalog(),
@@ -726,6 +836,9 @@ async function openNewConversationModelModal() {
       entry.textContent = option.label;
       providerSelect.appendChild(entry);
     }
+    // With Copilot alone the provider row is a single dead option — hide it.
+    const providerRow = document.getElementById('new-conversation-provider-row');
+    if (providerRow) providerRow.hidden = options.length <= 1;
     const preferredProvider = 'github';
     providerSelect.value = options.some((option) => option.value === preferredProvider)
       ? preferredProvider
@@ -751,6 +864,7 @@ async function openNewConversationModelModal() {
       void populateNewConversationReasoningSelect(modelSelect.value);
     });
   }
+  populateNewConversationCwdSelect();
   const modal = document.getElementById('new-conversation-model-modal');
   if (!modal) return;
   modal.classList.add('visible');
@@ -758,11 +872,15 @@ async function openNewConversationModelModal() {
   setTimeout(() => document.getElementById('new-conversation-model-select')?.focus(), 0);
 }
 
-export function closeNewConversationModelModal() {
-  if (newConversationInFlight) return;
+function hideNewConversationModelModal() {
   const modal = document.getElementById('new-conversation-model-modal');
   modal?.classList.remove('visible');
   modal?.setAttribute('aria-hidden', 'true');
+}
+
+export function closeNewConversationModelModal() {
+  if (newConversationInFlight) return;
+  hideNewConversationModelModal();
 }
 
 function persistReasoningSelection(reasoningEffort = '') {
@@ -775,7 +893,7 @@ function persistReasoningSelection(reasoningEffort = '') {
   }
 }
 
-async function createNewConversation(selectedModel, selectedReasoningEffort = '') {
+async function createNewConversation(selectedModel, selectedReasoningEffort = '', selectedCwd = '') {
   if (newConversationInFlight) return;
   newConversationInFlight = true;
   const confirmButton = document.getElementById('new-conversation-model-confirm');
@@ -793,6 +911,7 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       model: selectedModel || undefined,
       providerType: bootstrapProviderType(selectedProvider),
       reasoningEffort: String(selectedReasoningEffort || '').trim().toLowerCase() || undefined,
+      workspaceRootPath: selectedCwd || undefined,
       title: 'New Conversation',
     });
     const nextConversationId = String(result?.conversationId || '').trim();
@@ -800,6 +919,13 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       showTransientRelayNotice('Could not start a new conversation session. Please try again.');
       return;
     }
+    // Only a successful bootstrap makes the CWD choice sticky, so a rejected
+    // path can never become the default for the next chat.
+    try {
+      if (selectedCwd) localStorage.setItem(NEW_CHAT_CWD_STORAGE_KEY, selectedCwd);
+      else localStorage.removeItem(NEW_CHAT_CWD_STORAGE_KEY);
+    } catch {}
+    hideNewConversationModelModal();
     const bootstrappedModel = String(result?.selectedModel || '').trim();
     if (bootstrappedModel) {
       localStorage.setItem('copilot_model', bootstrappedModel);
@@ -819,10 +945,14 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
     if (result?.warning) {
       showTransientRelayNotice(String(result.warning), 6000);
     }
+    if (result?.workspaceRootWarning) {
+      showTransientRelayNotice(String(result.workspaceRootWarning), 7000);
+    }
     if (result?.defaultSessionWorkspaceRootWarning) {
       showTransientRelayNotice(String(result.defaultSessionWorkspaceRootWarning), 7000);
     }
   } catch (error) {
+    // The modal stays open so the user can fix the CWD/model and retry.
     showTransientRelayNotice(error?.message || 'Could not start a new conversation session.');
   } finally {
     newConversationInFlight = false;
@@ -835,10 +965,10 @@ export async function confirmNewConversationModel() {
   const selectedModel = String(document.getElementById('new-conversation-model-select')?.value || '').trim();
   const selectedReasoningEffort = String(document.getElementById('new-conversation-reasoning-select')?.value || '').trim().toLowerCase();
   if (!selectedModel) return;
-  const modal = document.getElementById('new-conversation-model-modal');
-  modal?.classList.remove('visible');
-  modal?.setAttribute('aria-hidden', 'true');
-  await createNewConversation(selectedModel, selectedReasoningEffort);
+  const selectedCwd = getNewConversationSelectedCwd();
+  // The modal stays open until the bootstrap succeeds; createNewConversation
+  // closes it, so a rejected CWD or model keeps the selection editable.
+  await createNewConversation(selectedModel, selectedReasoningEffort, selectedCwd);
 }
 
 export async function newConversation() {
@@ -847,22 +977,7 @@ export async function newConversation() {
     return;
   }
   if (newConversationInFlight) return;
-  // The provider picker is only useful when a managed provider can actually be
-  // selected; with Copilot alone the plain model-select path suffices.
-  const [openAISettings, claudeSettings, cursorSettings] = await Promise.all([
-    loadOpenAISettings(),
-    loadClaudeSettings(),
-    loadCursorSettings(),
-  ]);
-  const anyManagedProviderEnabled = openAISettings?.enabled === true
-    || claudeSettings?.enabled === true
-    || cursorSettings?.enabled === true;
-  if (anyManagedProviderEnabled) {
-    void openNewConversationModelModal();
-    return;
-  }
-  const selectedModel = String(document.getElementById('model-select')?.value || '').trim();
-  await createNewConversation(selectedModel);
+  await openNewConversationModelModal();
 }
 
 export function initConversationListLazyLoading() {

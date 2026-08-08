@@ -2102,11 +2102,22 @@
   }
   #new-conversation-provider-select,
   #new-conversation-model-select,
-  #new-conversation-reasoning-select {
+  #new-conversation-reasoning-select,
+  #new-conversation-cwd-select,
+  #new-conversation-cwd-manual {
     width: 100%;
     min-height: 42px;
     margin-top: 8px;
   }
+  #new-conversation-cwd-manual {
+    box-sizing: border-box;
+    padding: 0 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+  }
+  #new-conversation-cwd-manual[hidden] { display: none; }
   .tmux-inspector-dialog {
     width: min(1120px, 100%);
     height: min(80vh, 760px);
@@ -3048,6 +3059,7 @@
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+    overscroll-behavior: contain;
     padding: 8px;
     min-width: 0;
   }
@@ -3090,6 +3102,7 @@
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+    overscroll-behavior: contain;
     padding: 10px;
     min-width: 0;
   }
@@ -3779,7 +3792,7 @@
     }
     .new-conversation-model-dialog {
       height: auto;
-      max-height: min(520px, calc(var(--app-height) - 16px));
+      max-height: min(640px, calc(var(--app-height) - 16px));
     }
     .summary-modal-actions {
       justify-content: stretch;
@@ -4326,12 +4339,20 @@
       </div>
     </div>
     <div class="summary-body" style="padding: 16px;">
-      <label for="new-conversation-provider-select">Provider</label>
-      <select id="new-conversation-provider-select">
-        <option value="github">Copilot</option>
+      <label for="new-conversation-cwd-select">Working directory</label>
+      <select id="new-conversation-cwd-select">
+        <option value="">Default</option>
       </select>
-      <div id="new-conversation-provider-help" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Copilot models use your GitHub Copilot runtime.</div>
-      <label for="new-conversation-model-select">Model</label>
+      <input id="new-conversation-cwd-manual" type="text" hidden autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Full path of the launch directory">
+      <div id="new-conversation-cwd-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);word-break:break-word;">New chats start in the relay default directory.</div>
+      <div id="new-conversation-provider-row">
+        <label for="new-conversation-provider-select" style="display:block;margin-top:12px;">Provider</label>
+        <select id="new-conversation-provider-select">
+          <option value="github">Copilot</option>
+        </select>
+        <div id="new-conversation-provider-help" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Copilot models use your GitHub Copilot runtime.</div>
+      </div>
+      <label for="new-conversation-model-select" style="display:block;margin-top:12px;">Model</label>
       <select id="new-conversation-model-select"></select>
       <label for="new-conversation-reasoning-select" style="display:block;margin-top:12px;">Reasoning effort</label>
       <select id="new-conversation-reasoning-select"></select>

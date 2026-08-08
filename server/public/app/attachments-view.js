@@ -92,6 +92,7 @@ let pendingRepoBrowserRestore = null;
 let repoBrowserRefreshSeq = 0;
 let repoBrowserRenderSuspended = 0;
 let repoBrowserRenderDirty = false;
+let lastTreeScrolledPath = null;
 const filePreviewHistory = [];
 
 function takePendingRepoBrowserRestore() {
@@ -1086,6 +1087,11 @@ export function syncRepoTreeToCurrentPath(collapseOthers = false) {
       el.open = false;
     }
   });
+  // Reveal the active node only when the selection actually moved (or on an
+  // explicit focus): scrolling on every render yanks the pane back while the
+  // user is scrolling it themselves.
+  if (currentPath === lastTreeScrolledPath && !collapseOthers) return;
+  lastTreeScrolledPath = currentPath;
   const activeEl = treeHost.querySelector('.repo-tree-summary.active, .repo-tree-file.active');
   if (activeEl) {
     activeEl.scrollIntoView({ block: 'nearest' });
@@ -1196,7 +1202,9 @@ export function renderRepoFolder() {
     </div>`;
   }).join('');
 
+  const savedScrollTop = folderHost.scrollTop;
   folderHost.innerHTML = `<div class="${wrapperClass}">${rows}</div>`;
+  folderHost.scrollTop = savedScrollTop;
 }
 
 export function renderRepoTree() {
@@ -1215,8 +1223,12 @@ export function renderRepoTree() {
     treeHost.innerHTML = '<div class="repo-empty">Tree unavailable.</div>';
     return;
   }
+  // The rebuild resets the pane's scroll to 0; put it back so re-renders
+  // (child loads, refreshes) don't rubber-band a scroll in progress.
+  const savedScrollTop = treeHost.scrollTop;
   treeHost.innerHTML = renderRepoTreeNode(root);
   updateRepoTreeSelection();
+  treeHost.scrollTop = savedScrollTop;
   syncRepoTreeToCurrentPath();
 }
 
@@ -1318,6 +1330,7 @@ export async function ensureRepoChildrenLoaded(pathValue) {
   node.loadingChildren = true;
   repoBrowserState.loadingPath = nodePath;
   renderRepoBrowser();
+  const treeAtRequest = repoBrowserState.tree;
 
   const payload = repoBrowserState.activeRoot === 'workspace'
     ? await loadRepoChildren(
@@ -1330,18 +1343,29 @@ export async function ensureRepoChildrenLoaded(pathValue) {
 
   node.loadingChildren = false;
   repoBrowserState.loadingPath = '';
+  // The tree can be swapped out mid-fetch by a reload; writing onto the
+  // orphaned node object would silently drop the children. Attach to the node
+  // that now lives at the same path, or bail if the path is gone.
+  const target = repoBrowserState.tree === treeAtRequest
+    ? node
+    : repoBrowserState.nodeMap.get(nodePath) || null;
+  if (!target || target.type !== 'dir') {
+    renderRepoBrowser();
+    return false;
+  }
+  target.loadingChildren = false;
   if (!payload || payload.error || !payload.node || !Array.isArray(payload.node.children)) {
-    node.children = [];
-    node.childrenLoaded = true;
-    node.readError = true;
+    target.children = [];
+    target.childrenLoaded = true;
+    target.readError = true;
     renderRepoBrowser();
     return false;
   }
 
-  node.children = payload.node.children;
-  node.childrenLoaded = true;
-  node.lazy = false;
-  node.readError = !!payload.node.readError;
+  target.children = payload.node.children;
+  target.childrenLoaded = true;
+  target.lazy = false;
+  target.readError = !!payload.node.readError;
   repoBrowserState.nodeMap = repoNodeMapFromTree(repoBrowserState.tree);
   repoBrowserState.nodeCount = repoBrowserState.nodeMap.size;
   renderRepoBrowser();
@@ -1501,6 +1525,11 @@ export function refreshRepoBrowser() {
     error: '',
   });
   void loadRepoBrowserTree();
+}
+
+export function refreshRepoBrowserIfWorkspaceOpen() {
+  if (!repoBrowserState.open || repoBrowserState.activeRoot !== 'workspace') return;
+  refreshRepoBrowser();
 }
 
 export function resetWorkspaceRepoBrowserForRootChange() {

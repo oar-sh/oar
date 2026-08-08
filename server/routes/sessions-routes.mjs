@@ -3788,7 +3788,7 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.post('/api/conversation/bootstrap', auth, async (req, res) => {
-    ensureSessionId(req, res);
+    const clientSessionId = String(ensureSessionId(req, res) || '').trim();
     const now = new Date().toISOString();
     let conversationId = '';
     for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -3919,6 +3919,27 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
 
+    // Optional launch CWD from the New Chat modal. Validated before insertConv
+    // so a rejected path never leaves an orphaned conversation behind.
+    const requestedWorkspaceRootPath = readWorkspaceRootPathFromBody(req.body);
+    let bootstrapWorkspaceRootPath = '';
+    if (requestedWorkspaceRootPath) {
+      const validatedRoot = validateRequestedWorkspaceRoot(requestedWorkspaceRootPath, {
+        allowList: workspaceRootAllowList,
+      });
+      if (!validatedRoot.ok) {
+        return res.status(validatedRoot.code === 'root-path-not-allowed' ? 403 : 400)
+          .json({ ok: false, code: validatedRoot.code, error: validatedRoot.error });
+      }
+      // Keyed on the browser session: there is no conversation id yet.
+      const rateLimited = consumeWorkspaceRootRateLimit(clientSessionId || 'bootstrap', req);
+      if (!rateLimited.ok) {
+        res.set?.('Retry-After', String(rateLimited.retryAfterSeconds));
+        return res.status(429).json({ ok: false, code: 'rate-limited', error: 'Too many CWD updates. Try again shortly.' });
+      }
+      bootstrapWorkspaceRootPath = validatedRoot.realPath;
+    }
+
     const selectedModel = useOpenAIProvider
       ? resolveOpenAISessionModel({
           requestedModel: catalogSelectedModel,
@@ -3991,6 +4012,35 @@ export function registerSessionsRoutes(app, deps) {
           providerModel: (useOpenAIProvider || useClaudeProvider || useCursorProvider) ? selectedModel : null,
         },
       );
+      // Seed the configured root before ensureWorker so the very first launch
+      // already happens in the requested directory (resolveLaunchWorkspaceRootForSession
+      // prefers it over the relay default).
+      let workspaceRootState = null;
+      let workspaceRootWarning = null;
+      if (bootstrapWorkspaceRootPath) {
+        const workspaceRootResult = typeof updateConversationConfiguredWorkspaceRoot === 'function'
+          ? updateConversationConfiguredWorkspaceRoot({ conversationId, rootPath: bootstrapWorkspaceRootPath })
+          : null;
+        if (workspaceRootResult?.ok) {
+          workspaceRootState = workspaceRootResult.state || null;
+          const workspaceHints = workspaceRootPayload();
+          io.emit('conversation_workspace_root_updated', {
+            conversationId,
+            sdkSessionId: workspaceRootState?.sdkSessionId || null,
+            configuredWorkspaceRootPath: workspaceRootState?.configuredWorkspaceRootPath || null,
+            configuredWorkspaceRootName: workspaceRootState?.configuredWorkspaceRootName || null,
+            runtimeWorkspaceRootPath: workspaceRootState?.runtimeWorkspaceRootPath || null,
+            runtimeWorkspaceRootName: workspaceRootState?.runtimeWorkspaceRootName || null,
+            currentWorkspaceRootPath: workspaceRootState?.currentWorkspaceRootPath || null,
+            currentWorkspaceRootName: workspaceRootState?.currentWorkspaceRootName || null,
+            recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
+          });
+        } else {
+          // The directory passed validation moments ago, so a failure here is a
+          // race (deleted or unmounted since). Start the chat anyway and say so.
+          workspaceRootWarning = `The chat was created, but its working directory could not be set: ${workspaceRootResult?.error || 'unknown error'}. It starts in the default directory.`;
+        }
+      }
       const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
       const ownerSessionId = routingEnabled ? conversationId : null;
       if (ownerSessionId && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
@@ -4043,6 +4093,11 @@ export function registerSessionsRoutes(app, deps) {
         lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
         selectedModel,
         selectedProviderType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : (useCursorProvider ? 'cursor' : 'github')),
+        configuredWorkspaceRootPath: workspaceRootState?.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: workspaceRootState?.configuredWorkspaceRootName || null,
+        currentWorkspaceRootPath: workspaceRootState?.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: workspaceRootState?.currentWorkspaceRootName || null,
+        workspaceRootWarning,
         warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
         ...workspaceRootPayload(),
       });
