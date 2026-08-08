@@ -243,6 +243,7 @@
     --provider-openai-image: #d98cc4;
     --provider-claude: #e0855a;
     --provider-cursor: #a78bfa;
+    --provider-grok: #e879f9;
     --viewport-top-offset: 0px;
     --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     --chat-header-top-base-desktop: 14px;
@@ -303,6 +304,7 @@
     --provider-openai-image: #a3468b;
     --provider-claude: #b4531f;
     --provider-cursor: #6b3fd4;
+    --provider-grok: #a21caf;
     --inline-code-bg: #eff1f3;
   }
   :root {
@@ -630,6 +632,7 @@
   .conv-provider-indicator[data-provider="openai-image"] { color: var(--provider-openai-image); }
   .conv-provider-indicator[data-provider="claude"] { color: var(--provider-claude); }
   .conv-provider-indicator[data-provider="cursor"] { color: var(--provider-cursor); }
+  .conv-provider-indicator[data-provider="grok"] { color: var(--provider-grok); }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
   .conv-item.worker-ui-ready .conv-title,
@@ -1869,6 +1872,7 @@
   #model-lock-note[data-provider="openai-image"] { color: var(--provider-openai-image); }
   #model-lock-note[data-provider="claude"] { color: var(--provider-claude); }
   #model-lock-note[data-provider="cursor"] { color: var(--provider-cursor); }
+  #model-lock-note[data-provider="grok"] { color: var(--provider-grok); }
   #model-select:disabled,
   #reasoning-effort-select:disabled {
     opacity: 0.55;
@@ -4442,6 +4446,57 @@
           <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
         </div>
         <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="grok-model-input">Grok</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="grok-enabled-toggle">Enable Grok for New Chat model selection</label>
+          <input id="grok-enabled-toggle" type="checkbox" onchange="toggleGrokProvider(this.checked)">
+        </div>
+        <label for="grok-model-input" style="margin-top: 8px;">Grok model ID</label>
+        <input
+          id="grok-model-input"
+          type="text"
+          value="grok-4.5"
+          placeholder="grok-4.5"
+          aria-label="Grok model ID"
+        >
+        <div id="grok-settings-status" class="settings-help settings-provider-status">Loading Grok settings…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="grok-save-btn" type="button" class="summary-btn" onclick="saveGrokSettings()">Save Grok settings</button>
+        </div>
+        <div class="settings-help">Uses the host machine's logged-in Grok credentials (grok login or XAI_API_KEY). No API key is stored in the browser. Disabling also rebinds conversations that have not sent a message yet.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="grok-allowance-monthly-input">Grok monthly plan allowance</label>
+        <div class="settings-help">Grok does not expose remaining plan credits over ACP. Optional: enter your monthly USD budget so Check Usage can show an estimated remaining meter. Last-turn tokens and cost are always shown after a Grok turn.</div>
+        <label for="grok-allowance-monthly-input" style="margin-top: 8px;">Monthly allowance (USD)</label>
+        <input
+          id="grok-allowance-monthly-input"
+          type="number"
+          min="0"
+          step="0.01"
+          inputmode="decimal"
+          placeholder="e.g. 30"
+          aria-label="Grok monthly allowance in US dollars"
+        >
+        <label for="grok-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
+        <input
+          id="grok-allowance-reset-day-input"
+          type="number"
+          min="1"
+          max="31"
+          step="1"
+          inputmode="numeric"
+          placeholder="1"
+          aria-label="Grok billing reset day of month"
+        >
+        <div id="grok-allowance-status" class="settings-help settings-provider-status">Loading Grok allowances…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="grok-allowance-save-btn" type="button" class="summary-btn" onclick="saveGrokAllowanceSettings()">Save allowances</button>
+          <button id="grok-allowance-reset-btn" type="button" class="summary-btn" onclick="resetGrokAllowanceAccounting()">Reset tracked spend</button>
+        </div>
+        <div class="settings-help">Reset tracked spend after changing plan or account. Authoritative billing: <a href="https://console.x.ai" target="_blank" rel="noopener noreferrer">console.x.ai</a>.</div>
       </div>
       <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
         <label for="cursor-api-key-input">Cursor SDK</label>

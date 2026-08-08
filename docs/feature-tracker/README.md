@@ -12,6 +12,7 @@ that live in the relay itself (and apply to every provider) are tracked here.
 | **OpenAI (BYOK)** | Rides the Copilot worker via `COPILOT_PROVIDER_*` env vars; image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md) + the core rows below |
 | **Claude** | `@anthropic-ai/claude-agent-sdk` in `server/claude-worker/` | [claude-sdk.md](claude-sdk.md) |
 | **Cursor** | `@cursor/sdk` in `server/cursor-worker/` — *implemented, pending live validation* | [cursor-sdk.md](cursor-sdk.md) |
+| **Grok** | Grok CLI ACP (`grok agent stdio`) in `server/grok-worker/` — host login, no npm agent SDK | [grok-sdk.md](grok-sdk.md) |
 
 > **Evidence style:** rows cite files and exported symbols, not line ranges. Line numbers in this
 > document went stale silently and ended up pointing at unrelated code; symbol names survive edits
@@ -60,6 +61,10 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-08-08: Grok Check Usage now shows the live weekly SuperGrok quota bar with its reset date — fetched from the CLI chat proxy's `/v1/billing?format=credits` using the relay host's own `~/.grok/auth.json` login (`server/services/grok-billing-usage.mjs`), best-effort per request, estimated meters demoted to secondary when live data is present.
+- 2026-08-08: Grok audit fixes before first deploy: guarded the ACP client's `'error'` emit (a missing `grok` CLI could crash the relay server via `ERR_UNHANDLED_ERROR`), spawn cwd now honors the conversation workspace, model locked per conversation (409 `GROK_MODEL_REQUIRES_NEW_CONVERSATION` + composer pin), reasoning effort forwarded on prompt `_meta`, context usage gauge implemented (`/api/grok-context-usage`), plan boards + busy retry + requeue-on-empty + terminal-error field parity in the worker, discovery timeout no longer leaks agents and the CLI fallback is async, plan-usage hardening (negative-value rejection, full-precision accumulation, binding-validated route, worker source badge).
+- 2026-08-08: Grok plan usage on Check Usage — per-turn tokens/cost from ACP prompt `_meta`, optional monthly allowance meter, card hidden when Grok disabled, billing link `console.x.ai`.
+- 2026-08-08: Added the Grok CLI ACP provider (`server/grok-worker/`) with host-login settings, worker routing, model catalog layer, and frontend picker/badge. Control surface is `grok agent stdio` (no npm agent SDK).
 - 2026-06-20: Wired SDK `hooks.onPostToolUse` in extension mode for subagent lifecycle publishing.
 - 2026-06-20: Wired SDK history-fetch polling to `session.getEvents()`; behavior is guarded when runtime lacks the method.
 - 2026-06-20: Added installable PWA shell support with a scoped manifest and versioned service worker.

@@ -57,12 +57,24 @@ async function invokePost(routePath, deps, body) {
 function makePlanUsageDeps(overrides = {}) {
   const db = new Database(':memory:');
   const planUsageService = createPlanUsageService({ db, now: () => new Date('2026-08-08T12:00:00.000Z') });
+  // The grok route validates the conversation's provider binding; 'conv-g' is
+  // the well-known grok-bound conversation for these tests.
+  const runtimeSessionsByConversation = {
+    'conv-g': { id: 'rs-1', provider_type: 'grok', provider_model: 'grok-4.5' },
+    'conv-cursor': { id: 'rs-2', provider_type: 'cursor', provider_model: 'composer-2.5' },
+  };
   return {
     db,
     planUsageService,
     deps: baseRouteDeps({
       planUsageService,
+      stmts: {
+        getRuntimeSessionByConversation: {
+          get: (conversationId) => runtimeSessionsByConversation[conversationId] || null,
+        },
+      },
       getCursorPlanAllowanceSettings: () => ({ cursorModelsUsd: 20, otherModelsUsd: 20, resetDay: 1 }),
+      getGrokPlanAllowanceSettings: () => ({ monthlyUsd: 30, resetDay: 1 }),
       ...overrides,
     }),
   };
@@ -175,4 +187,122 @@ test('cursor-plan-usage honours the configured reset day when picking the cycle'
     rawCostCents: 100,
   });
   assert.equal(body.cycle, '2026-07-15');
+});
+
+// ─── Grok ────────────────────────────────────────────────────────────────────
+
+test('grok-plan-usage stores last-turn usage and books cycle spend', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  const { status, body } = await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-g',
+    model: 'grok-4.5',
+    usage: {
+      inputTokens: 100,
+      outputTokens: 20,
+      totalTokens: 120,
+      costUsdTicks: 200_000_000, // $0.20
+      modelId: 'grok-4.5',
+    },
+    capturedAt: '2026-08-08T12:00:00.000Z',
+  });
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.ok(body.cycle);
+  const stored = planUsageService.readSnapshot('grok');
+  assert.equal(stored.payload.costUsd, 0.2);
+  assert.equal(stored.payload.inputTokens, 100);
+  const cycle = planUsageService.readGrokCycleTotals({ resetDay: 1 });
+  assert.equal(cycle.totals.costUsd, 0.2);
+  assert.equal(cycle.totals.turnCount, 1);
+});
+
+test('grok-plan-usage rejects an empty payload', async () => {
+  const { deps } = makePlanUsageDeps();
+  const { status, body } = await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-g',
+    usage: {},
+  });
+  assert.equal(status, 400);
+  assert.equal(body.error, 'Missing usable usage payload');
+});
+
+test('grok-plan-usage accumulates across reports', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-g',
+    usage: { costUsdTicks: 4_000_000, totalTokens: 100 }, // $0.004
+  });
+  await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-g',
+    usage: { costUsdTicks: 4_000_000, totalTokens: 50 },
+  });
+  const { totals } = planUsageService.readGrokCycleTotals({ resetDay: 1 });
+  // Sub-cent turns must accumulate at full precision, not book as 2x $0.00.
+  assert.equal(totals.costUsd, 0.008);
+  assert.equal(totals.totalTokens, 150);
+  assert.equal(totals.turnCount, 2);
+});
+
+test('grok-plan-usage ignores negative values instead of decrementing spend', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-g',
+    usage: { costUsd: 0.5, totalTokens: 100 },
+  });
+  const { status } = await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-g',
+    usage: { costUsd: -100, totalTokens: -50 },
+  });
+  assert.equal(status, 400);
+  const { totals } = planUsageService.readGrokCycleTotals({ resetDay: 1 });
+  assert.equal(totals.costUsd, 0.5);
+});
+
+test('grok-plan-usage validates the conversation binding', async () => {
+  const { deps } = makePlanUsageDeps();
+  const missingConversation = await invokePost('/api/grok-plan-usage', deps, {
+    usage: { costUsd: 0.5 },
+  });
+  assert.equal(missingConversation.status, 400);
+
+  const unknown = await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-unknown',
+    usage: { costUsd: 0.5 },
+  });
+  assert.equal(unknown.status, 404);
+
+  const wrongProvider = await invokePost('/api/grok-plan-usage', deps, {
+    conversationId: 'conv-cursor',
+    usage: { costUsd: 0.5 },
+  });
+  assert.equal(wrongProvider.status, 409);
+});
+
+test('buildReport includes Grok only when configured', () => {
+  const { planUsageService } = makePlanUsageDeps();
+  planUsageService.recordGrokUsageReport({
+    inputTokens: 10,
+    outputTokens: 2,
+    totalTokens: 12,
+    costUsd: 0.01,
+    modelId: 'grok-4.5',
+  }, { resetDay: 1 });
+
+  const hidden = planUsageService.buildReport({
+    claudeConfigured: false,
+    cursorConfigured: false,
+    grokConfigured: false,
+  });
+  assert.ok(!hidden.providers.some((card) => card.provider === 'grok'));
+
+  const shown = planUsageService.buildReport({
+    claudeConfigured: false,
+    cursorConfigured: false,
+    grokConfigured: true,
+    grokAllowances: { monthlyUsd: 30, resetDay: 1 },
+  });
+  const grok = shown.providers.find((card) => card.provider === 'grok');
+  assert.ok(grok);
+  assert.equal(grok.meters[0]?.id, 'grok-monthly-spend');
+  assert.ok(grok.links.some((link) => link.url === 'https://console.x.ai'));
 });

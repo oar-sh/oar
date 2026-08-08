@@ -347,6 +347,77 @@ test('an explicit cursor providerType on an existing github conversation require
   assert.equal(body.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
 });
 
+// Grok model ids can also appear in the Cursor catalog (Cursor resells Grok).
+// A bound Grok session must not be 409'd as "needs a new Cursor conversation".
+test('a Grok session keeps sending a model the Cursor catalog also lists', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, {
+    conversationId: 'conv-grok',
+    providerType: 'grok',
+    providerModel: 'grok-4.5',
+  });
+  const deps = baseRouteDeps({
+    ...makeStmts(db),
+    getConvAnyStatus: { get: () => null },
+  }, {
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1', 'grok-4.5'] }),
+    getGrokProviderSettings: () => ({
+      enabled: true,
+      model: 'grok-4.5',
+      models: ['grok-4.5'],
+      effortsByModel: { 'grok-4.5': ['none', 'low', 'medium', 'high'] },
+    }),
+    maybeApplyWorkspaceRootFromMessage: () => ({ attempted: false, changed: false }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-grok',
+    text: 'tell me a joke',
+    model: 'grok-4.5',
+    relayMode: 'agent',
+  });
+  assert.notEqual(body?.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.notEqual(body?.code, 'GROK_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.notEqual(body?.code, 'OPENAI_MODEL_REQUIRES_NEW_CONVERSATION');
+  // Guard path only — conversation row is intentionally missing → 404 after guards.
+  assert.equal(status, 404);
+  assert.equal(body.error, 'Conversation not found');
+});
+
+// The Grok ACP surface cannot switch models mid-session, so the model pinned
+// at bootstrap is locked: a different Grok model on the same conversation is
+// refused instead of being silently relabeled.
+test('switching a bound Grok conversation to a different Grok model is refused', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, {
+    conversationId: 'conv-grok',
+    providerType: 'grok',
+    providerModel: 'grok-4.5',
+  });
+  const deps = baseRouteDeps({
+    ...makeStmts(db),
+    getConvAnyStatus: { get: () => null },
+  }, {
+    getGrokProviderSettings: () => ({
+      enabled: true,
+      model: 'grok-4.5',
+      models: ['grok-4.5', 'grok-code-fast-1'],
+      effortsByModel: {},
+    }),
+    maybeApplyWorkspaceRootFromMessage: () => ({ attempted: false, changed: false }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-grok',
+    text: 'switch please',
+    model: 'grok-code-fast-1',
+    relayMode: 'agent',
+  });
+  assert.equal(status, 409);
+  assert.equal(body.code, 'GROK_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.equal(body.error, 'Grok model switching requires creating a new Grok conversation');
+});
+
 // Cursor resells models the Claude provider serves under the same id, so the
 // id alone must never route a bound Claude session into the cursor rejection.
 test('a Claude session keeps sending a model the Cursor catalog also lists', async () => {

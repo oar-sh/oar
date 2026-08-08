@@ -28,10 +28,17 @@ import {
   normalizeCursorAllowanceSettings,
   resolveCursorBillingCycle,
 } from './plan-usage-cursor.mjs';
+import {
+  buildGrokPlanCard,
+  normalizeGrokAllowanceSettings,
+  normalizeGrokTurnUsage,
+  resolveGrokBillingCycle,
+} from './plan-usage-grok.mjs';
 
 export const PROVIDER_USAGE_SNAPSHOT_TABLE = 'provider_usage_snapshots';
 export const CURSOR_USAGE_CHECKPOINT_TABLE = 'cursor_usage_checkpoints';
 export const CURSOR_USAGE_CYCLE_TABLE = 'cursor_usage_cycle_totals';
+export const GROK_USAGE_CYCLE_TABLE = 'grok_usage_cycle_totals';
 
 export const PLAN_USAGE_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS ${PROVIDER_USAGE_SNAPSHOT_TABLE} (
@@ -68,6 +75,16 @@ export const PLAN_USAGE_SCHEMA_SQL = `
     run_count          REAL NOT NULL DEFAULT 0,
     updated_at         TEXT NOT NULL,
     PRIMARY KEY (cycle_key, pool)
+  );
+
+  CREATE TABLE IF NOT EXISTS ${GROK_USAGE_CYCLE_TABLE} (
+    cycle_key      TEXT PRIMARY KEY,
+    cost_usd       REAL NOT NULL DEFAULT 0,
+    input_tokens   REAL NOT NULL DEFAULT 0,
+    output_tokens  REAL NOT NULL DEFAULT 0,
+    total_tokens   REAL NOT NULL DEFAULT 0,
+    turn_count     REAL NOT NULL DEFAULT 0,
+    updated_at     TEXT NOT NULL
   );
 `;
 
@@ -169,6 +186,20 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     `),
     clearCheckpoints: db.prepare(`DELETE FROM ${CURSOR_USAGE_CHECKPOINT_TABLE}`),
     clearCycle: db.prepare(`DELETE FROM ${CURSOR_USAGE_CYCLE_TABLE} WHERE cycle_key = ?`),
+    getGrokCycle: db.prepare(`SELECT * FROM ${GROK_USAGE_CYCLE_TABLE} WHERE cycle_key = ?`),
+    addGrokCycle: db.prepare(`
+      INSERT INTO ${GROK_USAGE_CYCLE_TABLE} (
+        cycle_key, cost_usd, input_tokens, output_tokens, total_tokens, turn_count, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(cycle_key) DO UPDATE SET
+        cost_usd = ${GROK_USAGE_CYCLE_TABLE}.cost_usd + excluded.cost_usd,
+        input_tokens = ${GROK_USAGE_CYCLE_TABLE}.input_tokens + excluded.input_tokens,
+        output_tokens = ${GROK_USAGE_CYCLE_TABLE}.output_tokens + excluded.output_tokens,
+        total_tokens = ${GROK_USAGE_CYCLE_TABLE}.total_tokens + excluded.total_tokens,
+        turn_count = ${GROK_USAGE_CYCLE_TABLE}.turn_count + excluded.turn_count,
+        updated_at = excluded.updated_at
+    `),
+    clearGrokCycle: db.prepare(`DELETE FROM ${GROK_USAGE_CYCLE_TABLE} WHERE cycle_key = ?`),
   };
 
   function nowIso() {
@@ -288,6 +319,71 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
   }
 
   /**
+   * Book one completed Grok turn into the current billing cycle and refresh the
+   * last-turn snapshot. Grok reports per-prompt totals (not cumulative agent
+   * counters), so each report is added whole — no checkpoint/diff.
+   */
+  function recordGrokUsageReport(rawReport, { resetDay } = {}) {
+    const usage = normalizeGrokTurnUsage(rawReport);
+    if (!usage) return null;
+    const cycle = resolveGrokBillingCycle({ resetDay, now: now() });
+    // Server clock for the ledger/snapshot timestamp: the cycle is chosen by
+    // server time too, and a client-supplied capturedAt would otherwise drive
+    // the card's "Updated …" freshness label. The worker's capturedAt stays
+    // inside the snapshot payload itself.
+    const timestamp = nowIso();
+    const persist = db.transaction(() => {
+      stmts.addGrokCycle.run(
+        cycle.key,
+        usage.costUsd || 0,
+        usage.inputTokens || 0,
+        usage.outputTokens || 0,
+        usage.totalTokens || 0,
+        1,
+        timestamp,
+      );
+      stmts.upsertSnapshot.run(
+        'grok',
+        JSON.stringify(usage),
+        'worker',
+        timestamp,
+        null,
+      );
+    });
+    persist();
+    return { usage, cycle };
+  }
+
+  function readGrokCycleTotals({ resetDay } = {}) {
+    const cycle = resolveGrokBillingCycle({ resetDay, now: now() });
+    const row = stmts.getGrokCycle.get(cycle.key);
+    if (!row) {
+      return {
+        cycle,
+        totals: { costUsd: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, turnCount: 0 },
+        capturedAt: null,
+      };
+    }
+    return {
+      cycle,
+      totals: {
+        costUsd: Number(row.cost_usd) || 0,
+        inputTokens: Number(row.input_tokens) || 0,
+        outputTokens: Number(row.output_tokens) || 0,
+        totalTokens: Number(row.total_tokens) || 0,
+        turnCount: Number(row.turn_count) || 0,
+      },
+      capturedAt: row.updated_at || null,
+    };
+  }
+
+  function resetGrokAccounting({ resetDay } = {}) {
+    const cycle = resolveGrokBillingCycle({ resetDay, now: now() });
+    stmts.clearGrokCycle.run(cycle.key);
+    return { cycle };
+  }
+
+  /**
    * Assemble the full multi-provider report. Every provider is independent:
    * one failing source produces an unavailable card instead of failing the
    * whole response.
@@ -300,11 +396,17 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     claudeConfigured = true,
     cursorConfigured = true,
     cursorAllowances = null,
+    grokConfigured = false,
+    grokAllowances = null,
+    grokBilling = null,
   } = {}) {
     const generatedAt = nowIso();
     const claudeSnapshot = readSnapshot('claude');
     const allowances = normalizeCursorAllowanceSettings(cursorAllowances || {});
     const cursorCycle = readCursorCycleTotals({ resetDay: allowances.resetDay });
+    const grokSettings = normalizeGrokAllowanceSettings(grokAllowances || {});
+    const grokCycle = readGrokCycleTotals({ resetDay: grokSettings.resetDay });
+    const grokSnapshot = readSnapshot('grok');
 
     const providers = [
       buildCopilotPlanCard({
@@ -331,12 +433,30 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
         capturedAt: cursorCycle.capturedAt,
         configured: cursorConfigured !== false,
       }),
-    ].filter(Boolean);
+    ];
+
+    // Grok is opt-in: hide the card entirely when the provider is disabled
+    // (unlike Claude/Cursor which show a not-configured placeholder).
+    if (grokConfigured === true) {
+      providers.push(buildGrokPlanCard({
+        usage: grokSnapshot?.payload || null,
+        cycleTotals: grokCycle.totals,
+        allowances: grokSettings,
+        cycle: grokCycle.cycle,
+        billing: grokBilling,
+        capturedAt: grokSnapshot?.capturedAt || grokCycle.capturedAt || null,
+        configured: true,
+        message: grokSnapshot?.error || null,
+        // A snapshot row is the worker-reported last turn, not a cached copy
+        // of some fresher source — there is no independent staleness signal.
+        stale: false,
+      }));
+    }
 
     return {
       version: PLAN_USAGE_VERSION,
       generatedAt,
-      providers,
+      providers: providers.filter(Boolean),
     };
   }
 
@@ -346,6 +466,9 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     recordCursorUsageReport,
     readCursorCycleTotals,
     resetCursorAccounting,
+    recordGrokUsageReport,
+    readGrokCycleTotals,
+    resetGrokAccounting,
     buildReport,
     pools: CURSOR_POOLS,
   };

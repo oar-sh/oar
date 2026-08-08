@@ -33,6 +33,7 @@ import {
   loadModelCatalog,
   loadClaudeSettings,
   loadCursorSettings,
+  loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
@@ -70,6 +71,7 @@ let newConversationCatalogCache = null;
 let newConversationOpenAISettingsCache = null;
 let newConversationClaudeSettingsCache = null;
 let newConversationCursorSettingsCache = null;
+let newConversationGrokSettingsCache = null;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -484,6 +486,7 @@ function normalizeNewConversationProviderType(value = '') {
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude') return 'claude';
   if (normalized === 'cursor') return 'cursor';
+  if (normalized === 'grok') return 'grok';
   return 'github';
 }
 
@@ -520,6 +523,7 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   const hasOpenAIByok = providers.includes('openai-byok');
   const hasClaude = providers.includes('claude');
   const hasCursor = providers.includes('cursor');
+  const hasGrok = providers.includes('grok');
   if (wantsOpenAI) {
     if (hasOpenAIByok) return true;
     const settingsModel = String(newConversationOpenAISettingsCache?.model || '').trim();
@@ -547,11 +551,26 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
       : [];
     return normalizedModelId === cursorModel || cursorModels.includes(normalizedModelId);
   }
+  if (normalizedProvider === 'grok') {
+    if (hasGrok) return true;
+    const grokModel = String(newConversationGrokSettingsCache?.model || '').trim();
+    const grokModels = Array.isArray(newConversationGrokSettingsCache?.models)
+      ? newConversationGrokSettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    return normalizedModelId === grokModel || grokModels.includes(normalizedModelId);
+  }
   const claudeOnly = hasClaude && providers.every((provider) => provider === 'claude');
   if (claudeOnly) return false;
   const cursorOnly = hasCursor && providers.every((provider) => provider === 'cursor');
   if (cursorOnly) return false;
-  return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude' && provider !== 'cursor') || !hasOpenAIByok;
+  const grokOnly = hasGrok && providers.every((provider) => provider === 'grok');
+  if (grokOnly) return false;
+  return providers.some((provider) => (
+    provider !== 'openai-byok'
+    && provider !== 'claude'
+    && provider !== 'cursor'
+    && provider !== 'grok'
+  )) || !hasOpenAIByok;
 }
 
 function openAIImageSizesForModel(modelId = '') {
@@ -661,6 +680,10 @@ function updateNewConversationProviderHelp(provider = 'github') {
   }
   if (normalizedProvider === 'cursor') {
     help.textContent = 'Cursor chats run through the Cursor Agent SDK using your saved Cursor API key.';
+    return;
+  }
+  if (normalizedProvider === 'grok') {
+    help.textContent = "Grok chats use the host machine's logged-in Grok credentials (grok login or XAI_API_KEY).";
     return;
   }
   help.textContent = 'Copilot models use your GitHub Copilot runtime.';
@@ -806,16 +829,18 @@ function populateNewConversationCwdSelect() {
 }
 
 async function openNewConversationModelModal() {
-  const [catalog, settings, claudeSettings, cursorSettings] = await Promise.all([
+  const [catalog, settings, claudeSettings, cursorSettings, grokSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
     loadClaudeSettings(),
     loadCursorSettings(),
+    loadGrokSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
   newConversationClaudeSettingsCache = claudeSettings || null;
   newConversationCursorSettingsCache = cursorSettings || null;
+  newConversationGrokSettingsCache = grokSettings || null;
   const providerSelect = document.getElementById('new-conversation-provider-select');
   if (providerSelect) {
     const options = [{ value: 'github', label: 'Copilot' }];
@@ -828,6 +853,9 @@ async function openNewConversationModelModal() {
     }
     if (cursorSettings?.enabled === true) {
       options.push({ value: 'cursor', label: 'Cursor SDK' });
+    }
+    if (grokSettings?.enabled === true) {
+      options.push({ value: 'grok', label: 'Grok' });
     }
     providerSelect.innerHTML = '';
     for (const option of options) {

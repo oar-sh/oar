@@ -9,9 +9,13 @@ import {
   loadCursorSettings,
   loadCursorAllowanceSettings,
   updateCursorAllowanceSettings,
+  loadGrokAllowanceSettings,
+  updateGrokAllowanceSettings,
+  loadGrokSettings,
   loadOpenAISettings,
   updateClaudeSettings,
   updateCursorSettings,
+  updateGrokSettings,
   updateDefaultSessionWorkspaceRoot,
   updateOpenAISettings,
   loadWindowsAutostartSetting,
@@ -344,6 +348,122 @@ export async function toggleClaudeProvider(enabled) {
   }
 }
 
+let grokSettingsUpdateInFlight = false;
+let grokSettingsState = {
+  configured: false,
+  enabled: false,
+  model: 'grok-4.5',
+  models: [],
+};
+let grokSettingsInputsDirty = false;
+
+function ensureGrokSettingsInputTracking() {
+  const input = document.getElementById('grok-model-input');
+  if (!input || input.dataset.grokDirtyTracking === '1') return;
+  input.dataset.grokDirtyTracking = '1';
+  input.addEventListener('input', () => {
+    grokSettingsInputsDirty = true;
+  });
+}
+
+function setGrokSettingsControlsDisabled(disabled) {
+  for (const id of ['grok-model-input', 'grok-enabled-toggle', 'grok-save-btn']) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyGrokSettingsState(settings = {}, { resetInputs = false } = {}) {
+  ensureGrokSettingsInputTracking();
+  grokSettingsState = {
+    configured: settings?.enabled === true,
+    enabled: settings?.enabled === true,
+    model: String(settings?.model || grokSettingsState.model || 'grok-4.5').trim() || 'grok-4.5',
+    models: Array.isArray(settings?.models) ? settings.models : grokSettingsState.models,
+  };
+  const modelInput = document.getElementById('grok-model-input');
+  const toggle = document.getElementById('grok-enabled-toggle');
+  const status = document.getElementById('grok-settings-status');
+  if (modelInput && (!grokSettingsInputsDirty || resetInputs)) modelInput.value = grokSettingsState.model;
+  if (resetInputs) grokSettingsInputsDirty = false;
+  if (toggle) {
+    toggle.checked = grokSettingsState.enabled;
+    toggle.disabled = grokSettingsUpdateInFlight;
+  }
+  if (status) {
+    status.textContent = grokSettingsState.enabled
+      ? `Grok is enabled. Select Grok in New Chat to use model ${grokSettingsState.model}. Uses the host machine's logged-in Grok credentials (grok login or XAI_API_KEY).`
+      : 'Not enabled. Enable to allow Grok selection in New Chat (requires host Grok login or XAI_API_KEY).';
+    status.dataset.state = grokSettingsState.enabled ? 'active' : 'unconfigured';
+  }
+  window.syncAutoModelAvailability?.();
+  return grokSettingsState;
+}
+
+export async function refreshGrokSettingsState() {
+  const settings = await loadGrokSettings();
+  if (!settings) return null;
+  return applyGrokSettingsState(settings);
+}
+
+async function syncGrokSettingsInputs() {
+  const status = document.getElementById('grok-settings-status');
+  if (!status) return;
+  const settings = await refreshGrokSettingsState();
+  if (!settings) {
+    status.textContent = 'Unable to load Grok settings.';
+    status.dataset.state = 'error';
+  }
+}
+
+export async function saveGrokSettings() {
+  if (grokSettingsUpdateInFlight) return;
+  const modelInput = document.getElementById('grok-model-input');
+  const model = String(modelInput?.value || '').trim() || 'grok-4.5';
+  grokSettingsUpdateInFlight = true;
+  setGrokSettingsControlsDisabled(true);
+  try {
+    const result = await updateGrokSettings({ model });
+    if (!result) throw new Error('Failed to save Grok settings.');
+    applyGrokSettingsState(result, { resetInputs: true });
+    showTransientRelayNotice(
+      result.warning
+        ? `Grok settings saved. ${result.warning}`
+        : `Grok settings saved for ${result.model}.`,
+      result.warning ? 8000 : 4000,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to save Grok settings.');
+  } finally {
+    grokSettingsUpdateInFlight = false;
+    setGrokSettingsControlsDisabled(false);
+    applyGrokSettingsState(grokSettingsState);
+  }
+}
+
+export async function toggleGrokProvider(enabled) {
+  if (grokSettingsUpdateInFlight) return;
+  grokSettingsUpdateInFlight = true;
+  setGrokSettingsControlsDisabled(true);
+  try {
+    const result = await updateGrokSettings({ enabled: enabled === true });
+    if (!result) throw new Error('Failed to update the Grok provider.');
+    applyGrokSettingsState(result);
+    const providerLabel = result.enabled ? 'Grok provider enabled' : 'Grok provider disabled';
+    showTransientRelayNotice(
+      `${providerLabel}.${result.warning ? ` ${result.warning}` : ''}`,
+      result.warning ? 8000 : 4500,
+    );
+  } catch (error) {
+    applyGrokSettingsState(grokSettingsState);
+    alert(error?.message || 'Failed to update the Grok provider.');
+  } finally {
+    grokSettingsUpdateInFlight = false;
+    setGrokSettingsControlsDisabled(false);
+    applyGrokSettingsState(grokSettingsState);
+  }
+}
+
 let cursorSettingsUpdateInFlight = false;
 let cursorSettingsState = {
   configured: false,
@@ -552,6 +672,106 @@ export async function saveCursorAllowanceSettings({ resetAccounting = false } = 
 export async function resetCursorAllowanceAccounting() {
   if (!confirm('Reset the tracked Cursor spend for the current billing cycle?')) return;
   await saveCursorAllowanceSettings({ resetAccounting: true });
+}
+
+// ── Grok manual plan allowance ──
+// Grok ACP reports per-turn cost/tokens but no remaining plan credits.
+let grokAllowanceUpdateInFlight = false;
+
+function setGrokAllowanceControlsDisabled(disabled) {
+  for (const id of [
+    'grok-allowance-monthly-input',
+    'grok-allowance-reset-day-input',
+    'grok-allowance-save-btn',
+    'grok-allowance-reset-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyGrokAllowanceState(settings = {}) {
+  const monthly = document.getElementById('grok-allowance-monthly-input');
+  const resetDay = document.getElementById('grok-allowance-reset-day-input');
+  const status = document.getElementById('grok-allowance-status');
+  if (monthly) {
+    monthly.value = settings?.monthlyUsd === null || settings?.monthlyUsd === undefined
+      ? ''
+      : String(settings.monthlyUsd);
+  }
+  if (resetDay) resetDay.value = String(settings?.resetDay ?? 1);
+  if (status) {
+    const configured = settings?.monthlyUsd != null;
+    status.textContent = configured
+      ? `Tracking estimated spend against $${settings.monthlyUsd}/mo; resets on day ${settings?.resetDay ?? 1}.`
+      : 'No allowance set — Check Usage shows last-turn Grok cost/tokens without a remaining-budget meter.';
+    status.dataset.state = configured ? 'active' : 'unconfigured';
+  }
+  setGrokAllowanceControlsDisabled(grokAllowanceUpdateInFlight);
+  return settings;
+}
+
+export async function refreshGrokAllowanceState() {
+  try {
+    const settings = await loadGrokAllowanceSettings();
+    if (!settings) return null;
+    return applyGrokAllowanceState(settings);
+  } catch {
+    const status = document.getElementById('grok-allowance-status');
+    if (status) {
+      status.textContent = 'Unable to load Grok allowances.';
+      status.dataset.state = 'error';
+    }
+    return null;
+  }
+}
+
+function readGrokResetDayInput() {
+  const input = document.getElementById('grok-allowance-reset-day-input');
+  if (!input) return undefined;
+  if (input.validity?.badInput) throw new Error('Billing reset day must be a whole number between 1 and 31.');
+  const raw = String(input.value ?? '').trim();
+  if (raw === '') return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 31) {
+    throw new Error('Billing reset day must be between 1 and 31.');
+  }
+  return Math.round(parsed);
+}
+
+export async function saveGrokAllowanceSettings({ resetAccounting = false } = {}) {
+  if (grokAllowanceUpdateInFlight) return;
+  let payload;
+  try {
+    const resetDay = readGrokResetDayInput();
+    payload = {
+      monthlyUsd: readAllowanceInput('grok-allowance-monthly-input', 'Grok monthly allowance'),
+      ...(resetDay === undefined ? {} : { resetDay }),
+      ...(resetAccounting ? { resetAccounting: true } : {}),
+    };
+  } catch (error) {
+    alert(error?.message || 'Please check the Grok allowance values.');
+    return;
+  }
+  grokAllowanceUpdateInFlight = true;
+  setGrokAllowanceControlsDisabled(true);
+  try {
+    const result = await updateGrokAllowanceSettings(payload);
+    grokAllowanceUpdateInFlight = false;
+    applyGrokAllowanceState(result);
+    showTransientRelayNotice(resetAccounting
+      ? 'Grok allowances saved and tracked spend reset.'
+      : 'Grok allowances saved.');
+  } catch (error) {
+    grokAllowanceUpdateInFlight = false;
+    setGrokAllowanceControlsDisabled(false);
+    alert(error?.message || 'Failed to update Grok allowances.');
+  }
+}
+
+export async function resetGrokAllowanceAccounting() {
+  if (!confirm('Reset the tracked Grok spend for the current billing cycle?')) return;
+  await saveGrokAllowanceSettings({ resetAccounting: true });
 }
 
 async function syncCursorSettingsInputs() {
@@ -926,10 +1146,14 @@ export function openSettingsModal() {
   claudeSettingsInputsDirty = false;
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();
+  grokSettingsInputsDirty = false;
+  ensureGrokSettingsInputTracking();
+  void syncGrokSettingsInputs();
   cursorSettingsInputsDirty = false;
   ensureCursorSettingsInputTracking();
   void syncCursorSettingsInputs();
   void refreshCursorAllowanceState();
+  void refreshGrokAllowanceState();
   syncWindowsAutostartSetting();
   void refreshWindowsAutostartSetting();
   syncTurnCeilingSlider();

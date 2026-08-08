@@ -250,6 +250,43 @@ export async function updateClaudeSettings({
   }
 }
 
+export async function loadGrokSettings() {
+  return apiFetch('/api/settings/grok');
+}
+
+export async function updateGrokSettings({
+  enabled = undefined,
+  model = undefined,
+  enabledModels = undefined,
+} = {}) {
+  const payload = {};
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}/api/settings/grok`, {
+      signal: requestTimeoutSignal(),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = String(result?.error || `Failed to update Grok settings (${response.status})`).trim();
+      throw new Error(message);
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure('/api/settings/grok', error);
+    throw error;
+  }
+}
+
 export async function updateOpenAISettings({
   apiKey = '',
   model = 'gpt-4o',
@@ -385,6 +422,17 @@ export async function loadCursorAllowanceSettings() {
 
 export async function updateCursorAllowanceSettings(payload = {}) {
   return apiFetch('/api/settings/cursor-allowance', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function loadGrokAllowanceSettings() {
+  return apiFetch('/api/settings/grok-allowance');
+}
+
+export async function updateGrokAllowanceSettings(payload = {}) {
+  return apiFetch('/api/settings/grok-allowance', {
     method: 'POST',
     body: JSON.stringify(payload),
   });

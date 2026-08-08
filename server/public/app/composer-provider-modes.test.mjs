@@ -19,7 +19,7 @@ function sliceBetween(startMarker, endMarker) {
 test('every provider scope has a relay-mode list covering the shared vocabulary', () => {
   const tableSource = sliceBetween('const RELAY_MODES_BY_PROVIDER = {', '\nfunction relayModesForProvider(');
   const modes = new Function(`${tableSource}\nreturn RELAY_MODES_BY_PROVIDER;`)();
-  assert.deepEqual(Object.keys(modes).sort(), ['claude', 'cursor', 'github', 'openai']);
+  assert.deepEqual(Object.keys(modes).sort(), ['claude', 'cursor', 'github', 'grok', 'openai']);
   for (const [provider, list] of Object.entries(modes)) {
     assert.ok(list.includes('agent'), `${provider} must offer agent`);
     for (const mode of list) {

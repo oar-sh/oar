@@ -35,6 +35,7 @@ import {
   CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN,
   isSafeClaudeModelId,
   isSafeCursorModelId,
+  isSafeGrokModelId,
   isSafeProviderModelId,
 } from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
@@ -269,6 +270,28 @@ export function parseCursorSettingsUpdateRequest(body = {}) {
   };
 }
 
+export function parseGrokSettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const hasEnabled = typeof payload.enabled === 'boolean';
+  const hasModel = Object.prototype.hasOwnProperty.call(payload, 'model');
+  const model = hasModel ? (String(payload.model || '').trim() || 'grok-4.5') : undefined;
+  const hasModels = Array.isArray(payload.models);
+  const hasEnabledModels = Array.isArray(payload.enabledModels);
+  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels) {
+    return { ok: false, error: 'No Grok settings update provided' };
+  }
+  if (hasModel && !isSafeGrokModelId(model)) {
+    return { ok: false, error: 'Invalid Grok model ID' };
+  }
+  return {
+    ok: true,
+    ...(hasEnabled ? { enabled: payload.enabled } : {}),
+    ...(hasModel ? { model } : {}),
+    ...(hasModels ? { models: payload.models } : {}),
+    ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+  };
+}
+
 export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSettings = {}) {
   const configured = claudeSettings?.enabled === true;
   const model = String(claudeSettings?.model || '').trim();
@@ -478,12 +501,80 @@ export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSetti
   };
 }
 
+export function buildModelCatalogWithGrokProvider(modelState = {}, grokSettings = {}) {
+  const configured = grokSettings?.enabled === true;
+  const model = String(grokSettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const baseModels = new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+  const grokModelList = Array.isArray(grokSettings?.models)
+    ? grokSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const grokModels = [];
+  const seenGrokModels = new Set();
+  for (const grokModelId of [model, ...grokModelList]) {
+    const lowerId = grokModelId.toLowerCase();
+    if (seenGrokModels.has(lowerId)) continue;
+    seenGrokModels.add(lowerId);
+    grokModels.push(grokModelId);
+  }
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), ...grokModels]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const grokReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  const grokEffortsByModel = grokSettings?.effortsByModel && typeof grokSettings.effortsByModel === 'object'
+    ? grokSettings.effortsByModel
+    : {};
+  for (const grokModel of grokModels) {
+    const providersKey = String(grokModel || '').trim();
+    if (!providersKey) continue;
+    const lowerKey = providersKey.toLowerCase();
+    const grokEfforts = Array.isArray(grokEffortsByModel[lowerKey]) && grokEffortsByModel[lowerKey].length
+      ? grokEffortsByModel[lowerKey]
+      : ['none', 'low', 'medium', 'high'];
+    grokReasoningByModel[lowerKey] = [...grokEfforts];
+    if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
+      reasoningByModel[lowerKey] = [...grokEfforts];
+    }
+    const existingProviders = Array.isArray(providersByModel[providersKey])
+      ? providersByModel[providersKey]
+      : (Array.isArray(providersByModel[lowerKey])
+          ? providersByModel[lowerKey]
+          : (modelMetadataByModel[providersKey]?.provider ? [modelMetadataByModel[providersKey].provider] : []));
+    providersByModel[providersKey] = Array.from(new Set([
+      ...existingProviders,
+      ...(baseModels.has(lowerKey) ? ['github-copilot'] : []),
+      'grok',
+    ]));
+    modelMetadataByModel[providersKey] = {
+      ...(modelMetadataByModel[providersKey] || {}),
+      provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'grok'),
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      grok: grokReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude' || normalized === 'claude-agent-sdk' || normalized === 'anthropic') return 'claude';
   if (normalized === 'cursor') return 'cursor';
+  if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }
@@ -1703,6 +1794,9 @@ export function registerSessionsRoutes(app, deps) {
     getCursorProviderSettings = () => ({ configured: false, enabled: false, model: 'composer-2.5', models: [] }),
     setCursorProviderSettings = () => ({ ok: false, error: 'Cursor settings are unavailable' }),
     refreshCursorProviderModels = async () => ({ ok: false, models: [], error: 'Cursor model discovery is unavailable' }),
+    getGrokProviderSettings = () => ({ configured: false, enabled: false, model: 'grok-4.5', models: [] }),
+    setGrokProviderSettings = () => ({ ok: false, error: 'Grok settings are unavailable' }),
+    refreshGrokProviderModels = async () => ({ ok: false, models: [], error: 'Grok model discovery is unavailable' }),
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -1729,9 +1823,15 @@ export function registerSessionsRoutes(app, deps) {
     // token cannot read billing, in which case the Copilot card degrades to its
     // quota meters alone.
     fetchCopilotBillingUsage = null,
+    // Optional live Grok subscription quota (weekly SuperGrok %); absent in
+    // tests and when the host CLI is not logged in, in which case the Grok
+    // card degrades to the local estimated view.
+    fetchGrokBillingUsage = null,
     planUsageService = null,
     getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
     setCursorPlanAllowanceSettings = () => ({ ok: false, error: 'Cursor allowance settings are unavailable' }),
+    getGrokPlanAllowanceSettings = () => ({ monthlyUsd: null, resetDay: 1 }),
+    setGrokPlanAllowanceSettings = () => ({ ok: false, error: 'Grok allowance settings are unavailable' }),
     sessionHistoryRefreshService,
     sdkSessionImportService,
     ensureRuntimeSessionBinding,
@@ -1862,12 +1962,15 @@ export function registerSessionsRoutes(app, deps) {
 
   // Layer every enabled provider's models onto the base Copilot catalog.
   function buildModelCatalogWithProviders(modelState, openAISettings = getOpenAIProviderSettings()) {
-    return buildModelCatalogWithCursorProvider(
-      buildModelCatalogWithClaudeProvider(
-        buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
-        getClaudeProviderSettings(),
+    return buildModelCatalogWithGrokProvider(
+      buildModelCatalogWithCursorProvider(
+        buildModelCatalogWithClaudeProvider(
+          buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
+          getClaudeProviderSettings(),
+        ),
+        getCursorProviderSettings(),
       ),
-      getCursorProviderSettings(),
+      getGrokProviderSettings(),
     );
   }
 
@@ -2578,8 +2681,10 @@ export function registerSessionsRoutes(app, deps) {
       || null;
     const copilotSessionId = String(runtimeSessionBySdkSessionId?.sdk_session_id || runtimeSession?.sdk_session_id || '').trim() || null;
     const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
-    // The cursor worker posts the same Claude-shaped usage blob, so both providers share the stored reader.
-    const usesStoredContextUsage = providerType === 'claude' || providerType === 'cursor';
+    // The cursor and grok workers post the same Claude-shaped usage blob, so
+    // all three providers share the stored reader.
+    const usesStoredContextUsage = providerType === 'claude' || providerType === 'cursor'
+      || providerType === 'grok';
 
     const parsed = usesStoredContextUsage
       ? (() => {
@@ -2590,7 +2695,7 @@ export function registerSessionsRoutes(app, deps) {
           eventsPath: null,
           error: stored.snapshot
             ? null
-            : 'No context data captured yet for this Claude session; it is recorded when a turn completes.',
+            : 'No context data captured yet for this session; it is recorded when a turn completes.',
         };
       })()
       : {
@@ -3878,6 +3983,23 @@ export function registerSessionsRoutes(app, deps) {
         code: 'CURSOR_MODEL_UNAVAILABLE',
       });
     }
+    const grokSettings = getGrokProviderSettings();
+    const availableGrokModels = new Set([
+      String(grokSettings?.model || '').trim(),
+      ...(Array.isArray(grokSettings?.models) ? grokSettings.models : []),
+    ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean));
+    if (
+      requestedProviderType === 'grok'
+      && requestedBootstrapModel
+      && requestedBootstrapModel.toLowerCase() !== 'auto'
+      && !availableGrokModels.has(requestedBootstrapModel.toLowerCase())
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Requested Grok model is not available',
+        code: 'GROK_MODEL_UNAVAILABLE',
+      });
+    }
     const useOpenAIProvider = requestedProviderType === 'openai'
       || requestedProviderType === 'openai-image'
       || (
@@ -3904,6 +4026,15 @@ export function registerSessionsRoutes(app, deps) {
         && availableCursorModels.has(requestedBootstrapModel.toLowerCase())
       )
     );
+    const useGrokProvider = !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && (
+      requestedProviderType === 'grok'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableGrokModels.has(requestedBootstrapModel.toLowerCase())
+      )
+    );
     if (useOpenAIProvider && openAISettings?.configured !== true) {
       return res.status(400).json({
         ok: false,
@@ -3923,6 +4054,13 @@ export function registerSessionsRoutes(app, deps) {
         ok: false,
         error: 'Cursor API key is not configured',
         code: 'CURSOR_NOT_CONFIGURED',
+      });
+    }
+    if (useGrokProvider && grokSettings?.enabled !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Grok provider is not enabled',
+        code: 'GROK_NOT_CONFIGURED',
       });
     }
 
@@ -3965,7 +4103,13 @@ export function registerSessionsRoutes(app, deps) {
               configuredModel: cursorSettings.model,
               availableModels: Array.from(availableCursorModels),
             })
-          : catalogSelectedModel));
+          : (useGrokProvider
+            ? resolveOpenAISessionModel({
+                requestedModel: catalogSelectedModel,
+                configuredModel: grokSettings.model,
+                availableModels: Array.from(availableGrokModels),
+              })
+            : catalogSelectedModel)));
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
       return res.status(400).json({
         ok: false,
@@ -3973,7 +4117,7 @@ export function registerSessionsRoutes(app, deps) {
         code: 'OPENAI_IMAGE_MODEL_REQUIRED',
       });
     }
-    if (!useOpenAIProvider && !useClaudeProvider && !useCursorProvider) {
+    if (!useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider) {
       const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
         ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
         : [];
@@ -4004,10 +4148,26 @@ export function registerSessionsRoutes(app, deps) {
           code: 'CURSOR_PROVIDER_REQUIRED',
         });
       }
+      const grokOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'grok');
+      if (grokOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the Grok provider`,
+          code: 'GROK_PROVIDER_REQUIRED',
+        });
+      }
     }
 
     try {
       stmts.insertConv.run(conversationId, title, now, now);
+      const bootstrapProviderType = useOpenAIProvider
+        ? 'openai'
+        : (useClaudeProvider
+          ? 'claude'
+          : (useCursorProvider
+            ? 'cursor'
+            : (useGrokProvider ? 'grok' : 'github')));
       const runtimeSession = ensureRuntimeSessionBinding(
         conversationId,
         selectedModel,
@@ -4015,8 +4175,8 @@ export function registerSessionsRoutes(app, deps) {
         conversationId,
         {
           assignConfiguredProvider: true,
-          providerType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : (useCursorProvider ? 'cursor' : 'github')),
-          providerModel: (useOpenAIProvider || useClaudeProvider || useCursorProvider) ? selectedModel : null,
+          providerType: bootstrapProviderType,
+          providerModel: (useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider) ? selectedModel : null,
         },
       );
       // Seed the configured root before ensureWorker so the very first launch
@@ -4366,6 +4526,72 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  app.get('/api/settings/grok', auth, (_req, res) => {
+    const settings = getGrokProviderSettings();
+    return res.json({
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'grok-4.5').trim() || 'grok-4.5',
+      models: Array.isArray(settings?.models) ? settings.models : [],
+      availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+    });
+  });
+
+  app.post('/api/settings/grok', auth, async (req, res) => {
+    const parsed = parseGrokSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const previous = getGrokProviderSettings();
+    const result = setGrokProviderSettings(parsed);
+    if (!result?.ok) {
+      return res.status(400).json({
+        error: result?.error || 'Failed to update Grok settings',
+      });
+    }
+    const shouldDiscover = result.enabled === true && (
+      previous?.enabled !== true
+      || previous?.model !== result.model
+      || previous?.modelsDiscovered !== true
+    );
+    const discovery = !shouldDiscover
+      ? { ok: true, models: [], error: null }
+      : await refreshGrokProviderModels();
+    const reconciliationResult = await reconcileUnstartedConversationProviders({
+      enabled: result.enabled === true,
+      model: result.model,
+      provider: 'grok',
+    });
+    const reconciliation = {
+      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
+        ? reconciliationResult.failedConversations
+        : [],
+    };
+    const currentSettings = getGrokProviderSettings();
+    const settingsPayload = {
+      configured: currentSettings?.configured === true,
+      enabled: currentSettings?.enabled === true,
+      model: String(currentSettings?.model || result.model || 'grok-4.5').trim() || 'grok-4.5',
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
+      reconciliation,
+    };
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('grok_settings_updated', settingsPayload);
+    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
+      ? reconciliation.failedConversations
+      : [];
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      warning: reconciliationFailures.length
+        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'Grok model discovery failed')),
+    });
+  });
+
   app.get('/api/settings/cursor', auth, (_req, res) => {
     const settings = getCursorProviderSettings();
     return res.json({
@@ -4693,6 +4919,7 @@ export function registerSessionsRoutes(app, deps) {
     const modelState = getModelCatalogState();
     const claudeSettings = getClaudeProviderSettings();
     const cursorSettings = getCursorProviderSettings();
+    const grokSettings = getGrokProviderSettings();
     return {
       ...buildModelVariantCatalogPayload({
         rows,
@@ -4715,6 +4942,13 @@ export function registerSessionsRoutes(app, deps) {
             enabledModels: Array.isArray(cursorSettings.models) ? cursorSettings.models : [],
           }
         : null,
+      grokModels: grokSettings?.enabled === true
+        ? {
+            defaultModel: grokSettings.model,
+            availableModels: Array.isArray(grokSettings.availableModels) ? grokSettings.availableModels : [],
+            enabledModels: Array.isArray(grokSettings.models) ? grokSettings.models : [],
+          }
+        : null,
     };
   }
 
@@ -4732,6 +4966,7 @@ export function registerSessionsRoutes(app, deps) {
       const openAISettings = getOpenAIProviderSettings();
       const claudeSettings = getClaudeProviderSettings();
       const cursorSettings = getCursorProviderSettings();
+      const grokSettings = getGrokProviderSettings();
       const refreshTasks = [
         refreshModelVariantCatalogFromCli(),
         openAISettings?.enabled === true
@@ -4743,8 +4978,11 @@ export function registerSessionsRoutes(app, deps) {
         cursorSettings?.enabled === true
           ? refreshCursorProviderModels()
           : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        grokSettings?.enabled === true
+          ? refreshGrokProviderModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
       ];
-      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh] = await Promise.allSettled(refreshTasks);
+      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh] = await Promise.allSettled(refreshTasks);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
       const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
         ? openAIRefresh.value
@@ -4767,6 +5005,13 @@ export function registerSessionsRoutes(app, deps) {
             models: Array.isArray(cursorSettings?.models) ? cursorSettings.models : [],
             error: cursorRefresh.reason?.message || 'Cursor model discovery failed',
           };
+      const grokModelDiscovery = grokRefresh.status === 'fulfilled'
+        ? grokRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(grokSettings?.models) ? grokSettings.models : [],
+            error: grokRefresh.reason?.message || 'Grok model discovery failed',
+          };
       io.emit('models_updated', buildModelCatalogWithProviders(
         getModelCatalogState(),
       ));
@@ -4776,6 +5021,7 @@ export function registerSessionsRoutes(app, deps) {
         openAIModelDiscovery,
         claudeModelDiscovery,
         cursorModelDiscovery,
+        grokModelDiscovery,
       });
     } catch (error) {
       return res.status(500).json({
@@ -4882,6 +5128,16 @@ export function registerSessionsRoutes(app, deps) {
 
     const claudeSettings = getClaudeProviderSettings();
     const cursorSettings = getCursorProviderSettings();
+    const grokSettings = getGrokProviderSettings();
+    // Live Grok subscription quota is best-effort like Copilot billing.
+    let grokBilling = null;
+    if (grokSettings?.enabled === true && typeof fetchGrokBillingUsage === 'function') {
+      try {
+        grokBilling = await fetchGrokBillingUsage();
+      } catch {
+        grokBilling = null;
+      }
+    }
     const report = planUsageService.buildReport({
       copilotSummary: summary,
       copilotError: summaryError,
@@ -4889,6 +5145,9 @@ export function registerSessionsRoutes(app, deps) {
       claudeConfigured: claudeSettings?.enabled === true,
       cursorConfigured: cursorSettings?.enabled === true,
       cursorAllowances: getCursorPlanAllowanceSettings(),
+      grokConfigured: grokSettings?.enabled === true,
+      grokAllowances: getGrokPlanAllowanceSettings(),
+      grokBilling,
     });
 
     // Legacy top-level fields stay alongside `providers` so an older cached
@@ -4910,6 +5169,23 @@ export function registerSessionsRoutes(app, deps) {
     });
     if (!result?.ok) {
       return res.status(400).json({ error: result?.error || 'Failed to update Cursor allowances' });
+    }
+    return res.json(result);
+  });
+
+  app.get('/api/settings/grok-allowance', auth, (_req, res) => {
+    res.json({ ok: true, ...getGrokPlanAllowanceSettings() });
+  });
+
+  app.post('/api/settings/grok-allowance', auth, (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = setGrokPlanAllowanceSettings({
+      monthlyUsd: body.monthlyUsd,
+      resetDay: body.resetDay,
+      resetAccounting: body.resetAccounting === true,
+    });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update Grok allowances' });
     }
     return res.json(result);
   });

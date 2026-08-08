@@ -65,6 +65,12 @@ export function isSafeCursorModelId(value) {
   return isSafeProviderModelId(value);
 }
 
+// Grok / xAI model ids ("grok-4.5", "grok-code-fast-1") use the same safe-token
+// rules as other unprefixed agent providers.
+export function isSafeGrokModelId(value) {
+  return isSafeProviderModelId(value);
+}
+
 // The "[1m]" suffix marks the 1M-context variant of a Claude model. The UI
 // treats it as a context tier of the base model, not a separate model.
 export const CLAUDE_LONG_CONTEXT_SUFFIX = '[1m]';

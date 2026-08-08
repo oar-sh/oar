@@ -19,6 +19,7 @@ import {
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
 import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services/plan-usage-claude.mjs';
+import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 
@@ -973,6 +974,7 @@ export function buildDequeuedRelayMessage({
     providerModel: String(runtimeSession?.provider_model || '').trim() || null,
     claudeNativeSessionId: String(runtimeSession?.claude_native_session_id || '').trim() || null,
     cursorAgentId: String(runtimeSession?.cursor_agent_id || '').trim() || null,
+    grokNativeSessionId: String(runtimeSession?.grok_native_session_id || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
     quality: normalizeOpenAIImageQuality(msg.reasoning_effort),
@@ -1513,6 +1515,7 @@ export function registerMessagesRoutes(app, deps) {
     getOpenAIProviderSettings = () => ({ enabled: false, model: '' }),
     getClaudeProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     getCursorProviderSettings = () => ({ enabled: false, model: '', models: [] }),
+    getGrokProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
@@ -1539,6 +1542,7 @@ export function registerMessagesRoutes(app, deps) {
     fetchUsageSummary = null,
     planUsageService = null,
     getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
+    getGrokPlanAllowanceSettings = () => ({ monthlyUsd: null, resetDay: 1 }),
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
     relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
@@ -3632,9 +3636,14 @@ export function registerMessagesRoutes(app, deps) {
     // which provider a request targets. A session already bound to an explicit
     // provider resolves ids against that provider's own catalog, so the
     // cross-provider guards below must not infer a switch from the id alone.
+    // A session already bound to a managed provider resolves models against
+    // that provider's catalog. Include every non-github worker provider here
+    // so cross-provider mid-chat guards do not mis-fire (e.g. Cursor listing
+    // a Grok model id must not 409 a Grok-bound conversation).
     const runtimeBoundToExplicitProvider = runtimeProviderType === 'openai'
       || runtimeProviderType === 'claude'
-      || runtimeProviderType === 'cursor';
+      || runtimeProviderType === 'cursor'
+      || runtimeProviderType === 'grok';
     const configuredOpenAIModel = String(configuredOpenAI?.model || '').trim();
     const availableOpenAIModels = new Set(
       (Array.isArray(configuredOpenAI?.models) ? configuredOpenAI.models : [])
@@ -3716,6 +3725,31 @@ export function registerMessagesRoutes(app, deps) {
         return res.status(409).json({
           error: 'Cursor model selection requires creating a new Cursor conversation',
           code: 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION',
+        });
+      }
+    }
+    // Grok conversations are bootstrap-created only (same isolation as Cursor).
+    const runtimeUsesGrok = runtimeProviderType === 'grok';
+    if (!shouldCreateConversation && !runtimeUsesGrok) {
+      let requestTargetsGrok = requestedProviderType === 'grok';
+      if (
+        !requestTargetsGrok
+        && !runtimeBoundToExplicitProvider
+        && requestedOpenAIModel
+        && !requestedModelAvailableInGitHub
+      ) {
+        const grokSettings = getGrokProviderSettings();
+        const grokOnlyModels = new Set([
+          String(grokSettings?.model || '').trim(),
+          ...(Array.isArray(grokSettings?.models) ? grokSettings.models : [])
+            .map((value) => String(value || '').trim()),
+        ].filter(Boolean));
+        requestTargetsGrok = grokSettings?.enabled === true && grokOnlyModels.has(requestedOpenAIModel);
+      }
+      if (requestTargetsGrok) {
+        return res.status(409).json({
+          error: 'Grok model selection requires creating a new Grok conversation',
+          code: 'GROK_MODEL_REQUIRES_NEW_CONVERSATION',
         });
       }
     }
@@ -3813,6 +3847,30 @@ export function registerMessagesRoutes(app, deps) {
           ? requestedCursorModel
           : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredCursor?.model || '').trim()))
       : '';
+    const configuredGrok = runtimeUsesGrok ? getGrokProviderSettings() : null;
+    const requestedGrokModel = runtimeUsesGrok ? String(model || '').trim() : '';
+    const pinnedGrokModel = runtimeUsesGrok
+      ? String(existingRuntimeSession?.provider_model || '').trim()
+      : '';
+    // The Grok ACP surface has no mid-session model switch (the model rides
+    // only on session/new `_meta`), so the model pinned at bootstrap is
+    // locked for the conversation's lifetime. A different request is refused
+    // rather than silently relabeled.
+    if (
+      runtimeUsesGrok
+      && requestedGrokModel
+      && requestedGrokModel.toLowerCase() !== AUTO_MODEL_SENTINEL
+      && pinnedGrokModel
+      && requestedGrokModel.toLowerCase() !== pinnedGrokModel.toLowerCase()
+    ) {
+      return res.status(409).json({
+        error: 'Grok model switching requires creating a new Grok conversation',
+        code: 'GROK_MODEL_REQUIRES_NEW_CONVERSATION',
+      });
+    }
+    const grokModel = runtimeUsesGrok
+      ? (pinnedGrokModel || String(configuredGrok?.model || '').trim())
+      : '';
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -3837,7 +3895,15 @@ export function registerMessagesRoutes(app, deps) {
               reasoningEffort: null,
               error: cursorModel ? null : 'Cursor model is not configured',
             }
-          : resolveRequestedModel(model)));
+          : (runtimeUsesGrok
+            ? {
+                ok: !!grokModel,
+                model: grokModel,
+                modelVariantId: grokModel,
+                reasoningEffort: null,
+                error: grokModel ? null : 'Grok model is not configured',
+              }
+            : resolveRequestedModel(model))));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -3890,16 +3956,26 @@ export function registerMessagesRoutes(app, deps) {
       const effort = discovered.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort, supported: discovered };
     };
+    const resolveGrokReasoningEffort = () => {
+      const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
+      const supported = Array.isArray(configuredGrok?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
+        ? configuredGrok.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
+        : ['none', 'low', 'medium', 'high'];
+      const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
+      return { ok: true, effort, supported };
+    };
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
       : (runtimeUsesClaude
         ? resolveClaudeReasoningEffort()
         : (runtimeUsesCursor
           ? resolveCursorReasoningEffort()
-          : resolveRequestedReasoningEffort(
-              requestedModel,
-              explicitReasoningEffort || modelResolution.reasoningEffort || null,
-            )));
+          : (runtimeUsesGrok
+            ? resolveGrokReasoningEffort()
+            : resolveRequestedReasoningEffort(
+                requestedModel,
+                explicitReasoningEffort || modelResolution.reasoningEffort || null,
+              ))));
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
@@ -4325,6 +4401,33 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true, pendingCount });
   });
 
+  // POST /api/grok-native-session — Grok worker persists the ACP session id so
+  // later turns can session/load it across worker restarts.
+  app.post('/api/grok-native-session', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const grokNativeSessionId = String(req.body?.grokNativeSessionId || '').trim();
+    if (!conversationId || !grokNativeSessionId) {
+      return res.status(400).json({ error: 'Missing conversationId or grokNativeSessionId' });
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'grok') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Grok provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionGrokNativeSessionId?.run !== 'function') {
+      return res.status(500).json({ error: 'Grok native session storage is unavailable' });
+    }
+    stmts.updateRuntimeSessionGrokNativeSessionId.run(
+      grokNativeSessionId,
+      new Date().toISOString(),
+      conversationId,
+    );
+    res.json({ ok: true });
+  });
+
   // POST /api/claude-native-session — Claude worker persists the native Agent
   // SDK session id so later turns can resume it across worker restarts.
   app.post('/api/claude-native-session', auth, (req, res) => {
@@ -4389,6 +4492,37 @@ export function registerMessagesRoutes(app, deps) {
     });
     stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
     res.json({ ok: true });
+  });
+
+  // POST /api/grok-plan-usage — Grok worker reports per-prompt tokens/cost from
+  // the session/prompt result `_meta`. There is no ACP plan-quota API; the
+  // relay stores the last turn and optionally accumulates spend into a local
+  // monthly cycle when the user sets an allowance.
+  app.post('/api/grok-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'grok') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Grok provider' });
+    }
+    const usage = normalizeGrokTurnUsage({
+      ...(req.body?.usage && typeof req.body.usage === 'object' ? req.body.usage : {}),
+      model: req.body?.model,
+      modelId: req.body?.model || req.body?.usage?.modelId,
+      capturedAt: req.body?.capturedAt,
+    });
+    if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
+    const allowances = getGrokPlanAllowanceSettings();
+    const applied = planUsageService.recordGrokUsageReport(usage, {
+      resetDay: allowances.resetDay,
+    });
+    if (!applied) return res.status(400).json({ error: 'Missing usable usage metrics' });
+    res.json({ ok: true, cycle: applied.cycle.key });
   });
 
   // POST /api/claude-plan-usage — Claude worker reports the session's
@@ -4495,6 +4629,45 @@ export function registerMessagesRoutes(app, deps) {
     }
     if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'cursor') {
       return res.status(409).json({ error: 'Conversation is not bound to the Cursor provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
+      return res.status(500).json({ error: 'Context usage storage is unavailable' });
+    }
+
+    const payload = JSON.stringify({
+      model: String(req.body?.model || '').trim() || null,
+      contextUsage,
+      modelUsage,
+    });
+    stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
+    res.json({ ok: true });
+  });
+
+  // POST /api/grok-context-usage — Grok worker reports the session's
+  // context-window breakdown after a turn (per-prompt tokens from the ACP
+  // result `_meta`). Grok sessions have no Copilot events.jsonl to tail, so
+  // this is what feeds the composer indicator and the context-usage modal.
+  app.post('/api/grok-context-usage', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+
+    const contextUsage = req.body?.contextUsage && typeof req.body.contextUsage === 'object'
+      ? req.body.contextUsage
+      : null;
+    const modelUsage = req.body?.modelUsage && typeof req.body.modelUsage === 'object'
+      ? req.body.modelUsage
+      : null;
+    if (!contextUsage && !modelUsage) {
+      return res.status(400).json({ error: 'Missing contextUsage or modelUsage' });
+    }
+
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'grok') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Grok provider' });
     }
     if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
       return res.status(500).json({ error: 'Context usage storage is unavailable' });

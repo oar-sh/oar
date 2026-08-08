@@ -67,7 +67,7 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
 - Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
 - **Context usage** modal with a per-category token breakdown of the model's context window
-- **Plan usage** modal with subscription credits, rate-limit windows and reset countdowns for Copilot, Claude, and Cursor
+- **Plan usage** modal with subscription credits, rate-limit windows and reset countdowns for Copilot, Claude, Cursor, and Grok
 - **Image conversations** (OpenAI BYOK): generate images in chat and iterate on a generated image with *Edit this image*
 - **Share** a conversation by link, with per-message *Hide from shares* control
 - Conversation history stored in local SQLite
@@ -228,7 +228,8 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
   - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing.
   - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn.
   - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools. Cursor exposes no account API for included pools, so these figures are estimates and the Spending dashboard remains authoritative.
-- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, and Cursor turns do not consume Copilot premium requests, and no usage line is attached to them.
+  - **Grok** — per-turn tokens and estimated cost from the agent prompt result (no live plan-quota API over ACP). Optional monthly USD allowance in Settings for an estimated remaining meter; card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
+- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
 - Use the **Context** button for a per-category breakdown of the conversation's context window: a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets.
 - Use **Share** in the conversation menu to publish a read-only link. Hover any message and choose **Hide from shares** to keep it out of the shared view without deleting it; hidden messages stay fully visible to you and are marked as hidden.
 - External links in chat open in a new tab with `noopener`/`noreferrer`; workspace file mentions stay in the in-app preview.

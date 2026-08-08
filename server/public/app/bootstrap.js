@@ -61,6 +61,7 @@ import {
   saveEnabledModelVariants,
   updateClaudeSettings,
   updateCursorSettings,
+  updateGrokSettings,
   loadConversation,
   refreshConversationHistory,
   updateConversationTitle,
@@ -215,10 +216,16 @@ import {
   toggleClaudeProvider,
   applyClaudeSettingsState,
   refreshClaudeSettingsState,
+  saveGrokSettings,
+  toggleGrokProvider,
+  applyGrokSettingsState,
+  refreshGrokSettingsState,
   saveCursorSettings,
   removeCursorSettings,
   saveCursorAllowanceSettings,
   resetCursorAllowanceAccounting,
+  saveGrokAllowanceSettings,
+  resetGrokAllowanceAccounting,
   toggleCursorProvider,
   applyCursorSettingsState,
   refreshCursorSettingsState,
@@ -261,6 +268,7 @@ const PROVIDER_LABELS = {
   'openai-byok': 'OpenAI (BYOK)',
   claude: 'Claude SDK',
   cursor: 'Cursor SDK',
+  grok: 'Grok',
   'github-copilot': 'GitHub Copilot',
   // Vendor grouping for Copilot-served rows, distinct from the Claude SDK runtime.
   anthropic: 'Anthropic',
@@ -1075,6 +1083,30 @@ function currentOpenAIModelLock() {
   };
 }
 
+// A Grok conversation's model is fixed once the first message exists: the ACP
+// session cannot switch models mid-session and the relay 409s any attempt, so
+// the composer pins the picker instead of offering a switch that would fail.
+function currentGrokModelLock() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const providerType = String(
+    conversation?.runtimeProviderType
+    || conversation?.runtime_provider_type
+    || '',
+  ).trim().toLowerCase();
+  if (providerType !== 'grok' || !currentConversationHasMessages()) return null;
+  return {
+    model: String(
+      conversation?.runtimeProviderModel
+      || conversation?.runtime_provider_model
+      || '',
+    ).trim(),
+  };
+}
+
+function currentRuntimeModelLock() {
+  return currentOpenAIModelLock() || currentGrokModelLock();
+}
+
 // The runtime model decides the OpenAI/OpenAI Image distinction. Before the
 // first message the runtime model can still be rebound, so the composer
 // selection is the fresher source there.
@@ -1112,9 +1144,9 @@ function syncAutoModelAvailability() {
   }
   const autoOption = Array.from(select.options).find((option) => option.value.toLowerCase() === AUTO_MODEL_OPTION);
   const hasMessages = currentConversationHasMessages();
-  const openAILock = currentOpenAIModelLock();
+  const runtimeLock = currentRuntimeModelLock();
   for (const option of Array.from(select.options)) {
-    if (option.dataset.runtimeModelLock === '1' && option.value !== openAILock?.model) {
+    if (option.dataset.runtimeModelLock === '1' && option.value !== runtimeLock?.model) {
       option.remove();
     }
   }
@@ -1131,23 +1163,23 @@ function syncAutoModelAvailability() {
       && Array.from(select.options).some((option) => option.value === modelId));
     if (fallback) select.value = fallback;
   }
-  if (openAILock?.model && !Array.from(select.options).some((option) => option.value === openAILock.model)) {
+  if (runtimeLock?.model && !Array.from(select.options).some((option) => option.value === runtimeLock.model)) {
     const option = document.createElement('option');
-    option.value = openAILock.model;
-    option.textContent = `🔒 ${modelOptionLabel(openAILock.model)}`;
+    option.value = runtimeLock.model;
+    option.textContent = `🔒 ${modelOptionLabel(runtimeLock.model)}`;
     option.dataset.runtimeModelLock = '1';
     select.appendChild(option);
   }
-  if (openAILock?.model) {
-    select.value = openAILock.model;
+  if (runtimeLock?.model) {
+    select.value = runtimeLock.model;
   }
-  select.dataset.runtimeModelLocked = openAILock ? '1' : '0';
+  select.dataset.runtimeModelLocked = runtimeLock ? '1' : '0';
   const metadataBlocked = modelMetadataBlocked || !isModelMetadataHealthy();
-  select.disabled = metadataBlocked || !!openAILock;
-  select.title = openAILock
-    ? `Model locked to ${openAILock.model || 'the configured OpenAI model'} for this active OpenAI session`
+  select.disabled = metadataBlocked || !!runtimeLock;
+  select.title = runtimeLock
+    ? `Model locked to ${runtimeLock.model || 'the configured provider model'} for this active session`
     : (metadataBlocked ? 'Model metadata unavailable' : 'Model');
-  syncSessionLockNote({ pinnedModel: openAILock?.model || '' });
+  syncSessionLockNote({ pinnedModel: runtimeLock?.model || '' });
 }
 
 function syncSessionLockNote({ pinnedModel = '' } = {}) {
@@ -1204,6 +1236,7 @@ function normalizeModelSelectorProviderType(providerType = '') {
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'claude') return 'claude';
   if (normalized === 'cursor') return 'cursor';
+  if (normalized === 'grok') return 'grok';
   return 'github';
 }
 
@@ -1230,12 +1263,19 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
   const hasOpenAIByok = providers.includes('openai-byok');
   const hasClaude = providers.includes('claude');
   const hasCursor = providers.includes('cursor');
-  const hasNonExclusiveProvider = providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude' && provider !== 'cursor');
+  const hasGrok = providers.includes('grok');
+  const hasNonExclusiveProvider = providers.some((provider) => (
+    provider !== 'openai-byok'
+    && provider !== 'claude'
+    && provider !== 'cursor'
+    && provider !== 'grok'
+  ));
   const activeProvider = normalizeModelSelectorProviderType(activeProviderType);
   if (activeProvider === 'openai') return hasOpenAIByok;
   if (activeProvider === 'claude') return hasClaude;
   if (activeProvider === 'cursor') return hasCursor;
-  return !((hasOpenAIByok || hasClaude || hasCursor) && !hasNonExclusiveProvider);
+  if (activeProvider === 'grok') return hasGrok;
+  return !((hasOpenAIByok || hasClaude || hasCursor || hasGrok) && !hasNonExclusiveProvider);
 }
 
 function buildModelSelectorOptions(models = [], providersByModel = {}, activeProviderType = '') {
@@ -1547,6 +1587,7 @@ const RELAY_MODES_BY_PROVIDER = {
   openai: ['agent', 'ask', 'plan', 'autopilot'],
   claude: ['agent', 'ask', 'plan', 'autopilot'],
   cursor: ['agent', 'ask', 'plan', 'autopilot'],
+  grok: ['agent', 'ask', 'plan', 'autopilot'],
 };
 
 function relayModesForProvider(providerType = '') {
@@ -1720,7 +1761,7 @@ function initModelSelector() {
       }
       updateReasoningSelectorForModel(select.value);
       updateContextTierSelector(select.value);
-      syncSessionLockNote({ pinnedModel: currentOpenAIModelLock()?.model || '' });
+      syncSessionLockNote({ pinnedModel: currentRuntimeModelLock()?.model || '' });
       void persistCurrentConversationPreferences().catch(() => {});
     });
     select.addEventListener('blur', () => {
@@ -1809,6 +1850,13 @@ function reportOpenAIModelDiscoveryFailure(payload) {
   if (cursorDiscovery && cursorDiscovery.ok === false && !cursorDiscovery.skipped) {
     showTransientRelayNotice(
       `Cursor model discovery failed. Cached Cursor models were kept: ${cursorDiscovery.error || 'unknown error'}`,
+      8000,
+    );
+  }
+  const grokDiscovery = payload?.grokModelDiscovery;
+  if (grokDiscovery && grokDiscovery.ok === false && !grokDiscovery.skipped) {
+    showTransientRelayNotice(
+      `Grok model discovery failed. Cached Grok models were kept: ${grokDiscovery.error || 'unknown error'}`,
       8000,
     );
   }
@@ -1923,6 +1971,17 @@ function applyModelVariantCatalogState(payload) {
           : [],
       }
       : null,
+    grokModels: payload?.grokModels && typeof payload.grokModels === 'object'
+      ? {
+        defaultModel: String(payload.grokModels.defaultModel || '').trim(),
+        availableModels: Array.isArray(payload.grokModels.availableModels)
+          ? payload.grokModels.availableModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        enabledModels: Array.isArray(payload.grokModels.enabledModels)
+          ? payload.grokModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+      }
+      : null,
   };
 }
 
@@ -1981,9 +2040,9 @@ function renderModelVariantCatalogBody() {
     const providers = modelProvidersForId(baseModelId, providersByModel);
     const hasOpenAIByok = providers.includes('openai-byok');
     // Each tab lists only rows sourced from that runtime: the Claude SDK tab
-    // shows Claude-SDK rows exclusively, the Cursor SDK tab Cursor rows, and
-    // Copilot never shows rows that a different runtime contributed (there is
-    // no cross-runtime switching).
+    // shows Claude-SDK rows exclusively, the Cursor SDK tab Cursor rows, the
+    // Grok tab Grok rows, and Copilot never shows rows that a different runtime
+    // contributed (there is no cross-runtime switching).
     if (activeTab === 'anthropic') {
       return entryProvider === 'claude';
     }
@@ -1992,12 +2051,23 @@ function renderModelVariantCatalogBody() {
       return entryProvider === 'cursor';
     }
     if (entryProvider === 'cursor') return false;
+    if (activeTab === 'grok') {
+      return entryProvider === 'grok';
+    }
+    if (entryProvider === 'grok') return false;
     if (activeTab === 'openai') {
       return hasOpenAIByok || entryProvider === 'openai-byok';
     }
     // Copilot tab: only models the Copilot CLI itself serves.
     if (entryProvider === 'openai-byok') return false;
-    if (hasOpenAIByok) return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude' && provider !== 'cursor');
+    if (hasOpenAIByok) {
+      return providers.some((provider) => (
+        provider !== 'openai-byok'
+        && provider !== 'claude'
+        && provider !== 'cursor'
+        && provider !== 'grok'
+      ));
+    }
     return true;
   };
   const grouped = new Map();
@@ -2081,6 +2151,30 @@ function renderModelVariantCatalogBody() {
     }
     grouped.set('cursor', providerRows);
   }
+  const grokCatalog = modelVariantCatalogState.grokModels;
+  if (grokCatalog?.availableModels?.length) {
+    const grokEnabledSet = new Set(grokCatalog.enabledModels || []);
+    const grokDefaultModel = String(grokCatalog.defaultModel || '').trim();
+    const providerRows = [];
+    for (const [index, grokModelId] of grokCatalog.availableModels.entries()) {
+      const isDefaultModel = grokModelId === grokDefaultModel;
+      providerRows.push({
+        variantId: `${grokModelId}--provider-grok`,
+        baseModelId: grokModelId,
+        provider: 'grok',
+        label: humanizeModelLabel(grokModelId),
+        releaseStatus: null,
+        reasoningEffort: null,
+        // The default model always stays enabled; deselecting it would leave
+        // Grok conversations without a model.
+        selectable: !isDefaultModel,
+        enabled: grokEnabledSet.has(grokModelId) || isDefaultModel,
+        grokModelId,
+        sortOrder: index,
+      });
+    }
+    grouped.set('grok', providerRows);
+  }
   const selected = new Set(modelVariantCatalogState.enabledVariantIds);
   const selectedOrder = new Map(
     modelVariantCatalogState.enabledVariantIds.map((variantId, index) => [variantId, index]),
@@ -2115,13 +2209,16 @@ function renderModelVariantCatalogBody() {
   const hasCopilotTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'copilot'));
   const hasAnthropicTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'anthropic'));
   const hasCursorTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'cursor'));
+  const hasGrokTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'grok'));
   if (modelVariantCatalogProviderTab === 'openai' && !hasOpenAITab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'anthropic' && !hasAnthropicTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'cursor' && !hasCursorTab) modelVariantCatalogProviderTab = 'copilot';
+  if (modelVariantCatalogProviderTab === 'grok' && !hasGrokTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'copilot' && !hasCopilotTab) {
     if (hasOpenAITab) modelVariantCatalogProviderTab = 'openai';
     else if (hasAnthropicTab) modelVariantCatalogProviderTab = 'anthropic';
     else if (hasCursorTab) modelVariantCatalogProviderTab = 'cursor';
+    else if (hasGrokTab) modelVariantCatalogProviderTab = 'grok';
   }
   const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
   const providerTabButtons = `
@@ -2130,6 +2227,7 @@ function renderModelVariantCatalogBody() {
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Claude SDK</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'cursor' ? ' active' : ''}" data-model-provider-tab="cursor" ${hasCursorTab ? '' : 'disabled'}>Cursor SDK</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'grok' ? ' active' : ''}" data-model-provider-tab="grok" ${hasGrokTab ? '' : 'disabled'}>Grok</button>
     </div>
   `;
   const warnings = [
@@ -2175,9 +2273,9 @@ function renderModelVariantCatalogBody() {
       const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
       const variantRowsHtml = variantRows.map((row) => {
         const selectable = row.selectable !== false;
-        // SDK-provider rows (Claude/Cursor) carry their own enabled flag; only
+        // SDK-provider rows (Claude/Cursor/Grok) carry their own enabled flag; only
         // Copilot variant rows read the enabledVariantIds selection.
-        const sdkProviderModelId = row.claudeModelId || row.cursorModelId || '';
+        const sdkProviderModelId = row.claudeModelId || row.cursorModelId || row.grokModelId || '';
         const checked = sdkProviderModelId
           ? row.enabled === true
           : (selectable && selected.has(row.variantId));
@@ -2195,7 +2293,9 @@ function renderModelVariantCatalogBody() {
           : '';
         const sdkModelAttr = row.claudeModelId
           ? ` data-claude-model="${escHtml(row.claudeModelId)}"`
-          : (row.cursorModelId ? ` data-cursor-model="${escHtml(row.cursorModelId)}"` : '');
+          : (row.cursorModelId
+            ? ` data-cursor-model="${escHtml(row.cursorModelId)}"`
+            : (row.grokModelId ? ` data-grok-model="${escHtml(row.grokModelId)}"` : ''));
         return `
           <label class="model-variant-row">
             <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${sdkModelAttr} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
@@ -2316,12 +2416,17 @@ async function saveSelectedModelsFromModal() {
     .filter((input) => input.checked)
     .map((input) => String(input.getAttribute('data-cursor-model') || '').trim())
     .filter(Boolean);
+  const grokCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-grok-model]'));
+  const selectedGrokModels = grokCheckboxes
+    .filter((input) => input.checked)
+    .map((input) => String(input.getAttribute('data-grok-model') || '').trim())
+    .filter(Boolean);
   // Only the active provider tab's rows are in the DOM, but the PATCH
   // replaces the WHOLE enabled set — so the save must only change rows the
   // user could actually see. Off-screen variants keep their stored state,
   // otherwise saving from e.g. the OpenAI tab silently disables every
   // Copilot-only vendor group (Anthropic, Google, …).
-  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model])'));
+  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model]):not([data-grok-model])'));
   const renderedVariantIds = new Set(renderedVariantCheckboxes
     .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
     .filter(Boolean));
@@ -2357,7 +2462,12 @@ async function saveSelectedModelsFromModal() {
       if (!savedCursor) throw new Error('Failed to save Cursor model selection');
       applyCursorSettingsState(savedCursor);
     }
-    if (claudeCheckboxes.length || cursorCheckboxes.length) {
+    if (grokCheckboxes.length) {
+      const savedGrok = await updateGrokSettings({ enabledModels: selectedGrokModels });
+      if (!savedGrok) throw new Error('Failed to save Grok model selection');
+      applyGrokSettingsState(savedGrok);
+    }
+    if (claudeCheckboxes.length || cursorCheckboxes.length || grokCheckboxes.length) {
       const refreshedCatalog = await loadModelVariantCatalog();
       if (refreshedCatalog) applyModelVariantCatalogState(refreshedCatalog);
     }
@@ -2409,7 +2519,9 @@ async function loadContextSummaryAndRender(convId) {
   const refreshLookupId = sessionId || trimmedConvId || null;
   const providerLabel = payload.providerType === 'claude'
     ? 'Claude'
-    : (payload.providerType === 'cursor' ? 'Cursor' : 'Copilot');
+    : (payload.providerType === 'cursor'
+      ? 'Cursor'
+      : (payload.providerType === 'grok' ? 'Grok' : 'Copilot'));
   const subtitle = sessionId
     ? `${providerLabel} session ${sessionId.slice(0, 8)}`
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
@@ -3133,6 +3245,7 @@ initSocketHandlers({
   applyConversationPreferencesForConversation,
   applyOpenAISettingsState,
   applyClaudeSettingsState,
+  applyGrokSettingsState,
   applyCursorSettingsState,
 });
 
@@ -3402,6 +3515,7 @@ async function initApp() {
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshOpenAISettingsState();
   await refreshCursorSettingsState();
+  await refreshGrokSettingsState();
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
@@ -3498,10 +3612,14 @@ window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.saveClaudeSettings = saveClaudeSettings;
 window.toggleClaudeProvider = toggleClaudeProvider;
+window.saveGrokSettings = saveGrokSettings;
+window.toggleGrokProvider = toggleGrokProvider;
 window.saveCursorSettings = saveCursorSettings;
 window.removeCursorSettings = removeCursorSettings;
 window.saveCursorAllowanceSettings = saveCursorAllowanceSettings;
 window.resetCursorAllowanceAccounting = resetCursorAllowanceAccounting;
+window.saveGrokAllowanceSettings = saveGrokAllowanceSettings;
+window.resetGrokAllowanceAccounting = resetGrokAllowanceAccounting;
 window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;

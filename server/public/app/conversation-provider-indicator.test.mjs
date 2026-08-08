@@ -5,6 +5,7 @@ import {
   conversationProviderIndicatorKey,
   conversationProviderIndicatorLabel,
   isConversationUsingCursorProvider,
+  isConversationUsingGrokProvider,
   isConversationUsingOpenAIProvider,
   isOpenAIImageModelId,
   resolveConversationProviderType,
@@ -35,10 +36,20 @@ test('identifies Cursor conversations only', () => {
   assert.equal(isConversationUsingCursorProvider(null), false);
 });
 
+test('identifies Grok conversations only', () => {
+  assert.equal(isConversationUsingGrokProvider({ runtimeProviderType: 'grok' }), true);
+  assert.equal(isConversationUsingGrokProvider({ runtime_provider_type: ' Grok ' }), true);
+  assert.equal(isConversationUsingGrokProvider({ runtimeProviderType: 'github' }), false);
+  assert.equal(isConversationUsingGrokProvider({ runtimeProviderType: 'claude' }), false);
+  assert.equal(isConversationUsingGrokProvider({}), false);
+  assert.equal(isConversationUsingGrokProvider(null), false);
+});
+
 test('labels provider indicator per provider type', () => {
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'cursor' }), 'Cursor');
   assert.equal(conversationProviderIndicatorLabel({ runtime_provider_type: 'CURSOR' }), 'Cursor');
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'claude' }), 'Claude');
+  assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'grok' }), 'Grok');
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'openai' }), 'OpenAI');
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'github' }), 'Copilot');
   assert.equal(conversationProviderIndicatorLabel({ runtime_provider_type: 'GitHub-Copilot' }), 'Copilot');
@@ -50,6 +61,7 @@ test('labels provider indicator per provider type', () => {
 test('keys the provider pill to the composer palette', () => {
   assert.equal(conversationProviderIndicatorKey({ runtimeProviderType: 'cursor' }), 'cursor');
   assert.equal(conversationProviderIndicatorKey({ runtime_provider_type: 'CLAUDE' }), 'claude');
+  assert.equal(conversationProviderIndicatorKey({ runtimeProviderType: 'grok' }), 'grok');
   assert.equal(conversationProviderIndicatorKey({ runtimeProviderType: 'github-copilot' }), 'github');
   assert.equal(
     conversationProviderIndicatorKey({ runtimeProviderType: 'openai', runtimeModel: 'gpt-4o' }),
@@ -85,6 +97,8 @@ test('maps session lock provider keys, including the derived image variant', () 
   assert.equal(sessionLockProviderKey({ providerType: ' Claude ' }), 'claude');
   assert.equal(sessionLockProviderKey({ providerType: 'anthropic' }), 'claude');
   assert.equal(sessionLockProviderKey({ providerType: 'cursor' }), 'cursor');
+  assert.equal(sessionLockProviderKey({ providerType: 'grok' }), 'grok');
+  assert.equal(sessionLockProviderKey({ providerType: 'xai' }), 'grok');
   assert.equal(sessionLockProviderKey({ providerType: 'unknown' }), '');
   assert.equal(sessionLockProviderKey(), '');
 });
@@ -95,6 +109,7 @@ test('labels every supported session lock provider', () => {
   assert.equal(sessionLockProviderLabel({ providerType: 'openai', model: 'dall-e-3' }), 'OpenAI Image');
   assert.equal(sessionLockProviderLabel({ providerType: 'claude' }), 'Claude SDK');
   assert.equal(sessionLockProviderLabel({ providerType: 'cursor' }), 'Cursor SDK');
+  assert.equal(sessionLockProviderLabel({ providerType: 'grok' }), 'Grok');
   assert.equal(sessionLockProviderLabel({ providerType: '' }), '');
 });
 

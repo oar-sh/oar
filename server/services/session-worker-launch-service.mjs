@@ -79,7 +79,7 @@ export function applyOpenAIProviderEnvironment(env = {}, {
 
 export function resolveWorkerKind(env = {}) {
   const kind = String(env?.COPILOT_WEB_RELAY_WORKER_KIND || '').trim().toLowerCase();
-  if (kind === 'claude' || kind === 'cursor') return kind;
+  if (kind === 'claude' || kind === 'cursor' || kind === 'grok') return kind;
   return 'copilot';
 }
 
@@ -120,12 +120,35 @@ export function applyCursorProviderEnvironment(env = {}, {
   return next;
 }
 
+export function applyGrokProviderEnvironment(env = {}, {
+  enabled = false,
+  model = '',
+  command = '',
+} = {}) {
+  const next = { ...env };
+  // Host-login provider (like Claude): no API key is required in the relay.
+  if (resolveWorkerKind(next) === 'grok') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
+  delete next.GROK_RELAY_MODEL;
+  delete next.GROK_CLI_COMMAND;
+  if (!enabled) return next;
+  next.COPILOT_WEB_RELAY_WORKER_KIND = 'grok';
+  const normalizedModel = normalizeText(model);
+  if (normalizedModel) next.GROK_RELAY_MODEL = normalizedModel;
+  const normalizedCommand = normalizeText(command);
+  if (normalizedCommand) next.GROK_CLI_COMMAND = normalizedCommand;
+  return next;
+}
+
 export function isClaudeWorkerEnvironment(env = {}) {
   return String(env?.COPILOT_WEB_RELAY_WORKER_KIND || '').trim().toLowerCase() === 'claude';
 }
 
 export function isCursorWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'cursor';
+}
+
+export function isGrokWorkerEnvironment(env = {}) {
+  return resolveWorkerKind(env) === 'grok';
 }
 
 export function resolveClaudeWorkerScriptPath(env = {}) {
@@ -148,11 +171,22 @@ export function resolveCursorWorkerScriptPath(env = {}) {
   return path.join(process.cwd(), 'server', 'cursor-worker', 'cursor-session-worker.mjs');
 }
 
+export function resolveGrokWorkerScriptPath(env = {}) {
+  const explicit = normalizeText(env?.COPILOT_WEB_RELAY_GROK_WORKER_PATH);
+  if (explicit) return explicit;
+  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
+  if (repoRoot) return path.join(repoRoot, 'server', 'grok-worker', 'grok-session-worker.mjs');
+  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
+  if (serverDir) return path.join(serverDir, 'grok-worker', 'grok-session-worker.mjs');
+  return path.join(process.cwd(), 'server', 'grok-worker', 'grok-session-worker.mjs');
+}
+
 // Workers that run as plain Node processes (no CLI, no pseudo-TTY). Copilot is
 // intentionally absent: its launch path must stay exactly as-is.
 const NODE_WORKER_DESCRIPTORS = Object.freeze({
   claude: Object.freeze({ resolveScriptPath: resolveClaudeWorkerScriptPath, windowsTitle: 'Claude Worker' }),
   cursor: Object.freeze({ resolveScriptPath: resolveCursorWorkerScriptPath, windowsTitle: 'Cursor Worker' }),
+  grok: Object.freeze({ resolveScriptPath: resolveGrokWorkerScriptPath, windowsTitle: 'Grok Worker' }),
 });
 
 function resolveNodeWorkerDescriptor(env = {}) {
@@ -307,6 +341,9 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     'CLAUDE_RELAY_MODEL',
     'CURSOR_RELAY_MODEL',
     'CURSOR_AGENT_STORE_DIR',
+    'GROK_RELAY_MODEL',
+    'GROK_CLI_COMMAND',
+    'GROK_ALWAYS_APPROVE',
     'SESSION_ID',
     'COPILOT_WORKSPACE_ROOT',
     'INIT_CWD',
