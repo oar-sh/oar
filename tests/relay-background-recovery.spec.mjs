@@ -9,8 +9,14 @@ test.use({ ...devices["Pixel 5"], browserName: "chromium" });
 // The renderer's real visibility is not scriptable, so the app's own read of
 // document.visibilityState is overridden and the event dispatched by hand. This is
 // what the lifecycle handlers in bootstrap.js actually consume.
-async function installVisibilityControl(page) {
-  await page.addInitScript(() => {
+//
+// Backgrounding suspends the transport only after a grace period
+// (BACKGROUND_SUSPEND_GRACE_MS, 45s in production). The tests below that need
+// the suspend to actually happen override the grace to 0 so hiding suspends
+// immediately, which is the behavior they were written against.
+async function installVisibilityControl(page, { backgroundGraceMs = 0 } = {}) {
+  await page.addInitScript((graceMs) => {
+    window.__COPILOT_BACKGROUND_GRACE_MS = graceMs;
     let state = "visible";
     Object.defineProperty(document, "visibilityState", {
       configurable: true,
@@ -24,7 +30,7 @@ async function installVisibilityControl(page) {
       state = next;
       document.dispatchEvent(new Event("visibilitychange"));
     };
-  });
+  }, backgroundGraceMs);
 }
 
 function setVisibility(page, state) {
@@ -111,5 +117,52 @@ test.describe.serial("relay recovery after backgrounding", () => {
     await expect(relayDot(page)).toHaveClass("offline");
 
     await expect(relayDot(page)).toHaveClass("online", { timeout: 20_000 });
+  });
+
+  test("a brief background stays inside the grace period and never drops the socket", async ({ page }) => {
+    const token = relayToken();
+    // Production-scale grace: hiding must not suspend the transport for 45s.
+    await installVisibilityControl(page, { backgroundGraceMs: 45_000 });
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await expect(relayDot(page)).toHaveClass("online");
+
+    await setVisibility(page, "hidden");
+    await page.waitForTimeout(1500);
+    // Still connected while hidden: the suspend is deferred by the grace period.
+    const whileHidden = await page.evaluate(async () => {
+      const socket = await window.connectSocket();
+      return { connected: socket.connected };
+    });
+    expect(whileHidden.connected).toBe(true);
+    await expect(relayDot(page)).toHaveClass("online");
+
+    await setVisibility(page, "visible");
+    await page.waitForTimeout(500);
+    // The socket was never torn down, so this is the original connection, not
+    // a recovered one.
+    const afterReturn = await page.evaluate(async () => {
+      const socket = await window.connectSocket();
+      return { connected: socket.connected, recovered: socket.recovered };
+    });
+    expect(afterReturn.connected).toBe(true);
+    expect(afterReturn.recovered).not.toBe(true);
+  });
+
+  test("the suspend fires after the grace period elapses while still hidden", async ({ page }) => {
+    const token = relayToken();
+    await installVisibilityControl(page, { backgroundGraceMs: 1_000 });
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await expect(relayDot(page)).toHaveClass("online");
+
+    await setVisibility(page, "hidden");
+    // Inside the grace window the socket is still up...
+    await expect(relayDot(page)).toHaveClass("online");
+    // ...and once the grace elapses while hidden, the transport is suspended.
+    await expect(relayDot(page)).toHaveClass("offline", { timeout: 10_000 });
+
+    await setVisibility(page, "visible");
+    await expect(relayDot(page)).toHaveClass("online", { timeout: 15_000 });
   });
 });

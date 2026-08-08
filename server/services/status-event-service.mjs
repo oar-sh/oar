@@ -116,6 +116,22 @@ export function createStatusEventService(db, {
     return { event, deduped: false };
   }
 
+  function recordEvent(type, details = {}, timestamp = Date.now()) {
+    const event = {
+      id: `status-${randomUUID()}`,
+      timestamp: normalizeTimestamp(timestamp),
+      type: String(type || 'event'),
+      source: 'server',
+      details: details && typeof details === 'object' ? details : {},
+    };
+    const persist = db.transaction(() => {
+      insertEvent.run(event.id, event.timestamp, event.type, JSON.stringify(event.details));
+      deleteExpiredEvents.run(normalizedMaxEvents);
+    });
+    persist();
+    return event;
+  }
+
   function getEventsPage({ beforeTimestamp = null, beforeId = '', limit = 40 } = {}) {
     const hasCursor = beforeTimestamp !== null && beforeTimestamp !== undefined && String(beforeId || '').trim();
     const timestamp = Number(beforeTimestamp);
@@ -136,6 +152,7 @@ export function createStatusEventService(db, {
 
   return {
     getEventsPage,
+    recordEvent,
     recordSharedAccess,
   };
 }

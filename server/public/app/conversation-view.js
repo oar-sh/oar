@@ -45,6 +45,7 @@ import {
   setImageEditTarget as setStoredImageEditTarget,
 } from './store.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
+import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { renderRelayQuestions } from './ask-user-view.js';
@@ -2309,6 +2310,24 @@ export async function sendMessage() {
 
     const r = await sendMessageApi(body);
     if (!r) {
+      // Offline: park the send in the durable outbox instead of bouncing it
+      // back into the composer. The client-generated messageId makes a replay
+      // after an ambiguous failure idempotent (the server answers 409 for a
+      // send that already landed). Only existing conversations queue — a new
+      // conversation needs the server's response to become usable.
+      if (navigator.onLine === false && targetConversationId) {
+        const queued = await enqueueOutboxRequest({
+          kind: 'message',
+          path: '/api/message',
+          body: JSON.stringify(body),
+        });
+        if (queued) {
+          void registerOutboxSync();
+          showTransientRelayNotice('You are offline. Message queued — it will send when the connection returns.', 7000);
+          clearAttachments();
+          return;
+        }
+      }
       clearPendingUserMessage(clientMessageId);
       const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
       pendingNode?.remove();

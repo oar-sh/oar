@@ -7,6 +7,7 @@ import {
   relayQuestionDrafts,
 } from './store.js';
 import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion, answerRelayQuestionStructured } from './api-client.js';
+import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
@@ -449,6 +450,11 @@ export async function submitRelayStructuredAnswer(questionId) {
     const sdkSessionId = String(question?.sdkSessionId || '').trim();
     const r = await answerRelayQuestionStructured(questionId, structuredAnswer, sdkSessionId || null);
     if (!r?.ok) {
+      const queued = await enqueueRelayAnswerForSync(questionId, {
+        structuredAnswer,
+        sdk_session_id: sdkSessionId || undefined,
+      });
+      if (queued) return;
       controls.forEach((el) => { el.disabled = false; });
       const fieldErrors = Array.isArray(r?.fields) ? r.fields.map((f) => f.message).join('; ') : '';
       const message = fieldErrors || r?.error || 'Failed to submit answer';
@@ -474,6 +480,23 @@ export async function submitRelayQuestionChoice(questionId, choice) {
   await submitRelayQuestionAnswer(questionId, choice);
 }
 
+// Offline fallback: park the answer in the durable outbox so Background Sync
+// (or the next page load) delivers it. A replay against an already-answered
+// or expired question gets a 4xx and is dropped, so this cannot double-answer.
+async function enqueueRelayAnswerForSync(questionId, body) {
+  if (navigator.onLine !== false) return false;
+  const queued = await enqueueOutboxRequest({
+    kind: 'question-answer',
+    path: `/api/relay-question/${encodeURIComponent(questionId)}/answer`,
+    body: JSON.stringify(body),
+  });
+  if (queued) {
+    void registerOutboxSync();
+    window.showTransientRelayNotice?.('You are offline. Answer queued — it will send when the connection returns.', 7000);
+  }
+  return queued;
+}
+
 export async function submitRelayQuestionAnswer(questionId, presetAnswer = null) {
   const input = document.getElementById(`relay-question-input-${questionId}`);
   const answer = String(presetAnswer != null ? presetAnswer : (input?.value || '')).trim();
@@ -490,7 +513,13 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
     const r = singleFieldStructuredAnswer
       ? await answerRelayQuestionStructured(questionId, singleFieldStructuredAnswer, sdkSessionId || null)
       : await answerRelayQuestion(questionId, answer, sdkSessionId || null);
-    if (!r?.question) throw new Error('Failed to submit relay question answer');
+    if (!r?.question) {
+      const queued = await enqueueRelayAnswerForSync(questionId, singleFieldStructuredAnswer
+        ? { structuredAnswer: singleFieldStructuredAnswer, sdk_session_id: sdkSessionId || undefined }
+        : { answer, sdk_session_id: sdkSessionId || undefined });
+      if (queued) return;
+      throw new Error('Failed to submit relay question answer');
+    }
     relayQuestionDrafts.delete(questionId);
     relayQuestionStructuredDrafts.delete(questionId);
     relayQuestions.set(questionId, r.question);

@@ -1448,6 +1448,7 @@ export function registerMessagesRoutes(app, deps) {
     io,
     db,
     stmts,
+    pushDispatchService,
     runtimeState,
     config,
     uuidv4,
@@ -1777,6 +1778,7 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId, status: 'failed' });
+    void pushDispatchService?.notifyTurnFailed?.({ conversationId, messageId: responseId, text: responseText });
     cancelPendingRelayQuestionsForMessage(messageId);
     const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
       ? normalizeSessionWorkerId(queueRow?.owner_sdk_session_id)
@@ -4122,7 +4124,23 @@ export function registerMessagesRoutes(app, deps) {
         });
       }
     });
-    persistMessageAndQueue();
+    try {
+      persistMessageAndQueue();
+    } catch (error) {
+      // A replayed send (Background Sync outbox) with a caller-supplied id hits
+      // the messages.id primary key. Surface it as a clean 409 so the replay
+      // can treat "already accepted" as success instead of retrying forever.
+      const constraintViolation = String(error?.code || '').startsWith('SQLITE_CONSTRAINT');
+      if (clientMessageId && constraintViolation && stmts.getMessageByConversation?.get?.(msgId, convId)) {
+        return res.status(409).json({
+          error: 'Message already exists',
+          code: 'DUPLICATE_MESSAGE_ID',
+          messageId: msgId,
+          conversationId: convId,
+        });
+      }
+      throw error;
+    }
     io.emit('conversation_draft_updated', {
       conversationId: convId,
       draftText: '',
@@ -5711,6 +5729,11 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
+    void pushDispatchService?.notifyTurnComplete?.({
+      conversationId: targetConversationId,
+      messageId: responseId,
+      text: resolvedText,
+    });
     cancelPendingRelayQuestionsForMessage(messageId);
     res.json({ ok: true });
   });

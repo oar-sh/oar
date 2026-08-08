@@ -63,6 +63,16 @@ function formatStatusEvent(event) {
   if (type === 'foreground-recovery-timeout') {
     return `Foreground recovery timed out after ${Math.round(Number(details.timeoutMs || 0) / 1000)}s (${details.reason || 'unknown'})`;
   }
+  if (type === 'push-dispatched') {
+    const failures = Number(details.failed || 0);
+    return `Push sent for ${details.eventType || 'event'} to ${Number(details.sent || 0)} device(s)${failures ? `, ${failures} failed` : ''}`;
+  }
+  if (type === 'push-suppressed') {
+    return `Push suppressed for ${details.eventType || 'event'} (a device is active)`;
+  }
+  if (type === 'push-subscription-pruned') {
+    return `Push subscription removed (${details.label || details.deviceId || 'unknown device'}${details.statusCode ? `, HTTP ${details.statusCode}` : ''}${details.failureCount ? `, ${details.failureCount} consecutive failures` : ''})`;
+  }
   if (type === 'client-error') return `Error: ${formatValue(details.message || details.error)}`;
   if (type === 'unhandled-rejection') return `Unhandled rejection: ${formatValue(details.reason)}`;
   if (type === 'shared-access-opened') {

@@ -2,6 +2,7 @@ import {
   BASE,
   TOKEN,
   CLIENT_ID,
+  DEVICE_ID,
   currentConvId,
   conversations,
   seenMessageIds,
@@ -102,6 +103,17 @@ export function getSocket() {
 }
 
 /**
+ * Report this device's foreground state to the server, which uses it to decide
+ * whether push notifications should be suppressed. Safe to call in any state:
+ * a disconnected or absent socket makes it a no-op (the connect handler
+ * re-asserts visibility as soon as the socket is back).
+ */
+export function emitDeviceVisibility(visible) {
+  if (!socket?.connected) return;
+  socket.emit('device_visibility', { deviceId: DEVICE_ID, visible: visible === true });
+}
+
+/**
  * Close the transport rather than the namespace socket when backgrounding.
  *
  * socket.disconnect() makes the server report "client namespace disconnect", which
@@ -112,6 +124,9 @@ export function getSocket() {
  * backoff loop we are trying to avoid while hidden.
  */
 function suspendSocketForBackground() {
+  // The "now hidden" heartbeat has to leave before the transport closes or it
+  // never arrives and the device looks active until its socket drops.
+  emitDeviceVisibility(false);
   const manager = socket?.io;
   manager?.reconnection(false);
   if (manager?.engine) {
@@ -203,6 +218,9 @@ export async function connectSocket(overrideDeps) {
     lastSocketErrorSignature = '';
     lastSocketErrorAt = 0;
     console.log('Socket connected');
+    // Connect-time heartbeat. Also re-asserts visibility after a recovered
+    // session, whose restored socket.data the server deliberately resets.
+    emitDeviceVisibility(document.visibilityState === 'visible');
     clearMessageSearchRuntimeState();
     setRelayOnline(true);
     setCliOnline(true);

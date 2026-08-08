@@ -20,6 +20,7 @@ import {
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
+import { refreshPushSettingsSection } from './push-settings.js';
 
 const THEME_STORAGE_KEY = 'copilot_theme';
 const SHOW_SUSPEND_HOST_STORAGE_KEY = 'copilot_show_suspend_host';
@@ -797,6 +798,7 @@ export function openSettingsModal() {
   void refreshWindowsAutostartSetting();
   syncTurnCeilingSlider();
   void refreshTurnCeilingSetting();
+  void refreshPushSettingsSection();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }

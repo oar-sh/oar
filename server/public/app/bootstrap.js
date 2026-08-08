@@ -137,6 +137,7 @@ import {
   connectSocket,
   setSocketActivityEnabled,
   ensureSocketConnected,
+  emitDeviceVisibility,
 } from './socket-handlers.js';
 import {
   initInstallButton,
@@ -223,6 +224,14 @@ import {
   updateTurnCeilingSetting,
 } from './settings-modal.js';
 import {
+  togglePushOnThisDevice,
+  updatePushPreferencesFromControls,
+} from './push-settings.js';
+import {
+  enqueueDraftFlushForBackgroundSync,
+  initOutboxFallbackReplay,
+} from './sync-outbox.mjs';
+import {
   initActionConfirmations,
   openKillSessionConfirmation,
   confirmKillCurrentSession,
@@ -264,6 +273,14 @@ const FOREGROUND_RECOVERY_DEBOUNCE_MS = 1000;
 // to keep the latch closed, because that would suppress every later recovery.
 const FOREGROUND_RECOVERY_TIMEOUT_MS = 20000;
 const RELAY_WATCHDOG_INTERVAL_MS = 5000;
+// How long a hidden page keeps its transport before suspending it. Brief
+// app switches then never drop the socket at all. 45s matches the server's
+// ping window (pingInterval 25s + pingTimeout 20s): past that the server has
+// already dropped the client, so waiting longer would be inert. Tests override
+// this to avoid waiting out the real grace period.
+const BACKGROUND_SUSPEND_GRACE_MS = Number.isFinite(Number(window.__COPILOT_BACKGROUND_GRACE_MS))
+  ? Math.max(0, Number(window.__COPILOT_BACKGROUND_GRACE_MS))
+  : 45_000;
 
 let relayQuestionPollTimer = null;
 let relayBoardPollTimer = null;
@@ -284,6 +301,7 @@ let foregroundRecoveryInFlight = false;
 let foregroundRecoveryWatchdogTimer = null;
 let foregroundRecoveryGeneration = 0;
 let relayConnectionWatchdogTimer = null;
+let backgroundSuspendTimer = null;
 let appSharedMode = false;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let chatTitleEditingConversationId = null;
@@ -523,10 +541,63 @@ function scheduleForegroundRecovery(reason = 'visible', { immediate = false } = 
   }, FOREGROUND_RECOVERY_DEBOUNCE_MS);
 }
 
+function cancelBackgroundSuspend() {
+  if (!backgroundSuspendTimer) return;
+  clearTimeout(backgroundSuspendTimer);
+  backgroundSuspendTimer = null;
+}
+
+// Defer the background suspend by the grace period so a quick app switch keeps
+// the socket alive (and connectionStateRecovery never even has to replay).
+function scheduleBackgroundSuspend() {
+  cancelBackgroundSuspend();
+  if (BACKGROUND_SUSPEND_GRACE_MS <= 0) {
+    setForegroundNetworkWorkEnabled(false);
+    return;
+  }
+  backgroundSuspendTimer = setTimeout(() => {
+    backgroundSuspendTimer = null;
+    // A throttled or sleep-delayed timer can fire at the exact moment the user
+    // returns; re-check visibility so it cannot tear down a healthy connection.
+    if (document.visibilityState !== 'hidden') return;
+    setForegroundNetworkWorkEnabled(false);
+  }, BACKGROUND_SUSPEND_GRACE_MS);
+}
+
+// A notification tap in the service worker either messages an existing window
+// (copilot-open-conversation) or opens a fresh one with ?push_conv=<id>.
+function initPushNotificationClientHooks() {
+  if (!('serviceWorker' in navigator)) return;
+  if (window.__pushNotificationHooksBound) return;
+  window.__pushNotificationHooksBound = true;
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type !== 'copilot-open-conversation') return;
+    const conversationId = String(data.conversationId || '').trim();
+    if (!conversationId) return;
+    void openConversation(conversationId).catch(() => {});
+  });
+}
+
+function consumePushConversationDeepLink() {
+  const url = new URL(window.location.href);
+  const conversationId = String(url.searchParams.get('push_conv') || '').trim();
+  if (!conversationId) return '';
+  url.searchParams.delete('push_conv');
+  history.replaceState(null, document.title, `${url.pathname}${url.search}${url.hash}`);
+  return conversationId;
+}
+
 function handleForegroundTransition(reason, { immediate = false } = {}) {
   if (!isAppForegrounded()) return;
+  // The app came back before the grace period elapsed; keep the socket.
+  cancelBackgroundSuspend();
   // The transport comes back right away; only the data refresh is debounced.
   setForegroundNetworkWorkEnabled(true);
+  // Tell the server this device is foregrounded again so push suppression
+  // resumes. If the socket is still reconnecting this is a no-op; the
+  // connect-time heartbeat covers that case.
+  emitDeviceVisibility(true);
   scheduleForegroundRecovery(reason, { immediate });
 }
 
@@ -549,7 +620,11 @@ function initNetworkLifecycleHandling() {
   networkLifecycleBound = true;
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
-      setForegroundNetworkWorkEnabled(false);
+      // The "now hidden" heartbeat goes out immediately — the transport stays
+      // up for the grace period, so without it the device would keep looking
+      // active and suppress push notifications for every device.
+      emitDeviceVisibility(false);
+      scheduleBackgroundSuspend();
       return;
     }
     handleForegroundTransition('visibility');
@@ -558,17 +633,23 @@ function initNetworkLifecycleHandling() {
     handleForegroundTransition('online', { immediate: true });
   });
   window.addEventListener('offline', () => {
+    cancelBackgroundSuspend();
     setForegroundNetworkWorkEnabled(false);
   });
   window.addEventListener('pageshow', () => {
     handleForegroundTransition('pageshow', { immediate: true });
   });
   window.addEventListener('pagehide', () => {
+    // The page is going away; no grace period, suspend immediately.
+    cancelBackgroundSuspend();
     setForegroundNetworkWorkEnabled(false);
   });
   // Android Chrome freezes backgrounded PWAs. A freeze/resume cycle can happen
   // without any visibility transition, so resume needs its own recovery trigger.
   document.addEventListener('freeze', () => {
+    // Timers will not run while frozen, so the pending grace timer is useless;
+    // suspend now while code can still run.
+    cancelBackgroundSuspend();
     setForegroundNetworkWorkEnabled(false);
   });
   document.addEventListener('resume', () => {
@@ -3073,6 +3154,10 @@ async function initApp() {
   });
   window.addEventListener('pagehide', () => {
     stopSharedModeTimers();
+    // The direct flush below can be killed mid-flight by the browser; the
+    // queued copy survives and is replayed by Background Sync. If the direct
+    // write wins, the replay hits a draft version conflict and is dropped.
+    if (!appSharedMode) void enqueueDraftFlushForBackgroundSync(currentConvId);
     void flushConversationDraft(currentConvId);
     closeTmuxInspectorView();
   });
@@ -3300,7 +3385,14 @@ async function initApp() {
   startRelayBoardPolling();
   startSessionWorkerStatusPolling();
   startLiveConversationPolling();
+  initPushNotificationClientHooks();
+  // Browsers without Background Sync replay the outbox from the page instead.
+  void initOutboxFallbackReplay();
   await loadConversations();
+  const pushConversationId = consumePushConversationDeepLink();
+  if (pushConversationId) {
+    await openConversation(pushConversationId).catch(() => {});
+  }
   await loadRelayQuestions(currentConvId);
   await loadRelayBoards();
   updateCompactButton();
@@ -3376,6 +3468,8 @@ window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;
 window.previewTurnCeilingSetting = previewTurnCeilingSetting;
 window.updateTurnCeilingSetting = updateTurnCeilingSetting;
+window.togglePushOnThisDevice = togglePushOnThisDevice;
+window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 window.doAuth = doAuth;

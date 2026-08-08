@@ -93,6 +93,7 @@ export function registerRelayBoardRoutes(app, deps) {
     DEFAULT_RELAY_MODE,
     DEFAULT_MODEL,
     formatRelayBoardRow,
+    pushDispatchService,
   } = deps;
 
   app.get('/api/relay-boards', auth, (req, res) => {
@@ -158,6 +159,7 @@ export function registerRelayBoardRoutes(app, deps) {
 
     const board = formatRelayBoardRow(stmts.getBoard.get(boardId));
     io.emit('relay_board', { board });
+    void pushDispatchService?.notifyBoard?.(board);
     io.emit('relay_board_changed', { conversationId: board?.conversationId || null, boardId });
     return res.json({ board });
   });

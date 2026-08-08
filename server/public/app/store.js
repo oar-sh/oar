@@ -47,6 +47,23 @@ if (!CLIENT_ID) {
   } catch {}
 }
 
+// Durable device identity for push subscriptions and visibility heartbeats.
+// Unlike CLIENT_ID (per-tab, sessionStorage) this survives restarts so a
+// device keeps its identity across subscription churn.
+let deviceIdStorageValue = '';
+try {
+  deviceIdStorageValue = localStorage.getItem('copilot_device_id') || '';
+} catch {
+  deviceIdStorageValue = '';
+}
+export let DEVICE_ID = deviceIdStorageValue;
+if (!DEVICE_ID) {
+  DEVICE_ID = generateId();
+  try {
+    localStorage.setItem('copilot_device_id', DEVICE_ID);
+  } catch {}
+}
+
 export const seenMessageIds = new Set();
 export const pendingUserMessageIds = new Set();
 export const pendingUserMessageEntries = new Map();

@@ -25,6 +25,7 @@ import {
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
 import { rebuildRecentWorkspaceRootsTable } from './migrations/0002-recent-workspace-roots-path-key.mjs';
+import { ensurePushSubscriptionsTable } from './migrations/0003-push-subscriptions.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
 import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
@@ -40,6 +41,10 @@ import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { registerGitRoutes } from './routes/git-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
+import webpush from 'web-push';
+import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
+import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
+import { registerPushRoutes } from './routes/push-routes.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
@@ -2617,6 +2622,26 @@ db.exec(`
     updated_at TEXT NOT NULL
   );
 
+  -- Web Push subscriptions, one row per subscribed browser installation. See
+  -- migrations/0003-push-subscriptions.mjs for existing databases.
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id             TEXT PRIMARY KEY,
+    device_id      TEXT NOT NULL,
+    device_label   TEXT,
+    endpoint       TEXT NOT NULL UNIQUE,
+    keys_json      TEXT NOT NULL,
+    preferences_json TEXT NOT NULL,
+    user_agent     TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    last_success_at TEXT,
+    last_error     TEXT,
+    failure_count  INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_push_subscriptions_device
+    ON push_subscriptions(device_id);
+
   CREATE TABLE IF NOT EXISTS model_selector_state (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     source       TEXT,
@@ -2964,6 +2989,12 @@ const recentWorkspaceRootsRebuild = rebuildRecentWorkspaceRootsTable(db);
 if (recentWorkspaceRootsRebuild.applied) {
   console.log(`[workspace-root] rebuilt recent CWD history: ${recentWorkspaceRootsRebuild.rowsBefore} row(s) -> ${recentWorkspaceRootsRebuild.rowsAfter} distinct directory/ies`);
 }
+// The CREATE TABLE IF NOT EXISTS above covers fresh databases; this upgrades
+// an existing one before the push dispatch service prepares its statements.
+const pushSubscriptionsMigration = ensurePushSubscriptionsTable(db);
+if (pushSubscriptionsMigration.applied) {
+  console.log(`[push] created push_subscriptions table`);
+}
 if (!queueColumns.includes('parked_transaction_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN parked_transaction_id TEXT`);
 }
@@ -3192,6 +3223,33 @@ const stmts = {
   ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+
+// ─── Web Push ─────────────────────────────────────────────────────────────────
+// VAPID keys are generated once and persisted in app_settings; regenerating
+// them would invalidate every stored subscription.
+const pushVapidKeys = ensurePushVapidKeys(stmts, {
+  generateVapidKeys: () => webpush.generateVAPIDKeys(),
+});
+if (pushVapidKeys.generated) {
+  console.log('[push] generated VAPID key pair');
+}
+webpush.setVapidDetails(
+  String(config.pushVapidSubject || '').trim() || 'mailto:copilot-remote@example.com',
+  pushVapidKeys.publicKey,
+  pushVapidKeys.privateKey,
+);
+// `io` is created later in this file; the closures only run after startup.
+const activeDeviceTracker = createActiveDeviceTracker({
+  getSockets: () => io.of('/').sockets.values(),
+});
+const pushDispatchService = createPushDispatchService({
+  db,
+  webpush,
+  hasActiveDevice: () => activeDeviceTracker.hasActiveDevice(),
+  recordStatusEvent: (type, details) => statusEventService.recordEvent(type, details),
+  uuid: uuidv4,
+});
+
 const imageOperationService = createImageOperationService({
   db,
   repository: stmts,
@@ -6367,6 +6425,7 @@ const sharedRouteDeps = {
   statusEventService,
   imageOperationService,
   windowsAutostartService,
+  pushDispatchService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
@@ -6374,6 +6433,11 @@ registerAskUserRoutes(app, sharedRouteDeps);
 registerRelayBoardRoutes(app, sharedRouteDeps);
 registerCacheRoutes(app, sharedRouteDeps);
 registerGitRoutes(app, sharedRouteDeps);
+registerPushRoutes(app, {
+  auth,
+  pushDispatchService,
+  getPushVapidPublicKey: () => pushVapidKeys.publicKey,
+});
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   cliLastSeen = null;
   const wasOnline = cliOnline;
@@ -6385,6 +6449,7 @@ function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   if (wasOnline) {
     console.log(`${runtimeLogPrefix()}CLI OFFLINE${reason ? ` (${reason})` : ''}`);
     io.emit('cli_status', { online: false });
+    void pushDispatchService.notifyCliOffline();
   }
 }
 
@@ -6699,6 +6764,9 @@ io.on('connection', (socket) => {
   socket.data.sessionId = socket.handshake.auth?.clientId || socket.handshake.query?.clientId || cookies[SESSION_COOKIE] || null;
   // Send current CLI status immediately on connect
   socket.emit('cli_status', { online: cliOnline });
+  // Visibility heartbeats for push suppression; also clears a stale
+  // deviceVisible flag restored by connectionStateRecovery.
+  activeDeviceTracker.registerSocket(socket);
   tmuxInspectorSocketService.registerSocket(socket);
 });
 

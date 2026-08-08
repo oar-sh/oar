@@ -4324,6 +4324,54 @@
         </div>
         <div class="settings-help">Runs Cursor conversations through the Cursor Agent SDK using your saved Cursor API key. The key is stored on the relay host and never sent to browsers.</div>
       </div>
+      <div id="push-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label>Push notifications</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="push-enabled-toggle">Enable push notifications on this device</label>
+          <input id="push-enabled-toggle" type="checkbox" onchange="togglePushOnThisDevice(this.checked)" disabled>
+        </div>
+        <div id="push-settings-status" class="settings-help settings-provider-status">Loading push settings…</div>
+        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+          <label for="push-include-title-toggle">Include conversation title</label>
+          <input id="push-include-title-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+          <label for="push-preview-select">Message preview</label>
+          <select id="push-preview-select" onchange="updatePushPreferencesFromControls()" disabled>
+            <option value="none">None (generic text)</option>
+            <option value="truncated">Truncated</option>
+            <option value="full">Full text</option>
+          </select>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+          <label for="push-preview-chars-input">Preview length (characters)</label>
+          <input id="push-preview-chars-input" type="number" min="20" max="500" value="80" style="width: 90px;" onchange="updatePushPreferencesFromControls()" disabled>
+        </div>
+        <label style="margin-top: 10px;">Notify about</label>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-question-toggle">Questions from the agent</label>
+          <input id="push-event-question-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-turn-complete-toggle">Turn completed</label>
+          <input id="push-event-turn-complete-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-turn-failed-toggle">Turn failed</label>
+          <input id="push-event-turn-failed-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-board-toggle">Boards (plan reviews)</label>
+          <input id="push-event-board-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-cli-offline-toggle">CLI went offline</label>
+          <input id="push-event-cli-offline-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+        </div>
+        <label style="margin-top: 10px;">Devices</label>
+        <div id="push-device-list" style="width: 100%;"></div>
+        <div class="settings-help">Notifications are only sent while no device has the app in the foreground. Content defaults to generic text; message previews are opt-in per device.</div>
+      </div>
     </div>
   </div>
 </div>
