@@ -21,9 +21,24 @@ export function createQuestionRepository(db) {
         listActivityByQueueMessage: db.prepare(`SELECT text, subagent_run_id FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
         deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
 
-        // relay stream events
+        // relay stream events — every update carries the full text-so-far
+        // (all workers publish cumulative snapshots), so the store keeps ONE
+        // row per (queue message, subagent thread) and replaces it in place.
         getLastStreamSeqByQueueMessage: db.prepare(`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM relay_stream_events WHERE queue_message_id = ?`),
+        getStreamEventByQueueAndThread: db.prepare(`SELECT id, seq, done FROM relay_stream_events WHERE queue_message_id = ? AND subagent_run_id IS ? LIMIT 1`),
         insertStreamEvent: db.prepare(`INSERT INTO relay_stream_events (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, done, created_at, subagent_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+        updateStreamEventByQueueAndThread: db.prepare(`
+          UPDATE relay_stream_events
+          SET response_message_id = COALESCE(response_message_id, ?),
+              conversation_id = ?,
+              relay_mode = ?,
+              seq = ?,
+              text = ?,
+              done = CASE WHEN done = 1 OR ? = 1 THEN 1 ELSE 0 END,
+              created_at = ?
+          WHERE queue_message_id = ?
+            AND subagent_run_id IS ?
+        `),
         linkStreamEventsToResponse: db.prepare(`UPDATE relay_stream_events SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
         listStreamEventsByResponse: db.prepare(`SELECT seq, text, done, created_at, subagent_run_id FROM relay_stream_events WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
         listStreamEventsByQueueMessage: db.prepare(`SELECT seq, text, done, created_at, subagent_run_id FROM relay_stream_events WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),

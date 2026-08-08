@@ -5814,6 +5814,30 @@ export function registerMessagesRoutes(app, deps) {
         const row = stmts.getLastStreamSeqByQueueMessage?.get(messageId);
         const maxSeq = Math.max(0, Number(row?.max_seq || 0));
         const nextSeq = maxSeq + 1;
+        // Each update carries the full text-so-far, so the row for this thread
+        // is replaced in place — appending would persist the whole reply once
+        // per update. seq still advances per update so readers and the client
+        // stream state machine can order snapshots across threads.
+        const existing = stmts.getStreamEventByQueueAndThread?.get(messageId, normalizedSubagentRunId) || null;
+        if (existing) {
+          // A done snapshot is final for its thread; drop stale non-done
+          // stragglers, mirroring the client's stream state machine.
+          if (Number(existing.done || 0) === 1 && !done) {
+            return Math.max(0, Number(existing.seq || 0));
+          }
+          stmts.updateStreamEventByQueueAndThread?.run(
+            responseMessageId,
+            conversationId,
+            normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
+            nextSeq,
+            streamText,
+            done ? 1 : 0,
+            now,
+            messageId,
+            normalizedSubagentRunId,
+          );
+          return nextSeq;
+        }
         stmts.insertStreamEvent?.run(
           messageId,
           responseMessageId,

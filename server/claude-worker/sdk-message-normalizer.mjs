@@ -104,11 +104,19 @@ export function createSdkMessageNormalizer() {
         streamText: '',
         lastEmittedStreamText: '',
         thinking: new Map(), // block index -> { reasoningId, text }
-        // Assistant-message counter for the thread. Reasoning ids are keyed on
-        // (thread, message, block) so the partial `stream_event` frames and the
-        // complete `assistant` message for the same block produce the SAME id —
-        // the server upserts thoughts by reasoningId, so the complete message
-        // updates the streamed thought in place instead of duplicating it.
+        // The SDK delivers one complete `assistant` event PER CONTENT BLOCK
+        // (all sharing the message's API id, each arriving before that block's
+        // content_block_stop), so positional bookkeeping alone cannot pair a
+        // complete thinking block with its streamed frames. The streamed
+        // reasoning ids are recorded here per API message id and consumed in
+        // block order by the complete events — the server upserts thoughts by
+        // reasoningId, so the complete republish updates the streamed thought
+        // in place instead of duplicating it.
+        currentMessageId: '',
+        streamedThinkingIds: new Map(), // API message id -> [reasoningId, ...] in stream order
+        consumedThinkingIds: new Map(), // API message id -> count consumed by complete events
+        // Assistant-message counter for the thread; the fallback id key when
+        // partial frames (and thus recorded streamed ids) are unavailable.
         messageIndex: 0,
         // Set when `message_start` opens a message, so the complete `assistant`
         // message reuses that index instead of allocating a new one. Without
@@ -122,6 +130,22 @@ export function createSdkMessageNormalizer() {
 
   function thoughtIdFor(state, kind, blockIndex) {
     return `claude-${kind}-${state.key}-${state.messageIndex}-${blockIndex}`;
+  }
+
+  // Reasoning id for a thinking block on a complete assistant event: reuse the
+  // id its streamed frames already published (matched by API message id, in
+  // block order), falling back to a fresh positional id when no partial frames
+  // were seen for the message.
+  function completeThinkingIdFor(state, messageId, blockIndex) {
+    const streamedIds = messageId ? state.streamedThinkingIds.get(messageId) : null;
+    if (streamedIds?.length) {
+      const consumed = state.consumedThinkingIds.get(messageId) || 0;
+      if (consumed < streamedIds.length) {
+        state.consumedThinkingIds.set(messageId, consumed + 1);
+        return streamedIds[consumed];
+      }
+    }
+    return thoughtIdFor(state, 'thought', blockIndex);
   }
 
   // Called when a new assistant message begins on a thread, from whichever
@@ -221,7 +245,7 @@ export function createSdkMessageNormalizer() {
    * Copilot extension's reasoning-stream bridge; text on a final, tool-free
    * message is the answer itself and must not be duplicated as a thought.
    */
-  function actionsForAssistantMessage(content, parentToolUseId) {
+  function actionsForAssistantMessage(content, parentToolUseId, messageId) {
     const actions = [];
     const state = threadState(parentToolUseId);
     const subagentRunId = subagentRunIdFor(parentToolUseId);
@@ -231,12 +255,16 @@ export function createSdkMessageNormalizer() {
     for (const [index, block] of content.entries()) {
       const blockType = String(block?.type || '');
       if (blockType === 'thinking' || blockType === 'redacted_thinking') {
+        // Consume the pairing slot BEFORE the empty check: the summarized
+        // display can deliver an empty raw block ahead of the summary block,
+        // and skipping the empty one would hand its streamed id to the summary.
+        const reasoningId = completeThinkingIdFor(state, messageId, index);
         const text = capThought(block?.thinking || '');
         if (!text.trim()) continue;
         actions.push({
           channel: 'thought',
           payload: {
-            reasoningId: thoughtIdFor(state, 'thought', index),
+            reasoningId,
             text,
             done: true,
             subagentRunId,
@@ -275,6 +303,7 @@ export function createSdkMessageNormalizer() {
 
     if (eventType === 'message_start') {
       beginAssistantMessage(state, { fromStreamEvent: true });
+      state.currentMessageId = String(event?.message?.id || '').trim();
       return actions;
     }
 
@@ -282,10 +311,13 @@ export function createSdkMessageNormalizer() {
       const blockType = String(event?.content_block?.type || '');
       if (blockType === 'thinking' || blockType === 'redacted_thinking') {
         const index = Number(event?.index ?? 0);
-        state.thinking.set(index, {
-          reasoningId: thoughtIdFor(state, 'thought', index),
-          text: '',
-        });
+        const reasoningId = thoughtIdFor(state, 'thought', index);
+        state.thinking.set(index, { reasoningId, text: '' });
+        if (state.currentMessageId) {
+          const ids = state.streamedThinkingIds.get(state.currentMessageId) || [];
+          ids.push(reasoningId);
+          state.streamedThinkingIds.set(state.currentMessageId, ids);
+        }
       }
       return actions;
     }
@@ -363,7 +395,8 @@ export function createSdkMessageNormalizer() {
     if (type === 'assistant') {
       const parentToolUseId = sdkMessage?.parent_tool_use_id || null;
       const content = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
-      return actionsForAssistantMessage(content, parentToolUseId);
+      const messageId = String(sdkMessage?.message?.id || '').trim();
+      return actionsForAssistantMessage(content, parentToolUseId, messageId);
     }
 
     if (type === 'user') {
