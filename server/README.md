@@ -717,7 +717,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
 | GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored. Both return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
 | GET | `/api/context` | Same payload when a `conversationId` query is provided; otherwise returns a missing-selection response |
-| GET | `/api/usage` | Live Copilot usage snapshot |
+| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
+| GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
+| POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`) |
 | POST | `/api/settings/claude` | Enable/disable Claude, set the default model or the enabled model subset; triggers discovery and unstarted-conversation reconciliation |
 | GET | `/api/settings/cursor` | Read Cursor provider settings — same shape as Claude's: `models` is the enabled subset, `availableModels` the full discovered list, plus per-model `efforts` |
@@ -726,6 +728,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
 | POST | `/api/claude-native-session` | (Claude worker) Persist the native Agent SDK session id for resume |
 | POST | `/api/claude-context-usage` | (Claude worker) Report the session's context-window breakdown after a turn |
+| POST | `/api/claude-plan-usage` | (Claude worker) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot |
+| POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run for the active turn |
 | POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Request cancellation of one subagent run (unsupported by the Claude runtime) |
 | PATCH | `/api/conversation/:id/message/:messageId/share-visibility` | Hide or unhide a single message from shared views |
@@ -980,7 +984,11 @@ The CLI extension (`.github/extensions/web-relay/extension.mjs`) loads `relay-to
 for shared tool guidance.
 
 The browser UI keeps the usage button in the sidebar header, and that button continues to
-call `/api/usage` directly.
+call `/api/usage` directly. It now renders the unified plan-usage report — one card per
+provider with meters, reset countdowns and collapsible cost detail — via
+`public/app/plan-usage-view.mjs`, falling back to the old Copilot-only text summary when
+the response carries no `providers` array (an older relay, or one without the plan-usage
+service).
 
 ## Config (`config.json`)
 

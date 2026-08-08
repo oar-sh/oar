@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { buildClaudeUserContent } from './claude-attachments.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
-import { startClaudeTurn, createCanUseTool, readContextUsage } from './claude-sdk-adapter.mjs';
+import { startClaudeTurn, createCanUseTool, readContextUsage, readPlanUsage } from './claude-sdk-adapter.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
@@ -49,6 +49,7 @@ export function createClaudeTurnRunner({
   pathToClaudeCodeExecutable = '',
   startClaudeTurnImpl = startClaudeTurn,
   readContextUsageImpl = readContextUsage,
+  readPlanUsageImpl = readPlanUsage,
   relocateTranscriptImpl = relocateClaudeTranscriptForCwd,
   // Ceiling on how long a turn's input gate may stay held for background work.
   backgroundLingerCapMs = 30 * 60_000,
@@ -178,6 +179,29 @@ export function createClaudeTurnRunner({
     });
   }
 
+  /**
+   * Ship the session's plan usage (rate-limit windows + cost totals) to the
+   * relay. Falls back to the stable result fields when the experimental usage
+   * control request is unavailable, so the card still gets session cost.
+   * Advisory: a failure here must not disturb the turn's response.
+   */
+  async function publishPlanUsage(message, state) {
+    const totalCostUsd = state.result?.totalCostUsd ?? null;
+    // A cost with no per-model breakdown is still a usable fallback payload, so
+    // it has to count as a reason to publish or the card loses session cost on
+    // any turn the SDK reports without `modelUsage`.
+    if (!state.planUsage && !state.modelUsage && totalCostUsd === null) return;
+    await api('POST', '/api/claude-plan-usage', {
+      conversationId: message.conversationId,
+      sdkSessionId,
+      usage: state.planUsage,
+      modelUsage: state.modelUsage,
+      totalCostUsd,
+    }).catch((error) => {
+      dbg('plan usage publish failed', error?.message || String(error));
+    });
+  }
+
   async function publishFinalStream(message, text) {
     await api('POST', '/api/stream', {
       messageId: message.id,
@@ -211,6 +235,7 @@ export function createClaudeTurnRunner({
       lastStreamedText: '',
       responseModel: '',
       contextUsage: null,
+      planUsage: null,
       modelUsage: null,
     };
     let aborted = false;
@@ -343,7 +368,15 @@ export function createClaudeTurnRunner({
         linger.timer = null;
       }
       if (reason !== 'result') dbg('releasing held input gate', reason, message.id);
-      state.contextUsage = await readContextUsageImpl(turn, dbg);
+      // Both control requests run against the same still-open transport;
+      // issuing them concurrently keeps the gate hold to one timeout rather
+      // than two, since this is on the path to the CLI's exit.
+      const [contextUsage, planUsage] = await Promise.all([
+        readContextUsageImpl(turn, dbg),
+        readPlanUsageImpl(turn, dbg),
+      ]);
+      state.contextUsage = contextUsage;
+      state.planUsage = planUsage;
       turn?.endInput?.();
     }
 
@@ -427,6 +460,7 @@ export function createClaudeTurnRunner({
       // Runs on every exit path so a snapshot captured before the turn went
       // sideways still reaches the relay.
       await publishContextUsage(message, state, model);
+      await publishPlanUsage(message, state);
     }
 
     if (aborted) {

@@ -9,7 +9,7 @@ import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
-import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
+import { mapUsageSnapshotRow, fetchUsageSummaryPromise } from '../services/usage-snapshot-helpers.mjs';
 import { readStoredClaudeContextUsage } from '../services/claude-context-usage.mjs';
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
@@ -1725,6 +1725,13 @@ export function registerSessionsRoutes(app, deps) {
     touchCli,
     markCliOffline,
     fetchUsageSummary,
+    // Optional personal-scope billing detail; absent in tests and whenever the
+    // token cannot read billing, in which case the Copilot card degrades to its
+    // quota meters alone.
+    fetchCopilotBillingUsage = null,
+    planUsageService = null,
+    getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
+    setCursorPlanAllowanceSettings = () => ({ ok: false, error: 'Cursor allowance settings are unavailable' }),
     sessionHistoryRefreshService,
     sdkSessionImportService,
     ensureRuntimeSessionBinding,
@@ -4841,11 +4848,69 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  // GET /api/usage — Copilot quota fetched live from GitHub API
-  app.get('/api/usage', auth, (req, res) => {
-    fetchUsageSummary((err, summary) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(summary);
+  // GET /api/usage — unified plan usage across every configured provider.
+  //
+  // Plan-first: subscription credits, rate-limit windows and reset times, with
+  // token/cost diagnostics carried as collapsible detail sections. Each
+  // provider is independent — a failing source yields an "unavailable" card
+  // rather than a failed response — so the modal always renders something.
+  app.get('/api/usage', auth, async (req, res) => {
+    const wantsLegacyOnly = String(req.query?.legacy || '').trim() === '1';
+
+    let summary = null;
+    let summaryError = null;
+    try {
+      summary = await fetchUsageSummaryPromise(fetchUsageSummary);
+    } catch (error) {
+      summaryError = String(error?.message || error || 'Failed to fetch usage data');
+    }
+
+    if (wantsLegacyOnly || !planUsageService) {
+      if (!summary) return res.status(500).json({ error: summaryError || 'Usage is unavailable' });
+      return res.json(summary);
+    }
+
+    // Billing detail is best-effort and must never delay or fail the card.
+    let billing = null;
+    if (typeof fetchCopilotBillingUsage === 'function') {
+      try {
+        billing = await fetchCopilotBillingUsage();
+      } catch (error) {
+        billing = { items: [], timePeriod: null, scope: null, error: String(error?.message || error) };
+      }
+    }
+
+    const claudeSettings = getClaudeProviderSettings();
+    const cursorSettings = getCursorProviderSettings();
+    const report = planUsageService.buildReport({
+      copilotSummary: summary,
+      copilotError: summaryError,
+      copilotBilling: billing,
+      claudeConfigured: claudeSettings?.enabled === true,
+      cursorConfigured: cursorSettings?.enabled === true,
+      cursorAllowances: getCursorPlanAllowanceSettings(),
     });
+
+    // Legacy top-level fields stay alongside `providers` so an older cached
+    // client shell keeps working through a PWA update.
+    return res.json({ ...(summary || {}), ...report });
+  });
+
+  app.get('/api/settings/cursor-allowance', auth, (_req, res) => {
+    res.json({ ok: true, ...getCursorPlanAllowanceSettings() });
+  });
+
+  app.post('/api/settings/cursor-allowance', auth, (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = setCursorPlanAllowanceSettings({
+      cursorModelsUsd: body.cursorModelsUsd,
+      otherModelsUsd: body.otherModelsUsd,
+      resetDay: body.resetDay,
+      resetAccounting: body.resetAccounting === true,
+    });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update Cursor allowances' });
+    }
+    return res.json(result);
   });
 }

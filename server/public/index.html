@@ -1614,6 +1614,153 @@
     word-break: break-word;
   }
 
+  /* ── Plan usage modal ──
+     Shares the context-usage bar/table vocabulary so the two modals read as
+     one family, but leads with per-provider plan cards. */
+  .plan-usage { display: flex; flex-direction: column; gap: 16px; }
+  .plan-usage-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    background: var(--bg2);
+  }
+  .plan-usage-card[data-status="unavailable"],
+  .plan-usage-card[data-status="not-configured"] { opacity: 0.72; }
+  .plan-usage-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .plan-usage-card-title { font-size: 1rem; font-weight: 600; }
+  .plan-usage-badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .plan-usage-badge {
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    white-space: nowrap;
+  }
+  .plan-usage-badge-plan { color: var(--accent); border-color: var(--accent); }
+  .plan-usage-badge-status { color: var(--warn); border-color: var(--warn); }
+  .plan-usage-message {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 10px;
+    line-height: 1.45;
+  }
+  .plan-usage-meter { margin-bottom: 12px; }
+  .plan-usage-meter-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 5px;
+  }
+  .plan-usage-meter-label {
+    font-size: 0.88rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .plan-usage-meter-secondary .plan-usage-meter-label { font-weight: 500; font-size: 0.82rem; }
+  .plan-usage-flag {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 6px;
+  }
+  .plan-usage-meter-pct {
+    font-size: 0.88rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .plan-usage-bar {
+    width: 100%;
+    height: 10px;
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--bg3);
+  }
+  .plan-usage-meter-secondary .plan-usage-bar { height: 6px; border-radius: 3px; }
+  .plan-usage-bar-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    transition: width 0.25s ease, background 0.25s ease;
+  }
+  .plan-usage-bar-unknown {
+    background-image: repeating-linear-gradient(
+      45deg, rgba(255, 255, 255, 0.12) 0 6px, transparent 6px 12px
+    );
+  }
+  .plan-usage-meter-meta,
+  .plan-usage-meter-note {
+    font-size: 0.76rem;
+    color: var(--muted);
+    margin-top: 5px;
+    line-height: 1.4;
+  }
+  .plan-usage-secondary {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin-top: 4px;
+  }
+  .plan-usage-details {
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+    margin-top: 8px;
+    font-size: 0.82rem;
+  }
+  .plan-usage-details summary {
+    cursor: pointer;
+    outline: none;
+    color: var(--muted);
+    padding: 2px 0;
+  }
+  .plan-usage-details summary:hover { color: var(--text); }
+  .plan-usage-detail-note {
+    font-size: 0.74rem;
+    color: var(--muted);
+    margin: 6px 0 2px;
+    line-height: 1.4;
+  }
+  .plan-usage-detail-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  .plan-usage-detail-table td { padding: 5px 2px; border-bottom: 1px solid var(--border); }
+  .plan-usage-detail-table tr:last-child td { border-bottom: none; }
+  .plan-usage-detail-label { display: flex; flex-direction: column; gap: 2px; }
+  .plan-usage-detail-hint { font-size: 0.7rem; color: var(--muted); }
+  .plan-usage-detail-value {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    vertical-align: top;
+  }
+  .plan-usage-card-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    font-size: 0.74rem;
+    color: var(--muted);
+  }
+  .plan-usage-link { color: var(--accent); text-decoration: none; }
+  .plan-usage-link:hover { text-decoration: underline; }
+  @media (prefers-reduced-motion: reduce) {
+    .plan-usage-bar-fill { transition: none; }
+  }
+
   #attachment-preview {
     display: none; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
   }
@@ -4323,6 +4470,47 @@
           <button id="cursor-remove-btn" type="button" class="summary-btn" onclick="removeCursorSettings()">Remove saved key</button>
         </div>
         <div class="settings-help">Runs Cursor conversations through the Cursor Agent SDK using your saved Cursor API key. The key is stored on the relay host and never sent to browsers.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="cursor-allowance-cursor-models-input">Cursor monthly plan allowance</label>
+        <div class="settings-help">Cursor does not expose your included pools through its SDK, so enter the monthly allowance from your plan. Spend is measured with raw model cost and reset on the day you choose.</div>
+        <label for="cursor-allowance-cursor-models-input" style="margin-top: 8px;">Cursor Models pool (USD)</label>
+        <input
+          id="cursor-allowance-cursor-models-input"
+          type="number"
+          min="0"
+          step="0.01"
+          inputmode="decimal"
+          placeholder="e.g. 20"
+          aria-label="Cursor Models monthly allowance in US dollars"
+        >
+        <label for="cursor-allowance-other-models-input" style="margin-top: 8px;">Other Models pool (USD)</label>
+        <input
+          id="cursor-allowance-other-models-input"
+          type="number"
+          min="0"
+          step="0.01"
+          inputmode="decimal"
+          placeholder="e.g. 20"
+          aria-label="Other Models monthly allowance in US dollars"
+        >
+        <label for="cursor-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
+        <input
+          id="cursor-allowance-reset-day-input"
+          type="number"
+          min="1"
+          max="31"
+          step="1"
+          inputmode="numeric"
+          placeholder="1"
+          aria-label="Cursor billing reset day of month"
+        >
+        <div id="cursor-allowance-status" class="settings-help settings-provider-status">Loading Cursor allowances…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="cursor-allowance-save-btn" type="button" class="summary-btn" onclick="saveCursorAllowanceSettings()">Save allowances</button>
+          <button id="cursor-allowance-reset-btn" type="button" class="summary-btn" onclick="resetCursorAllowanceAccounting()">Reset tracked spend</button>
+        </div>
+        <div class="settings-help">Reset tracked spend after changing plan or account: tracking re-baselines from each agent's current totals, so past spend is never counted twice.</div>
       </div>
       <div id="push-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
         <label>Push notifications</label>

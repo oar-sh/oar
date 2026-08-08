@@ -67,6 +67,7 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
 - Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
 - **Context usage** modal with a per-category token breakdown of the model's context window
+- **Plan usage** modal with subscription credits, rate-limit windows and reset countdowns for Copilot, Claude, and Cursor
 - **Image conversations** (OpenAI BYOK): generate images in chat and iterate on a generated image with *Edit this image*
 - **Share** a conversation by link, with per-message *Hide from shares* control
 - Conversation history stored in local SQLite
@@ -223,7 +224,11 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
 - Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes only** and **Full file** modes; closing it returns to the still-open list.
 - Answer clarification prompts in relay question cards (from `ask_user`, or Claude's `AskUserQuestion`).
 - Watch the reply arrive: assistant text streams into the pending bubble as it is generated, and any subagent the turn spawns gets its own nested bubble with its own thoughts, activity, and text.
-- Use the usage button (`📊`) for a live GitHub Copilot plan usage summary. It is recorded only for Copilot turns — OpenAI, Claude, and Cursor turns do not consume Copilot premium requests, and no usage line is attached to them.
+- Use **Check Usage** (`📊`) in the conversation menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Sources differ per provider:
+  - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing.
+  - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn.
+  - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools. Cursor exposes no account API for included pools, so these figures are estimates and the Spending dashboard remains authoritative.
+- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, and Cursor turns do not consume Copilot premium requests, and no usage line is attached to them.
 - Use the **Context** button for a per-category breakdown of the conversation's context window: a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets.
 - Use **Share** in the conversation menu to publish a read-only link. Hover any message and choose **Hide from shares** to keep it out of the shared view without deleting it; hidden messages stay fully visible to you and are marked as hidden.
 - External links in chat open in a new tab with `noopener`/`noreferrer`; workspace file mentions stay in the in-app preview.
@@ -263,7 +268,7 @@ What Claude conversations support:
 Differences from Copilot conversations:
 
 - Cancelling one individual subagent is not supported — **Stop** ends the whole turn instead
-- Claude turns are not included in the Copilot usage summary, and no usage line is attached to their replies
+- Claude turns are not included in the Copilot usage line, and no usage line is attached to their replies (Claude's own plan limits appear in **Check Usage**)
 - The browsable **Session** root points at the Agent SDK's project directory rather than a Copilot session-state folder
 
 ### Cursor (Agent SDK)
@@ -278,7 +283,7 @@ What Cursor conversations support:
 - The browsable **Session** root points at the worker's per-session agent store, created on the session's first turn
 - Expired cached agent handles are recreated and retried automatically once — a second auth failure means the API key itself is invalid
 
-Like Claude, Cursor turns are not included in the Copilot usage summary and no usage line is attached to their replies.
+Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under Settings → Cursor monthly plan allowance.
 
 ## Relay modes
 
@@ -429,7 +434,8 @@ Common routes:
 - Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/cursor`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
 - Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
-- Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`
+- Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
+- Cursor worker: `/api/cursor-agent-id`, `/api/cursor-context-usage`, `/api/cursor-plan-usage`
 - Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
 - Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`

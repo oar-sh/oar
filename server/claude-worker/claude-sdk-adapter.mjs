@@ -155,6 +155,43 @@ export async function readContextUsage(turn, dbg = () => {}, { timeoutMs = 10000
 }
 
 /**
+ * Read the session's structured `/usage` data: plan rate-limit windows plus
+ * session cost/token totals — the same data Claude Code's `/usage` dialog
+ * renders.
+ *
+ * Same transport constraint as `readContextUsage`: the control request only
+ * works while the turn's `Query` is open, so this is called from the same
+ * finalize step, before the input gate releases.
+ *
+ * The SDK marks this API EXPERIMENTAL and says the method name will change
+ * when it stabilizes, so the call is feature-detected and every failure is
+ * swallowed — plan limits are a nice-to-have, never a reason to fail a turn.
+ */
+const CLAUDE_USAGE_METHOD = 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET';
+
+export async function readPlanUsage(turn, dbg = () => {}, { timeoutMs = 10000 } = {}) {
+  if (typeof turn?.[CLAUDE_USAGE_METHOD] !== 'function') return null;
+  let timer = null;
+  try {
+    const request = turn[CLAUDE_USAGE_METHOD]();
+    // The race leaves the losing promise unobserved on timeout; swallow its
+    // rejection so it cannot surface as an unhandledRejection.
+    request.catch?.(() => {});
+    return await Promise.race([
+      request,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`plan usage timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    dbg('plan usage request failed', error?.message || String(error));
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * Build the `canUseTool` callback for one turn. Everything is auto-allowed
  * (parity with the Copilot workers' `--allow-all` posture); the only
  * interceptions are AskUserQuestion (bridged to relay question cards) and

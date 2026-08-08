@@ -18,6 +18,7 @@ import {
   usageSnapshotFromRow,
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
+import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services/plan-usage-claude.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 
@@ -1536,6 +1537,8 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerProcessInspector,
     resolveSessionStateRoot,
     fetchUsageSummary = null,
+    planUsageService = null,
+    getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
     relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
@@ -4386,6 +4389,58 @@ export function registerMessagesRoutes(app, deps) {
     });
     stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
     res.json({ ok: true });
+  });
+
+  // POST /api/claude-plan-usage — Claude worker reports the session's
+  // structured /usage data (plan rate-limit windows + session cost totals).
+  //
+  // Read from the live query transport at the end of a turn; the relay never
+  // opens an extra turn to refresh it, so the newest reading is whatever the
+  // last real turn produced.
+  app.post('/api/claude-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    const usage = normalizeClaudePlanUsage(req.body?.usage)
+      || claudePlanUsageFromResult({
+        modelUsage: req.body?.modelUsage,
+        totalCostUsd: req.body?.totalCostUsd,
+      });
+    if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
+    planUsageService.saveSnapshot('claude', usage, {
+      source: 'worker',
+      error: String(req.body?.error || '').trim() || null,
+    });
+    res.json({ ok: true });
+  });
+
+  // POST /api/cursor-plan-usage — Cursor worker reports the agent's cumulative
+  // billed usage. The relay diffs it against the stored checkpoint and books
+  // the increase into the current billing cycle under the pool implied by the
+  // model that ran the turn.
+  app.post('/api/cursor-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    const agentId = String(req.body?.agentId || '').trim();
+    if (!agentId) return res.status(400).json({ error: 'Missing agentId' });
+    const allowances = getCursorPlanAllowanceSettings();
+    const applied = planUsageService.recordCursorUsageReport(
+      {
+        agentId,
+        model: req.body?.model,
+        rawCostCents: req.body?.rawCostCents,
+        chargedCents: req.body?.chargedCents,
+        inputTokens: req.body?.inputTokens,
+        outputTokens: req.body?.outputTokens,
+        cacheReadTokens: req.body?.cacheReadTokens,
+        cacheWriteTokens: req.body?.cacheWriteTokens,
+        totalTokens: req.body?.totalTokens,
+        runCount: req.body?.runCount,
+        capturedAt: req.body?.capturedAt,
+      },
+      { resetDay: allowances.resetDay },
+    );
+    if (!applied) return res.status(400).json({ error: 'Missing usable usage metrics' });
+    res.json({ ok: true, pool: applied.pool, cycle: applied.cycle.key, changed: applied.changed });
   });
 
   // POST /api/cursor-agent-id — Cursor worker persists the Cursor agent id so

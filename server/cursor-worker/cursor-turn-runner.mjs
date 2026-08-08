@@ -7,6 +7,7 @@ import {
   classifyCursorError,
   isCursorAuthErrorMessage,
   readModelContextWindow,
+  readAgentUsage,
   resolveCursorReasoningParams,
 } from './cursor-sdk-adapter.mjs';
 import { createAskUserTool } from './cursor-ask-user-tool.mjs';
@@ -87,6 +88,7 @@ export function createCursorTurnRunner({
   startCursorRunImpl = startCursorRun,
   classifyErrorImpl = classifyCursorError,
   readContextWindowImpl = readModelContextWindow,
+  readAgentUsageImpl = readAgentUsage,
   resolveModelParamsImpl = resolveCursorReasoningParams,
   createNormalizerImpl = createSdkMessageNormalizer,
   buildUserMessageImpl = buildCursorUserMessage,
@@ -274,6 +276,28 @@ export function createCursorTurnRunner({
     });
   }
 
+  /**
+   * Report the agent's cumulative billed usage so the relay can book this
+   * turn's increase against the configured monthly allowance. The model is
+   * carried along because it is the only signal available for deciding which
+   * Cursor billing pool the spend belongs to — the SDK's per-run entries do
+   * not identify a model.
+   */
+  async function publishPlanUsage(message, state, model) {
+    if (!agentHandle?.agent || !agentHandle.agentId) return;
+    const usage = await readAgentUsageImpl({ agent: agentHandle.agent, dbg });
+    if (!usage) return;
+    await api('POST', '/api/cursor-plan-usage', {
+      conversationId: message.conversationId,
+      agentId: agentHandle.agentId,
+      model: state.responseModel || model || '',
+      ...usage,
+      capturedAt: new Date().toISOString(),
+    }).catch((error) => {
+      dbg('plan usage publish failed', error?.message || String(error));
+    });
+  }
+
   async function publishFinalStream(message, text) {
     await api('POST', '/api/stream', {
       messageId: message.id,
@@ -429,6 +453,7 @@ export function createCursorTurnRunner({
       // Runs on every exit path so usage captured before the turn went
       // sideways still reaches the relay.
       await publishContextUsage(message, state, model);
+      await publishPlanUsage(message, state, model);
     }
 
     if (aborted) {

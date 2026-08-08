@@ -9,6 +9,7 @@ import {
   isCursorAuthErrorMessage,
   createCursorAgentHandle,
   modeForRelayMode,
+  readAgentUsage,
   readModelContextWindow,
   resolveCursorReasoningParams,
   startCursorRun,
@@ -393,6 +394,68 @@ test('readModelContextWindow caches per model', async () => {
   assert.equal(await readModelContextWindow({ apiKey: 'cursor-test-key', model: 'cached-model', modelsListImpl }), 32000);
   assert.equal(await readModelContextWindow({ apiKey: 'cursor-test-key', model: 'cached-model', modelsListImpl }), 32000);
   assert.equal(calls, 1);
+});
+
+test('readAgentUsage flattens the SDK usage shape', async () => {
+  const agent = {
+    getUsage: async () => ({
+      usage: { inputTokens: 10, outputTokens: 20, cacheReadTokens: 5, cacheWriteTokens: 1, totalTokens: 36 },
+      cost: { rawCostCents: 250, chargedCents: 0 },
+      runs: [{ runId: 'a' }, { runId: 'b' }],
+    }),
+  };
+  assert.deepEqual(await readAgentUsage({ agent }), {
+    rawCostCents: 250,
+    chargedCents: 0,
+    inputTokens: 10,
+    outputTokens: 20,
+    cacheReadTokens: 5,
+    cacheWriteTokens: 1,
+    totalTokens: 36,
+    runCount: 2,
+  });
+});
+
+test('readAgentUsage reports absent cost as null rather than zero', async () => {
+  // Cost is eventually consistent, so "not reported yet" must not be booked as
+  // a real $0 or the checkpoint diff would swallow the spend when it lands.
+  const agent = { getUsage: async () => ({ usage: { totalTokens: 12 }, runs: [] }) };
+  const usage = await readAgentUsage({ agent });
+  assert.equal(usage.rawCostCents, null);
+  assert.equal(usage.chargedCents, null);
+  assert.equal(usage.totalTokens, 12);
+});
+
+test('readAgentUsage gives up rather than holding the turn open', async () => {
+  // getUsage() is a remote read issued while the turn is still finalizing, and
+  // the SDK sends it with no abort signal, so a hung Cursor API must cost the
+  // usage reading and never the reply.
+  const started = Date.now();
+  const agent = { getUsage: () => new Promise(() => {}) };
+  assert.equal(await readAgentUsage({ agent, timeoutMs: 40 }), null);
+  assert.ok(Date.now() - started < 2000, 'timed out promptly instead of hanging');
+});
+
+test('readAgentUsage swallows a rejection that lands after the timeout', async () => {
+  const rejections = [];
+  const onRejection = (error) => rejections.push(error);
+  process.on('unhandledRejection', onRejection);
+  try {
+    const agent = {
+      getUsage: () => new Promise((_, reject) => setTimeout(() => reject(new Error('late')), 20)),
+    };
+    assert.equal(await readAgentUsage({ agent, timeoutMs: 5 }), null);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off('unhandledRejection', onRejection);
+  }
+});
+
+test('readAgentUsage returns null for an agent that cannot report usage', async () => {
+  assert.equal(await readAgentUsage({ agent: {} }), null);
+  assert.equal(await readAgentUsage({ agent: { getUsage: async () => null } }), null);
+  assert.equal(await readAgentUsage({ agent: { getUsage: async () => { throw new Error('nope'); } } }), null);
 });
 
 // Parameter shapes mirror live Cursor models.list entries: GPT models expose a

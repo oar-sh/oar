@@ -149,6 +149,7 @@ import {
   updatePwaAppName,
 } from './pwa-install.js';
 import { renderContextUsageHtml } from './context-usage-view.mjs';
+import { renderPlanUsageHtml, planUsageSubtitle } from './plan-usage-view.mjs';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
 import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
@@ -216,6 +217,8 @@ import {
   refreshClaudeSettingsState,
   saveCursorSettings,
   removeCursorSettings,
+  saveCursorAllowanceSettings,
+  resetCursorAllowanceAccounting,
   toggleCursorProvider,
   applyCursorSettingsState,
   refreshCursorSettingsState,
@@ -2371,11 +2374,24 @@ async function saveSelectedModelsFromModal() {
 async function loadUsageSummaryAndRender() {
   const d = await loadUsageSummary();
   if (!d) throw new Error('Unable to load usage data');
-  const pct = d.premiumInteractions.percentRemaining != null
+  const planHtml = renderPlanUsageHtml(d);
+  if (planHtml) {
+    renderSummaryModalContent({
+      title: 'Plan usage',
+      subtitle: planUsageSubtitle(d),
+      bodyHtml: planHtml,
+      refresh: loadUsageSummaryAndRender,
+      kind: 'usage',
+    });
+    return;
+  }
+  // Legacy relay (or a relay without the plan-usage service): fall back to the
+  // Copilot-only text summary rather than showing an empty modal.
+  const pct = d.premiumInteractions?.percentRemaining != null
     ? ` (${d.premiumInteractions.percentRemaining.toFixed(1)}% left)`
     : '';
-  const msg = `Chat/Completions: ${d.chat.unlimited ? 'Unlimited ✅' : `${d.chat.remaining} remaining`}\n` +
-    `Premium interactions: ${d.premiumInteractions.remaining} / ${d.premiumInteractions.entitlement} remaining${pct}`;
+  const msg = `Chat/Completions: ${d.chat?.unlimited ? 'Unlimited ✅' : `${d.chat?.remaining} remaining`}\n` +
+    `Premium interactions: ${d.premiumInteractions?.remaining} / ${d.premiumInteractions?.entitlement} remaining${pct}`;
   renderSummaryModalContent({
     title: 'Copilot Usage',
     subtitle: `Resets ${d.resetDate || 'unknown'}`,
@@ -2424,9 +2440,9 @@ async function showUsage() {
     btn.disabled = true;
   }
   openSummaryModal({
-    title: 'Copilot Usage',
+    title: 'Plan usage',
     subtitle: 'Loading…',
-    bodyHtml: '<div class="summary-loading">Fetching usage snapshot…</div>',
+    bodyHtml: '<div class="summary-loading">Fetching plan usage across providers…</div>',
     refresh: loadUsageSummaryAndRender,
     kind: 'usage',
   });
@@ -2435,7 +2451,7 @@ async function showUsage() {
     await loadUsageSummaryAndRender();
   } catch (e) {
     renderSummaryModalContent({
-      title: 'Copilot Usage',
+      title: 'Plan usage',
       subtitle: 'Unable to load',
       bodyHtml: `<div class="summary-error">Failed to fetch usage: ${escHtml(e.message || 'Unknown error')}</div>`,
       refresh: loadUsageSummaryAndRender,
@@ -3484,6 +3500,8 @@ window.saveClaudeSettings = saveClaudeSettings;
 window.toggleClaudeProvider = toggleClaudeProvider;
 window.saveCursorSettings = saveCursorSettings;
 window.removeCursorSettings = removeCursorSettings;
+window.saveCursorAllowanceSettings = saveCursorAllowanceSettings;
+window.resetCursorAllowanceAccounting = resetCursorAllowanceAccounting;
 window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;

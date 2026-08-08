@@ -7,6 +7,8 @@ import {
 import {
   loadClaudeSettings,
   loadCursorSettings,
+  loadCursorAllowanceSettings,
+  updateCursorAllowanceSettings,
   loadOpenAISettings,
   updateClaudeSettings,
   updateCursorSettings,
@@ -419,6 +421,139 @@ export async function refreshCursorSettingsState() {
   return applyCursorSettingsState(settings);
 }
 
+// ── Cursor manual plan allowances ──
+// Cursor's SDK reports spend but not the included-pool balance, so these
+// user-entered numbers are what the plan-usage card measures spend against.
+let cursorAllowanceUpdateInFlight = false;
+
+function setCursorAllowanceControlsDisabled(disabled) {
+  for (const id of [
+    'cursor-allowance-cursor-models-input',
+    'cursor-allowance-other-models-input',
+    'cursor-allowance-reset-day-input',
+    'cursor-allowance-save-btn',
+    'cursor-allowance-reset-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyCursorAllowanceState(settings = {}) {
+  const cursorModels = document.getElementById('cursor-allowance-cursor-models-input');
+  const otherModels = document.getElementById('cursor-allowance-other-models-input');
+  const resetDay = document.getElementById('cursor-allowance-reset-day-input');
+  const status = document.getElementById('cursor-allowance-status');
+  if (cursorModels) {
+    cursorModels.value = settings?.cursorModelsUsd === null || settings?.cursorModelsUsd === undefined
+      ? ''
+      : String(settings.cursorModelsUsd);
+  }
+  if (otherModels) {
+    otherModels.value = settings?.otherModelsUsd === null || settings?.otherModelsUsd === undefined
+      ? ''
+      : String(settings.otherModelsUsd);
+  }
+  if (resetDay) resetDay.value = String(settings?.resetDay ?? 1);
+  if (status) {
+    const configured = settings?.cursorModelsUsd != null || settings?.otherModelsUsd != null;
+    status.textContent = configured
+      ? `Tracking spend against your allowances; resets on day ${settings?.resetDay ?? 1} of each month.`
+      : 'No allowance set — the usage card shows Cursor spend without a remaining balance.';
+    status.dataset.state = configured ? 'active' : 'unconfigured';
+  }
+  setCursorAllowanceControlsDisabled(cursorAllowanceUpdateInFlight);
+  return settings;
+}
+
+export async function refreshCursorAllowanceState() {
+  try {
+    const settings = await loadCursorAllowanceSettings();
+    if (!settings) return null;
+    return applyCursorAllowanceState(settings);
+  } catch {
+    const status = document.getElementById('cursor-allowance-status');
+    if (status) {
+      status.textContent = 'Unable to load Cursor allowances.';
+      status.dataset.state = 'error';
+    }
+    return null;
+  }
+}
+
+/**
+ * Read one allowance field.
+ *
+ * A `type="number"` input reports an empty `value` for text the browser could
+ * not parse, so `validity.badInput` is the only way to tell a deliberately
+ * cleared field from "12,50" typed in a comma-decimal locale. Without that
+ * check the second case silently posts `null` and wipes the allowance.
+ *
+ * @returns {number|null|undefined} the amount, null to clear, undefined when
+ *   the control is absent (leave the stored value alone)
+ * @throws {Error} when the field holds something that is not a valid amount
+ */
+function readAllowanceInput(id, label) {
+  const input = document.getElementById(id);
+  if (!input) return undefined;
+  if (input.validity?.badInput) throw new Error(`${label} must be a number, for example 20 or 20.00.`);
+  const raw = String(input.value ?? '').trim();
+  // An emptied field clears the allowance rather than leaving the old value.
+  if (raw === '') return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} must be zero or a positive amount.`);
+  return parsed;
+}
+
+function readResetDayInput() {
+  const input = document.getElementById('cursor-allowance-reset-day-input');
+  if (!input) return undefined;
+  if (input.validity?.badInput) throw new Error('Billing reset day must be a whole number between 1 and 31.');
+  const raw = String(input.value ?? '').trim();
+  if (raw === '') return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 31) {
+    throw new Error('Billing reset day must be between 1 and 31.');
+  }
+  return Math.round(parsed);
+}
+
+export async function saveCursorAllowanceSettings({ resetAccounting = false } = {}) {
+  if (cursorAllowanceUpdateInFlight) return;
+  let payload;
+  try {
+    const resetDay = readResetDayInput();
+    payload = {
+      cursorModelsUsd: readAllowanceInput('cursor-allowance-cursor-models-input', 'Cursor Models allowance'),
+      otherModelsUsd: readAllowanceInput('cursor-allowance-other-models-input', 'Other Models allowance'),
+      ...(resetDay === undefined ? {} : { resetDay }),
+      ...(resetAccounting ? { resetAccounting: true } : {}),
+    };
+  } catch (error) {
+    alert(error?.message || 'Please check the Cursor allowance values.');
+    return;
+  }
+  cursorAllowanceUpdateInFlight = true;
+  setCursorAllowanceControlsDisabled(true);
+  try {
+    const result = await updateCursorAllowanceSettings(payload);
+    cursorAllowanceUpdateInFlight = false;
+    applyCursorAllowanceState(result);
+    showTransientRelayNotice(resetAccounting
+      ? 'Cursor allowances saved and tracked spend reset.'
+      : 'Cursor allowances saved.');
+  } catch (error) {
+    cursorAllowanceUpdateInFlight = false;
+    setCursorAllowanceControlsDisabled(false);
+    alert(error?.message || 'Failed to update Cursor allowances.');
+  }
+}
+
+export async function resetCursorAllowanceAccounting() {
+  if (!confirm('Reset the tracked Cursor spend for the current billing cycle?')) return;
+  await saveCursorAllowanceSettings({ resetAccounting: true });
+}
+
 async function syncCursorSettingsInputs() {
   const keyInput = document.getElementById('cursor-api-key-input');
   const modelInput = document.getElementById('cursor-model-input');
@@ -794,6 +929,7 @@ export function openSettingsModal() {
   cursorSettingsInputsDirty = false;
   ensureCursorSettingsInputTracking();
   void syncCursorSettingsInputs();
+  void refreshCursorAllowanceState();
   syncWindowsAutostartSetting();
   void refreshWindowsAutostartSetting();
   syncTurnCeilingSlider();

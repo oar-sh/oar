@@ -52,6 +52,9 @@ import {
   toDriveWebPath as _toDriveWebPath,
   normalizeLinuxAbsolutePath as _normalizeLinuxAbsolutePath,
 } from './services/drives-path-helpers.mjs';
+import { createPlanUsageService } from './services/plan-usage-service.mjs';
+import { normalizeCursorAllowanceSettings } from './services/plan-usage-cursor.mjs';
+import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
 import { createInstalledCopilotClient } from './copilot-sdk-runtime.mjs';
@@ -562,6 +565,86 @@ function getCursorProviderSettings() {
   };
 }
 
+/**
+ * Manual Cursor plan allowances. Cursor's SDK reports authoritative spend but
+ * no included-pool balance or billing reset date, so these are the only source
+ * for the "how much is left" side of the Cursor usage card.
+ */
+function getCursorPlanAllowanceSettings() {
+  const readNumeric = (key) => {
+    const raw = readAppSettingValue(key);
+    if (raw === '' || raw === null || raw === undefined) return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  return normalizeCursorAllowanceSettings({
+    cursorModelsUsd: readNumeric(CURSOR_ALLOWANCE_CURSOR_MODELS_SETTING_KEY),
+    otherModelsUsd: readNumeric(CURSOR_ALLOWANCE_OTHER_MODELS_SETTING_KEY),
+    resetDay: readNumeric(CURSOR_ALLOWANCE_RESET_DAY_SETTING_KEY),
+  });
+}
+
+function setCursorPlanAllowanceSettings(update = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Cursor allowance settings are unavailable' };
+  }
+  const payload = update && typeof update === 'object' ? update : {};
+  const current = getCursorPlanAllowanceSettings();
+  const nowIso = new Date().toISOString();
+
+  // Plan every write before performing any of them: the form posts all three
+  // fields together, so a rejected second field must not leave the first one
+  // already persisted.
+  const writes = [];
+  const planAllowance = (key, value, label) => {
+    if (value === undefined) return null;
+    // null / '' clears the allowance so the card falls back to "spend only".
+    if (value === null || value === '') {
+      writes.push(() => stmts.deleteAppSetting.run(key));
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) return { error: `Invalid ${label} allowance` };
+    const normalized = Math.round(parsed * 100) / 100;
+    writes.push(() => stmts.upsertAppSetting.run(key, String(normalized), nowIso));
+    return null;
+  };
+
+  const cursorModelsError = planAllowance(
+    CURSOR_ALLOWANCE_CURSOR_MODELS_SETTING_KEY,
+    payload.cursorModelsUsd,
+    'Cursor Models',
+  );
+  if (cursorModelsError) return { ok: false, ...cursorModelsError };
+  const otherModelsError = planAllowance(
+    CURSOR_ALLOWANCE_OTHER_MODELS_SETTING_KEY,
+    payload.otherModelsUsd,
+    'Other Models',
+  );
+  if (otherModelsError) return { ok: false, ...otherModelsError };
+
+  let resetDay = current.resetDay;
+  if (payload.resetDay !== undefined) {
+    const parsedDay = Number(payload.resetDay);
+    if (!Number.isFinite(parsedDay) || parsedDay < 1 || parsedDay > 31) {
+      return { ok: false, error: 'Reset day must be between 1 and 31' };
+    }
+    resetDay = Math.round(parsedDay);
+    writes.push(() => stmts.upsertAppSetting.run(CURSOR_ALLOWANCE_RESET_DAY_SETTING_KEY, String(resetDay), nowIso));
+  }
+
+  const applyWrites = db.transaction(() => {
+    for (const write of writes) write();
+  });
+  applyWrites();
+
+  if (payload.resetAccounting === true) {
+    planUsageService.resetCursorAccounting({ resetDay });
+  }
+
+  return { ok: true, ...getCursorPlanAllowanceSettings() };
+}
+
 function setCursorProviderSettings(update = {}) {
   const payload = update && typeof update === 'object' ? update : {};
   const apiKey = payload.apiKey;
@@ -761,6 +844,11 @@ const CURSOR_MODEL_SETTING_KEY = 'cursor_model';
 const CURSOR_MODELS_SETTING_KEY = 'cursor_models';
 const CURSOR_ENABLED_MODELS_SETTING_KEY = 'cursor_enabled_models';
 const CURSOR_MODEL_EFFORTS_SETTING_KEY = 'cursor_model_efforts';
+// Cursor exposes no account API for the monthly included pools, so the
+// allowances the plan-usage card measures spend against are user-supplied.
+const CURSOR_ALLOWANCE_CURSOR_MODELS_SETTING_KEY = 'cursor_allowance_cursor_models_usd';
+const CURSOR_ALLOWANCE_OTHER_MODELS_SETTING_KEY = 'cursor_allowance_other_models_usd';
+const CURSOR_ALLOWANCE_RESET_DAY_SETTING_KEY = 'cursor_allowance_reset_day';
 const CURSOR_EFFORT_LEVELS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_CURSOR_MODEL = 'composer-2.5';
 const DEFAULT_CURSOR_MODELS = ['composer-2.5'];
@@ -3216,6 +3304,11 @@ if (modelVariantColumns.length && !modelVariantColumns.includes('pricing_json'))
 }
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
+// Owns its own schema (plan-usage tables) and the derived Cursor spend
+// bookkeeping; created before `stmts` because it prepares statements against
+// tables it creates itself.
+const planUsageService = createPlanUsageService({ db, dbg: (...args) => console.log('[plan-usage]', ...args) });
+
 const stmts = {
   ...createSessionRepository(db),
   ...createMessageRepository(db),
@@ -5587,8 +5680,96 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
   return rows;
 }
 
-function fetchUsageSummary(cb) {
+// One `/api/usage` needs the same token for the quota read and the billing
+// read, and `gh auth token` costs a process spawn. A short TTL collapses that
+// to one spawn per modal open while still picking up a re-login promptly.
+const GITHUB_TOKEN_CACHE_TTL_MS = 60_000;
+let githubTokenCache = null;
+
+/**
+ * Resolve a GitHub token for quota/billing reads: an explicit environment
+ * token wins, otherwise the CLI's own `gh auth token`.
+ */
+function resolveGitHubToken(cb) {
   const envToken = String(process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '').trim();
+  if (envToken) {
+    cb(null, envToken);
+    return;
+  }
+  if (githubTokenCache && githubTokenCache.expiresAt > Date.now()) {
+    cb(null, githubTokenCache.token);
+    return;
+  }
+  execFile('gh', ['auth', 'token'], (err, stdout, stderr) => {
+    const ghToken = String(stdout || '').trim();
+    if (!err && ghToken) {
+      githubTokenCache = { token: ghToken, expiresAt: Date.now() + GITHUB_TOKEN_CACHE_TTL_MS };
+      cb(null, ghToken);
+      return;
+    }
+    githubTokenCache = null;
+    const reason = String(stderr || stdout || '').trim();
+    const reasonSuffix = reason ? ` (${reason})` : '';
+    cb(new Error(`GitHub token unavailable: run gh auth login or set GH_TOKEN/GITHUB_TOKEN${reasonSuffix}`));
+  });
+}
+
+// Most tokens (including every `gh auth token`) cannot read billing, and that
+// answer does not change between two opens of the usage modal. Remembering the
+// refusal keeps the modal from paying for the same three doomed requests each
+// time; the TTL is what lets a newly-scoped PAT start working without a restart.
+const COPILOT_BILLING_DENIAL_TTL_MS = 10 * 60_000;
+let copilotBillingDenial = null;
+let copilotBillingLogin = '';
+
+/**
+ * Optional, personal-scope billing detail for the plan-usage card. Never
+ * rejects: a token without billing scope simply yields `{ error }` and the card
+ * renders its quota meters without the cost breakdown.
+ */
+function fetchCopilotBillingUsage() {
+  if (copilotBillingDenial && copilotBillingDenial.expiresAt > Date.now()) {
+    return Promise.resolve({
+      items: [],
+      timePeriod: null,
+      scope: copilotBillingDenial.scope,
+      error: copilotBillingDenial.error,
+    });
+  }
+  return new Promise((resolve) => {
+    resolveGitHubToken((error, token) => {
+      if (error || !token) {
+        resolve({ items: [], timePeriod: null, scope: null, error: error?.message || 'no GitHub token available' });
+        return;
+      }
+      // The cached login skips the `/user` lookup; it is cleared alongside a
+      // denial so a token that now points at another account re-resolves.
+      fetchPersonalBillingUsage({ token, login: copilotBillingLogin })
+        .then((result) => {
+          if (result?.denied) {
+            copilotBillingDenial = {
+              expiresAt: Date.now() + COPILOT_BILLING_DENIAL_TTL_MS,
+              error: result.error || 'billing usage is unavailable',
+              scope: result.scope || null,
+            };
+            copilotBillingLogin = '';
+          } else {
+            copilotBillingDenial = null;
+            copilotBillingLogin = String(result?.scope || '').trim();
+          }
+          resolve(result);
+        })
+        .catch((billingError) => resolve({
+          items: [],
+          timePeriod: null,
+          scope: null,
+          error: String(billingError?.message || billingError || 'billing usage failed'),
+        }));
+    });
+  });
+}
+
+function fetchUsageSummary(cb) {
   const useToken = (token) => {
     fetch('https://api.github.com/copilot_internal/user', {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
@@ -5621,6 +5802,9 @@ function fetchUsageSummary(cb) {
             remaining: Math.round(premium.quota_remaining ?? premium.remaining ?? 0),
             entitlement: premium.entitlement ?? 1500,
             percentRemaining: premium.percent_remaining ?? null,
+            // Carried through so the plan-usage card can label the bucket as
+            // AI credits or premium requests from the payload itself.
+            unit: premium.unit ?? snap.unit ?? data?.quota_unit ?? null,
           },
           planQuota: {
             unlimited: planSnapshot.unlimited ?? false,
@@ -5633,20 +5817,12 @@ function fetchUsageSummary(cb) {
       .catch((e) => cb(new Error(e?.message || 'Failed to fetch usage data')));
   };
 
-  if (envToken) {
-    useToken(envToken);
-    return;
-  }
-
-  execFile('gh', ['auth', 'token'], (err, stdout, stderr) => {
-    const ghToken = String(stdout || '').trim();
-    if (!err && ghToken) {
-      useToken(ghToken);
+  resolveGitHubToken((error, token) => {
+    if (error || !token) {
+      cb(error || new Error('GitHub token unavailable'));
       return;
     }
-    const reason = String(stderr || stdout || '').trim();
-    const reasonSuffix = reason ? ` (${reason})` : '';
-    cb(new Error(`GitHub token unavailable: run gh auth login or set GH_TOKEN/GITHUB_TOKEN${reasonSuffix}`));
+    useToken(token);
   });
 }
 
@@ -6399,6 +6575,10 @@ const sharedRouteDeps = {
   path,
   uploadsDir: UPLOAD_DIR,
   fetchUsageSummary,
+  fetchCopilotBillingUsage,
+  planUsageService,
+  getCursorPlanAllowanceSettings,
+  setCursorPlanAllowanceSettings,
   bootstrapRuntimeSessionBindings,
   SUPPORTED_RELAY_MODES,
   SUPPORTED_CONVERSATION_SESSION_MODES,

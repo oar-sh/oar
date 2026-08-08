@@ -70,6 +70,58 @@ export async function createCursorAgentHandle({
   };
 }
 
+/**
+ * Read the agent's cumulative billed usage and cost.
+ *
+ * `agent.getUsage()` returns lifetime totals for the agent (plus a per-run
+ * breakdown that carries no model, which is why the relay diffs whole-agent
+ * totals per turn instead of classifying runs). Cost is documented as
+ * server-derived and eventually consistent, so it can legitimately be absent
+ * right after a run ends — the caller re-reports on the next turn and the
+ * checkpoint diff picks it up whole.
+ *
+ * Best-effort: usage reporting must never disturb the turn that produced it.
+ * Despite the local agent, this is a *remote* read — the SDK routes
+ * `getUsage()` to `GET /v1/agents/:id/usage` through a plain `fetch` with no
+ * abort signal — and it runs on the path to publishing the turn's reply, so it
+ * is raced against a timeout the way the Claude worker races its control
+ * requests. A slow Cursor API costs the usage reading, never the answer.
+ */
+export async function readAgentUsage({ agent, dbg = () => {}, timeoutMs = 8000 } = {}) {
+  if (typeof agent?.getUsage !== 'function') return null;
+  let timer = null;
+  try {
+    const request = agent.getUsage();
+    // The race leaves the losing promise unobserved on timeout; swallow its
+    // rejection so it cannot surface as an unhandledRejection.
+    request?.catch?.(() => {});
+    const usage = await Promise.race([
+      request,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`cursor usage timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+    if (!usage || typeof usage !== 'object') return null;
+    const tokens = usage.usage && typeof usage.usage === 'object' ? usage.usage : {};
+    const cost = usage.cost && typeof usage.cost === 'object' ? usage.cost : null;
+    return {
+      rawCostCents: Number.isFinite(Number(cost?.rawCostCents)) ? Number(cost.rawCostCents) : null,
+      chargedCents: Number.isFinite(Number(cost?.chargedCents)) ? Number(cost.chargedCents) : null,
+      inputTokens: Number.isFinite(Number(tokens.inputTokens)) ? Number(tokens.inputTokens) : null,
+      outputTokens: Number.isFinite(Number(tokens.outputTokens)) ? Number(tokens.outputTokens) : null,
+      cacheReadTokens: Number.isFinite(Number(tokens.cacheReadTokens)) ? Number(tokens.cacheReadTokens) : null,
+      cacheWriteTokens: Number.isFinite(Number(tokens.cacheWriteTokens)) ? Number(tokens.cacheWriteTokens) : null,
+      totalTokens: Number.isFinite(Number(tokens.totalTokens)) ? Number(tokens.totalTokens) : null,
+      runCount: Array.isArray(usage.runs) ? usage.runs.length : null,
+    };
+  } catch (error) {
+    dbg('cursor agent usage read failed', error?.message || String(error));
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function modeForRelayMode(relayMode) {
   return String(relayMode || 'agent').trim().toLowerCase() === 'plan' ? 'plan' : 'agent';
 }

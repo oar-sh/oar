@@ -401,6 +401,64 @@ test('a runtime without the context control request still completes the turn', a
   );
 });
 
+test('plan usage publishes a session cost even when the SDK reports no model breakdown', async () => {
+  // The experimental /usage control request is optional; when it is missing the
+  // stable result fields are the whole payload, and `total_cost_usd` can arrive
+  // without `modelUsage`. Skipping that turn would silently drop session cost.
+  const stub = makeApiStub();
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => fakeTurn([
+      initMessage('native-1'),
+      { ...resultMessage('done', 'native-1'), total_cost_usd: 0.42 },
+    ]),
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage } }), true);
+  const post = stub.calls.find((call) => call.routePath === '/api/claude-plan-usage');
+  assert.ok(post, 'plan usage must be published for a cost-only result');
+  assert.equal(post.body.totalCostUsd, 0.42);
+  assert.equal(post.body.usage, null);
+});
+
+test('a turn that reports no usage at all publishes no plan usage', async () => {
+  const stub = makeApiStub();
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => fakeTurn([initMessage('native-1'), resultMessage('done', 'native-1')]),
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage } }), true);
+  assert.ok(
+    !stub.calls.find((call) => call.routePath === '/api/claude-plan-usage'),
+    'nothing usable to report',
+  );
+});
+
+test('a failing plan usage publish does not disturb the response', async () => {
+  const stub = makeApiStub({ failRoutes: new Set(['/api/claude-plan-usage']) });
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'sess-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => fakeTurn([
+      initMessage('native-1'),
+      { ...resultMessage('done', 'native-1'), total_cost_usd: 1.5 },
+    ]),
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage } }), true);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'done');
+});
+
 test('a failing context publish does not disturb the response', async () => {
   const stub = makeApiStub({ failRoutes: new Set(['/api/claude-context-usage']) });
   const runner = createClaudeTurnRunner({

@@ -379,6 +379,17 @@ export async function loadUsageSummary() {
   return apiFetch('/api/usage');
 }
 
+export async function loadCursorAllowanceSettings() {
+  return apiFetch('/api/settings/cursor-allowance');
+}
+
+export async function updateCursorAllowanceSettings(payload = {}) {
+  return apiFetch('/api/settings/cursor-allowance', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function loadContextSummary(convId = null) {
   const trimmedConvId = String(convId || '').trim();
   const lookupId = resolveContextLookupId(trimmedConvId);
