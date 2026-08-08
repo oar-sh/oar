@@ -5757,7 +5757,20 @@ httpServer.prependListener('request', (req, _res) => {
 httpServer.prependListener('upgrade', (req, _socket, _head) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
-const io         = new Server(httpServer, { cors: { origin: '*' }, path: socketIoPath() });
+// Mobile clients disconnect whenever the PWA is backgrounded. Connection state
+// recovery replays the discrete events they missed instead of forcing a full
+// resync, so a phone that was away for a few minutes comes back in sync.
+// High-volume stream chunks are emitted volatile and deliberately excluded from
+// the replay buffer; see the io.volatile.emit('relay_stream') call site.
+const SOCKET_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
+const io         = new Server(httpServer, {
+  cors: { origin: '*' },
+  path: socketIoPath(),
+  connectionStateRecovery: {
+    maxDisconnectionDuration: SOCKET_RECOVERY_WINDOW_MS,
+    skipMiddlewares: true,
+  },
+});
 const SHARED_VIEWER_STALE_MS = 45_000;
 const SHARED_VIEWER_MAX_PER_CONVERSATION = Number.isFinite(Number(config.sharedPresenceMaxPerConversation))
   ? Math.max(1, Math.trunc(Number(config.sharedPresenceMaxPerConversation)))

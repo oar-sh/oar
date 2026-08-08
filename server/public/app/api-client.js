@@ -1,8 +1,20 @@
 import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform } from './store.js';
 
+// fetch() has no default timeout. Without one, a request issued while the app is
+// being backgrounded can hang indefinitely on a half-open mobile connection and
+// stall every caller awaiting it, including foreground recovery.
+const REQUEST_TIMEOUT_MS = 15000;
+// Session bootstrap, uploads and git operations do real work server-side, so they
+// get a ceiling that only catches a genuinely dead connection.
+const LONG_REQUEST_TIMEOUT_MS = 120000;
+
 let networkRequestsEnabled = true;
 let fetchOutageActive = false;
 let lastFetchOutageSignature = '';
+
+function requestTimeoutSignal(timeoutMs = REQUEST_TIMEOUT_MS) {
+  return AbortSignal.timeout?.(timeoutMs);
+}
 
 function toErrorMessage(error) {
   if (!error) return 'unknown error';
@@ -37,6 +49,7 @@ export async function apiFetch(url, opts = {}) {
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(),
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders(),
@@ -67,7 +80,10 @@ export async function verifyExistingSession(tokenCandidate = '') {
   }
   try {
     const requestStatus = async (headers = null) => {
-      const response = await fetch(`${BASE}/api/status`, headers ? { headers } : undefined);
+      const response = await fetch(`${BASE}/api/status`, {
+        signal: requestTimeoutSignal(),
+        ...(headers ? { headers } : {}),
+      });
       const payload = await response.json().catch(() => null);
       if (response.ok && payload) {
         updateWorkspaceRootHints(payload);
@@ -121,6 +137,7 @@ export async function verifyToken(token) {
   }
   try {
     const response = await fetch(`${BASE}/api/status`, {
+      signal: requestTimeoutSignal(),
       headers: { Authorization: `Bearer ${token}` },
     });
     const payload = await response.json().catch(() => null);
@@ -212,6 +229,7 @@ export async function updateClaudeSettings({
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}/api/settings/claude`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -249,6 +267,7 @@ export async function updateOpenAISettings({
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}/api/settings/openai`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -292,6 +311,7 @@ export async function updateCursorSettings({
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}/api/settings/cursor`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -534,6 +554,7 @@ export async function loadSharedConversation(shareToken, options = {}) {
   const query = params.toString();
   try {
     const response = await fetch(`${BASE}/api/shared/${encodeURIComponent(token)}${query ? `?${query}` : ''}`, {
+      signal: requestTimeoutSignal(),
       headers: { 'Content-Type': 'application/json' },
     });
     const payload = await response.json().catch(() => null);
@@ -564,6 +585,7 @@ export async function reportSharedViewerPresence(shareToken, viewerId) {
   if (!token || !viewer) return { ok: false, status: 400, error: 'Missing shared presence payload' };
   try {
     const response = await fetch(`${BASE}/api/shared/${encodeURIComponent(token)}/presence`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ viewerId: viewer }),
@@ -595,6 +617,7 @@ export async function updateConversationDraft(id, draft = {}) {
   if (!convId) return null;
   try {
     const response = await fetch(`${BASE}/api/conversation/${convId}/draft`, {
+      signal: requestTimeoutSignal(),
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -674,6 +697,7 @@ export async function sendMessage(body) {
 export async function bootstrapConversationSession(body = {}) {
   if (!areNetworkRequestsEnabled()) return null;
   const response = await fetch(`${BASE}/api/conversation/bootstrap`, {
+    signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -743,6 +767,7 @@ export async function answerRelayQuestionStructured(questionId, structuredAnswer
   const sessionId = String(sdkSessionId || '').trim();
   try {
     const response = await fetch(`${BASE}/api/relay-question/${encodeURIComponent(id)}/answer`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ structuredAnswer, sdk_session_id: sessionId || undefined }),
@@ -780,6 +805,7 @@ export async function submitRelayBoardAction(boardId, actionId) {
 export async function uploadAttachment(item) {
   if (!item?.file) return null;
   const response = await fetch(`${BASE}/api/upload`, {
+    signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
     method: 'POST',
     headers: {
       ...authHeaders(),
@@ -868,6 +894,7 @@ export async function requestGitPull(conversationId = null) {
   if (convId) params.set('conversationId', convId);
   const suffix = params.toString();
   const response = await fetch(`${BASE}/api/git/pull${suffix ? `?${suffix}` : ''}`, {
+    signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
   }).catch(() => null);

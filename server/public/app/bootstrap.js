@@ -132,7 +132,12 @@ import {
   setGitDiffMode,
 } from './git-changes-view.js';
 
-import { initSocketHandlers, connectSocket, setSocketActivityEnabled } from './socket-handlers.js';
+import {
+  initSocketHandlers,
+  connectSocket,
+  setSocketActivityEnabled,
+  ensureSocketConnected,
+} from './socket-handlers.js';
 import {
   initInstallButton,
   initFullscreenButton,
@@ -144,7 +149,7 @@ import {
 } from './pwa-install.js';
 import { renderContextUsageHtml } from './context-usage-view.mjs';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
-import { initClientDiagnostics } from './status-store.mjs';
+import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
 import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
 import { installExternalLinkPolicy, openExternalNavigation } from './external-link-policy.mjs';
 import {
@@ -253,6 +258,12 @@ const PROVIDER_LABELS = {
 };
 const CHAT_TITLE_MAX_LENGTH = 120;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
+const FOREGROUND_RECOVERY_DEBOUNCE_MS = 1000;
+// Upper bound on how long the in-flight latch may stay set. A recovery request
+// that never settles (frozen renderer, half-open mobile socket) must not be able
+// to keep the latch closed, because that would suppress every later recovery.
+const FOREGROUND_RECOVERY_TIMEOUT_MS = 20000;
+const RELAY_WATCHDOG_INTERVAL_MS = 5000;
 
 let relayQuestionPollTimer = null;
 let relayBoardPollTimer = null;
@@ -270,6 +281,9 @@ let sharedConversationLastError = '';
 let networkLifecycleBound = false;
 let foregroundRecoveryTimer = null;
 let foregroundRecoveryInFlight = false;
+let foregroundRecoveryWatchdogTimer = null;
+let foregroundRecoveryGeneration = 0;
+let relayConnectionWatchdogTimer = null;
 let appSharedMode = false;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let chatTitleEditingConversationId = null;
@@ -429,8 +443,15 @@ function stopSharedModeTimers() {
   liveConversationPollInFlight = false;
 }
 
+function isAppForegrounded() {
+  return document.visibilityState === 'visible';
+}
+
+// Polling gates on foreground state alone. It deliberately ignores the recovery
+// latch: polling is the fallback that keeps the UI current while the socket is
+// down, so a slow or stalled recovery pass must not silence it.
 function shouldRunForegroundNetworkWork() {
-  return document.visibilityState === 'visible' && !foregroundRecoveryInFlight;
+  return isAppForegrounded();
 }
 
 function setForegroundNetworkWorkEnabled(enabled) {
@@ -439,11 +460,34 @@ function setForegroundNetworkWorkEnabled(enabled) {
   setSocketActivityEnabled(next);
 }
 
+function clearForegroundRecoveryLatch() {
+  if (foregroundRecoveryWatchdogTimer) {
+    clearTimeout(foregroundRecoveryWatchdogTimer);
+    foregroundRecoveryWatchdogTimer = null;
+  }
+  foregroundRecoveryInFlight = false;
+}
+
 async function runForegroundRecovery(reason = 'visible') {
-  if (document.visibilityState !== 'visible') return;
-  if (foregroundRecoveryInFlight) return;
-  foregroundRecoveryInFlight = true;
+  if (!isAppForegrounded()) return;
+  // Re-enabling the transport happens ahead of the stampede guard. An explicit
+  // socket.disconnect() drops socket.io's own reconnect subscriptions, so this is
+  // the only route back online and it must never be skippable.
   setForegroundNetworkWorkEnabled(true);
+  if (foregroundRecoveryInFlight) {
+    recordStatusEvent('foreground-recovery-skipped', { reason });
+    return;
+  }
+  const generation = ++foregroundRecoveryGeneration;
+  foregroundRecoveryInFlight = true;
+  foregroundRecoveryWatchdogTimer = setTimeout(() => {
+    foregroundRecoveryWatchdogTimer = null;
+    foregroundRecoveryInFlight = false;
+    recordStatusEvent('foreground-recovery-timeout', {
+      reason,
+      timeoutMs: FOREGROUND_RECOVERY_TIMEOUT_MS,
+    });
+  }, FOREGROUND_RECOVERY_TIMEOUT_MS);
   try {
     if (appSharedMode) {
       await refreshSharedConversation();
@@ -458,16 +502,46 @@ async function runForegroundRecovery(reason = 'visible') {
   } catch (error) {
     console.warn(`[foreground-recovery:${reason}]`, error?.message || error);
   } finally {
-    foregroundRecoveryInFlight = false;
+    // The watchdog may already have released the latch and let a newer pass take
+    // ownership; only the pass that still owns it may clear it.
+    if (foregroundRecoveryGeneration === generation) clearForegroundRecoveryLatch();
   }
 }
 
-function scheduleForegroundRecovery(reason = 'visible') {
-  if (foregroundRecoveryTimer) clearTimeout(foregroundRecoveryTimer);
+function scheduleForegroundRecovery(reason = 'visible', { immediate = false } = {}) {
+  if (foregroundRecoveryTimer) {
+    clearTimeout(foregroundRecoveryTimer);
+    foregroundRecoveryTimer = null;
+  }
+  if (immediate) {
+    void runForegroundRecovery(reason);
+    return;
+  }
   foregroundRecoveryTimer = setTimeout(() => {
     foregroundRecoveryTimer = null;
     void runForegroundRecovery(reason);
-  }, 1000);
+  }, FOREGROUND_RECOVERY_DEBOUNCE_MS);
+}
+
+function handleForegroundTransition(reason, { immediate = false } = {}) {
+  if (!isAppForegrounded()) return;
+  // The transport comes back right away; only the data refresh is debounced.
+  setForegroundNetworkWorkEnabled(true);
+  scheduleForegroundRecovery(reason, { immediate });
+}
+
+// socket.io gives up permanently after an explicit disconnect or a rejected
+// handshake, so a dropped relay never comes back on its own while the app stays in
+// the foreground. This is the safety net for that.
+function startRelayConnectionWatchdog() {
+  if (relayConnectionWatchdogTimer || appSharedMode) return;
+  relayConnectionWatchdogTimer = setInterval(() => {
+    if (!isAppForegrounded()) return;
+    if (navigator.onLine === false) return;
+    if (ensureSocketConnected() === 'forced') {
+      recordStatusEvent('relay-reconnect-forced', {});
+    }
+  }, RELAY_WATCHDOG_INTERVAL_MS);
 }
 
 function initNetworkLifecycleHandling() {
@@ -478,19 +552,27 @@ function initNetworkLifecycleHandling() {
       setForegroundNetworkWorkEnabled(false);
       return;
     }
-    scheduleForegroundRecovery('visibility');
+    handleForegroundTransition('visibility');
   });
   window.addEventListener('online', () => {
-    if (document.visibilityState === 'visible') scheduleForegroundRecovery('online');
+    handleForegroundTransition('online', { immediate: true });
   });
   window.addEventListener('offline', () => {
     setForegroundNetworkWorkEnabled(false);
   });
   window.addEventListener('pageshow', () => {
-    if (document.visibilityState === 'visible') scheduleForegroundRecovery('pageshow');
+    handleForegroundTransition('pageshow', { immediate: true });
   });
   window.addEventListener('pagehide', () => {
     setForegroundNetworkWorkEnabled(false);
+  });
+  // Android Chrome freezes backgrounded PWAs. A freeze/resume cycle can happen
+  // without any visibility transition, so resume needs its own recovery trigger.
+  document.addEventListener('freeze', () => {
+    setForegroundNetworkWorkEnabled(false);
+  });
+  document.addEventListener('resume', () => {
+    handleForegroundTransition('resume', { immediate: true });
   });
 }
 
@@ -3213,6 +3295,7 @@ async function initApp() {
   initGitChangesView();
   syncChatTitleControls();
   connectSocket();
+  startRelayConnectionWatchdog();
   startRelayQuestionPolling();
   startRelayBoardPolling();
   startSessionWorkerStatusPolling();

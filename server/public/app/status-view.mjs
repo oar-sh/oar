@@ -56,6 +56,13 @@ function formatStatusEvent(event) {
   if (type === 'relay-unreachable') return 'Web relay unreachable';
   if (type === 'cli-connected') return 'CLI connected';
   if (type === 'cli-unreachable') return 'CLI offline';
+  if (type === 'relay-reconnect-forced') return 'Web relay reconnect forced by watchdog';
+  if (type === 'foreground-recovery-skipped') {
+    return `Foreground recovery skipped, one already running (${details.reason || 'unknown'})`;
+  }
+  if (type === 'foreground-recovery-timeout') {
+    return `Foreground recovery timed out after ${Math.round(Number(details.timeoutMs || 0) / 1000)}s (${details.reason || 'unknown'})`;
+  }
   if (type === 'client-error') return `Error: ${formatValue(details.message || details.error)}`;
   if (type === 'unhandled-rejection') return `Unhandled rejection: ${formatValue(details.reason)}`;
   if (type === 'shared-access-opened') {

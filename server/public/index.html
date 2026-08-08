@@ -136,6 +136,7 @@
     try {
       __clearLegacyClientAuthCookie();
       const response = await fetch(`${__APP_BASE}/api/status`, {
+        signal: AbortSignal.timeout?.(15000),
         headers: { Authorization: `Bearer ${token}` },
       });
       if (response.ok) {

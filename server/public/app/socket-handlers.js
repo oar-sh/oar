@@ -101,14 +101,62 @@ export function getSocket() {
   return socket;
 }
 
+/**
+ * Close the transport rather than the namespace socket when backgrounding.
+ *
+ * socket.disconnect() makes the server report "client namespace disconnect", which
+ * is absent from socket.io's RECOVERABLE_DISCONNECT_REASONS, so the session is
+ * discarded and connectionStateRecovery replays nothing when the phone returns.
+ * Closing the engine surfaces as "transport close", which is recoverable. Manager
+ * reconnection is suspended first so the close does not immediately trigger the
+ * backoff loop we are trying to avoid while hidden.
+ */
+function suspendSocketForBackground() {
+  const manager = socket?.io;
+  manager?.reconnection(false);
+  if (manager?.engine) {
+    manager.engine.close();
+    return;
+  }
+  if (socket?.connected || socket?.active) socket.disconnect();
+}
+
+function resumeSocketFromBackground() {
+  socket?.io?.reconnection(true);
+  if (socket && !socket.connected) socket.connect();
+}
+
 export function setSocketActivityEnabled(value) {
   socketActivityEnabled = !!value;
   if (!socket) return;
   if (!socketActivityEnabled) {
-    if (socket.connected || socket.active) socket.disconnect();
+    suspendSocketForBackground();
     return;
   }
-  if (!socket.connected) socket.connect();
+  resumeSocketFromBackground();
+}
+
+/**
+ * Bring the relay socket back up, whatever state the manager is in. Safe to call on a
+ * timer: connect() skips the manager while it is mid-backoff, so this cannot compete
+ * with socket.io's own retry schedule.
+ *
+ * `socket.active` only distinguishes the two cases for the caller's benefit. It stays
+ * true while the manager works through its backoff, and goes false once it gives up
+ * for good — which is what happens after an explicit disconnect() or a rejected
+ * handshake, since both destroy the socket instead of scheduling a retry. That is the
+ * case worth reporting, because nothing else would have reconnected.
+ * @returns {'connected'|'retrying'|'forced'|'disabled'}
+ */
+export function ensureSocketConnected() {
+  if (!socketActivityEnabled || !socket) return 'disabled';
+  if (socket.connected) return 'connected';
+  const wasRetrying = socket.active;
+  // Reconnection is suspended while backgrounded, so re-arm it before asking the
+  // socket to connect. connect() is a no-op while the manager is mid-backoff.
+  socket.io?.reconnection(true);
+  socket.connect();
+  return wasRetrying ? 'retrying' : 'forced';
 }
 
 function requireDeps() {

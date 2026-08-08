@@ -5824,7 +5824,11 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(500).json({ error: error?.message || 'Failed to persist stream event' });
     }
 
-    io.emit('relay_stream', {
+    // Volatile keeps these out of the connection-state-recovery buffer. Each chunk
+    // carries the full text so far, so replaying a turn's worth of them costs
+    // megabytes to deliver what one reconnect resync already fetches from
+    // relay_stream_events. Live delivery to connected clients is unchanged.
+    io.volatile.emit('relay_stream', {
       messageId,
       conversationId,
       mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
