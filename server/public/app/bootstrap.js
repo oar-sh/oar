@@ -273,6 +273,13 @@ const FOREGROUND_RECOVERY_DEBOUNCE_MS = 1000;
 // to keep the latch closed, because that would suppress every later recovery.
 const FOREGROUND_RECOVERY_TIMEOUT_MS = 20000;
 const RELAY_WATCHDOG_INTERVAL_MS = 5000;
+// The server treats a visibility report older than 90s as stale, so a foregrounded
+// device has to keep re-asserting itself or it silently stops counting as active
+// and push suppression stops working mid-turn. 30s leaves room for two dropped
+// beats inside that window. Tests shorten this rather than waiting it out.
+const DEVICE_VISIBILITY_HEARTBEAT_MS = Number.isFinite(Number(window.__COPILOT_VISIBILITY_HEARTBEAT_MS))
+  ? Math.max(50, Number(window.__COPILOT_VISIBILITY_HEARTBEAT_MS))
+  : 30_000;
 // How long a hidden page keeps its transport before suspending it. Brief
 // app switches then never drop the socket at all. 45s matches the server's
 // ping window (pingInterval 25s + pingTimeout 20s): past that the server has
@@ -301,6 +308,7 @@ let foregroundRecoveryInFlight = false;
 let foregroundRecoveryWatchdogTimer = null;
 let foregroundRecoveryGeneration = 0;
 let relayConnectionWatchdogTimer = null;
+let deviceVisibilityHeartbeatTimer = null;
 let backgroundSuspendTimer = null;
 let appSharedMode = false;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
@@ -613,6 +621,18 @@ function startRelayConnectionWatchdog() {
       recordStatusEvent('relay-reconnect-forced', {});
     }
   }, RELAY_WATCHDOG_INTERVAL_MS);
+}
+
+// Visibility is reported on transitions, but the server ages those reports out
+// after 90s. Without a periodic re-assert, a user who simply sits and reads for
+// longer than that stops looking active, and a turn finishing afterwards pushes a
+// notification to the phone already in their hand.
+function startDeviceVisibilityHeartbeat() {
+  if (deviceVisibilityHeartbeatTimer || appSharedMode) return;
+  deviceVisibilityHeartbeatTimer = setInterval(() => {
+    if (!isAppForegrounded()) return;
+    emitDeviceVisibility(true);
+  }, DEVICE_VISIBILITY_HEARTBEAT_MS);
 }
 
 function initNetworkLifecycleHandling() {
@@ -3381,6 +3401,7 @@ async function initApp() {
   syncChatTitleControls();
   connectSocket();
   startRelayConnectionWatchdog();
+  startDeviceVisibilityHeartbeat();
   startRelayQuestionPolling();
   startRelayBoardPolling();
   startSessionWorkerStatusPolling();

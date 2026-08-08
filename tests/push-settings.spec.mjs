@@ -139,4 +139,33 @@ test.describe.serial("push notification settings", () => {
     const response = await request.get(`${relayBaseUrl()}/api/push/devices`);
     expect(response.status()).toBe(401);
   });
+
+  // The server ages a visibility report out after 90s, so reporting only on
+  // transitions meant a user reading for longer than that stopped counting as
+  // active and got pushed mid-session. The heartbeat has to keep repeating for
+  // as long as the page is foregrounded.
+  test("a foregrounded page keeps re-asserting its visibility", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__COPILOT_VISIBILITY_HEARTBEAT_MS = 150;
+    });
+    await page.goto(`/?token=${encodeURIComponent(relayToken())}`);
+    await page.waitForLoadState("networkidle");
+
+    await page.evaluate(async () => {
+      const socket = await window.connectSocket();
+      window.__visibilityBeats = [];
+      const emit = socket.emit.bind(socket);
+      socket.emit = (event, ...args) => {
+        if (event === "device_visibility") window.__visibilityBeats.push(args[0]);
+        return emit(event, ...args);
+      };
+    });
+
+    await expect
+      .poll(() => page.evaluate(() => window.__visibilityBeats.length), { timeout: 10_000 })
+      .toBeGreaterThan(2);
+    const beats = await page.evaluate(() => window.__visibilityBeats);
+    expect(beats.every((beat) => beat?.visible === true)).toBe(true);
+    expect(beats.every((beat) => typeof beat?.deviceId === "string" && beat.deviceId.length > 0)).toBe(true);
+  });
 });
