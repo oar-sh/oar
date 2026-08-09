@@ -225,12 +225,30 @@ test('buildCursorPlanCard explains why live bars are missing', () => {
   assert.match(noToken.message, /no Cursor IDE login/);
   assert.match(noToken.message, /CURSOR_SESSION_TOKEN/);
 
+  // The rejected-token wording names the token's actual source: a stored
+  // token expires, but an IDE-derived one means the IDE login went stale.
   const rejected = buildCursorPlanCard({
     configured: true,
     dashboard: null,
     dashboardAuth: { configured: true, source: 'manual' },
   });
+  assert.match(rejected.message, /stored dashboard token/);
   assert.match(rejected.message, /expired/);
+
+  const ideRejected = buildCursorPlanCard({
+    configured: true,
+    dashboard: null,
+    dashboardAuth: { configured: true, source: 'ide' },
+  });
+  assert.match(ideRejected.message, /Cursor IDE login/);
+  assert.ok(!/stored dashboard token/.test(ideRejected.message));
+
+  const envRejected = buildCursorPlanCard({
+    configured: true,
+    dashboard: null,
+    dashboardAuth: { configured: true, source: 'env' },
+  });
+  assert.match(envRejected.message, /CURSOR_SESSION_TOKEN/);
 
   // Live data present, or auth state unknown: no nagging.
   const live = buildCursorPlanCard({

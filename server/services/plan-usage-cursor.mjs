@@ -510,8 +510,13 @@ export function buildCursorPlanCard({
   // card can only show locally reconstructed spend — which is $0.00 on a relay
   // that has not run a Cursor turn yet, and reads as "broken" unless we say so.
   if (!hasLiveQuota && dashboardAuth) {
+    const REJECTED_BY_SOURCE = {
+      ide: "Live plan bars unavailable — Cursor did not accept the session token from this machine's Cursor IDE login. Sign in to Cursor again in the IDE, or paste a token in Settings.",
+      env: 'Live plan bars unavailable — Cursor did not accept the CURSOR_SESSION_TOKEN from the relay environment. It has most likely expired; set a fresh value.',
+      manual: 'Live plan bars unavailable — Cursor did not accept the stored dashboard token. It has most likely expired; save a fresh one in Settings.',
+    };
     notes.push(dashboardAuth.configured === true
-      ? 'Live plan bars unavailable — Cursor did not accept the stored dashboard token. It has most likely expired; save a fresh one in Settings.'
+      ? (REJECTED_BY_SOURCE[dashboardAuth.source] || REJECTED_BY_SOURCE.manual)
       : 'Live plan bars need a Cursor dashboard token. This host has no Cursor IDE login to read one from — paste the WorkosCursorSessionToken cookie in Settings, or set CURSOR_SESSION_TOKEN on the relay.');
   }
   if (!hasLiveQuota && settings.cursorModelsUsd === null && settings.otherModelsUsd === null) {
