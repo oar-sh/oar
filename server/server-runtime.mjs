@@ -576,11 +576,22 @@ function getCursorProviderSettings() {
  */
 // Session cookie for cursor.com's dashboard API (live plan-quota bars). The
 // API key has no plan/usage surface; the token comes from the host's Cursor
-// IDE login automatically, with a user-pasted cookie as the override for
-// headless hosts.
+// IDE login automatically, with a user-pasted cookie or CURSOR_SESSION_TOKEN
+// as the override for headless hosts (the Linux relay has no IDE install).
+function readCursorSessionTokenFromEnv() {
+  return String(process.env.CURSOR_SESSION_TOKEN || '').trim();
+}
+
+function readCursorDashboardSessionToken() {
+  return readAppSettingValue(CURSOR_SESSION_TOKEN_SETTING_KEY) || readCursorSessionTokenFromEnv();
+}
+
 function getCursorDashboardTokenSettings() {
   if (readAppSettingValue(CURSOR_SESSION_TOKEN_SETTING_KEY) !== '') {
     return { configured: true, source: 'manual' };
+  }
+  if (readCursorSessionTokenFromEnv() !== '') {
+    return { configured: true, source: 'env' };
   }
   if (readCursorIdeSessionToken()) {
     return { configured: true, source: 'ide' };
@@ -6929,7 +6940,7 @@ const sharedRouteDeps = {
   fetchCopilotBillingUsage,
   fetchGrokBillingUsage: createGrokBillingUsageFetcher(),
   fetchCursorDashboardUsage: createCursorDashboardUsageFetcher({
-    getSessionToken: () => readAppSettingValue(CURSOR_SESSION_TOKEN_SETTING_KEY),
+    getSessionToken: readCursorDashboardSessionToken,
   }),
   getCursorDashboardTokenSettings,
   setCursorDashboardTokenSettings,

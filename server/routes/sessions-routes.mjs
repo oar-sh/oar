@@ -5145,11 +5145,19 @@ export function registerSessionsRoutes(app, deps) {
     }
     // Live Cursor plan quota (dashboard session token) — same best-effort rule.
     let cursorBilling = null;
+    let cursorDashboardAuth = null;
     if (cursorSettings?.enabled === true && typeof fetchCursorDashboardUsage === 'function') {
       try {
         cursorBilling = await fetchCursorDashboardUsage();
       } catch {
         cursorBilling = null;
+      }
+      // Whether a token exists at all decides which of the two very different
+      // "no live bars" explanations the card shows.
+      try {
+        cursorDashboardAuth = getCursorDashboardTokenSettings() || null;
+      } catch {
+        cursorDashboardAuth = null;
       }
     }
     const report = planUsageService.buildReport({
@@ -5160,6 +5168,7 @@ export function registerSessionsRoutes(app, deps) {
       cursorConfigured: cursorSettings?.enabled === true,
       cursorAllowances: getCursorPlanAllowanceSettings(),
       cursorBilling,
+      cursorDashboardAuth,
       grokConfigured: grokSettings?.enabled === true,
       grokAllowances: getGrokPlanAllowanceSettings(),
       grokBilling,

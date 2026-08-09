@@ -284,6 +284,10 @@ export function buildCursorPlanCard({
   // normalizeCursorDashboardUsage() — live plan quota from cursor.com's
   // dashboard API (requires the user-provided session token).
   dashboard = null,
+  // { configured, source } from the dashboard-token settings. Lets the card
+  // explain an empty panel instead of silently showing $0.00 estimates; null
+  // when the caller cannot tell.
+  dashboardAuth = null,
 } = {}) {
   if (!configured) {
     return buildUnavailableCard({
@@ -502,6 +506,14 @@ export function buildCursorPlanCard({
   if (cycleSection) details.push(cycleSection);
 
   const notes = [];
+  // Cursor's API key exposes no plan surface, so without a dashboard token the
+  // card can only show locally reconstructed spend — which is $0.00 on a relay
+  // that has not run a Cursor turn yet, and reads as "broken" unless we say so.
+  if (!hasLiveQuota && dashboardAuth) {
+    notes.push(dashboardAuth.configured === true
+      ? 'Live plan bars unavailable — Cursor did not accept the stored dashboard token. It has most likely expired; save a fresh one in Settings.'
+      : 'Live plan bars need a Cursor dashboard token. This host has no Cursor IDE login to read one from — paste the WorkosCursorSessionToken cookie in Settings, or set CURSOR_SESSION_TOKEN on the relay.');
+  }
   if (!hasLiveQuota && settings.cursorModelsUsd === null && settings.otherModelsUsd === null) {
     notes.push('No monthly allowance configured — showing spend only.');
   }

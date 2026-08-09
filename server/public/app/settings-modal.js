@@ -700,9 +700,12 @@ export function applyCursorDashboardTokenState(settings = {}) {
   if (input) input.value = '';
   if (input) input.placeholder = source === 'manual' ? 'Token saved — paste a new one to replace it' : 'WorkosCursorSessionToken cookie value';
   if (status) {
-    status.textContent = source === 'ide'
-      ? "Using this machine's Cursor IDE login automatically — nothing to configure. Paste a token only to override it."
-      : (configured
+    const STATUS_TEXT = {
+      ide: "Using this machine's Cursor IDE login automatically — nothing to configure. Paste a token only to override it.",
+      env: 'Using the CURSOR_SESSION_TOKEN environment variable on the relay. Paste a token only to override it.',
+    };
+    status.textContent = STATUS_TEXT[source]
+      || (configured
         ? 'Dashboard token saved. The usage card shows live plan bars while it stays valid.'
         : 'No Cursor IDE login found on the relay host and no token pasted — the usage card shows local spend estimates only.');
     status.dataset.state = configured ? 'active' : 'unconfigured';

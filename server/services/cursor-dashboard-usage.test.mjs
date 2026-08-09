@@ -213,6 +213,35 @@ test('buildCursorPlanCard keeps the manual view when no dashboard data exists', 
   assert.ok(!card.meters.some((m) => m.id === 'cursor-plan-total'));
 });
 
+test('buildCursorPlanCard explains why live bars are missing', () => {
+  // Hosts without a Cursor install (the Linux relay) have no IDE login to
+  // read, so the card has to point at the manual token instead of showing a
+  // bare $0.00 panel.
+  const noToken = buildCursorPlanCard({
+    configured: true,
+    dashboard: null,
+    dashboardAuth: { configured: false, source: null },
+  });
+  assert.match(noToken.message, /no Cursor IDE login/);
+  assert.match(noToken.message, /CURSOR_SESSION_TOKEN/);
+
+  const rejected = buildCursorPlanCard({
+    configured: true,
+    dashboard: null,
+    dashboardAuth: { configured: true, source: 'manual' },
+  });
+  assert.match(rejected.message, /expired/);
+
+  // Live data present, or auth state unknown: no nagging.
+  const live = buildCursorPlanCard({
+    configured: true,
+    dashboard: normalizeCursorDashboardUsage(PERIOD_USAGE_PAYLOAD),
+    dashboardAuth: { configured: false, source: null },
+  });
+  assert.ok(!/CURSOR_SESSION_TOKEN/.test(live.message || ''));
+  assert.ok(!/CURSOR_SESSION_TOKEN/.test(buildCursorPlanCard({ configured: true }).message || ''));
+});
+
 test('local pool estimates step back to secondary next to live bars', () => {
   const card = buildCursorPlanCard({
     configured: true,
