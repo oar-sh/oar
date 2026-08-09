@@ -7314,6 +7314,12 @@ io.engine.on('initial_headers', (headers, req) => {
 io.on('connection', (socket) => {
   const cookies = parseCookies(socket.request.headers.cookie);
   socket.data.sessionId = socket.handshake.auth?.clientId || socket.handshake.query?.clientId || cookies[SESSION_COOKIE] || null;
+  // Liveness probe ack for verifySocketLiveness() in public/app/socket-handlers.js:
+  // a PWA resuming from an Android freeze pings before trusting a socket that
+  // still claims to be connected.
+  socket.on('client_ping', (ack) => {
+    if (typeof ack === 'function') ack({ ok: true });
+  });
   // Send current CLI status immediately on connect
   socket.emit('cli_status', { online: cliOnline });
   // Visibility heartbeats for push suppression; also clears a stale

@@ -138,8 +138,14 @@ import {
   connectSocket,
   setSocketActivityEnabled,
   ensureSocketConnected,
+  hardResetSocket,
+  verifySocketLiveness,
   emitDeviceVisibility,
 } from './socket-handlers.js';
+import {
+  adviseWatchdogTick,
+  RELAY_WATCHDOG_HARD_RESET_TICKS,
+} from './relay-watchdog-policy.mjs';
 import {
   initInstallButton,
   initFullscreenButton,
@@ -321,6 +327,7 @@ let foregroundRecoveryInFlight = false;
 let foregroundRecoveryWatchdogTimer = null;
 let foregroundRecoveryGeneration = 0;
 let relayConnectionWatchdogTimer = null;
+let relayWatchdogDisconnectedTicks = 0;
 let deviceVisibilityHeartbeatTimer = null;
 let backgroundSuspendTimer = null;
 let appSharedMode = false;
@@ -619,19 +626,42 @@ function handleForegroundTransition(reason, { immediate = false } = {}) {
   // resumes. If the socket is still reconnecting this is a no-op; the
   // connect-time heartbeat covers that case.
   emitDeviceVisibility(true);
+  // A socket that reports connected after a freeze may be a zombie whose
+  // ping-timeout timer died with the freeze; probe it instead of trusting it.
+  verifySocketLiveness();
   scheduleForegroundRecovery(reason, { immediate });
 }
 
 // socket.io gives up permanently after an explicit disconnect or a rejected
 // handshake, so a dropped relay never comes back on its own while the app stays in
-// the foreground. This is the safety net for that.
+// the foreground. This is the safety net for that. It deliberately does not
+// consult navigator.onLine: Android Chrome can report a stale `false` after a
+// standby resume while fetches work fine, and that guard once muzzled the
+// watchdog for the rest of the page's life. A failed connect attempt is cheap;
+// a silently disabled watchdog is not.
+//
+// connect() alone cannot escape every wedged manager state (see
+// relay-watchdog-policy.mjs), so ticks spent disconnected escalate to a hard
+// reset of the socket.
 function startRelayConnectionWatchdog() {
   if (relayConnectionWatchdogTimer || appSharedMode) return;
   relayConnectionWatchdogTimer = setInterval(() => {
-    if (!isAppForegrounded()) return;
-    if (navigator.onLine === false) return;
-    if (ensureSocketConnected() === 'forced') {
-      recordStatusEvent('relay-reconnect-forced', {});
+    if (!isAppForegrounded()) {
+      // Background ticks say nothing about the connection; a count carried
+      // across a resume could trigger a reset before reconnection had a chance.
+      relayWatchdogDisconnectedTicks = 0;
+      return;
+    }
+    const state = ensureSocketConnected();
+    if (state === 'forced') recordStatusEvent('relay-reconnect-forced', {});
+    const advice = adviseWatchdogTick({ state, disconnectedTicks: relayWatchdogDisconnectedTicks });
+    relayWatchdogDisconnectedTicks = advice.disconnectedTicks;
+    if (advice.hardReset) {
+      hardResetSocket();
+      recordStatusEvent('relay-socket-hard-reset', {
+        state,
+        afterTicks: RELAY_WATCHDOG_HARD_RESET_TICKS,
+      });
     }
   }, RELAY_WATCHDOG_INTERVAL_MS);
 }

@@ -29,7 +29,7 @@ import {
   setConversationWatcherCount,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
-import { publishStatusEvent } from './status-store.mjs';
+import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
 import { renderConvList, refreshConversations, openConversation } from './journal-view.js';
 import {
   upsertRelayQuestion,
@@ -65,9 +65,16 @@ import { mergeRelayThoughts } from './relay-thoughts.mjs';
 
 const FALLBACK_MODE = 'agent';
 
+// How long a liveness probe waits for its ack before declaring the transport a
+// zombie. Comfortably above one mobile round-trip, far below the ~45s the
+// engine's own ping timeout would need — which is the timer an Android freeze
+// may have discarded, making the probe necessary in the first place.
+const SOCKET_LIVENESS_TIMEOUT_MS = 5000;
+
 /** @type {import('socket.io-client').Socket | null} */
 let socket = null;
 let socketActivityEnabled = true;
+let livenessProbeInFlight = false;
 let lastSocketErrorSignature = '';
 let lastSocketErrorAt = 0;
 
@@ -173,6 +180,48 @@ export function ensureSocketConnected() {
   socket.io?.reconnection(true);
   socket.connect();
   return wasRetrying ? 'retrying' : 'forced';
+}
+
+/**
+ * Last-resort recovery for manager states connect() cannot escape: a
+ * `_reconnecting` flag whose backoff timer was dropped by an Android freeze, or
+ * a connect attempt whose timers died with it. disconnect() forcibly clears the
+ * manager state machine (skipReconnect/_reconnecting) and destroys whatever
+ * engine is left; connect() then opens a clean handshake, and the socket's
+ * retained recovery offset still lets the server replay missed events when the
+ * outage stayed inside the recovery window.
+ */
+export function hardResetSocket() {
+  if (!socket) return;
+  try {
+    socket.disconnect();
+  } catch {}
+  if (!socketActivityEnabled) return;
+  socket.io?.reconnection(true);
+  socket.connect();
+}
+
+/**
+ * Distrust a socket that claims to be connected right after the app returns to
+ * the foreground. A page frozen mid-connection can resume with `connected`
+ * still true on a transport the server dropped hours ago, and if the engine's
+ * ping-timeout timer was discarded with the freeze nothing ever notices — the
+ * watchdog sees "connected" and stands down. An acked ping settles it: no ack
+ * within the timeout means zombie, and closing the engine hands the manager a
+ * real close event to reconnect from.
+ */
+export function verifySocketLiveness() {
+  if (!socketActivityEnabled || !socket?.connected || livenessProbeInFlight) return;
+  livenessProbeInFlight = true;
+  socket.timeout(SOCKET_LIVENESS_TIMEOUT_MS).emit('client_ping', (err) => {
+    livenessProbeInFlight = false;
+    if (!err) return;
+    // The engine may already have noticed and reconnected (or been suspended)
+    // while the probe was outstanding; only kill a socket still playing alive.
+    if (!socket?.connected) return;
+    recordStatusEvent('relay-zombie-socket', { timeoutMs: SOCKET_LIVENESS_TIMEOUT_MS });
+    socket.io?.engine?.close();
+  });
 }
 
 function requireDeps() {
