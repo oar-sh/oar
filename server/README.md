@@ -157,7 +157,7 @@ If `localhostOnly` is enabled in `config.json`, the server listens only on loopb
 http://localhost:3333/
 ```
 
-`localhostOnly` affects only the local relay listener. SSH reverse tunnel exposure is configured separately with `sshTunnel.remoteBind`.
+`localhostOnly` affects only the local relay listener. SSH reverse tunnel exposure is configured separately with `sshTunnel.remoteBind`. The Cloudflare Tunnel mode (`cloudflaredTunnel`) needs no public bind at all: `cloudflared` connects outbound to Cloudflare and proxies back into `127.0.0.1`.
 
 Sign in once with the token prompt; the browser stores the session in an HttpOnly cookie.
 Each CLI session now tracks its own workspace root:
@@ -1014,6 +1014,13 @@ service).
     "remotePort": 4444,
     "identityFile": "~/.ssh/id_rsa",
     "autoReclaimPort": true
+  },
+  "cloudflaredTunnel": {
+    "mode": "disabled",
+    "required": false,
+    "token": "",
+    "binary": "",
+    "extraArgs": []
   }
 }
 ```
@@ -1048,6 +1055,13 @@ service).
 | `sshTunnel.autoReclaimPort` | `true` | When remote bind fails, run a remote reclaim step before retrying |
 | `sshTunnel.reclaimStaleSshSessions` | `false` | Also kill your own childless `@notty` SSH sessions when the port stays held (see caveat below) |
 | `sshTunnel.remoteCleanupCommand` | *(optional)* | Override reclaim command (`ssh user@host <command>`) for custom VPS cleanup |
+| `cloudflaredTunnel.mode` | `disabled` | Cloudflare tunnel mode (`disabled` or `managed`) |
+| `cloudflaredTunnel.enabled` | `false` | Legacy alias for mode (`true` => `managed`) |
+| `cloudflaredTunnel.required` | `false` | Pause dequeue when the Cloudflare tunnel is disconnected in managed mode |
+| `cloudflaredTunnel.token` | — | Tunnel token from the router panel (never logged) |
+| `cloudflaredTunnel.binary` | *(auto)* | `cloudflared` path; falls back to the optional npm package, then `PATH` |
+| `cloudflaredTunnel.extraArgs` | `[]` | Extra arguments appended to `cloudflared tunnel run` |
+| `tunnelMarkerHeaders` | `[]` | Extra edge-injected header names that mark tunnel traffic for the session-worker path guard |
 
 ### SDK auto-detection behavior
 
@@ -1249,4 +1263,6 @@ working with the corresponding feature inert rather than crashing at startup.
 | `claude-worker/` | Claude Agent SDK session worker (turn runner, ask-user bridge, attachments, SDK message normalizer) |
 | `services/claude-session-root-service.mjs` | Resolves the browsable session folder for Claude conversations |
 | `services/context-usage-view.mjs` | Normalizes Copilot and Claude context data into one payload |
+| `services/cloudflared-tunnel-service.mjs` | Supervises the `cloudflared` child process for the Cloudflare Tunnel mode |
+| `services/tunnel-worker-path-guard.mjs` | Rejects session-worker WebSocket paths that arrive through a public tunnel |
 | `../shared/turn-ceiling.mjs` | Shared bounds/formatting for the max turn duration setting |

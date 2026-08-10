@@ -14,7 +14,7 @@ function normalizePathPrefix(value) {
   return prefixed.replace(/\/+$/, '');
 }
 
-function buildAcceptedWorkerPaths(pathPrefix) {
+export function buildAcceptedWorkerPaths(pathPrefix) {
   const basePath = '/api/session-worker/ws';
   const prefixed = `${normalizePathPrefix(pathPrefix)}${basePath}` || basePath;
   return Array.from(new Set([basePath, prefixed]));

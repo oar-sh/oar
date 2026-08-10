@@ -76,6 +76,8 @@ import { createSessionWorkerProcessInspector } from './services/session-worker-p
 import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
 import { applyClaudeProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
+import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
+import { createTunnelWorkerPathGuard } from './services/tunnel-worker-path-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
@@ -1197,7 +1199,8 @@ const AUTO_MODEL_SENTINEL = 'auto';
 const SUPPORTED_CONVERSATION_SESSION_MODES = ['isolated', 'shared'];
 const DEFAULT_CONVERSATION_SESSION_MODE = 'isolated';
 const MAX_UPLOAD_ATTACHMENTS = 6;
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+// Cloudflare passes bodies up to 100 MB on Free/Pro; 64 MiB leaves headroom.
+const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
 const MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES = 1 * 1024 * 1024;
 const DEFAULT_SESSION_WORKSPACE_ROOT_KEY = 'default_session_workspace_root_path';
@@ -6350,6 +6353,20 @@ httpServer.prependListener('request', (req, _res) => {
 httpServer.prependListener('upgrade', (req, _socket, _head) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
+// Public tunnels (Cloudflare, or a VPS/Caddy front) forward every path on the
+// bound hostname to this port, including the session-worker WebSocket plumbing.
+// Reject those before auth; local workers connect over 127.0.0.1 with no edge
+// marker header and are unaffected.
+const tunnelWorkerPathGuard = createTunnelWorkerPathGuard({
+  pathPrefix: remotePath,
+  extraMarkerHeaders: config.tunnelMarkerHeaders
+    || process.env.COPILOT_TUNNEL_MARKER_HEADERS
+    || [],
+  logger: console,
+});
+httpServer.prependListener('upgrade', (req, socket, _head) => {
+  tunnelWorkerPathGuard.handleUpgrade(req, socket);
+});
 // Mobile clients disconnect whenever the PWA is backgrounded. Connection state
 // recovery replays the discrete events they missed instead of forcing a full
 // resync, so a phone that was away for a few minutes comes back in sync.
@@ -6559,6 +6576,20 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     };
   }
 
+  if (runtimeState.cloudflaredTunnelState?.blocking) {
+    return {
+      message: null,
+      paused: true,
+      reason: 'cloudflared_tunnel_required',
+      cloudflaredTunnel: {
+        mode: runtimeState.cloudflaredTunnelState?.mode ?? null,
+        required: runtimeState.cloudflaredTunnelState?.required ?? false,
+        connected: runtimeState.cloudflaredTunnelState?.connected ?? false,
+        lastError: runtimeState.cloudflaredTunnelState?.lastError ?? null,
+      },
+    };
+  }
+
   const counts = queueCounts();
   const existingWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
   if (!existingWorker) {
@@ -6729,6 +6760,11 @@ async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
   return requested;
 }
 
+// Guard first, so a tunnelled request to a worker path is rejected before any
+// body is parsed and before auth runs.
+app.use(tunnelWorkerPathGuard.requestMiddleware);
+// Uploads travel as raw bodies on POST /api/upload (express.raw, capped by
+// MAX_UPLOAD_BYTES), so the JSON limit only bounds inline image data URLs.
 app.use(express.json({ limit: '20mb' }));
 app.use((req, _res, next) => {
   stripRequestPathPrefix(req, remotePath);
@@ -7341,6 +7377,18 @@ const sshTunnelManager = createSshTunnelManager({
 const tunnelState = sshTunnelManager.state;
 runtimeState.tunnelState = tunnelState;
 
+// ─── Cloudflare Tunnel ────────────────────────────────────────────────────────
+// Independent of the SSH tunnel above; both modes may run simultaneously.
+const cloudflaredTunnelManager = createCloudflaredTunnelManager({
+  tunnelConfig: config.cloudflaredTunnel || {},
+  runtimeLogPrefix,
+  io,
+  logger: console,
+  runtimeShutdownRef: () => runtimeShutdownStarted,
+  configBaseDir: __dirname,
+});
+runtimeState.cloudflaredTunnelState = cloudflaredTunnelManager.state;
+
 function clearRuntimeTimers() {
   for (const timer of Object.values(runtimeTimers)) {
     if (!timer) continue;
@@ -7374,6 +7422,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();
+  cloudflaredTunnelManager.stop();
   try { relaySingletonGuard.release(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Failed to release singleton lock: ${error?.message || error}`);
   }
@@ -7496,6 +7545,7 @@ httpServer.listen(config.port, listenHost, () => {
 
   // Start SSH tunnel after server is listening
   sshTunnelManager.start();
+  cloudflaredTunnelManager.start();
   void sdkSessionImportService.runStartupImport().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session import startup failed: ${error?.message || error}`);
   });

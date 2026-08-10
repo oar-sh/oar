@@ -29,6 +29,7 @@
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
+    "cloudflared": "^0.7.1",
     "tty-console": "^1.0.4"
   },
   "devDependencies": {

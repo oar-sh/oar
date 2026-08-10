@@ -362,6 +362,12 @@ When either trips, the turn is returned to the queue rather than lost.
 | `sshTunnel.host`           | —                    | SSH host                                                                  |
 | `sshTunnel.remotePort`     | —                    | Remote forwarded port                                                     |
 | `sshTunnel.identityFile`   | optional             | SSH key path (falls back to default agent/key)                            |
+| `cloudflaredTunnel.mode`   | `disabled`           | Cloudflare tunnel mode (`disabled` or `managed`)                          |
+| `cloudflaredTunnel.required` | `false`            | Pause dequeue while the managed Cloudflare tunnel is disconnected         |
+| `cloudflaredTunnel.token`  | —                    | Tunnel token issued by the router panel                                   |
+| `cloudflaredTunnel.binary` | *(auto)*             | `cloudflared` path; defaults to the npm package, then `PATH`              |
+| `cloudflaredTunnel.extraArgs` | `[]`              | Extra arguments appended to `cloudflared tunnel run`                      |
+| `tunnelMarkerHeaders`      | `[]`                 | Extra edge-injected headers that mark tunnel traffic (see worker-path guard) |
 
 
 > Session mismatch recovery is restart-driven: the relay restart orchestrator parks queue work, restarts/rebinds the CLI runtime, and resumes dequeueing after rebind confirmation. The extension no longer attempts in-process session switch APIs from the dequeue/send path.
@@ -394,6 +400,48 @@ relay.example.com {
 ```
 
 The relay auto-reconnects tunnel drops with exponential backoff.
+
+## Optional remote internet access (Cloudflare Tunnel)
+
+An alternative to the SSH tunnel that needs no VPS and no inbound port: the relay
+supervises Cloudflare's `cloudflared` binary, and Cloudflare carries your hostname down
+to `127.0.0.1:3333`. Both modes are independent and may run at the same time.
+
+```json
+"cloudflaredTunnel": {
+  "mode": "managed",
+  "required": false,
+  "token": "<tunnel token>",
+  "binary": "",
+  "extraArgs": []
+}
+```
+
+Hostname-to-machine bindings are managed remotely in the router panel (see the
+`cpr-router` project), never configured on this machine — paste the token it gives you and
+start the relay. Environment overrides: `COPILOT_CLOUDFLARED_MODE`,
+`COPILOT_CLOUDFLARED_TOKEN`, `COPILOT_CLOUDFLARED_BINARY`.
+
+`localhostOnly` stays `true`: `cloudflared` connects outbound and nothing binds publicly.
+The binary resolves from `cloudflaredTunnel.binary`, then the optional `cloudflared` npm
+package, then `PATH`; a managed config with no resolvable binary is reported as a config
+error instead of crashing. Connection drops reconnect with jittered exponential backoff,
+and repeated fast exits (deleted tunnel or bad token) are reported as `auth-or-config`
+instead of hammering Cloudflare.
+
+### Session-worker path guard
+
+Any public tunnel forwards *every* path on the bound hostname to port `3333`, including
+the internal session-worker WebSocket endpoints. Requests to those paths that carry an
+edge marker header (`cf-ray`, plus anything listed in `tunnelMarkerHeaders`) are rejected
+with `403` on both the request and upgrade paths. Local workers connect over `127.0.0.1`
+without such a header and are unaffected, and shared conversation links keep working
+anonymously over the tunnel.
+
+Shared links work unchanged through Cloudflare. Do not add a Cloudflare Cache Rule
+covering `/api/shared/*` — shared views poll for liveness and an edge-cached response
+would pin viewers to a stale snapshot. Likewise, a Cloudflare Access application over the
+bound hostname breaks share links unless it bypasses `/shared/*` and `/api/shared/*`.
 
 ## Global extension install (optional)
 
