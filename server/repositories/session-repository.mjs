@@ -19,7 +19,7 @@ export function createSessionRepository(db) {
         getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? AND status != 'deleted' ORDER BY updated_at DESC LIMIT 1`),
         listConvIdsMissingRuntimeSession: db.prepare(`SELECT c.id AS id FROM conversations c LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE rs.id IS NULL AND c.status != 'deleted'`),
         runtimeSessionsSupportProviders,
-        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
+        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.draft_attachments, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
         insertConv:     db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
         updateConvTime: db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`),
         updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`),
@@ -32,6 +32,7 @@ export function createSessionRepository(db) {
         getConvSeed:    db.prepare(`SELECT summary_seed, seed_pending FROM conversations WHERE id = ?`),
         clearConvSeed:  db.prepare(`UPDATE conversations SET seed_pending = 0, updated_at = ? WHERE id = ?`),
         updateConvDraft: db.prepare(`UPDATE conversations SET draft_text = ?, draft_updated_at = ?, draft_updated_by_client_id = ? WHERE id = ?`),
+        updateConvDraftAttachments: db.prepare(`UPDATE conversations SET draft_attachments = ?, draft_updated_at = ?, draft_updated_by_client_id = ? WHERE id = ?`),
         archiveConv:    db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`),
         deleteConv:     db.prepare(`DELETE FROM conversations WHERE id = ?`),
 

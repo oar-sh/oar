@@ -1818,6 +1818,47 @@
     border: none; border-radius: 999px; background: rgba(0,0,0,0.65); color: var(--text);
     cursor: pointer; line-height: 22px; font-size: var(--fs-meta-md);
   }
+  .attachment-preview-status {
+    position: absolute; inset: 0 0 26px 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.55);
+    border: none; padding: 0; margin: 0;
+    color: var(--text); font-size: var(--fs-meta-md);
+  }
+  .attachment-preview-status-error {
+    cursor: pointer; color: var(--warn); font-size: 18px;
+    background: rgba(45, 26, 0, 0.75);
+  }
+  .attachment-preview-error { border-color: var(--warn); }
+  .attachment-preview-spinner {
+    width: 18px; height: 18px; border-radius: 999px;
+    border: 2px solid rgba(255,255,255,0.25); border-top-color: var(--text);
+    animation: attachment-spin 0.7s linear infinite;
+  }
+  @keyframes attachment-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .attachment-preview-spinner { animation-duration: 2.4s; }
+  }
+  #input-area.composer-dropzone-active {
+    outline: 2px dashed var(--accent);
+    outline-offset: -4px;
+    border-radius: 10px;
+  }
+  #input-area.composer-dropzone-active::after {
+    content: 'Drop files to attach';
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.45);
+    color: var(--text); font-size: var(--fs-meta-md);
+    pointer-events: none; border-radius: 10px; z-index: 5;
+  }
+  #composer-attachment-warning {
+    margin-bottom: 8px; padding: 6px 10px;
+    border: 1px solid var(--warn); border-radius: 8px;
+    background: rgba(210, 153, 34, 0.15);
+    color: var(--warn); font-size: var(--fs-meta-sm); text-align: center;
+  }
+  #composer-attachment-warning[hidden] { display: none; }
   #offline-banner {
     display: none; background: #2d1a00; border: 1px solid var(--warn); color: var(--warn);
     border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; font-size: var(--fs-meta-sm); text-align: center;
@@ -2179,7 +2220,10 @@
     object-fit: contain;
     border-radius: 6px;
     transform-origin: center center;
-    will-change: transform;
+    /* No will-change: transform here. It promotes the image to its own GPU
+       layer that is rasterised once at layout size, so zooming magnified that
+       raster instead of resampling the full-resolution source. Zoom now changes
+       layout size (see _applyImgZoom), which needs a normal repaint. */
     pointer-events: none;
     display: block;
     user-select: none;
@@ -4202,6 +4246,7 @@
         <button type="button" id="model-metadata-retry-btn">Refresh models</button>
       </div>
       <div id="attachment-preview"></div>
+      <div id="composer-attachment-warning" role="status" aria-live="polite" hidden></div>
       <div id="image-edit-target" aria-live="polite"></div>
       <div id="emoji-popup" aria-hidden="true"></div>
       <div class="input-row">

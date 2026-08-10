@@ -41,6 +41,7 @@ import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { registerGitRoutes } from './routes/git-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
+import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
 import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
 import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
@@ -2901,6 +2902,7 @@ db.exec(`
     draft_text TEXT,
     draft_updated_at TEXT,
     draft_updated_by_client_id TEXT,
+    draft_attachments TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -3562,6 +3564,9 @@ if (!conversationColumns.includes('draft_updated_at')) {
 }
 if (!conversationColumns.includes('draft_updated_by_client_id')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN draft_updated_by_client_id TEXT`);
+}
+if (!conversationColumns.includes('draft_attachments')) {
+  db.exec(`ALTER TABLE conversations ADD COLUMN draft_attachments TEXT`);
 }
 
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_sessions_sdk_session_id ON runtime_sessions(sdk_session_id) WHERE sdk_session_id IS NOT NULL AND sdk_session_id != ''`);
@@ -5836,6 +5841,13 @@ function deleteOrphanedUploads(hashes) {
   }
 }
 
+function sweepUnreferencedUploadBlobs() {
+  return sweepUnreferencedUploads({
+    listUnreferenced: () => db.prepare(UNREFERENCED_UPLOADS_QUERY).all(),
+    deleteUploads: deleteOrphanedUploads,
+  });
+}
+
 function normalizeMessageLine(text, maxLength = 240) {
   const compact = String(text || '').replace(/\s+/g, ' ').trim();
   if (!compact) return '';
@@ -7099,6 +7111,12 @@ runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
 expirePendingQuestions();
 runtimeTimers.sharedViewerPrune = setInterval(pruneSharedViewerPresence, 5_000);
 if (typeof runtimeTimers.sharedViewerPrune.unref === 'function') runtimeTimers.sharedViewerPrune.unref();
+const sweptUploads = sweepUnreferencedUploadBlobs();
+if (sweptUploads > 0) {
+  console.log(`${runtimeLogPrefix()}Reclaimed ${sweptUploads} unreferenced upload(s)`);
+}
+runtimeTimers.uploadSweep = setInterval(sweepUnreferencedUploadBlobs, 6 * 60 * 60 * 1000);
+if (typeof runtimeTimers.uploadSweep.unref === 'function') runtimeTimers.uploadSweep.unref();
 const runtimeBindingsBootstrapped = bootstrapRuntimeSessionBindings();
 if (runtimeBindingsBootstrapped > 0) {
   console.log(`${runtimeLogPrefix()}Runtime sessions bootstrapped: ${runtimeBindingsBootstrapped}`);

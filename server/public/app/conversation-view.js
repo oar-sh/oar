@@ -47,7 +47,13 @@ import {
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
-import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import {
+  serializeDraftAttachments,
+  hydrateDraftAttachments,
+  mergeDraftAttachmentUpdate,
+  draftAttachmentsEqual,
+} from './composer-attachment-cache.mjs';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { renderRelayBoards } from './relay-board-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
@@ -58,7 +64,7 @@ import {
   computeNextRelayStreamState,
 } from './stream-state.mjs';
 import { mergeRelayActivityTexts, normalizeRelayActivityEntry, relayActivityEntryText } from './activity-replay-state.mjs';
-import { deriveComposerControlState, hasComposerDraft } from './composer-control-state.mjs';
+import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
@@ -311,6 +317,7 @@ function syncSendButtonState() {
     }),
     sendInFlight,
     modelMetadataBlocked: window.isModelMetadataBlocked?.() === true,
+    attachmentsUploading: hasUploadingAttachments(selectedAttachments),
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
@@ -341,6 +348,7 @@ function clearDraftTimerForConversation(conversationId) {
 
 function upsertConversationDraftState(conversationId, {
   draftText = '',
+  draftAttachments = undefined,
   draftUpdatedAt = null,
   draftUpdatedByClientId = null,
 } = {}) {
@@ -350,12 +358,35 @@ function upsertConversationDraftState(conversationId, {
   conversations[id] = {
     ...existing,
     draftText: String(draftText || ''),
+    draftAttachments: draftAttachments === undefined
+      ? (existing.draftAttachments || [])
+      : (Array.isArray(draftAttachments) ? draftAttachments : []),
     draftUpdatedAt: draftUpdatedAt || null,
     draftUpdatedByClientId: draftUpdatedByClientId || null,
   };
 }
 
-async function persistConversationDraft(conversationId, draftText) {
+/**
+ * Persists the composer's attachment set for the active conversation. Called
+ * whenever an attachment finishes uploading or is removed, so the cache is
+ * written as a discrete action rather than riding the text debounce.
+ *
+ * Before a conversation exists there is nowhere to persist to: the attachments
+ * simply stay in the composer (they were already uploaded) and are adopted by
+ * the conversation created on the first send.
+ */
+export function persistComposerAttachments() {
+  const id = String(currentConvId || '').trim();
+  if (!id) return null;
+  return scheduleConversationDraftSave({
+    conversationId: id,
+    draftText: document.getElementById('msg-input')?.value || '',
+    draftAttachments: serializeDraftAttachments(selectedAttachments),
+    immediate: true,
+  });
+}
+
+async function persistConversationDraft(conversationId, draftText, draftAttachments = undefined) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const text = String(draftText || '');
@@ -365,12 +396,14 @@ async function persistConversationDraft(conversationId, draftText) {
       draftText: text,
       clientId: CLIENT_ID,
       baseDraftUpdatedAt,
+      ...(draftAttachments === undefined ? {} : { draftAttachments }),
     });
     if (!response?.ok) {
       if (response?.conflict === true || response?.code === 'draft-version-conflict') {
         applyIncomingConversationDraftUpdate({
           conversationId: id,
           draftText: response.draftText || '',
+          draftAttachments: response.draftAttachments,
           draftUpdatedAt: response.draftUpdatedAt || null,
           draftUpdatedByClientId: response.draftUpdatedByClientId || null,
         });
@@ -379,6 +412,7 @@ async function persistConversationDraft(conversationId, draftText) {
     }
     upsertConversationDraftState(id, {
       draftText: response.draftText,
+      draftAttachments: response.draftAttachments,
       draftUpdatedAt: response.draftUpdatedAt || response.updatedAt || null,
       draftUpdatedByClientId: response.draftUpdatedByClientId || response.senderClientId || null,
     });
@@ -400,20 +434,21 @@ async function persistConversationDraft(conversationId, draftText) {
 async function scheduleConversationDraftSave({
   conversationId,
   draftText,
+  draftAttachments = undefined,
   immediate = false,
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const text = String(draftText || '');
-  upsertConversationDraftState(id, { draftText: text });
+  upsertConversationDraftState(id, { draftText: text, draftAttachments });
   clearDraftTimerForConversation(id);
   if (immediate) {
-    return persistConversationDraft(id, text);
+    return persistConversationDraft(id, text, draftAttachments);
   }
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       draftSaveTimerByConversation.delete(id);
-      persistConversationDraft(id, text).then(resolve).catch(() => resolve(null));
+      persistConversationDraft(id, text, draftAttachments).then(resolve).catch(() => resolve(null));
     }, COMPOSER_DRAFT_DEBOUNCE_MS);
     draftSaveTimerByConversation.set(id, timer);
   });
@@ -433,21 +468,28 @@ export async function flushConversationDraft(conversationId = currentConvId) {
 
 export function hydrateConversationDraft(conversationId, {
   draftText = '',
+  draftAttachments = [],
   draftUpdatedAt = null,
   draftUpdatedByClientId = null,
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return;
   const normalizedDraftText = String(draftText || '');
+  const normalizedAttachments = Array.isArray(draftAttachments) ? draftAttachments : [];
   const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
   const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
   if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
   upsertConversationDraftState(id, {
     draftText: normalizedDraftText,
+    draftAttachments: normalizedAttachments,
     draftUpdatedAt,
     draftUpdatedByClientId,
   });
   if (String(currentConvId || '').trim() !== id) return;
+  // Restore the composer's pending attachments for the conversation being opened.
+  if (!draftAttachmentsEqual(selectedAttachments, hydrateDraftAttachments(normalizedAttachments))) {
+    setComposerAttachments(hydrateDraftAttachments(normalizedAttachments));
+  }
   const input = document.getElementById('msg-input');
   if (!input) return;
   const isFocused = document.activeElement === input;
@@ -465,6 +507,7 @@ export function hydrateConversationDraft(conversationId, {
 export function applyIncomingConversationDraftUpdate({
   conversationId,
   draftText = '',
+  draftAttachments = undefined,
   draftUpdatedAt = null,
   draftUpdatedByClientId = null,
   senderClientId = null,
@@ -478,10 +521,21 @@ export function applyIncomingConversationDraftUpdate({
   if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
   upsertConversationDraftState(id, {
     draftText: incomingDraftText,
+    draftAttachments,
     draftUpdatedAt,
     draftUpdatedByClientId: draftUpdatedByClientId || senderClientId || null,
   });
   if (String(currentConvId || '').trim() !== id) return;
+  if (draftAttachments !== undefined) {
+    const merged = mergeDraftAttachmentUpdate({
+      existing: selectedAttachments,
+      incoming: hydrateDraftAttachments(Array.isArray(draftAttachments) ? draftAttachments : []),
+      existingUpdatedAt: conversations[id]?.draftUpdatedAt || null,
+      incomingUpdatedAt: draftUpdatedAt,
+      isLocalEcho: senderClientId === CLIENT_ID,
+    });
+    if (merged.changed) setComposerAttachments(merged.attachments);
+  }
   const input = document.getElementById('msg-input');
   if (!input) return;
   const isFocused = document.activeElement === input;

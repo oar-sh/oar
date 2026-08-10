@@ -888,6 +888,69 @@ export function hasConversationDraftVersionConflict({
   return normalizeOptionalIsoTimestamp(existingDraftUpdatedAt) !== normalizeOptionalIsoTimestamp(baseDraftUpdatedAt);
 }
 
+export const MAX_CONVERSATION_DRAFT_ATTACHMENTS = 6;
+export const DRAFT_UPLOAD_MESSAGE_ID = '__draft__';
+
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+
+export function parseDraftAttachmentsColumn(value) {
+  if (Array.isArray(value)) return value;
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Validates a client-supplied draft attachment list. Every entry must reference
+ * a blob that already exists, so a draft can never point at content the server
+ * does not hold. Returns `{ ok:false, error }` instead of throwing so the route
+ * can answer with a 400.
+ */
+export function normalizeDraftAttachmentsInput(value, {
+  lookupUploadFile,
+  max = MAX_CONVERSATION_DRAFT_ATTACHMENTS,
+} = {}) {
+  if (value === undefined) return { ok: true, provided: false, attachments: [] };
+  if (value === null) return { ok: true, provided: true, attachments: [] };
+  if (!Array.isArray(value)) return { ok: false, error: 'draftAttachments must be an array' };
+  if (value.length > max) return { ok: false, error: `At most ${max} draft attachments are allowed` };
+
+  const seen = new Set();
+  const attachments = [];
+  for (const entry of value) {
+    const sha256 = String(entry?.sha256 || '').trim().toLowerCase();
+    if (!SHA256_PATTERN.test(sha256)) return { ok: false, error: 'Invalid draft attachment id' };
+    if (seen.has(sha256)) continue;
+    seen.add(sha256);
+
+    const row = typeof lookupUploadFile === 'function' ? lookupUploadFile(sha256) : null;
+    if (!row) return { ok: false, error: 'Unknown draft attachment' };
+
+    attachments.push({
+      sha256,
+      name: String(entry?.name || row.original_name || '').trim().slice(0, 255) || `upload-${sha256.slice(0, 12)}`,
+      type: String(entry?.type || row.mime_type || 'application/octet-stream').trim().toLowerCase().slice(0, 127),
+      size: Math.max(0, Number(entry?.size ?? row.size_bytes ?? 0) || 0),
+    });
+  }
+
+  return { ok: true, provided: true, attachments };
+}
+
+export function diffDraftAttachmentHashes(previous = [], next = []) {
+  const before = new Set(previous.map((item) => String(item?.sha256 || item || '').trim().toLowerCase()).filter(Boolean));
+  const after = new Set(next.map((item) => String(item?.sha256 || item || '').trim().toLowerCase()).filter(Boolean));
+  return {
+    added: [...after].filter((sha) => !before.has(sha)),
+    removed: [...before].filter((sha) => !after.has(sha)),
+  };
+}
+
 function resolveConversationPreferences(row, {
   supportedRelayModes = [],
   defaultRelayMode = FALLBACK_RELAY_MODE,
@@ -1872,6 +1935,28 @@ export function registerSessionsRoutes(app, deps) {
     uploadPathForSha,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
+
+  /**
+   * Drops draft references to the given blobs and reclaims any that no longer
+   * have a reference at all. Blobs still referenced by a sent message survive.
+   *
+   * Only blobs that actually held a draft reference for this conversation are
+   * considered: a blob with no references at all is either owned by someone else
+   * or still mid-upload, and must not be collected here.
+   */
+  function releaseDraftUploadReferences(conversationId, hashes = []) {
+    const list = [...new Set((hashes || []).map((sha) => String(sha || '').trim().toLowerCase()).filter(Boolean))];
+    if (!list.length) return;
+    const released = [];
+    for (const sha256 of list) {
+      const result = stmts.deleteDraftUploadRef?.run?.(conversationId, sha256);
+      if (Number(result?.changes || 0) > 0) released.push(sha256);
+    }
+    if (released.length && typeof deleteOrphanedUploads === 'function') {
+      deleteOrphanedUploads(released);
+    }
+  }
+
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
@@ -2378,6 +2463,7 @@ export function registerSessionsRoutes(app, deps) {
         preferredModel: preferences.preferredModel,
         preferredReasoningEffort: preferences.preferredReasoningEffort,
         draftText: String(r.draft_text || ''),
+        draftAttachments: parseDraftAttachmentsColumn(r.draft_attachments),
         draftUpdatedAt: r.draft_updated_at || null,
         draftUpdatedByClientId: r.draft_updated_by_client_id || null,
       };
@@ -2963,6 +3049,7 @@ export function registerSessionsRoutes(app, deps) {
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,
       draftText: String(conv.draft_text || ''),
+      draftAttachments: parseDraftAttachmentsColumn(conv.draft_attachments),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
@@ -3332,6 +3419,7 @@ export function registerSessionsRoutes(app, deps) {
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,
       draftText: String(conv.draft_text || ''),
+      draftAttachments: parseDraftAttachmentsColumn(conv.draft_attachments),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
@@ -3492,6 +3580,17 @@ export function registerSessionsRoutes(app, deps) {
     const now = new Date().toISOString();
     const draftText = normalizeConversationDraftText(req.body?.draftText ?? req.body?.text);
     const persistedDraftText = draftText || null;
+
+    const attachmentsInput = normalizeDraftAttachmentsInput(req.body?.draftAttachments, {
+      lookupUploadFile: (sha256) => stmts.getUploadFile?.get?.(sha256) || null,
+    });
+    if (!attachmentsInput.ok) {
+      return res.status(400).json({ error: attachmentsInput.error });
+    }
+
+    const previousAttachments = parseDraftAttachmentsColumn(existing.draft_attachments);
+    const nextAttachments = attachmentsInput.provided ? attachmentsInput.attachments : previousAttachments;
+
     if (typeof stmts.updateConvDraft?.run === 'function') {
       stmts.updateConvDraft.run(persistedDraftText, now, senderClientId, conversationId);
     } else {
@@ -3501,9 +3600,34 @@ export function registerSessionsRoutes(app, deps) {
         WHERE id = ?
       `).run(persistedDraftText, now, senderClientId, conversationId);
     }
+
+    if (attachmentsInput.provided) {
+      const serialized = nextAttachments.length ? JSON.stringify(nextAttachments) : null;
+      if (typeof stmts.updateConvDraftAttachments?.run === 'function') {
+        stmts.updateConvDraftAttachments.run(serialized, now, senderClientId, conversationId);
+      } else {
+        db.prepare(`
+          UPDATE conversations
+          SET draft_attachments = ?, draft_updated_at = ?, draft_updated_by_client_id = ?
+          WHERE id = ?
+        `).run(serialized, now, senderClientId, conversationId);
+      }
+
+      // Keep upload references in step with the draft so blobs stay alive while
+      // referenced and become collectable the moment they are not.
+      const { added, removed } = diffDraftAttachmentHashes(previousAttachments, nextAttachments);
+      for (const sha256 of added) {
+        stmts.insertUploadRef?.run?.(sha256, conversationId, DRAFT_UPLOAD_MESSAGE_ID, now);
+      }
+      if (removed.length && typeof releaseDraftUploadReferences === 'function') {
+        releaseDraftUploadReferences(conversationId, removed);
+      }
+    }
+
     const payload = {
       conversationId,
       draftText: persistedDraftText || '',
+      draftAttachments: nextAttachments,
       draftUpdatedAt: now,
       draftUpdatedByClientId: senderClientId,
       senderClientId,
@@ -4340,6 +4464,17 @@ export function registerSessionsRoutes(app, deps) {
         connectedSince: runtimeState.tunnelState?.connectedSince ?? null,
         lastError: runtimeState.tunnelState?.lastError ?? null,
         valid: runtimeState.tunnelState?.valid ?? true,
+      },
+      cloudflaredTunnel: {
+        enabled: runtimeState.cloudflaredTunnelState?.enabled ?? false,
+        mode: runtimeState.cloudflaredTunnelState?.mode ?? 'disabled',
+        required: runtimeState.cloudflaredTunnelState?.required ?? false,
+        blocking: runtimeState.cloudflaredTunnelState?.blocking ?? false,
+        connected: runtimeState.cloudflaredTunnelState?.connected ?? false,
+        reconnectAttempts: runtimeState.cloudflaredTunnelState?.reconnectAttempts ?? 0,
+        connectedSince: runtimeState.cloudflaredTunnelState?.connectedSince ?? null,
+        lastError: runtimeState.cloudflaredTunnelState?.lastError ?? null,
+        valid: runtimeState.cloudflaredTunnelState?.valid ?? true,
       },
       workerWebSocket: runtimeState.workerWebSocketStatus || null,
       tmuxInspector: runtimeState.tmuxInspectorStatus || null,

@@ -183,7 +183,7 @@ const BASE_SCHEMA = `
     compacted_into TEXT, compacted_from TEXT, sdk_session_id TEXT, preferred_relay_mode TEXT,
     preferred_model TEXT, preferred_reasoning_effort TEXT, configured_workspace_root_path TEXT,
     runtime_workspace_root_path TEXT, draft_text TEXT, draft_updated_at TEXT,
-    draft_updated_by_client_id TEXT, summary_seed TEXT, seed_pending INTEGER,
+    draft_updated_by_client_id TEXT, draft_attachments TEXT, summary_seed TEXT, seed_pending INTEGER,
     status TEXT NOT NULL DEFAULT 'active', created_at TEXT, updated_at TEXT
   );
   CREATE TABLE messages (

@@ -10,6 +10,7 @@ import {
   filePreviewState,
   repoBrowserState,
   workspaceRootPath,
+  showTransientRelayNotice,
   getConversationCurrentWorkspaceRootPath,
 } from './store.js';
 import {
@@ -22,6 +23,16 @@ import {
   loadDriveChildren,
   loadSessionRootTree,
 } from './api-client.js';
+import {
+  extractPastedFiles,
+  extractDroppedFiles,
+  isGenericClipboardName,
+  pastedFileName,
+  planAttachmentMerge,
+  overCapNoticeText,
+} from './composer-paste.mjs';
+import { reencodeReason, downscaleImageFile, browserDownscaleDeps } from './image-downscale.mjs';
+import { imageAttachmentWarningText } from './model-vision-support.mjs';
 import {
   normalizeWorkspaceMentionPath,
   normalizeDriveBrowserPath,
@@ -199,67 +210,242 @@ export function renderAttachmentPreview() {
     el.innerHTML = '';
     el.classList.remove('visible');
     window.syncComposerControlState?.();
+    syncComposerAttachmentWarning();
     return;
   }
 
-  el.innerHTML = selectedAttachments.map((att, idx) => `
-    <div class="attachment-preview-item">
+  el.innerHTML = selectedAttachments.map((att, idx) => {
+    const state = String(att?.uploadState || 'uploaded');
+    const thumb = att.isImage && att.previewUrl
+      ? `<img src="${escHtml(att.previewUrl)}" alt="${escHtml(att.name)}">`
+      : `<div class="attachment-preview-meta" style="height:88px;display:flex;align-items:center;justify-content:center">📎</div>`;
+    const overlay = state === 'pending' || state === 'uploading'
+      ? `<div class="attachment-preview-status attachment-preview-status-uploading" role="status" aria-label="Uploading ${escHtml(att.name)}"><span class="attachment-preview-spinner"></span></div>`
+      : state === 'error'
+        ? `<button type="button" class="attachment-preview-status attachment-preview-status-error" onclick="retryAttachmentUpload(${idx})" title="${escHtml(att.error || 'Upload failed')} — click to retry">⟳</button>`
+        : '';
+    return `
+    <div class="attachment-preview-item attachment-preview-${escHtml(state)}">
       <button class="attachment-preview-remove" onclick="removeAttachment(${idx})" title="Remove">×</button>
-      ${att.isImage && att.previewUrl ? `<img src="${att.previewUrl}" alt="${escHtml(att.name)}">` : `<div class="attachment-preview-meta" style="height:88px;display:flex;align-items:center;justify-content:center">📎</div>`}
+      ${thumb}
+      ${overlay}
       <div class="attachment-preview-meta">${escHtml(att.name)}${att.size ? ` · ${formatBytes(att.size)}` : ''}</div>
     </div>
-  `).join('');
+  `;
+  }).join('');
   el.classList.add('visible');
   window.syncComposerControlState?.();
+  syncComposerAttachmentWarning();
+}
+
+function syncComposerAttachmentWarning() {
+  const el = document.getElementById('composer-attachment-warning');
+  if (!el) return;
+  const modelId = document.getElementById('model-select')?.value || '';
+  const text = imageAttachmentWarningText(modelId, selectedAttachments);
+  el.textContent = text;
+  el.hidden = !text;
+}
+
+export function refreshComposerAttachmentWarning() {
+  syncComposerAttachmentWarning();
+}
+
+function releaseAttachmentPreviewUrl(attachment) {
+  // Hydrated draft attachments point at a server URL, which must not be revoked.
+  if (!attachment?.previewUrl) return;
+  if (attachment.previewUrlIsObjectUrl === false) return;
+  URL.revokeObjectURL(attachment.previewUrl);
 }
 
 export function removeAttachment(idx) {
   const [removed] = selectedAttachments.splice(idx, 1);
-  if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+  releaseAttachmentPreviewUrl(removed);
   renderAttachmentPreview();
+  // Persisting the remaining list lets the server diff it and release the draft
+  // reference itself. Going through the normal draft save keeps removals ordered
+  // against in-flight draft writes instead of racing them.
+  window.persistComposerAttachments?.();
 }
 
 export function clearAttachments() {
   for (const att of selectedAttachments) {
-    if (att?.previewUrl) URL.revokeObjectURL(att.previewUrl);
+    releaseAttachmentPreviewUrl(att);
   }
   selectedAttachments.length = 0;
   renderAttachmentPreview();
 }
 
-export async function handleAttachmentInput(files) {
-  const inputFiles = Array.from(files || []);
-  if (!inputFiles.length) return;
-
-  const next = [];
-  for (const file of inputFiles) {
-    next.push({
-      name: file.name,
-      type: file.type || 'application/octet-stream',
-      size: Number(file.size || 0),
-      file,
-      isImage: String(file.type || '').startsWith('image/'),
-      previewUrl: String(file.type || '').startsWith('image/') ? URL.createObjectURL(file) : '',
-    });
-  }
-
-  const merged = selectedAttachments.concat(next);
-  const dropped = merged.slice(MAX_UPLOAD_ATTACHMENTS);
-  for (const att of dropped) {
-    if (att?.previewUrl) URL.revokeObjectURL(att.previewUrl);
+/**
+ * Replaces composer attachments wholesale, used when hydrating a conversation's
+ * cached draft attachments. Object URLs from the outgoing set are released.
+ */
+export function setComposerAttachments(attachments = []) {
+  for (const att of selectedAttachments) {
+    releaseAttachmentPreviewUrl(att);
   }
   selectedAttachments.length = 0;
-  selectedAttachments.push(...merged.slice(0, MAX_UPLOAD_ATTACHMENTS));
+  selectedAttachments.push(...(Array.isArray(attachments) ? attachments.filter(Boolean) : []));
   renderAttachmentPreview();
+}
+
+let attachmentIdSeq = 0;
+
+function nextAttachmentId() {
+  attachmentIdSeq += 1;
+  return `att-${Date.now()}-${attachmentIdSeq}`;
+}
+
+async function prepareIncomingFile(file, { source, now, index }) {
+  const rawType = String(file?.type || '').trim().toLowerCase() || 'application/octet-stream';
+  const isImage = rawType.startsWith('image/');
+
+  // Clipboard bitmaps arrive unnamed (or as a generic "image.png"), so they get a
+  // timestamped name that survives the round trip to the server.
+  const needsGeneratedName = source === 'paste' && isGenericClipboardName(file?.name);
+  let prepared = file;
+  // Re-encode when the image is oversized, and also when its format is one the
+  // model cannot read (a small WebP would otherwise arrive invisible).
+  if (isImage && reencodeReason(file)) {
+    prepared = await downscaleImageFile(file, {}, browserDownscaleDeps());
+  }
+
+  const finalType = String(prepared?.type || rawType).trim().toLowerCase() || 'application/octet-stream';
+  const finalIsImage = finalType.startsWith('image/');
+  const name = needsGeneratedName
+    ? pastedFileName(finalType, now, index)
+    : String(prepared?.name || file?.name || 'upload');
+
+  return {
+    id: nextAttachmentId(),
+    name,
+    type: finalType,
+    size: Number(prepared?.size || 0),
+    file: prepared,
+    isImage: finalIsImage,
+    previewUrl: finalIsImage ? URL.createObjectURL(prepared) : '',
+    previewUrlIsObjectUrl: finalIsImage,
+    uploadState: 'pending',
+    uploaded: null,
+    error: '',
+  };
+}
+
+async function startAttachmentUpload(attachment, ownerConversationId = currentConversationId()) {
+  if (!attachment?.file) return;
+  attachment.uploadState = 'uploading';
+  attachment.error = '';
+  renderAttachmentPreview();
+  try {
+    const payload = await uploadAttachment(attachment);
+    if (!payload?.attachment) throw new Error('Upload returned no attachment');
+    // The entry may have been removed, or the user may have moved to another
+    // conversation, while the upload was in flight.
+    if (!selectedAttachments.includes(attachment)) return;
+    attachment.uploaded = payload.attachment;
+    attachment.sha256 = payload.attachment.sha256;
+    attachment.uploadState = 'uploaded';
+    attachment.error = '';
+    renderAttachmentPreview();
+    if (currentConversationId() !== ownerConversationId) return;
+    window.persistComposerAttachments?.();
+  } catch (e) {
+    if (!selectedAttachments.includes(attachment)) return;
+    attachment.uploadState = 'error';
+    attachment.error = e?.message || 'Upload failed';
+    renderAttachmentPreview();
+    showTransientRelayNotice(`Upload failed for ${attachment.name}. Click the chip to retry.`);
+  }
+}
+
+export function retryAttachmentUpload(idx) {
+  const attachment = selectedAttachments[idx];
+  if (!attachment || attachment.uploadState !== 'error') return;
+  void startAttachmentUpload(attachment);
+}
+
+/**
+ * Single ingestion path shared by the file picker, paste and drag-and-drop.
+ * Files are normalized, optionally downscaled, capped, and uploaded immediately
+ * so that pressing Send never has to wait on the network.
+ */
+export async function ingestFiles(files, { source = 'picker' } = {}) {
+  const inputFiles = Array.from(files || []).filter(Boolean);
+  if (!inputFiles.length) return [];
+
+  // Downscaling a large image takes long enough for the user to switch
+  // conversations, and the result must never land in the wrong composer.
+  const ownerConversationId = currentConversationId();
+  const now = new Date();
+  const prepared = [];
+  for (let index = 0; index < inputFiles.length; index += 1) {
+    prepared.push(await prepareIncomingFile(inputFiles[index], { source, now, index }));
+  }
+
+  if (currentConversationId() !== ownerConversationId) {
+    for (const item of prepared) releaseAttachmentPreviewUrl(item);
+    return [];
+  }
+
+  const plan = planAttachmentMerge(selectedAttachments, prepared, MAX_UPLOAD_ATTACHMENTS);
+  const rejected = prepared.filter((item) => !plan.acceptedAdditions.includes(item));
+  for (const item of rejected) {
+    releaseAttachmentPreviewUrl(item);
+  }
+
+  selectedAttachments.length = 0;
+  selectedAttachments.push(...plan.accepted);
+  renderAttachmentPreview();
+
+  if (plan.droppedCount > 0) {
+    showTransientRelayNotice(overCapNoticeText(plan.droppedCount, MAX_UPLOAD_ATTACHMENTS));
+  }
+
+  await Promise.all(plan.acceptedAdditions.map(
+    (attachment) => startAttachmentUpload(attachment, ownerConversationId),
+  ));
+  return plan.acceptedAdditions;
+}
+
+export async function handleAttachmentInput(files) {
+  return ingestFiles(files, { source: 'picker' });
+}
+
+export async function handleComposerPaste(event) {
+  const { files } = extractPastedFiles(event?.clipboardData);
+  if (!files.length) return false;
+  // Only claim the event once a file is actually present, so pasting plain text
+  // keeps its native behaviour.
+  event.preventDefault?.();
+  await ingestFiles(files, { source: 'paste' });
+  return true;
+}
+
+export async function handleComposerDrop(event) {
+  const { files } = extractDroppedFiles(event?.dataTransfer);
+  if (!files.length) return false;
+  event.preventDefault?.();
+  await ingestFiles(files, { source: 'drop' });
+  return true;
 }
 
 export async function uploadAttachments(files) {
   const items = Array.isArray(files) ? files : [];
   const uploaded = [];
   for (const item of items) {
-    if (!item?.file) continue;
+    if (!item) continue;
+    // Eagerly uploaded attachments already hold their server payload; only
+    // entries that never made it (offline, failed, still queued) are retried.
+    if (item.uploaded?.sha256) {
+      uploaded.push(item.uploaded);
+      continue;
+    }
+    if (!item.file) continue;
     const payload = await uploadAttachment(item);
     if (!payload?.attachment) throw new Error('Upload returned no attachment');
+    item.uploaded = payload.attachment;
+    item.sha256 = payload.attachment.sha256;
+    item.uploadState = 'uploaded';
     uploaded.push(payload.attachment);
   }
   return uploaded;
@@ -337,6 +523,9 @@ function teardownImageZoom() {
   }
   imgZoom.imgEl = null;
   imgZoom.onImgLoad = null;
+  imgZoom.baseW = 0;
+  imgZoom.baseH = 0;
+  _cancelImgZoomCrispen();
   const bodyEl = document.getElementById('file-preview-body');
   if (bodyEl) bodyEl.classList.remove('image-zoom-mode');
 }
@@ -365,6 +554,9 @@ function teardownVideoPreview() {
 function setupImageZoom(container) {
   imgZoom.container = container;
   imgZoom.imgEl = container.querySelector('img');
+  // Stale from the previously viewed image, and wrong for this one.
+  imgZoom.baseW = 0;
+  imgZoom.baseH = 0;
   imgZoom.minScale = 1;
   imgZoom.scale = 1;
   imgZoom.panX = 0;
@@ -405,6 +597,8 @@ let imgZoom = {
   container: null,
   imgEl: null,
   onImgLoad: null,
+  baseW: 0,
+  baseH: 0,
 };
 let videoPreview = {
   videoEl: null,
@@ -420,13 +614,54 @@ function _isAtImgZoomMin() {
   return Math.abs(imgZoom.scale - imgZoom.minScale) <= IMG_ZOOM_EPS;
 }
 
-function _getImgBaseSize() {
+/**
+ * The image's laid-out size at scale 1, measured once with the zoom styles
+ * removed. Deriving it from the live rect instead would be circular now that
+ * zooming changes the element's layout size rather than only its transform.
+ */
+function _measureImgBaseSize() {
   const img = imgZoom.container?.querySelector('img');
   if (!img) return null;
+  const prev = { width: img.style.width, height: img.style.height, maxWidth: img.style.maxWidth, maxHeight: img.style.maxHeight, transform: img.style.transform };
+  img.style.width = '';
+  img.style.height = '';
+  img.style.maxWidth = '';
+  img.style.maxHeight = '';
+  img.style.transform = '';
   const rect = img.getBoundingClientRect();
+  img.style.width = prev.width;
+  img.style.height = prev.height;
+  img.style.maxWidth = prev.maxWidth;
+  img.style.maxHeight = prev.maxHeight;
+  img.style.transform = prev.transform;
   if (!rect.width || !rect.height) return null;
-  const scale = imgZoom.scale || 1;
-  return { baseW: rect.width / scale, baseH: rect.height / scale };
+  imgZoom.baseW = rect.width;
+  imgZoom.baseH = rect.height;
+  return { baseW: rect.width, baseH: rect.height };
+}
+
+function _getImgBaseSize() {
+  if (imgZoom.baseW && imgZoom.baseH) return { baseW: imgZoom.baseW, baseH: imgZoom.baseH };
+  return _measureImgBaseSize();
+}
+
+let imgZoomCrispenTimer = null;
+
+function _cancelImgZoomCrispen() {
+  if (!imgZoomCrispenTimer) return;
+  clearTimeout(imgZoomCrispenTimer);
+  imgZoomCrispenTimer = null;
+}
+
+// Re-layout only once the gesture stops, so a wheel spin does not trigger a
+// full resample of a large bitmap on every tick.
+function _scheduleImgZoomCrispen() {
+  _cancelImgZoomCrispen();
+  imgZoomCrispenTimer = setTimeout(() => {
+    imgZoomCrispenTimer = null;
+    if (!imgZoom.container) return;
+    _applyImgZoom({ crisp: true });
+  }, 180);
 }
 
 function _recomputeImgZoomMinScale({ resetToMin = false } = {}) {
@@ -449,12 +684,47 @@ function _recomputeImgZoomMinScale({ resetToMin = false } = {}) {
   _applyImgZoom();
 }
 
-function _applyImgZoom() {
+/**
+ * Zooming happens in two stages.
+ *
+ * While the user is actively zooming, a CSS transform is used: it is GPU cheap
+ * and stays smooth even on an 8-megapixel screenshot. Once the gesture settles,
+ * the image is re-laid-out at its zoomed size instead, which forces the browser
+ * to resample from the full-resolution bitmap.
+ *
+ * The second stage matters because a transform only magnifies whatever raster
+ * the compositor already has. Desktop Chromium happens to re-rasterise and stays
+ * sharp, but that is not guaranteed — devices that cap decoded image resolution
+ * to save memory, which is common on phones, keep magnifying the reduced raster
+ * and fine text turns to mush.
+ */
+function _applyImgZoom({ crisp = false } = {}) {
   const img = imgZoom.container?.querySelector('img');
   if (!img) return;
-  img.style.transform = (Math.abs(imgZoom.scale - 1) <= IMG_ZOOM_EPS && imgZoom.panX === 0 && imgZoom.panY === 0)
+
+  const size = _getImgBaseSize();
+  const atRest = Math.abs(imgZoom.scale - imgZoom.minScale) <= IMG_ZOOM_EPS
+    && imgZoom.panX === 0 && imgZoom.panY === 0;
+  const panOnly = imgZoom.panX === 0 && imgZoom.panY === 0
     ? ''
-    : `translate(${imgZoom.panX}px,${imgZoom.panY}px) scale(${imgZoom.scale})`;
+    : `translate(${imgZoom.panX}px,${imgZoom.panY}px)`;
+
+  if (crisp && size && !atRest) {
+    img.style.maxWidth = 'none';
+    img.style.maxHeight = 'none';
+    img.style.width = `${size.baseW * imgZoom.scale}px`;
+    img.style.height = `${size.baseH * imgZoom.scale}px`;
+    img.style.transform = panOnly;
+  } else {
+    img.style.maxWidth = '';
+    img.style.maxHeight = '';
+    img.style.width = '';
+    img.style.height = '';
+    img.style.transform = atRest
+      ? ''
+      : `${panOnly} scale(${imgZoom.scale})`.trim();
+    _scheduleImgZoomCrispen();
+  }
   imgZoom.container.style.cursor = imgZoom.dragging ? 'grabbing'
     : imgZoom.scale > (imgZoom.minScale + IMG_ZOOM_EPS) ? 'grab' : 'zoom-in';
 }
@@ -610,6 +880,9 @@ function _imgZoomTouchEnd(e) {
 
 function _imgZoomOnResize() {
   if (!imgZoom.container) return;
+  // The unzoomed size is container-relative, so it has to be measured again.
+  imgZoom.baseW = 0;
+  imgZoom.baseH = 0;
   _recomputeImgZoomMinScale({ resetToMin: _isAtImgZoomMin() });
 }
 

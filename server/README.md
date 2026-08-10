@@ -673,6 +673,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/message` | Send a message from the browser |
 | POST | `/api/upload` | Upload binary file content (deduped by SHA-256) |
 | GET | `/api/upload/:sha256/content` | Stream stored upload content by hash |
+| PATCH | `/api/conversation/:id/draft` | Save composer draft text and optional `draftAttachments` |
 | GET | `/api/files/*` | Stream a workspace file by repo-relative path (token required) |
 | GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image/video files |
 | GET | `/api/repo/tree` | Return repository root + first-level entries for lazy workspace browsing |
@@ -778,6 +779,68 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - Image attachments are forwarded to the Copilot SDK as multimodal attachments
   (`file` when a disk path is available, otherwise inline `blob`).
 - Non-image uploads continue to be exposed as file references.
+- `POST /api/upload` sniffs the payload's magic bytes and reconciles them against the
+  client-supplied `X-File-Type` header. The detected type wins on disagreement, so a
+  disguised executable is stored as what it actually is. Unrecognised bytes (plain text,
+  CSV, source files) keep the claimed type. The response reports `mimeTypeCorrected`.
+
+### Composer attachments: paste, drag-and-drop and eager upload
+
+- Files reach the composer through three paths, all sharing one ingestion function:
+  the 📎 picker, `Ctrl+V` paste, and drag-and-drop onto the input area.
+- **Paste attaches, it never sends.** When the clipboard holds both an image and text,
+  the image wins and the text is discarded. When it holds only text, the handler does
+  nothing so the browser's native paste is untouched.
+- Clipboard bitmaps arrive unnamed (or as a generic `image.png`) and are renamed
+  `pasted-<ISO-timestamp>.<ext>`.
+- Images over ~2 MB are downscaled client-side to a 2560 px longest edge and re-encoded
+  to **JPEG** before upload. GIF and SVG are never re-encoded, and a re-encode that fails,
+  grows the file, or yields anything other than JPEG/PNG falls back to the original bytes.
+- The output format is deliberately restricted to JPEG/PNG: Copilot's image-input docs call
+  these "the most widely supported formats". WebP compresses better and previews correctly
+  in the browser, but arrives at the model unreadable.
+- Re-encoding therefore has two triggers, tracked by `reencodeReason()`:
+  - `'size'` — the image is over the byte threshold. Abandoned if the result is no smaller.
+  - `'format'` — the source is not PNG/JPEG/GIF (e.g. WebP, AVIF, HEIC), so it is converted
+    at its original dimensions **regardless of size**, and kept even if the result is larger:
+    a bigger image the model can read beats a smaller one it cannot.
+- Without the `'format'` trigger a WebP small enough to skip the size threshold would reach
+  the model invisible.
+- Attachments upload **eagerly** on selection rather than on Send. Chips show an
+  uploading spinner, and a failed upload becomes a clickable retry.
+- Send is disabled while any upload is in flight. Failed uploads are deliberately not
+  counted as in-flight, so a failure can never wedge the button.
+- Exceeding the 6-attachment cap keeps the first 6 and reports the overflow in a toast
+  (previously the overflow was dropped silently).
+- Shared read-only viewers cannot paste or drop.
+
+### Composer attachment cache
+
+- Pending attachments persist **per conversation**, mirroring how text drafts already work.
+  Switching conversations and returning restores them, as does reloading the page.
+- Storage is `conversations.draft_attachments`: a JSON array of `{sha256, name, type, size}`.
+  Only already-uploaded attachments are persisted — never file bytes.
+- `PATCH /api/conversation/:id/draft` accepts an optional `draftAttachments` array.
+  Omitting the field leaves the stored attachments untouched; passing `null` or `[]` clears
+  them. Every entry must reference a blob the server already holds, otherwise the request
+  is rejected with a 400.
+- Removing an attachment is expressed as a draft save carrying the remaining list, so it is
+  ordered against in-flight draft writes rather than racing them. The server diffs the list
+  and releases the reference itself; there is deliberately no delete-by-hash endpoint, since
+  blobs are content-addressed and shared, and such a route would let one caller destroy
+  another conversation's freshly uploaded blob.
+- Draft blobs are kept alive by an `upload_refs` row using the sentinel
+  `message_id = '__draft__'`. On send, the real message reference is inserted and the
+  sentinel row is dropped. Reference release only reclaims blobs whose sentinel row this
+  conversation actually held.
+- Conversation deletion needs no special handling: the existing foreign-key cascade and
+  orphan sweep already collect draft blobs.
+- Because uploads are eager, a blob can exist before anything references it (pasting into a
+  conversation that is then abandoned, or switching conversations mid-upload). A sweep runs
+  at startup and every 6 hours to reclaim unreferenced blobs older than 24 hours; the age
+  floor guarantees an in-flight upload is never collected.
+- Attachments added before a conversation exists stay in the composer (already uploaded) and
+  are adopted by the conversation created on first send.
 
 ### Chat file reference tokens
 

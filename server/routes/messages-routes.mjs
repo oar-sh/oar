@@ -3,6 +3,7 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
+import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
 import {
   shouldParkForRestart,
   parkPendingQueueForRestart,
@@ -2896,12 +2897,16 @@ export function registerMessagesRoutes(app, deps) {
     let decodedName = '';
     try { decodedName = decodeURIComponent(rawNameHeader); } catch { decodedName = rawNameHeader; }
     const fileName = decodedName || `upload-${Date.now()}`;
-    const fileType = String(req.headers['x-file-type'] || req.headers['content-type'] || req.query.type || 'application/octet-stream').trim().toLowerCase();
+    const claimedType = String(req.headers['x-file-type'] || req.headers['content-type'] || req.query.type || 'application/octet-stream').trim().toLowerCase();
+    // The MIME type is client supplied, so verify it against the actual bytes
+    // before it is stored and later handed to a model or a download.
+    const resolvedType = resolveUploadMimeType(payload, claimedType);
+    const fileType = resolvedType.mimeType;
 
     try {
       const attachment = persistUploadBuffer(payload, { name: fileName, type: fileType });
       if (!attachment) return res.status(500).json({ error: 'Upload persistence failed' });
-      res.json({ ok: true, attachment });
+      res.json({ ok: true, attachment, mimeTypeCorrected: resolvedType.corrected });
     } catch (e) {
       res.status(400).json({ error: e?.message || 'Upload failed' });
     }
@@ -4155,6 +4160,18 @@ export function registerMessagesRoutes(app, deps) {
           WHERE id = ?
         `).run(now, sessionId || null, convId);
       }
+      // The message now owns these blobs, so the draft placeholders can go. The
+      // sent-message references were just inserted above, so nothing is orphaned.
+      if (typeof stmts.updateConvDraftAttachments?.run === 'function') {
+        stmts.updateConvDraftAttachments.run(null, now, sessionId || null, convId);
+      } else {
+        db.prepare(`
+          UPDATE conversations
+          SET draft_attachments = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
+          WHERE id = ?
+        `).run(now, sessionId || null, convId);
+      }
+      stmts.deleteDraftUploadRefs?.run?.(convId);
       conversationPreferences = persistConversationModelPreference(
         convId,
         requestedRelayMode,
@@ -4223,6 +4240,7 @@ export function registerMessagesRoutes(app, deps) {
     io.emit('conversation_draft_updated', {
       conversationId: convId,
       draftText: '',
+      draftAttachments: [],
       draftUpdatedAt: now,
       draftUpdatedByClientId: sessionId || null,
       senderClientId: sessionId || null,
@@ -4735,6 +4753,19 @@ export function registerMessagesRoutes(app, deps) {
           required: runtimeState.tunnelState?.required ?? false,
           connected: runtimeState.tunnelState?.connected ?? false,
           lastError: runtimeState.tunnelState?.lastError ?? null,
+        },
+      });
+    }
+    if (runtimeState.cloudflaredTunnelState?.blocking) {
+      return res.json({
+        message: null,
+        paused: true,
+        reason: 'cloudflared_tunnel_required',
+        cloudflaredTunnel: {
+          mode: runtimeState.cloudflaredTunnelState?.mode ?? null,
+          required: runtimeState.cloudflaredTunnelState?.required ?? false,
+          connected: runtimeState.cloudflaredTunnelState?.connected ?? false,
+          lastError: runtimeState.cloudflaredTunnelState?.lastError ?? null,
         },
       });
     }

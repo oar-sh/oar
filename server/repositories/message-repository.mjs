@@ -317,5 +317,11 @@ export function createMessageRepository(db) {
         deleteUploadRefsByConversation: db.prepare(`DELETE FROM upload_refs WHERE conversation_id = ?`),
         countUploadRefsBySha: db.prepare(`SELECT COUNT(*) AS cnt FROM upload_refs WHERE file_sha256 = ?`),
         deleteUploadFile: db.prepare(`DELETE FROM uploaded_files WHERE sha256 = ?`),
+
+        // Draft attachment references use a sentinel message id so a composer
+        // draft can hold a blob alive before any message exists.
+        listDraftUploadHashes: db.prepare(`SELECT file_sha256 FROM upload_refs WHERE conversation_id = ? AND message_id = '__draft__'`),
+        deleteDraftUploadRefs: db.prepare(`DELETE FROM upload_refs WHERE conversation_id = ? AND message_id = '__draft__'`),
+        deleteDraftUploadRef: db.prepare(`DELETE FROM upload_refs WHERE conversation_id = ? AND message_id = '__draft__' AND file_sha256 = ?`),
     };
 }

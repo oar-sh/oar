@@ -371,6 +371,7 @@ export function applyLoadedConversationState(id, response, {
   const didRenderMessages = renderMessages(response.messages, !restoreScroll, response);
   hydrateConversationDraft(id, {
     draftText: response.draftText,
+    draftAttachments: response.draftAttachments,
     draftUpdatedAt: response.draftUpdatedAt,
     draftUpdatedByClientId: response.draftUpdatedByClientId,
   });

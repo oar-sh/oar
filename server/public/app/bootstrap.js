@@ -96,6 +96,7 @@ import {
   getConversationLoadedMessageCount,
   loadOlderConversationMessages,
   syncComposerControlState,
+  persistComposerAttachments,
   flushConversationDraft,
   initConversationHistoryLazyLoading,
   initBubbleActionHandlers,
@@ -107,8 +108,9 @@ import {
 } from './conversation-view.js';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
-import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
+import { dataTransferHasFiles } from './composer-paste.mjs';
 import { resolveConversationComposerSelection } from './conversation-preferences.mjs';
 import {
   modelSelectorOptionsEqual,
@@ -1794,6 +1796,7 @@ function initModelSelector() {
       updateReasoningSelectorForModel(select.value);
       updateContextTierSelector(select.value);
       syncSessionLockNote({ pinnedModel: currentRuntimeModelLock()?.model || '' });
+      refreshComposerAttachmentWarning();
       void persistCurrentConversationPreferences().catch(() => {});
     });
     select.addEventListener('blur', () => {
@@ -2831,6 +2834,62 @@ function setupViewportTracking() {
   }
 }
 
+function composerAttachmentsAllowed() {
+  // Shared read-only viewers must never be able to attach files.
+  return !appSharedMode && !IS_SHARED_VIEW;
+}
+
+function initComposerAttachmentInput() {
+  const input = document.getElementById('msg-input');
+  if (input && input.dataset.pasteBound !== '1') {
+    input.dataset.pasteBound = '1';
+    input.addEventListener('paste', (event) => {
+      if (!composerAttachmentsAllowed()) return;
+      void handleComposerPaste(event);
+    });
+  }
+
+  const dropZone = document.getElementById('input-area');
+  if (!dropZone || dropZone.dataset.dropBound === '1') return;
+  dropZone.dataset.dropBound = '1';
+
+  // dragenter/dragleave fire for every child element, so the highlight is
+  // reference counted instead of toggled, otherwise it flickers on each hover.
+  let dragDepth = 0;
+  const clearHighlight = () => {
+    dragDepth = 0;
+    dropZone.classList.remove('composer-dropzone-active');
+  };
+
+  dropZone.addEventListener('dragenter', (event) => {
+    if (!composerAttachmentsAllowed() || !dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepth += 1;
+    dropZone.classList.add('composer-dropzone-active');
+  });
+
+  dropZone.addEventListener('dragover', (event) => {
+    if (!composerAttachmentsAllowed() || !dataTransferHasFiles(event.dataTransfer)) return;
+    // Without preventDefault the browser refuses the drop entirely.
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+  });
+
+  dropZone.addEventListener('dragleave', (event) => {
+    if (!dragDepth) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) dropZone.classList.remove('composer-dropzone-active');
+  });
+
+  dropZone.addEventListener('drop', (event) => {
+    clearHighlight();
+    if (!composerAttachmentsAllowed()) return;
+    void handleComposerDrop(event);
+  });
+
+  window.addEventListener('dragend', clearHighlight);
+}
+
 function initMessageScrollPersistence() {
   const el = document.getElementById('messages');
   if (!el || el.dataset.scrollPersistenceBound === '1') return;
@@ -3558,6 +3617,7 @@ async function initApp() {
   initConversationHistoryLazyLoading();
   initBubbleActionHandlers();
   initMessageScrollPersistence();
+  initComposerAttachmentInput();
   initMessageSearchView({ openConversation });
   initGitChangesView();
   syncChatTitleControls();
@@ -3704,6 +3764,7 @@ window.toggleStatusView = toggleStatusView;
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;
 window.handleAttachmentInput = handleAttachmentInput;
+window.retryAttachmentUpload = retryAttachmentUpload;
 window.removeAttachment = removeAttachment;
 window.clearAttachments = clearAttachments;
 window.openUploadedAttachmentViewer = openUploadedAttachmentViewer;
@@ -3730,6 +3791,7 @@ window.submitRelayBoardAction = submitRelayBoardAction;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
 window.syncComposerControlState = syncComposerControlState;
+window.persistComposerAttachments = persistComposerAttachments;
 window.appendMessage = appendMessage;
 window.loadOlderConversationMessages = loadOlderConversationMessages;
 window.handleKey = handleKey;
