@@ -496,6 +496,12 @@
     background: #6e7681;
     box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.08);
   }
+  /* Reachable over Cloudflare Tunnel: amber, between the green "reachable" and
+     a warning colour, so internet exposure is visible at a glance. */
+  #cli-dot.online.tunnelled {
+    background: #d29922;
+    box-shadow: 0 0 0 1px rgba(210, 153, 34, 0.42), 0 0 8px rgba(210, 153, 34, 0.35);
+  }
 
   #new-conv-btn {
     margin: 0; padding: 10px 14px; background: var(--accent); color: #000;

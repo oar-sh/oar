@@ -15,6 +15,7 @@ import {
   repoBrowserState,
   setRelayOnline,
   setCliOnline,
+  setCloudflaredTunnelState,
   setCurrentConv,
   updateWorkspaceRootHints,
   updateCompactButton,
@@ -299,6 +300,10 @@ export async function connectSocket(overrideDeps) {
     if (online) refreshCurrentView().catch(() => {});
     refreshSessionWorkerStatus().catch(() => {});
     if (online) refreshModelCatalog().catch(() => {});
+  });
+  // Keeps the relay dot's Cloudflare Tunnel colour live between status polls.
+  socket.on('cloudflared_tunnel_status', (payload) => {
+    setCloudflaredTunnelState(payload || null);
   });
   socket.on('models_updated', (payload) => {
     updateModelCatalogState(payload || {});

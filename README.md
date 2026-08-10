@@ -429,6 +429,12 @@ error instead of crashing. Connection drops reconnect with jittered exponential 
 and repeated fast exits (deleted tunnel or bad token) are reported as `auth-or-config`
 instead of hammering Cloudflare.
 
+The relay status dot turns **amber** while the Cloudflare tunnel is connected, so it is
+obvious at a glance that the relay is reachable from the internet rather than only from
+this machine. It stays green when no tunnel is configured and grey when the relay itself
+is unreachable; a managed tunnel that has dropped keeps the dot green — the relay still
+answers locally — and reports the drop in the tooltip.
+
 ### Session-worker path guard
 
 Any public tunnel forwards *every* path on the bound hostname to port `3333`, including

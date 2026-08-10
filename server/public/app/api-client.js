@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform } from './store.js';
 
 // fetch() has no default timeout. Without one, a request issued while the app is
 // being backgrounded can hang indefinitely on a half-open mobile connection and
@@ -89,6 +89,7 @@ export async function verifyExistingSession(tokenCandidate = '') {
         updateWorkspaceRootHints(payload);
         setContextIndicatorMode(payload?.contextIndicatorMode);
         setCliOnline(!!payload?.cliOnline);
+        setCloudflaredTunnelState(payload?.cloudflaredTunnel || null);
         setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
         setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
         if (payload?.platform) setServerPlatform(payload.platform);
@@ -145,6 +146,7 @@ export async function verifyToken(token) {
       updateWorkspaceRootHints(payload);
       setContextIndicatorMode(payload?.contextIndicatorMode);
       setCliOnline(!!payload?.cliOnline);
+      setCloudflaredTunnelState(payload?.cloudflaredTunnel || null);
       setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
       setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
       if (payload?.platform) setServerPlatform(payload.platform);
@@ -173,6 +175,7 @@ export async function refreshWorkspaceRootHints() {
     updateWorkspaceRootHints(status);
     setContextIndicatorMode(status?.contextIndicatorMode);
     setCliOnline(!!status?.cliOnline);
+    setCloudflaredTunnelState(status?.cloudflaredTunnel || null);
     setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
     setRuntimeSessionBindingCount(status?.runtimeSessionBindingCount);
     if (status?.platform) setServerPlatform(status.platform);

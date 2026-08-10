@@ -1,4 +1,5 @@
 import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
+import { resolveRelayDotState } from './relay-dot-state.mjs';
 import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
 
@@ -69,6 +70,9 @@ export const pendingUserMessageIds = new Set();
 export const pendingUserMessageEntries = new Map();
 export let cliOnline = false;
 export let relayOnline = false;
+// Latest cloudflared tunnel status, from /api/status on load and the
+// cloudflared_tunnel_status socket event thereafter. Null until first reported.
+export let cloudflaredTunnelState = null;
 export let activeRuntimeSessionCount = 0;
 export let runtimeSessionBindingCount = 0;
 export let conversations = {};
@@ -716,20 +720,16 @@ export function updateCliStatus() {
   const errorCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'error').length;
   const questionCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'question').length;
   if (dot) {
-    dot.className = relayOnline ? 'online' : 'offline';
-    if (!relayOnline) {
-      dot.title = 'Web relay unreachable';
-    } else if (!cliOnline) {
-      dot.title = 'Web relay reachable; CLI offline';
-    } else if (processingCount > 0) {
-      dot.title = `Web relay reachable; ${processingCount} session worker${processingCount === 1 ? '' : 's'} processing`;
-    } else if (errorCount > 0) {
-      dot.title = `Web relay reachable; ${errorCount} session worker${errorCount === 1 ? '' : 's'} degraded`;
-    } else if (questionCount > 0) {
-      dot.title = `Web relay reachable; ${questionCount} session worker${questionCount === 1 ? '' : 's'} waiting on a question`;
-    } else {
-      dot.title = 'Web relay reachable';
-    }
+    const dotState = resolveRelayDotState({
+      relayOnline,
+      cliOnline,
+      cloudflaredTunnel: cloudflaredTunnelState,
+      processingCount,
+      errorCount,
+      questionCount,
+    });
+    dot.className = dotState.className;
+    dot.title = dotState.title;
   }
   if (text) text.textContent = cliOnline ? 'CLI online' : 'CLI offline';
   if (changeCwdBtn) {
@@ -755,6 +755,11 @@ export function setRelayOnline(value) {
   const changed = relayOnline !== nextOnline;
   relayOnline = nextOnline;
   if (changed) recordRelayLifecycleEvent(nextOnline);
+  updateCliStatus();
+}
+
+export function setCloudflaredTunnelState(value) {
+  cloudflaredTunnelState = value && typeof value === 'object' ? value : null;
   updateCliStatus();
 }
 
