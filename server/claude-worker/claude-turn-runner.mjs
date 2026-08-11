@@ -4,6 +4,7 @@ import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
 import { startClaudeTurn, createCanUseTool, readContextUsage, readPlanUsage } from './claude-sdk-adapter.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 
 const PLAN_BOARD_ACTIONS = [
@@ -517,12 +518,13 @@ export function createClaudeTurnRunner({
         await api('POST', '/api/relay-board', boardPayload).catch(() => {});
       }
     }
-    if (!finalText) {
-      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
-      return true;
-    }
-    await publishFinalStream(message, finalText);
-    await publishResponse(message, { text: finalText, model: responseModel });
+    // Same reasoning as the Cursor worker: a terminal, non-error result with no
+    // prose is a completed turn (the model can end on tool activity alone), and
+    // requeuing it re-runs deterministically empty work until the retry cap
+    // fails the message with a misleading "Relay timeout".
+    const publishedText = finalText || EMPTY_TURN_COMPLETION_NOTE;
+    await publishFinalStream(message, publishedText);
+    await publishResponse(message, { text: publishedText, model: responseModel });
     return true;
   }
 

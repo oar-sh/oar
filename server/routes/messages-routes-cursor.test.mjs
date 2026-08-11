@@ -288,6 +288,72 @@ test('buildDequeuedRelayMessage carries the persisted cursor agent id', () => {
   assert.equal(message.providerType, 'cursor');
 });
 
+test('buildDequeuedRelayMessage delivers the enabled cursor models as the subagent roster', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  insertRuntimeSession(db, { id: 'rs-1', conversationId: 'conv-1', providerType: 'cursor' });
+  const msg = {
+    id: 'q-1',
+    conversation_id: 'conv-1',
+    runtime_session_id: 'rs-1',
+    is_new_conversation: 0,
+    model: 'composer-1',
+    text: 'hello',
+    status: 'processing',
+    timestamp: NOW,
+  };
+  const base = {
+    msg,
+    stmts,
+    normalizeRelayMode: (value) => String(value || '').trim() || null,
+    defaultRelayMode: 'default',
+    defaultModel: 'gpt-5',
+  };
+
+  const message = buildDequeuedRelayMessage({
+    ...base,
+    getCursorProviderSettings: () => ({ enabledModels: ['grok-4.5', ' claude-opus-5 ', ''] }),
+  });
+  assert.deepEqual(message.cursorSubagentModels, ['grok-4.5', 'claude-opus-5']);
+
+  // A provider without the field (the registerMessagesRoutes default stub) must
+  // not throw or emit junk — the worker just gets no subagents.
+  assert.deepEqual(
+    buildDequeuedRelayMessage({ ...base, getCursorProviderSettings: () => ({ enabled: false }) }).cursorSubagentModels,
+    [],
+  );
+  assert.deepEqual(buildDequeuedRelayMessage(base).cursorSubagentModels, []);
+});
+
+test('buildDequeuedRelayMessage leaves the subagent roster empty for non-cursor providers', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  insertRuntimeSession(db, { id: 'rs-1', conversationId: 'conv-1', providerType: 'claude' });
+  let settingsReads = 0;
+  const message = buildDequeuedRelayMessage({
+    msg: {
+      id: 'q-1',
+      conversation_id: 'conv-1',
+      runtime_session_id: 'rs-1',
+      is_new_conversation: 0,
+      model: 'claude-opus-5',
+      text: 'hello',
+      status: 'processing',
+      timestamp: NOW,
+    },
+    stmts,
+    normalizeRelayMode: (value) => String(value || '').trim() || null,
+    defaultRelayMode: 'default',
+    defaultModel: 'gpt-5',
+    getCursorProviderSettings: () => {
+      settingsReads += 1;
+      return { enabledModels: ['grok-4.5'] };
+    },
+  });
+  assert.deepEqual(message.cursorSubagentModels, []);
+  assert.equal(settingsReads, 0, 'cursor settings are not read on a non-cursor dequeue');
+});
+
 test('buildDequeuedRelayMessage yields a null cursorAgentId when the column is empty', () => {
   const db = makeDb();
   const stmts = makeStmts(db);

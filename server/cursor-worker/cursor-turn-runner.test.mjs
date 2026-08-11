@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createCursorTurnRunner, buildCursorPlanReadyBoardPayload, cursorModeNudge } from './cursor-turn-runner.mjs';
+import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 
 function makeApiStub({ failRoutes = new Set() } = {}) {
   const calls = [];
@@ -124,6 +125,72 @@ test('first turn creates the agent, persists its id, and later turns reuse the l
     1,
     'an already-cached id is not re-persisted',
   );
+});
+
+test('the payload roster becomes model-pinned subagents on the created handle', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('ok.'), evFinished()]]),
+  }));
+
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, cursorSubagentModels: ['grok-4.5', 'claude-opus-5'] },
+  });
+
+  const { agents } = createCalls[0];
+  assert.deepEqual(Object.keys(agents), ['grok-4-5', 'claude-opus-5']);
+  assert.deepEqual(agents['grok-4-5'].model, { id: 'grok-4.5' });
+});
+
+test('a payload with no roster still creates the handle, with no subagents', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('ok.'), evFinished()]]),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+
+  assert.equal(createCalls.length, 1);
+  assert.deepEqual(createCalls[0].agents, {});
+});
+
+test('changing the enabled models rebuilds the handle against the same durable agent', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const closes = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes, agentIds: ['agent-a'] }),
+    startCursorRunImpl: queuedTurns([
+      [evInit(), evDelta('one.'), evFinished()],
+      [evInit(), evDelta('two.'), evFinished()],
+      [evInit(), evDelta('three.'), evFinished()],
+    ]),
+  }));
+
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, cursorSubagentModels: ['grok-4.5'] },
+  });
+  assert.equal(createCalls.length, 1);
+
+  // Same roster: the handle is reused, so a stable selection costs nothing.
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', cursorSubagentModels: ['grok-4.5'] },
+  });
+  assert.equal(createCalls.length, 1, 'an unchanged roster must not rebuild the handle');
+
+  // Roster changed in the Select Models modal: without a rebuild the session
+  // would keep offering the old subagent menu for the rest of its life.
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-3', cursorSubagentModels: ['grok-4.5', 'claude-opus-5'] },
+  });
+  assert.equal(createCalls.length, 2);
+  assert.deepEqual(closes, ['agent-a'], 'the stale handle is closed, not leaked');
+  assert.equal(createCalls[1].agentId, 'agent-a', 'the rebuild resumes the same durable agent');
+  assert.deepEqual(Object.keys(createCalls[1].agents), ['grok-4-5', 'claude-opus-5']);
 });
 
 test('a fresh runner resumes from the server-provided durable agent id', async () => {
@@ -426,6 +493,31 @@ test('a stream that ends without a result falls back to streamed text or requeue
   const requeue = emptyStub.calls.find((call) => call.routePath === '/api/requeue');
   assert.deepEqual(requeue.body, { messageId: 'q-1' });
   assert.ok(!emptyStub.calls.find((call) => call.routePath === '/api/response'));
+});
+
+test('a turn that finishes on tool activity alone publishes instead of requeueing', async () => {
+  // Regression: conv 1e497a75. "do nothing else than spawning a grok-4.5 sub
+  // agent" makes the model end its turn with no prose (the SDK recorded
+  // `status: FINISHED, result: null`). Requeuing re-ran the subagent on every
+  // attempt and then failed the message with a bogus "Relay timeout".
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evFinished()]]),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+
+  assert.ok(
+    !stub.calls.find((call) => call.routePath === '/api/requeue'),
+    'a completed turn must never be requeued',
+  );
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, EMPTY_TURN_COMPLETION_NOTE);
+  // `/api/response` rejects an empty body, so the note is what makes the
+  // completion publishable at all.
+  assert.ok(response.body.text.trim(), 'the published text must be non-empty');
+  assert.ok(!response.body.terminalError, 'a silent turn is a success, not a failure');
 });
 
 test('result usage publishes the context breakdown without disturbing the response', async () => {

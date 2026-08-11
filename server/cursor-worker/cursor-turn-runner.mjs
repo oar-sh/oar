@@ -11,7 +11,12 @@ import {
   resolveCursorReasoningParams,
 } from './cursor-sdk-adapter.mjs';
 import { createAskUserTool } from './cursor-ask-user-tool.mjs';
+import {
+  buildCursorSubagentAgents,
+  cursorSubagentRosterFingerprint,
+} from './cursor-subagent-roster.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 
@@ -100,6 +105,9 @@ export function createCursorTurnRunner({
   // and reaches the active turn's state through these closures.
   let agentHandle = null;
   let cursorAgentId = '';
+  // The subagent roster is fixed when the handle is created, so the handle has
+  // to be rebuilt when the user's model selection changes mid-conversation.
+  let agentRosterFingerprint = null;
   let activeMessage = null;
   let waitingForTurn = false;
   let currentAbortController = null;
@@ -143,6 +151,7 @@ export function createCursorTurnRunner({
       dbg('cursor agent close failed on dispose', error?.message || String(error));
     }
     agentHandle = null;
+    agentRosterFingerprint = null;
   }
 
   async function persistAgentId(message, agentId) {
@@ -163,9 +172,24 @@ export function createCursorTurnRunner({
   }
 
   async function ensureAgentHandle(message, model) {
+    const rosterModels = Array.isArray(message.cursorSubagentModels) ? message.cursorSubagentModels : [];
+    const rosterFingerprint = cursorSubagentRosterFingerprint(rosterModels);
+    if (agentHandle && agentRosterFingerprint !== rosterFingerprint) {
+      // Closing drops only the local handle; the durable Cursor agent id is
+      // persisted, so the rebuild below resumes the same conversation with the
+      // new roster rather than starting a fresh one.
+      dbg('cursor subagent roster changed, rebuilding agent handle');
+      try {
+        await agentHandle.close?.();
+      } catch (error) {
+        dbg('cursor agent close failed on roster change', error?.message || String(error));
+      }
+      agentHandle = null;
+    }
     if (!agentHandle) {
       const durableId = String(message.cursorAgentId || '').trim() || cursorAgentId;
-      const options = { apiKey, model, cwd, storeDir, sdkSessionId, customTools, dbg };
+      const agents = buildCursorSubagentAgents(rosterModels);
+      const options = { apiKey, model, cwd, storeDir, sdkSessionId, customTools, agents, dbg };
       try {
         agentHandle = await createAgentHandleImpl({ ...options, agentId: durableId });
       } catch (error) {
@@ -176,6 +200,9 @@ export function createCursorTurnRunner({
         agentHandle = await createAgentHandleImpl({ ...options, agentId: '' });
       }
     }
+    // Only recorded once a handle exists: a create that threw leaves the
+    // fingerprint stale, and the null handle makes the next turn rebuild.
+    agentRosterFingerprint = rosterFingerprint;
     // Runs even when the handle is reused, so a persist that failed on an
     // earlier turn is retried here.
     if (agentHandle.agentId && agentHandle.agentId !== cursorAgentId) {
@@ -525,12 +552,15 @@ export function createCursorTurnRunner({
         planBoardPosted = true;
       }
     }
-    if (!finalText) {
-      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
-      return true;
-    }
-    await publishFinalStream(message, finalText);
-    await publishResponse(message, { text: finalText, model: responseModel });
+    // A terminal, non-error result carrying no prose is a COMPLETED turn — not
+    // a failed delivery — so it publishes rather than requeues. The requeue
+    // that used to live here re-ran a turn whose emptiness was deterministic,
+    // re-billing the provider and re-spawning its subagents on every attempt
+    // before the retry cap failed the message with a "Relay timeout" that
+    // misreported a turn which had succeeded.
+    const publishedText = finalText || EMPTY_TURN_COMPLETION_NOTE;
+    await publishFinalStream(message, publishedText);
+    await publishResponse(message, { text: publishedText, model: responseModel });
     return true;
   }
 
