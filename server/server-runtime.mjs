@@ -4121,8 +4121,12 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
   const launchMode = String(launched?.launchMode || 'detached').trim();
   const tmuxSessionName = String(launched?.tmuxSessionName || '').trim();
-  console.log(`${runtimeLogPrefix()}worker launcher: spawned ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
-  return { workerId, pid: workerPid };
+  // "spawned" used to be logged even when the launcher reused a live tmux pane,
+  // which made spawn counts meaningless: a crash-looping session and a healthy
+  // one produced the same line. Report what actually happened.
+  const launchVerb = launched?.reused === true ? 'reused' : 'spawned';
+  console.log(`${runtimeLogPrefix()}worker launcher: ${launchVerb} ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
+  return { workerId, pid: workerPid, reused: launched?.reused === true };
 }
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   registry: sessionWorkerRegistry,
@@ -4696,9 +4700,16 @@ function buildContextResponseText({ snapshot, runtimeSession, conversationId, ev
   return buildContextUsageBlock(snapshot, runtimeSession, detailEntries);
 }
 
-function computeRetryDelayMs(retryCount) {
-  const base = 30_000;
-  const max = 10 * 60_000;
+// `transient` is for a turn that never started — the worker was still booting,
+// the session was unavailable, the model was refused at session-create. The
+// long ladder is punishing there: it freezes the row for 60s, and since the row
+// is already 'pending' no queue-count change fires, so only the periodic
+// ready-check sweep can rescue it. Measured, that is where nearly all of the
+// "message sat pending for a minute" time went. Genuine provider/model failures
+// keep the long ladder so a broken provider is not hammered.
+function computeRetryDelayMs(retryCount, { transient = false } = {}) {
+  const base = transient ? 5_000 : 30_000;
+  const max = transient ? 2 * 60_000 : 10 * 60_000;
   const n = Math.max(0, Number(retryCount) || 0);
   return Math.min(max, base * Math.pow(2, Math.min(n, 4)));
 }

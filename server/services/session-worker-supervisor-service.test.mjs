@@ -339,3 +339,50 @@ test('ensureWorker re-checks kill block before spawn begins', async () => {
   assert.equal(blocked.error, 'session-killed');
   assert.equal(spawnCalled, false);
 });
+
+test('default startup timeout outlasts a slow Copilot CLI boot', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 1_000;
+  // No heartbeatTimeoutMs override: this asserts the production default.
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    spawnWorker: async () => ({ workerId: 'worker-slowboot', pid: null }),
+  });
+
+  await supervisor.ensureWorker('slow-boot-session');
+
+  // Measured median boot for a copilot-kind worker is ~35s; the old 30s default
+  // killed it mid-boot and paid a second cold start.
+  nowMs += 60_000;
+  assert.equal(supervisor.getLifecycleState('slow-boot-session')?.degradedReason, null);
+
+  nowMs += 35_000;
+  assert.equal(
+    supervisor.getLifecycleState('slow-boot-session')?.degradedReason,
+    'startup-heartbeat-timeout',
+  );
+});
+
+test('default kill block clears in seconds, not half a minute', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 1_000;
+  // No killBlockGraceMs override: this asserts the production default.
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    spawnWorker: async () => ({ workerId: 'worker-killed', pid: 4242 }),
+  });
+
+  await supervisor.ensureWorker('killed-session');
+  supervisor.markKilled('killed-session');
+  assert.equal(supervisor.isKillBlocked('killed-session'), true);
+
+  // Long enough to cover a kill racing an in-flight respawn...
+  nowMs += 1_000;
+  assert.equal(supervisor.isKillBlocked('killed-session'), true);
+
+  // ...but stopping a turn then sending a new message must not wait 30s.
+  nowMs += 2_500;
+  assert.equal(supervisor.isKillBlocked('killed-session'), false);
+});

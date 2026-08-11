@@ -82,6 +82,23 @@ Findings:
   spawn counts unreadable: 1208 spawn lines over 356 sessions, 58% within 60s of
   a previous spawn for the same session.
 
+Latency fixes applied (2026-08-11, approved):
+- `computeRetryDelayMs(retryCount, { transient })` — transient requeues use a
+  5s base capped at 2min instead of 30s/10min. Classified server-side by
+  `isTransientRequeue` (no relay activity, no stream events, in flight <15s),
+  so no protocol change was needed; every caller posts only `{ messageId }`.
+  `REQUEUED` now logs `class=transient|failure`.
+- `heartbeatTimeoutMs` default 30s -> 90s, so a ~35s CLI boot is no longer
+  killed as a startup failure. Pid liveness still catches dead workers fast.
+- `killBlockGraceMs` default 30s -> 3s, so stopping a turn and immediately
+  sending a new message no longer adds 30s in front of the boot.
+- `worker launcher:` logs `reused` vs `spawned` from `launched.reused`, so
+  spawn counts distinguish a crash-loop from normal reuse.
+Deliberately skipped: rejecting `/api/pending` claims from not-ready sessions
+(the owner filter plus `shouldFetchPending:false` may have already closed that
+path — re-measure first), pre-spawn/warm-pool, and reordering the extension's
+WS link startup.
+
 Open follow-ups from the audit of that fix (not yet done):
 - No test exercises `POST /api/response` end to end; the provenance decision is
   covered at the helper level only, so the `serverExecutedOperation` wiring and

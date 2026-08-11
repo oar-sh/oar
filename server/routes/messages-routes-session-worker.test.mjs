@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import {
   dequeuePendingMessageForWorkerLoop,
+  isTransientRequeue,
   normalizeOpenAIImageApiGeneratedImages,
   normalizeOpenAIImageGenerateRequestBody,
   resolveOpenAIImageEditAttachment,
@@ -258,4 +259,52 @@ test('normalizeOpenAIImageApiGeneratedImages normalizes OpenAI image API output'
   assert.equal(normalized[0].data, 'aGVsbG8=');
   assert.equal(normalized[0].mimeType, 'image/png');
   assert.equal(normalized[0].revisedPrompt, 'refined prompt');
+});
+
+// A turn that never started (worker still booting, session not yet available)
+// is requeued in seconds; one that actually ran and failed keeps the long
+// backoff ladder so a broken provider is not hammered.
+test('isTransientRequeue treats a turn that produced nothing as a startup hiccup', () => {
+  const startedAt = '2026-08-11T16:27:48.000Z';
+  const nowMs = Date.parse('2026-08-11T16:27:50.500Z');
+
+  assert.equal(isTransientRequeue({
+    queueRow: { processing_at: startedAt },
+    relayActivityCount: 0,
+    relayStreamCount: 0,
+    nowMs,
+  }), true);
+
+  // A row that never began at all.
+  assert.equal(isTransientRequeue({
+    queueRow: { processing_at: null },
+    nowMs,
+  }), true);
+});
+
+test('isTransientRequeue keeps the long ladder once a turn made progress', () => {
+  const startedAt = '2026-08-11T16:27:48.000Z';
+  const nowMs = Date.parse('2026-08-11T16:27:50.500Z');
+
+  // Streamed text or logged activity means the provider really was reached.
+  assert.equal(isTransientRequeue({
+    queueRow: { processing_at: startedAt },
+    relayActivityCount: 1,
+    relayStreamCount: 0,
+    nowMs,
+  }), false);
+  assert.equal(isTransientRequeue({
+    queueRow: { processing_at: startedAt },
+    relayActivityCount: 0,
+    relayStreamCount: 3,
+    nowMs,
+  }), false);
+
+  // So does having been in flight for a while, even with nothing emitted.
+  assert.equal(isTransientRequeue({
+    queueRow: { processing_at: startedAt },
+    relayActivityCount: 0,
+    relayStreamCount: 0,
+    nowMs: Date.parse('2026-08-11T16:28:30.000Z'),
+  }), false);
 });
