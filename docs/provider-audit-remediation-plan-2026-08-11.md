@@ -43,6 +43,45 @@ they resolve through their runtime row. An unresolvable responder identity now
 reports `unknown` (no chip, no mismatch) and logs `PROVIDER UNRESOLVED` rather
 than fabricating a `github` mismatch or staying silent.
 
+Phase 1 gap closed (conv `bba84ef0`): `findPendingForLegacyRelay` filtered by
+provider but not by owner, contrary to what 1.1 above specifies. An OpenAI image
+turn owned by a booting worker was claimed by the identity-less relay 0.3s after
+spawn, failed (`gpt-image-*` is not a Copilot model) and burned a retry plus a
+60s backoff. The query now also requires `owner_sdk_session_id IS NULL`; owners
+are only assigned when routing is enabled, so routing-disabled installs are
+unaffected. The two mislabeled image messages were backfilled to `openai`.
+
+## Turn-start latency investigation (2026-08-11)
+
+Symptom: messages sit `pending` for a long time before the turn starts, across
+providers. Measured over 457 spawns in `server.log`.
+
+Findings:
+- Delivery itself is fast: once a worker socket is ready, a pending message is
+  delivered within 500ms by the `monitorQueue` sweep
+  (`session-worker-websocket-service.mjs:245-253`). There is no slow sweep.
+- **Dominant cause: the requeue backoff ladder.** `computeRetryDelayMs` is
+  `30s x 2^n` (`server-runtime.mjs:4699-4704`), so any transient failure freezes
+  the row for 60s, then 120s, 240s. All dequeue SQL gates on `next_attempt_at`,
+  and because the row is already `pending` no count-change event fires — only
+  the periodic `ready-check` branch rescues it. Every recent slow delivery in
+  the log sits exactly 60/120/240s after a `REQUEUED` line. The WS send-failure
+  path already uses a 5s cap (`server-runtime.mjs:6761`); the HTTP requeue path
+  does not.
+- Copilot CLI cold start is ~35s median (2779 `readyWithoutHeartbeatMs`
+  samples) and is not ours to fix. Workers ARE kept warm between turns
+  (`idleEvictionMs` is 0 and `evictIdleWorkers` has no caller), and warm
+  sessions deliver in <300ms.
+- **Foot-gun:** `heartbeatTimeoutMs` is 30s (`session-worker-supervisor-service.mjs:84`)
+  but median boot is ~35s, so `startup-heartbeat-timeout` can kill a still-booting
+  CLI and pay a second cold start.
+- The kill route sets a 30s kill-block (`session-worker-supervisor-service.mjs:268-272`),
+  so a kill followed by a message costs 30s + full boot.
+- `worker launcher: spawned` is logged even when the launcher reused an existing
+  tmux pane (`server-runtime.mjs:4124` ignores `launched.reused`), which makes
+  spawn counts unreadable: 1208 spawn lines over 356 sessions, 58% within 60s of
+  a previous spawn for the same session.
+
 Open follow-ups from the audit of that fix (not yet done):
 - No test exercises `POST /api/response` end to end; the provenance decision is
   covered at the helper level only, so the `serverExecutedOperation` wiring and

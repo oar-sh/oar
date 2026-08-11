@@ -114,6 +114,15 @@ export function createMessageRepository(db) {
         // (claude/cursor/grok) are excluded outright: handing one of their turns
         // to the relay executes it on the Copilot plan under whatever model the
         // id happens to resolve to there, invisibly to the user.
+        //
+        // Owned rows are excluded too. An owner means a session worker is
+        // responsible for the turn, and the relay polls every 2s while a worker
+        // takes ~a minute to become ready — so without this the relay wins that
+        // race and fails a turn it cannot run (an OpenAI image model is not a
+        // Copilot model), costing a retry and a backoff. Owners are only
+        // assigned when session-worker routing is enabled
+        // (resolveInitialQueueOwnerSessionId returns null otherwise), so
+        // routing-disabled installs still hand the relay every row.
         findPendingForLegacyRelay: db.prepare(`
           SELECT q.*
           FROM queue q
@@ -123,6 +132,7 @@ export function createMessageRepository(db) {
             ON rsc.conversation_id = q.conversation_id
           WHERE q.status = 'pending'
             AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
+            AND NULLIF(q.owner_sdk_session_id, '') IS NULL
             AND LOWER(COALESCE(
               NULLIF(rs.provider_type, ''),
               NULLIF(rsc.provider_type, ''),
