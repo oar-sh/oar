@@ -804,6 +804,28 @@ export function dequeuePendingMessage({
   return dequeue();
 }
 
+// A requeue for a turn that produced nothing and was only briefly in flight is
+// a startup/routing hiccup, not a provider failure: the worker was still
+// booting, or the bound session was not available yet. Those deserve a short
+// retry. Anything that streamed text, logged activity, or ran for a while is
+// treated as a real failure and keeps the long backoff ladder.
+export const TRANSIENT_REQUEUE_MAX_PROCESSING_MS = 15_000;
+
+export function isTransientRequeue({
+  queueRow = null,
+  relayActivityCount = 0,
+  relayStreamCount = 0,
+  nowMs = Date.now(),
+  maxProcessingMs = TRANSIENT_REQUEUE_MAX_PROCESSING_MS,
+} = {}) {
+  if (Math.max(0, Number(relayActivityCount || 0)) > 0) return false;
+  if (Math.max(0, Number(relayStreamCount || 0)) > 0) return false;
+  const startedAtMs = Date.parse(String(queueRow?.processing_at || '').trim());
+  // No processing_at means the row never even began; treat that as transient.
+  if (!Number.isFinite(startedAtMs)) return true;
+  return (nowMs - startedAtMs) < Math.max(0, Number(maxProcessingMs) || 0);
+}
+
 export function shouldFailRecoveredProcessingRow({
   reason = null,
   relayActivityCount = 0,
@@ -6530,7 +6552,14 @@ export function registerMessagesRoutes(app, deps) {
       } else {
         const restartState = relayRestartOrchestrator?.getState?.() || null;
         const parkForRestart = shouldParkForRestart(restartState);
-        const nextAttemptAt = parkForRestart ? null : addMsIso(computeRetryDelayMs(retryCount));
+        const transientRequeue = isTransientRequeue({
+          queueRow: q,
+          relayActivityCount: stmts.listActivityByQueueMessage?.all?.(messageId)?.length || 0,
+          relayStreamCount: stmts.listStreamEventsByQueueMessage?.all?.(messageId)?.length || 0,
+        });
+        const nextAttemptAt = parkForRestart
+          ? null
+          : addMsIso(computeRetryDelayMs(retryCount, { transient: transientRequeue }));
         const result = db.prepare(`
           UPDATE queue
           SET
@@ -6577,7 +6606,7 @@ export function registerMessagesRoutes(app, deps) {
               extra: parkForRestart ? { parkedForRestart: true } : null,
             });
           }
-          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} status=${parkForRestart ? 'parked' : 'pending'}${nextAttemptAt ? ` next=${nextAttemptAt}` : ''}`);
+          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} class=${transientRequeue ? 'transient' : 'failure'} status=${parkForRestart ? 'parked' : 'pending'}${nextAttemptAt ? ` next=${nextAttemptAt}` : ''}`);
           io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: parkForRestart ? 'parked' : 'pending' });
         }
       }

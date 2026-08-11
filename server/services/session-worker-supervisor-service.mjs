@@ -64,9 +64,17 @@ export function createSessionWorkerSupervisor({
   restartBackoffBaseMs = 1_000,
   restartBackoffMaxMs = 30_000,
   idleEvictionMs = 0,
-  heartbeatTimeoutMs = 30_000,
+  // Copilot-kind workers boot a full CLI (auth, model catalog, workspace scan)
+  // before their extension can heartbeat; measured median is ~35s. A 30s
+  // timeout marked those still-booting workers as startup failures and killed
+  // them mid-boot, so the turn paid a second cold start. Pid liveness is still
+  // the fast path for genuinely dead workers.
+  heartbeatTimeoutMs = 90_000,
   degradedRecoveryGraceMs = 10_000,
-  killBlockGraceMs = 30_000,
+  // Long enough to keep a kill from racing an in-flight ensureWorker respawn,
+  // short enough that stopping a turn and immediately sending a new message
+  // does not add 30s in front of the worker's boot.
+  killBlockGraceMs = 3_000,
   isPidAlive = defaultIsPidAlive,
   diagnosticPlanReference = null,
   log = null,
@@ -81,9 +89,9 @@ export function createSessionWorkerSupervisor({
   const backoffBaseMs = Math.max(1, clampInt(restartBackoffBaseMs, 1_000));
   const backoffMaxMs = Math.max(backoffBaseMs, clampInt(restartBackoffMaxMs, 30_000));
   const idleTimeoutMs = clampInt(idleEvictionMs, 0);
-  const heartbeatStaleAfterMs = Math.max(1_000, clampInt(heartbeatTimeoutMs, 30_000));
+  const heartbeatStaleAfterMs = Math.max(1_000, clampInt(heartbeatTimeoutMs, 90_000));
   const recoveryGraceMs = Math.max(0, clampInt(degradedRecoveryGraceMs, 10_000));
-  const killGraceMs = Math.max(0, clampInt(killBlockGraceMs, 30_000));
+  const killGraceMs = Math.max(0, clampInt(killBlockGraceMs, 3_000));
   function resolvePlanReference() {
     const value = typeof diagnosticPlanReference === 'function'
       ? diagnosticPlanReference()
