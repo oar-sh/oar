@@ -111,7 +111,13 @@ import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserS
 import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import { dataTransferHasFiles } from './composer-paste.mjs';
-import { resolveConversationComposerSelection } from './conversation-preferences.mjs';
+import { isReasoningOffUnsupported, reasoningEffortOptionLabel } from './reasoning-effort-labels.mjs';
+import {
+  firstDefinedPreference,
+  normalizePreferenceValue,
+  resolveComposerReasoningEffort,
+  resolveConversationComposerSelection,
+} from './conversation-preferences.mjs';
 import {
   modelSelectorOptionsEqual,
   normalizeModelSelectorOptions,
@@ -264,6 +270,9 @@ import {
 } from './action-confirmations.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
+// The New Chat modal used to keep its own model key, so a selection made there
+// never reached the composer. Both now read MODEL_STORAGE_KEY.
+const LEGACY_MODEL_STORAGE_KEY = 'copilot_model';
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
 const AUTO_MODEL_OPTION = 'auto';
@@ -1359,13 +1368,17 @@ function selectedReasoningEffortValue() {
   return FALLBACK_REASONING_EFFORT;
 }
 
-function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
+// Opt in to persist=true only from a user-initiated change. Every other caller
+// is re-rendering options (catalog refresh, provider rescope, applying a stored
+// preference), and letting those write the shared fallback storage is what made
+// a transient resolution the remembered default.
+function updateReasoningSelectorForModel(modelId, preferredEffort = '', { persist = false } = {}) {
   const select = document.getElementById('reasoning-effort-select');
   if (!select) return;
   select.title = isOpenAIImageModelId(modelId) ? 'Quality' : 'Reasoning effort';
   const options = reasoningOptionsForModel(modelId);
-  const selectedBefore = String(select.value || '').trim().toLowerCase();
-  const genericStored = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
+  const currentEffort = String(select.value || '').trim().toLowerCase();
+  const storedEffort = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
   select.innerHTML = '';
   if (!options.length) {
     const opt = document.createElement('option');
@@ -1375,20 +1388,67 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
     select.value = '';
     return;
   }
+  const reasoningOffUnsupported = isReasoningOffUnsupported(
+    modelCatalogState,
+    activeComposerProviderType(),
+    modelId,
+  );
   for (const effort of options) {
     const opt = document.createElement('option');
     opt.value = effort;
-    opt.textContent = effort;
+    opt.textContent = reasoningEffortOptionLabel(effort, { reasoningOffUnsupported });
     select.appendChild(opt);
   }
-  const preferred = String(preferredEffort || '').trim().toLowerCase();
-  const resolvedPreferred = [preferred, selectedBefore, genericStored]
-    .find((value) => value && options.includes(value));
-  const resolved = resolvedPreferred
-    || options.find((value) => value !== 'none')
-    || options[0];
+  const resolved = resolveComposerReasoningEffort({
+    preferredEffort,
+    storedEffort,
+    currentEffort,
+    supportedEfforts: options,
+  });
   select.value = resolved;
-  localStorage.setItem(REASONING_STORAGE_KEY, resolved);
+  if (persist && resolved) localStorage.setItem(REASONING_STORAGE_KEY, resolved);
+}
+
+// Rebuilds the option list for the active conversation's provider without
+// touching the selection, mirroring updateModeSelectorForProvider. Preferences
+// used to be clamped against the previous provider's options, which is how a
+// Cursor conversation could keep the Claude model that was selected before it.
+function rebuildModelSelectorOptionsForProvider() {
+  const select = document.getElementById('model-select');
+  if (!select || isSharedReaderMode()) return false;
+  const activeProviderType = activeComposerProviderType();
+  const scope = normalizeModelSelectorProviderType(activeProviderType);
+  if (select.dataset.providerScope === scope) return false;
+  // Same rule as the catalog refresh: never re-render the list out from under
+  // an open picker. The scope stays unset so the rebuild happens on blur.
+  if (document.activeElement === select) return false;
+  const nextOptions = buildModelSelectorOptions(
+    modelCatalogState.models,
+    modelCatalogState.providersByModel,
+    activeProviderType,
+  );
+  const currentOptions = Array.from(select.options)
+    .filter((option) => option.dataset.runtimeModelLock !== '1')
+    .map((option) => ({ value: option.value, label: option.textContent }));
+  if (!modelSelectorOptionsEqual(currentOptions, nextOptions)) {
+    const selectedBefore = String(select.value || '').trim();
+    const lockedOptions = Array.from(select.options).filter((option) => option.dataset.runtimeModelLock === '1');
+    select.innerHTML = '';
+    for (const option of nextOptions) {
+      const opt = document.createElement('option');
+      opt.value = option.value;
+      opt.textContent = option.label;
+      select.appendChild(opt);
+    }
+    for (const locked of lockedOptions) select.appendChild(locked);
+    // Emptying the select resets the value to the first option, which would
+    // hand the clamp below "auto" instead of what was actually selected.
+    if (Array.from(select.options).some((option) => option.value === selectedBefore)) {
+      select.value = selectedBefore;
+    }
+  }
+  select.dataset.providerScope = scope;
+  return true;
 }
 
 function updateModelCatalogState(payload) {
@@ -1425,6 +1485,17 @@ function updateModelCatalogState(payload) {
           ? Object.fromEntries(Object.entries(entries).map(([modelId, efforts]) => [
               String(modelId || '').trim().toLowerCase(),
               normalizeReasoningEffortList(efforts),
+            ]))
+          : {},
+      ]))
+      : {},
+    reasoningOffUnsupportedByProvider: payload?.reasoningOffUnsupportedByProvider && typeof payload.reasoningOffUnsupportedByProvider === 'object'
+      ? Object.fromEntries(Object.entries(payload.reasoningOffUnsupportedByProvider).map(([provider, entries]) => [
+        String(provider || '').trim().toLowerCase(),
+        entries && typeof entries === 'object'
+          ? Object.fromEntries(Object.entries(entries).map(([modelId, unsupported]) => [
+              String(modelId || '').trim().toLowerCase(),
+              unsupported === true,
             ]))
           : {},
       ]))
@@ -1508,12 +1579,20 @@ function updateModelCatalogState(payload) {
   }
   select.dataset.providerScope = normalizeModelSelectorProviderType(activeProviderType);
 
-  const preferred = [selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
-    .find((value) => value && nextModels.includes(value)) || nextModels[0];
-  select.value = preferred;
-  localStorage.setItem(MODEL_STORAGE_KEY, preferred);
-  updateReasoningSelectorForModel(preferred);
-  updateContextTierSelector(preferred);
+  // A catalog refresh re-renders options and keeps the current selection valid;
+  // it must not decide what is selected. The active conversation's preferences
+  // are reapplied at the end, so a refresh cannot overwrite the user's pick.
+  const keptSelection = nextModels.includes(selectedBefore) ? selectedBefore : '';
+  const nextSelection = keptSelection
+    || [
+      localStorage.getItem(MODEL_STORAGE_KEY),
+      modelCatalogState.currentModel,
+      modelCatalogState.defaultModel,
+    ].map((value) => String(value || '').trim()).find((value) => value && nextModels.includes(value))
+    || nextModels[0];
+  select.value = nextSelection;
+  updateReasoningSelectorForModel(nextSelection, '');
+  updateContextTierSelector(nextSelection);
 
   if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
@@ -1525,6 +1604,9 @@ function updateModelCatalogState(payload) {
 
   syncModelMetadataBlocker();
   syncAutoModelAvailability();
+  // The rebuilt catalog may now contain the conversation's preferred model for
+  // the first time (provider models arrive after the initial catalog load).
+  if (currentConvId) applyConversationPreferencesForConversation(currentConvId);
 }
 
 function selectedModelValue() {
@@ -1668,7 +1750,12 @@ async function persistCurrentConversationPreferences() {
   if (!modeSelect || !modelSelect) return;
   const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
   const model = String(modelSelect.value || '').trim();
-  const reasoningEffort = selectedReasoningEffortValue();
+  // The raw value, not selectedReasoningEffortValue(): a model with no reasoning
+  // options leaves the selector empty, and that helper's 'none' fallback would
+  // record an effort the user never picked when they only changed the mode.
+  const reasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+  // These keys hold the last explicit choice, so they are not rolled back when
+  // the write below fails: the user did make the choice either way.
   localStorage.setItem(MODE_STORAGE_KEY, mode);
   if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
   if (reasoningEffort) localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
@@ -1683,6 +1770,19 @@ async function persistCurrentConversationPreferences() {
     ? `${model}[1m]`
     : model;
 
+  // Record the choice locally before the round-trip: a catalog refresh landing
+  // while the PATCH is in flight reapplies preferences, and it must see the new
+  // selection rather than the one being replaced.
+  const previousRecord = conversations[convId] || null;
+  if (previousRecord) {
+    conversations[convId] = {
+      ...previousRecord,
+      preferredRelayMode: mode,
+      preferredModel: preferredModelWithTier || previousRecord.preferredModel || '',
+      preferredReasoningEffort: reasoningEffort || previousRecord.preferredReasoningEffort || '',
+    };
+  }
+
   const writeVersion = ++conversationPreferenceWriteVersion;
   const response = await updateConversationPreferences(convId, {
     clientId: CLIENT_ID,
@@ -1690,7 +1790,22 @@ async function persistCurrentConversationPreferences() {
     preferredModel: preferredModelWithTier,
     preferredReasoningEffort: reasoningEffort,
   });
-  if (!response || writeVersion !== conversationPreferenceWriteVersion) return;
+  if (writeVersion !== conversationPreferenceWriteVersion) return;
+  if (!response) {
+    // The server never took the write, so the optimistic preference has to go
+    // back rather than linger as one the next apply would trust. Only the three
+    // preference fields are restored: the poll rewrites the rest of the record
+    // (messageCount, runtime binding, title) during the round trip.
+    if (previousRecord && conversations[convId]) {
+      conversations[convId] = {
+        ...conversations[convId],
+        preferredRelayMode: previousRecord.preferredRelayMode,
+        preferredModel: previousRecord.preferredModel,
+        preferredReasoningEffort: previousRecord.preferredReasoningEffort,
+      };
+    }
+    return;
+  }
   if (conversations[convId]) {
     conversations[convId] = {
       ...conversations[convId],
@@ -1711,8 +1826,11 @@ function applyConversationPreferences({
   const modelSelect = document.getElementById('model-select');
   if (!modeSelect || !modelSelect) return;
 
-  // Options first, so the preference clamp below sees the provider's modes.
+  // Options first, so the preference clamp below sees the provider's modes and
+  // models. Clamping before the model rebuild let the previous conversation's
+  // provider decide which models were "supported" for this one.
   updateModeSelectorForProvider();
+  rebuildModelSelectorOptionsForProvider();
   const supportedModes = modeOptions();
   const supportedModels = modelOptions().length ? modelOptions() : modelCatalogState.models;
   const selection = resolveConversationComposerSelection({
@@ -1725,52 +1843,73 @@ function applyConversationPreferences({
     fallbackMode: FALLBACK_MODE,
     fallbackModel: FALLBACK_MODEL,
   });
+  // finally, because the flag also gates every composer change handler: leaking
+  // it as true would silently stop the composer from persisting anything at all
+  // until the page is reloaded.
   suppressConversationPreferenceSync = true;
-  modeSelect.value = selection.mode;
-  if (selection.model) modelSelect.value = selection.model;
-  syncAutoModelAvailability();
-  updateReasoningSelectorForModel(
-    selection.model || modelSelect.value,
-    String(preferredReasoningEffort || '').trim().toLowerCase(),
-  );
-  updateContextTierSelector(selection.model || modelSelect.value);
-  const tierSelect = document.getElementById('context-tier-select');
-  const desiredTier = String(preferredContextTier || 'default').trim().toLowerCase();
-  if (tierSelect && Array.from(tierSelect.options).some((option) => option.value === desiredTier)) {
-    tierSelect.value = desiredTier;
-    updateModelPricingDetails(selection.model || modelSelect.value, tierSelect.value);
+  try {
+    modeSelect.value = selection.mode;
+    if (selection.model) modelSelect.value = selection.model;
+    syncAutoModelAvailability();
+    updateReasoningSelectorForModel(
+      selection.model || modelSelect.value,
+      String(preferredReasoningEffort || '').trim().toLowerCase(),
+    );
+    updateContextTierSelector(selection.model || modelSelect.value);
+    const tierSelect = document.getElementById('context-tier-select');
+    const desiredTier = String(preferredContextTier || 'default').trim().toLowerCase();
+    if (tierSelect && Array.from(tierSelect.options).some((option) => option.value === desiredTier)) {
+      tierSelect.value = desiredTier;
+      updateModelPricingDetails(selection.model || modelSelect.value, tierSelect.value);
+    }
+  } finally {
+    suppressConversationPreferenceSync = false;
   }
-  suppressConversationPreferenceSync = false;
-
-  localStorage.setItem(MODE_STORAGE_KEY, selection.mode);
-  if (selection.model) localStorage.setItem(MODEL_STORAGE_KEY, selection.model);
+  // Nothing is written to the shared "last used" storage here. Applying a
+  // conversation's stored preferences is not a choice: it runs on every open,
+  // on the ~1s live poll, on a catalog refresh and on another client's edit,
+  // so persisting the clamp let one conversation's resolution become the
+  // default for the next New Chat. Only persistCurrentConversationPreferences
+  // (a user edit) and a successful bootstrap write those keys.
 }
 
 function applyConversationPreferencesForConversation(conversationId, payload = {}) {
   const convId = String(conversationId || currentConvId || '').trim();
   const conversation = convId ? conversations[convId] : null;
-  const preferredRelayMode = payload?.preferredRelayMode
-    ?? conversation?.preferredRelayMode
-    ?? localStorage.getItem(MODE_STORAGE_KEY)
-    ?? FALLBACK_MODE;
-  const preferredModel = payload?.preferredModel
-    ?? conversation?.preferredModel
-    ?? localStorage.getItem(MODEL_STORAGE_KEY)
-    ?? '';
-  const preferredReasoningEffort = payload?.preferredReasoningEffort
-    ?? conversation?.preferredReasoningEffort
-    ?? '';
-  const runtimeModel = String(
-    payload?.runtimeModel
-    ?? conversation?.runtimeModel
-    ?? conversation?.runtime_model
-    ?? '',
-  ).trim();
-  const effectivePreferredModel = String(
-    Number(conversation?.messageCount || 0) === 0 && runtimeModel
-      ? runtimeModel
-      : preferredModel,
-  ).trim();
+  // Unset preferences arrive as '', so each source has to fall through rather
+  // than stop at an empty string the way `??` did.
+  const preferredRelayMode = firstDefinedPreference(
+    payload?.preferredRelayMode,
+    conversation?.preferredRelayMode,
+    localStorage.getItem(MODE_STORAGE_KEY),
+  ) || FALLBACK_MODE;
+  const preferredModel = firstDefinedPreference(
+    payload?.preferredModel,
+    conversation?.preferredModel,
+    localStorage.getItem(MODEL_STORAGE_KEY),
+  );
+  // No localStorage fallback here on purpose: updateReasoningSelectorForModel
+  // already consults the shared "last used" effort, but below the conversation's
+  // own value. Feeding it in as `preferredEffort` would promote it above the
+  // selector's current state and let one conversation's clamp leak into the next.
+  const preferredReasoningEffort = firstDefinedPreference(
+    payload?.preferredReasoningEffort,
+    conversation?.preferredReasoningEffort,
+  );
+  const runtimeModel = firstDefinedPreference(
+    payload?.runtimeModel,
+    conversation?.runtimeProviderModel,
+    conversation?.runtime_provider_model,
+    conversation?.runtimeModel,
+    conversation?.runtime_model,
+  );
+  // The runtime binding only stands in for an unstarted conversation that has
+  // no stored preference. Preferring it over one would let every catalog
+  // refresh revert a model the user changed before sending anything.
+  const effectivePreferredModel = normalizePreferenceValue(
+    preferredModel
+    || (Number(conversation?.messageCount || 0) === 0 ? runtimeModel : ''),
+  );
   // A stored "[1m]" id decomposes into the base model plus the 1M context tier.
   const isLongContextModel = CLAUDE_LONG_CONTEXT_PATTERN.test(effectivePreferredModel);
   applyConversationPreferences({
@@ -1793,7 +1932,15 @@ function initModelSelector() {
         setModelBanner('⚠️ Auto model selection is available only for a new conversation.');
         return;
       }
-      updateReasoningSelectorForModel(select.value);
+      // Carry the current effort across the model change so switching models
+      // does not quietly downgrade a deliberate "high" to the model's default.
+      // The raw value, not selectedReasoningEffortValue(): its 'none' fallback
+      // for an empty selector would overwrite a remembered effort.
+      updateReasoningSelectorForModel(
+        select.value,
+        String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase(),
+        { persist: true },
+      );
       updateContextTierSelector(select.value);
       syncSessionLockNote({ pinnedModel: currentRuntimeModelLock()?.model || '' });
       refreshComposerAttachmentWarning();
@@ -3366,7 +3513,21 @@ function showAuthGate(error = '') {
   document.getElementById('token-input')?.focus();
 }
 
+// Runs before anything reads MODEL_STORAGE_KEY so the first load after an
+// upgrade already sees the model the user last picked in the New Chat modal.
+function migrateLegacyModelStorageKey() {
+  try {
+    const legacy = String(localStorage.getItem(LEGACY_MODEL_STORAGE_KEY) || '').trim();
+    if (!legacy) return;
+    if (!String(localStorage.getItem(MODEL_STORAGE_KEY) || '').trim()) {
+      localStorage.setItem(MODEL_STORAGE_KEY, legacy);
+    }
+    localStorage.removeItem(LEGACY_MODEL_STORAGE_KEY);
+  } catch {}
+}
+
 async function initApp() {
+  migrateLegacyModelStorageKey();
   initClientDiagnostics();
   installExternalLinkPolicy({ onFallback: showExternalLinkFallback });
   const sharedMode = isSharedReaderMode();

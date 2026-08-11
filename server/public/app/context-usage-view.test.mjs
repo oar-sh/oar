@@ -70,10 +70,36 @@ test('unknown colors fall back rather than emitting invalid CSS', () => {
   assert.equal(categoryColor(null), '#6e7681');
 });
 
-test('estimate flag renders a caveat', () => {
-  const html = renderContextUsageHtml({ ...usage, isEstimate: true });
-  assert.match(html, /Estimated lower bound/);
-  assert.ok(!renderContextUsageHtml(usage).includes('Estimated lower bound'));
+test('estimate flag renders a caveat worded per estimate kind', () => {
+  const lowerBound = renderContextUsageHtml({
+    ...usage,
+    isEstimate: true,
+    estimateKind: 'assistant-output-lower-bound',
+  });
+  assert.match(lowerBound, /Estimated lower bound/);
+
+  const cursorAverage = renderContextUsageHtml({
+    ...usage,
+    isEstimate: true,
+    estimateKind: 'cursor-per-call-average',
+  });
+  assert.match(cursorAverage, /aggregate token usage/);
+
+  const unknownKind = renderContextUsageHtml({ ...usage, isEstimate: true });
+  assert.match(unknownKind, /Estimated —/);
+
+  assert.ok(!renderContextUsageHtml(usage).includes('Estimated'));
+});
+
+test('capturedAt renders a staleness note naming the model', () => {
+  const html = renderContextUsageHtml({
+    ...usage,
+    capturedAt: '2026-08-10T19:19:32.236Z',
+  });
+  assert.match(html, /As of the last completed turn \(/);
+  assert.match(html, /on claude-opus-5\[1m\]/);
+  assert.ok(!renderContextUsageHtml({ ...usage, capturedAt: 'not-a-date' })
+    .includes('As of the last completed turn'));
 });
 
 test('category names are escaped', () => {

@@ -711,6 +711,14 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
   const autoTag = (msg.role === 'assistant' && modelOrigin === 'auto')
     ? ' <span class="msg-auto">auto</span>' : '';
+  // A turn answered by a different provider than the conversation is bound to
+  // (e.g. the Copilot relay answering a Cursor conversation) must be visible,
+  // not silent: it ran on another plan than the header indicates.
+  const executedProvider = String(msg?.executedProvider || '').trim().toLowerCase();
+  const boundProvider = String(conversations[currentConvId]?.runtimeProviderType || 'github').trim().toLowerCase();
+  const crossProviderTag = (msg.role === 'assistant' && executedProvider && executedProvider !== boundProvider)
+    ? ` <span class="msg-provider-mismatch" title="This turn was executed by the ${escHtml(executedProvider)} provider, not the conversation's ${escHtml(boundProvider)} provider.">ran on ${escHtml(executedProvider)}</span>`
+    : '';
   const usage = (msg.role === 'assistant' && msg?.usage && typeof msg.usage === 'object') ? msg.usage : null;
   const deltaCredits = Number(usage?.premium?.deltaCredits ?? usage?.premium?.deltaUsed);
   const deltaMonthlyPercent = Number(usage?.plan?.deltaMonthlyPercent);
@@ -768,7 +776,7 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   div.innerHTML = `
     <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${userBubbleActionsHtml}</div>
-    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
+    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
   rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });

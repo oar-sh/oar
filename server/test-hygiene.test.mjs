@@ -124,3 +124,49 @@ test('tests reference process.platform only behind a skip option or a host-platf
     + 'If host behavior is genuinely required, gate the test with `{ skip: process.platform !== \'<os>\' }` '
     + `or annotate the line with a \`host-platform:\` comment. Violations:\n${violations.join('\n')}`);
 });
+
+// Guard: the companion to the one above. That guard catches a test that *reads*
+// the host OS; this one catches a test that silently *assumes* it — win32-only
+// path shapes asserted with no statement of which platform is meant. Both of the
+// specs that only ever passed on Windows (a `cd U:\` resolution asserted through
+// the host's native `path`, and a drives-explorer case asserting drive-letter
+// roots against an API that answers '/' on POSIX) were invisible to the guard
+// above, because neither mentioned `process.platform` at all.
+//
+// A win32-only path shape is either a string literal with a drive-letter prefix
+// ("C:\\dev") or a regex asserting that shape (/^[A-Za-z]:$/).
+const WIN32_PATH_LITERAL_RE = /['"`][A-Za-z]:\\/;
+// A character class holding a letter range, immediately followed by ':' —
+// /^[A-Za-z]:$/, /^[a-zA-Z]:\\/ and friends.
+const WIN32_PATH_REGEX_RE = /\[[^\]]*[A-Za-z]-[A-Za-z][^\]]*\]:/;
+
+// A file using those shapes must declare, once, how it handles the platform:
+//   - names 'win32'/`path.win32` — the platform is injected into the code under
+//     test, so the win32 half runs everywhere (the preferred form),
+//   - gates with `skip` — reported as skipped on the other OS, not failed,
+//   - carries a `host-platform:` note — real host behavior is under test, or
+//   - carries a `platform-agnostic:` note — the code under test treats the path
+//     as an opaque string, so the literal's shape never reaches path semantics.
+const WIN32_SHAPE_DECLARED_RE = /win32|\bskip\b|host-platform:|platform-agnostic:/;
+
+test('tests asserting win32 path shapes declare how they handle the platform', () => {
+  const files = collectTestFiles(repoRoot);
+  const violations = [];
+
+  for (const file of files) {
+    const source = fs.readFileSync(file, 'utf8');
+    if (WIN32_SHAPE_DECLARED_RE.test(source)) continue;
+    const relPath = path.relative(repoRoot, file);
+    source.split(/\r?\n/).forEach((line, idx) => {
+      const code = line.split('//')[0]; // a mention inside a comment is fine
+      if (WIN32_PATH_LITERAL_RE.test(code) || WIN32_PATH_REGEX_RE.test(code)) {
+        violations.push(`${relPath}:${idx + 1} — ${line.trim()}`);
+      }
+    });
+  }
+
+  assert.deepEqual(violations, [],
+    'Tests asserting win32 path shapes must say which platform they mean: inject the platform into '
+    + 'the code under test (preferred), gate with `{ skip: process.platform !== \'win32\' }`, or annotate '
+    + `with a \`host-platform:\` / \`platform-agnostic:\` note. Violations:\n${violations.join('\n')}`);
+});

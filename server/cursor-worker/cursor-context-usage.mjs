@@ -9,13 +9,22 @@
  * are omitted entirely.
  */
 
+// Percentages above this are impossible occupancy readings; the worker clamps
+// them so the stored blob never claims more than a full window.
+const MAX_PERCENT = 100;
+
 function tokenCount(value) {
   if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) ? Math.round(n) : null;
 }
 
-export function buildCursorContextUsage({ usage, model = '', contextWindow = null } = {}) {
+export function buildCursorContextUsage({
+  usage,
+  model = '',
+  contextWindow = null,
+  modelCallCount = 1,
+} = {}) {
   if (!usage || typeof usage !== 'object') return null;
 
   const inputTokens = tokenCount(usage.inputTokens);
@@ -27,11 +36,17 @@ export function buildCursorContextUsage({ usage, model = '', contextWindow = nul
     return null;
   }
 
-  // Context occupancy comes from the LAST usage event: input + cache reads +
-  // cache writes + output approximates what the next request re-sends. The
-  // SDK's `totalTokens` is cumulative across the run, so it must not be used.
-  const totalTokens = (inputTokens || 0) + (cacheReadTokens || 0)
-    + (cacheWriteTokens || 0) + (outputTokens || 0);
+  // The SDK's turn usage aggregates EVERY model call in the turn, and each
+  // call re-sends the whole context — so input + cache reads + cache writes is
+  // roughly `calls ×` the real occupancy (observed 10× the window on long
+  // agentic turns; the SDK's cumulative `totalTokens` is even further off and
+  // must not be used). Divide the prompt-side aggregate by the model-call
+  // count for a per-call average: an estimate that slightly undershoots the
+  // final call's context instead of pinning the gauge at 100%.
+  const calls = Math.max(1, Math.round(Number(modelCallCount) || 1));
+  const promptAggregate = (inputTokens || 0) + (cacheReadTokens || 0) + (cacheWriteTokens || 0);
+  const totalTokens = Math.round(promptAggregate / calls) + (outputTokens || 0);
+  const estimateKind = calls > 1 ? 'cursor-per-call-average' : null;
   const maxTokens = (typeof contextWindow === 'number' && Number.isFinite(contextWindow)
     && contextWindow > 0)
     ? Math.round(contextWindow)
@@ -41,8 +56,12 @@ export function buildCursorContextUsage({ usage, model = '', contextWindow = nul
     model,
     totalTokens,
     ...(maxTokens !== null
-      ? { maxTokens, percentage: Math.round((totalTokens / maxTokens) * 10000) / 100 }
+      ? {
+        maxTokens,
+        percentage: Math.min(MAX_PERCENT, Math.round((totalTokens / maxTokens) * 10000) / 100),
+      }
       : {}),
+    ...(estimateKind ? { estimateKind } : {}),
     categories: [],
     apiUsage: {
       input_tokens: inputTokens || 0,

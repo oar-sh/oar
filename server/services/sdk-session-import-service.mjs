@@ -154,6 +154,20 @@ export function createSdkSessionImportService({
     const sdkSessionId = sessionIdOf(session);
     if (!sdkSessionId) return { status: 'skipped', category: 'unchanged', reason: 'missing-session-id' };
     if (isTombstoned(sdkSessionId)) return { sdkSessionId, status: 'skipped', category: 'tombstoned', reason: 'tombstoned' };
+    // Sessions the relay created to execute an existing conversation's turns
+    // are vehicles, not conversations: their history already lives in the
+    // conversation they ran for. Importing them creates duplicate "shadow"
+    // conversations in the list.
+    const relayLink = stmts.getRelaySessionLink?.get?.(sdkSessionId) || null;
+    if (relayLink && text(relayLink.conversation_id) && text(relayLink.conversation_id) !== sdkSessionId) {
+      return { sdkSessionId, status: 'skipped', category: 'relay-owned', reason: 'relay-execution-session' };
+    }
+    // Same protection when a live conversation already claims this session id
+    // as its transcript binding under a different conversation id.
+    const owningConversation = stmts.getConvBySdkSessionId?.get?.(sdkSessionId) || null;
+    if (owningConversation && text(owningConversation.id) && text(owningConversation.id) !== sdkSessionId) {
+      return { sdkSessionId, status: 'skipped', category: 'bound-elsewhere', reason: 'session-bound-to-existing-conversation' };
+    }
     const claimed = claim(sdkSessionId, session, { force });
     if (!claimed.claimed) return { sdkSessionId, status: 'skipped', category: claimed.category, reason: 'unchanged-or-active' };
 
@@ -192,6 +206,8 @@ export function createSdkSessionImportService({
         unchanged: 0,
         failed: 0,
         tombstoned: 0,
+        'relay-owned': 0,
+        'bound-elsewhere': 0,
       };
       try {
         stmts.resetInterruptedSdkSessionImports.run(new Date().toISOString());
@@ -210,7 +226,8 @@ export function createSdkSessionImportService({
       }
       logger.info?.(
         `[sdk-session-import] listed=${summary.listed} new=${summary.new} changed=${summary.changed}`
-        + ` unchanged=${summary.unchanged} failed=${summary.failed} tombstoned=${summary.tombstoned}`,
+        + ` unchanged=${summary.unchanged} failed=${summary.failed} tombstoned=${summary.tombstoned}`
+        + ` relay-owned=${summary['relay-owned']} bound-elsewhere=${summary['bound-elsewhere']}`,
       );
       return summary;
     })();

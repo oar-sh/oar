@@ -1,62 +1,16 @@
 'use strict';
 
+import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
+
+// Re-exported for existing importers; the table itself lives in shared/ so the
+// Cursor worker's fallback cannot drift from this one.
+export { resolveFallbackContextLimitTokens };
+
 const CONTEXT_CACHE_MAX = 128;
-// Context window of a model id carrying the `[1m]` capability suffix, whatever
-// the base model's default window is.
-const LONG_CONTEXT_TOKENS = 1000000;
-const MODEL_FALLBACK_LIMITS = Object.freeze({
-  // Anthropic Claude Sonnet
-  'claude-sonnet-5': 200000,
-  'claude-sonnet-4.6': 200000,
-  'claude-sonnet-4.5': 200000,
-  // Anthropic Claude Haiku
-  'claude-haiku-4.5': 200000,
-  // Anthropic Claude Fable
-  'claude-fable-5': 200000,
-  // Anthropic Claude Opus
-  'claude-opus-5': 200000,
-  'claude-opus-4.8': 200000,
-  'claude-opus-4.7': 200000,
-  'claude-opus-4.6': 200000,
-  'claude-opus-4.6-fast': 200000,
-  'claude-opus-4.5': 200000,
-  // OpenAI GPT-5 series
-  'gpt-5.6-terra': 272000,
-  'gpt-5.6-luna': 272000,
-  'gpt-5.6-sol': 272000,
-  'gpt-5.5': 256000,
-  'gpt-5.4': 256000,
-  'gpt-5.3-codex': 256000,
-  'gpt-5.2-codex': 256000,
-  'gpt-5.2': 256000,
-  'gpt-5.4-mini': 256000,
-  'gpt-5-mini': 256000,
-  // Google Gemini
-  'gemini-3.1-pro-preview': 1000000,
-  'gemini-3.5-flash': 1000000,
-});
 
 function normalizeText(value) {
   const text = String(value || '').trim();
   return text || '';
-}
-
-/**
- * Resolve a fallback context window for a model id.
- *
- * Model ids may carry a bracketed capability suffix (see `isSafeClaudeModelId`),
- * e.g. `claude-opus-5[1m]`. Those are a different context window than the base
- * model, so they are resolved first — falling through to the base entry would
- * report a 1M session as 200k.
- */
-export function resolveFallbackContextLimitTokens(modelId) {
-  const model = normalizeText(modelId).toLowerCase();
-  if (!model) return null;
-  if (MODEL_FALLBACK_LIMITS[model]) return MODEL_FALLBACK_LIMITS[model];
-  const suffixMatch = model.match(/\[([^\]]+)\]\s*$/);
-  if (!suffixMatch) return null;
-  if (suffixMatch[1].trim() === '1m') return LONG_CONTEXT_TOKENS;
-  return MODEL_FALLBACK_LIMITS[model.slice(0, suffixMatch.index).trim()] || null;
 }
 
 function toNullableInt(value) {

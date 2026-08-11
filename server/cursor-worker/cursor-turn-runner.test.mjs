@@ -481,6 +481,65 @@ test('result usage publishes the context breakdown without disturbing the respon
   );
 });
 
+test('usage seen mid-turn is published even when no terminal status arrives', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[
+      evInit(),
+      evDelta('answer without a status message.'),
+      evUsage({ inputTokens: 800, outputTokens: 200, cacheReadTokens: 0, cacheWriteTokens: 0 }),
+      // stream ends here — no status message, so no result action
+    ]]),
+    readContextWindowImpl: async () => 200000,
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const post = stub.calls.find((call) => call.routePath === '/api/cursor-context-usage');
+  assert.ok(post, 'the normalizer-held usage must still be published');
+  assert.equal(post.body.contextUsage.totalTokens, 1000);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'answer without a status message.');
+});
+
+test('multi-step turns publish a per-call estimate, flagged as such', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[
+      evInit(),
+      { source: 'delta', update: { type: 'step-started', stepId: 1 } },
+      { source: 'delta', update: { type: 'step-started', stepId: 2 } },
+      evDelta('two-call answer.'),
+      evUsage({ inputTokens: 2000, outputTokens: 100, cacheReadTokens: 1000, cacheWriteTokens: 1000 }),
+      evFinished(),
+    ]]),
+    readContextWindowImpl: async () => 200000,
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const post = stub.calls.find((call) => call.routePath === '/api/cursor-context-usage');
+  // (2000 + 1000 + 1000) / 2 steps + 100 output
+  assert.equal(post.body.contextUsage.totalTokens, 2100);
+  assert.equal(post.body.contextUsage.estimateKind, 'cursor-per-call-average');
+});
+
+test('the static fallback window applies when the provider lookup returns null', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[
+      evInit('grok-4.5'),
+      evDelta('fallback window answer.'),
+      evUsage({ inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 }),
+      evFinished(),
+    ]]),
+    readContextWindowImpl: async () => null,
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const post = stub.calls.find((call) => call.routePath === '/api/cursor-context-usage');
+  assert.equal(post.body.contextUsage.maxTokens, 256000, 'grok-4.5 comes from the shared fallback table');
+  assert.equal(post.body.modelUsage['grok-4.5'].contextWindow, 256000);
+});
+
 test('an error result publishes a terminal response and republishes the partial text', async () => {
   const stub = makeApiStub();
   const runner = createCursorTurnRunner(baseRunnerOptions(stub, {

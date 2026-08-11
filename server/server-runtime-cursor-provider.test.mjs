@@ -25,6 +25,25 @@ test('cursor provider constants pin the composer default', () => {
   assert.match(source, /const DEFAULT_CURSOR_MODELS = \['composer-2\.5'\];/);
 });
 
+test('cursor discovery records whether a model can actually turn reasoning off', () => {
+  const detectSource = sliceBetween(
+    'function cursorEntrySupportsReasoningOff(entry) {',
+    '\nfunction cursorEntryEffortLevels(',
+  );
+  // Must mirror resolveCursorReasoningParams: 'thinking' or an explicit 'none'
+  // effort value are the only ways the SDK can be told to stop reasoning.
+  const detect = new Function(`${detectSource}\nreturn cursorEntrySupportsReasoningOff;`)();
+  assert.equal(detect({ parameters: [{ id: 'thinking', values: [] }] }), true);
+  assert.equal(detect({ parameters: [{ id: 'reasoning', values: [{ value: 'none' }, { value: 'low' }] }] }), true);
+  assert.equal(detect({ parameters: [{ id: 'effort', values: ['low', 'high'] }] }), false);
+  assert.equal(detect({ parameters: [] }), false);
+  assert.equal(detect({}), false);
+
+  const discoverySource = sliceBetween('async function refreshCursorProviderModels(', '\nfunction readGrokModelListSetting(');
+  assert.match(discoverySource, /reasoningOffByModel\[modelId\.toLowerCase\(\)\] = cursorEntrySupportsReasoningOff\(entry\);/);
+  assert.match(discoverySource, /CURSOR_MODEL_REASONING_OFF_SETTING_KEY, JSON\.stringify\(reasoningOffByModel\)/);
+});
+
 test('runtime_sessions migration adds the cursor_agent_id column', () => {
   const migrationSource = sliceBetween(
     'const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`)',
@@ -210,6 +229,9 @@ const BASE_SCHEMA = `
   );
   CREATE TABLE conversation_shares (
     token TEXT PRIMARY KEY, conversation_id TEXT, created_at TEXT, last_accessed_at TEXT, revoked_at TEXT
+  );
+  CREATE TABLE relay_session_links (
+    sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, created_at TEXT NOT NULL
   );
 `;
 

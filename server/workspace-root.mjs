@@ -3,6 +3,12 @@ import path from 'path';
 
 import { normalizeDriveLetterOnlyPath } from './services/workspace-root-path-policy.mjs';
 
+// Mirrors workspace-root-path-policy.mjs: the platform is a parameter, never an
+// implicit read of the host, so win32 `cd` semantics stay testable off Windows.
+function pathFor(platform) {
+  return platform === 'win32' ? path.win32 : path.posix;
+}
+
 function isDirectory(targetPath) {
   try {
     return fs.statSync(targetPath).isDirectory();
@@ -60,16 +66,22 @@ export function parseCdCommandTarget(text) {
   return target;
 }
 
-export function resolveCdCommandPath(targetPath, currentRoot, homeDir = process.env.USERPROFILE || process.env.HOME || process.cwd()) {
+export function resolveCdCommandPath(
+  targetPath,
+  currentRoot,
+  homeDir = process.env.USERPROFILE || process.env.HOME || process.cwd(),
+  platform = process.platform,
+) {
+  const pathApi = pathFor(platform);
   let candidate = normalizeDriveLetterOnlyPath(targetPath);
   if (!candidate) return null;
 
   if (candidate === '~') {
     candidate = homeDir;
   } else if (candidate.startsWith('~/') || candidate.startsWith('~\\')) {
-    candidate = path.join(homeDir, candidate.slice(2));
+    candidate = pathApi.join(homeDir, candidate.slice(2));
   }
 
-  const baseRoot = path.resolve(String(currentRoot || process.cwd()).trim() || process.cwd());
-  return path.resolve(baseRoot, candidate);
+  const baseRoot = pathApi.resolve(String(currentRoot || process.cwd()).trim() || process.cwd());
+  return pathApi.resolve(baseRoot, candidate);
 }

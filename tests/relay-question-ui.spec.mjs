@@ -1453,7 +1453,34 @@ test("chat title color matches active conversation list color", async ({ page, r
   }
 });
 
-test("supports drives explorer root and drive file preview API", async ({ page, request }) => {
+// The drives explorer is genuinely platform-split *on the server*: /api/drives/*
+// serve win32 drive-letter roots on Windows and the POSIX '/' tree everywhere
+// else. That branch reads the host OS of the process under test, so it cannot be
+// injected from a browser spec — hence one host-gated case per platform. The
+// platform that isn't running reports as skipped rather than silently vanishing.
+
+// Shared by both cases: the file preview API takes a native absolute path and
+// always answers with forward slashes.
+async function expectRepoReadmeDrivePreview(request, headers) {
+  const readmeDrivePath = `${process.cwd().replace(/\\/g, "/")}/README.md`;
+  const drivePreviewRes = await request.get(`/api/drives/files-preview?path=${encodeURIComponent(readmeDrivePath)}`, { headers });
+  expect(drivePreviewRes.ok()).toBeTruthy();
+  const drivePreviewBody = await drivePreviewRes.json();
+  expect(String(drivePreviewBody?.name || "")).toBe("README.md");
+  expect(String(drivePreviewBody?.path || "")).toContain("/README.md");
+  expect(String(drivePreviewBody?.rawUrl || "")).toContain("/api/drives/file?path=");
+}
+
+async function openDrivesExplorer(page, token) {
+  await page.goto(`/?token=${encodeURIComponent(token)}`);
+  await page.waitForLoadState("networkidle");
+  await openRepoBrowserFromComposer(page);
+  await page.click("#repo-root-drives-btn");
+  await expect(page.locator("#repo-root-drives-btn")).toHaveClass(/active/);
+}
+
+test("supports win32 drive-letter explorer roots and drive file preview API", async ({ page, request }) => {
+  test.skip(process.platform !== "win32", "win32 drive-letter roots; the POSIX case covers other hosts");
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
 
@@ -1466,23 +1493,38 @@ test("supports drives explorer root and drive file preview API", async ({ page, 
   const drivePath = String(drives[0]?.path || "");
   expect(drivePath).toMatch(/^[A-Za-z]:$/);
 
-  const readmeDrivePath = `${process.cwd().replace(/\\/g, "/")}/README.md`;
-  const drivePreviewRes = await request.get(`/api/drives/files-preview?path=${encodeURIComponent(readmeDrivePath)}`, { headers });
-  expect(drivePreviewRes.ok()).toBeTruthy();
-  const drivePreviewBody = await drivePreviewRes.json();
-  expect(String(drivePreviewBody?.name || "")).toBe("README.md");
-  expect(String(drivePreviewBody?.path || "")).toContain("/README.md");
-  expect(String(drivePreviewBody?.rawUrl || "")).toContain("/api/drives/file?path=");
+  await expectRepoReadmeDrivePreview(request, headers);
 
-  await page.goto(`/?token=${encodeURIComponent(token)}`);
-  await page.waitForLoadState("networkidle");
-  await openRepoBrowserFromComposer(page);
-  await page.click("#repo-root-drives-btn");
-
-  await expect(page.locator("#repo-root-drives-btn")).toHaveClass(/active/);
+  await openDrivesExplorer(page, token);
   await expect(page.locator("#repo-toggle-heavy-btn")).toBeDisabled();
   await expect(page.locator("#repo-toggle-hidden-btn")).toContainText("Hidden/System");
   await expect(page.locator("#repo-tree")).toContainText(drivePath);
+});
+
+test("supports the POSIX root explorer listing and drive file preview API", async ({ page, request }) => {
+  test.skip(process.platform === "win32", "POSIX '/' root; the win32 case covers Windows");
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const drivesRootsRes = await request.get("/api/drives/roots", { headers });
+  expect(drivesRootsRes.ok()).toBeTruthy();
+  const drivesRootsBody = await drivesRootsRes.json();
+  expect(String(drivesRootsBody?.root?.path || "")).toBe("/");
+  const entries = Array.isArray(drivesRootsBody?.root?.children) ? drivesRootsBody.root.children : [];
+  expect(entries.length).toBeGreaterThan(0);
+
+  const entryPath = String(entries[0]?.path || "");
+  expect(entryPath).toMatch(/^\/[^/]/);
+  // The tree labels POSIX entries with their basename; on win32 the drive path
+  // ("C:") doubles as its own label, which is why that case asserts the path.
+  const entryLabel = String(entries[0]?.name || "");
+  expect(entryLabel).toBeTruthy();
+
+  await expectRepoReadmeDrivePreview(request, headers);
+
+  await openDrivesExplorer(page, token);
+  await expect(page.locator("#repo-toggle-hidden-btn")).toContainText("Hidden/System");
+  await expect(page.locator("#repo-tree")).toContainText(entryLabel);
 });
 
 test("opens folder when clicking a tree node", async ({ page }) => {

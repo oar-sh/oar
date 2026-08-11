@@ -490,6 +490,22 @@ async function refreshClaudeProviderModels() {
   }
 }
 
+function readCursorModelReasoningOffSetting() {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_MODEL_REASONING_OFF_SETTING_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [modelId, supported] of Object.entries(parsed)) {
+      const key = String(modelId || '').trim().toLowerCase();
+      if (!key) continue;
+      out[key] = supported === true;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 function readCursorModelEffortsSetting() {
   try {
     const parsed = JSON.parse(readAppSettingValue(CURSOR_MODEL_EFFORTS_SETTING_KEY) || '{}');
@@ -545,10 +561,13 @@ function getCursorProviderSettings() {
     ...(enabledSelection.length ? enabledSelection : availableModels),
   ])).filter(Boolean);
   const storedEfforts = readCursorModelEffortsSetting();
+  const storedReasoningOff = readCursorModelReasoningOffSetting();
   const effortsByModel = {};
+  const reasoningOffByModel = {};
   for (const availableModel of availableModels) {
     const key = String(availableModel || '').trim().toLowerCase();
     if (!key) continue;
+    reasoningOffByModel[key] = storedReasoningOff[key] === true;
     const discoveredEfforts = storedEfforts[key] || [];
     // 'none' is always offered; discovered tiers follow. The worker maps
     // 'none' to an explicit off-switch where the model can express it
@@ -565,9 +584,14 @@ function getCursorProviderSettings() {
     availableModels,
     enabledModels: resolvedModels,
     effortsByModel,
+    reasoningOffByModel,
     // Pre-effort installs have models but no efforts setting; the settings
-    // route uses this to re-run discovery once and backfill the tiers.
+    // route uses this to re-run discovery once and backfill the tiers. The
+    // reasoning-off capability shipped later and needs the same one-shot
+    // backfill, otherwise an install that already discovered efforts would
+    // treat every Cursor model as unable to turn reasoning off.
     effortsDiscovered: readAppSettingValue(CURSOR_MODEL_EFFORTS_SETTING_KEY) !== '',
+    reasoningOffDiscovered: readAppSettingValue(CURSOR_MODEL_REASONING_OFF_SETTING_KEY) !== '',
     providerType: 'cursor',
   };
 }
@@ -804,6 +828,7 @@ function setCursorProviderSettings(update = {}) {
     stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
     stmts.deleteAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY);
     stmts.deleteAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY);
     stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, 'false', nowIso);
     stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
   } else {
@@ -811,6 +836,7 @@ function setCursorProviderSettings(update = {}) {
     if (normalizedApiKey) {
       stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
       stmts.deleteAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY);
+      stmts.deleteAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY);
       stmts.upsertAppSetting.run(CURSOR_API_KEY_SETTING_KEY, normalizedApiKey, nowIso);
     }
     const hasApiKey = !!(normalizedApiKey || existing.apiKey);
@@ -847,12 +873,27 @@ const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
 // whose value list varies by model; 'extra-high' is Cursor's spelling of the
 // composer's 'xhigh'. Values with no composer equivalent (e.g. 'minimal') are
 // dropped rather than remapped onto a tier the model does not actually have.
+// Mirrors resolveCursorReasoningParams exactly, including its parameter
+// precedence: it consults 'effort' first and only falls back to 'reasoning',
+// so scanning both would advertise an off switch the worker never sends.
+function cursorEntrySupportsReasoningOff(entry) {
+  const parameters = Array.isArray(entry?.parameters) ? entry.parameters : [];
+  const byId = new Map(parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]));
+  if (byId.has('thinking')) return true;
+  const effortParam = byId.get('effort') || byId.get('reasoning');
+  const values = Array.isArray(effortParam?.values) ? effortParam.values : [];
+  return values.some((value) => (
+    String((value && typeof value === 'object' ? value.value : value) || '').trim().toLowerCase() === 'none'
+  ));
+}
+
 function cursorEntryEffortLevels(entry) {
   const parameters = Array.isArray(entry?.parameters) ? entry.parameters : [];
-  const effortParam = parameters.find((param) => {
-    const paramId = String(param?.id || '').trim().toLowerCase();
-    return paramId === 'effort' || paramId === 'reasoning';
-  });
+  // Same precedence as cursorEntrySupportsReasoningOff and the adapter: a model
+  // listing both parameters must not have its tiers read from one and its off
+  // switch from the other.
+  const byId = new Map(parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]));
+  const effortParam = byId.get('effort') || byId.get('reasoning');
   if (!effortParam) return [];
   const levels = [];
   for (const value of (Array.isArray(effortParam.values) ? effortParam.values : [])) {
@@ -902,12 +943,14 @@ async function refreshCursorProviderModels() {
         : (Array.isArray(payload?.data) ? payload.data : []));
     const discovered = [];
     const effortsByModel = {};
+    const reasoningOffByModel = {};
     for (const entry of entries) {
       const modelId = String(typeof entry === 'string' ? entry : (entry?.id || entry?.name || '')).trim();
       if (!modelId || !isSafeCursorModelId(modelId)) continue;
       discovered.push(modelId);
       const effortLevels = cursorEntryEffortLevels(entry);
       if (effortLevels.length) effortsByModel[modelId.toLowerCase()] = effortLevels;
+      reasoningOffByModel[modelId.toLowerCase()] = cursorEntrySupportsReasoningOff(entry);
     }
     if (!discovered.length) {
       return { ok: false, models: settings.models, error: 'Cursor model discovery returned no models' };
@@ -916,6 +959,7 @@ async function refreshCursorProviderModels() {
     const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
     stmts.upsertAppSetting.run(CURSOR_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
     stmts.upsertAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY, JSON.stringify(reasoningOffByModel), nowIso);
     return { ok: true, models, error: null };
   } catch (error) {
     return {
@@ -1175,6 +1219,10 @@ const CURSOR_MODEL_SETTING_KEY = 'cursor_model';
 const CURSOR_MODELS_SETTING_KEY = 'cursor_models';
 const CURSOR_ENABLED_MODELS_SETTING_KEY = 'cursor_enabled_models';
 const CURSOR_MODEL_EFFORTS_SETTING_KEY = 'cursor_model_efforts';
+// Whether a Cursor model can actually be told to stop reasoning ('thinking'
+// param, or an 'effort' value of 'none'). Without it, 'none' means "model
+// default" and the composer must not promise reasoning-off.
+const CURSOR_MODEL_REASONING_OFF_SETTING_KEY = 'cursor_model_reasoning_off';
 // Cursor exposes no account API for the monthly included pools, so the
 // allowances the plan-usage card measures spend against are user-supplied.
 const CURSOR_ALLOWANCE_CURSOR_MODELS_SETTING_KEY = 'cursor_allowance_cursor_models_usd';
@@ -3036,6 +3084,17 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sdk_session_imports_status
     ON sdk_session_imports(status, updated_at);
 
+  -- Copilot SDK sessions the relay created as execution vehicles for existing
+  -- conversations. The startup import sweep must never surface these as new
+  -- conversations: their history already lives in the conversation they ran
+  -- for (that duplication is how "shadow" conversations like a stray
+  -- "procees" appeared in the conversation list).
+  CREATE TABLE IF NOT EXISTS relay_session_links (
+    sdk_session_id  TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+  );
+
   -- path_key is the dedupe key: on Windows it is the whole path lower-cased, so
   -- "C:\Git\Repo" and "c:\git\repo" occupy one row instead of two. See
   -- migrations/0002-recent-workspace-roots-path-key.mjs for existing databases.
@@ -3350,6 +3409,13 @@ if (!messageColumns.includes('hidden_from_shares')) {
 }
 if (!messageColumns.includes('share_hidden_at')) {
   db.exec(`ALTER TABLE messages ADD COLUMN share_hidden_at TEXT`);
+}
+if (!messageColumns.includes('executed_provider')) {
+  // Which provider actually ran the turn, derived from the authenticated
+  // responder identity — never from the response payload. A value that
+  // differs from the conversation's provider marks a cross-provider
+  // execution (e.g. the Copilot relay answering a Cursor conversation).
+  db.exec(`ALTER TABLE messages ADD COLUMN executed_provider TEXT`);
 }
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_share_visibility
@@ -6752,8 +6818,10 @@ async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
   if (typeof sessionWorkerSupervisor?.ensureWorker !== 'function') return 0;
   if (typeof stmts.listPendingWorkerOwnerSessionIds?.all !== 'function') return 0;
 
-  const now = new Date().toISOString();
-  const rows = stmts.listPendingWorkerOwnerSessionIds.all(now, 25);
+  // No next_attempt_at filter here: rows sitting in retry backoff still need
+  // their worker warm, otherwise the 2s relay poll wins the race the moment
+  // the backoff matures and the turn executes on the wrong provider.
+  const rows = stmts.listPendingWorkerOwnerSessionIds.all(25);
   let requested = 0;
   for (const row of rows) {
     const sdkSessionId = String(row?.sdk_session_id || '').trim();

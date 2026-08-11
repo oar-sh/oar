@@ -249,6 +249,39 @@ test('usage is captured last-wins from both surfaces and exposed on the result',
   assert.deepEqual(result[0].payload.usage, second);
 });
 
+test('init model accepts the SDK ModelSelection object shape', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const actions = normalizer.normalize(stream({
+    type: 'system',
+    subtype: 'init',
+    model: { id: 'grok-4.5', params: [{ id: 'effort', value: 'high' }] },
+  }));
+  assert.equal(actions[0].payload.model, 'grok-4.5');
+  assert.equal(normalizer.model, 'grok-4.5');
+});
+
+test('lastUsage is exposed even when no terminal status message arrives', () => {
+  const normalizer = createSdkMessageNormalizer();
+  assert.equal(normalizer.lastUsage, null);
+  const usage = { inputTokens: 120, outputTokens: 40, cacheReadTokens: 900, cacheWriteTokens: 30 };
+  normalizer.normalize(delta({ type: 'turn-ended', usage }));
+  assert.deepEqual(normalizer.lastUsage, usage);
+});
+
+test('modelCallCount tracks step boundaries, assistant messages in degraded mode', () => {
+  const withSteps = createSdkMessageNormalizer();
+  assert.equal(withSteps.modelCallCount, 1);
+  withSteps.normalize(delta({ type: 'step-started', stepId: 1 }));
+  withSteps.normalize(delta({ type: 'step-started', stepId: 2 }));
+  withSteps.normalize(delta({ type: 'step-started', stepId: 3 }));
+  assert.equal(withSteps.modelCallCount, 3);
+
+  const degraded = createSdkMessageNormalizer();
+  degraded.normalize(assistantText('First model call.'));
+  degraded.normalize(assistantText('Second model call.'));
+  assert.equal(degraded.modelCallCount, 2);
+});
+
 test('thought text is capped at 16KiB per thought', () => {
   const normalizer = createSdkMessageNormalizer();
   const first = normalizer.normalize(delta({ type: 'thinking-delta', text: 'y'.repeat(20 * 1024) }));

@@ -17,6 +17,9 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
       text TEXT NOT NULL, timestamp TEXT NOT NULL
     );
     CREATE TABLE deleted_sdk_sessions (sdk_session_id TEXT PRIMARY KEY);
+    CREATE TABLE relay_session_links (
+      sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, created_at TEXT NOT NULL
+    );
     CREATE TABLE sdk_session_imports (
       sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT, status TEXT NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0, started_at TEXT, completed_at TEXT,
@@ -25,6 +28,8 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
   `);
   const stmts = {
     getDeletedSdkSession: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions WHERE sdk_session_id = ?`),
+    getRelaySessionLink: db.prepare(`SELECT * FROM relay_session_links WHERE sdk_session_id = ?`),
+    getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? ORDER BY updated_at DESC LIMIT 1`),
     getSdkSessionImport: db.prepare(`SELECT * FROM sdk_session_imports WHERE sdk_session_id = ?`),
     upsertSdkSessionImport: db.prepare(`INSERT INTO sdk_session_imports (sdk_session_id, conversation_id, status, attempt_count, updated_at) VALUES (?, ?, 'pending', 0, ?) ON CONFLICT(sdk_session_id) DO NOTHING`),
     claimSdkSessionImport: db.prepare(`UPDATE sdk_session_imports SET status = 'processing', attempt_count = attempt_count + 1, started_at = ?, updated_at = ?, last_error = NULL WHERE sdk_session_id = ? AND (? = 1 OR status != 'completed') AND status != 'processing'`),
@@ -72,7 +77,7 @@ test('imports all SDK sessions sequentially and skips unchanged ledger rows', as
     },
   });
   const first = await service.runStartupImport();
-  assert.deepEqual(first, { listed: 2, new: 2, changed: 0, unchanged: 0, failed: 0, tombstoned: 0 });
+  assert.deepEqual(first, { listed: 2, new: 2, changed: 0, unchanged: 0, failed: 0, tombstoned: 0, 'relay-owned': 0, 'bound-elsewhere': 0 });
   assert.deepEqual(resumed, ['first', 'second']);
   assert.deepEqual(resumeConfigs, [
     { suppressResumeEvent: true, availableTools: [] },
@@ -81,7 +86,7 @@ test('imports all SDK sessions sequentially and skips unchanged ledger rows', as
   assert.equal(replaced.length, 2);
 
   const second = await service.runStartupImport();
-  assert.deepEqual(second, { listed: 2, new: 0, changed: 0, unchanged: 2, failed: 0, tombstoned: 0 });
+  assert.deepEqual(second, { listed: 2, new: 0, changed: 0, unchanged: 2, failed: 0, tombstoned: 0, 'relay-owned': 0, 'bound-elsewhere': 0 });
   assert.deepEqual(resumed, ['first', 'second']);
   assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM conversations`).get().count, 2);
 });
@@ -135,7 +140,7 @@ test('re-imports a newer SDK snapshot and preserves manual relay titles', async 
 
   const summary = await service.runStartupImport();
 
-  assert.deepEqual(summary, { listed: 1, new: 0, changed: 1, unchanged: 0, failed: 0, tombstoned: 0 });
+  assert.deepEqual(summary, { listed: 1, new: 0, changed: 1, unchanged: 0, failed: 0, tombstoned: 0, 'relay-owned': 0, 'bound-elsewhere': 0 });
   assert.deepEqual(resumed, ['changed', 'changed']);
   assert.deepEqual(replaced.at(-1), {
     conversationId: 'changed',
@@ -218,4 +223,42 @@ test('forced refresh bypasses the timestamp skip decision', async () => {
 
   assert.equal(result.status, 'completed');
   assert.deepEqual(resumed, ['refresh', 'refresh']);
+});
+
+test('relay execution sessions are never imported as conversations', async () => {
+  const { db, service, resumed } = makeHarness({
+    eventsBySession: {
+      'relay-vehicle': [{ id: 'm1', role: 'user', text: 'please proceed' }],
+      'normal-cli': [{ id: 'm2', role: 'user', text: 'a real CLI session' }],
+    },
+  });
+  // The relay reported that it created 'relay-vehicle' to execute turns for an
+  // existing conversation.
+  db.prepare(`INSERT INTO relay_session_links (sdk_session_id, conversation_id, created_at) VALUES (?, ?, ?)`)
+    .run('relay-vehicle', 'existing-conversation', '2026-08-11T13:00:00.000Z');
+
+  const summary = await service.runStartupImport();
+
+  assert.equal(summary['relay-owned'], 1);
+  assert.equal(summary.new, 1);
+  assert.deepEqual(resumed, ['normal-cli']);
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM conversations WHERE id = 'relay-vehicle'`).get().count, 0);
+});
+
+test('sessions bound to an existing conversation under another id are not duplicated', async () => {
+  const { db, service, resumed } = makeHarness({
+    eventsBySession: {
+      'bound-session': [{ id: 'm1', role: 'user', text: 'already visible elsewhere' }],
+    },
+  });
+  db.prepare(`
+    INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at)
+    VALUES ('owning-conversation', 'Owner', 'bound-session', '2026-08-11T12:00:00.000Z', '2026-08-11T12:00:00.000Z')
+  `).run();
+
+  const summary = await service.runStartupImport();
+
+  assert.equal(summary['bound-elsewhere'], 1);
+  assert.deepEqual(resumed, []);
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM conversations WHERE id = 'bound-session'`).get().count, 0);
 });

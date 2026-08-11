@@ -23,6 +23,7 @@ import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services
 import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
+import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -81,8 +82,18 @@ function normalizeRequestedProviderType(value = '') {
   if (normalized === 'openai' || normalized === 'openai-byok' || normalized === 'openai-image') return 'openai';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   if (normalized === 'cursor') return 'cursor';
+  // Without these, an explicit request for a bootstrap-only provider read as
+  // "no provider stated" and the guards below could never fire.
+  if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
+  if (normalized === 'claude' || normalized === 'anthropic') return 'claude';
   return '';
 }
+
+const BOOTSTRAP_ONLY_PROVIDER_LABELS = Object.freeze({
+  cursor: 'Cursor',
+  grok: 'Grok',
+  claude: 'Claude',
+});
 
 function deriveModelOrigin(model) {
   const requested = String(model || '').trim().toLowerCase();
@@ -701,6 +712,18 @@ export function shouldTakeOverStrandedPendingMessage({
   return degradedReason === 'startup-heartbeat-timeout' || degradedReason === 'stale-pid';
 }
 
+// Which provider actually executed a turn, derived from the authenticated
+// responder identity: a session worker names its sdk session via the bridge
+// header, and that session's runtime row names the provider. No identity
+// means the legacy Copilot relay. The response payload has no say — a
+// misrouted responder must not be able to mask itself.
+export function resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity } = {}) {
+  const responderSessionId = normalizeSessionWorkerId(responseBridgeIdentity?.sessionId);
+  if (!responderSessionId) return 'github';
+  const runtimeSession = stmts?.getRuntimeSessionBySdkSessionId?.get?.(responderSessionId) || null;
+  return String(runtimeSession?.provider_type || '').trim().toLowerCase() || 'github';
+}
+
 export function dequeuePendingMessage({
   db,
   stmts,
@@ -726,7 +749,13 @@ export function dequeuePendingMessage({
     }
     if (!next && affinityOnly) return null;
     if (!next) {
-      next = stmts.findPending.get(currentIso);
+      // Requesters that reach the global fallback carry no worker identity
+      // (the legacy Copilot relay CLI, or a bridge client whose affinity scan
+      // came up empty). Conversations bound to a session-worker provider are
+      // off limits here: their turns must only ever run on their own worker.
+      next = stmts.findPendingForLegacyRelay
+        ? stmts.findPendingForLegacyRelay.get(currentIso)
+        : stmts.findPending.get(currentIso);
     }
     if (!next) return null;
     if (routingEnabled && requesterSid && stmts.setProcessingWithWorkerLease) {
@@ -3691,6 +3720,20 @@ export function registerMessagesRoutes(app, deps) {
         code: 'OPENAI_NOT_CONFIGURED',
       });
     }
+    // This create path can only bind github/openai sessions. Accepting a
+    // Cursor, Grok or Claude request here would silently produce a GitHub
+    // conversation running a model the caller never asked for.
+    const bootstrapOnlyProvider = shouldCreateConversation
+      ? BOOTSTRAP_ONLY_PROVIDER_LABELS[requestedProviderType]
+      : null;
+    if (bootstrapOnlyProvider) {
+      // 409 to match its siblings (CURSOR/GROK_MODEL_REQUIRES_NEW_CONVERSATION),
+      // which report the same "wrong entry point for this provider" condition.
+      return res.status(409).json({
+        error: `Creating a ${bootstrapOnlyProvider} conversation requires POST /api/conversation/bootstrap`,
+        code: 'PROVIDER_REQUIRES_BOOTSTRAP',
+      });
+    }
     const requestedConfiguredOpenAIModel = configuredOpenAI?.enabled
       && String(model || '').trim() === String(configuredOpenAI.model || '').trim();
     if (shouldRequireNewOpenAIConversation({
@@ -3842,16 +3885,30 @@ export function registerMessagesRoutes(app, deps) {
     // is allowed: each Cursor turn resumes the persisted agent.
     const configuredCursor = runtimeUsesCursor ? getCursorProviderSettings() : null;
     const requestedCursorModel = runtimeUsesCursor ? String(model || '').trim() : '';
-    const availableCursorModels = new Set([
+    const availableCursorModels = [
       String(configuredCursor?.model || '').trim(),
       String(existingRuntimeSession?.provider_model || '').trim(),
       ...(Array.isArray(configuredCursor?.models) ? configuredCursor.models : []),
-    ].map((value) => String(value || '').trim()).filter(Boolean));
-    const cursorModel = runtimeUsesCursor
-      ? (availableCursorModels.has(requestedCursorModel)
-          ? requestedCursorModel
-          : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredCursor?.model || '').trim()))
-      : '';
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    // A model the Cursor provider does not offer is refused instead of quietly
+    // relabelled: silently answering with the pinned/default model is how a
+    // conversation ended up running a different model than the composer showed.
+    const cursorModelSelection = runtimeUsesCursor
+      ? resolveProviderModelSelection({
+          requestedModel: requestedCursorModel,
+          configuredModel: String(existingRuntimeSession?.provider_model || '').trim()
+            || String(configuredCursor?.model || '').trim(),
+          availableModels: availableCursorModels,
+        })
+      : null;
+    if (cursorModelSelection && !cursorModelSelection.ok) {
+      return res.status(400).json({
+        error: `Cursor model "${cursorModelSelection.requestedModel}" is not available`,
+        code: 'CURSOR_MODEL_UNAVAILABLE',
+        supportedModels: cursorModelSelection.availableModels || [],
+      });
+    }
+    const cursorModel = cursorModelSelection ? cursorModelSelection.model : '';
     const configuredGrok = runtimeUsesGrok ? getGrokProviderSettings() : null;
     const requestedGrokModel = runtimeUsesGrok ? String(model || '').trim() : '';
     const pinnedGrokModel = runtimeUsesGrok
@@ -4172,6 +4229,18 @@ export function registerMessagesRoutes(app, deps) {
         `).run(now, sessionId || null, convId);
       }
       stmts.deleteDraftUploadRefs?.run?.(convId);
+      // Cursor allows per-turn model switching, so the pinned provider_model has
+      // to follow the accepted model; otherwise the conversation list and the
+      // composer keep restoring the model chosen at bootstrap.
+      if (
+        runtimeUsesCursor
+        && cursorModel
+        && runtimeSession?.id
+        && cursorModel !== String(existingRuntimeSession?.provider_model || '').trim()
+        && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
+      ) {
+        stmts.updateRuntimeSessionProvider.run('cursor', cursorModel, cursorModel, now, runtimeSession.id);
+      }
       conversationPreferences = persistConversationModelPreference(
         convId,
         requestedRelayMode,
@@ -4619,6 +4688,24 @@ export function registerMessagesRoutes(app, deps) {
       new Date().toISOString(),
       conversationId,
     );
+    res.json({ ok: true });
+  });
+
+  // POST /api/relay-session-link — the Copilot relay reports which SDK session
+  // it created to execute a conversation's turns. The startup import sweep
+  // consults these links so relay execution vehicles are never surfaced as
+  // stand-alone conversations ("shadow" duplicates in the conversation list).
+  app.post('/api/relay-session-link', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const sdkSessionId = String(req.body?.sdkSessionId || '').trim();
+    if (!conversationId || !sdkSessionId) {
+      return res.status(400).json({ error: 'Missing conversationId or sdkSessionId' });
+    }
+    if (typeof stmts.upsertRelaySessionLink?.run !== 'function') {
+      return res.status(500).json({ error: 'Relay session link storage is unavailable' });
+    }
+    stmts.upsertRelaySessionLink.run(sdkSessionId, conversationId, new Date().toISOString());
     res.json({ ok: true });
   });
 
@@ -5727,6 +5814,13 @@ export function registerMessagesRoutes(app, deps) {
     const responseId = uuidv4();
     const requestedModel = String(q?.model || '').trim() || null;
     const modelOrigin = deriveModelOrigin(requestedModel);
+    const executedProvider = resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity });
+    const conversationProvider = String(
+      stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type || '',
+    ).trim().toLowerCase() || 'github';
+    if (executedProvider !== conversationProvider) {
+      console.warn(`[${ts()}] PROVIDER MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${conversationProvider} executed=${executedProvider} — turn answered by the wrong provider`);
+    }
     const explicitModel = String(model || '').trim() || null;
     const resolvedAssistantModel = explicitModel
       || (modelOrigin === 'auto' ? 'unknown' : requestedModel)
@@ -5767,6 +5861,7 @@ export function registerMessagesRoutes(app, deps) {
         explicitModel,
         modelOrigin,
       );
+      stmts.setMessageExecutedProvider?.run(executedProvider, responseId);
       stmts.linkActivityToResponse.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
       stmts.linkThoughtsToResponse?.run(responseId, messageId);
@@ -5985,6 +6080,7 @@ export function registerMessagesRoutes(app, deps) {
         timestamp: now,
         activities,
         thoughts,
+        executedProvider,
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
