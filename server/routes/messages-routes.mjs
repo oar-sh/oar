@@ -714,14 +714,38 @@ export function shouldTakeOverStrandedPendingMessage({
 
 // Which provider actually executed a turn, derived from the authenticated
 // responder identity: a session worker names its sdk session via the bridge
-// header, and that session's runtime row names the provider. No identity
-// means the legacy Copilot relay. The response payload has no say — a
-// misrouted responder must not be able to mask itself.
-export function resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity } = {}) {
+// header, and that session's runtime row names the provider. The response
+// payload has no say — a misrouted responder must not be able to mask itself.
+//
+// Identity-less responders are the interesting case. Two of them exist:
+//   - server/relay.mjs, spawned by start.js with plain env (see the spawn in
+//     start.js: no COPILOT_PROVIDER_TYPE), so it authenticates on the Copilot
+//     plan no matter what the conversation is bound to. A turn it answers for
+//     a non-github conversation really did run on the wrong plan.
+//   - this server finalizing an image operation it executed itself: it calls
+//     the provider's own API with the conversation's BYOK key and then
+//     self-posts to /api/response with no bridge headers. That one genuinely
+//     ran on the bound provider.
+// OpenAI BYOK chat turns are not identity-less: they run on a Copilot CLI
+// launched with COPILOT_PROVIDER_TYPE=openai whose web-relay extension does
+// send X-Relay-Session-Id, so they resolve through the runtime row above.
+export function resolveExecutedProviderForResponse({
+  stmts,
+  responseBridgeIdentity,
+  conversationProvider = null,
+  serverExecutedOperation = false,
+} = {}) {
+  const boundProvider = String(conversationProvider || '').trim().toLowerCase() || 'github';
   const responderSessionId = normalizeSessionWorkerId(responseBridgeIdentity?.sessionId);
-  if (!responderSessionId) return 'github';
-  const runtimeSession = stmts?.getRuntimeSessionBySdkSessionId?.get?.(responderSessionId) || null;
-  return String(runtimeSession?.provider_type || '').trim().toLowerCase() || 'github';
+  if (responderSessionId) {
+    const runtimeSession = stmts?.getRuntimeSessionBySdkSessionId?.get?.(responderSessionId) || null;
+    const providerType = String(runtimeSession?.provider_type || '').trim().toLowerCase();
+    // A session id that names no runtime row proves nothing; reporting
+    // 'github' here would fabricate a mismatch out of a stale identity.
+    return providerType || 'unknown';
+  }
+  if (serverExecutedOperation) return boundProvider;
+  return 'github';
 }
 
 export function dequeuePendingMessage({
@@ -5814,11 +5838,23 @@ export function registerMessagesRoutes(app, deps) {
     const responseId = uuidv4();
     const requestedModel = String(q?.model || '').trim() || null;
     const modelOrigin = deriveModelOrigin(requestedModel);
-    const executedProvider = resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity });
     const conversationProvider = String(
       stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type || '',
     ).trim().toLowerCase() || 'github';
-    if (executedProvider !== conversationProvider) {
+    const executedProvider = resolveExecutedProviderForResponse({
+      stmts,
+      responseBridgeIdentity,
+      conversationProvider,
+      // Image operations are executed by this server against the conversation's
+      // own provider API, then finalized through an identity-less self-post.
+      serverExecutedOperation: !!q?.image_operation_id,
+    });
+    if (executedProvider === 'unknown') {
+      // An identity that names no runtime session is itself an anomaly (a stale
+      // or forged header), just not evidence of cross-provider execution. Say so
+      // rather than staying silent.
+      console.warn(`[${ts()}] PROVIDER UNRESOLVED ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${conversationProvider} responder=${normalizeSessionWorkerId(responseBridgeIdentity?.sessionId)?.slice(0, 8) || 'none'} — responder identity matches no runtime session`);
+    } else if (executedProvider !== conversationProvider) {
       console.warn(`[${ts()}] PROVIDER MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${conversationProvider} executed=${executedProvider} — turn answered by the wrong provider`);
     }
     const explicitModel = String(model || '').trim() || null;

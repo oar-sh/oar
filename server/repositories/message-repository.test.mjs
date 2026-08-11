@@ -348,7 +348,7 @@ test('anonymous dequeue skips provider-worker rows but the owning worker still g
   assert.equal(claimed?.status, 'processing');
 });
 
-test('executed provider derives from responder identity, never from the payload', () => {
+test('executed provider derives from responder identity, never from the response payload', () => {
   const db = createTestDb();
   db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type) VALUES (?, ?, ?, ?)')
     .run('runtime-cursor', 'conv-cursor', 'cursor-session', 'cursor');
@@ -362,15 +362,77 @@ test('executed provider derives from responder identity, never from the payload'
     responseBridgeIdentity: { sessionId: 'cursor-session' },
   }), 'cursor');
 
-  // No bridge identity = the legacy Copilot relay.
-  assert.equal(resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity: null }), 'github');
-  assert.equal(resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity: { sessionId: '' } }), 'github');
+  // No bridge identity = the legacy Copilot relay, which owns github turns.
+  assert.equal(resolveExecutedProviderForResponse({
+    stmts,
+    responseBridgeIdentity: null,
+    conversationProvider: 'github',
+  }), 'github');
+  assert.equal(resolveExecutedProviderForResponse({
+    stmts,
+    responseBridgeIdentity: { sessionId: '' },
+    conversationProvider: '',
+  }), 'github');
 
-  // Unknown identity falls back to github rather than trusting anything else.
+  // A bridge session id that names no runtime row proves nothing: it must not
+  // fabricate a mismatch by claiming github.
   assert.equal(resolveExecutedProviderForResponse({
     stmts,
     responseBridgeIdentity: { sessionId: 'never-registered' },
-  }), 'github');
+    conversationProvider: 'github',
+  }), 'unknown');
+});
+
+test('a server-executed image operation is credited to the conversation provider', () => {
+  const db = createTestDb();
+  const stmts = {
+    getRuntimeSessionBySdkSessionId: db.prepare('SELECT * FROM runtime_sessions WHERE sdk_session_id = ?'),
+  };
+
+  // The OpenAI BYOK image path: this server calls the OpenAI API with the
+  // conversation's own key, then finalizes through a self-post that carries no
+  // bridge headers. Flagging that as a github crossover was the false alarm.
+  assert.equal(resolveExecutedProviderForResponse({
+    stmts,
+    responseBridgeIdentity: null,
+    conversationProvider: 'openai',
+    serverExecutedOperation: true,
+  }), 'openai');
+  assert.equal(resolveExecutedProviderForResponse({
+    stmts,
+    responseBridgeIdentity: null,
+    conversationProvider: 'OpenAI ',
+    serverExecutedOperation: true,
+  }), 'openai');
+});
+
+test('an identity-less response for a non-github conversation still reports github', () => {
+  const db = createTestDb();
+  const stmts = {
+    getRuntimeSessionBySdkSessionId: db.prepare('SELECT * FROM runtime_sessions WHERE sdk_session_id = ?'),
+  };
+
+  // The theft case. server/relay.mjs is the only identity-less responder for a
+  // normal turn and start.js gives it plain env, so it runs on the Copilot plan
+  // whatever the conversation is bound to. openai belongs in this list: a BYOK
+  // chat turn answered without an identity did NOT use the BYOK key.
+  for (const provider of ['cursor', 'claude', 'grok', 'openai']) {
+    assert.equal(resolveExecutedProviderForResponse({
+      stmts,
+      responseBridgeIdentity: null,
+      conversationProvider: provider,
+    }), 'github', `expected ${provider} theft to be reported as github`);
+  }
+
+  // An OpenAI BYOK chat turn from its properly configured worker carries an
+  // identity and resolves through the runtime row instead.
+  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type) VALUES (?, ?, ?, ?)')
+    .run('runtime-openai', 'conv-openai', 'openai-session', 'openai');
+  assert.equal(resolveExecutedProviderForResponse({
+    stmts,
+    responseBridgeIdentity: { sessionId: 'openai-session' },
+    conversationProvider: 'openai',
+  }), 'openai');
 });
 
 test('legacy-relay dequeue respects retry backoff windows', () => {

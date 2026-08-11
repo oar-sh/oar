@@ -716,7 +716,9 @@ function createMessageNode(msg, msgId = null, force = false) {
   // not silent: it ran on another plan than the header indicates.
   const executedProvider = String(msg?.executedProvider || '').trim().toLowerCase();
   const boundProvider = String(conversations[currentConvId]?.runtimeProviderType || 'github').trim().toLowerCase();
-  const crossProviderTag = (msg.role === 'assistant' && executedProvider && executedProvider !== boundProvider)
+  // 'unknown' means the responder identity did not resolve, not that another
+  // provider ran the turn — no chip for it.
+  const crossProviderTag = (msg.role === 'assistant' && executedProvider && executedProvider !== 'unknown' && executedProvider !== boundProvider)
     ? ` <span class="msg-provider-mismatch" title="This turn was executed by the ${escHtml(executedProvider)} provider, not the conversation's ${escHtml(boundProvider)} provider.">ran on ${escHtml(executedProvider)}</span>`
     : '';
   const usage = (msg.role === 'assistant' && msg?.usage && typeof msg.usage === 'object') ? msg.usage : null;
