@@ -290,10 +290,36 @@ test('legacy-relay dequeue never returns rows bound to a session-worker provider
   // The cursor/claude/grok rows are older, but the relay must skip them all.
   assert.equal(repo.findPendingForLegacyRelay.get(now), undefined);
 
-  // A github conversation is claimable even when it carries an owner session
-  // (copilot conversations get their SDK session id as owner after turn one).
-  seedProviderConversation(db, { key: 'github', providerType: 'github', ownerSdkSessionId: 'copilot-sdk', timestamp: '2026-08-11T12:00:03.000Z' });
+  // An owned github row is a session worker's job too: the worker is starting
+  // up, and the relay polls far faster than a worker boots.
+  seedProviderConversation(db, { key: 'github-owned', providerType: 'github', ownerSdkSessionId: 'copilot-sdk', timestamp: '2026-08-11T12:00:03.000Z' });
+  assert.equal(repo.findPendingForLegacyRelay.get(now), undefined);
+
+  // Unowned (routing disabled, or no worker responsible) is the relay's work.
+  seedProviderConversation(db, { key: 'github', providerType: 'github', timestamp: '2026-08-11T12:00:04.000Z' });
   assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-github');
+});
+
+test('legacy-relay dequeue leaves an owned openai row to its worker', () => {
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  const now = '2026-08-11T13:00:00.000Z';
+
+  // The live regression: an OpenAI image turn owned by a booting worker was
+  // grabbed by the relay ~0.3s after the worker spawned, failed (gpt-image-*
+  // is not a Copilot model) and burned a retry plus a 60s backoff.
+  seedProviderConversation(db, { key: 'openai-owned', providerType: 'openai', ownerSdkSessionId: 'conv-openai-owned', timestamp: '2026-08-11T12:00:00.000Z' });
+  assert.equal(repo.findPendingForLegacyRelay.get(now), undefined);
+
+  // The owning worker still claims it through the routed path.
+  const claimed = dequeuePendingMessage({
+    db,
+    stmts: repo,
+    nowIso: now,
+    routingEnabled: true,
+    requesterSessionId: 'conv-openai-owned',
+  });
+  assert.equal(claimed?.id, 'message-openai-owned');
 });
 
 test('legacy-relay dequeue serves openai rows and rows with no runtime session', () => {
