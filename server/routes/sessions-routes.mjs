@@ -9,6 +9,11 @@ import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
+import {
+  resolveProviderReasoningEffort,
+  supportedReasoningEffortsForProviderModel,
+} from '../services/provider-reasoning-effort.mjs';
 import { mapUsageSnapshotRow, fetchUsageSummaryPromise } from '../services/usage-snapshot-helpers.mjs';
 import { readStoredClaudeContextUsage } from '../services/claude-context-usage.mjs';
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
@@ -460,6 +465,12 @@ export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSetti
   const cursorEffortsByModel = cursorSettings?.effortsByModel && typeof cursorSettings.effortsByModel === 'object'
     ? cursorSettings.effortsByModel
     : {};
+  const cursorReasoningOffByModel = cursorSettings?.reasoningOffByModel && typeof cursorSettings.reasoningOffByModel === 'object'
+    ? cursorSettings.reasoningOffByModel
+    : {};
+  // Models that cannot be told to stop reasoning still expose 'none'; it means
+  // "model default" there, and the composer labels it that way.
+  const cursorReasoningDefaultOnly = {};
   for (const cursorModel of cursorModels) {
     const providersKey = String(cursorModel || '').trim();
     if (!providersKey) continue;
@@ -470,6 +481,16 @@ export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSetti
       ? cursorEffortsByModel[lowerKey]
       : ['none'];
     cursorReasoningByModel[lowerKey] = [...cursorEfforts];
+    // Only claim a model cannot turn reasoning off where discovery actually said
+    // so. Before the first refresh on an upgraded install there is no map at
+    // all, and a configured model discovery never saw has no entry in it —
+    // asserting "unsupported" in either case would relabel a working off switch.
+    if (
+      cursorSettings?.reasoningOffDiscovered === true
+      && Object.prototype.hasOwnProperty.call(cursorReasoningOffByModel, lowerKey)
+    ) {
+      cursorReasoningDefaultOnly[lowerKey] = cursorReasoningOffByModel[lowerKey] !== true;
+    }
     if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
       reasoningByModel[lowerKey] = [...cursorEfforts];
     }
@@ -495,6 +516,10 @@ export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSetti
     reasoningByProvider: {
       ...(modelState?.reasoningByProvider || {}),
       cursor: cursorReasoningByModel,
+    },
+    reasoningOffUnsupportedByProvider: {
+      ...(modelState?.reasoningOffUnsupportedByProvider || {}),
+      cursor: cursorReasoningDefaultOnly,
     },
     modelMetadataByModel,
     providersByModel,
@@ -582,22 +607,6 @@ function normalizeRequestedProviderType(value = '') {
 function isOpenAIImageModelId(model = '') {
   const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
   return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
-}
-
-export function resolveOpenAISessionModel({
-  requestedModel = '',
-  configuredModel = 'gpt-4o',
-  availableModels = [],
-} = {}) {
-  const requested = String(requestedModel || '').trim();
-  const fallback = String(configuredModel || '').trim() || 'gpt-4o';
-  const available = new Set(
-    (Array.isArray(availableModels) ? availableModels : [])
-      .map((value) => String(value || '').trim())
-      .filter(Boolean),
-  );
-  if (requested === fallback || available.has(requested)) return requested;
-  return fallback;
 }
 
 function runHostSuspendToRam() {
@@ -1646,7 +1655,11 @@ export function buildConversationMessages({
         const sourceMessageId = message?.role === 'assistant'
           ? (responseMessageToSourceId.get(id) || undefined)
           : undefined;
-        const queueRow = sourceMessageId ? queueRowsById.get(sourceMessageId) : null;
+        // A user row's queue entry shares its id; assistant rows reach the same
+        // entry through the response mapping. Both need it for the effort tag.
+        const queueRow = sourceMessageId
+          ? queueRowsById.get(sourceMessageId)
+          : (message?.role === 'user' ? queueRowsById.get(id) : null);
         return {
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
           thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
@@ -1665,6 +1678,7 @@ export function buildConversationMessages({
           hiddenFromShares: Number(message?.hidden_from_shares || 0) === 1,
           timestamp: message?.timestamp,
           sourceMessageId,
+          executedProvider: message?.executed_provider || message?.executedProvider || undefined,
         };
       })
     : [];
@@ -1673,7 +1687,10 @@ export function buildConversationMessages({
     const sourceMessageId = message?.role === 'assistant'
       ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
       : message?.sourceMessageId;
-    const queueRow = sourceMessageId ? queueRowsById.get(String(sourceMessageId || '').trim()) : null;
+    // As in the db branch: a user row's queue entry is keyed by its own id.
+    const queueRow = sourceMessageId
+      ? queueRowsById.get(String(sourceMessageId || '').trim())
+      : (message?.role === 'user' ? queueRowsById.get(id) : null);
     return {
       ...message,
       id,
@@ -4061,18 +4078,6 @@ export function registerSessionsRoutes(app, deps) {
       String(openAISettings?.model || '').trim(),
       ...(Array.isArray(openAISettings?.models) ? openAISettings.models : []),
     ].map((value) => String(value || '').trim()).filter(Boolean));
-    if (
-      (requestedProviderType === 'openai' || requestedProviderType === 'openai-image')
-      && requestedBootstrapModel
-      && requestedBootstrapModel.toLowerCase() !== 'auto'
-      && !availableOpenAIModels.has(requestedBootstrapModel)
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: `OpenAI model "${requestedBootstrapModel}" is not available`,
-        code: 'OPENAI_MODEL_UNAVAILABLE',
-      });
-    }
     const claudeSettings = getClaudeProviderSettings();
     // Include base ids of "[1m]" long-context variants: the composer and the
     // new-conversation modal only ever offer base ids (the 1M tier is picked
@@ -4083,59 +4088,28 @@ export function registerSessionsRoutes(app, deps) {
     ].map((value) => String(value || '').trim()).filter(Boolean)
       .flatMap((value) => [value, value.replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '')])
       .filter(Boolean));
-    if (
-      requestedProviderType === 'claude'
-      && requestedBootstrapModel
-      && requestedBootstrapModel.toLowerCase() !== 'auto'
-      && !availableClaudeModels.has(requestedBootstrapModel)
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: `Claude model "${requestedBootstrapModel}" is not available`,
-        code: 'CLAUDE_MODEL_UNAVAILABLE',
-      });
-    }
     const cursorSettings = getCursorProviderSettings();
-    const availableCursorModels = new Set([
+    // Kept in the provider's own casing: the canonical id is what gets bound,
+    // persisted and echoed back, so a "Grok-4.5" request cannot drift into a
+    // different string than the one the worker later sends to the SDK.
+    const cursorModelCatalog = [
       String(cursorSettings?.model || '').trim(),
       ...(Array.isArray(cursorSettings?.models) ? cursorSettings.models : []),
-    ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean));
-    if (
-      requestedProviderType === 'cursor'
-      && requestedBootstrapModel
-      && requestedBootstrapModel.toLowerCase() !== 'auto'
-      && !availableCursorModels.has(requestedBootstrapModel.toLowerCase())
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Requested Cursor model is not available',
-        code: 'CURSOR_MODEL_UNAVAILABLE',
-      });
-    }
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    const availableCursorModels = new Set(cursorModelCatalog.map((value) => value.toLowerCase()));
     const grokSettings = getGrokProviderSettings();
-    const availableGrokModels = new Set([
+    const grokModelCatalog = [
       String(grokSettings?.model || '').trim(),
       ...(Array.isArray(grokSettings?.models) ? grokSettings.models : []),
-    ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean));
-    if (
-      requestedProviderType === 'grok'
-      && requestedBootstrapModel
-      && requestedBootstrapModel.toLowerCase() !== 'auto'
-      && !availableGrokModels.has(requestedBootstrapModel.toLowerCase())
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Requested Grok model is not available',
-        code: 'GROK_MODEL_UNAVAILABLE',
-      });
-    }
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    const availableGrokModels = new Set(grokModelCatalog.map((value) => value.toLowerCase()));
     const useOpenAIProvider = requestedProviderType === 'openai'
       || requestedProviderType === 'openai-image'
       || (
         requestedProviderType === ''
         && requestedBootstrapModel
         && requestedBootstrapModel.toLowerCase() !== 'auto'
-        && availableOpenAIModels.has(requestedBootstrapModel)
+        && isProviderModelAvailable(requestedBootstrapModel, availableOpenAIModels)
       );
     const useClaudeProvider = !useOpenAIProvider && (
       requestedProviderType === 'claude'
@@ -4143,7 +4117,7 @@ export function registerSessionsRoutes(app, deps) {
         requestedProviderType === ''
         && requestedBootstrapModel
         && requestedBootstrapModel.toLowerCase() !== 'auto'
-        && availableClaudeModels.has(requestedBootstrapModel)
+        && isProviderModelAvailable(requestedBootstrapModel, availableClaudeModels)
       )
     );
     const useCursorProvider = !useOpenAIProvider && !useClaudeProvider && (
@@ -4164,6 +4138,63 @@ export function registerSessionsRoutes(app, deps) {
         && availableGrokModels.has(requestedBootstrapModel.toLowerCase())
       )
     );
+    // Managed providers resolve the request against their own catalog only.
+    // Routing it through the merged Copilot catalog first (resolveBootstrapModelSelection)
+    // silently substituted that catalog's current model whenever the requested
+    // id was missing from it, which is how a Cursor/Grok pick could come back
+    // bound to Opus.
+    // With no model in the request the shared catalog's current model is still
+    // honoured when the provider offers it, which is what callers that omit
+    // `model` relied on before.
+    const providerRequestedModel = (availableModels) => (
+      requestedBootstrapModel
+      || (isProviderModelAvailable(catalogSelectedModel, availableModels) ? catalogSelectedModel : '')
+    );
+    const providerModelSelection = useOpenAIProvider
+      ? resolveProviderModelSelection({
+          requestedModel: providerRequestedModel(availableOpenAIModels),
+          // The removed resolveOpenAISessionModel carried this last-resort id.
+          configuredModel: openAISettings.model || 'gpt-4o',
+          availableModels: availableOpenAIModels,
+        })
+      : (useClaudeProvider
+        ? resolveProviderModelSelection({
+            requestedModel: providerRequestedModel(availableClaudeModels),
+            configuredModel: claudeSettings.model,
+            availableModels: availableClaudeModels,
+          })
+        : (useCursorProvider
+          ? resolveProviderModelSelection({
+              requestedModel: providerRequestedModel(cursorModelCatalog),
+              configuredModel: cursorSettings.model,
+              availableModels: cursorModelCatalog,
+            })
+          : (useGrokProvider
+            ? resolveProviderModelSelection({
+                requestedModel: providerRequestedModel(grokModelCatalog),
+                configuredModel: grokSettings.model,
+                availableModels: grokModelCatalog,
+              })
+            : null)));
+    // The single rejection for "this provider does not offer that model".
+    // Per-provider pre-checks used to duplicate it and had drifted apart in
+    // wording, casing rules and whether they listed the alternatives.
+    if (providerModelSelection && !providerModelSelection.ok) {
+      const providerLabel = useOpenAIProvider
+        ? 'OpenAI'
+        : (useClaudeProvider ? 'Claude' : (useCursorProvider ? 'Cursor' : 'Grok'));
+      const providerCode = useOpenAIProvider
+        ? 'OPENAI_MODEL_UNAVAILABLE'
+        : (useClaudeProvider
+          ? 'CLAUDE_MODEL_UNAVAILABLE'
+          : (useCursorProvider ? 'CURSOR_MODEL_UNAVAILABLE' : 'GROK_MODEL_UNAVAILABLE'));
+      return res.status(400).json({
+        ok: false,
+        error: `${providerLabel} model "${providerModelSelection.requestedModel}" is not available`,
+        code: providerCode,
+        supportedModels: providerModelSelection.availableModels || [],
+      });
+    }
     if (useOpenAIProvider && openAISettings?.configured !== true) {
       return res.status(400).json({
         ok: false,
@@ -4214,31 +4245,7 @@ export function registerSessionsRoutes(app, deps) {
       bootstrapWorkspaceRootPath = validatedRoot.realPath;
     }
 
-    const selectedModel = useOpenAIProvider
-      ? resolveOpenAISessionModel({
-          requestedModel: catalogSelectedModel,
-          configuredModel: openAISettings.model,
-          availableModels: openAISettings.models,
-        })
-      : (useClaudeProvider
-        ? resolveOpenAISessionModel({
-            requestedModel: catalogSelectedModel,
-            configuredModel: claudeSettings.model,
-            availableModels: Array.from(availableClaudeModels),
-          })
-        : (useCursorProvider
-          ? resolveOpenAISessionModel({
-              requestedModel: catalogSelectedModel,
-              configuredModel: cursorSettings.model,
-              availableModels: Array.from(availableCursorModels),
-            })
-          : (useGrokProvider
-            ? resolveOpenAISessionModel({
-                requestedModel: catalogSelectedModel,
-                configuredModel: grokSettings.model,
-                availableModels: Array.from(availableGrokModels),
-              })
-            : catalogSelectedModel)));
+    const selectedModel = providerModelSelection ? providerModelSelection.model : catalogSelectedModel;
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
       return res.status(400).json({
         ok: false,
@@ -4288,26 +4295,79 @@ export function registerSessionsRoutes(app, deps) {
       }
     }
 
+    const bootstrapProviderType = useOpenAIProvider
+      ? 'openai'
+      : (useClaudeProvider
+        ? 'claude'
+        : (useCursorProvider
+          ? 'cursor'
+          : (useGrokProvider ? 'grok' : 'github')));
+    // Preferences are written in the same transaction as the conversation, so
+    // the caller's current mode has to arrive with the request: without it every
+    // new chat would be stored as the default one and reset the composer. An
+    // omitted or unknown mode still falls back to the default rather than 400,
+    // because a new chat is worth starting either way.
+    const bootstrapRelayMode = normalizeRelayModePreference(req.body?.relayMode ?? req.body?.preferredRelayMode, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+      fallbackMode: DEFAULT_RELAY_MODE,
+    });
+    // The New Chat modal's reasoning choice is validated with the same rules the
+    // first send would apply, so the composer can restore it from the server
+    // instead of guessing from localStorage.
+    const bootstrapReasoning = resolveProviderReasoningEffort({
+      requestedEffort: req.body?.reasoningEffort,
+      strict: bootstrapProviderType === 'openai',
+      supportedEfforts: supportedReasoningEffortsForProviderModel({
+        providerType: bootstrapProviderType,
+        model: selectedModel,
+        cursorSettings,
+        claudeSettings,
+        grokSettings,
+        reasoningByModel: modelState?.reasoningByModel || null,
+      }),
+    });
+    if (!bootstrapReasoning.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: bootstrapReasoning.error || 'Unsupported reasoning effort',
+        code: 'REASONING_EFFORT_UNSUPPORTED',
+        supportedReasoningEfforts: bootstrapReasoning.supported,
+      });
+    }
+
     try {
-      stmts.insertConv.run(conversationId, title, now, now);
-      const bootstrapProviderType = useOpenAIProvider
-        ? 'openai'
-        : (useClaudeProvider
-          ? 'claude'
-          : (useCursorProvider
-            ? 'cursor'
-            : (useGrokProvider ? 'grok' : 'github')));
-      const runtimeSession = ensureRuntimeSessionBinding(
-        conversationId,
-        selectedModel,
-        now,
-        conversationId,
-        {
-          assignConfiguredProvider: true,
-          providerType: bootstrapProviderType,
-          providerModel: (useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider) ? selectedModel : null,
-        },
-      );
+      // One transaction so a conversation can never exist without its runtime
+      // binding and preferences: every later reader treats these three as a
+      // single canonical tuple.
+      const commitBootstrapState = db.transaction(() => {
+        stmts.insertConv.run(conversationId, title, now, now);
+        const boundRuntimeSession = ensureRuntimeSessionBinding(
+          conversationId,
+          selectedModel,
+          now,
+          conversationId,
+          {
+            assignConfiguredProvider: true,
+            providerType: bootstrapProviderType,
+            providerModel: (useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider) ? selectedModel : null,
+          },
+        );
+        const preferences = persistConversationPreferences({
+          db,
+          stmts,
+          conversationId,
+          preferredRelayMode: bootstrapRelayMode,
+          preferredModel: selectedModel,
+          preferredReasoningEffort: bootstrapReasoning.effort,
+          updatedAt: now,
+        });
+        return { boundRuntimeSession, preferences };
+      });
+      const { boundRuntimeSession, preferences } = commitBootstrapState();
+      const runtimeSession = boundRuntimeSession;
+      const preferredRelayMode = preferences?.preferredRelayMode || bootstrapRelayMode;
+      const preferredModel = preferences?.preferredModel || selectedModel;
+      const preferredReasoningEffort = preferences?.preferredReasoningEffort || bootstrapReasoning.effort || '';
       // Seed the configured root before ensureWorker so the very first launch
       // already happens in the requested directory (resolveLaunchWorkspaceRootForSession
       // prefers it over the relay default).
@@ -4343,6 +4403,9 @@ export function registerSessionsRoutes(app, deps) {
         sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
         const ensureResult = await sessionWorkerSupervisor.ensureWorker(ownerSessionId);
         if (!ensureResult?.ok) {
+          // The conversation is already committed with its provider selection,
+          // so the failure payload carries enough for the client to open and
+          // retry it instead of leaving an unreachable row in the sidebar.
           return res.status(409).json({
             ok: false,
             error: ensureResult?.error || 'worker-bootstrap-failed',
@@ -4351,6 +4414,12 @@ export function registerSessionsRoutes(app, deps) {
             ownerSessionId,
             worker: ensureResult?.worker || null,
             lifecycle: ensureResult?.lifecycle || null,
+            conversationCreated: true,
+            selectedModel,
+            selectedProviderType: bootstrapProviderType,
+            preferredRelayMode,
+            preferredModel,
+            preferredReasoningEffort,
             ...workspaceRootPayload(),
           });
         }
@@ -4365,12 +4434,20 @@ export function registerSessionsRoutes(app, deps) {
         const pendingDepth = Number(queueCounts?.().pendingCount || 0);
         sessionWorkerSupervisor?.markIdle?.(ownerSessionId, pendingDepth);
       } else if (ownerSessionId) {
+        // Same state as the 409 above: the conversation is committed, only the
+        // worker is missing, so the client gets what it needs to open it.
         return res.status(500).json({
           ok: false,
           error: 'session-worker-launcher-unavailable',
           conversationId,
           runtimeSessionId: runtimeSession?.id || null,
           ownerSessionId,
+          conversationCreated: true,
+          selectedModel,
+          selectedProviderType: bootstrapProviderType,
+          preferredRelayMode,
+          preferredModel,
+          preferredReasoningEffort,
           ...workspaceRootPayload(),
         });
       }
@@ -4388,7 +4465,10 @@ export function registerSessionsRoutes(app, deps) {
         worker: ownerWorker,
         lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
         selectedModel,
-        selectedProviderType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : (useCursorProvider ? 'cursor' : 'github')),
+        selectedProviderType: bootstrapProviderType,
+        preferredRelayMode,
+        preferredModel,
+        preferredReasoningEffort,
         configuredWorkspaceRootPath: workspaceRootState?.configuredWorkspaceRootPath || null,
         configuredWorkspaceRootName: workspaceRootState?.configuredWorkspaceRootName || null,
         currentWorkspaceRootPath: workspaceRootState?.currentWorkspaceRootPath || null,
@@ -4763,6 +4843,7 @@ export function registerSessionsRoutes(app, deps) {
       || previous?.enabled !== true
       || previous?.model !== result.model
       || previous?.effortsDiscovered !== true
+      || previous?.reasoningOffDiscovered !== true
     );
     const discovery = !shouldDiscover
       ? { ok: true, models: [], error: null }
@@ -5200,6 +5281,7 @@ export function registerSessionsRoutes(app, deps) {
       defaultModel: modelState.defaultModel,
       reasoningByModel: modelState.reasoningByModel || {},
       reasoningByProvider: modelState.reasoningByProvider || {},
+      reasoningOffUnsupportedByProvider: modelState.reasoningOffUnsupportedByProvider || {},
       reasoningEfforts: modelState.reasoningEfforts || [],
       contextLimitsByModel: modelState.contextLimitsByModel || {},
       modelMetadataByModel: modelState.modelMetadataByModel || {},

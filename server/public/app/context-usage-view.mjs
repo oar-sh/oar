@@ -75,6 +75,28 @@ function renderBarSegments(categories, maxTokens) {
     .join('');
 }
 
+// Estimate wording keyed by the snapshot's estimate_kind; the fallback covers
+// kinds added server-side before this file learns about them.
+const ESTIMATE_NOTES = Object.freeze({
+  'assistant-output-lower-bound':
+    'Estimated lower bound — this runtime does not report a full breakdown.',
+  'cursor-per-call-average':
+    'Estimated from the turn’s aggregate token usage — the Cursor runtime does not report context occupancy directly.',
+});
+const DEFAULT_ESTIMATE_NOTE = 'Estimated — this runtime does not report context occupancy directly.';
+
+function estimateNoteText(estimateKind) {
+  return ESTIMATE_NOTES[String(estimateKind || '').trim()] || DEFAULT_ESTIMATE_NOTE;
+}
+
+function formatCapturedAt(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const stamp = new Date(raw);
+  if (Number.isNaN(stamp.getTime())) return '';
+  return stamp.toLocaleString();
+}
+
 function renderRow({ name, tokens, percent, color, muted = false }) {
   const swatch = color === null
     ? '<span class="ctx-usage-swatch ctx-usage-swatch-empty"></span>'
@@ -115,7 +137,10 @@ export function renderContextUsageHtml(usage) {
     : '';
 
   const estimateNote = usage.isEstimate
-    ? '<div class="ctx-usage-note">Estimated lower bound — this runtime does not report a full breakdown.</div>'
+    ? `<div class="ctx-usage-note">${escapeHtml(estimateNoteText(usage.estimateKind))}</div>`
+    : '';
+  const capturedNote = formatCapturedAt(usage.capturedAt)
+    ? `<div class="ctx-usage-note">As of the last completed turn (${escapeHtml(formatCapturedAt(usage.capturedAt))}${usage.model ? ` on ${escapeHtml(usage.model)}` : ''}).</div>`
     : '';
 
   return `
@@ -124,6 +149,7 @@ export function renderContextUsageHtml(usage) {
       ${headline ? `<div class="ctx-usage-headline">${escapeHtml(headline)}</div>` : ''}
       <div class="ctx-usage-bar">${renderBarSegments(categories, usage.maxTokens)}</div>
       ${estimateNote}
+      ${capturedNote}
       <table class="ctx-usage-table">
         <thead>
           <tr><th>Category</th><th class="ctx-usage-num">Tokens</th><th class="ctx-usage-num">Usage</th></tr>

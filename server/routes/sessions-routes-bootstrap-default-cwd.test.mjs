@@ -4,33 +4,10 @@ import assert from 'node:assert/strict';
 import {
   buildModelCatalogWithOpenAIProvider,
   parseOpenAISettingsUpdateRequest,
-  resolveOpenAISessionModel,
   resolveBootstrapModelSelection,
   parseDefaultSessionWorkspaceRootUpdateRequest,
   normalizePreferredReasoningEffort,
 } from './sessions-routes.mjs';
-
-test('resolveOpenAISessionModel preserves selected OpenAI models', () => {
-  assert.equal(resolveOpenAISessionModel({
-    requestedModel: 'gpt-5.4',
-    configuredModel: 'gpt-4o',
-    availableModels: ['gpt-4o', 'gpt-5.4'],
-  }), 'gpt-5.4');
-  assert.equal(resolveOpenAISessionModel({
-    requestedModel: 'o3-pro',
-    configuredModel: 'gpt-4o',
-    availableModels: ['gpt-4o', 'o3-pro'],
-  }), 'o3-pro');
-  assert.equal(resolveOpenAISessionModel({
-    requestedModel: 'gpt-github-only',
-    configuredModel: 'gpt-4o',
-    availableModels: ['gpt-4o'],
-  }), 'gpt-4o');
-  assert.equal(resolveOpenAISessionModel({
-    requestedModel: 'claude-sonnet-4.6',
-    configuredModel: 'gpt-4o',
-  }), 'gpt-4o');
-});
 
 test('parseOpenAISettingsUpdateRequest accepts save and remove requests', () => {
   assert.deepEqual(parseOpenAISettingsUpdateRequest({
@@ -105,6 +82,8 @@ test('resolveBootstrapModelSelection falls back to current/default model', () =>
   assert.equal(selectedFallback, 'gpt-5.4-mini');
 });
 
+// platform-agnostic: request parsing only reads the body alias and hands the
+// path on untouched; validation against the filesystem happens elsewhere.
 test('parseDefaultSessionWorkspaceRootUpdateRequest reads supported body aliases', () => {
   const parsed = parseDefaultSessionWorkspaceRootUpdateRequest({
     default_session_workspace_root_path: 'C:\\dev\\project',

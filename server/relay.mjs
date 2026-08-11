@@ -556,10 +556,33 @@ async function getOrCreateSession(runtimeSessionId, convId, requestedModel, appr
 
   const actualModel = await getCurrentModelId(session);
   if (targetModel && actualModel && canonicalModelId(actualModel) !== canonicalModelId(targetModel)) {
-    err(`Session started with model "${actualModel}" instead of requested "${targetModel}"`);
+    // A silent fallback here answers the turn with a model the user never
+    // picked (and shows the requested one in the UI). Fail the turn instead;
+    // the session must not be reused either, or every retry lands on it.
+    sessions.delete(key);
+    try {
+      await session.dispose?.();
+    } catch (_) {}
+    throw new Error(`Copilot session started with model "${actualModel}" instead of requested "${targetModel}"; refusing to run the turn on a substituted model`);
   }
 
   log(`Session created: ${session.sessionId.slice(0, 8)} key=${key.slice(0, 12)}${actualModel ? ` model=${actualModel}` : ''}`);
+
+  // Tell the server this SDK session is an execution vehicle for an existing
+  // conversation, so the session-state import sweep does not resurrect it as
+  // a stand-alone "shadow" conversation. Best effort: older servers without
+  // the endpoint just 404.
+  const linkedConversationId = String(convId || '').trim();
+  if (linkedConversationId) {
+    try {
+      await apiJson('POST', '/api/relay-session-link', {
+        conversationId: linkedConversationId,
+        sdkSessionId: session.sessionId,
+      }, { auth: true });
+    } catch (e) {
+      vlog(`relay-session-link report failed: ${e.message}`);
+    }
+  }
   return session;
 }
 
@@ -854,6 +877,20 @@ async function processNext(approveAll) {
 
   const msg = data.message;
   if (!msg) return;
+
+  // Messages from conversations bound to a session-worker provider must never
+  // execute here: this relay runs on the Copilot plan, and model ids like
+  // claude-opus-5 exist on both sides, so a stolen turn would silently bill
+  // the wrong plan under the wrong provider label. The server-side dequeue
+  // already filters these; this guard covers a server that predates it.
+  const msgProviderType = String(msg.providerType || '').trim().toLowerCase();
+  if (msgProviderType && msgProviderType !== 'github' && msgProviderType !== 'openai') {
+    err(`Refusing msg ${msg.id.slice(0, 8)}: it belongs to provider "${msgProviderType}", not the Copilot relay`);
+    try {
+      await apiJson('POST', '/api/requeue', { messageId: msg.id }, { auth: true });
+    } catch (_) {}
+    return;
+  }
 
   busy = true;
   const started = Date.now();

@@ -781,7 +781,13 @@ export async function bootstrapConversationSession(body = {}) {
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const message = String(payload?.error || '').trim();
-    throw new Error(message || `Could not start a new conversation session (HTTP ${response.status}).`);
+    const error = new Error(message || `Could not start a new conversation session (HTTP ${response.status}).`);
+    // The conversation may already be committed (worker prestart failed after
+    // it was created); the caller needs the payload to open it instead of
+    // leaving an unreachable row behind.
+    error.status = response.status;
+    error.payload = payload || null;
+    throw error;
   }
   return payload;
 }

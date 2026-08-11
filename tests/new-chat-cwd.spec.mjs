@@ -18,6 +18,8 @@ import { relayToken } from "./e2e-env.mjs";
 // payload the browser would receive on a real relay; every other response
 // (validation rejections included) passes through untouched.
 
+// platform-agnostic: the recents list is echoed through /api/status and rendered
+// as text; these are opaque strings, never resolved against the host filesystem.
 const FAKE_RECENTS = [
   "C:\\workspaces\\alpha",
   "C:\\workspaces\\beta",
@@ -77,7 +79,7 @@ test.describe("New Chat modal CWD picker", () => {
     });
 
     await page.addInitScript(() => {
-      localStorage.setItem("copilot_model", "gpt-5.4-mini");
+      localStorage.setItem("copilot_selected_model", "gpt-5.4-mini");
       localStorage.removeItem("copilot_new_chat_cwd");
     });
     await page.goto(`/?token=${encodeURIComponent(token)}`);

@@ -128,6 +128,12 @@ export function createSessionRepository(db) {
         // deleted sdk sessions tombstones (hide rediscovered SDK sessions after UI delete)
         listDeletedSdkSessions: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions`),
         getDeletedSdkSession: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions WHERE sdk_session_id = ? LIMIT 1`),
+        upsertRelaySessionLink: db.prepare(`
+          INSERT INTO relay_session_links (sdk_session_id, conversation_id, created_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(sdk_session_id) DO UPDATE SET conversation_id = excluded.conversation_id
+        `),
+        getRelaySessionLink: db.prepare(`SELECT * FROM relay_session_links WHERE sdk_session_id = ?`),
         markDeletedSdkSession: db.prepare(`INSERT OR REPLACE INTO deleted_sdk_sessions (sdk_session_id, deleted_at) VALUES (?, ?)`),
         clearDeletedSdkSession: db.prepare(`DELETE FROM deleted_sdk_sessions WHERE sdk_session_id = ?`),
         deleteDeletedSdkSessions: db.prepare(`DELETE FROM deleted_sdk_sessions`),

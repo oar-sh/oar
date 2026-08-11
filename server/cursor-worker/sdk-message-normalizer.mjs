@@ -95,6 +95,7 @@ export function createSdkMessageNormalizer() {
   let stepIndex = 0;
   let thoughtIndex = 0; // monotonic across the turn, so ids never collide
   let lastUsage = null;
+  let assistantMessageCount = 0; // degraded-mode stand-in for the step count
   const knownSubagentRuns = new Map(); // call_id -> displayName
   const seenToolFrames = new Set(); // `${call_id}\u0000${status}` de-dupe
 
@@ -266,7 +267,9 @@ export function createSdkMessageNormalizer() {
     const type = String(message?.type || '');
 
     if (type === 'system' && message?.subtype === 'init') {
-      initModel = String(message.model || '').trim();
+      // `model` is a ModelSelection object ({id, params?}) in current SDK
+      // builds; older shapes and test fixtures carry a plain string.
+      initModel = String(message.model?.id ?? message.model ?? '').trim();
       actions.push({
         channel: 'init',
         payload: {
@@ -278,6 +281,7 @@ export function createSdkMessageNormalizer() {
     }
 
     if (type === 'assistant') {
+      assistantMessageCount += 1;
       const content = Array.isArray(message?.message?.content) ? message.message.content : [];
       for (const block of content) {
         if (block?.type !== 'text') continue; // tool_use lifecycle is owned by tool_call messages
@@ -379,5 +383,12 @@ export function createSdkMessageNormalizer() {
     normalize,
     finalStreamText,
     get model() { return initModel; },
+    // The turn's usage as last seen on either surface, so the runner can still
+    // publish context data when the run ends without a terminal status message.
+    get lastUsage() { return lastUsage; },
+    // Model calls made this turn: step boundaries when the delta surface is
+    // live, assistant messages in degraded mode. Divides the turn's aggregate
+    // usage into a per-call context estimate (see cursor-context-usage.mjs).
+    get modelCallCount() { return Math.max(stepIndex, assistantMessageCount, 1); },
   };
 }

@@ -76,6 +76,9 @@ export function normalizeClaudeContextUsage(raw) {
     totalTokens,
     maxTokens,
     percentage: toNullablePercent(raw.percentage),
+    // Set by the Cursor worker when occupancy is derived rather than measured
+    // (e.g. 'cursor-per-call-average'); absent from Claude SDK payloads.
+    estimateKind: normalizeText(raw.estimateKind) || null,
     categories,
     skills: raw.skills && typeof raw.skills === 'object'
       ? {
@@ -183,7 +186,7 @@ export function buildClaudeContextSnapshot({
     cache_read_tokens: usage?.apiUsage?.cacheReadTokens ?? null,
     cache_write_tokens: usage?.apiUsage?.cacheWriteTokens ?? null,
     captured_at: normalizeText(capturedAt) || null,
-    estimate_kind: null,
+    estimate_kind: usage?.estimateKind ?? null,
   };
 }
 

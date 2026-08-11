@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 
 import { buildKnownCwdOptions, normalizeKnownCwdPath } from './known-cwd-options.mjs';
 
+// platform-agnostic: these helpers run in the browser, where the host OS is not
+// the server's. They do regex string work on whatever path the server reported,
+// so the win32 fixtures exercise the same code on any host.
+
 test('normalizeKnownCwdPath strips trailing separators and restores drive roots', () => {
   assert.equal(normalizeKnownCwdPath(' C:\\dev\\project\\ '), 'C:\\dev\\project');
   assert.equal(normalizeKnownCwdPath('/home/dev/repo/'), '/home/dev/repo');

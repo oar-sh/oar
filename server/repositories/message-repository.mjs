@@ -18,6 +18,9 @@ export function createMessageRepository(db) {
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
         getRecentMessagesDesc: db.prepare(`SELECT role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
         insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+        // Provenance is derived from the authenticated responder identity at
+        // /api/response time, never from the response payload.
+        setMessageExecutedProvider: db.prepare(`UPDATE messages SET executed_provider = ? WHERE id = ?`),
         searchMessagesCount: db.prepare(`
           SELECT COUNT(*) AS cnt
           FROM messages_fts fts
@@ -106,6 +109,32 @@ export function createMessageRepository(db) {
         insertQ:        db.prepare(insertQueueSql),
         queueHasImageOperationId,
         findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
+        // Global fallback for requesters without a session identity (the legacy
+        // Copilot relay CLI). Conversations bound to a session-worker provider
+        // (claude/cursor/grok) are excluded outright: handing one of their turns
+        // to the relay executes it on the Copilot plan under whatever model the
+        // id happens to resolve to there, invisibly to the user.
+        findPendingForLegacyRelay: db.prepare(`
+          SELECT q.*
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          LEFT JOIN runtime_sessions rsc
+            ON rsc.conversation_id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
+            AND LOWER(COALESCE(
+              NULLIF(rs.provider_type, ''),
+              NULLIF(rsc.provider_type, ''),
+              'github'
+            )) NOT IN ('claude', 'cursor', 'grok')
+          ORDER BY
+            q.retry_count ASC,
+            CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
+            COALESCE(q.next_attempt_at, q.timestamp) ASC,
+            q.timestamp ASC
+          LIMIT 1
+        `),
         findPendingForWorker: db.prepare(`
           SELECT q.*
           FROM queue q
@@ -192,7 +221,6 @@ export function createMessageRepository(db) {
           LEFT JOIN conversations c
             ON c.id = q.conversation_id
           WHERE q.status = 'pending'
-            AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
             AND COALESCE(
               NULLIF(q.owner_sdk_session_id, ''),
               NULLIF(rs.sdk_session_id, ''),
@@ -227,7 +255,10 @@ export function createMessageRepository(db) {
         deleteConvQ:    db.prepare(`DELETE FROM queue WHERE conversation_id = ?`),
         findQById:      db.prepare(`SELECT * FROM queue WHERE id = ?`),
         pruneQueue:     db.prepare(`DELETE FROM queue WHERE status = 'done' AND id NOT IN (SELECT id FROM queue WHERE status = 'done' ORDER BY timestamp DESC LIMIT 200)`),
-        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_sdk_session_id = NULL, owner_assigned_at = NULL, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND processing_at < ?`),
+        // Recovery clears only the lease, never the owner: a recovered row must
+        // stay routed to its provider worker so the primer respawns that worker
+        // instead of the row becoming claimable by the global relay poll.
+        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND processing_at < ?`),
         // Staleness is inactivity, not elapsed turn time: owner_last_claimed_at is
         // refreshed by every worker heartbeat for the message it is working on, so a
         // long-but-alive turn keeps moving the cutoff. processing_at is only the
@@ -251,8 +282,6 @@ export function createMessageRepository(db) {
           SET status = 'pending',
               processing_at = NULL,
               next_attempt_at = @requeueAt,
-              owner_sdk_session_id = NULL,
-              owner_assigned_at = NULL,
               owner_lease_expires_at = NULL,
               owner_last_claimed_at = NULL
           WHERE status = 'processing'

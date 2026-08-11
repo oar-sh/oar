@@ -6,6 +6,9 @@ import {
   resolveLaunchWorkspaceRootPath,
 } from './workspace-root-defaults-service.mjs';
 
+// platform-agnostic: normalizePath is injected, so the stored root is an opaque
+// string here — the win32 fixtures never reach real path semantics.
+
 test('resolveDefaultSessionWorkspaceRootState returns empty state when setting is unset', () => {
   const result = resolveDefaultSessionWorkspaceRootState({
     storedPath: '',

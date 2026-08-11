@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createMessageRepository } from './message-repository.mjs';
+import { dequeuePendingMessage, resolveExecutedProviderForResponse } from '../routes/messages-routes.mjs';
 import { mapUsageSnapshotRow } from '../routes/sessions-routes.mjs';
 
 function createTestDb() {
@@ -18,7 +19,8 @@ function createTestDb() {
       id TEXT PRIMARY KEY,
       conversation_id TEXT,
       sdk_session_id TEXT,
-      status TEXT
+      status TEXT,
+      provider_type TEXT NOT NULL DEFAULT 'github'
     );
 
     CREATE TABLE messages (
@@ -32,6 +34,7 @@ function createTestDb() {
       model_requested TEXT,
       model_actual TEXT,
       model_origin TEXT,
+      executed_provider TEXT,
       hidden_from_shares INTEGER NOT NULL DEFAULT 0,
       share_hidden_at TEXT,
       timestamp TEXT
@@ -208,7 +211,7 @@ test('routed worker dequeue uses runtime session binding when queue owner is emp
   assert.equal(wrongWorkerRow, undefined);
 });
 
-test('repository lists due pending worker owners from queue and bindings', () => {
+test('repository lists pending worker owners including rows still in retry backoff', () => {
   const db = createTestDb();
   const repo = createMessageRepository(db);
   const now = '2026-06-11T20:00:00.000Z';
@@ -248,8 +251,137 @@ test('repository lists due pending worker owners from queue and bindings', () =>
   insert.run('message-later', 'conv-runtime', 'runtime-bound', 'gpt-5.4-mini', 'gpt-5.4-mini', 'agent', 'later', 'pending', now, '2026-06-11T21:00:00.000Z', 'later-sdk');
   insert.run('message-processing', 'conv-runtime', 'runtime-bound', 'gpt-5.4-mini', 'gpt-5.4-mini', 'agent', 'processing', 'processing', now, null, 'processing-sdk');
 
-  const owners = repo.listPendingWorkerOwnerSessionIds.all(now, 10).map((row) => row.sdk_session_id);
-  assert.deepEqual(owners, ['owner-sdk', 'runtime-sdk']);
+  // 'later-sdk' sits in a retry backoff window (next_attempt_at in the future)
+  // and must still be listed: its worker needs to be warm before the backoff
+  // matures, or the relay's faster poll claims the row first.
+  const owners = repo.listPendingWorkerOwnerSessionIds.all(10).map((row) => row.sdk_session_id);
+  assert.deepEqual([...owners].sort(), ['later-sdk', 'owner-sdk', 'runtime-sdk']);
+});
+
+// ─── Legacy-relay dequeue scoping ─────────────────────────────────────────────
+// The Copilot relay CLI polls /api/pending without a session identity and used
+// to fall through to the unscoped global queue. That let it claim and execute
+// cursor/claude/grok conversations' turns on the Copilot plan (the model id is
+// passed verbatim, and ids like claude-opus-5 exist on both sides).
+
+function seedProviderConversation(db, { key, providerType, ownerSdkSessionId = '', timestamp }) {
+  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)')
+    .run(`conv-${key}`, key, 'active', ownerSdkSessionId);
+  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type) VALUES (?, ?, ?, ?)')
+    .run(`runtime-${key}`, `conv-${key}`, ownerSdkSessionId, providerType);
+  db.prepare(`
+    INSERT INTO queue (
+      id, conversation_id, runtime_session_id, is_new_conversation, model,
+      model_variant_id, reasoning_effort, relay_mode, text, attachments,
+      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
+    ) VALUES (?, ?, ?, 0, 'claude-opus-5', 'claude-opus-5', NULL, 'agent', ?, NULL, 'pending', ?, 0, NULL, ?)
+  `).run(`message-${key}`, `conv-${key}`, `runtime-${key}`, key, timestamp, ownerSdkSessionId);
+}
+
+test('legacy-relay dequeue never returns rows bound to a session-worker provider', () => {
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  const now = '2026-08-11T13:00:00.000Z';
+
+  seedProviderConversation(db, { key: 'cursor', providerType: 'cursor', ownerSdkSessionId: 'conv-cursor', timestamp: '2026-08-11T12:00:00.000Z' });
+  seedProviderConversation(db, { key: 'claude', providerType: 'claude', ownerSdkSessionId: 'conv-claude', timestamp: '2026-08-11T12:00:01.000Z' });
+  seedProviderConversation(db, { key: 'grok', providerType: 'grok', ownerSdkSessionId: 'conv-grok', timestamp: '2026-08-11T12:00:02.000Z' });
+
+  // The cursor/claude/grok rows are older, but the relay must skip them all.
+  assert.equal(repo.findPendingForLegacyRelay.get(now), undefined);
+
+  // A github conversation is claimable even when it carries an owner session
+  // (copilot conversations get their SDK session id as owner after turn one).
+  seedProviderConversation(db, { key: 'github', providerType: 'github', ownerSdkSessionId: 'copilot-sdk', timestamp: '2026-08-11T12:00:03.000Z' });
+  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-github');
+});
+
+test('legacy-relay dequeue serves openai rows and rows with no runtime session', () => {
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  const now = '2026-08-11T13:00:00.000Z';
+
+  seedProviderConversation(db, { key: 'openai', providerType: 'openai', timestamp: '2026-08-11T12:00:00.000Z' });
+  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-openai');
+
+  // No runtime session at all (brand-new conversation): defaults to github.
+  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)')
+    .run('conv-fresh', 'fresh', 'active', '');
+  db.prepare(`
+    INSERT INTO queue (
+      id, conversation_id, runtime_session_id, is_new_conversation, model,
+      model_variant_id, reasoning_effort, relay_mode, text, attachments,
+      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
+    ) VALUES ('message-fresh', 'conv-fresh', NULL, 1, 'gpt-5.4-mini', 'gpt-5.4-mini', NULL, 'agent', 'fresh', NULL, 'pending', '2026-08-11T11:00:00.000Z', 0, NULL, '')
+  `).run();
+  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-fresh');
+});
+
+test('anonymous dequeue skips provider-worker rows but the owning worker still gets them', () => {
+  const db = createTestDb();
+  const stmts = createMessageRepository(db);
+  const now = '2026-08-11T13:00:00.000Z';
+
+  seedProviderConversation(db, { key: 'cursor', providerType: 'cursor', ownerSdkSessionId: 'conv-cursor', timestamp: '2026-08-11T12:00:00.000Z' });
+
+  // The relay CLI: routing on, no x-relay-session-id. Must come up empty even
+  // though a pending row exists.
+  const stolen = dequeuePendingMessage({
+    db,
+    stmts,
+    nowIso: now,
+    routingEnabled: true,
+    requesterSessionId: null,
+  });
+  assert.equal(stolen, null);
+  assert.equal(db.prepare(`SELECT status FROM queue WHERE id = 'message-cursor'`).get().status, 'pending');
+
+  // The cursor worker itself claims it normally.
+  const claimed = dequeuePendingMessage({
+    db,
+    stmts,
+    nowIso: now,
+    routingEnabled: true,
+    requesterSessionId: 'conv-cursor',
+  });
+  assert.equal(claimed?.id, 'message-cursor');
+  assert.equal(claimed?.status, 'processing');
+});
+
+test('executed provider derives from responder identity, never from the payload', () => {
+  const db = createTestDb();
+  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type) VALUES (?, ?, ?, ?)')
+    .run('runtime-cursor', 'conv-cursor', 'cursor-session', 'cursor');
+  const stmts = {
+    getRuntimeSessionBySdkSessionId: db.prepare('SELECT * FROM runtime_sessions WHERE sdk_session_id = ?'),
+  };
+
+  // A cursor worker answering: its bridge identity resolves to its provider.
+  assert.equal(resolveExecutedProviderForResponse({
+    stmts,
+    responseBridgeIdentity: { sessionId: 'cursor-session' },
+  }), 'cursor');
+
+  // No bridge identity = the legacy Copilot relay.
+  assert.equal(resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity: null }), 'github');
+  assert.equal(resolveExecutedProviderForResponse({ stmts, responseBridgeIdentity: { sessionId: '' } }), 'github');
+
+  // Unknown identity falls back to github rather than trusting anything else.
+  assert.equal(resolveExecutedProviderForResponse({
+    stmts,
+    responseBridgeIdentity: { sessionId: 'never-registered' },
+  }), 'github');
+});
+
+test('legacy-relay dequeue respects retry backoff windows', () => {
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+
+  seedProviderConversation(db, { key: 'github', providerType: 'github', timestamp: '2026-08-11T12:00:00.000Z' });
+  db.prepare(`UPDATE queue SET next_attempt_at = '2026-08-11T14:00:00.000Z' WHERE id = 'message-github'`).run();
+
+  assert.equal(repo.findPendingForLegacyRelay.get('2026-08-11T13:00:00.000Z'), undefined);
+  assert.equal(repo.findPendingForLegacyRelay.get('2026-08-11T14:00:01.000Z')?.id, 'message-github');
 });
 
 test('mapUsageSnapshotRow exposes turn delta credits and monthly remaining context', () => {
@@ -372,7 +504,7 @@ test('a null ceiling disables the elapsed-time cap entirely', () => {
   assert.deepEqual(fixture.recoverable({ ceilingMinutes: null }), []);
 });
 
-test('recovery clears ownership and requeues exactly the stale rows', () => {
+test('recovery keeps ownership and requeues exactly the stale rows', () => {
   const fixture = createRecoveryFixture();
   fixture.addTurn({ id: 'q-live', startedMsAgo: 90 * 60_000, lastHeartbeatMsAgo: 5_000 });
   fixture.addTurn({ id: 'q-dead', startedMsAgo: 90 * 60_000, lastHeartbeatMsAgo: 30 * 60_000 });
@@ -391,7 +523,10 @@ test('recovery clears ownership and requeues exactly the stale rows', () => {
 
   const dead = rows.find((row) => row.id === 'q-dead');
   assert.equal(dead.processing_at, null);
-  assert.equal(dead.owner_sdk_session_id, null);
+  // The owner survives recovery: the row stays routed to its provider worker
+  // (which the primer respawns) instead of becoming claimable by the global
+  // relay poll — that steal is how a Cursor turn once ran on the Copilot plan.
+  assert.equal(dead.owner_sdk_session_id, 'session-1');
   assert.equal(dead.next_attempt_at, requeueAt);
 
   const live = rows.find((row) => row.id === 'q-live');

@@ -191,6 +191,65 @@ test('cursor catalog uses discovered per-model efforts and falls back to none-on
   assert.deepEqual(fallback.reasoningByProvider.cursor, { 'composer-2.5': ['none'] });
 });
 
+test('cursor catalog reports which models cannot actually turn reasoning off', () => {
+  const result = buildModelCatalogWithCursorProvider({
+    models: [],
+    providersByModel: {},
+    reasoningByModel: {},
+    modelMetadataByModel: {},
+  }, {
+    enabled: true,
+    model: 'composer-2.5',
+    models: ['composer-2.5', 'grok-4.5'],
+    effortsByModel: {
+      'composer-2.5': ['none'],
+      'grok-4.5': ['none', 'low', 'high'],
+    },
+    reasoningOffByModel: { 'composer-2.5': true, 'grok-4.5': false },
+    reasoningOffDiscovered: true,
+  });
+  // 'none' on grok-4.5 means "model default", so the composer must not present
+  // it as an off switch.
+  assert.deepEqual(result.reasoningOffUnsupportedByProvider.cursor, {
+    'composer-2.5': false,
+    'grok-4.5': true,
+  });
+});
+
+test('cursor catalog stays silent about reasoning-off until discovery has run', () => {
+  // An install upgraded before the discovery refresh has no map at all, and
+  // claiming "cannot turn reasoning off" there would relabel every model.
+  const result = buildModelCatalogWithCursorProvider({
+    models: [],
+    providersByModel: {},
+    reasoningByModel: {},
+    modelMetadataByModel: {},
+  }, {
+    enabled: true,
+    model: 'composer-2.5',
+    models: ['composer-2.5', 'grok-4.5'],
+    effortsByModel: { 'grok-4.5': ['none', 'low', 'high'] },
+  });
+  assert.deepEqual(result.reasoningOffUnsupportedByProvider.cursor, {});
+});
+
+test('cursor catalog leaves a model discovery never saw out of the reasoning-off map', () => {
+  const result = buildModelCatalogWithCursorProvider({
+    models: [],
+    providersByModel: {},
+    reasoningByModel: {},
+    modelMetadataByModel: {},
+  }, {
+    enabled: true,
+    // The configured model is offered even when discovery did not return it.
+    model: 'composer-2.5',
+    models: ['composer-2.5', 'grok-4.5'],
+    reasoningOffByModel: { 'grok-4.5': false },
+    reasoningOffDiscovered: true,
+  });
+  assert.deepEqual(result.reasoningOffUnsupportedByProvider.cursor, { 'grok-4.5': true });
+});
+
 test('cursor catalog composes onto the openai and claude layers', () => {
   const base = {
     models: ['gpt-5.4-mini'],

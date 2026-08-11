@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+// platform-agnostic: drives-path-helpers.mjs pins path.win32 / path.posix per
+// helper rather than following the host, so both families are exercised anywhere.
 import {
   normalizeDriveAbsolutePath,
   driveRootFromAbsolutePath,

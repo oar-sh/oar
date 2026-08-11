@@ -501,6 +501,86 @@ test('a Cursor session keeps sending a model the OpenAI catalog also lists', asy
   assert.equal(body.error, 'Conversation not found');
 });
 
+// Silently answering with the pinned model is what let a conversation run a
+// model the composer never showed.
+test('an unavailable Cursor model is refused instead of falling back to the pinned model', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, {
+    conversationId: 'conv-cursor',
+    providerType: 'cursor',
+    providerModel: 'composer-2.5',
+  });
+  const deps = baseRouteDeps({
+    ...makeStmts(db),
+    getConvAnyStatus: { get: () => null },
+  }, {
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-2.5', models: ['composer-2.5', 'grok-4.5'] }),
+    maybeApplyWorkspaceRootFromMessage: () => ({ attempted: false, changed: false }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-cursor',
+    text: 'hello there',
+    model: 'ghost-model',
+    relayMode: 'default',
+  });
+  assert.equal(status, 400);
+  assert.equal(body.code, 'CURSOR_MODEL_UNAVAILABLE');
+  assert.match(String(body.error), /"ghost-model" is not available/);
+});
+
+test('a case-variant Cursor model is accepted rather than rejected', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, {
+    conversationId: 'conv-cursor',
+    providerType: 'cursor',
+    providerModel: 'composer-2.5',
+  });
+  const deps = baseRouteDeps({
+    ...makeStmts(db),
+    getConvAnyStatus: { get: () => null },
+  }, {
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-2.5', models: ['composer-2.5', 'Grok-4.5'] }),
+    maybeApplyWorkspaceRootFromMessage: () => ({ attempted: false, changed: false }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-cursor',
+    text: 'hello there',
+    model: 'grok-4.5',
+    relayMode: 'default',
+  });
+  assert.notEqual(body?.code, 'CURSOR_MODEL_UNAVAILABLE');
+  // Guard path only — the conversation row is intentionally missing, so this
+  // reaches the lookup rather than any provider refusal. That the canonical
+  // casing ('Grok-4.5') is what gets bound is covered by
+  // provider-model-selection.test.mjs and end to end by the bootstrap spec.
+  assert.equal(status, 404);
+  assert.equal(body.error, 'Conversation not found');
+});
+
+test('creating a Cursor or Grok conversation through /api/message is refused', async () => {
+  for (const providerType of ['cursor', 'grok']) {
+    const db = makeDb();
+    const deps = baseRouteDeps(makeStmts(db), {
+      getCursorProviderSettings: () => ({ enabled: true, model: 'composer-2.5', models: ['composer-2.5'] }),
+      getGrokProviderSettings: () => ({ enabled: true, model: 'grok-4.5', models: ['grok-4.5'] }),
+    });
+    const { status, body } = await invokePost('/api/message', deps, {
+      clientId: 'client-1',
+      newConversation: true,
+      text: 'hello there',
+      model: providerType === 'cursor' ? 'composer-2.5' : 'grok-4.5',
+      providerType,
+      relayMode: 'default',
+    });
+    // 409, like the other "this provider needs a new conversation" refusals.
+    assert.equal(status, 409, providerType);
+    assert.equal(body.code, 'PROVIDER_REQUIRES_BOOTSTRAP', providerType);
+    assert.match(String(body.error), /\/api\/conversation\/bootstrap/);
+  }
+});
+
 test('a disabled Cursor provider does not hijack unknown models into the cursor rejection', async () => {
   const db = makeDb();
   insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });

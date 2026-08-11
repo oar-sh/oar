@@ -12,6 +12,7 @@ import {
 } from './cursor-sdk-adapter.mjs';
 import { createAskUserTool } from './cursor-ask-user-tool.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 
 const PLAN_BOARD_ACTIONS = [
@@ -254,15 +255,24 @@ export function createCursorTurnRunner({
    * Ship the turn's token usage to the relay as a context-window breakdown.
    * Advisory data: a failure here must not disturb the turn's response.
    */
-  async function publishContextUsage(message, state, model) {
-    if (!state.lastUsage) return;
+  async function publishContextUsage(message, state, model, normalizer) {
+    // The result payload is the primary carrier, but a run can end without a
+    // terminal status message (or get aborted); the normalizer still saw the
+    // turn's usage events, so fall back to its copy rather than dropping them.
+    const usage = state.lastUsage || normalizer?.lastUsage || null;
+    if (!usage) return;
     const usageModel = state.responseModel || model || '';
-    const contextWindow = await readContextWindowImpl({ apiKey, model: usageModel, dbg })
-      .catch(() => null);
+    // Provider-advertised window first; the shared static table covers models
+    // whose `models.list()` entry has no `context` parameter, so the gauge is
+    // not totals-only for them.
+    const contextWindow = (await readContextWindowImpl({ apiKey, model: usageModel, dbg })
+      .catch(() => null))
+      ?? resolveFallbackContextLimitTokens(usageModel);
     const built = buildCursorContextUsage({
-      usage: state.lastUsage,
+      usage,
       model: usageModel,
       contextWindow,
+      modelCallCount: normalizer?.modelCallCount,
     });
     if (!built) return;
     await api('POST', '/api/cursor-context-usage', {
@@ -451,8 +461,10 @@ export function createCursorTurnRunner({
     } finally {
       controlPoller?.stop?.(controlState);
       // Runs on every exit path so usage captured before the turn went
-      // sideways still reaches the relay.
-      await publishContextUsage(message, state, model);
+      // sideways still reaches the relay. `normalizer` is the live instance
+      // (the auth retry swaps it), so a discarded attempt's usage is not
+      // republished over the retry's.
+      await publishContextUsage(message, state, model, normalizer);
       await publishPlanUsage(message, state, model);
     }
 

@@ -48,6 +48,7 @@ import {
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
 } from './new-conversation-model-choice.mjs';
+import { isReasoningOffUnsupported, reasoningEffortOptionLabel } from './reasoning-effort-labels.mjs';
 import {
   conversationProviderIndicatorKey,
   conversationProviderIndicatorLabel,
@@ -59,6 +60,13 @@ const PROCESSING_DOT_INTERVAL_MS = 1000;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const CONVERSATION_LIST_PAGE_SIZE = 40;
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
+// Shared with the composer (bootstrap.js). The modal used to read and write its
+// own 'copilot_model' key, so a New Chat selection never reached the composer.
+// (bootstrap.js migrates the old key on startup.)
+const MODEL_STORAGE_KEY = 'copilot_selected_model';
+const MODE_STORAGE_KEY = 'copilot_selected_mode';
+// Claude 1M-context ids are stored as "model[1m]"; the modal only offers base ids.
+const CLAUDE_LONG_CONTEXT_PATTERN = /\[1m\]$/i;
 const OPENAI_IMAGE_SIZE_STORAGE_KEY = 'copilot_openai_image_size';
 const NEW_CHAT_CWD_STORAGE_KEY = 'copilot_new_chat_cwd';
 const NEW_CHAT_CUSTOM_CWD_VALUE = '__custom__';
@@ -67,6 +75,18 @@ let processingDotTimer = null;
 let lastConvListHtml = '';
 let openConversationVersion = 0;
 let newConversationInFlight = false;
+
+// New Chat stays in flight until the created conversation is open, which takes
+// a sidebar refresh and a full message load. The button has to say so: it used
+// to look enabled the whole time while silently ignoring clicks.
+function setNewConversationInFlight(inFlight) {
+  newConversationInFlight = inFlight;
+  const button = document.getElementById('new-conv-btn');
+  if (!button) return;
+  button.disabled = inFlight;
+  if (inFlight) button.setAttribute('aria-busy', 'true');
+  else button.removeAttribute('aria-busy');
+}
 let newConversationCatalogCache = null;
 let newConversationOpenAISettingsCache = null;
 let newConversationClaudeSettingsCache = null;
@@ -645,10 +665,11 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
     if (status) status.textContent = 'Reasoning metadata unavailable for this model.';
     return;
   }
+  const reasoningOffUnsupported = isReasoningOffUnsupported(catalog, provider, modelId);
   for (const effort of efforts) {
     const option = document.createElement('option');
     option.value = effort;
-    option.textContent = effort;
+    option.textContent = reasoningEffortOptionLabel(effort, { reasoningOffUnsupported });
     select.appendChild(option);
   }
   const preferred = resolvePreferredReasoningEffort(efforts, [
@@ -661,6 +682,10 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
       ? 'Choose output quality for generated images.'
       : 'Choose the effort used when this conversation starts.';
   }
+}
+
+function storedComposerModel() {
+  return String(localStorage.getItem(MODEL_STORAGE_KEY) || '').trim();
 }
 
 function updateNewConversationProviderHelp(provider = 'github') {
@@ -725,7 +750,7 @@ async function populateNewConversationModelSelect(providerType = 'github') {
     target.appendChild(option);
   }
   if (!target.options.length) return false;
-  const storedModel = String(localStorage.getItem('copilot_model') || '').trim();
+  const storedModel = storedComposerModel();
   if (storedModel && Array.from(target.options).some((option) => option.value === storedModel)) {
     target.value = storedModel;
   } else if (normalizedProvider !== 'openai-image' && Array.from(target.options).some((option) => option.value === 'auto')) {
@@ -912,22 +937,54 @@ export function closeNewConversationModelModal() {
   hideNewConversationModelModal();
 }
 
-function persistReasoningSelection(reasoningEffort = '') {
-  const effort = String(reasoningEffort || '').trim().toLowerCase();
-  if (!effort) return;
-  localStorage.setItem(REASONING_STORAGE_KEY, effort);
-  const composerReasoningSelect = document.getElementById('reasoning-effort-select');
-  if (composerReasoningSelect && Array.from(composerReasoningSelect.options || []).some((option) => option.value === effort)) {
-    composerReasoningSelect.value = effort;
+// The only writer of the shared "last used" keys on this path, and only once
+// the bootstrap has succeeded: an abandoned or rejected New Chat must not
+// change what the open conversation or the next one starts with.
+function rememberBootstrappedSelection(result = null) {
+  const bootstrappedModel = String(result?.preferredModel || result?.selectedModel || '')
+    .trim()
+    // The composer stores base ids and carries the 1M tier separately.
+    .replace(CLAUDE_LONG_CONTEXT_PATTERN, '');
+  if (bootstrappedModel) localStorage.setItem(MODEL_STORAGE_KEY, bootstrappedModel);
+  const bootstrappedEffort = String(result?.preferredReasoningEffort || '').trim().toLowerCase();
+  if (bootstrappedEffort) localStorage.setItem(REASONING_STORAGE_KEY, bootstrappedEffort);
+}
+
+// The conversation row exists in both the success and the worker-prestart
+// failure case, so both take the same post-create steps.
+async function openBootstrappedConversation({
+  conversationId,
+  payload,
+  selectedCwd = '',
+  selectedProvider = '',
+  selectedSize = '',
+}) {
+  // Only a bootstrap that actually created the conversation makes the CWD
+  // choice sticky, so a rejected path can never become the next chat's default.
+  try {
+    if (selectedCwd) localStorage.setItem(NEW_CHAT_CWD_STORAGE_KEY, selectedCwd);
+    else localStorage.removeItem(NEW_CHAT_CWD_STORAGE_KEY);
+  } catch {}
+  hideNewConversationModelModal();
+  // The server echoes what it actually bound and stored; the composer picks
+  // those up from the conversation row when it opens, so only the shared
+  // "last used" storage is updated here.
+  rememberBootstrappedSelection(payload);
+  await refreshConversations();
+  await openConversation(conversationId);
+  if (selectedProvider === 'openai-image') {
+    const contextTierSelect = document.getElementById('context-tier-select');
+    if (contextTierSelect && selectedSize && Array.from(contextTierSelect.options).some((option) => option.value === selectedSize)) {
+      contextTierSelect.value = selectedSize;
+    }
   }
 }
 
 async function createNewConversation(selectedModel, selectedReasoningEffort = '', selectedCwd = '') {
   if (newConversationInFlight) return;
-  newConversationInFlight = true;
+  setNewConversationInFlight(true);
   const confirmButton = document.getElementById('new-conversation-model-confirm');
   if (confirmButton) confirmButton.disabled = true;
-  persistReasoningSelection(selectedReasoningEffort);
   const selectedProvider = normalizeNewConversationProviderType(
     String(document.getElementById('new-conversation-provider-select')?.value || '').trim(),
   );
@@ -940,6 +997,15 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       model: selectedModel || undefined,
       providerType: bootstrapProviderType(selectedProvider),
       reasoningEffort: String(selectedReasoningEffort || '').trim().toLowerCase() || undefined,
+      // Bootstrap writes the conversation's preferences, so the current mode has
+      // to travel with it or every new chat would come back as the default one.
+      // The composer's selector wins over storage: storage holds the last
+      // explicit choice, which is not the mode of the conversation on screen.
+      relayMode: String(
+        document.getElementById('mode-select')?.value
+        || localStorage.getItem(MODE_STORAGE_KEY)
+        || '',
+      ).trim() || undefined,
       workspaceRootPath: selectedCwd || undefined,
       title: 'New Conversation',
     });
@@ -948,29 +1014,13 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       showTransientRelayNotice('Could not start a new conversation session. Please try again.');
       return;
     }
-    // Only a successful bootstrap makes the CWD choice sticky, so a rejected
-    // path can never become the default for the next chat.
-    try {
-      if (selectedCwd) localStorage.setItem(NEW_CHAT_CWD_STORAGE_KEY, selectedCwd);
-      else localStorage.removeItem(NEW_CHAT_CWD_STORAGE_KEY);
-    } catch {}
-    hideNewConversationModelModal();
-    const bootstrappedModel = String(result?.selectedModel || '').trim();
-    if (bootstrappedModel) {
-      localStorage.setItem('copilot_model', bootstrappedModel);
-      const modelSelect = document.getElementById('model-select');
-      if (Array.from(modelSelect?.options || []).some((option) => option.value === bootstrappedModel)) {
-        modelSelect.value = bootstrappedModel;
-      }
-    }
-    await refreshConversations();
-    await openConversation(nextConversationId);
-    if (selectedProvider === 'openai-image') {
-      const contextTierSelect = document.getElementById('context-tier-select');
-      if (contextTierSelect && selectedSize && Array.from(contextTierSelect.options).some((option) => option.value === selectedSize)) {
-        contextTierSelect.value = selectedSize;
-      }
-    }
+    await openBootstrappedConversation({
+      conversationId: nextConversationId,
+      payload: result,
+      selectedCwd,
+      selectedProvider,
+      selectedSize,
+    });
     if (result?.warning) {
       showTransientRelayNotice(String(result.warning), 6000);
     }
@@ -981,10 +1031,35 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       showTransientRelayNotice(String(result.defaultSessionWorkspaceRootWarning), 7000);
     }
   } catch (error) {
-    // The modal stays open so the user can fix the CWD/model and retry.
-    showTransientRelayNotice(error?.message || 'Could not start a new conversation session.');
+    // A worker that fails to prestart still leaves a committed conversation
+    // bound to the requested provider. Open it so the user can retry from the
+    // chat instead of hunting for an orphaned row in the sidebar.
+    const createdConversationId = error?.payload?.conversationCreated
+      ? String(error.payload.conversationId || '').trim()
+      : '';
+    let recovered = false;
+    if (createdConversationId) {
+      try {
+        await openBootstrappedConversation({
+          conversationId: createdConversationId,
+          payload: error.payload,
+          selectedCwd,
+          selectedProvider,
+          selectedSize,
+        });
+        recovered = true;
+      } catch {
+        // Fall through to the failure notice below with the modal closed; the
+        // conversation exists and the sidebar refresh will show it.
+      }
+    }
+    showTransientRelayNotice(recovered
+      // The chat is usable, but its worker did not start, so say what broke.
+      ? `The chat was created, but its session could not start: ${error?.message || 'unknown error'}.`
+      // Otherwise the modal stays open so the user can fix the CWD/model and retry.
+      : (error?.message || 'Could not start a new conversation session.'));
   } finally {
-    newConversationInFlight = false;
+    setNewConversationInFlight(false);
     if (confirmButton) confirmButton.disabled = false;
   }
 }
