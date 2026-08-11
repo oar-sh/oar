@@ -27,6 +27,37 @@ Phase 1 delivery notes:
   Still to verify manually: `bdbefd8f`, `dfa5b033`, `42b63d92`, `c2a32479`
   (possible earlier shadows, not deleted).
 
+Phase 1 follow-up fix (same day): the provenance check flagged every OpenAI BYOK
+image turn as `ran on github`. Cause: this server executes image operations
+itself against the conversation's provider API and then finalizes through an
+identity-less self-post (`/api/image-operations/:id/execute` → `/api/response`
+with only Authorization), so the responder had no bridge identity and fell back
+to `github`. Fixed by crediting the bound provider only when the turn is a
+server-executed operation (`q.image_operation_id`). Deliberately *not* fixed by
+treating all identity-less `openai` turns as legitimate: `server/relay.mjs` is
+spawned by `start.js` with plain env, so it authenticates on the Copilot plan
+regardless of binding — an identity-less OpenAI *chat* turn genuinely did run on
+the wrong plan and must stay flagged. Correctly configured OpenAI BYOK workers
+are Copilot CLIs whose web-relay extension does send `X-Relay-Session-Id`, so
+they resolve through their runtime row. An unresolvable responder identity now
+reports `unknown` (no chip, no mismatch) and logs `PROVIDER UNRESOLVED` rather
+than fabricating a `github` mismatch or staying silent.
+
+Open follow-ups from the audit of that fix (not yet done):
+- No test exercises `POST /api/response` end to end; the provenance decision is
+  covered at the helper level only, so the `serverExecutedOperation` wiring and
+  the `executed_provider` write are unpinned. A harness would need ~20 statement
+  stubs — worth doing when route-level test infrastructure exists.
+- The terminal-failure early return in `/api/response` records no provenance and
+  runs no mismatch check, yet stolen turns dying on `402 quota_exceeded` (the
+  original incident's signature) all exit there.
+- The identity branch never checks that the responder's runtime row belongs to
+  the turn's conversation, so same-provider cross-*conversation* execution is
+  invisible.
+- Relay-eligible providers are encoded in two inverse-shaped places: the
+  allowlist in `relay.mjs` processNext and the `NOT IN ('claude','cursor','grok')`
+  denylist in `findPendingForLegacyRelay`. Adding a provider means editing both.
+
 ---
 
 ## Part 1 — Findings (all verified against live data, logs and code)

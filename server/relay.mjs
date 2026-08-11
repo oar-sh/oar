@@ -883,6 +883,13 @@ async function processNext(approveAll) {
   // claude-opus-5 exist on both sides, so a stolen turn would silently bill
   // the wrong plan under the wrong provider label. The server-side dequeue
   // already filters these; this guard covers a server that predates it.
+  // openai is allowed through because routing-disabled installs still run
+  // OpenAI BYOK conversations here. Note this process gets plain env from
+  // start.js, so such a turn does execute on the Copilot plan and is reported
+  // as a mismatch by the provenance check in /api/response. Keep this list in
+  // sync with the findPendingForLegacyRelay denylist in
+  // repositories/message-repository.mjs — this file is a standalone CLI and
+  // must not import the express routes.
   const msgProviderType = String(msg.providerType || '').trim().toLowerCase();
   if (msgProviderType && msgProviderType !== 'github' && msgProviderType !== 'openai') {
     err(`Refusing msg ${msg.id.slice(0, 8)}: it belongs to provider "${msgProviderType}", not the Copilot relay`);
