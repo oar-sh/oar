@@ -6735,6 +6735,7 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     normalizeRelayMode,
     defaultRelayMode: DEFAULT_RELAY_MODE,
     defaultModel: DEFAULT_MODEL,
+    getCursorProviderSettings,
   });
   if (out?.ownerSessionId) {
     const worker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;

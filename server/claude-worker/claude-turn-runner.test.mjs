@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createClaudeTurnRunner, buildClaudePlanReadyBoardPayload } from './claude-turn-runner.mjs';
+import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 
 // Keeps the turn tests off the real `~/.claude/projects`; transcript
 // relocation has its own suite in claude-transcript-relocator.test.mjs.
@@ -74,6 +75,30 @@ const baseMessage = {
   model: 'claude-sonnet-5',
   attachments: [],
 };
+
+test('a turn that finishes on tool activity alone publishes instead of requeueing', async () => {
+  // Same defect the Cursor worker hit in conv 1e497a75: a successful result
+  // carrying no prose is a completed turn, and requeuing it re-runs work whose
+  // emptiness is deterministic until the retry cap fails the message.
+  const stub = makeApiStub();
+  const runner = createClaudeTurnRunner({
+    api: stub.api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeTurnImpl: () => fakeTurn([initMessage('native-1'), resultMessage('', 'native-1')]),
+  });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+
+  assert.ok(
+    !stub.calls.find((call) => call.routePath === '/api/requeue'),
+    'a completed turn must never be requeued',
+  );
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, EMPTY_TURN_COMPLETION_NOTE);
+  assert.ok(!response.body.terminalError, 'a silent turn is a success, not a failure');
+});
 
 test('first turn persists the native session id and later turns resume it', async () => {
   const stub = makeApiStub();

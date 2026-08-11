@@ -1023,6 +1023,7 @@ export function buildDequeuedRelayMessage({
   normalizeRelayMode,
   defaultRelayMode,
   defaultModel,
+  getCursorProviderSettings = () => null,
 } = {}) {
   if (!msg) return null;
   const attachments = parseAttachments(msg.attachments).map(hydrateAttachment).filter(Boolean);
@@ -1039,6 +1040,19 @@ export function buildDequeuedRelayMessage({
       stmts.setQueueRuntimeSession.run(runtimeSession.id, msg.id);
     }
   }
+  const providerType = String(runtimeSession?.provider_type || '').trim().toLowerCase() || null;
+  // The Cursor worker declares one subagent per enabled model, because the
+  // SDK's built-in subagent model menu is stuck at `inherit` +
+  // `composer-2.5-fast` (see cursor-subagent-roster.mjs). Delivered per turn
+  // rather than baked into the worker's launch env so toggling models in the
+  // Select Models modal takes effect on the next turn, with no respawn.
+  let cursorSubagentModels = [];
+  if (providerType === 'cursor') {
+    const cursorSettings = getCursorProviderSettings();
+    cursorSubagentModels = (Array.isArray(cursorSettings?.enabledModels) ? cursorSettings.enabledModels : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+  }
   return {
     id: msg.id,
     conversationId: msg.conversation_id,
@@ -1046,10 +1060,11 @@ export function buildDequeuedRelayMessage({
     isNewConversation: msg.is_new_conversation === 1,
     model: String(msg.model || '').trim() || defaultModel,
     modelVariantId: String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
-    providerType: String(runtimeSession?.provider_type || '').trim().toLowerCase() || null,
+    providerType,
     providerModel: String(runtimeSession?.provider_model || '').trim() || null,
     claudeNativeSessionId: String(runtimeSession?.claude_native_session_id || '').trim() || null,
     cursorAgentId: String(runtimeSession?.cursor_agent_id || '').trim() || null,
+    cursorSubagentModels,
     grokNativeSessionId: String(runtimeSession?.grok_native_session_id || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
@@ -5225,6 +5240,7 @@ export function registerMessagesRoutes(app, deps) {
         normalizeRelayMode,
         defaultRelayMode: DEFAULT_RELAY_MODE,
         defaultModel: DEFAULT_MODEL,
+        getCursorProviderSettings,
       });
       
       if (out.attachments.length) {

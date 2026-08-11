@@ -119,6 +119,60 @@ test('resume path passes the same option shape and keeps customTools', async () 
   }
 });
 
+test('the subagent roster rides on both create and resume, and an empty one is omitted', async () => {
+  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-adapter-test-'));
+  const agents = {
+    'grok-4-5': { description: 'd', prompt: 'p', model: { id: 'grok-4.5' } },
+  };
+  try {
+    const factory = createRecordingFactory({ agentId: 'agent-1' });
+    await createCursorAgentHandle({
+      apiKey: 'k',
+      model: 'composer-1',
+      cwd: '/home/dev/project',
+      storeDir,
+      sdkSessionId: 'sess-agents-create',
+      agents,
+      agentFactoryImpl: factory,
+      storeFactoryImpl: () => ({}),
+    });
+    assert.deepEqual(factory.calls.create[0].agents, agents);
+
+    // Resume must carry it too: the SDK persists the roster into store metadata
+    // at create time and falls back to that copy when a resume passes none, so
+    // omitting it here would pin the session to a stale subagent menu.
+    await createCursorAgentHandle({
+      apiKey: 'k',
+      model: 'composer-1',
+      cwd: '/home/dev/project',
+      storeDir,
+      sdkSessionId: 'sess-agents-resume',
+      agentId: 'agent-9',
+      agents,
+      agentFactoryImpl: factory,
+      storeFactoryImpl: () => ({}),
+    });
+    assert.deepEqual(factory.calls.resume[0].options.agents, agents);
+
+    for (const emptyRoster of [{}, null, undefined]) {
+      const bare = createRecordingFactory({ agentId: 'agent-2' });
+      await createCursorAgentHandle({
+        apiKey: 'k',
+        model: 'composer-1',
+        cwd: '/home/dev/project',
+        storeDir,
+        sdkSessionId: 'sess-agents-empty',
+        agents: emptyRoster,
+        agentFactoryImpl: bare,
+        storeFactoryImpl: () => ({}),
+      });
+      assert.ok(!('agents' in bare.calls.create[0]), 'an empty roster must not reach the SDK');
+    }
+  } finally {
+    fs.rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
 test('agentId falls back to the passed id and close survives agent.close throwing', async () => {
   const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-adapter-test-'));
   try {

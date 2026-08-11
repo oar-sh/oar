@@ -37,6 +37,7 @@ export async function createCursorAgentHandle({
   sdkSessionId,
   agentId = '',
   customTools = {},
+  agents = null,
   agentFactoryImpl = null,
   storeFactoryImpl = null,
   dbg = () => {},
@@ -46,9 +47,18 @@ export async function createCursorAgentHandle({
   const storePath = path.join(storeDir, sdkSessionId, 'agent.db');
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   const store = await makeStore(storePath, { cwd });
+  // `agents` rides on BOTH create and resume on purpose. The SDK persists the
+  // roster into the agent's store metadata at create time and falls back to
+  // that copy when a resume passes none, so a session resumed after the user
+  // changed their model selection would otherwise keep the old subagent menu.
+  // An empty roster is omitted rather than sent: the SDK maps `{}` to
+  // "unspecified" anyway, so there is no way to express "no subagents" that
+  // clears the persisted set.
+  const hasAgents = !!agents && Object.keys(agents).length > 0;
   const options = {
     apiKey,
     model: { id: model },
+    ...(hasAgents ? { agents } : {}),
     local: { cwd, store, customTools, autoReview: false },
   };
   const resumeId = String(agentId || '').trim();
