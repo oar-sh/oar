@@ -51,6 +51,13 @@ import {
   TURN_CEILING_STEP_MINUTES,
   parseTurnCeilingUpdate,
 } from '../../shared/turn-ceiling.mjs';
+import {
+  DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
+  BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
+  BACKGROUND_TASK_TIMEOUT_MIN_MINUTES,
+  BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
+  parseBackgroundTaskTimeoutUpdate,
+} from '../../shared/background-task-timeout.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -1850,6 +1857,7 @@ export function registerSessionsRoutes(app, deps) {
     buildContextResponseText,
     readContextFromSessionEvents,
     inFlightStateForConversation,
+    backgroundTaskStore,
     createCompactedConversation,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
@@ -1944,6 +1952,8 @@ export function registerSessionsRoutes(app, deps) {
     resolveCursorSessionRoot = null,
     getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
+    getBackgroundTaskTimeoutMinutes = () => DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
+    setBackgroundTaskTimeoutMinutes = () => ({ ok: false, error: 'Background task timeout settings are unavailable' }),
     markSharedViewerPresence,
     getSharedWatcherCount,
     statusEventService,
@@ -3432,6 +3442,7 @@ export function registerSessionsRoutes(app, deps) {
       updatedAt: conv.updated_at,
       sessionUsageSummary,
       inFlight,
+      backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,
@@ -4915,6 +4926,30 @@ export function registerSessionsRoutes(app, deps) {
       maxMinutes: TURN_CEILING_MAX_MINUTES,
       stepMinutes: TURN_CEILING_STEP_MINUTES,
       defaultMinutes: DEFAULT_TURN_CEILING_MINUTES,
+    });
+  });
+
+  app.get('/api/settings/background-task-timeout', auth, (_req, res) => {
+    res.json({
+      timeoutMinutes: getBackgroundTaskTimeoutMinutes(),
+      minMinutes: BACKGROUND_TASK_TIMEOUT_MIN_MINUTES,
+      maxMinutes: BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
+      stepMinutes: BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
+      defaultMinutes: DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
+    });
+  });
+
+  app.post('/api/settings/background-task-timeout', auth, (req, res) => {
+    const parsed = parseBackgroundTaskTimeoutUpdate(req.body?.timeoutMinutes);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setBackgroundTaskTimeoutMinutes(parsed.minutes);
+    if (!result.ok) return res.status(500).json({ error: result.error });
+    return res.json({
+      timeoutMinutes: result.timeoutMinutes,
+      minMinutes: BACKGROUND_TASK_TIMEOUT_MIN_MINUTES,
+      maxMinutes: BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
+      stepMinutes: BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
+      defaultMinutes: DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     });
   });
 

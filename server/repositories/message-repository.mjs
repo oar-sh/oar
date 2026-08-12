@@ -108,7 +108,15 @@ export function createMessageRepository(db) {
         // queue
         insertQ:        db.prepare(insertQueueSql),
         queueHasImageOperationId,
-        findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
+        // A background-continuation turn: born 'processing' and owned by its
+        // session worker — the CLI already started it on its own, so it must
+        // never be handed out as deliverable work.
+        insertContinuationQ: db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, relay_mode, text, status, kind, timestamp, processing_at, retry_count, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, 0, ?, ?, ?, 'processing', 'continuation', ?, ?, 0, ?, ?, ?, ?)`),
+        setMessageKind: db.prepare(`UPDATE messages SET kind = ? WHERE id = ?`),
+        // Quiet teardown for a continuation whose worker died: there is no
+        // user to answer, so it fails without the terminal-failure ceremony.
+        dropStaleContinuation: db.prepare(`UPDATE queue SET status = 'failed', processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status = 'processing' AND kind = 'continuation'`),
+        findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND COALESCE(kind, '') != 'continuation' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
         // Global fallback for requesters without a session identity (the legacy
         // Copilot relay CLI). Conversations bound to a session-worker provider
         // (claude/cursor/grok) are excluded outright: handing one of their turns
@@ -131,6 +139,7 @@ export function createMessageRepository(db) {
           LEFT JOIN runtime_sessions rsc
             ON rsc.conversation_id = q.conversation_id
           WHERE q.status = 'pending'
+            AND COALESCE(q.kind, '') != 'continuation'
             AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
             AND NULLIF(q.owner_sdk_session_id, '') IS NULL
             AND LOWER(COALESCE(
@@ -153,6 +162,7 @@ export function createMessageRepository(db) {
           LEFT JOIN conversations c
             ON c.id = q.conversation_id
           WHERE q.status = 'pending'
+            AND COALESCE(q.kind, '') != 'continuation'
             AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
             AND (
               COALESCE(
@@ -189,6 +199,7 @@ export function createMessageRepository(db) {
           LEFT JOIN conversations c
             ON c.id = q.conversation_id
           WHERE q.status = 'pending'
+            AND COALESCE(q.kind, '') != 'continuation'
             AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
             AND COALESCE(
               NULLIF(q.owner_sdk_session_id, ''),
@@ -268,7 +279,7 @@ export function createMessageRepository(db) {
         // Recovery clears only the lease, never the owner: a recovered row must
         // stay routed to its provider worker so the primer respawns that worker
         // instead of the row becoming claimable by the global relay poll.
-        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND processing_at < ?`),
+        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND COALESCE(kind, '') != 'continuation' AND processing_at < ?`),
         // Staleness is inactivity, not elapsed turn time: owner_last_claimed_at is
         // refreshed by every worker heartbeat for the message it is working on, so a
         // long-but-alive turn keeps moving the cutoff. processing_at is only the
@@ -281,6 +292,7 @@ export function createMessageRepository(db) {
           SELECT id, conversation_id
           FROM queue
           WHERE status = 'processing'
+            AND COALESCE(kind, '') != 'continuation'
             AND (
               COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
               OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
@@ -295,11 +307,25 @@ export function createMessageRepository(db) {
               owner_lease_expires_at = NULL,
               owner_last_claimed_at = NULL
           WHERE status = 'processing'
+            AND COALESCE(kind, '') != 'continuation'
             AND (
               COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
               OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
             )
             AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+        `),
+        // A continuation with no live worker can only be torn down — replaying
+        // it as deliverable work would send the CLI's own bookkeeping text back
+        // to the CLI as a user prompt.
+        listStaleProcessingContinuations: db.prepare(`
+          SELECT id, conversation_id
+          FROM queue
+          WHERE status = 'processing'
+            AND kind = 'continuation'
+            AND (
+              COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
+              OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
+            )
         `),
         listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         // Authoritative "is a turn in flight" signal for the conversation list.

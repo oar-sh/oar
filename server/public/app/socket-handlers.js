@@ -38,6 +38,7 @@ import {
   updatePendingQuestionBanner,
 } from './ask-user-view.js';
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
+import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import {
   showThinking,
   removeThinking,
@@ -419,6 +420,9 @@ export async function connectSocket(overrideDeps) {
   socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_changed', () => {
     loadRelayBoards();
+  });
+  socket.on('background_tasks', ({ conversationId, tasks }) => {
+    setConversationBackgroundTasks(conversationId, tasks);
   });
   socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId }) => {
     if (!messageId || !text) return;

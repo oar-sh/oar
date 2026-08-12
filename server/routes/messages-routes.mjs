@@ -1596,6 +1596,8 @@ export function registerMessagesRoutes(app, deps) {
     queueCounts,
     getModelCatalogState,
     buildRelayReadyBannerData,
+    backgroundTaskStore,
+    sendWorkerControl,
     ensureSessionId,
     touchCli,
     recoverProcessingOlderThan,
@@ -2304,24 +2306,37 @@ export function registerMessagesRoutes(app, deps) {
     sdkSessionId,
     {
       excludeMessageId = null,
+      excludeMessageIds = null,
       reason = 'owner-heartbeat-idle',
       graceMs = SESSION_WORKER_IDLE_RECOVERY_GRACE_MS,
     } = {},
   ) {
     const normalizedSessionId = normalizeSessionWorkerId(sdkSessionId);
     if (!normalizedSessionId) return [];
-    const excludedId = String(excludeMessageId || '').trim();
+    const excludedIds = new Set(
+      [excludeMessageId, ...(Array.isArray(excludeMessageIds) ? excludeMessageIds : [])]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    );
     const cutoffIso = new Date(Date.now() - Math.max(1_000, Number(graceMs) || SESSION_WORKER_IDLE_RECOVERY_GRACE_MS)).toISOString();
-    const rows = listRecoverableProcessingOwnedBySession.all(
+    const rows = (listRecoverableProcessingOwnedBySession.all(
       normalizedSessionId,
-      excludedId,
-      excludedId,
+      '',
+      '',
       cutoffIso,
-    ) || [];
+    ) || []).filter((row) => !excludedIds.has(String(row.id)));
     if (!rows.length) return [];
     const rowsToFail = [];
     const rowsToRecover = [];
     for (const row of rows) {
+      if (String(row.kind || '') === 'continuation') {
+        // A background continuation whose worker stopped claiming it has no
+        // user to answer and must never be replayed as a prompt: tear it down
+        // quietly.
+        stmts.dropStaleContinuation?.run?.(row.id);
+        io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+        continue;
+      }
       const relayActivityRows = stmts.listActivityByQueueMessage?.all?.(row.id);
       const relayStreamRows = stmts.listStreamEventsByQueueMessage?.all?.(row.id);
       const fallbackRelayActivities = Array.isArray(relayActivityRows)
@@ -2470,6 +2485,13 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
     sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
     sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
+    // Re-arm the kill block now that the processes are actually gone. Windows
+    // process-tree discovery and the kill itself are synchronous and take
+    // seconds — longer than the block's grace window — so the marker set at the
+    // top of this route has already expired by the time the worker dies, and
+    // the first delivery check after this handler yields spawns a replacement
+    // for the session that was just killed.
+    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
 
     // Drain ALL owned processing rows, not just first
     const queueRows = findAllProcessingOwnedBySession.all(sdkSessionId) || [];
@@ -2478,6 +2500,18 @@ export function registerMessagesRoutes(app, deps) {
 
     if (queueRows.length > 0) {
       for (const queueRow of queueRows) {
+        if (String(queueRow.kind || '') === 'continuation') {
+          // A background continuation has no user prompt behind it, so it is
+          // torn down quietly instead of answering the chat with a terminal
+          // failure for a turn nobody asked for.
+          stmts.dropStaleContinuation?.run?.(queueRow.id);
+          io.emit('message_status', {
+            messageId: queueRow.id,
+            conversationId: queueRow.conversation_id,
+            status: 'failed',
+          });
+          continue;
+        }
         const failureRecord = {
           kind: 'manual-session-kill',
           code: 'worker-session-killed',
@@ -4505,6 +4539,16 @@ export function registerMessagesRoutes(app, deps) {
     const requester = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
     const activeQueueMessageId = String(req.body?.activeQueueMessageId || '').trim();
+    // A persistent-process worker can hold several live rows at once (the
+    // running turn plus a delivered message queued behind it plus a
+    // background continuation); every one of them needs its lease refreshed
+    // or the owner-recovery below replays a turn the worker still owns.
+    const activeQueueMessageIds = [...new Set(
+      [
+        activeQueueMessageId,
+        ...(Array.isArray(req.body?.activeQueueMessageIds) ? req.body.activeQueueMessageIds : []),
+      ].map((value) => String(value || '').trim()).filter(Boolean),
+    )];
     if (requesterSessionId) {
       const existingRequesterWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
       const requesterPid = Number(requester?.pid);
@@ -4530,12 +4574,14 @@ export function registerMessagesRoutes(app, deps) {
         });
       }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
-      if (activeQueueMessageId) {
+      if (activeQueueMessageIds.length) {
         const now = new Date().toISOString();
         const leaseExpiresAt = addMsToIso(now, SESSION_WORKER_OWNER_LEASE_MS);
-        refreshProcessingLeaseForOwnedMessage.run(leaseExpiresAt, now, activeQueueMessageId, requesterSessionId);
+        for (const id of activeQueueMessageIds) {
+          refreshProcessingLeaseForOwnedMessage.run(leaseExpiresAt, now, id, requesterSessionId);
+        }
         recoverOwnedProcessingRowsForSession(requesterSessionId, {
-          excludeMessageId: activeQueueMessageId,
+          excludeMessageIds: activeQueueMessageIds,
           reason: 'owner-heartbeat-mismatch',
         });
       } else {
@@ -5935,6 +5981,9 @@ export function registerMessagesRoutes(app, deps) {
         explicitModel,
         modelOrigin,
       );
+      if (String(q?.kind || '') === 'continuation') {
+        stmts.setMessageKind?.run('continuation', responseId);
+      }
       stmts.setMessageExecutedProvider?.run(executedProvider, responseId);
       stmts.linkActivityToResponse.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
@@ -6155,6 +6204,7 @@ export function registerMessagesRoutes(app, deps) {
         activities,
         thoughts,
         executedProvider,
+        kind: String(q?.kind || '') === 'continuation' ? 'continuation' : undefined,
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
@@ -6164,6 +6214,89 @@ export function registerMessagesRoutes(app, deps) {
       text: resolvedText,
     });
     cancelPendingRelayQuestionsForMessage(messageId);
+    res.json({ ok: true });
+  });
+
+  // POST /api/continuation-turn — a session worker's CLI started a turn on its
+  // own (a background task's notification). The synthetic queue row gives that
+  // turn the full relay surface — stream, thoughts, activity, questions, and a
+  // response of its own — without any user message: born 'processing', owned
+  // by the session, and excluded from every delivery/recovery path.
+  app.post('/api/continuation-turn', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+    const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+    if (providerType !== 'claude') {
+      return res.status(409).json({ error: 'Background continuations are only supported for Claude conversations' });
+    }
+    const requester = readBridgeIdentity(req);
+    const ownerSessionId = normalizeSessionWorkerId(requester?.sessionId)
+      || normalizeSessionWorkerId(req.body?.sdkSessionId)
+      || String(conversation.sdk_session_id || conversationId);
+    const relayMode = normalizeRelayMode(req.body?.relayMode) || DEFAULT_RELAY_MODE;
+    const messageId = uuidv4();
+    const now = new Date().toISOString();
+    const leaseExpiresAt = addMsToIso(now, SESSION_WORKER_OWNER_LEASE_MS);
+    stmts.insertContinuationQ.run(
+      messageId,
+      conversationId,
+      runtimeSession?.id || null,
+      String(req.body?.model || '').trim() || null,
+      relayMode,
+      '[background continuation]',
+      now,
+      now,
+      ownerSessionId,
+      now,
+      leaseExpiresAt,
+      now,
+    );
+    console.log(`[${ts()}] CONTINUATION ${messageId.slice(0, 8)} conv=${conversationId.slice(0, 8)} owner=${ownerSessionId.slice(0, 8)} trigger=${String(req.body?.trigger || 'background_task')}`);
+    io.emit('message_status', { messageId, conversationId, status: 'processing', kind: 'continuation' });
+    io.emit('queue_updated', { continuation: 1 });
+    res.json({ ok: true, messageId, conversationId });
+  });
+
+  // POST /api/background-tasks — a session worker publishes its live
+  // background-task set (REPLACE semantics, mirroring the SDK's
+  // background_tasks_changed signal) so the composer panel tracks it live.
+  app.post('/api/background-tasks', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const tasks = (Array.isArray(req.body?.tasks) ? req.body.tasks : [])
+      .map((task) => ({
+        taskId: String(task?.taskId || '').trim(),
+        taskType: String(task?.taskType || '').trim(),
+        description: String(task?.description || '').trim().slice(0, 500),
+        startedAt: Number(task?.startedAt) || null,
+        summary: String(task?.summary || '').trim().slice(0, 500) || null,
+        lastToolName: String(task?.lastToolName || '').trim() || null,
+        totalTokens: Number.isFinite(Number(task?.totalTokens)) ? Number(task.totalTokens) : null,
+      }))
+      .filter((task) => task.taskId);
+    backgroundTaskStore?.replace?.(conversationId, tasks);
+    io.emit('background_tasks', { conversationId, tasks });
+    res.json({ ok: true, count: tasks.length });
+  });
+
+  // POST /api/conversation/:conversationId/background-task/:taskId/stop —
+  // fire-and-forget stop push to the conversation's session worker. The
+  // resulting background_tasks_changed replaces the panel's set.
+  app.post('/api/conversation/:conversationId/background-task/:taskId/stop', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const taskId = String(req.params.taskId || '').trim();
+    if (!conversationId || !taskId) return res.status(400).json({ error: 'Missing conversationId or taskId' });
+    const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    const sessionId = String(conversation.sdk_session_id || conversationId);
+    const sent = sendWorkerControl?.(sessionId, { type: 'stop_background_task', taskId });
+    if (!sent) return res.status(409).json({ error: 'Session worker is not connected' });
+    console.log(`[${ts()}] BG-TASK STOP ${taskId} conv=${conversationId.slice(0, 8)}`);
     res.json({ ok: true });
   });
 
@@ -6542,6 +6675,14 @@ export function registerMessagesRoutes(app, deps) {
         );
       }
       return res.json({ ok: true, terminal: true, code: terminalFailure.stableCode });
+    }
+    if (q && q.status === 'processing' && String(q.kind || '') === 'continuation') {
+      // A continuation has no user prompt to replay; a worker that gives up on
+      // one just tears it down.
+      stmts.dropStaleContinuation?.run?.(messageId);
+      io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'failed' });
+      console.log(`[${ts()}] CONTINUATION DROPPED ${messageId?.slice(0,8)} reason=requeue`);
+      return res.json({ ok: true, dropped: 'continuation' });
     }
     if (q && q.status === 'processing') {
       const retryCount = Number(q.retry_count || 0) + 1;

@@ -5,6 +5,11 @@ export function createHeartbeatController({
   getHeartbeatTimer,
   setHeartbeatTimer,
   getActiveQueueMessageId,
+  // Optional: every queue message the worker currently owns work for (a
+  // persistent-process worker can hold a running turn, a delivered message
+  // queued behind it, and a background continuation at once). Each reported
+  // id gets its owner lease refreshed; unreported owned rows are recovered.
+  getActiveQueueMessageIds,
 }) {
   async function pulseHeartbeat() {
     if (!getSessionReady()) return false;
@@ -12,7 +17,14 @@ export function createHeartbeatController({
       const activeQueueMessageId = typeof getActiveQueueMessageId === "function"
         ? String(getActiveQueueMessageId() || "").trim()
         : "";
-      await api("POST", "/api/heartbeat", activeQueueMessageId ? { activeQueueMessageId } : {});
+      const activeQueueMessageIds = typeof getActiveQueueMessageIds === "function"
+        ? (getActiveQueueMessageIds() || []).map((id) => String(id || "").trim()).filter(Boolean)
+        : [];
+      const body = {
+        ...(activeQueueMessageId ? { activeQueueMessageId } : {}),
+        ...(activeQueueMessageIds.length ? { activeQueueMessageIds } : {}),
+      };
+      await api("POST", "/api/heartbeat", body);
       return true;
     } catch {
       return false;

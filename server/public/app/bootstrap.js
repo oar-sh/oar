@@ -248,6 +248,8 @@ import {
   updateWindowsAutostartSettingFromToggle,
   previewTurnCeilingSetting,
   updateTurnCeilingSetting,
+  previewBackgroundTaskTimeoutSetting,
+  updateBackgroundTaskTimeoutSetting,
 } from './settings-modal.js';
 import {
   togglePushOnThisDevice,
@@ -3880,6 +3882,8 @@ window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;
 window.previewTurnCeilingSetting = previewTurnCeilingSetting;
 window.updateTurnCeilingSetting = updateTurnCeilingSetting;
+window.previewBackgroundTaskTimeoutSetting = previewBackgroundTaskTimeoutSetting;
+window.updateBackgroundTaskTimeoutSetting = updateBackgroundTaskTimeoutSetting;
 window.togglePushOnThisDevice = togglePushOnThisDevice;
 window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;
 window.openSettingsModal = openSettingsModal;

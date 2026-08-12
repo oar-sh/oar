@@ -94,6 +94,12 @@ export function createSessionWorkerWebSocketService({
   noteWorkerHeartbeat = () => {},
   onDeliverySendFailed = async () => {},
   requestWork = async () => null,
+  // Liveness probe for a socket's worker process. A killed worker's socket
+  // survives its process by an event-loop turn (the kill path blocks the loop,
+  // so this service's timer runs before the socket close lands), and asking for
+  // work on its behalf makes the relay spawn a replacement for the session that
+  // was just killed.
+  isWorkerProcessAlive = () => true,
   pathPrefix = '',
   pollIntervalMs = 1000,
   nowIso = () => new Date().toISOString(),
@@ -170,6 +176,7 @@ export function createSessionWorkerWebSocketService({
     if (!meta || meta.delivering || !meta.ready) return false;
     if (!meta.sessionId) return false;
     if (socket.readyState !== socket.OPEN) return false;
+    if (meta.pid && isWorkerProcessAlive(meta.pid) === false) return false;
     meta.delivering = true;
     try {
       const pending = await requestWork({
@@ -428,6 +435,22 @@ export function createSessionWorkerWebSocketService({
     handleUpgrade(req, socket, head);
   }
 
+  /**
+   * Fire-and-forget control push to a connected session worker (e.g. "stop
+   * background task"). Returns false when the session has no open socket —
+   * the caller surfaces that as "worker offline" instead of queueing.
+   */
+  function sendControlToSession(sessionId, control) {
+    const normalized = normalizeText(sessionId);
+    if (!normalized) return false;
+    for (const socket of clients) {
+      const meta = clientState.get(socket);
+      if (meta?.sessionId !== normalized) continue;
+      if (emitEvent(socket, { type: 'worker.control', control, timestamp: nowIso() })) return true;
+    }
+    return false;
+  }
+
   return {
     start,
     stop,
@@ -435,5 +458,6 @@ export function createSessionWorkerWebSocketService({
     emitQueueChanged,
     emitDraining,
     handleUpgrade,
+    sendControlToSession,
   };
 }

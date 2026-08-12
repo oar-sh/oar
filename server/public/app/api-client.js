@@ -394,6 +394,17 @@ export async function updateTurnCeilingSetting(ceilingMinutes) {
   });
 }
 
+export async function loadBackgroundTaskTimeoutSetting() {
+  return apiFetch('/api/settings/background-task-timeout');
+}
+
+export async function updateBackgroundTaskTimeoutSetting(timeoutMinutes) {
+  return apiFetch('/api/settings/background-task-timeout', {
+    method: 'POST',
+    body: JSON.stringify({ timeoutMinutes: Number(timeoutMinutes) }),
+  });
+}
+
 export async function launchSessionWorker(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return null;

@@ -97,6 +97,11 @@ import {
   readTurnCeilingSetting,
   turnCeilingMinutesToMs,
 } from '../shared/turn-ceiling.mjs';
+import {
+  parseBackgroundTaskTimeoutUpdate,
+  readBackgroundTaskTimeoutSetting,
+  backgroundTaskTimeoutMinutesToMs,
+} from '../shared/background-task-timeout.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
 import {
   canonicalizeModelId,
@@ -1796,6 +1801,22 @@ function setTurnCeilingMinutes(value) {
   return { ok: true, ceilingMinutes: parsed.minutes };
 }
 
+const BACKGROUND_TASK_TIMEOUT_SETTING_KEY = 'background_task_timeout_minutes';
+
+function getBackgroundTaskTimeoutMinutes() {
+  return readBackgroundTaskTimeoutSetting(readAppSettingValue(BACKGROUND_TASK_TIMEOUT_SETTING_KEY));
+}
+
+function setBackgroundTaskTimeoutMinutes(value) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Background task timeout settings are unavailable' };
+  }
+  const parsed = parseBackgroundTaskTimeoutUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(BACKGROUND_TASK_TIMEOUT_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
+  return { ok: true, timeoutMinutes: parsed.minutes };
+}
+
 function resolveDefaultSessionWorkspaceRootState() {
   return resolveDefaultSessionWorkspaceRootStateFromService({
     storedPath: readAppSettingValue(DEFAULT_SESSION_WORKSPACE_ROOT_KEY),
@@ -3417,6 +3438,11 @@ if (!messageColumns.includes('executed_provider')) {
   // execution (e.g. the Copilot relay answering a Cursor conversation).
   db.exec(`ALTER TABLE messages ADD COLUMN executed_provider TEXT`);
 }
+if (!messageColumns.includes('kind')) {
+  // 'continuation' marks an assistant message the CLI produced on its own
+  // after a background task settled (no user prompt); the client badges it.
+  db.exec(`ALTER TABLE messages ADD COLUMN kind TEXT`);
+}
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_share_visibility
   ON messages(conversation_id, hidden_from_shares, timestamp)
@@ -3478,6 +3504,12 @@ if (!queueColumns.includes('parked_at')) {
 }
 if (!queueColumns.includes('parked_target_session_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN parked_target_session_id TEXT`);
+}
+if (!queueColumns.includes('kind')) {
+  // 'continuation' rows are synthetic turns for the Claude worker's
+  // background-task continuations: born 'processing', never deliverable, and
+  // torn down (not requeued) when their worker disappears.
+  db.exec(`ALTER TABLE queue ADD COLUMN kind TEXT`);
 }
 
 // recent_workspace_roots gained a case-normalized primary key (path_key). The
@@ -6079,6 +6111,26 @@ function mapSubagentRunRow(row) {
   };
 }
 
+// Live background-task sets per conversation, published by Claude session
+// workers (REPLACE semantics, mirroring the SDK's background_tasks_changed
+// signal). In-memory only: the worker republishes on every change and clears
+// on teardown, so a relay restart simply starts empty until the next update.
+const backgroundTaskStore = {
+  sets: new Map(),
+  replace(conversationId, tasks) {
+    const id = String(conversationId || '').trim();
+    if (!id) return;
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+      this.sets.delete(id);
+      return;
+    }
+    this.sets.set(id, { tasks, updatedAt: Date.now() });
+  },
+  get(conversationId) {
+    return this.sets.get(String(conversationId || '').trim())?.tasks || [];
+  },
+};
+
 function inFlightStateForConversation(conversationId) {
   const row = stmts.getLatestProcessingQueueByConversation.get(conversationId);
   if (!row) return null;
@@ -6102,6 +6154,13 @@ function inFlightStateForConversation(conversationId) {
 
 function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso = null } = {}) {
   const params = { inactiveBefore: cutoffIso, ceilingBefore: ceilingBeforeIso || null };
+  // Stale background-continuation turns are torn down, never requeued —
+  // replaying one would deliver the CLI's own continuation as a user prompt.
+  const staleContinuations = stmts.listStaleProcessingContinuations?.all?.(params) || [];
+  for (const row of staleContinuations) {
+    stmts.dropStaleContinuation?.run?.(row.id);
+    io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+  }
   const rows = stmts.listRecoverableProcessing.all(params);
   if (!rows.length) return [];
 
@@ -6754,6 +6813,11 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
   io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
   return {
     message: out,
+    // Piggybacked settings so workers pick up slider changes on the next
+    // delivery without a restart.
+    settings: {
+      backgroundTaskTimeoutMs: backgroundTaskTimeoutMinutesToMs(getBackgroundTaskTimeoutMinutes()),
+    },
     routing: {
       enabled: true,
       requesterSessionId,
@@ -6804,6 +6868,7 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   },
   onDeliverySendFailed: recoverUndeliveredSessionWorkerMessage,
   requestWork: requestSessionWorkerSocketDelivery,
+  isWorkerProcessAlive: (pid) => isProcessAlive(Number(pid)),
   pathPrefix: remotePath,
   pollIntervalMs: 500,
   logger: console,
@@ -7039,6 +7104,8 @@ const sharedRouteDeps = {
   subagentRunsForResponse,
   sanitizeActivityText,
   inFlightStateForConversation,
+  backgroundTaskStore,
+  sendWorkerControl: (sessionId, control) => sessionWorkerWebSocketService.sendControlToSession(sessionId, control),
   emitToClientsExceptSessionId,
   relayBridgeOwnerService,
   relayCliLauncherService,
@@ -7097,6 +7164,8 @@ const sharedRouteDeps = {
   resolveCursorSessionRoot: cursorSessionRootResolver.resolveCursorSessionRoot,
   getTurnCeilingMinutes,
   setTurnCeilingMinutes,
+  getBackgroundTaskTimeoutMinutes,
+  setBackgroundTaskTimeoutMinutes,
   requestRelayShutdown,
   markSharedViewerPresence,
   getSharedWatcherCount,

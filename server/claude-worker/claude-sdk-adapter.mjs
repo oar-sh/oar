@@ -29,36 +29,55 @@ export function systemPromptForRelayMode(relayMode) {
 }
 
 /**
- * One user message, but the stream stays open until `release()` is called.
- *
- * The CLI begins shutting down as soon as the input stream ends and the result
- * is emitted — which closes the control transport and makes end-of-turn
- * control requests (`getContextUsage`) fail with "Query closed before response
- * received". Holding the stream open keeps the session alive just long enough
- * to read the context breakdown; the runner releases it in a `finally`, so the
- * process always gets to exit.
+ * A user-message stream the session process feeds for the whole life of the
+ * CLI process: each `push(content)` becomes one user turn, and the stream
+ * only ends on `end()` — which is what lets the CLI exit. The CLI begins
+ * shutting down as soon as the input stream ends and the pending result is
+ * emitted, which also closes the control transport (canUseTool, context
+ * usage), so the session process keeps this open while background tasks or
+ * queued continuations still need the process alive.
  */
-function createGatedUserMessageStream(content) {
-  let release = () => {};
-  const gate = new Promise((resolve) => { release = resolve; });
+function createPushableUserMessageStream() {
+  const queued = [];
+  let wake = null;
+  let ended = false;
   async function* stream() {
-    yield {
-      type: 'user',
-      message: { role: 'user', content },
-      parent_tool_use_id: null,
-    };
-    await gate;
+    for (;;) {
+      while (queued.length) yield queued.shift();
+      if (ended) return;
+      await new Promise((resolve) => { wake = resolve; });
+      wake = null;
+    }
   }
-  return { stream: stream(), release };
+  return {
+    stream: stream(),
+    push(content) {
+      if (ended) throw new Error('user message stream already ended');
+      queued.push({
+        type: 'user',
+        message: { role: 'user', content },
+        parent_tool_use_id: null,
+      });
+      wake?.();
+    },
+    end() {
+      ended = true;
+      wake?.();
+    },
+  };
 }
 
 /**
  * The only module that imports `@anthropic-ai/claude-agent-sdk`.
  *
- * Runs one relay turn as a streaming-input `query()` (required for image
- * content blocks) and returns the SDK `Query` async iterable.
+ * Starts one persistent streaming-input `query()` — the CLI process that
+ * carries a whole relay session: the first user turn, any user turns pushed
+ * later, and the background-task continuation turns the CLI dequeues on its
+ * own. Returns the SDK `Query` async iterable with two extra methods:
+ * `pushUserMessage(content)` to feed another turn and `endInput()` to let the
+ * process exit once its current work drains.
  */
-export function startClaudeTurn({
+export function startClaudeSession({
   content,
   cwd,
   model = '',
@@ -88,12 +107,14 @@ export function startClaudeTurn({
       ? { pathToClaudeCodeExecutable: String(pathToClaudeCodeExecutable).trim() }
       : {}),
   };
-  const { stream, release } = createGatedUserMessageStream(content);
+  const { stream, push, end } = createPushableUserMessageStream();
   const turn = queryImpl({ prompt: stream, options });
   requestSummarizedThinkingDisplay(turn, dbg);
-  // The runner MUST call this (it does, in a finally) or the CLI process
-  // lingers waiting for more input.
-  turn.endInput = release;
+  turn.pushUserMessage = push;
+  // The session process MUST call this on every teardown path or the CLI
+  // process lingers waiting for more input.
+  turn.endInput = end;
+  if (content !== undefined && content !== null) push(content);
   return turn;
 }
 

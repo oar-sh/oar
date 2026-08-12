@@ -711,6 +711,11 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
   const autoTag = (msg.role === 'assistant' && modelOrigin === 'auto')
     ? ' <span class="msg-auto">auto</span>' : '';
+  // A turn the agent started on its own after a background task settled — no
+  // user prompt precedes it, so say where it came from.
+  const continuationTag = (msg.role === 'assistant' && String(msg?.kind || '').trim() === 'continuation')
+    ? ' <span class="msg-continuation" title="The agent continued on its own after a background task finished.">background continuation</span>'
+    : '';
   // A turn answered by a different provider than the conversation is bound to
   // (e.g. the Copilot relay answering a Cursor conversation) must be visible,
   // not silent: it ran on another plan than the header indicates.
@@ -778,7 +783,7 @@ function createMessageNode(msg, msgId = null, force = false) {
 
   div.innerHTML = `
     <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${userBubbleActionsHtml}</div>
-    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
+    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
   rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });

@@ -37,6 +37,7 @@ import {
   loadOpenAISettings,
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
+import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRepoBrowserLaunchCwdPath } from './attachments-view.js';
@@ -396,6 +397,8 @@ export function applyLoadedConversationState(id, response, {
     draftUpdatedByClientId: response.draftUpdatedByClientId,
   });
   restoreInFlightThinking(response.inFlight || null, followLiveUpdates);
+  setBackgroundTasksConversation(id);
+  setConversationBackgroundTasks(id, response.backgroundTasks || []);
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
   if (!restoreScroll || !didRenderMessages) return;

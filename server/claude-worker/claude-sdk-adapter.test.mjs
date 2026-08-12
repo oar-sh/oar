@@ -5,7 +5,7 @@ import {
   createCanUseTool,
   normalizeClaudeEffort,
   permissionModeForRelayMode,
-  startClaudeTurn,
+  startClaudeSession,
   systemPromptForRelayMode,
 } from './claude-sdk-adapter.mjs';
 
@@ -25,14 +25,14 @@ test('ask and autopilot get a system prompt append; plan and agent do not', () =
   assert.equal(systemPromptForRelayMode('agent').preset, 'claude_code');
 });
 
-test('startClaudeTurn builds streaming-input query options', async () => {
+test('startClaudeSession builds streaming-input query options', async () => {
   let captured = null;
   const queryImpl = (params) => {
     captured = params;
     return { async* [Symbol.asyncIterator]() {} };
   };
   const abortController = new AbortController();
-  const turn = startClaudeTurn({
+  const turn = startClaudeSession({
     content: [{ type: 'text', text: 'hi' }],
     cwd: '/workspace',
     model: 'claude-sonnet-5',
@@ -53,23 +53,27 @@ test('startClaudeTurn builds streaming-input query options', async () => {
   assert.equal(captured.options.abortController, abortController);
   assert.equal(typeof captured.options.canUseTool, 'function');
 
-  // The prompt stream yields exactly one user message with the given content,
-  // then stays open (gated) until endInput releases it.
+  // The prompt stream carries the initial content, accepts pushed follow-up
+  // turns, and only ends when endInput releases it.
   assert.equal(typeof turn.endInput, 'function');
+  assert.equal(typeof turn.pushUserMessage, 'function');
   const messages = [];
   const drained = (async () => {
     for await (const message of captured.prompt) messages.push(message);
   })();
+  turn.pushUserMessage([{ type: 'text', text: 'follow-up' }]);
   turn.endInput();
   await drained;
-  assert.equal(messages.length, 1);
+  assert.equal(messages.length, 2);
   assert.equal(messages[0].type, 'user');
   assert.deepEqual(messages[0].message.content, [{ type: 'text', text: 'hi' }]);
+  assert.deepEqual(messages[1].message.content, [{ type: 'text', text: 'follow-up' }]);
+  assert.throws(() => turn.pushUserMessage([{ type: 'text', text: 'late' }]), /ended/);
 });
 
-test('startClaudeTurn omits model for auto and resume when empty', () => {
+test('startClaudeSession omits model for auto and resume when empty', () => {
   let captured = null;
-  startClaudeTurn({
+  startClaudeSession({
     content: [{ type: 'text', text: 'hi' }],
     cwd: '/workspace',
     model: 'auto',
@@ -134,7 +138,7 @@ test('canUseTool denies when the bridge fails', async () => {
 test('reasoning effort maps onto the SDK effort option per turn', () => {
   let captured = null;
   const queryImpl = (params) => { captured = params; return {}; };
-  startClaudeTurn({
+  startClaudeSession({
     content: [{ type: 'text', text: 'hi' }],
     cwd: '/workspace',
     reasoningEffort: 'xhigh',
@@ -146,7 +150,7 @@ test('reasoning effort maps onto the SDK effort option per turn', () => {
 test('none/invalid reasoning effort omits the effort option (SDK default)', () => {
   for (const value of ['none', '', 'auto', 'bogus']) {
     let captured = null;
-    startClaudeTurn({
+    startClaudeSession({
       content: [{ type: 'text', text: 'hi' }],
       cwd: '/workspace',
       reasoningEffort: value,

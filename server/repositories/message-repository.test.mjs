@@ -37,6 +37,7 @@ function createTestDb() {
       executed_provider TEXT,
       hidden_from_shares INTEGER NOT NULL DEFAULT 0,
       share_hidden_at TEXT,
+      kind TEXT,
       timestamp TEXT
     );
 
@@ -68,7 +69,8 @@ function createTestDb() {
       parked_at TEXT,
       parked_target_session_id TEXT,
       parked_transaction_id TEXT,
-      parked_reason TEXT
+      parked_reason TEXT,
+      kind TEXT
     );
 
     CREATE TABLE message_usage_snapshots (
@@ -638,4 +640,78 @@ test('active-turn lookup reports only conversations with live queue rows', () =>
 
   const ids = repo.listConversationIdsWithActiveQueue.all().map((row) => row.conversation_id).sort();
   assert.deepEqual(ids, ['conv-busy', 'conv-parked', 'conv-queued']);
+});
+
+// ─── Background-continuation rows ─────────────────────────────────────────────
+// Synthetic turns for the Claude worker's background-task continuations: born
+// 'processing' and owned by their session worker. They must never be handed
+// out as deliverable work — a replay would send the CLI's own continuation
+// text back to the CLI as a user prompt — so recovery tears them down instead.
+
+function insertContinuationRow(stmts, { id = 'q-cont', lastClaimedAgoMs = 0 } = {}) {
+  const now = recoveryIsoAgo(lastClaimedAgoMs);
+  stmts.insertContinuationQ.run(
+    id,
+    'conv-1',
+    null,
+    null,
+    'agent',
+    '[background continuation]',
+    now,
+    now,
+    'session-1',
+    now,
+    now,
+    now,
+  );
+}
+
+test('a continuation row is born processing, owned, and never deliverable', () => {
+  const db = createTestDb();
+  const stmts = createMessageRepository(db);
+  insertContinuationRow(stmts, { id: 'q-cont' });
+
+  const row = db.prepare(`SELECT * FROM queue WHERE id = 'q-cont'`).get();
+  assert.equal(row.status, 'processing');
+  assert.equal(row.kind, 'continuation');
+  assert.equal(row.owner_sdk_session_id, 'session-1');
+
+  // Even if something flips it to pending, no delivery path may return it.
+  db.prepare(`UPDATE queue SET status = 'pending' WHERE id = 'q-cont'`).run();
+  const nowIso = recoveryIsoAgo(-60_000);
+  assert.equal(stmts.findPending.get(nowIso) || null, null);
+  assert.equal(stmts.findPendingForWorker.get(nowIso, 'session-1', 'session-1') || null, null);
+  assert.equal(stmts.findPendingForSessionAffinity.get(nowIso, 'session-1') || null, null);
+  assert.equal(stmts.findPendingForLegacyRelay.get(nowIso) || null, null);
+});
+
+test('the stale sweep tears down continuations instead of requeueing them', () => {
+  const db = createTestDb();
+  const stmts = createMessageRepository(db);
+  insertContinuationRow(stmts, { id: 'q-cont-stale', lastClaimedAgoMs: RECOVERY_HOUR_MS });
+
+  const params = {
+    inactiveBefore: recoveryIsoAgo(10 * 60_000),
+    ceilingBefore: null,
+  };
+  // The recovery statements skip it entirely...
+  assert.deepEqual(stmts.listRecoverableProcessing.all(params), []);
+  stmts.recoverProcessingBefore.run({ ...params, requeueAt: recoveryIsoAgo(0) });
+  assert.equal(db.prepare(`SELECT status FROM queue WHERE id = 'q-cont-stale'`).get().status, 'processing');
+
+  // ...and the companion teardown statements own it.
+  const stale = stmts.listStaleProcessingContinuations.all(params).map((row) => row.id);
+  assert.deepEqual(stale, ['q-cont-stale']);
+  stmts.dropStaleContinuation.run('q-cont-stale');
+  assert.equal(db.prepare(`SELECT status FROM queue WHERE id = 'q-cont-stale'`).get().status, 'failed');
+});
+
+test('recoverStale never revives a continuation row', () => {
+  const db = createTestDb();
+  const stmts = createMessageRepository(db);
+  insertContinuationRow(stmts, { id: 'q-cont-old', lastClaimedAgoMs: RECOVERY_HOUR_MS });
+  db.prepare(`UPDATE queue SET processing_at = ? WHERE id = 'q-cont-old'`).run(recoveryIsoAgo(RECOVERY_HOUR_MS));
+
+  stmts.recoverStale.run(recoveryIsoAgo(0), recoveryIsoAgo(10 * 60_000));
+  assert.equal(db.prepare(`SELECT status FROM queue WHERE id = 'q-cont-old'`).get().status, 'processing');
 });

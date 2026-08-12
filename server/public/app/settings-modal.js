@@ -24,6 +24,8 @@ import {
   updateWindowsAutostartSetting,
   loadTurnCeilingSetting,
   updateTurnCeilingSetting as requestTurnCeilingSetting,
+  loadBackgroundTaskTimeoutSetting,
+  updateBackgroundTaskTimeoutSetting as requestBackgroundTaskTimeoutSetting,
 } from './api-client.js';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
@@ -129,6 +131,72 @@ export async function updateTurnCeilingSetting(value) {
   } finally {
     turnCeilingUpdateInFlight = false;
     syncTurnCeilingSlider();
+  }
+}
+
+// Mirrors shared/background-task-timeout.mjs (the browser cannot import it).
+// Bounds come from the API response; these are just pre-response defaults.
+let backgroundTaskTimeoutMinutes = 0;
+let backgroundTaskTimeoutUpdateInFlight = false;
+
+function syncBackgroundTaskTimeoutSlider() {
+  const slider = document.getElementById('background-task-timeout-slider');
+  const label = document.getElementById('background-task-timeout-value');
+  if (slider instanceof HTMLInputElement) {
+    slider.value = String(backgroundTaskTimeoutMinutes);
+    slider.disabled = backgroundTaskTimeoutUpdateInFlight;
+  }
+  if (label) label.textContent = formatTurnCeilingLabel(backgroundTaskTimeoutMinutes);
+}
+
+/** Live label feedback while dragging; nothing is persisted until change fires. */
+export function previewBackgroundTaskTimeoutSetting(value) {
+  const label = document.getElementById('background-task-timeout-value');
+  if (label) label.textContent = formatTurnCeilingLabel(value);
+}
+
+export async function refreshBackgroundTaskTimeoutSetting() {
+  syncBackgroundTaskTimeoutSlider();
+  try {
+    const result = await loadBackgroundTaskTimeoutSetting();
+    if (!result || !Number.isFinite(Number(result.timeoutMinutes))) return;
+    backgroundTaskTimeoutMinutes = Number(result.timeoutMinutes);
+    const slider = document.getElementById('background-task-timeout-slider');
+    if (slider instanceof HTMLInputElement) {
+      if (Number.isFinite(Number(result.minMinutes))) slider.min = String(result.minMinutes);
+      if (Number.isFinite(Number(result.maxMinutes))) slider.max = String(result.maxMinutes);
+      if (Number.isFinite(Number(result.stepMinutes))) slider.step = String(result.stepMinutes);
+    }
+  } catch {
+    // Leave the slider at its last known value; the setting is not critical.
+  } finally {
+    syncBackgroundTaskTimeoutSlider();
+  }
+}
+
+export async function updateBackgroundTaskTimeoutSetting(value) {
+  if (backgroundTaskTimeoutUpdateInFlight) {
+    syncBackgroundTaskTimeoutSlider();
+    return;
+  }
+  const requested = Math.max(0, Math.round(Number(value) || 0));
+  backgroundTaskTimeoutUpdateInFlight = true;
+  syncBackgroundTaskTimeoutSlider();
+  try {
+    const result = await requestBackgroundTaskTimeoutSetting(requested);
+    backgroundTaskTimeoutMinutes = Number.isFinite(Number(result?.timeoutMinutes))
+      ? Number(result.timeoutMinutes)
+      : requested;
+    showTransientRelayNotice(
+      backgroundTaskTimeoutMinutes === 0
+        ? 'Background tasks will run without a time limit.'
+        : `Background task timeout set to ${formatTurnCeilingLabel(backgroundTaskTimeoutMinutes)}.`,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to update the background task timeout.');
+  } finally {
+    backgroundTaskTimeoutUpdateInFlight = false;
+    syncBackgroundTaskTimeoutSlider();
   }
 }
 
@@ -1251,6 +1319,8 @@ export function openSettingsModal() {
   void refreshWindowsAutostartSetting();
   syncTurnCeilingSlider();
   void refreshTurnCeilingSetting();
+  syncBackgroundTaskTimeoutSlider();
+  void refreshBackgroundTaskTimeoutSetting();
   void refreshPushSettingsSection();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');

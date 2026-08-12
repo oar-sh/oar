@@ -298,3 +298,68 @@ test('worker websocket service preserves readiness and closes on delivery send f
   assert.equal(socket.closeCalls, 1);
   service.stop();
 });
+
+test('a ready check from a killed worker socket never asks for work', async () => {
+  // The socket outlives the process it belongs to: killing a worker blocks the
+  // relay's event loop, so this service's delivery timer runs before the socket
+  // close lands. Requesting work there is what respawned the killed session.
+  const httpServer = new EventEmitter();
+  const requestedSessions = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    isWorkerProcessAlive: (pid) => Number(pid) !== 4242,
+    requestWork: async ({ sessionId }) => {
+      requestedSessions.push(sessionId);
+      return { message: null };
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-dead&pid=4242', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'test' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  service.emitQueueChanged('test');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requestedSessions, [], 'a dead worker process must not be handed work');
+  service.stop();
+});
+
+test('a live worker socket still gets work through the liveness probe', async () => {
+  const httpServer = new EventEmitter();
+  const requestedSessions = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    isWorkerProcessAlive: () => true,
+    requestWork: async ({ sessionId }) => {
+      requestedSessions.push(sessionId);
+      return { message: null };
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-live&pid=4242', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'test' }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requestedSessions, ['sdk-live']);
+  service.stop();
+});
