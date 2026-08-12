@@ -238,6 +238,11 @@
     --conversation-title-ready: #3fb950;
     --conversation-title-question: #f85149;
     --conversation-title-error: #d29922;
+    /* Relay reachability tones, shared by the sidebar dot and the mobile
+       burger bars so the two indicators cannot drift apart. */
+    --relay-tone-offline: #6e7681;
+    --relay-tone-online: #3fb950;
+    --relay-tone-tunnelled: #d29922;
     --provider-github: #58a6ff;
     --provider-openai: #56d4a0;
     --provider-openai-image: #d98cc4;
@@ -485,21 +490,21 @@
     border-radius: 50%;
     flex-shrink: 0;
     transition: background 0.2s ease, box-shadow 0.2s ease;
-    background: #6e7681;
+    background: var(--relay-tone-offline);
     box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.08);
   }
   #cli-dot.online {
-    background: #3fb950;
+    background: var(--relay-tone-online);
     box-shadow: 0 0 0 1px rgba(63, 185, 80, 0.42), 0 0 8px rgba(63, 185, 80, 0.35);
   }
   #cli-dot.offline {
-    background: #6e7681;
+    background: var(--relay-tone-offline);
     box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.08);
   }
   /* Reachable over Cloudflare Tunnel: amber, between the green "reachable" and
      a warning colour, so internet exposure is visible at a glance. */
   #cli-dot.online.tunnelled {
-    background: #d29922;
+    background: var(--relay-tone-tunnelled);
     box-shadow: 0 0 0 1px rgba(210, 153, 34, 0.42), 0 0 8px rgba(210, 153, 34, 0.35);
   }
 
@@ -3824,6 +3829,22 @@
       order: 1;
       font-size: 1.05rem;
       padding: 2px 6px;
+      transition: color 0.2s ease, text-shadow 0.2s ease;
+    }
+    /* The relay dot rides in the sidebar, which is off-canvas here, so the
+       burger's bars carry the relay tone instead. Only the glyph is dyed —
+       the button keeps its usual chrome. The ID+attribute selectors outrank
+       .header-icon-btn:hover, which mobile browsers leave stuck after a tap. */
+    #sidebar-toggle[data-relay-tone="offline"] {
+      color: var(--relay-tone-offline);
+    }
+    #sidebar-toggle[data-relay-tone="online"] {
+      color: var(--relay-tone-online);
+      text-shadow: 0 0 8px rgba(63, 185, 80, 0.35);
+    }
+    #sidebar-toggle[data-relay-tone="tunnelled"] {
+      color: var(--relay-tone-tunnelled);
+      text-shadow: 0 0 8px rgba(210, 153, 34, 0.35);
     }
     #chat-title-wrap { order: 2; }
     #chat-header-actions { order: 3; }

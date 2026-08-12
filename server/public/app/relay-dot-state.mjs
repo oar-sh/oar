@@ -10,6 +10,11 @@
  * relay itself is still reachable, and grey would claim otherwise. The tooltip
  * carries the bad news instead. Note this state is only ever visible locally —
  * a remote browser whose tunnel is down cannot load the page at all.
+ *
+ * `tone` is the same state as `className`, minus the dot's CSS baggage. The
+ * mobile burger toggle dyes its bars from it, because the dot itself sits in
+ * the off-canvas sidebar and is invisible whenever the conversation list is
+ * closed. Both indicators read the one tone so they cannot disagree.
  */
 
 function normalizeTunnel(tunnel) {
@@ -40,11 +45,12 @@ export function resolveRelayDotState({
   questionCount = 0,
 } = {}) {
   if (!relayOnline) {
-    return { className: 'offline', title: 'Web relay unreachable' };
+    return { className: 'offline', tone: 'offline', title: 'Web relay unreachable' };
   }
 
   const tunnel = normalizeTunnel(cloudflaredTunnel);
   const tunnelled = !!tunnel && tunnel.connected;
+  const tone = tunnelled ? 'tunnelled' : 'online';
   const className = tunnelled ? 'online tunnelled' : 'online';
 
   let reach = 'Web relay reachable';
@@ -56,8 +62,8 @@ export function resolveRelayDotState({
       : 'Web relay reachable; Cloudflare tunnel disconnected';
   }
 
-  if (!cliOnline) return { className, title: `${reach}; CLI offline` };
+  if (!cliOnline) return { className, tone, title: `${reach}; CLI offline` };
 
   const workers = describeWorkers({ processingCount, errorCount, questionCount });
-  return { className, title: workers ? `${reach}; ${workers}` : reach };
+  return { className, tone, title: workers ? `${reach}; ${workers}` : reach };
 }
