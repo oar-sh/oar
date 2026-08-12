@@ -367,6 +367,11 @@ export function createGrokTurnRunner({
         await publishFinalStream(message, state.lastStreamedText);
         return true;
       }
+      // A stalled turn keeps whatever streamed before the hang so the user
+      // sees the partial reply next to the stall system note.
+      if (classifyErrorImpl(error).isStalled && state.lastStreamedText) {
+        await publishFinalStream(message, state.lastStreamedText);
+      }
       throw error;
     } finally {
       controlPoller?.stop?.(controlState);
@@ -448,10 +453,13 @@ export function createGrokTurnRunner({
       dbg('turn failed', classified.code, classified.message);
       // The guidance rides on the response text — there is no separate
       // system-note channel (Claude/Cursor parity).
+      const noteText = classified.isAuth
+        ? `System note: the Grok agent could not authenticate (${classified.message})`
+        : classified.isStalled
+          ? `System note: the Grok turn stalled and was stopped (${classified.message}). Send a new message to retry.`
+          : `System note: the Grok turn failed (${classified.message}).`;
       await publishResponse(message, {
-        text: classified.isAuth
-          ? `System note: the Grok agent could not authenticate (${classified.message})`
-          : `System note: the Grok turn failed (${classified.message}).`,
+        text: noteText,
         model: message.providerModel || defaultModel || null,
         terminalError: buildGrokTerminalError(classified, message),
       });

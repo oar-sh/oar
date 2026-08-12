@@ -1,6 +1,6 @@
 # Grok CLI ACP provider
 
-Updated: 2026-08-08 · Part of the [SDK Feature Tracker](README.md)
+Updated: 2026-08-12 · Part of the [SDK Feature Tracker](README.md)
 
 There is no first-party npm package equivalent to `@cursor/sdk`. The control surface is
 the **Grok CLI Agent Client Protocol** (`grok agent --no-leader stdio`). The worker package
@@ -17,6 +17,8 @@ host environment). The relay stores no API key — enablement is a settings togg
 | `session/prompt` streaming | Implemented | `startGrokTurn` merges ACP `session/update` into relay channels |
 | `session/cancel` / Stop | Implemented | Control poller `abort_turn` → abort + `session/cancel` |
 | Auto permission approve | Implemented | Responds allow-once on `session/request_permission` (allow-all parity; "always" options skipped) |
+| Client-hosted terminal + fs (ACP) | Implemented | `acp-host-services.mjs` answers `terminal/create\|output\|wait_for_exit\|kill\|release` and `fs/read_text_file\|write_text_file` — the contract behind the initialize client capabilities. **Advertising a capability without answering its requests deadlocks the agent's turn** (the 2026-08-12 `0117fb12` stall: `terminal/create` waited forever). Unhandled agent→client requests now get JSON-RPC `-32601` so future mismatches fail fast instead of hanging. Windows commands run via pwsh (powershell fallback); output tail-truncated per `outputByteLimit`. |
+| Turn stall watchdog | Implemented | `sessionPrompt` fails a turn after 120s without ACP traffic (skipped while a client-hosted terminal/fs request is pending) or a 30-minute absolute ceiling — replaces the old flat 600s request timeout. Trips classify as `grok.turn-stalled`: partial stream is preserved, response carries a stall system note, handle is recreated for the next turn. |
 | Durable session resume | Implemented | `grok_native_session_id` + `POST /api/grok-native-session` |
 | Model discovery | Implemented | From initialize `_meta.modelState` (models, efforts, context windows) with async `grok models` CLI fallback; discovery timeout disposes late-spawned agents |
 | Per-message model switch | Not implemented (locked) | ACP has no mid-session switch (model rides `session/new` `_meta` only); relay 409s `GROK_MODEL_REQUIRES_NEW_CONVERSATION`, composer pins the picker |

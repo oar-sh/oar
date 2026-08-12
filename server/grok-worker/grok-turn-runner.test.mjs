@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
+import { classifyGrokError } from './grok-sdk-adapter.mjs';
 
 function createMockApi() {
   const calls = [];
@@ -170,6 +171,45 @@ test('a thrown turn error publishes the full terminal-error shape in the respons
   assert.equal(terminalError.stableCode, 'grok.authentication_failed');
   assert.equal(terminalError.queueMessageId, 'msg-e');
   assert.ok(terminalError.failedAt);
+  await runner.dispose();
+});
+
+test('classifyGrokError maps watchdog messages to grok.turn-stalled', () => {
+  const stalled = classifyGrokError(new Error('grok turn stalled: no ACP activity for 120s'));
+  assert.equal(stalled.code, 'grok.turn-stalled');
+  assert.equal(stalled.isStalled, true);
+  assert.equal(stalled.isBusy, false);
+  const ceiling = classifyGrokError(new Error('grok turn exceeded the 30-minute turn ceiling'));
+  assert.equal(ceiling.code, 'grok.turn-stalled');
+  assert.equal(ceiling.isStalled, true);
+});
+
+test('a stalled turn publishes the partial stream and a grok.turn-stalled terminal error', async () => {
+  const api = createMockApi();
+  async function* stalledTurn() {
+    yield { channel: 'stream', payload: { text: 'partial before hang', done: false, subagentRunId: null } };
+    throw new Error('grok turn stalled: no ACP activity for 120s');
+  }
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-stall',
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    createAgentHandleImpl: async () => makeHandle(),
+    startGrokTurnImpl: () => stalledTurn(),
+  });
+  const ok = await runner.handlePendingPayload({
+    message: { id: 'msg-s', conversationId: 'conv-stall', text: 'x', relayMode: 'agent' },
+  });
+  assert.equal(ok, true);
+  // Whatever streamed before the hang must survive next to the system note.
+  const finalStream = api.calls.find((c) => c.path === '/api/stream' && c.body.done === true);
+  assert.ok(finalStream, 'partial stream should be finalized');
+  assert.equal(finalStream.body.text, 'partial before hang');
+  const response = api.calls.find((c) => c.path === '/api/response');
+  assert.ok(response.body.text.includes('stalled'));
+  assert.equal(response.body.terminalError.stableCode, 'grok.turn-stalled');
+  assert.ok(!api.calls.some((c) => c.path === '/api/requeue'), 'stalls fail terminally, no auto-requeue');
   await runner.dispose();
 });
 

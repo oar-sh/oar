@@ -3,6 +3,7 @@
  * per worker; sessions are created/loaded and prompts streamed via AcpClient.
  */
 import { AcpClient, extractGrokModelsFromInitialize } from './acp-client.mjs';
+import { createAcpHostServices } from './acp-host-services.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
 
 export { extractGrokModelsFromInitialize };
@@ -34,6 +35,16 @@ export function classifyGrokError(error) {
       isBusy: true,
     };
   }
+  // Watchdog trips from AcpClient.sessionPrompt (inactivity or turn ceiling).
+  if (lower.includes('turn stalled') || lower.includes('turn exceeded')) {
+    return {
+      code: 'grok.turn-stalled',
+      message: message || 'Grok turn stalled',
+      isAuth: false,
+      isBusy: false,
+      isStalled: true,
+    };
+  }
   if (lower.includes('enoent') || lower.includes('not found') || lower.includes('spawn')) {
     return {
       code: 'grok.cli_missing',
@@ -62,6 +73,7 @@ export async function createGrokAgentHandle({
   nativeSessionId = '',
   model = '',
   AcpClientImpl = AcpClient,
+  createHostServicesImpl = createAcpHostServices,
   dbg = () => {},
 } = {}) {
   const client = new AcpClientImpl({
@@ -82,6 +94,12 @@ export async function createGrokAgentHandle({
     const line = String(text || '').trim();
     if (line) dbg('grok stderr', line.slice(0, 400));
   });
+
+  // The terminal/fs handlers backing the capabilities initialize() advertises.
+  // They must be attached before the first prompt, or the agent's first shell
+  // command deadlocks the turn waiting on terminal/create.
+  const hostServices = createHostServicesImpl({ cwd, env, dbg });
+  hostServices.attach(client);
 
   await client.initialize();
   const discovered = extractGrokModelsFromInitialize(client.initializeResult);
@@ -107,6 +125,7 @@ export async function createGrokAgentHandle({
     sessionId = String(created?.sessionId || created?.session_id || '').trim();
   }
   if (!sessionId) {
+    hostServices.disposeAll();
     await client.dispose();
     throw new Error('Grok session/new did not return sessionId');
   }
@@ -116,7 +135,9 @@ export async function createGrokAgentHandle({
     sessionId,
     model: String(model || discovered.defaultModel || '').trim(),
     discovered,
+    hostServices,
     async close() {
+      hostServices.disposeAll();
       await client.dispose();
     },
   };
@@ -132,6 +153,7 @@ export function startGrokTurn({
   text = '',
   reasoningEffort = '',
   abortSignal = null,
+  watchdog = null,
   createNormalizerImpl = createSdkMessageNormalizer,
   dbg = () => {},
 } = {}) {
@@ -224,6 +246,12 @@ export function startGrokTurn({
       }
     },
     promptExtra,
+    {
+      // A running client-hosted terminal (or an in-flight terminal/fs request)
+      // means the agent is waiting on us, not stalled.
+      hasPendingWork: () => handle.hostServices?.hasPendingWork?.() === true,
+      ...(watchdog || {}),
+    },
   ).then((promptResult) => {
     const stopReason = String(promptResult?.stopReason || promptResult?.stop_reason || '').trim();
     const isError = stopReason.toLowerCase() === 'error' || promptResult?.isError === true;

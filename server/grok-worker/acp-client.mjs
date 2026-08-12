@@ -12,6 +12,12 @@ function whichCommand(command = 'grok') {
   return value;
 }
 
+// Prompt watchdog defaults: a turn that produces no ACP traffic for the
+// inactivity window (while no client-side work is pending) is stalled; the
+// ceiling bounds a single prompt absolutely. Both are overridable per call.
+export const ACP_PROMPT_INACTIVITY_MS = 120_000;
+export const ACP_PROMPT_MAX_TURN_MS = 1_800_000;
+
 export class AcpClient extends EventEmitter {
   /**
    * @param {object} opts
@@ -38,9 +44,25 @@ export class AcpClient extends EventEmitter {
     this.rl = null;
     this.nextId = 1;
     this.pending = new Map();
+    this.requestHandlers = new Map();
     this._bufferErr = '';
     this.dead = false;
     this.initializeResult = null;
+    this.lastActivityAt = Date.now();
+  }
+
+  _touchActivity() {
+    this.lastActivityAt = Date.now();
+  }
+
+  /**
+   * Register a handler for an agent→client request method (terminal/*, fs/*).
+   * The handler receives the request params and its resolved value is sent as
+   * the JSON-RPC result (undefined becomes null); a rejection is sent as a
+   * -32603 error so the agent's tool call fails instead of hanging.
+   */
+  setRequestHandler(method, handler) {
+    this.requestHandlers.set(String(method || ''), handler);
   }
 
   start() {
@@ -86,6 +108,7 @@ export class AcpClient extends EventEmitter {
   _onLine(line) {
     const trimmed = line.trim();
     if (!trimmed) return;
+    this._touchActivity();
     let msg;
     try {
       msg = JSON.parse(trimmed);
@@ -110,9 +133,27 @@ export class AcpClient extends EventEmitter {
     if (msg.method) {
       this.emit('notification', msg);
       this.emit(msg.method, msg);
-      if (msg.method === 'session/request_permission' && msg.id != null) {
+      if (msg.id == null) return;
+      if (msg.method === 'session/request_permission') {
         this.emit('permission', msg);
+        return;
       }
+      const handler = this.requestHandlers.get(msg.method);
+      if (!handler) {
+        // Fail fast: an agent→client request that never gets a response
+        // deadlocks the agent's turn — it waits forever on the reply (the
+        // 0117fb12 stall: terminal/create was advertised but unanswered).
+        // Method-not-found turns a capability mismatch into a visible tool
+        // error instead of a silent hang.
+        this.respondError(msg.id, `Method not found: ${msg.method}`, -32601);
+        return;
+      }
+      Promise.resolve()
+        .then(() => handler(msg.params || {}))
+        .then(
+          (result) => this.respond(msg.id, result === undefined ? null : result),
+          (error) => this.respondError(msg.id, error?.message || 'request handler failed', -32603),
+        );
     }
   }
 
@@ -131,6 +172,10 @@ export class AcpClient extends EventEmitter {
         this.pending.delete(id);
         reject(new Error(`ACP request timeout: ${method}`));
       }, timeoutMs);
+      // A pending request must not keep the process alive on its own — an
+      // abandoned prompt (watchdog raced past it) would otherwise pin the
+      // event loop for the full timeout.
+      if (typeof timer.unref === 'function') timer.unref();
       this.pending.set(id, {
         resolve: (v) => {
           clearTimeout(timer);
@@ -141,6 +186,7 @@ export class AcpClient extends EventEmitter {
           reject(e);
         },
       });
+      this._touchActivity();
       this.proc.stdin.write(`${payload}\n`, 'utf8');
     });
   }
@@ -149,22 +195,25 @@ export class AcpClient extends EventEmitter {
     if (this.dead) return;
     this.start();
     const payload = JSON.stringify({ jsonrpc: '2.0', method, params });
+    this._touchActivity();
     this.proc.stdin.write(`${payload}\n`, 'utf8');
   }
 
   respond(id, result) {
     if (this.dead) return;
     const payload = JSON.stringify({ jsonrpc: '2.0', id, result });
+    this._touchActivity();
     this.proc.stdin.write(`${payload}\n`, 'utf8');
   }
 
-  respondError(id, message) {
+  respondError(id, message, code = -32000) {
     if (this.dead) return;
     const payload = JSON.stringify({
       jsonrpc: '2.0',
       id,
-      error: { code: -32000, message },
+      error: { code, message },
     });
+    this._touchActivity();
     this.proc.stdin.write(`${payload}\n`, 'utf8');
   }
 
@@ -172,6 +221,11 @@ export class AcpClient extends EventEmitter {
     this.start();
     this.initializeResult = await this.request('initialize', {
       protocolVersion: 1,
+      // Each capability advertised here is a contract to answer the agent's
+      // matching requests — the handlers live in acp-host-services.mjs and
+      // must be attached via setRequestHandler before the first prompt. An
+      // advertised-but-unanswered request deadlocks the agent's turn (the
+      // 0117fb12 stall: terminal/create waited forever on a reply).
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
         terminal: true,
@@ -203,25 +257,64 @@ export class AcpClient extends EventEmitter {
 
   /**
    * Send a prompt and stream session/update until the prompt request resolves.
+   *
+   * A watchdog replaces the old flat request timeout: the prompt fails when no
+   * ACP traffic (in either direction) happens for `inactivityMs` while no
+   * client-side work is pending (`hasPendingWork`), or when `maxTurnMs` is
+   * exceeded outright. On a trip the session is cancelled best-effort and the
+   * promise rejects with a message classifyGrokError maps to grok.turn-stalled.
+   *
    * @param {string} sessionId
    * @param {Array} prompt content blocks
    * @param {(update: object) => void} [onUpdate]
    * @param {object} [extra] additional session/prompt params (e.g. `_meta`)
+   * @param {object} [watchdog] { inactivityMs, maxTurnMs, hasPendingWork }
    */
-  async sessionPrompt(sessionId, prompt, onUpdate, extra = {}) {
+  async sessionPrompt(sessionId, prompt, onUpdate, extra = {}, watchdog = {}) {
+    const inactivityMs = Number(watchdog?.inactivityMs) > 0
+      ? Number(watchdog.inactivityMs)
+      : ACP_PROMPT_INACTIVITY_MS;
+    const maxTurnMs = Number(watchdog?.maxTurnMs) > 0
+      ? Number(watchdog.maxTurnMs)
+      : ACP_PROMPT_MAX_TURN_MS;
+    const hasPendingWork = typeof watchdog?.hasPendingWork === 'function'
+      ? watchdog.hasPendingWork
+      : () => false;
     const handler = (msg) => {
       if (msg.method !== 'session/update') return;
       if (msg.params?.sessionId && msg.params.sessionId !== sessionId) return;
       onUpdate?.(msg.params?.update || msg.params);
     };
     this.on('notification', handler);
+    let watchdogTimer = null;
+    const startedAt = Date.now();
+    const stallPromise = new Promise((_, reject) => {
+      const pollMs = Math.max(250, Math.min(5000, Math.floor(inactivityMs / 4)));
+      watchdogTimer = setInterval(() => {
+        const now = Date.now();
+        if (now - startedAt >= maxTurnMs) {
+          try { this.sessionCancel(sessionId); } catch { /* ignore */ }
+          reject(new Error(`grok turn exceeded the ${Math.round(maxTurnMs / 60000)}-minute turn ceiling`));
+          return;
+        }
+        if (hasPendingWork()) return;
+        if (now - this.lastActivityAt >= inactivityMs) {
+          try { this.sessionCancel(sessionId); } catch { /* ignore */ }
+          reject(new Error(`grok turn stalled: no ACP activity for ${Math.round(inactivityMs / 1000)}s`));
+        }
+      }, pollMs);
+      if (typeof watchdogTimer.unref === 'function') watchdogTimer.unref();
+    });
     try {
-      return await this.request(
-        'session/prompt',
-        { sessionId, prompt, ...extra },
-        600000,
-      );
+      // The race keeps both promises observed, so the late loser cannot
+      // become an unhandled rejection. The raw request timeout sits above
+      // the ceiling; the watchdog is the real limiter.
+      return await Promise.race([
+        this.request('session/prompt', { sessionId, prompt, ...extra }, maxTurnMs + 60_000),
+        stallPromise,
+      ]);
     } finally {
+      clearInterval(watchdogTimer);
       this.off('notification', handler);
     }
   }
