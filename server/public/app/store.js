@@ -712,6 +712,7 @@ export function updateCompactButton() {
 
 export function updateCliStatus() {
   const dot = document.getElementById('cli-dot');
+  const burger = document.getElementById('sidebar-toggle');
   const text = document.getElementById('cli-status-text');
   const banner = document.getElementById('offline-banner');
   const changeCwdBtn = document.getElementById('chat-menu-change-cwd');
@@ -719,18 +720,21 @@ export function updateCliStatus() {
   const processingCount = workerStates.filter((state) => String(state?.status || '').trim().toLowerCase() === 'processing').length;
   const errorCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'error').length;
   const questionCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'question').length;
+  const dotState = resolveRelayDotState({
+    relayOnline,
+    cliOnline,
+    cloudflaredTunnel: cloudflaredTunnelState,
+    processingCount,
+    errorCount,
+    questionCount,
+  });
   if (dot) {
-    const dotState = resolveRelayDotState({
-      relayOnline,
-      cliOnline,
-      cloudflaredTunnel: cloudflaredTunnelState,
-      processingCount,
-      errorCount,
-      questionCount,
-    });
     dot.className = dotState.className;
     dot.title = dotState.title;
   }
+  // The dot lives in the sidebar, which is an off-canvas drawer on mobile. The
+  // burger toggle stays on screen, so it carries the same tone on its bars.
+  if (burger) burger.dataset.relayTone = dotState.tone;
   if (text) text.textContent = cliOnline ? 'CLI online' : 'CLI offline';
   if (changeCwdBtn) {
     changeCwdBtn.disabled = false;

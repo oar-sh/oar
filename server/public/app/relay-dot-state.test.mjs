@@ -108,6 +108,24 @@ test('worker counts combine with the tunnel reach', () => {
   assert.equal(state.title, 'Web relay reachable via Cloudflare Tunnel; 2 session workers processing');
 });
 
+test('the tone mirrors the dot colour for the mobile burger bars', () => {
+  // The burger keys off `tone` alone, so every state must name one.
+  assert.equal(resolveRelayDotState({ relayOnline: false, cliOnline: true }).tone, 'offline');
+  assert.equal(resolveRelayDotState({ relayOnline: true, cliOnline: true }).tone, 'online');
+  assert.equal(
+    resolveRelayDotState({ relayOnline: true, cliOnline: true, cloudflaredTunnel: MANAGED_CONNECTED }).tone,
+    'tunnelled',
+  );
+  assert.equal(
+    resolveRelayDotState({ relayOnline: true, cliOnline: true, cloudflaredTunnel: MANAGED_DOWN }).tone,
+    'online',
+  );
+  assert.equal(
+    resolveRelayDotState({ relayOnline: true, cliOnline: false, cloudflaredTunnel: MANAGED_CONNECTED }).tone,
+    'tunnelled',
+  );
+});
+
 test('a malformed tunnel payload is treated as absent', () => {
   for (const tunnel of ['managed', 42, [], undefined]) {
     const state = resolveRelayDotState({ relayOnline: true, cliOnline: true, cloudflaredTunnel: tunnel });
