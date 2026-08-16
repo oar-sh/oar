@@ -19,9 +19,14 @@ async function createMessage(request, headers, { text, conversationId = null }) 
   return response.json();
 }
 
-async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 40) {
+async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 40, ownerSessionId = '') {
+  // Owned rows (session-worker routing enabled) are invisible to anonymous
+  // polls; claim them with the owner identity POST /api/message reported.
+  const dequeueHeaders = String(ownerSessionId || '').trim()
+    ? { ...headers, 'x-relay-session-id': String(ownerSessionId).trim() }
+    : headers;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const dequeued = await request.get('/api/pending', { headers });
+    const dequeued = await request.get('/api/pending', { headers: dequeueHeaders });
     expect(dequeued.ok()).toBeTruthy();
     const body = await dequeued.json();
     const msg = body?.message || null;
@@ -73,14 +78,14 @@ test('keeps stream/activity session-bound while switching and avoids duplicate u
     msgA = String(first?.messageId || '').trim();
     expect(convA).toBeTruthy();
     expect(msgA).toBeTruthy();
-    await dequeueSpecificMessage(request, headers, msgA);
+    await dequeueSpecificMessage(request, headers, msgA, 40, String(first?.ownerSessionId || ''));
 
     const second = await createMessage(request, headers, { text: seedB });
     convB = String(second?.conversationId || '').trim();
     msgB = String(second?.messageId || '').trim();
     expect(convB).toBeTruthy();
     expect(msgB).toBeTruthy();
-    await dequeueSpecificMessage(request, headers, msgB);
+    await dequeueSpecificMessage(request, headers, msgB, 40, String(second?.ownerSessionId || ''));
 
     const syncA = await request.post('/api/session-sync', {
       headers,

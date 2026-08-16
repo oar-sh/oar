@@ -52,9 +52,16 @@ async function openRepoBrowserFromComposer(page) {
   await page.click("#repo-browser-fab");
 }
 
-async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 30) {
+async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 30, ownerSessionId = "") {
+  // When session-worker routing is enabled the queue row is born owned and the
+  // anonymous legacy-relay poll never sees it; claiming it as its owner (the
+  // x-relay-session-id bridge identity) exercises the owned-dequeue path the
+  // production workers use. POST /api/message returns the assigned owner id.
+  const dequeueHeaders = String(ownerSessionId || "").trim()
+    ? { ...headers, "x-relay-session-id": String(ownerSessionId).trim() }
+    : headers;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers });
+    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
     expect(dequeued.ok()).toBeTruthy();
     const pendingBody = await dequeued.json();
     const msg = pendingBody?.message || null;
@@ -99,7 +106,7 @@ test("renders and answers relay question card in the web UI", async ({ page, req
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const pendingBody = await dequeueSpecificMessage(request, headers, messageId);
+    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
     expect(String(pendingBody?.message?.id || "")).toBe(messageId);
 
     const created = await request.post("/api/relay-question", {
@@ -403,7 +410,7 @@ test("linkifies workspace file mentions in assistant messages and question cards
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const dequeuedBody = await dequeueSpecificMessage(request, headers, messageId);
+    const dequeuedBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
     expect(String(dequeuedBody?.message?.id || "")).toBe(messageId);
 
     const createdQuestion = await request.post("/api/relay-question", {
@@ -717,12 +724,18 @@ test("does not reuse the previous reply text in a new thinking bubble", async ({
     await page.click("#send-btn");
 
     // The thinking bubble renders when the queued turn moves to "processing";
-    // with CLI spawn disabled nothing dequeues it, so pull it ourselves.
+    // with CLI spawn disabled nothing dequeues it, so pull it ourselves. Under
+    // session-worker routing the follow-up is owned by the bound session, so
+    // claim it with that identity; anonymously otherwise.
+    const boundSessionHeaders = { ...headers, "x-relay-session-id": `pw-sid-think-${stamp}` };
     await expect.poll(async () => {
-      const pending = await request.get("/api/pending", { headers });
-      if (!pending.ok()) return false;
-      const body = await pending.json();
-      return Boolean(body?.message?.id);
+      for (const pollHeaders of [boundSessionHeaders, headers]) {
+        const pending = await request.get("/api/pending", { headers: pollHeaders });
+        if (!pending.ok()) continue;
+        const body = await pending.json();
+        if (body?.message?.id) return true;
+      }
+      return false;
     }, { timeout: 15000 }).toBeTruthy();
 
     await expect(page.locator("#thinking-indicator")).toBeVisible();
@@ -1657,7 +1670,7 @@ test("keeps non-image @file references as text-only pending turns", async ({ req
   });
   expect(textRef.ok()).toBeTruthy();
   const textBody = await textRef.json();
-  const textPendingBody = await dequeueSpecificMessage(request, headers, String(textBody?.messageId || ""));
+  const textPendingBody = await dequeueSpecificMessage(request, headers, String(textBody?.messageId || ""), 30, String(textBody?.ownerSessionId || ""));
   expect(String(textPendingBody?.message?.id || "")).toBe(String(textBody?.messageId || ""));
   expect(Array.isArray(textPendingBody?.message?.attachments) ? textPendingBody.message.attachments.length : 0).toBe(0);
   await finalizePending(String(textBody?.conversationId || ""), String(textBody?.messageId || ""));
