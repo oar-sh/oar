@@ -307,8 +307,36 @@ export function createWorkerSecretEnvFile(env = {}, {
   };
 }
 
+/**
+ * Where a worker's stdout/stderr land. Before this existed workers ran with
+ * their output discarded (`stdio: 'ignore'` / bare tmux exec), so a crash
+ * left zero forensic trail — the failure mode that made the 2026-08-11
+ * incident undiagnosable. Best-effort by design: a log problem must never
+ * block a worker spawn. Naive rotation: >10 MB rolls to `<file>.1`.
+ */
+export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, { fsImpl = fs } = {}) {
+  try {
+    const explicitDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_LOG_DIR);
+    const serverDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_SERVER_DIR);
+    const moduleDir = path.dirname(new URL(import.meta.url).pathname);
+    const baseDir = explicitDir
+      || (serverDir ? path.join(serverDir, 'logs') : path.join(moduleDir, '..', 'logs'));
+    fsImpl.mkdirSync(baseDir, { recursive: true });
+    const safeId = String(targetSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'worker';
+    const logPath = path.join(baseDir, `worker-${safeId}.log`);
+    try {
+      const stats = fsImpl.statSync(logPath);
+      if (stats.size > 10 * 1024 * 1024) fsImpl.renameSync(logPath, `${logPath}.1`);
+    } catch {}
+    return logPath;
+  } catch {
+    return null;
+  }
+}
+
 export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
   secretEnvFilePath = '',
+  workerLogPath = '',
 } = {}) {
   const launchEnv = {
     ...env,
@@ -358,8 +386,14 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     : '';
   const workerCommand = buildPosixWorkerLaunchCommand(targetSessionId, launchEnv);
   if (resolveNodeWorkerDescriptor(launchEnv)) {
-    // Node workers (Claude, Cursor) are plain processes; no pseudo-TTY needed.
-    return `${prefix}${secretPrefix}exec ${workerCommand}`;
+    // Node workers (Claude, Cursor, Grok) are plain processes; no pseudo-TTY
+    // needed. Their output is teed to the worker log so a crash leaves a
+    // trail (the Copilot CLI keeps its own logs and draws a TUI, so it is
+    // deliberately not teed).
+    const teeSuffix = String(workerLogPath || '').trim()
+      ? ` >> ${shellQuote(workerLogPath)} 2>&1`
+      : '';
+    return `${prefix}${secretPrefix}exec ${workerCommand}${teeSuffix}`;
   }
   // Use script to create a pseudo-TTY without GH_FORCE_TTY so the CLI routes
   // ask_user requests through the SDK's onUserInputRequest handler instead of
@@ -466,6 +500,9 @@ export async function launchSessionCli({
     }
     killTmuxSession(sessionName, { execFileSyncImpl });
     const secretEnvFile = createSecretEnvFileImpl(launchSessionEnv);
+    const tmuxWorkerLogPath = resolveNodeWorkerDescriptor(launchSessionEnv)
+      ? prepareWorkerLogFile(target, launchSessionEnv)
+      : null;
     try {
       execFileSyncImpl('tmux', [
         'new-session',
@@ -478,6 +515,7 @@ export async function launchSessionCli({
         '-lc',
         buildTmuxWorkerShellCommand(target, launchSessionEnv, {
           secretEnvFilePath: secretEnvFile?.filePath,
+          workerLogPath: tmuxWorkerLogPath || '',
         }),
       ], {
         env: tmuxEnv,
@@ -552,14 +590,33 @@ export async function launchSessionCli({
     : (nodeWorker
       ? [nodeWorker.scriptPath, '--session-id', target]
       : ['--allow-all', '--session-id', target]);
+  // POSIX node workers tee stdout/stderr into the worker log (a crash must
+  // leave a trail). On win32 the `start` intermediary opens its own console,
+  // so fd inheritance cannot reach the worker — its window shows the output.
+  let detachedStdio = 'ignore';
+  if (platform !== 'win32' && nodeWorker) {
+    const workerLogPath = prepareWorkerLogFile(target, launchSessionEnv);
+    if (workerLogPath) {
+      try {
+        const logFd = fs.openSync(workerLogPath, 'a');
+        detachedStdio = ['ignore', logFd, logFd];
+      } catch {
+        detachedStdio = 'ignore';
+      }
+    }
+  }
   const child = spawnImpl(spawnCommand, spawnArgs, {
     cwd: launchProcessCwd,
     env: launchSessionEnv,
     detached: true,
-    stdio: 'ignore',
+    stdio: detachedStdio,
     windowsHide: platform !== 'win32',
   });
   child.unref?.();
+  if (Array.isArray(detachedStdio) && typeof detachedStdio[1] === 'number') {
+    // The child inherited the descriptor; the parent's copy must not leak.
+    try { fs.closeSync(detachedStdio[1]); } catch {}
+  }
   if (platform === 'win32') {
     const attempts = Math.max(1, Number(detachedPollAttempts) || 1);
     for (let index = 0; index < attempts; index += 1) {

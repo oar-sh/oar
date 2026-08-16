@@ -289,7 +289,7 @@ export function createMessageRepository(db) {
         // A turn blocked on an unanswered AskUserQuestion is never stale — it is
         // waiting on the human, and relay_questions carries its own expiry.
         listRecoverableProcessing: db.prepare(`
-          SELECT id, conversation_id
+          SELECT id, conversation_id, kind, relay_mode, model, retry_count
           FROM queue
           WHERE status = 'processing'
             AND COALESCE(kind, '') != 'continuation'
@@ -305,7 +305,8 @@ export function createMessageRepository(db) {
               processing_at = NULL,
               next_attempt_at = @requeueAt,
               owner_lease_expires_at = NULL,
-              owner_last_claimed_at = NULL
+              owner_last_claimed_at = NULL,
+              retry_count = retry_count + 1
           WHERE status = 'processing'
             AND COALESCE(kind, '') != 'continuation'
             AND (
@@ -313,6 +314,37 @@ export function createMessageRepository(db) {
               OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
             )
             AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+        `),
+        // Dead-worker recovery: the owner's process is provably gone, so its
+        // in-flight rows go back to pending — owner intact (the primer
+        // respawns that worker; the row must never become global prey) and
+        // retry_count incremented so a worker that dies on every delivery
+        // eventually exhausts the same budget as any other retry loop. The
+        // pending-question exemption deliberately does NOT apply here: a dead
+        // worker can never collect its answer, so holding the row would leak
+        // both the row and the question.
+        listProcessingRowsForOwner: db.prepare(`
+          SELECT id, conversation_id, kind, retry_count
+          FROM queue
+          WHERE status = 'processing'
+            AND NULLIF(owner_sdk_session_id, '') = ?
+        `),
+        recoverProcessingRowKeepOwner: db.prepare(`
+          UPDATE queue
+          SET status = 'pending',
+              processing_at = NULL,
+              next_attempt_at = ?,
+              owner_lease_expires_at = NULL,
+              owner_last_claimed_at = NULL,
+              retry_count = retry_count + 1
+          WHERE id = ? AND status = 'processing'
+        `),
+        listProcessingOwnerSessionIds: db.prepare(`
+          SELECT DISTINCT NULLIF(owner_sdk_session_id, '') AS sdk_session_id
+          FROM queue
+          WHERE status = 'processing'
+            AND NULLIF(owner_sdk_session_id, '') IS NOT NULL
+          LIMIT ?
         `),
         // A continuation with no live worker can only be torn down — replaying
         // it as deliverable work would send the CLI's own bookkeeping text back

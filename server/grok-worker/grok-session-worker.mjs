@@ -13,6 +13,7 @@ import { createApiClient } from '../../.github/extensions/web-relay/runtime/api-
 import { createWorkerWebSocketLink } from '../../.github/extensions/web-relay/runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../.github/extensions/web-relay/polling/heartbeat.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
+import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -108,11 +109,26 @@ async function main() {
     try { wsLink.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
-    try { await turnRunner.dispose(); } catch {}
+    // Bounded: a hung ACP agent teardown must never leave the process
+    // ignoring the supervisor's SIGTERM.
+    try {
+      await Promise.race([
+        turnRunner.dispose(),
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, 3_000);
+          timer.unref?.();
+        }),
+      ]);
+    } catch {}
     process.exit(0);
   };
   process.on('SIGTERM', () => { shutdown('SIGTERM'); });
   process.on('SIGINT', () => { shutdown('SIGINT'); });
+  installWorkerCrashGuard({
+    api,
+    workerName: 'grok-session-worker',
+    getActiveQueueMessageIds: () => [turnRunner.getActiveQueueMessageId()],
+  });
 
   dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}`);
   heartbeat.startHeartbeat();

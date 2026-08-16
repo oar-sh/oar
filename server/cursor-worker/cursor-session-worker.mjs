@@ -14,6 +14,7 @@ import { createApiClient } from '../../.github/extensions/web-relay/runtime/api-
 import { createWorkerWebSocketLink } from '../../.github/extensions/web-relay/runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../.github/extensions/web-relay/polling/heartbeat.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
+import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createCursorTurnRunner } from './cursor-turn-runner.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -127,6 +128,11 @@ async function main() {
   };
   process.on('SIGTERM', () => { shutdown('SIGTERM'); });
   process.on('SIGINT', () => { shutdown('SIGINT'); });
+  installWorkerCrashGuard({
+    api,
+    workerName: 'cursor-session-worker',
+    getActiveQueueMessageIds: () => [turnRunner.getActiveQueueMessageId()],
+  });
 
   dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}`);
   heartbeat.startHeartbeat();

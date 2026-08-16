@@ -93,6 +93,7 @@ export function createSessionWorkerWebSocketService({
   touchCli = () => {},
   noteWorkerHeartbeat = () => {},
   onDeliverySendFailed = async () => {},
+  onWorkerSocketClosed = async () => {},
   requestWork = async () => null,
   // Liveness probe for a socket's worker process. A killed worker's socket
   // survives its process by an event-loop turn (the kill path blocks the loop,
@@ -361,14 +362,32 @@ export function createSessionWorkerWebSocketService({
         });
       }
     });
-    ws.on('close', () => {
+    const dropSocket = (reason) => {
+      const meta = clientState.get(ws);
       clients.delete(ws);
       clientState.delete(ws);
-    });
-    ws.on('error', () => {
-      clients.delete(ws);
-      clientState.delete(ws);
-    });
+      // Death-detection hook: a worker socket closing while its session owns
+      // an in-flight processing row used to be silently forgotten, leaving
+      // the row to the 600s stale sweep. The handler PID-probes and recovers.
+      if (meta?.sessionId) {
+        Promise.resolve(onWorkerSocketClosed({
+          sessionId: meta.sessionId,
+          pid: meta.pid || null,
+          reason,
+        })).catch(() => {});
+      }
+    };
+    ws.on('close', () => dropSocket('close'));
+    ws.on('error', () => dropSocket('error'));
+  }
+
+  function hasWorkerSocket(sessionId) {
+    const wanted = normalizeText(sessionId);
+    if (!wanted) return false;
+    for (const meta of clientState.values()) {
+      if (meta?.sessionId === wanted) return true;
+    }
+    return false;
   }
 
   function start() {
@@ -459,5 +478,6 @@ export function createSessionWorkerWebSocketService({
     emitDraining,
     handleUpgrade,
     sendControlToSession,
+    hasWorkerSocket,
   };
 }

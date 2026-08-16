@@ -6152,6 +6152,57 @@ function inFlightStateForConversation(conversationId) {
   };
 }
 
+// A recovered row that has exhausted the retry budget is failed terminally
+// instead of looping recover → deliver → die forever (recovery increments
+// retry_count like /api/requeue does, but bypasses that route's budget check,
+// so the sweep enforces it here). Minimal mirror of the route-side
+// failQueueMessage: mark failed, insert the assistant failure message, emit.
+function failRecoveredRowTerminally(row, reason) {
+  const now = new Date().toISOString();
+  const responseId = uuidv4();
+  const retryCount = Number(row?.retry_count || 0) + 1;
+  const failureText = `Relay recovery limit reached after ${retryCount} attempts (${reason}). The worker kept dying before completing this turn, so the message was failed to keep the queue moving. Send it again to retry.`;
+  const requestedModel = String(row?.model || '').trim() || null;
+  const tx = db.transaction(() => {
+    stmts.setFailed.run(JSON.stringify({
+      kind: 'recovery-limit',
+      error: 'recovery-limit',
+      code: 'recovery-limit',
+      stableCode: 'relay.recovery-limit',
+      reason: String(reason || 'worker-died'),
+      retryCount,
+      failedAt: now,
+    }), row.id);
+    stmts.setQueueResponseMessageId?.run(responseId, row.id);
+    stmts.insertMsg.run(
+      responseId,
+      row.conversation_id,
+      'assistant',
+      failureText,
+      requestedModel || 'unknown',
+      String(row?.relay_mode || '').trim() || null,
+      null,
+      now,
+      requestedModel,
+      null,
+      requestedModel ? 'user' : 'auto',
+    );
+    stmts.linkActivityToResponse?.run(responseId, row.id);
+    stmts.linkStreamEventsToResponse?.run(responseId, row.id);
+    stmts.linkThoughtsToResponse?.run(responseId, row.id);
+    stmts.updateConvTime.run(now, row.conversation_id);
+  });
+  tx();
+  io.emit('assistant_message', {
+    conversationId: row.conversation_id,
+    sourceMessageId: row.id,
+    messageId: responseId,
+    message: { role: 'assistant', text: failureText, model: requestedModel || 'unknown', mode: String(row?.relay_mode || '').trim() || null, timestamp: now },
+  });
+  io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+  console.warn(`${runtimeLogPrefix()}RECOVERY LIMIT ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
+}
+
 function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso = null } = {}) {
   const params = { inactiveBefore: cutoffIso, ceilingBefore: ceilingBeforeIso || null };
   // Stale background-continuation turns are torn down, never requeued —
@@ -6161,7 +6212,13 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
     stmts.dropStaleContinuation?.run?.(row.id);
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
   }
-  const rows = stmts.listRecoverableProcessing.all(params);
+  const allRows = stmts.listRecoverableProcessing.all(params);
+  if (!allRows.length) return [];
+  // Enforce the retry budget before requeueing: failing these rows first
+  // flips them out of 'processing' so the recovery UPDATE below skips them.
+  const overBudget = allRows.filter((row) => Number(row?.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES);
+  for (const row of overBudget) failRecoveredRowTerminally(row, 'stale-recovery');
+  const rows = allRows.filter((row) => Number(row?.retry_count || 0) + 1 < MAX_REQUEUE_RETRIES);
   if (!rows.length) return [];
 
   const tx = db.transaction(() => {
@@ -6857,6 +6914,95 @@ async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionI
   return true;
 }
 
+// ─── Dead-worker detection ────────────────────────────────────────────────────
+// A worker that dies mid-turn used to leave its 'processing' row to the 600s
+// stale sweep (and, before queue isolation, to the relay steal). Two paths
+// close that window: the worker socket's close event (grace + PID probe), and
+// a periodic sweep for workers that died without a close event.
+
+const WORKER_DEATH_GRACE_MS = 15_000;
+
+function isWorkerSessionProcessAlive(sessionId, hintPid = null) {
+  if (sessionWorkerWebSocketService?.hasWorkerSocket?.(sessionId)) return true;
+  try {
+    if (sessionWorkerProcessInspector?.findProcessForSession?.(sessionId)) return true;
+  } catch {}
+  const registryPid = Number(sessionWorkerRegistry?.getWorker?.(sessionId)?.pid || 0);
+  if (registryPid > 0 && isProcessAlive(registryPid)) return true;
+  const pid = Number(hintPid || 0);
+  if (pid > 0 && isProcessAlive(pid)) return true;
+  return false;
+}
+
+function recoverDeadWorkerProcessingRows(sessionId, reason) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return 0;
+  const rows = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
+  if (!rows.length) return 0;
+  let recovered = 0;
+  const requeueAt = addMsIso(2_000);
+  for (const row of rows) {
+    if (String(row.kind || '') === 'continuation') {
+      // No user prompt to replay: a dead worker's continuation is torn down.
+      stmts.dropStaleContinuation?.run?.(row.id);
+      io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+      continue;
+    }
+    if (Number(row.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES) {
+      failRecoveredRowTerminally(row, `worker-died-${reason}`);
+      continue;
+    }
+    stmts.recoverProcessingRowKeepOwner?.run?.(requeueAt, row.id);
+    io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
+    recovered += 1;
+  }
+  if (recovered > 0) {
+    io.emit('queue_updated', { recovered, reason: `worker-died:${reason}` });
+    sessionWorkerWebSocketService?.emitQueueChanged?.(`worker-died:${reason}`);
+  }
+  sessionWorkerSupervisor?.markError?.(sid, `worker-died:${reason}`);
+  // The rows stay owned, so the primer is what respawns their worker.
+  void primePendingSessionWorkers(`worker-died:${reason}`);
+  return recovered;
+}
+
+function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return;
+  if (runtimeShutdownStarted) return;
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const owned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
+  if (!owned.length) return;
+  const timer = setTimeout(() => {
+    try {
+      if (runtimeShutdownStarted) return;
+      if (isWorkerSessionProcessAlive(sid, pid)) return; // reconnect or socket flap
+      const stillOwned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
+      if (!stillOwned.length) return;
+      console.warn(`${runtimeLogPrefix()}WORKER DIED session=${sid.slice(0, 8)} rows=${stillOwned.length} trigger=socket-close — recovering owned turns`);
+      recoverDeadWorkerProcessingRows(sid, 'socket-close');
+    } catch (error) {
+      console.warn(`${runtimeLogPrefix()}WORKER DEATH check failed session=${sid.slice(0, 8)} err=${error?.message || error}`);
+    }
+  }, WORKER_DEATH_GRACE_MS);
+  timer.unref?.();
+}
+
+function sweepDeadWorkerProcessingRows() {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
+  if (runtimeShutdownStarted) return 0;
+  const owners = stmts.listProcessingOwnerSessionIds?.all?.(25) || [];
+  let recovered = 0;
+  for (const owner of owners) {
+    const sid = String(owner?.sdk_session_id || '').trim();
+    if (!sid) continue;
+    if (isWorkerSessionProcessAlive(sid)) continue;
+    console.warn(`${runtimeLogPrefix()}WORKER DEAD session=${sid.slice(0, 8)} trigger=sweep — recovering owned turns`);
+    recovered += recoverDeadWorkerProcessingRows(sid, 'sweep');
+  }
+  return recovered;
+}
+
 const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   WebSocketServerImpl: WebSocketServer,
   httpServer,
@@ -6867,12 +7013,15 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
     sessionWorkerSupervisor?.noteSessionHeartbeat?.(sessionId);
   },
   onDeliverySendFailed: recoverUndeliveredSessionWorkerMessage,
+  onWorkerSocketClosed: handleWorkerSocketClosed,
   requestWork: requestSessionWorkerSocketDelivery,
   isWorkerProcessAlive: (pid) => isProcessAlive(Number(pid)),
   pathPrefix: remotePath,
   pollIntervalMs: 500,
   logger: console,
 });
+runtimeTimers.deadWorkerSweep = setInterval(sweepDeadWorkerProcessingRows, 30_000);
+if (typeof runtimeTimers.deadWorkerSweep.unref === 'function') runtimeTimers.deadWorkerSweep.unref();
 const tmuxInspectorAccessPolicy = createTmuxInspectorAccessPolicy({
   sessionWorkerRegistry,
   sessionWorkerSupervisor,

@@ -662,3 +662,36 @@ test('launchSessionCli ignores a dead discovered pid and continues to launch', a
   assert.equal(launched.pid, 4243);
   assert.equal(spawnCalls[0]?.command, 'copilot');
 });
+
+test('node-worker tmux commands tee output into the worker log', async () => {
+  const { buildTmuxWorkerShellCommand } = await import('./session-worker-launch-service.mjs');
+  const command = buildTmuxWorkerShellCommand('sid-log', {
+    COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
+    COPILOT_WEB_RELAY_SERVER_DIR: '/srv/server',
+  }, { workerLogPath: '/srv/server/logs/worker-sid-log.log' });
+  assert.match(command, />> '\/srv\/server\/logs\/worker-sid-log\.log' 2>&1$/);
+});
+
+test('prepareWorkerLogFile creates the log dir, sanitizes the id, and rotates oversized logs', async () => {
+  const { prepareWorkerLogFile } = await import('./session-worker-launch-service.mjs');
+  const mkdirs = [];
+  const renames = [];
+  const fsImpl = {
+    mkdirSync: (dir) => { mkdirs.push(dir); },
+    statSync: () => ({ size: 11 * 1024 * 1024 }),
+    renameSync: (from, to) => { renames.push([from, to]); },
+  };
+  const logPath = prepareWorkerLogFile('sid/../evil', { COPILOT_WEB_RELAY_LOG_DIR: '/var/log/relay' }, { fsImpl });
+  assert.equal(logPath, '/var/log/relay/worker-sidevil.log');
+  assert.deepEqual(mkdirs, ['/var/log/relay']);
+  assert.equal(renames.length, 1, 'an oversized log rotates');
+  assert.equal(renames[0][1], '/var/log/relay/worker-sidevil.log.1');
+});
+
+test('prepareWorkerLogFile never throws when the filesystem misbehaves', async () => {
+  const { prepareWorkerLogFile } = await import('./session-worker-launch-service.mjs');
+  const logPath = prepareWorkerLogFile('sid', {}, {
+    fsImpl: { mkdirSync: () => { throw new Error('read-only fs'); } },
+  });
+  assert.equal(logPath, null);
+});
