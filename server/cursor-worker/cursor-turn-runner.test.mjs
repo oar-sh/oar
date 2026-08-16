@@ -329,7 +329,7 @@ test('agent creation failures publish classified terminal responses', async () =
   assert.equal(genericResponse.body.terminalError.kind, 'cursor-turn-failed');
 });
 
-test('a busy agent is closed, recreated, and retried once; a second busy is terminal', async () => {
+test('a busy agent is closed and retried; the second retry forces run expiry; a third busy is terminal', async () => {
   const stub = makeApiStub();
   const createCalls = [];
   const closes = [];
@@ -347,6 +347,7 @@ test('a busy agent is closed, recreated, and retried once; a second busy is term
   assert.equal(createCalls.length, 2, 'a fresh handle must be created for the retry');
   assert.equal(createCalls[1].agentId, 'agent-b', 'the retry resumes the persisted durable id');
   assert.equal(started.length, 2);
+  assert.equal(started[1].sendLocal, null, 'the first retry does not force');
   const response = stub.calls.find((call) => call.routePath === '/api/response');
   assert.equal(response.body.text, 'recovered fine.');
   assert.equal(response.body.terminalError, undefined);
@@ -358,11 +359,17 @@ test('a busy agent is closed, recreated, and retried once; a second busy is term
     startCursorRunImpl: queuedTurns([
       () => rejectingTurn(busyError()),
       () => rejectingTurn(busyError()),
+      () => rejectingTurn(busyError()),
     ], busyStarted),
   }));
   const handled = await busyRunner.handlePendingPayload({ message: { ...baseMessage } });
   assert.equal(handled, true);
-  assert.equal(busyStarted.length, 2, 'exactly one retry');
+  assert.equal(busyStarted.length, 3, 'two retries before going terminal');
+  assert.deepEqual(
+    busyStarted[2].sendLocal,
+    { force: true },
+    'the second retry expires the wedged persisted run (the SDK\'s documented recovery)',
+  );
   const busyResponse = busyStub.calls.find((call) => call.routePath === '/api/response');
   assert.equal(busyResponse.body.terminalError.stableCode, 'cursor.agent_busy');
 });
@@ -394,7 +401,7 @@ test('an auth error result closes and recreates the handle, and the retry recove
   assert.equal(response.body.terminalError, undefined);
 });
 
-test('a second auth error result is terminal with the key renewal hint', async () => {
+test('exhausting the auth-retry budget is terminal with the key renewal hint', async () => {
   const stub = makeApiStub();
   const started = [];
   const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
@@ -402,16 +409,42 @@ test('a second auth error result is terminal with the key renewal hint', async (
     startCursorRunImpl: queuedTurns([
       [evInit(), authErrorResult()],
       [evInit(), authErrorResult()],
+      [evInit(), authErrorResult()],
     ], started),
   }));
 
   const handled = await runner.handlePendingPayload({ message: { ...baseMessage } });
   assert.equal(handled, true);
-  assert.equal(started.length, 2, 'exactly one retry');
+  assert.equal(started.length, 3, 'two recreate-and-retry attempts before going terminal');
   const response = stub.calls.find((call) => call.routePath === '/api/response');
   assert.equal(response.body.terminalError.stableCode, 'cursor.authentication_failed');
   assert.equal(response.body.terminalError.code, 'authentication_failed');
   assert.match(response.body.text, /Set or renew the Cursor API key/);
+});
+
+test('a thrown AuthenticationError gets the same recreate-and-retry as the result-shaped failure', async () => {
+  const stub = makeApiStub();
+  const closes = [];
+  const started = [];
+  const authThrow = () => {
+    const error = new Error('AuthenticationError: token exchange expired');
+    error.name = 'AuthenticationError';
+    return error;
+  };
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes, agentIds: ['agent-a'] }),
+    startCursorRunImpl: queuedTurns([
+      () => rejectingTurn(authThrow()),
+      [evInit(), evDelta('recovered after the thrown auth error.'), evFinished()],
+    ], started),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(closes.length, 1, 'the stale handle must be closed');
+  assert.equal(started.length, 2);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'recovered after the thrown auth error.');
+  assert.equal(response.body.terminalError, undefined);
 });
 
 test('an auth error hidden behind streamed text still triggers the handle retry', async () => {

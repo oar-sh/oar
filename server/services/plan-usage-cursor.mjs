@@ -157,6 +157,9 @@ export function normalizeCursorUsageReport(raw = {}) {
     agentId,
     model: toTrimmedString(raw?.model),
     capturedAt: toIsoTimestamp(raw?.capturedAt) || new Date().toISOString(),
+    // True only when the worker created this agent fresh (its lifetime IS the
+    // current conversation) — the first-sighting rule below keys on it.
+    agentCreated: raw?.agentCreated === true,
   };
   let hasMetric = false;
   for (const field of NUMERIC_REPORT_FIELDS) {
@@ -192,6 +195,14 @@ export function applyCursorUsageDelta({ checkpoint = null, report = null } = {})
   if (!normalized) return null;
 
   const previous = checkpoint && typeof checkpoint === 'object' ? checkpoint : {};
+  // First sighting of this agent with no stored checkpoint: getUsage() is a
+  // LIFETIME total, so booking it as a delta would dump the agent's entire
+  // history into the current cycle (fresh install, restored DB, pruned
+  // checkpoint). Seed the baseline without booking — unless the worker says
+  // it created the agent this conversation, in which case the lifetime IS
+  // current work and books whole.
+  const firstSighting = toTrimmedString(previous?.agentId) !== normalized.agentId;
+  const seedOnly = firstSighting && normalized.agentCreated !== true;
   const delta = {};
   const nextCheckpoint = { agentId: normalized.agentId, capturedAt: normalized.capturedAt };
   let restated = false;
@@ -206,6 +217,11 @@ export function applyCursorUsageDelta({ checkpoint = null, report = null } = {})
       // baseline so the value is picked up whole on a later report.
       delta[field] = 0;
       nextCheckpoint[field] = prior;
+      continue;
+    }
+    if (seedOnly) {
+      delta[field] = 0;
+      nextCheckpoint[field] = current;
       continue;
     }
     const increase = prior === null ? current : current - prior;

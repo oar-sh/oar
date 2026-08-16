@@ -20,6 +20,15 @@ import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.m
 import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 
+// Stale-auth recovery budget per turn: expiry is routine on long-lived
+// handles, and one retry proved too small in practice (an orchestrator turn
+// re-authenticated once, then died terminally on the second expiry hours
+// later).
+const MAX_STALE_AUTH_RETRIES = 2;
+// Recreate a handle proactively once it has sat idle past this window; the
+// exchanged auth goes stale around the 4h mark while the API key stays valid.
+const STALE_HANDLE_IDLE_MS = 30 * 60_000;
+
 const PLAN_BOARD_ACTIONS = [
   { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
   { id: 'interactive', label: 'Stop here and prompt myself', mode: 'agent' },
@@ -111,6 +120,13 @@ export function createCursorTurnRunner({
   let activeMessage = null;
   let waitingForTurn = false;
   let currentAbortController = null;
+  // Handle staleness is the norm, not the exception (~4h idle expires the
+  // exchanged auth while the API key stays valid); recreate proactively after
+  // a long idle instead of paying a failed attempt to find out.
+  let agentHandleLastUsedAt = 0;
+  // Open ask_user round-trips: the merged-stream stall watchdog defers while
+  // a human is thinking about a question card.
+  let pendingAskUserCalls = 0;
   // Mirrors the Copilot extension's lastPromptedRelayMode: full mode
   // instructions ride on the first message of a mode and on mode changes only.
   let lastNudgedRelayMode = '';
@@ -132,7 +148,14 @@ export function createCursorTurnRunner({
     ask_user: {
       description: askUserTool.description,
       inputSchema: askUserTool.inputSchema,
-      execute: askUserTool.execute,
+      execute: async (...args) => {
+        pendingAskUserCalls += 1;
+        try {
+          return await askUserTool.execute(...args);
+        } finally {
+          pendingAskUserCalls -= 1;
+        }
+      },
     },
   };
 
@@ -174,6 +197,19 @@ export function createCursorTurnRunner({
   async function ensureAgentHandle(message, model) {
     const rosterModels = Array.isArray(message.cursorSubagentModels) ? message.cursorSubagentModels : [];
     const rosterFingerprint = cursorSubagentRosterFingerprint(rosterModels);
+    if (
+      agentHandle
+      && agentHandleLastUsedAt
+      && Date.now() - agentHandleLastUsedAt > STALE_HANDLE_IDLE_MS
+    ) {
+      dbg('cursor agent handle idle past the staleness window, recreating proactively');
+      try {
+        await agentHandle.close?.();
+      } catch (error) {
+        dbg('cursor agent close failed on staleness refresh', error?.message || String(error));
+      }
+      agentHandle = null;
+    }
     if (agentHandle && agentRosterFingerprint !== rosterFingerprint) {
       // Closing drops only the local handle; the durable Cursor agent id is
       // persisted, so the rebuild below resumes the same conversation with the
@@ -328,6 +364,10 @@ export function createCursorTurnRunner({
       conversationId: message.conversationId,
       agentId: agentHandle.agentId,
       model: state.responseModel || model || '',
+      // Lets the ledger tell a brand-new agent (book its lifetime — it IS
+      // this conversation) from one resumed without a checkpoint (seed the
+      // baseline; booking would dump historic spend into today's cycle).
+      agentCreated: agentHandle.created === true,
       ...usage,
       capturedAt: new Date().toISOString(),
     }).catch((error) => {
@@ -361,7 +401,9 @@ export function createCursorTurnRunner({
 
   async function runTurn(message) {
     currentAbortController = new AbortController();
-    const abortController = currentAbortController;
+    // `let`: the auth-retry path burns the old signal to unblock a parked
+    // ask_user wait, then arms a fresh one for the retry attempt.
+    let abortController = currentAbortController;
     let normalizer = createNormalizerImpl();
     const state = {
       result: null,
@@ -416,6 +458,46 @@ export function createCursorTurnRunner({
 
       let busyRetries = 0;
       let staleAuthRetries = 0;
+      let forceNextSend = false;
+
+      // A stale handle's auth expiry is the norm on long conversations
+      // (~4h idle), so the budget is 2 recreate-and-retry attempts with a
+      // short backoff before the failure goes terminal. Shared by the
+      // result-shaped and the thrown flavor of the same failure.
+      const recreateHandleForAuthRetry = async (flavor) => {
+        staleAuthRetries += 1;
+        dbg(`cursor auth error (${flavor}), recreating handle for retry ${staleAuthRetries}/${MAX_STALE_AUTH_RETRIES}`);
+        // A question card parked on the dead attempt would poll forever:
+        // burn the old signal to settle its wait, then arm a fresh one for
+        // the retry.
+        try { abortController.abort(); } catch {}
+        abortController = new AbortController();
+        currentAbortController = abortController;
+        // Subagent runs the failed attempt already announced can never be
+        // terminated by the fresh normalizer (it has no memory of them), so
+        // close their relay rows out now instead of leaving them 'running'.
+        for (const run of normalizer?.activeSubagentRuns?.() || []) {
+          await dispatchAction(message, {
+            channel: 'subagent',
+            payload: { ...run, parentSubagentId: null, status: 'failed' },
+          }, state, normalizer);
+        }
+        await agentHandle?.close?.();
+        agentHandle = null;
+        await ensureAgentHandle(message, model);
+        normalizer = createNormalizerImpl();
+        state.result = null;
+        state.lastStreamedText = '';
+        state.responseModel = '';
+        state.lastUsage = null;
+        // The failed attempt already streamed partial text to the relay;
+        // clear it and leave a trace so the retry doesn't read as the
+        // same turn silently rewriting itself.
+        await publishFinalStream(message, '');
+        await postActivity(message, 'Cursor session re-authenticated; retrying this message on a fresh agent handle.');
+        await new Promise((resolve) => setTimeout(resolve, 400 * staleAuthRetries));
+      };
+
       while (true) {
         try {
           turn = startCursorRunImpl({
@@ -425,8 +507,13 @@ export function createCursorTurnRunner({
             modelParams,
             relayMode: message.relayMode,
             abortSignal: abortController.signal,
+            // The SDK's documented recovery for a wedged persisted run —
+            // armed by the second busy retry below.
+            sendLocal: forceNextSend ? { force: true } : null,
+            hasPendingClientWork: () => pendingAskUserCalls > 0,
             dbg,
           });
+          forceNextSend = false;
           for await (const event of turn) {
             const actions = normalizer.normalize(event);
             for (const action of actions) {
@@ -436,10 +523,10 @@ export function createCursorTurnRunner({
           // A long-lived handle whose exchanged auth expired fails as a
           // terminal ERROR result, not a thrown AuthenticationError, and the
           // API key itself is usually still valid — so recreate the handle
-          // and retry once. A second auth failure is a real key problem and
-          // falls through to the isError publish below.
+          // and retry. Exhausting the budget falls through to the isError
+          // publish below.
           if (
-            staleAuthRetries === 0
+            staleAuthRetries < MAX_STALE_AUTH_RETRIES
             && !aborted
             && !abortController.signal.aborted
             && state.result?.isError
@@ -448,21 +535,7 @@ export function createCursorTurnRunner({
             // must never trigger a silent re-run.
             && isCursorAuthErrorMessage(state.result.errorMessage)
           ) {
-            staleAuthRetries += 1;
-            dbg('cursor auth error result, recreating handle for one retry');
-            await agentHandle?.close?.();
-            agentHandle = null;
-            await ensureAgentHandle(message, model);
-            normalizer = createNormalizerImpl();
-            state.result = null;
-            state.lastStreamedText = '';
-            state.responseModel = '';
-            state.lastUsage = null;
-            // The failed attempt already streamed partial text to the relay;
-            // clear it and leave a trace so the retry doesn't read as the
-            // same turn silently rewriting itself.
-            await publishFinalStream(message, '');
-            await postActivity(message, 'Cursor session re-authenticated; retrying this message on a fresh agent handle.');
+            await recreateHandleForAuthRetry('result');
             continue;
           }
           // An abort can end the iterator cleanly before the send ever
@@ -474,15 +547,30 @@ export function createCursorTurnRunner({
           }
           break;
         } catch (error) {
+          const classified = classifyErrorImpl(error);
           // A stale handle whose previous run never settled server-side
-          // reports busy; one close-and-resume usually clears it. A second
-          // busy is terminal (classified cursor.agent_busy upstream).
-          if (busyRetries === 0 && classifyErrorImpl(error).isBusy) {
+          // reports busy; one close-and-resume usually clears it, and the
+          // second attempt additionally expires the wedged persisted run via
+          // LocalSendOptions.force. A third busy is terminal.
+          if (busyRetries < 2 && classified.isBusy) {
             busyRetries += 1;
-            dbg('cursor agent busy, recreating handle for one retry');
+            forceNextSend = busyRetries >= 2;
+            dbg(`cursor agent busy, recreating handle for retry ${busyRetries}/2${forceNextSend ? ' (forcing run expiry)' : ''}`);
             await agentHandle?.close?.();
             agentHandle = null;
             await ensureAgentHandle(message, model);
+            continue;
+          }
+          // The thrown flavor of the same stale-auth failure (an
+          // AuthenticationError from agent.send or from the handle rebuild)
+          // deserves the same recreate-and-retry as the result-shaped one.
+          if (
+            staleAuthRetries < MAX_STALE_AUTH_RETRIES
+            && !aborted
+            && !abortController.signal.aborted
+            && classified.isAuth
+          ) {
+            await recreateHandleForAuthRetry('thrown');
             continue;
           }
           throw error;
@@ -497,6 +585,7 @@ export function createCursorTurnRunner({
       throw error;
     } finally {
       controlPoller?.stop?.(controlState);
+      agentHandleLastUsedAt = Date.now();
       // Runs on every exit path so usage captured before the turn went
       // sideways still reaches the relay. `normalizer` is the live instance
       // (the auth retry swaps it), so a discarded attempt's usage is not

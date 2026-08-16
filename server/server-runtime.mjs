@@ -923,14 +923,10 @@ async function refreshCursorProviderModels() {
   }
   try {
     const mod = await import('@cursor/sdk');
-    const listModels = async () => {
-      try {
-        const listed = await mod.Cursor?.models?.list?.({ apiKey: settings.apiKey });
-        if (listed !== undefined) return listed;
-      } catch { /* fall through to the client-instance form */ }
-      const CursorClient = mod.Cursor || mod.default;
-      return new CursorClient({ apiKey: settings.apiKey }).models.list();
-    };
+    // The namespace form is the only working call shape: `Cursor` has a
+    // private constructor and `models` is static, so the old client-instance
+    // fallback could only throw a TypeError that replaced the real error.
+    const listModels = async () => mod.Cursor.models.list({ apiKey: settings.apiKey });
     const payload = await Promise.race([
       listModels(),
       new Promise((_resolve, reject) => {

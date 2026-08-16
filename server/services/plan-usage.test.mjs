@@ -335,7 +335,7 @@ test('a reset day past the end of a short month clamps to its last day', () => {
 test('a cumulative report is diffed against the checkpoint', () => {
   const first = applyCursorUsageDelta({
     checkpoint: null,
-    report: { agentId: 'a1', model: 'composer-2.5', rawCostCents: 120, chargedCents: 0, totalTokens: 900 },
+    report: { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 120, chargedCents: 0, totalTokens: 900 },
   });
   assert.equal(first.delta.rawCostCents, 120);
   assert.equal(first.pool, 'cursor');
@@ -343,7 +343,7 @@ test('a cumulative report is diffed against the checkpoint', () => {
 
   const second = applyCursorUsageDelta({
     checkpoint: first.checkpoint,
-    report: { agentId: 'a1', model: 'claude-opus-5', rawCostCents: 200, chargedCents: 30, totalTokens: 1500 },
+    report: { agentId: 'a1', agentCreated: true, model: 'claude-opus-5', rawCostCents: 200, chargedCents: 30, totalTokens: 1500 },
   });
   assert.equal(second.delta.rawCostCents, 80);
   assert.equal(second.delta.totalTokens, 600);
@@ -352,8 +352,8 @@ test('a cumulative report is diffed against the checkpoint', () => {
 
 test('a backend restatement re-baselines without counting spend twice', () => {
   const restated = applyCursorUsageDelta({
-    checkpoint: { agentId: 'a1', rawCostCents: 500, totalTokens: 1000 },
-    report: { agentId: 'a1', model: 'composer-2.5', rawCostCents: 450, totalTokens: 900 },
+    checkpoint: { agentId: 'a1', agentCreated: true, rawCostCents: 500, totalTokens: 1000 },
+    report: { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 450, totalTokens: 900 },
   });
   assert.equal(restated.delta.rawCostCents, 0);
   assert.equal(restated.restated, true);
@@ -368,7 +368,7 @@ test('recovering after a restatement books nothing until the previous peak is pa
   const observe = (rawCostCents) => {
     const applied = applyCursorUsageDelta({
       checkpoint,
-      report: { agentId: 'a1', model: 'composer-2.5', rawCostCents },
+      report: { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents },
     });
     checkpoint = applied.checkpoint;
     return applied.delta.rawCostCents;
@@ -385,7 +385,7 @@ test('out-of-order reports from concurrent turns do not inflate the total', () =
   const observe = (rawCostCents) => {
     const applied = applyCursorUsageDelta({
       checkpoint,
-      report: { agentId: 'a1', model: 'composer-2.5', rawCostCents },
+      report: { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents },
     });
     checkpoint = applied.checkpoint;
     return applied.delta.rawCostCents;
@@ -397,14 +397,14 @@ test('out-of-order reports from concurrent turns do not inflate the total', () =
 test('cost that lags behind a run is picked up whole on the next report', () => {
   const noCost = applyCursorUsageDelta({
     checkpoint: null,
-    report: { agentId: 'a1', model: 'composer-2.5', rawCostCents: null, totalTokens: 400 },
+    report: { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: null, totalTokens: 400 },
   });
   assert.equal(noCost.delta.rawCostCents, 0);
   assert.equal(noCost.checkpoint.rawCostCents, null);
 
   const withCost = applyCursorUsageDelta({
     checkpoint: noCost.checkpoint,
-    report: { agentId: 'a1', model: 'composer-2.5', rawCostCents: 75, totalTokens: 400 },
+    report: { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 75, totalTokens: 400 },
   });
   assert.equal(withCost.delta.rawCostCents, 75);
 });
@@ -523,4 +523,24 @@ test('the first candidate that reports usage wins and reports no error', async (
   assert.equal(result.error, null);
   assert.equal(result.denied, false);
   assert.deepEqual(result.timePeriod, { year: 2026, month: 8 });
+});
+
+test('an agent resumed without a checkpoint seeds the baseline instead of booking its lifetime', () => {
+  // getUsage() is a lifetime total: on a fresh install / restored DB the
+  // first report for a long-lived agent must not dump historic spend into
+  // the current cycle.
+  const first = applyCursorUsageDelta({
+    checkpoint: null,
+    report: { agentId: 'a-resumed', model: 'composer-2.5', rawCostCents: 12_000, totalTokens: 900_000 },
+  });
+  assert.equal(first.delta.rawCostCents, 0, 'lifetime totals seed, never book');
+  assert.equal(first.changed, false);
+  assert.equal(first.checkpoint.rawCostCents, 12_000, 'the baseline is the current total');
+  // The next report books only the increase since the seed.
+  const second = applyCursorUsageDelta({
+    checkpoint: first.checkpoint,
+    report: { agentId: 'a-resumed', model: 'composer-2.5', rawCostCents: 12_150, totalTokens: 905_000 },
+  });
+  assert.equal(second.delta.rawCostCents, 150);
+  assert.equal(second.changed, true);
 });

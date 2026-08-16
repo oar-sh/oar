@@ -47,11 +47,11 @@ test('only the latest snapshot is retained per provider', () => {
 test('cursor reports accumulate into the cycle under the model’s pool', () => {
   const { service } = makeService();
   service.recordCursorUsageReport(
-    { agentId: 'a1', model: 'composer-2.5', rawCostCents: 300, chargedCents: 0, totalTokens: 1000 },
+    { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 300, chargedCents: 0, totalTokens: 1000 },
     { resetDay: 1 },
   );
   service.recordCursorUsageReport(
-    { agentId: 'a1', model: 'claude-opus-5', rawCostCents: 800, chargedCents: 100, totalTokens: 2500 },
+    { agentId: 'a1', agentCreated: true, model: 'claude-opus-5', rawCostCents: 800, chargedCents: 100, totalTokens: 2500 },
     { resetDay: 1 },
   );
   const { totals, cycle } = service.readCursorCycleTotals({ resetDay: 1 });
@@ -63,7 +63,7 @@ test('cursor reports accumulate into the cycle under the model’s pool', () => 
 
 test('a repeated identical report adds nothing', () => {
   const { service } = makeService();
-  const report = { agentId: 'a1', model: 'composer-2.5', rawCostCents: 300 };
+  const report = { agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 300 };
   service.recordCursorUsageReport(report, { resetDay: 1 });
   const second = service.recordCursorUsageReport(report, { resetDay: 1 });
   assert.equal(second.changed, false);
@@ -72,9 +72,9 @@ test('a repeated identical report adds nothing', () => {
 
 test('spend books into the cycle that is current when it is observed', () => {
   const { service, clock } = makeService();
-  service.recordCursorUsageReport({ agentId: 'a1', model: 'composer-2.5', rawCostCents: 100 }, { resetDay: 1 });
+  service.recordCursorUsageReport({ agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 100 }, { resetDay: 1 });
   clock.value = new Date('2026-09-05T00:00:00.000Z');
-  service.recordCursorUsageReport({ agentId: 'a1', model: 'composer-2.5', rawCostCents: 250 }, { resetDay: 1 });
+  service.recordCursorUsageReport({ agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 250 }, { resetDay: 1 });
 
   clock.value = new Date('2026-08-20T00:00:00.000Z');
   assert.equal(service.readCursorCycleTotals({ resetDay: 1 }).totals.cursor.rawCostCents, 100);
@@ -84,20 +84,20 @@ test('spend books into the cycle that is current when it is observed', () => {
 
 test('separate agents accumulate independently', () => {
   const { service } = makeService();
-  service.recordCursorUsageReport({ agentId: 'a1', model: 'composer-2.5', rawCostCents: 100 }, { resetDay: 1 });
-  service.recordCursorUsageReport({ agentId: 'a2', model: 'composer-2.5', rawCostCents: 400 }, { resetDay: 1 });
+  service.recordCursorUsageReport({ agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 100 }, { resetDay: 1 });
+  service.recordCursorUsageReport({ agentId: 'a2', agentCreated: true, model: 'composer-2.5', rawCostCents: 400 }, { resetDay: 1 });
   assert.equal(service.readCursorCycleTotals({ resetDay: 1 }).totals.cursor.rawCostCents, 500);
 });
 
 test('resetting accounting clears the cycle and re-baselines future reports', () => {
   const { service } = makeService();
-  service.recordCursorUsageReport({ agentId: 'a1', model: 'composer-2.5', rawCostCents: 900 }, { resetDay: 1 });
+  service.recordCursorUsageReport({ agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 900 }, { resetDay: 1 });
   service.resetCursorAccounting({ resetDay: 1 });
   assert.equal(service.readCursorCycleTotals({ resetDay: 1 }).totals.cursor.rawCostCents, 0);
 
   // The agent's lifetime total is unchanged, so a fresh baseline must not
   // retroactively re-book the spend that was just cleared.
-  service.recordCursorUsageReport({ agentId: 'a1', model: 'composer-2.5', rawCostCents: 950 }, { resetDay: 1 });
+  service.recordCursorUsageReport({ agentId: 'a1', agentCreated: true, model: 'composer-2.5', rawCostCents: 950 }, { resetDay: 1 });
   assert.equal(service.readCursorCycleTotals({ resetDay: 1 }).totals.cursor.rawCostCents, 950);
 });
 

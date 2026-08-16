@@ -62,19 +62,35 @@ export async function createCursorAgentHandle({
     local: { cwd, store, customTools, autoReview: false },
   };
   const resumeId = String(agentId || '').trim();
-  const agent = resumeId
-    ? await factory.resume(resumeId, options)
-    : await factory.create(options);
-  const resolvedAgentId = agent?.id || agent?.agentId || resumeId;
+  let agent = null;
+  try {
+    agent = resumeId
+      ? await factory.resume(resumeId, options)
+      : await factory.create(options);
+  } catch (error) {
+    // The handle owns the store it opened; a failed create/resume must not
+    // leak the SQLite handle (rebuild paths retry with a fresh open).
+    try { store?.close?.(); } catch {}
+    throw error;
+  }
+  const resolvedAgentId = agent?.agentId || resumeId;
   dbg('cursor agent ready', resumeId ? 'resumed' : 'created', resolvedAgentId);
   return {
     agent,
     agentId: resolvedAgentId,
+    // Fresh agents' lifetime usage belongs to this conversation; resumed ones
+    // carry history the plan-usage ledger must baseline, not book.
+    created: !resumeId,
     async close() {
       try {
         await agent?.close?.();
       } catch (error) {
         dbg('cursor agent close failed', error?.message || String(error));
+      }
+      // Handles are rebuilt on roster changes and busy/auth retries; without
+      // this every rebuild leaked an open SQLite store on the same file.
+      try { store?.close?.(); } catch (error) {
+        dbg('cursor store close failed', error?.message || String(error));
       }
     },
   };
@@ -150,6 +166,14 @@ export function startCursorRun({
   modelParams = null,
   relayMode = 'agent',
   abortSignal = null,
+  // LocalSendOptions passthrough — `{ force: true }` is the SDK's documented
+  // recovery for a local agent left wedged by a crashed process.
+  sendLocal = null,
+  // Turn backstop: with no SDK traffic for this long (and no client-hosted
+  // work pending, e.g. an open ask_user card) the run is failed as stalled
+  // instead of parking the merged iterator forever. 0 disables.
+  stallTimeoutMs = 120_000,
+  hasPendingClientWork = () => false,
   dbg = () => {},
 } = {}) {
   const queue = [];
@@ -157,6 +181,8 @@ export function startCursorRun({
   let failure = null;
   let notify = null;
   let run = null;
+  let lastEventAt = Date.now();
+  let stallTimer = null;
 
   const wake = () => {
     if (!notify) return;
@@ -166,11 +192,16 @@ export function startCursorRun({
   };
   const push = (event) => {
     if (ended) return;
+    lastEventAt = Date.now();
     queue.push(event);
     wake();
   };
   const end = () => {
     ended = true;
+    if (stallTimer) {
+      clearInterval(stallTimer);
+      stallTimer = null;
+    }
     wake();
   };
   const onAbort = () => {
@@ -185,6 +216,24 @@ export function startCursorRun({
     abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
+  if (!ended && Number(stallTimeoutMs) > 0) {
+    stallTimer = setInterval(() => {
+      if (ended) return;
+      if (hasPendingClientWork()) {
+        // A human is thinking about a question card; the clock restarts when
+        // the tool settles and traffic resumes.
+        lastEventAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastEventAt >= Number(stallTimeoutMs)) {
+        failure = failure || new Error(`cursor turn stalled: no SDK traffic for ${Math.round(Number(stallTimeoutMs) / 1000)}s`);
+        dbg('cursor run stalled, ending merged stream');
+        end();
+      }
+    }, Math.min(15_000, Math.max(1_000, Math.floor(Number(stallTimeoutMs) / 4))));
+    stallTimer.unref?.();
+  }
+
   (async () => {
     if (ended) return;
     try {
@@ -195,6 +244,7 @@ export function startCursorRun({
           ...(Array.isArray(modelParams) && modelParams.length ? { params: modelParams } : {}),
         },
         mode: modeForRelayMode(relayMode),
+        ...(sendLocal && typeof sendLocal === 'object' ? { local: sendLocal } : {}),
         onDelta: ({ update }) => push({ source: 'delta', update }),
       });
       for await (const sdkMessage of run.stream()) {

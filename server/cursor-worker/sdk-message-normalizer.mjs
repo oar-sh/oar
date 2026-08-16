@@ -97,6 +97,7 @@ export function createSdkMessageNormalizer() {
   let lastUsage = null;
   let assistantMessageCount = 0; // degraded-mode stand-in for the step count
   const knownSubagentRuns = new Map(); // call_id -> displayName
+  const openSubagentRuns = new Set(); // call_ids currently 'running'
   const seenToolFrames = new Set(); // `${call_id}\u0000${status}` de-dupe
 
   function allocateThoughtId() {
@@ -202,6 +203,7 @@ export function createSdkMessageNormalizer() {
           || 'Subagent',
         ).trim() || 'Subagent';
         knownSubagentRuns.set(callId, displayName);
+        openSubagentRuns.add(callId);
         actions.push({
           channel: 'subagent',
           payload: {
@@ -221,6 +223,7 @@ export function createSdkMessageNormalizer() {
 
     if (status === 'completed') {
       if (knownSubagentRuns.has(callId)) {
+        openSubagentRuns.delete(callId);
         actions.push({
           channel: 'subagent',
           payload: {
@@ -236,6 +239,7 @@ export function createSdkMessageNormalizer() {
 
     if (status === 'error') {
       if (knownSubagentRuns.has(callId)) {
+        openSubagentRuns.delete(callId);
         actions.push({
           channel: 'subagent',
           payload: {
@@ -382,6 +386,13 @@ export function createSdkMessageNormalizer() {
   return {
     normalize,
     finalStreamText,
+    // Subagent runs opened but not yet terminated — the auth-retry path
+    // closes them out before discarding this normalizer, otherwise their
+    // relay rows stay 'running' forever.
+    activeSubagentRuns: () => [...openSubagentRuns].map((callId) => ({
+      subagentRunId: callId,
+      displayName: knownSubagentRuns.get(callId) || 'Subagent',
+    })),
     get model() { return initModel; },
     // The turn's usage as last seen on either surface, so the runner can still
     // publish context data when the run ends without a terminal status message.

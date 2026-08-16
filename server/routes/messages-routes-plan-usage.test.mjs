@@ -135,7 +135,7 @@ test('claude-plan-usage reports 500 when plan usage storage is absent', async ()
 test('cursor-plan-usage books the delta into the model’s pool', async () => {
   const { deps, planUsageService } = makePlanUsageDeps();
   const first = await invokePost('/api/cursor-plan-usage', deps, {
-    agentId: 'agent-1',
+    agentId: 'agent-1', agentCreated: true,
     model: 'composer-2.5',
     rawCostCents: 250,
     chargedCents: 0,
@@ -147,7 +147,7 @@ test('cursor-plan-usage books the delta into the model’s pool', async () => {
   assert.equal(first.body.cycle, '2026-08-01');
 
   const second = await invokePost('/api/cursor-plan-usage', deps, {
-    agentId: 'agent-1',
+    agentId: 'agent-1', agentCreated: true,
     model: 'claude-opus-5',
     rawCostCents: 600,
     chargedCents: 100,
@@ -170,7 +170,7 @@ test('cursor-plan-usage requires an agent id', async () => {
 test('cursor-plan-usage rejects a report with no metrics', async () => {
   const { deps } = makePlanUsageDeps();
   const { status, body } = await invokePost('/api/cursor-plan-usage', deps, {
-    agentId: 'agent-1',
+    agentId: 'agent-1', agentCreated: true,
     model: 'composer-2.5',
   });
   assert.equal(status, 400);
@@ -182,7 +182,7 @@ test('cursor-plan-usage honours the configured reset day when picking the cycle'
     getCursorPlanAllowanceSettings: () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 15 }),
   });
   const { body } = await invokePost('/api/cursor-plan-usage', deps, {
-    agentId: 'agent-1',
+    agentId: 'agent-1', agentCreated: true,
     model: 'composer-2.5',
     rawCostCents: 100,
   });

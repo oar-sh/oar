@@ -88,7 +88,7 @@ test('create path assembles options, builds the store under storeDir, and prefer
 test('resume path passes the same option shape and keeps customTools', async () => {
   const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-adapter-test-'));
   try {
-    const factory = createRecordingFactory({ id: 'agent-resumed-id' });
+    const factory = createRecordingFactory({ agentId: 'agent-resumed-id' });
     const handle = await createCursorAgentHandle({
       apiKey: 'cursor-test-key',
       model: 'composer-1',
@@ -112,7 +112,8 @@ test('resume path passes the same option shape and keeps customTools', async () 
     assert.ok(options.local.customTools.ask_user);
     assert.equal(options.local.store.storePath, path.join(storeDir, 'sess-2', 'agent.db'));
 
-    // agent.id wins over the passed agentId.
+    // The SDK agent's own agentId wins over the passed agentId (`id` is not
+    // part of the SDKAgent contract).
     assert.equal(handle.agentId, 'agent-resumed-id');
   } finally {
     fs.rmSync(storeDir, { recursive: true, force: true });

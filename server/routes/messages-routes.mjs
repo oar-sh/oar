@@ -4759,6 +4759,18 @@ export function registerMessagesRoutes(app, deps) {
   app.post('/api/claude-plan-usage', auth, (req, res) => {
     touchCli();
     if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    // Same binding validation as every other provider usage route: only a
+    // Claude-bound conversation's worker may write the Claude card. The
+    // snapshot itself is global, so a misrouted poster would corrupt it for
+    // everyone.
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (conversationId) {
+      const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+      const boundProvider = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+      if (runtimeSession && boundProvider !== 'claude') {
+        return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+      }
+    }
     const usage = normalizeClaudePlanUsage(req.body?.usage)
       || claudePlanUsageFromResult({
         modelUsage: req.body?.modelUsage,
@@ -4781,11 +4793,22 @@ export function registerMessagesRoutes(app, deps) {
     if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
     const agentId = String(req.body?.agentId || '').trim();
     if (!agentId) return res.status(400).json({ error: 'Missing agentId' });
+    // The worker sends its conversation id; require the binding like the
+    // sibling routes so spend cannot be booked from a misrouted poster.
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (conversationId) {
+      const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+      const boundProvider = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+      if (runtimeSession && boundProvider !== 'cursor') {
+        return res.status(409).json({ error: 'Conversation is not bound to the Cursor provider' });
+      }
+    }
     const allowances = getCursorPlanAllowanceSettings();
     const applied = planUsageService.recordCursorUsageReport(
       {
         agentId,
         model: req.body?.model,
+        agentCreated: req.body?.agentCreated === true,
         rawCostCents: req.body?.rawCostCents,
         chargedCents: req.body?.chargedCents,
         inputTokens: req.body?.inputTokens,
