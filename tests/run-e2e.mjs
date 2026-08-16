@@ -113,6 +113,15 @@ async function main() {
         COPILOT_WEB_RELAY_DATA_DIR: dataDir,
         COPILOT_WEB_RELAY_CONFIG: path.join(stateRoot, "config.json"),
         COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "0",
+        // The startup SDK-session import sweep reads ~/.copilot/session-state:
+        // on a developer host it would import the live relay's real Copilot
+        // sessions into the "isolated" test server (seen as stray sidebar
+        // conversations and startup DB contention). Point every home-derived
+        // path at the temp state root so the server can see none of the
+        // host's provider state.
+        COPILOT_SESSION_STATE_DIR: path.join(stateRoot, "session-state"),
+        HOME: stateRoot,
+        USERPROFILE: stateRoot,
         ...(disableCliSpawn ? { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: disableCliSpawn } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
