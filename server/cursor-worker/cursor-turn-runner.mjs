@@ -382,24 +382,11 @@ export function createCursorTurnRunner({
       || String(message.providerModel || '').trim()
       || defaultModel;
 
-    await ensureAgentHandle(message, model);
-    const userMessage = buildUserMessageImpl(message);
-    const modeNudge = cursorModeNudge(message.relayMode, lastNudgedRelayMode);
-    if (modeNudge) userMessage.text = [modeNudge, userMessage.text].filter(Boolean).join('\n\n');
-    // Committed only once the send reached the transport (before the loop's
-    // break below) — a turn that dies before delivery must re-inject the
-    // nudge next time, or a mode change would be silently swallowed.
-    const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
-    // Per-turn like the model: the composer's effort maps onto Cursor model
-    // params, and null (no mapping / lookup failure) sends the model default.
-    const modelParams = await resolveModelParamsImpl({
-      apiKey,
-      model,
-      reasoningEffort: message.reasoningEffort || '',
-      dbg,
-    });
-
     let turn = null;
+    // Started before agent/params setup: Agent.resume and the model-params
+    // lookup can take a while (or hang on a slow API), and the user's Stop
+    // must not be inert during that window. The whole setup lives inside the
+    // try so the finally can never leak a running poller.
     const controlState = controlPoller?.start?.({
       queueMessageId: message.id,
       onAbortTurn: async () => {
@@ -410,6 +397,23 @@ export function createCursorTurnRunner({
     });
 
     try {
+      await ensureAgentHandle(message, model);
+      const userMessage = buildUserMessageImpl(message);
+      const modeNudge = cursorModeNudge(message.relayMode, lastNudgedRelayMode);
+      if (modeNudge) userMessage.text = [modeNudge, userMessage.text].filter(Boolean).join('\n\n');
+      // Committed only once the send reached the transport (before the loop's
+      // break below) — a turn that dies before delivery must re-inject the
+      // nudge next time, or a mode change would be silently swallowed.
+      const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
+      // Per-turn like the model: the composer's effort maps onto Cursor model
+      // params, and null (no mapping / lookup failure) sends the model default.
+      const modelParams = await resolveModelParamsImpl({
+        apiKey,
+        model,
+        reasoningEffort: message.reasoningEffort || '',
+        dbg,
+      });
+
       let busyRetries = 0;
       let staleAuthRetries = 0;
       while (true) {
@@ -461,7 +465,13 @@ export function createCursorTurnRunner({
             await postActivity(message, 'Cursor session re-authenticated; retrying this message on a fresh agent handle.');
             continue;
           }
-          lastNudgedRelayMode = pendingNudgedRelayMode;
+          // An abort can end the iterator cleanly before the send ever
+          // reached the transport; committing the nudge then would swallow a
+          // mode change. Re-injecting on a delivered-then-aborted turn is a
+          // harmless duplicate, so under-committing is the safe direction.
+          if (!aborted && !abortController.signal.aborted) {
+            lastNudgedRelayMode = pendingNudgedRelayMode;
+          }
           break;
         } catch (error) {
           // A stale handle whose previous run never settled server-side

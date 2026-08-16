@@ -110,8 +110,19 @@ async function main() {
     try { wsLink.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
-    // The agent handle owns a SQLite store; close it before exiting.
-    try { await turnRunner.dispose(); } catch {}
+    // The agent handle owns a SQLite store; close it before exiting — but
+    // bounded: a dispose that hangs must never leave the process ignoring the
+    // supervisor's SIGTERM (the exit path has to be as reliable as the Claude
+    // worker's synchronous one).
+    try {
+      await Promise.race([
+        turnRunner.dispose(),
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, 3_000);
+          timer.unref?.();
+        }),
+      ]);
+    } catch {}
     process.exit(0);
   };
   process.on('SIGTERM', () => { shutdown('SIGTERM'); });

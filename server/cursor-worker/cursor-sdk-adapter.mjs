@@ -212,11 +212,17 @@ export function startCursorRun({
 
   async function* iterate() {
     while (true) {
-      if (failure) throw failure;
+      // Drain buffered events before surfacing a producer failure: the
+      // consumer awaits an HTTP post per action, so a terminal status frame
+      // (with the turn's text and usage) is often still queued when the
+      // stream throws — dropping it would turn a completed turn into a hard
+      // failure. An abort clears the queue, so the failure still surfaces
+      // immediately on the abort race.
       if (queue.length) {
         yield queue.shift();
         continue;
       }
+      if (failure) throw failure;
       if (ended) return;
       await new Promise((resolve) => { notify = resolve; });
     }
@@ -303,17 +309,19 @@ export function classifyCursorError(error) {
 }
 
 async function defaultModelsList({ apiKey }) {
+  // The namespace form is the only working call shape: `Cursor` has a private
+  // constructor and `models` is a static member, so the old client-instance
+  // fallback could only ever throw a TypeError that masked the real error.
   const sdk = await import('@cursor/sdk');
-  try {
-    return await sdk.Cursor.models.list({ apiKey });
-  } catch {
-    // Older/newer SDK builds may expose models on a client instance instead.
-    const client = new sdk.Cursor({ apiKey });
-    return client.models.list();
-  }
+  return sdk.Cursor.models.list({ apiKey });
 }
 
 const contextWindowCache = new Map();
+// Models without a `context` parameter (composer-2.5, grok-4.5) resolve to
+// null; remember that for a while so they stop paying a models.list() round
+// trip on every turn. Transient list failures are never cached.
+const NEGATIVE_CONTEXT_WINDOW_TTL_MS = 30 * 60_000;
+const MODELS_LIST_TIMEOUT_MS = 8_000;
 
 function modelEntriesFromListResponse(response) {
   if (Array.isArray(response)) return response;
@@ -376,21 +384,35 @@ function pickContextWindow(entry) {
 
 /**
  * Best-effort context-window lookup: never throws, null on any failure.
- * Successful lookups are cached per model; failures are not, so a transient
- * list error does not pin null for the process lifetime.
+ * Successful lookups are cached per model for the process lifetime; a list
+ * that succeeds but resolves no window is cached as null with a TTL (the
+ * absence is structural, not transient); list failures are never cached. The
+ * call is raced against a timeout because it runs in the turn's finally path,
+ * where a hung Cursor API would otherwise gate reply publication.
  */
 export async function readModelContextWindow({
   apiKey,
   model,
   modelsListImpl = null,
+  timeoutMs = MODELS_LIST_TIMEOUT_MS,
   dbg = () => {},
 } = {}) {
   const wanted = String(model || '').trim();
   if (!wanted) return null;
-  if (contextWindowCache.has(wanted)) return contextWindowCache.get(wanted);
+  const cached = contextWindowCache.get(wanted);
+  if (cached && (!cached.expiresAt || cached.expiresAt > Date.now())) return cached.value;
   try {
     const listImpl = modelsListImpl || defaultModelsList;
-    const response = await listImpl({ apiKey });
+    const response = await Promise.race([
+      listImpl({ apiKey }),
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`models.list timed out after ${timeoutMs}ms`)),
+          Math.max(1, Number(timeoutMs) || MODELS_LIST_TIMEOUT_MS),
+        );
+        timer.unref?.();
+      }),
+    ]);
     const entries = modelEntriesFromListResponse(response);
     const wantedLower = wanted.toLowerCase();
     for (const entry of entries) {
@@ -399,11 +421,15 @@ export async function readModelContextWindow({
       if (typeof entry === 'string') break;
       const contextWindow = pickContextWindow(entry);
       if (contextWindow !== null) {
-        contextWindowCache.set(wanted, contextWindow);
+        contextWindowCache.set(wanted, { value: contextWindow, expiresAt: 0 });
         return contextWindow;
       }
       break;
     }
+    contextWindowCache.set(wanted, {
+      value: null,
+      expiresAt: Date.now() + NEGATIVE_CONTEXT_WINDOW_TTL_MS,
+    });
   } catch (error) {
     dbg('cursor models list failed', error?.message || String(error));
   }

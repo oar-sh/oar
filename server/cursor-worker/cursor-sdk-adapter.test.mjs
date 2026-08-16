@@ -679,3 +679,67 @@ test('readModelContextWindow returns null on failure, no match, or unusable entr
     modelsListImpl: async () => [{ id: '', contextWindow: 1 }],
   }), null);
 });
+
+// ---------------------------------------------------------------------------
+// 2026-08-16 review hardening
+
+test('the merged iterator drains buffered events before surfacing a producer failure', async () => {
+  // The consumer awaits an HTTP post per action, so a terminal status frame is
+  // often still buffered when the stream throws. Dropping it turned completed
+  // turns into hard failures.
+  const agent = {
+    send: () => ({
+      id: 'run-drain',
+      stream: async function* () {
+        yield { seq: 'partial-text' };
+        yield { seq: 'terminal-status' };
+        throw new Error('transport died after the terminal frame');
+      },
+    }),
+  };
+  const turn = startCursorRun({ agent, message: { text: 'hi' }, model: 'composer-1' });
+  // Let the producer finish before the consumer starts, so both frames and the
+  // failure are already recorded when iteration begins.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const seen = [];
+  let thrown = null;
+  try {
+    for await (const event of turn) seen.push(event.message?.seq);
+  } catch (error) {
+    thrown = error;
+  }
+  assert.deepEqual(seen, ['partial-text', 'terminal-status'], 'buffered frames must be delivered');
+  assert.match(String(thrown?.message || ''), /transport died/, 'the failure still surfaces after the drain');
+});
+
+test('readModelContextWindow caches a resolved-but-absent window without re-hitting the network', async () => {
+  let calls = 0;
+  const modelsListImpl = async () => {
+    calls += 1;
+    return [{ id: 'windowless-model', parameters: [], variants: [] }];
+  };
+  assert.equal(await readModelContextWindow({ apiKey: 'k', model: 'windowless-model', modelsListImpl }), null);
+  assert.equal(await readModelContextWindow({ apiKey: 'k', model: 'windowless-model', modelsListImpl }), null);
+  assert.equal(calls, 1, 'a structural miss must be cached, not re-fetched every turn');
+});
+
+test('readModelContextWindow times out instead of gating the turn, and never caches the failure', async () => {
+  let hangs = 0;
+  const hangingImpl = () => { hangs += 1; return new Promise(() => {}); };
+  const started = Date.now();
+  assert.equal(
+    await readModelContextWindow({ apiKey: 'k', model: 'timeout-model', modelsListImpl: hangingImpl, timeoutMs: 30 }),
+    null,
+  );
+  assert.ok(Date.now() - started < 5_000, 'a hung models.list must not stall the caller');
+  // The failure was transient: a later working lookup succeeds.
+  assert.equal(
+    await readModelContextWindow({
+      apiKey: 'k',
+      model: 'timeout-model',
+      modelsListImpl: async () => [{ id: 'timeout-model', contextWindow: 64000 }],
+    }),
+    64000,
+  );
+  assert.equal(hangs, 1);
+});
