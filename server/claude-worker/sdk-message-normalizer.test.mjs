@@ -557,3 +557,66 @@ test('background_tasks_changed maps the live set with replace semantics', () => 
   });
   assert.deepEqual(emptied, [{ channel: 'background_tasks', payload: { tasks: [] } }]);
 });
+
+// ---------------------------------------------------------------------------
+// Per-block delivery correctness (2026-08-16 review)
+
+test('narration demotion works across per-block assistant events sharing one message id', () => {
+  const normalizer = createSdkMessageNormalizer();
+  // One API message, delivered one block per event (the real SDK shape):
+  // text first, then a tool_use — the text is interim narration.
+  const textActions = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_A', content: [{ type: 'text', text: 'Let me check the file first.' }] },
+  });
+  assert.equal(textActions.length, 0, 'text buffers until the message proves itself narration or answer');
+  const toolActions = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_A', content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: '/tmp/x' } }] },
+  });
+  const narration = toolActions.find((action) => action.channel === 'thought');
+  assert.ok(narration, 'the buffered text becomes a narration thought once the tool_use lands');
+  assert.equal(narration.payload.text, 'Let me check the file first.');
+  // A later text block in the same (tool-bearing) message demotes immediately.
+  const followUp = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_A', content: [{ type: 'text', text: 'Now writing the fix.' }] },
+  });
+  assert.equal(followUp.filter((action) => action.channel === 'thought').length, 1);
+  // The next message's lone text block is the answer — never a thought.
+  const answer = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_B', content: [{ type: 'text', text: 'All done: the file is fixed.' }] },
+  });
+  assert.equal(answer.filter((action) => action.channel === 'thought').length, 0);
+});
+
+test('the live stream resets at each message boundary instead of concatenating', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const longNarration = 'Let me look into the failing test before answering properly.';
+  normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id: 'msg_A' } } });
+  normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: longNarration } } });
+  normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id: 'msg_B' } } });
+  const answerDelta = 'The answer is forty-two, with confidence.';
+  const actions = normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answerDelta } } });
+  const stream = actions.find((action) => action.channel === 'stream');
+  assert.ok(stream);
+  assert.equal(stream.payload.text, answerDelta, 'the second message streams alone, not appended to the first');
+  assert.equal(normalizer.finalStreamText(), answerDelta);
+});
+
+test('redacted thinking surfaces as a placeholder instead of vanishing', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const actions = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_R', content: [{ type: 'redacted_thinking', data: 'ENCRYPTED' }] },
+  });
+  const thought = actions.find((action) => action.channel === 'thought');
+  assert.ok(thought);
+  assert.match(thought.payload.text, /redacted/i);
+});

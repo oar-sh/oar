@@ -1,6 +1,7 @@
 const MAX_TOOL_DETAIL_LENGTH = 140;
 // Matches the Copilot reasoning-stream bridge's per-thought cap.
 const MAX_THOUGHT_CHARS = 16 * 1024;
+const REDACTED_THINKING_PLACEHOLDER = '[Reasoning redacted by the model provider]';
 const SUBAGENT_TOOL_NAMES = new Set(['task', 'agent']);
 
 function truncate(text, maxLength = MAX_TOOL_DETAIL_LENGTH) {
@@ -123,6 +124,10 @@ export function createSdkMessageNormalizer() {
         // partial messages there is no `message_start`, and each complete
         // message allocates its own index.
         messageStarted: false,
+        // Which complete message the thread is currently inside, for the
+        // one-event-per-block delivery model.
+        lastCompleteMessageId: '',
+        currentComplete: null,
       });
     }
     return threads.get(key);
@@ -150,13 +155,24 @@ export function createSdkMessageNormalizer() {
 
   // Called when a new assistant message begins on a thread, from whichever
   // signal arrives first (`message_start`, or the complete message itself).
-  function beginAssistantMessage(state, { fromStreamEvent }) {
+  // Complete events arrive one per content block, all sharing message.id, so
+  // later blocks of the same message must not open a new message (that would
+  // drift the positional thought ids and re-trigger the boundary logic).
+  function beginAssistantMessage(state, { fromStreamEvent, messageId = '' }) {
     if (fromStreamEvent) {
       state.messageIndex += 1;
       state.messageStarted = true;
       state.thinking.clear();
+      // New API message: the pending bubble must show this message's prose,
+      // not the previous message's narration concatenated onto it. The
+      // stream channel publishes cumulative text, so the accumulator resets
+      // at the message boundary.
+      state.streamText = '';
+      state.lastEmittedStreamText = '';
       return;
     }
+    if (messageId && state.lastCompleteMessageId === messageId) return;
+    state.lastCompleteMessageId = messageId;
     if (state.messageStarted) {
       state.messageStarted = false;
       return;
@@ -249,8 +265,34 @@ export function createSdkMessageNormalizer() {
     const actions = [];
     const state = threadState(parentToolUseId);
     const subagentRunId = subagentRunIdFor(parentToolUseId);
-    beginAssistantMessage(state, { fromStreamEvent: false });
-    const hasToolUse = content.some((block) => block?.type === 'tool_use');
+    beginAssistantMessage(state, { fromStreamEvent: false, messageId });
+
+    // Whether a text block is interim narration (a thought) or the answer is
+    // a property of the whole API message, but the SDK delivers one complete
+    // event per content block — so within one event a text block can never
+    // share `content` with a tool_use. Track tool-bearing per message.id:
+    // text seen before the message's first tool_use buffers until either a
+    // tool_use proves it narration or the message ends (answer text is
+    // published from the result message and must never double as a thought).
+    if (messageId && state.currentComplete?.id !== messageId) {
+      state.currentComplete = { id: messageId, sawToolUse: false, pendingTexts: [] };
+    }
+    const tracker = messageId ? state.currentComplete : null;
+    const hasToolUseInEvent = content.some((block) => block?.type === 'tool_use');
+
+    const emitNarration = (text, index) => {
+      const capped = capThought(text || '');
+      if (!capped.trim()) return;
+      actions.push({
+        channel: 'thought',
+        payload: {
+          reasoningId: thoughtIdFor(state, 'narration', index),
+          text: capped,
+          done: true,
+          subagentRunId,
+        },
+      });
+    };
 
     for (const [index, block] of content.entries()) {
       const blockType = String(block?.type || '');
@@ -259,7 +301,11 @@ export function createSdkMessageNormalizer() {
         // display can deliver an empty raw block ahead of the summary block,
         // and skipping the empty one would hand its streamed id to the summary.
         const reasoningId = completeThinkingIdFor(state, messageId, index);
-        const text = capThought(block?.thinking || '');
+        const text = blockType === 'redacted_thinking'
+          // Redacted blocks carry encrypted `data`, never `thinking` — a
+          // placeholder keeps the reasoning visible instead of vanishing.
+          ? (String(block?.data || '').trim() ? REDACTED_THINKING_PLACEHOLDER : '')
+          : capThought(block?.thinking || '');
         if (!text.trim()) continue;
         actions.push({
           channel: 'thought',
@@ -272,21 +318,23 @@ export function createSdkMessageNormalizer() {
         });
         continue;
       }
-      if (blockType === 'text' && hasToolUse) {
-        const text = capThought(block?.text || '');
-        if (!text.trim()) continue;
-        actions.push({
-          channel: 'thought',
-          payload: {
-            reasoningId: thoughtIdFor(state, 'narration', index),
-            text,
-            done: true,
-            subagentRunId,
-          },
-        });
+      if (blockType === 'text') {
+        if (tracker) {
+          if (tracker.sawToolUse) emitNarration(block?.text, index);
+          else tracker.pendingTexts.push({ index, text: String(block?.text || '') });
+        } else if (hasToolUseInEvent) {
+          // No message id to correlate on: fall back to the per-event check.
+          emitNarration(block?.text, index);
+        }
         continue;
       }
       if (blockType === 'tool_use') {
+        if (tracker) {
+          tracker.sawToolUse = true;
+          for (const pending of tracker.pendingTexts.splice(0)) {
+            emitNarration(pending.text, pending.index);
+          }
+        }
         actions.push(...actionsForToolUseBlock(block, parentToolUseId));
       }
     }

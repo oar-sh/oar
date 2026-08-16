@@ -1067,3 +1067,17 @@ test('an AskUserQuestion between turns attaches to a fresh continuation turn ins
   turn.endInput();
   await settled(runner);
 });
+
+test('the CLI-reported model backs the response when the composer says auto', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, defaultModel: '' });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage, model: 'auto' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('the answer', 'native-1'));
+  assert.equal(await pending, true);
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.model, 'claude-sonnet-5', 'the init model must back the response, not null');
+  turn.endInput();
+  await settled(runner);
+});

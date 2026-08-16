@@ -48,15 +48,37 @@ test('image data-url is used when no path is readable', () => {
   assert.equal(imageBlocks[0].source.data, data);
 });
 
-test('non-image with readable path becomes a note line; unreadable is skipped', () => {
+test('non-image with readable path becomes a note line; unreadable is noted, not dropped', () => {
   const fsImpl = fakeFs({ '/uploads/doc': Buffer.from('pdf') });
   const { imageBlocks, noteLines } = buildClaudeAttachmentContent([
     { name: 'spec.pdf', type: 'application/pdf', path: '/uploads/doc' },
     { name: 'ghost.txt', type: 'text/plain', path: '/uploads/missing' },
   ], { fsImpl });
   assert.equal(imageBlocks.length, 0);
-  assert.equal(noteLines.length, 1);
+  assert.equal(noteLines.length, 2);
   assert.equal(noteLines[0], 'Attached file "spec.pdf" (application/pdf): /uploads/doc');
+  // Silently dropping a failed hydration reads as "the user attached
+  // nothing" — the model must learn the attachment existed.
+  assert.match(noteLines[1], /ghost\.txt.*could not be resolved/);
+});
+
+test('the inline-image guards hold on every embed path', () => {
+  const big = Buffer.alloc(6 * 1024 * 1024, 1);
+  const fsImpl = fakeFs({ '/uploads/big.png': big });
+  const bigDataUrl = `data:image/png;base64,${big.toString('base64')}`;
+  const svgDataUrl = `data:image/svg+xml;base64,${Buffer.from('<svg/>').toString('base64')}`;
+  const { imageBlocks, noteLines } = buildClaudeAttachmentContent([
+    // Oversized file AND oversized data URL: before the fix the data-URL
+    // fallback embedded the full 6MB payload, defeating the cap.
+    { name: 'big.png', type: 'image/png', path: '/uploads/big.png', dataUrl: bigDataUrl },
+    // A media type the Anthropic image block rejects must never be embedded
+    // (it would 400 the whole turn).
+    { name: 'chart.svg', type: 'image/svg+xml', dataUrl: svgDataUrl },
+  ], { fsImpl });
+  assert.equal(imageBlocks.length, 0, 'neither oversized nor non-embeddable images may inline');
+  assert.equal(noteLines.length, 2);
+  assert.match(noteLines[0], /big\.png.*\/uploads\/big\.png$/);
+  assert.match(noteLines[1], /chart\.svg.*could not be embedded/);
 });
 
 test('buildClaudeUserContent composes text, notes, context, and image blocks', () => {

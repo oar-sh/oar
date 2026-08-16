@@ -205,6 +205,7 @@ export function createClaudeSessionRunner({
     proc.activeCtx = ctx;
     proc.lastBoundary = null;
     proc.notificationPendingAt = 0;
+    if (proc.initModel && !ctx.state.responseModel) ctx.state.responseModel = proc.initModel;
     ctx.controlState = controlPoller?.start?.({
       queueMessageId: ctx.message?.id || '',
       onAbortTurn: () => interruptActiveTurn(ctx),
@@ -248,7 +249,9 @@ export function createClaudeSessionRunner({
     activateContext(ctx);
     (async () => {
       let response = null;
-      for (let attempt = 0; attempt < 3 && !response; attempt += 1) {
+      // Retry on any registration that produced no message id — a truthy but
+      // empty response body must not end the loop early.
+      for (let attempt = 0; attempt < 3 && !response?.messageId; attempt += 1) {
         response = await api('POST', '/api/continuation-turn', {
           conversationId: sdkSessionId,
           sdkSessionId,
@@ -258,7 +261,7 @@ export function createClaudeSessionRunner({
           dbg('continuation turn registration failed', error?.message || String(error));
           return null;
         });
-        if (!response) await new Promise((resolve) => setTimeout(resolve, continuationRetryDelayMs));
+        if (!response?.messageId) await new Promise((resolve) => setTimeout(resolve, continuationRetryDelayMs));
       }
       if (!response?.messageId) {
         ctx.discarded = true;
@@ -269,6 +272,11 @@ export function createClaudeSessionRunner({
         return;
       }
       ctx.message.id = String(response.messageId);
+      // The route reports which conversation the synthetic row landed on;
+      // trusting it beats assuming worker session id === conversation id.
+      if (String(response.conversationId || '').trim()) {
+        ctx.message.conversationId = String(response.conversationId).trim();
+      }
       // Restart the control poller now that the turn has its real queue id.
       controlPoller?.stop?.(ctx.controlState);
       ctx.controlState = controlPoller?.start?.({
@@ -414,6 +422,13 @@ export function createClaudeSessionRunner({
       closeContext(ctx, true);
       return;
     }
+    // The transport is gone, so nothing new can be read — but usage already
+    // captured on this context (a result seen before the stream died) still
+    // reaches the relay. Best-effort by definition of this path.
+    if (ctx.state.contextUsage || ctx.state.planUsage) {
+      await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model, sdkSessionId }).catch(() => {});
+      await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId }).catch(() => {});
+    }
     if (ctx.interrupted || aborted) {
       await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
       closeContext(ctx, true);
@@ -481,6 +496,7 @@ export function createClaudeSessionRunner({
         summary: task.summary || null,
         lastToolName: task.lastToolName || null,
         totalTokens: task.totalTokens ?? null,
+        toolUseId: task.toolUseId || null,
       }));
       api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks }).catch((error) => {
         dbg('background task publish failed', error?.message || String(error));
@@ -505,6 +521,11 @@ export function createClaudeSessionRunner({
     const subtype = String(sdkMessage.subtype || '');
     if (subtype === 'init') {
       persistNativeSessionId(sdkSessionId, sdkMessage.session_id).catch(() => {});
+      // Init always lands before any context is active, so the per-context
+      // normalizer never sees it — capture the CLI's actual model here and
+      // seed it into every context at activation. Without this, a composer
+      // set to `auto` published responses with model: null.
+      proc.initModel = String(sdkMessage.model || '').trim() || proc.initModel;
       return;
     }
     if (subtype === 'background_tasks_changed') {
@@ -522,7 +543,16 @@ export function createClaudeSessionRunner({
             startedAt: known.startedAt || Date.now(),
           }];
         }));
-      for (const taskId of proc.liveTasks.keys()) proc.knownTasks.add(taskId);
+      for (const taskId of proc.liveTasks.keys()) {
+        // A task started after an expiry deserves its own timeout budget —
+        // the one-shot latch would otherwise never cap it.
+        if (!previous.has(taskId)) {
+          proc.tasksExpired = false;
+          proc.tasksExpiredAt = 0;
+          proc.heldForTasksSince = 0;
+        }
+        proc.knownTasks.add(taskId);
+      }
       publishBackgroundTasks();
       evaluateLifecycle();
       return;
@@ -534,6 +564,10 @@ export function createClaudeSessionRunner({
       if (known) {
         known.description = String(sdkMessage.description || '').trim() || known.description;
         known.taskType = String(sdkMessage.task_type || '').trim() || known.taskType;
+        // The task's spawning tool_use id is the same identity the subagent
+        // bubbles key on — recorded so the panel and the bubbles can be
+        // correlated (and a targeted stop can find its task).
+        known.toolUseId = String(sdkMessage.tool_use_id || '').trim() || known.toolUseId || '';
         publishBackgroundTasks({ throttled: true });
       }
       return;
@@ -544,6 +578,7 @@ export function createClaudeSessionRunner({
       if (known) {
         known.summary = String(sdkMessage.summary || '').trim() || known.summary;
         known.lastToolName = String(sdkMessage.last_tool_name || '').trim() || known.lastToolName;
+        known.toolUseId = String(sdkMessage.tool_use_id || '').trim() || known.toolUseId || '';
         const totalTokens = Number(sdkMessage.usage?.total_tokens);
         if (Number.isFinite(totalTokens)) known.totalTokens = totalTokens;
         publishBackgroundTasks({ throttled: true });
@@ -553,8 +588,12 @@ export function createClaudeSessionRunner({
     if (subtype === 'task_notification') {
       const taskId = String(sdkMessage.task_id || '').trim();
       // A settled session-level task means the CLI is about to dequeue a
-      // continuation turn — the process must not idle out under it.
-      if (taskId && proc.knownTasks.has(taskId)) proc.notificationPendingAt = Date.now();
+      // continuation turn — the process must not idle out under it. The SDK
+      // flags silent notifications explicitly: skip_transcript means no
+      // continuation is coming, so nothing should pin the process for one.
+      if (taskId && proc.knownTasks.has(taskId) && sdkMessage.skip_transcript !== true) {
+        proc.notificationPendingAt = Date.now();
+      }
       if (!proc.activeCtx) {
         const status = String(sdkMessage.status || '').trim() || 'unknown';
         const summary = String(sdkMessage.summary || '').trim();
@@ -612,6 +651,15 @@ export function createClaudeSessionRunner({
         if (timeoutMs > 0 && now - proc.heldForTasksSince >= timeoutMs) {
           expireBackgroundTasks(timeoutMs).catch(() => {});
         }
+        // Hard backstop: stopTask only *requests* the stops. If the CLI
+        // still reports the tasks live well past the expiry, drop them from
+        // the local set so the hold releases and the normal idle wind-down
+        // (endInput → CLI exit) enforces the timeout for real.
+        if (proc.tasksExpired && proc.tasksExpiredAt && now - proc.tasksExpiredAt >= 60_000) {
+          dbg('background tasks still live after expiry; forcing the hold release', [...proc.liveTasks.keys()].join(','));
+          proc.liveTasks = new Map();
+          publishBackgroundTasks();
+        }
       } else {
         proc.heldForTasksSince = 0;
       }
@@ -627,6 +675,7 @@ export function createClaudeSessionRunner({
   async function expireBackgroundTasks(timeoutMs) {
     if (!proc || proc.tasksExpired) return;
     proc.tasksExpired = true;
+    proc.tasksExpiredAt = Date.now();
     dbg('background task timeout reached', `${Math.round(timeoutMs / 60000)}min`, [...proc.liveTasks.keys()].join(','));
     for (const taskId of proc.liveTasks.keys()) {
       // Each stop emits a task_notification (status 'stopped') — the CLI's own
@@ -718,6 +767,7 @@ export function createClaudeSessionRunner({
       permissionMode: permissionModeForRelayMode(relayMode),
       liveTasks: new Map(),
       knownTasks: new Set(),
+      initModel: '',
       notificationPendingAt: 0,
       pendingActivities: [],
       activeCtx: null,
@@ -727,6 +777,7 @@ export function createClaudeSessionRunner({
       lastEventAt: Date.now(),
       heldForTasksSince: 0,
       tasksExpired: false,
+      tasksExpiredAt: 0,
       aborted: false,
       closing: false,
       lifecycleTimer: null,
@@ -850,14 +901,18 @@ export function createClaudeSessionRunner({
       });
       proc.permissionMode = permissionMode;
     }
-    if (model && model !== proc.model) {
-      await Promise.resolve(proc.turn.setModel?.(model)).catch((error) => {
+    // A falsy model/effort is a real setting too: switching the composer back
+    // to `auto` (model '') or effort `none` must reset the live process to the
+    // SDK default — setModel(undefined) and effortLevel null exist for exactly
+    // that. The old truthiness gate left the previous pin in place forever.
+    if (model !== proc.model) {
+      await Promise.resolve(proc.turn.setModel?.(model || undefined)).catch((error) => {
         dbg('setModel failed', error?.message || String(error));
       });
       proc.model = model;
     }
-    if (effort && effort !== proc.effort) {
-      await Promise.resolve(proc.turn.applyFlagSettings?.({ effortLevel: effort })).catch((error) => {
+    if (effort !== proc.effort) {
+      await Promise.resolve(proc.turn.applyFlagSettings?.({ effortLevel: effort || null })).catch((error) => {
         dbg('applyFlagSettings effort failed', error?.message || String(error));
       });
       proc.effort = effort;
