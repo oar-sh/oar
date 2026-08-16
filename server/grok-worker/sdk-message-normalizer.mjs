@@ -162,7 +162,14 @@ export function createSdkMessageNormalizer() {
     if (kind === 'tool_call' || kind === 'tool_call_update') {
       const toolCallId = String(update.toolCallId || update.tool_call_id || update.id || '').trim();
       const title = String(update.title || '').trim();
-      const toolName = String(update.kind || update.name || update.toolName || title || 'tool').trim() || 'tool';
+      // ACP's `kind` on a tool_call is the tool CATEGORY (read/edit/execute/
+      // think/…), not the tool's name — using it as the name produced labels
+      // like "Tool (execute)" and made subagent detection unreachable (a
+      // category is never 'task'/'agent'). Name fields win, then the title,
+      // with the category as the last-resort label.
+      const toolCategory = String(update.kind || '').trim();
+      const explicitToolName = String(update.name || update.toolName || '').trim();
+      const toolName = explicitToolName || title || toolCategory || 'tool';
       const status = String(update.status || (kind === 'tool_call' ? 'pending' : '')).trim().toLowerCase();
       const frameKey = `${toolCallId}\u0000${status || kind}`;
       if (toolCallId && seenToolFrames.has(frameKey)) return actions;
@@ -180,7 +187,11 @@ export function createSdkMessageNormalizer() {
         });
       }
 
-      if (isSubagentToolName(toolName) && toolCallId) {
+      // Subagent lifecycle keys on the explicit tool name when present, and
+      // otherwise on a task/agent-shaped title — the category can never match.
+      const subagentLike = isSubagentToolName(explicitToolName)
+        || (!explicitToolName && /^(task|agent|subagent)\b/i.test(title));
+      if (subagentLike && toolCallId) {
         const displayName = title || toolName;
         if (status === 'pending' || status === 'in_progress' || status === 'running' || kind === 'tool_call') {
           if (!knownSubagentRuns.has(toolCallId)) {

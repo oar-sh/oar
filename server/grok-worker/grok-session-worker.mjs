@@ -95,6 +95,10 @@ async function main() {
     getPid: () => process.pid,
     onDeliver: async (pending, reason) => {
       dbg('queue.deliver received', `reason=${reason}`, `msgId=${pending?.message?.id || 'none'}`);
+      const deliveredCeiling = Number(pending?.settings?.turnCeilingMs);
+      if (Number.isFinite(deliveredCeiling) && deliveredCeiling >= 0) {
+        turnRunner.setTurnCeilingMs?.(deliveredCeiling);
+      }
       try {
         return await turnRunner.handlePendingPayload(pending);
       } catch (error) {

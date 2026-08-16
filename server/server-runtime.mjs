@@ -6882,6 +6882,10 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     // delivery without a restart.
     settings: {
       backgroundTaskTimeoutMs: backgroundTaskTimeoutMinutesToMs(getBackgroundTaskTimeoutMinutes()),
+      // The user's max-turn-duration ceiling (0 = no limit): worker-local
+      // watchdogs (Grok's prompt ceiling) must honor it rather than imposing
+      // their own cap on a turn the user asked to leave unbounded.
+      turnCeilingMs: turnCeilingMinutesToMs(getTurnCeilingMinutes()),
     },
     routing: {
       enabled: true,

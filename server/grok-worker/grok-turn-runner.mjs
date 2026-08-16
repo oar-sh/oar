@@ -6,6 +6,7 @@ import {
 import { buildGrokContextUsage, resolveGrokContextWindow } from './grok-context-usage.mjs';
 import { extractGrokUsageFromPromptResult, normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
+import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 
 const PLAN_BOARD_ACTIONS = [
   { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
@@ -103,6 +104,10 @@ export function createGrokTurnRunner({
   let waitingForTurn = false;
   let currentAbortController = null;
   let lastNudgedRelayMode = '';
+  // The user's max-turn-duration ceiling (0 = no limit), piggybacked on queue
+  // deliveries; null means no delivery has told us yet and the ACP defaults
+  // apply.
+  let turnCeilingMs = null;
 
   function getActiveQueueMessageId() {
     return waitingForTurn ? String(activeMessage?.id || '') : '';
@@ -148,6 +153,11 @@ export function createGrokTurnRunner({
     });
     if (agentHandle.sessionId) {
       await persistNativeSessionId(message, agentHandle.sessionId);
+    }
+    // A silent fresh start after a failed session/load looks like the
+    // conversation lost its memory for no reason — say so in the transcript.
+    if (agentHandle.resumeFailed && message?.id) {
+      await postActivity(message, 'System note: the previous Grok session could not be restored; this turn starts a fresh agent session without the earlier context.');
     }
     return agentHandle;
   }
@@ -333,6 +343,7 @@ export function createGrokTurnRunner({
 
     try {
       let busyRetries = 0;
+      let actionsDispatched = false;
       while (true) {
         try {
           turn = startGrokTurnImpl({
@@ -340,18 +351,28 @@ export function createGrokTurnRunner({
             text: promptText,
             reasoningEffort: message.reasoningEffort || '',
             abortSignal: abortController.signal,
+            // The user's max-turn-duration setting overrides the worker-local
+            // absolute cap: "No limit" (0) must not be silently trimmed to
+            // the 30-minute default. The inactivity watchdog stays — it
+            // detects a dead transport, not a long turn.
+            watchdog: turnCeilingMs !== null
+              ? { maxTurnMs: turnCeilingMs > 0 ? turnCeilingMs : 0 }
+              : null,
             dbg,
           });
           for await (const action of turn) {
+            actionsDispatched = true;
             await dispatchAction(message, action, state);
           }
           lastNudgedRelayMode = pendingNudgedRelayMode;
           break;
         } catch (error) {
           // A stale agent whose previous prompt never settled reports busy;
-          // one close-and-resume usually clears it. A second busy is terminal
-          // (classified grok.agent_busy upstream).
-          if (busyRetries === 0 && classifyErrorImpl(error).isBusy) {
+          // one close-and-resume usually clears it — but only before anything
+          // streamed: replaying the whole prompt over already-dispatched
+          // frames would duplicate text the user has seen. A busy after
+          // dispatch (or a second busy) is terminal.
+          if (busyRetries === 0 && !actionsDispatched && classifyErrorImpl(error).isBusy) {
             busyRetries += 1;
             dbg('grok agent busy, recreating handle for one retry');
             await dispose();
@@ -376,9 +397,11 @@ export function createGrokTurnRunner({
     } finally {
       controlPoller?.stop?.(controlState);
       // Publish on every exit path that may have captured usage (including
-      // abort after a partial result) without delaying the reply path below.
-      await publishContextUsage(message, state, model);
-      await publishPlanUsage(message, state);
+      // abort after a partial result). Fire-and-forget: advisory data must
+      // not gate the reply below — the comment used to claim this while the
+      // awaits made it false.
+      void publishContextUsage(message, state, model).catch(() => {});
+      void publishPlanUsage(message, state).catch(() => {});
     }
 
     if (aborted) {
@@ -428,12 +451,13 @@ export function createGrokTurnRunner({
         planBoardPosted = true;
       }
     }
-    if (!finalText) {
-      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
-      return true;
-    }
-    await publishFinalStream(message, finalText);
-    await publishResponse(message, { text: finalText, model: responseModel });
+    // A terminal, non-error result carrying no prose is a COMPLETED turn, not
+    // a failed delivery: requeueing re-billed a deterministically-empty turn
+    // on every retry until the cap failed it (Claude/Cursor parity via the
+    // shared note).
+    const publishedText = finalText || EMPTY_TURN_COMPLETION_NOTE;
+    await publishFinalStream(message, publishedText);
+    await publishResponse(message, { text: publishedText, model: responseModel });
     return true;
   }
 
@@ -478,5 +502,9 @@ export function createGrokTurnRunner({
     getActiveQueueMessageId,
     isTurnActive,
     dispose,
+    setTurnCeilingMs(value) {
+      const ms = Number(value);
+      turnCeilingMs = Number.isFinite(ms) && ms >= 0 ? ms : null;
+    },
   };
 }

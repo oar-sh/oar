@@ -15,6 +15,9 @@ import fs from 'node:fs/promises';
 
 const DEFAULT_OUTPUT_BYTE_LIMIT = 1024 * 1024;
 const MAX_OUTPUT_BYTE_LIMIT = 8 * 1024 * 1024;
+// How long a running terminal's silence still counts as "the agent is
+// waiting on us" for the prompt watchdog. See hasPendingWork.
+const TERMINAL_ACTIVITY_WINDOW_MS = 5 * 60_000;
 
 function envArrayToObject(env) {
   const out = {};
@@ -75,6 +78,7 @@ export function createAcpHostServices({
 
   function appendOutput(entry, chunk) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+    entry.lastActivityAt = Date.now();
     entry.chunks.push(buf);
     entry.byteLength += buf.length;
     // ACP truncates from the start of the output: the most recent bytes win.
@@ -130,6 +134,7 @@ export function createAcpHostServices({
       outputByteLimit,
       exitStatus: null,
       exitWaiters: [],
+      lastActivityAt: Date.now(),
     };
     proc.stdout?.on('data', (chunk) => appendOutput(entry, chunk));
     proc.stderr?.on('data', (chunk) => appendOutput(entry, chunk));
@@ -227,13 +232,19 @@ export function createAcpHostServices({
   };
 
   function attach(client) {
+    // wait_for_exit is a passive park, not active servicing: counting it as
+    // inflight would defer the stall watchdog forever for a process that
+    // never exits. Its pending-ness is represented by the unfinished
+    // terminal entry below instead.
+    const passiveWaits = new Set(['terminal/wait_for_exit']);
     for (const [method, handler] of Object.entries(handlers)) {
+      const passive = passiveWaits.has(method);
       client.setRequestHandler(method, async (params) => {
-        inflightRequests += 1;
+        if (!passive) inflightRequests += 1;
         try {
           return await handler(params);
         } finally {
-          inflightRequests -= 1;
+          if (!passive) inflightRequests -= 1;
         }
       });
     }
@@ -241,13 +252,17 @@ export function createAcpHostServices({
 
   /**
    * True while the agent is legitimately waiting on us: a handler request is
-   * being serviced (including a pending wait_for_exit) or a terminal process
-   * is still running. The prompt watchdog must not count this as a stall.
+   * being serviced, or a terminal process is running AND recently active. A
+   * long-quiet background command (a dev server, a hung build) stops
+   * deferring the stall watchdog after the activity window — otherwise one
+   * `npm run dev` made every turn immune to stall detection forever.
    */
   function hasPendingWork() {
     if (inflightRequests > 0) return true;
+    const now = Date.now();
     for (const entry of terminals.values()) {
-      if (!entry.exitStatus) return true;
+      if (entry.exitStatus) continue;
+      if (now - entry.lastActivityAt <= TERMINAL_ACTIVITY_WINDOW_MS) return true;
     }
     return false;
   }

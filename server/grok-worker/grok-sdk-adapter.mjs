@@ -2,7 +2,7 @@
  * Thin adapter around the Grok CLI ACP surface. One long-lived agent process
  * per worker; sessions are created/loaded and prompts streamed via AcpClient.
  */
-import { AcpClient, extractGrokModelsFromInitialize } from './acp-client.mjs';
+import { AcpClient, extractGrokModelsFromInitialize, pickAllowOnceOptionId } from './acp-client.mjs';
 import { createAcpHostServices } from './acp-host-services.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
 
@@ -105,13 +105,27 @@ export async function createGrokAgentHandle({
   const discovered = extractGrokModelsFromInitialize(client.initializeResult);
 
   let sessionId = '';
+  let resumeFailed = false;
   const resumeId = String(nativeSessionId || '').trim();
   if (resumeId) {
-    try {
-      const loaded = await client.sessionLoad(resumeId, cwd);
-      sessionId = String(loaded?.sessionId || loaded?.session_id || resumeId).trim();
-    } catch (error) {
-      dbg('grok session/load failed, creating new session', error?.message || String(error));
+    // Attempting session/load against an agent that never advertised the
+    // capability is a guaranteed failure; either way a fresh session is a
+    // silent history loss the caller must be able to surface.
+    const capabilities = client.initializeResult?.agentCapabilities
+      || client.initializeResult?.capabilities
+      || {};
+    const supportsLoad = capabilities.loadSession === true || capabilities.load_session === true;
+    if (!supportsLoad) {
+      resumeFailed = true;
+      dbg('grok agent does not advertise loadSession; starting fresh');
+    } else {
+      try {
+        const loaded = await client.sessionLoad(resumeId, cwd);
+        sessionId = String(loaded?.sessionId || loaded?.session_id || resumeId).trim();
+      } catch (error) {
+        resumeFailed = true;
+        dbg('grok session/load failed, creating new session', error?.message || String(error));
+      }
     }
   }
   if (!sessionId) {
@@ -136,6 +150,7 @@ export async function createGrokAgentHandle({
     model: String(model || discovered.defaultModel || '').trim(),
     discovered,
     hostServices,
+    resumeFailed,
     async close() {
       hostServices.disposeAll();
       await client.dispose();
@@ -203,22 +218,9 @@ export function startGrokTurn({
   }
 
   const onPermission = (msg) => {
-    const options = Array.isArray(msg?.params?.options) ? msg.params.options : [];
     // Prefer a one-shot allow: a blanket "allow always" would grant more than
     // the relay's per-request approval parity intends.
-    const allowOnce = options.find((opt) => {
-      const id = String(opt?.optionId || opt?.id || '').toLowerCase();
-      return id.includes('allow') && !id.includes('always') && !id.includes('reject') && !id.includes('deny');
-    });
-    const allowAny = options.find((opt) => {
-      const id = String(opt?.optionId || opt?.id || '').toLowerCase();
-      return id.includes('allow');
-    });
-    const optionId = String(
-      allowOnce?.optionId || allowOnce?.id
-      || allowAny?.optionId || allowAny?.id
-      || 'allow-once',
-    );
+    const optionId = pickAllowOnceOptionId(msg?.params?.options);
     try {
       handle.client.respond(msg.id, {
         outcome: { outcome: 'selected', optionId },

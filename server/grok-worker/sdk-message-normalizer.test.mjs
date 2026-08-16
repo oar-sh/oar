@@ -71,8 +71,48 @@ test('normalizeAcpUpdate maps tool_call to activity lines', () => {
   });
   assert.ok(actions.some((a) => a.channel === 'activity'));
   const activity = actions.find((a) => a.channel === 'activity');
-  assert.match(activity.payload.text, /Tool \(read\)/);
+  // The ACP `kind` is the tool CATEGORY, not the name — the human-readable
+  // title labels the line, with the category only as a last resort.
+  assert.match(activity.payload.text, /Tool \(Read file\)/);
   assert.match(activity.payload.text, /README\.md/);
+
+  const categoryOnly = createSdkMessageNormalizer().normalizeAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'tc-2',
+    kind: 'execute',
+    status: 'pending',
+    rawInput: { command: 'npm test' },
+  });
+  assert.match(
+    categoryOnly.find((a) => a.channel === 'activity').payload.text,
+    /Tool \(execute\)/,
+    'the category still labels frames that carry no name or title',
+  );
+});
+
+test('a task-shaped tool call opens a subagent run (the category never matches)', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const opened = normalizer.normalizeAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'tc-task-1',
+    title: 'Task: research the failing suite',
+    kind: 'other',
+    status: 'in_progress',
+  });
+  const running = opened.find((a) => a.channel === 'subagent');
+  assert.ok(running, 'a Task-titled tool call must open a subagent run');
+  assert.equal(running.payload.status, 'running');
+  assert.equal(running.payload.subagentRunId, 'tc-task-1');
+
+  const closed = normalizer.normalizeAcpUpdate({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'tc-task-1',
+    title: 'Task: research the failing suite',
+    kind: 'other',
+    status: 'completed',
+  });
+  const terminal = closed.find((a) => a.channel === 'subagent');
+  assert.equal(terminal.payload.status, 'completed');
 });
 
 test('formatToolActivityText and classifyGrokError are pure helpers', () => {

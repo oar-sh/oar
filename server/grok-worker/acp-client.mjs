@@ -18,6 +18,27 @@ function whichCommand(command = 'grok') {
 export const ACP_PROMPT_INACTIVITY_MS = 120_000;
 export const ACP_PROMPT_MAX_TURN_MS = 1_800_000;
 
+/**
+ * Pick the one-shot allow option from an ACP permission request. A blanket
+ * "allow always" would grant more than the relay's per-request approval
+ * parity intends; a missing/unrecognizable option list falls back to the
+ * conventional id.
+ */
+export function pickAllowOnceOptionId(rawOptions) {
+  const options = Array.isArray(rawOptions) ? rawOptions : [];
+  const idOf = (opt) => String(opt?.optionId || opt?.id || '').toLowerCase();
+  const allowOnce = options.find((opt) => {
+    const id = idOf(opt);
+    return id.includes('allow') && !id.includes('always') && !id.includes('reject') && !id.includes('deny');
+  });
+  const allowAny = options.find((opt) => idOf(opt).includes('allow'));
+  return String(
+    allowOnce?.optionId || allowOnce?.id
+    || allowAny?.optionId || allowAny?.id
+    || 'allow-once',
+  );
+}
+
 export class AcpClient extends EventEmitter {
   /**
    * @param {object} opts
@@ -132,9 +153,22 @@ export class AcpClient extends EventEmitter {
 
     if (msg.method) {
       this.emit('notification', msg);
-      this.emit(msg.method, msg);
+      // Method-named convenience events — except 'error', which EventEmitter
+      // treats specially: an agent sending {"method":"error"} would otherwise
+      // throw ERR_UNHANDLED_ERROR and kill the worker.
+      if (msg.method !== 'error') this.emit(msg.method, msg);
       if (msg.id == null) return;
       if (msg.method === 'session/request_permission') {
+        // The turn runner attaches its listener only while a prompt is in
+        // flight. A permission request arriving outside that window (a
+        // session/load replay, a request racing prompt settlement) must still
+        // get a reply — an unanswered agent→client request deadlocks the
+        // agent, the exact failure the -32601 fallback below exists for.
+        if (this.listenerCount('permission') === 0) {
+          const optionId = pickAllowOnceOptionId(msg?.params?.options);
+          this.respond(msg.id, { outcome: { outcome: 'selected', optionId } });
+          return;
+        }
         this.emit('permission', msg);
         return;
       }
@@ -168,21 +202,25 @@ export class AcpClient extends EventEmitter {
     const id = this.nextId++;
     const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params });
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`ACP request timeout: ${method}`));
-      }, timeoutMs);
+      // timeoutMs <= 0 = no request-level timeout (an unlimited-ceiling
+      // prompt); the caller's watchdog owns liveness in that case.
+      const timer = Number(timeoutMs) > 0
+        ? setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error(`ACP request timeout: ${method}`));
+        }, timeoutMs)
+        : null;
       // A pending request must not keep the process alive on its own — an
       // abandoned prompt (watchdog raced past it) would otherwise pin the
       // event loop for the full timeout.
-      if (typeof timer.unref === 'function') timer.unref();
+      if (timer && typeof timer.unref === 'function') timer.unref();
       this.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           resolve(v);
         },
         reject: (e) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           reject(e);
         },
       });
@@ -274,8 +312,12 @@ export class AcpClient extends EventEmitter {
     const inactivityMs = Number(watchdog?.inactivityMs) > 0
       ? Number(watchdog.inactivityMs)
       : ACP_PROMPT_INACTIVITY_MS;
-    const maxTurnMs = Number(watchdog?.maxTurnMs) > 0
-      ? Number(watchdog.maxTurnMs)
+    // An explicit 0 means NO absolute ceiling (the user's "No limit"
+    // setting); only an absent/invalid value falls back to the default. The
+    // inactivity watchdog still catches dead transports either way.
+    const rawMaxTurnMs = Number(watchdog?.maxTurnMs);
+    const maxTurnMs = Number.isFinite(rawMaxTurnMs) && rawMaxTurnMs >= 0
+      ? rawMaxTurnMs
       : ACP_PROMPT_MAX_TURN_MS;
     const hasPendingWork = typeof watchdog?.hasPendingWork === 'function'
       ? watchdog.hasPendingWork
@@ -292,7 +334,7 @@ export class AcpClient extends EventEmitter {
       const pollMs = Math.max(250, Math.min(5000, Math.floor(inactivityMs / 4)));
       watchdogTimer = setInterval(() => {
         const now = Date.now();
-        if (now - startedAt >= maxTurnMs) {
+        if (maxTurnMs > 0 && now - startedAt >= maxTurnMs) {
           try { this.sessionCancel(sessionId); } catch { /* ignore */ }
           reject(new Error(`grok turn exceeded the ${Math.round(maxTurnMs / 60000)}-minute turn ceiling`));
           return;
@@ -310,7 +352,11 @@ export class AcpClient extends EventEmitter {
       // become an unhandled rejection. The raw request timeout sits above
       // the ceiling; the watchdog is the real limiter.
       return await Promise.race([
-        this.request('session/prompt', { sessionId, prompt, ...extra }, maxTurnMs + 60_000),
+        this.request(
+          'session/prompt',
+          { sessionId, prompt, ...extra },
+          maxTurnMs > 0 ? maxTurnMs + 60_000 : 0,
+        ),
         stallPromise,
       ]);
     } finally {

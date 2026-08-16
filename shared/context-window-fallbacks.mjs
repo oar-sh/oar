@@ -41,6 +41,10 @@ export const MODEL_FALLBACK_LIMITS = Object.freeze({
   // Conservative published defaults; a provider-advertised window always wins.
   'grok-4.5': 256000,
   'composer-2.5': 200000,
+  // xAI models the Grok CLI serves when ACP discovery reports no window
+  // (public xAI docs values); also reachable through the Cursor catalog.
+  'grok-4': 256000,
+  'grok-code-fast-1': 256000,
 });
 
 /**

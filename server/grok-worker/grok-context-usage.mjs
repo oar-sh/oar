@@ -1,3 +1,4 @@
+import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
 /**
  * Maps a normalized Grok turn usage blob (per-prompt `_meta` tokens from
  * `normalizeGrokTurnUsage`) onto the payload shape the relay already persists
@@ -7,22 +8,16 @@
  * ACP reports no per-category breakdown, so `categories` is always empty.
  */
 
-// Best-effort fallbacks when ACP model discovery reports no window size.
-// Values from the public xAI model docs; unknown models get no fill metric
-// (token totals only, like Cursor's partial state).
-const GROK_MODEL_CONTEXT_WINDOWS = {
-  'grok-4.5': 256_000,
-  'grok-4': 256_000,
-  'grok-code-fast-1': 256_000,
-};
-
+// Best-effort fallbacks when ACP model discovery reports no window size come
+// from the shared static table (shared/context-window-fallbacks.mjs), which
+// exists precisely so per-provider copies cannot drift. Unknown models get no
+// fill metric (token totals only, like Cursor's partial state).
 export function resolveGrokContextWindow(model = '', contextWindowsByModel = {}) {
   const key = String(model || '').trim().toLowerCase();
   if (!key) return null;
   const discovered = Number(contextWindowsByModel?.[key]);
   if (Number.isFinite(discovered) && discovered > 0) return Math.round(discovered);
-  const known = GROK_MODEL_CONTEXT_WINDOWS[key];
-  return typeof known === 'number' ? known : null;
+  return resolveFallbackContextLimitTokens(key);
 }
 
 function tokenCount(value) {
