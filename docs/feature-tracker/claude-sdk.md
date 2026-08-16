@@ -1,6 +1,6 @@
 # Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`)
 
-Updated: 2026-08-12 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
+Updated: 2026-08-16 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
 provider-agnostic relay rows live there.
 
 Everything below lives in `server/claude-worker/` unless noted. The SDK has exactly two import
@@ -26,7 +26,7 @@ Authentication uses the relay host's logged-in Claude credentials; the relay sto
 | `options.cwd` | Implemented | Set from `COPILOT_WORKSPACE_ROOT` (`claude-session-worker.mjs`). |
 | `options.pathToClaudeCodeExecutable` | Implemented | Set from `CLAUDE_CODE_EXECUTABLE` when provided. |
 | `options.maxTurns` | Not implemented | Turn length is bounded by the relay's own inactivity window (`DEFAULT_PROCESSING_TIMEOUT_MS`, explicitly not a cap on turn length) and the max-turn-duration ceiling (`shared/turn-ceiling.mjs`, applied in `recoverStaleMessages`) instead. |
-| Image content blocks | Implemented | Images ≤ 5 MB are inlined as base64 (oversized or unreadable images fall back to a data URL, then a path note); non-image files become absolute path references for the `Read` tool (`claude-attachments.mjs`). |
+| Image content blocks | Implemented | Only the media types the Anthropic image block accepts (jpeg/png/gif/webp) inline, ≤ 5 MB on BOTH the file-read and data-URL paths (the fallback used to bypass the cap); everything else — oversized, exotic type, unresolvable — becomes a visible path/failure note; non-image files become absolute path references for the `Read` tool (`claude-attachments.mjs`). |
 
 ## Control requests + tools
 
@@ -39,7 +39,7 @@ Authentication uses the relay host's logged-in Claude credentials; the relay sto
 | `query.getContextUsage()` | Implemented | Read from inside the message loop while the transport is still open (10 s timeout), normalized by `server/services/claude-context-usage.mjs` (`buildClaudeContextSnapshot`, context window from `modelUsage[model].contextWindow`), and posted to the relay on every exit path (`claude-sdk-adapter.mjs` → `readContextUsage`, `claude-turn-publisher.mjs` → `publishContextUsage`). |
 | `query.setMaxThinkingTokens()` | Partial | Called only as `(null, 'summarized')` to make existing thinking *visible* without enabling it or changing a budget. Deprecated and best-effort; failures are logged and ignored (`claude-sdk-adapter.mjs` → `requestSummarizedThinkingDisplay`). |
 | `query.close()` | Implemented | Tears down the discovery query in a `finally`, after releasing the input gate (`server/server-runtime.mjs`). |
-| Targeted subagent cancellation | Not implemented (SDK gap) | No per-subagent cancellation primitive; `abort_subagent` control requests are answered with an explicit "not supported" result and full-turn Stop remains available (`control-poller.mjs`). |
+| Targeted subagent cancellation | Implemented for backgrounded subagents (2026-08-16) | `task_started`/`task_progress` report the spawning `tool_use_id` — the same identity the relay uses as `subagentRunId` — so `abort_subagent` maps to `query.stopTask()` when the run is a live background task (`claude-session-process.mjs` → `stopBackgroundTaskByToolUseId`, wired via `control-poller.mjs` `onAbortSubagent`). In-turn subagents still answer "not supported" (whole-turn Stop only). |
 | `query.interrupt()` | Implemented | The relay Stop control interrupts the current turn instead of killing the persistent process, so background tasks survive a Stop; a failed interrupt falls back to aborting the process (`claude-session-process.mjs` → `interruptActiveTurn`). |
 | `query.setModel()` / `setPermissionMode()` / `applyFlagSettings({effortLevel})` | Implemented | Per-turn model, relay-mode permission mode, and reasoning effort are applied to the live process as diffs before each pushed message. A relay-mode change that would alter the spawn-time system prompt append recycles the process — but only when nothing (task/turn/question) lives in it (`claude-session-process.mjs` → `adaptProcess`). |
 | `query.stopTask()` | Implemented | Backs the composer panel's per-task Stop button (`worker.control` websocket push → `stopBackgroundTask`) and the background-task timeout expiry (`claude-session-process.mjs`). |
@@ -53,7 +53,7 @@ this lives in `sdk-message-normalizer.mjs`.
 | -------------- | ------ | ---------------- |
 | `stream_event` partial messages | Implemented | `normalizeStreamEvent` handles `message_start`, `content_block_start`, `text_delta`, `thinking_delta`, `content_block_stop`; emission is gated (`shouldEmitStreamUpdate`: ≥24-char delta or sentence-ending punctuation) to mirror the Copilot publisher. |
 | Stable reasoning ids across partials | Implemented | Ids of the form `claude-{thought\|narration}-{thread}-{msgIndex}-{blockIndex}` are kept stable between partial frames and the complete `assistant` message (`beginAssistantMessage` reconciliation), so the server upserts thoughts instead of duplicating them. |
-| Narration demotion | Implemented | Assistant `text` blocks that share a message with a `tool_use` are demoted to narration thoughts, never answer text; `redacted_thinking` is handled alongside `thinking`; thoughts are capped at 16 KiB (`MAX_THOUGHT_CHARS`). |
+| Narration demotion | Implemented (rebuilt 2026-08-16 for per-block delivery) | The SDK delivers one complete assistant event per content block (same `message.id`), so tool-bearing is tracked per message: text buffered until a sibling `tool_use` proves it narration, answer text never doubles as a thought, the live stream accumulator resets at each message boundary, and `redacted_thinking` surfaces as a placeholder; thoughts are capped at 16 KiB (`MAX_THOUGHT_CHARS`). |
 | Subagent lifecycle inference | Implemented | Tool names in `SUBAGENT_TOOL_NAMES` (`task`/`agent`) open a `running` subagent run keyed by `tool_use.id`; the matching `tool_result` closes it `completed`/`failed`. Purely derived from tool blocks — not an SDK lifecycle API. |
 | Tool-failure surfacing | Implemented | `tool_result.is_error` becomes a truncated "Tool failed: …" activity line. |
 | `system` / `compact_boundary` | Implemented | Host-driven auto-compaction is surfaced as a "Context compacted (Xk → Yk tokens)" activity from `compact_metadata.pre_tokens` / `post_tokens`. The relay never *triggers* compaction (see the README's `/compact` row). |

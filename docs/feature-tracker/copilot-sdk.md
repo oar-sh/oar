@@ -1,6 +1,6 @@
 # Copilot SDK (`@github/copilot-sdk`)
 
-Updated: 2026-08-02 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
+Updated: 2026-08-16 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
 provider-agnostic relay rows live there.
 
 Two integration paths consume this SDK:
@@ -66,7 +66,7 @@ Two integration paths consume this SDK:
 
 | SDK feature | Status | Notes / evidence |
 | ----------- | ------ | ---------------- |
-| Model switch per turn | Implemented | Relay switches the requested model per message via `setModelForMessage`; the underlying call is the `session.rpc.model.switchTo({ modelId, contextTier })` RPC (`.github/extensions/web-relay/model-api/model-switching.mjs`, `server/relay.mjs` → `setModelForMessage`). |
+| Model switch per turn | Implemented | Extension path via the `session.rpc.model.switchTo({ modelId, contextTier })` RPC (`model-api/model-switching.mjs`); the standalone relay calls its own `setModelForMessage` in `processNext` since 2026-08-16 — the helper existed but had no caller, so cached sessions silently kept their creation model. |
 | Runtime model discovery | Implemented | Extension calls the `models.list` RPC over `session.connection.sendRequest` and publishes a snapshot to `POST /api/models/snapshot`, including on the error path (`.github/extensions/web-relay/model-api/model-switching.mjs`). |
 | `session.setModel()` helper | Not implemented | The implementation uses `session.rpc.model.switchTo(...)` rather than `session.setModel(...)`. |
 | `client.listModels()` | Partial | Available and used by the standalone relay path only (`server/relay.mjs`); the extension path prefers the `models.list` RPC. |

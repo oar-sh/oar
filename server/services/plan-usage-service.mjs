@@ -451,9 +451,11 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
         capturedAt: grokSnapshot?.capturedAt || grokCycle.capturedAt || null,
         configured: true,
         message: grokSnapshot?.error || null,
-        // A snapshot row is the worker-reported last turn, not a cached copy
-        // of some fresher source — there is no independent staleness signal.
-        stale: false,
+        // Same semantics as the Claude card: a stored snapshot is by
+        // definition from an earlier turn (the relay never opens a billable
+        // turn just to refresh it), so the two identical data shapes carry
+        // the same staleness flag.
+        stale: !!grokSnapshot?.payload,
       }));
     }
 

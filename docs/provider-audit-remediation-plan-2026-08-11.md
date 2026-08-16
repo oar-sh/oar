@@ -4,7 +4,17 @@ Audit trigger: Cursor session `66e4feaa-8e91-4cdc-8d8b-abd261bb6523` ("sca imple
 repeatedly dropping from `processing` back to `pending`; suspected provider crossover to
 Copilot; Cursor sub-agents appearing in the conversation list.
 
-Status: **Phase 1 implemented 2026-08-11 (signed off by Simon); Phases 2–4 pending.**
+Status: **Phase 1 implemented 2026-08-11 (signed off by Simon); Phases 2–4 implemented
+2026-08-16 as part of the merge-readiness review wave (see the feature-tracker changelog for
+the full delivery list). The four "open follow-ups" below are all closed: (a) route-level
+`/api/response` provenance tests exist (`messages-routes-response-provenance.test.mjs`),
+(b) the terminal-failure path records provenance + runs the mismatch check, (c) the responder's
+conversation binding is compared (`CONVERSATION MISMATCH`), (d) the relay-eligible provider set
+lives in `shared/provider-routing.mjs` and both encodings derive from it. Notable deltas from
+the plan as written: Phase 3.1's "best-effort inference" was superseded — the Cursor SDK's
+`tool-call-delta` carries real per-subagent attribution (live-verified), so the relay uses that
+instead of a heuristic; Phase 2.3's reference points moved from `claude-turn-runner.mjs` (gone)
+to `claude-session-process.mjs`.**
 
 Phase 1 delivery notes:
 - 1.1 `findPendingForLegacyRelay` (message-repository.mjs) + fallback switch in

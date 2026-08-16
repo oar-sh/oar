@@ -1,6 +1,6 @@
 # SDK Feature Tracker
 
-Updated: 2026-08-05
+Updated: 2026-08-16
 Scope: `server/` + `server/claude-worker/` + `.github/extensions/web-relay/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
@@ -25,23 +25,23 @@ Status legend: **Implemented** | **Partial** | **Not implemented**
 The relay-facing contract a provider worker must deliver. This doubles as the implementation
 checklist for a new provider (details per column in the per-SDK files).
 
-| Relay capability | Copilot | Claude | Cursor |
-| ---------------- | ------- | ------ | ------ |
-| Turn execution + live reply streaming | Implemented | Implemented | Implemented (`run.stream()` + `onDelta` merged) |
-| Thought / reasoning streaming | Implemented | Implemented | Implemented (`thinking-delta` / `thinking` events) |
-| Stop (whole turn) | Implemented | Implemented | Implemented (`run.cancel()` + abort-signal race) |
-| Targeted subagent abort | Partial (capability-probed) | Not implemented (SDK gap) | Not implemented (SDK gap) |
-| Question cards (ask user) | Implemented (`onUserInputRequest`) | Implemented (`AskUserQuestion` via `canUseTool`) | Implemented (`ask_user` custom tool; 10/10 live compliance) |
-| Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | n/a |
-| Plan boards (`plan_ready`) | Implemented (tool detection + text fallback) | Implemented (`ExitPlanMode` + text fallback) | Implemented (text fallback only) |
-| Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | Implemented (inferred; lifecycle chips only, no text attribution) |
-| Per-message model switch | Implemented | Implemented | Implemented (re-pinned every send — sticky overrides) |
-| Model discovery / catalog | Implemented | Implemented | Implemented (`Cursor.models.list()`, defensive call-shape) |
-| Reasoning effort per turn | Implemented | Implemented | Not implemented (`['none']`; SDK has no effort option) |
-| Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) |
-| Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) |
-| Context usage display | Not implemented | Implemented | Implemented (window parsed from the model's `context` parameter since 2026-08-09; models without one show totals only) |
-| Auth model | Relay host's CLI login | Relay host's `claude` login | API key via provider settings (secret-env-file delivery) |
+| Relay capability | Copilot | Claude | Cursor | Grok |
+| ---------------- | ------- | ------ | ------ | ---- |
+| Turn execution + live reply streaming | Implemented | Implemented | Implemented (`run.stream()` + `onDelta` merged) | Implemented (ACP `session/update`) |
+| Thought / reasoning streaming | Implemented | Implemented | Implemented (`thinking-delta` / `thinking` events) | Implemented |
+| Stop (whole turn) | Implemented | Implemented | Implemented (`run.cancel()` + abort-signal race) | Implemented (`session/cancel`) |
+| Targeted subagent abort | Partial (capability-probed) | Implemented for backgrounded subagents (`stopTask` via the task↔tool_use_id map, 2026-08-16); in-turn subagents remain whole-turn Stop | Not implemented (SDK gap; button pins "Stop unavailable") | Not implemented (protocol gap) |
+| Question cards (ask user) | Implemented (`onUserInputRequest`) | Implemented (`AskUserQuestion` via `canUseTool`; between-turn background-agent questions ride a continuation turn) | Implemented (`ask_user` custom tool; 10/10 live compliance) | Not implemented — **protocol gap**: ACP has no free-form ask-user surface (only `session/request_permission`, which the relay auto-approves) |
+| Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | n/a | n/a |
+| Plan boards (`plan_ready`) | Implemented (tool detection + text fallback) | Implemented (`ExitPlanMode` + text fallback) | Implemented (text fallback only) | Implemented (text fallback only) |
+| Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | Implemented **with text/thinking attribution** via `tool-call-delta` nested frames (live-verified 2026-08-16) | Implemented (title/name-shaped detection; lifecycle chips) |
+| Per-message model switch | Implemented (both paths since 2026-08-16) | Implemented | Implemented (re-pinned every send — sticky overrides) | Not implemented (locked; 409 + composer pin) |
+| Model discovery / catalog | Implemented | Implemented | Implemented (`Cursor.models.list()`) | Implemented (initialize `_meta.modelState` + CLI fallback) |
+| Reasoning effort per turn | Implemented | Implemented | Implemented (model params; per-model discovery) | Partial (best-effort `_meta`) |
+| Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) | Partial (path notes only) |
+| Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) | Implemented (`session/load`, capability-checked; visible note on fallback) |
+| Context usage display | Implemented (server-derived from `events.jsonl`) | Implemented | Implemented (window from the model's `context` parameter; shared static fallback) | Implemented (`_meta` tokens; shared static fallback) |
+| Auth model | Relay host's CLI login | Relay host's `claude` login | API key via provider settings (secret-env-file delivery; key rotation respawns workers) | Relay host's `grok` login |
 
 ## Relay core (provider-agnostic)
 
@@ -61,6 +61,30 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-08-16: Merge-readiness review wave (all providers). Queue/provenance: terminal failures
+  now record `executed_provider` + run the mismatch check (the original hijack signature exited
+  uninstrumented), keep their thoughts, and reconcile still-running `subagent_runs`; the
+  relay-eligible provider set lives in `shared/provider-routing.mjs` (one edit adds a provider);
+  the relay's provider-mismatch refusal no longer burns a retry; recovery counts against
+  `MAX_REQUEUE_RETRIES`; dead workers are detected in ~30s (socket-close probe + sweep) instead
+  of the 600s stale window; all three node workers install crash guards and tee output to
+  `server/logs/worker-<sid>.log`. Claude: persistent-process wedges fixed (discarded
+  continuations, between-turn chatter, respawn races, control-poller handle scoping), init model
+  backs `auto` responses, narration demotion works under per-block delivery, attachment guards
+  enforced, background-agent questions ride continuation turns, targeted stop for backgrounded
+  subagents via `stopTask`. Cursor: auth retry budget 2 covering thrown errors with ask_user
+  unblocking, busy retry uses `LocalSendOptions.force`, merged-stream drain-before-throw + stall
+  watchdog, context-window lookups timed and negative-cached, store handles closed, **subagent
+  text/thinking attribution via `tool-call-delta`** (live-probed; the documented "no
+  parent-attribution field" was wrong for 1.0.27), plan-usage first-report seeding, key rotation
+  respawns workers. Grok: out-of-turn permission requests answered (deadlock class closed), tool
+  names from title/name instead of the ACP category (subagent detection can fire now), user turn
+  ceiling honored (0 = unlimited), long-quiet terminals stop deferring the stall watchdog,
+  resume failures surface a note, empty turns publish the shared note. Copilot: standalone
+  relay's per-message model switch wired (was dead code), extension publishes the shared
+  empty-turn note. E2E isolation: `features.mjs` honors `COPILOT_WEB_RELAY_CONFIG`, and the
+  test server's HOME points at the temp state root (the import sweep was pulling the host's
+  real sessions into "isolated" runs).
 - 2026-08-12: Rebuilt the Claude worker around one persistent CLI process per conversation (`claude-session-process.mjs`, pushable streaming input) — fixes background tasks being killed seconds after each reply (incident conv `2353a9eb`: the per-turn process + `local_bash` gate exclusion orphaned E2E runs and their "you will be notified" continuations). Background tasks of every type now keep the process alive between turns; task-notification continuations publish as their own relay turns (`POST /api/continuation-turn`, `kind='continuation'` queue rows — never deliverable, torn down instead of requeued; heartbeats now refresh every owned row via `activeQueueMessageIds`). New composer fold shows the live task set (from `POST /api/background-tasks` + `background_tasks` socket event) with per-task Stop (`worker.control` push → `query.stopTask()`); Stop-turn maps to `query.interrupt()` so tasks survive; per-turn model/mode/effort switch live via `setModel`/`setPermissionMode`/`applyFlagSettings`. New "Background task timeout" settings slider (`shared/background-task-timeout.mjs`, default No limit) caps task-only process holds; idle processes exit after 10 min (`CLAUDE_RELAY_IDLE_SHUTDOWN_MS`) and resume on demand.
 - 2026-08-09: Fixed the Cursor context gauge (SDK `models.list()` dropped the window field; it now lives in the `context` parameter values, which `readModelContextWindow` parses from the default variant) and added live Cursor plan-quota bars (Total/Auto/API % + reset date) to Check Usage via the dashboard API. The session cookie resolves automatically from the relay host's Cursor IDE login (`state.vscdb` access token, read in place — never copied; the db can be multi-GB), with a user-pasted `WorkosCursorSessionToken` or `CURSOR_SESSION_TOKEN` env var as the headless-host override (new `cursor-dashboard-usage.mjs` + settings field). Hosts with neither (the Linux relay) now get an explicit card message naming the missing token instead of an empty panel. `agent.getUsage()` is 403 feature-gated for individual accounts, which is why the local spend ledger stayed empty.
 - 2026-08-08: Grok Check Usage now shows the live weekly SuperGrok quota bar with its reset date — fetched from the CLI chat proxy's `/v1/billing?format=credits` using the relay host's own `~/.grok/auth.json` login (`server/services/grok-billing-usage.mjs`), best-effort per request, estimated meters demoted to secondary when live data is present.

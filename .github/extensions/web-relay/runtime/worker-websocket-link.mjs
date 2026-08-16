@@ -297,7 +297,9 @@ export function createWorkerWebSocketLink({
   }
 
   function status() {
-    const connected = !!ws && ws.readyState === ws.OPEN;
+    // Some WebSocket implementations expose OPEN only on the constructor —
+    // the same reason every other check here goes through the resolver.
+    const connected = !!ws && ws.readyState === resolveSocketStateValue(ws, "OPEN", 1);
     return {
       connected,
       delivering: !!deliveryInFlight,

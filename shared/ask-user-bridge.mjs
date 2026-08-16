@@ -12,6 +12,9 @@ function normalizeQuestions(input) {
   return questions
     .map((entry) => ({
       question: String(entry?.question || '').trim(),
+      // The SDK joins answers back by EXACT question text; a model question
+      // with stray whitespace must still match its answer key.
+      rawQuestion: String(entry?.question || ''),
       header: String(entry?.header || '').trim(),
       multiSelect: entry?.multiSelect === true,
       options: (Array.isArray(entry?.options) ? entry.options : [])
@@ -112,6 +115,9 @@ export function createAskUserBridge({
     for (const entry of questions) {
       const result = await askSingleQuestion(entry, { signal });
       answers[entry.question] = result.answer;
+      if (entry.rawQuestion && entry.rawQuestion !== entry.question) {
+        answers[entry.rawQuestion] = result.answer;
+      }
       if (result.timedOut) timedOut = true;
       if (result.aborted) break;
     }
