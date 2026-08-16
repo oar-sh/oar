@@ -902,3 +902,168 @@ test('a failed continuation registration discards the turn without failing the p
   turn.endInput();
   await settled(runner);
 });
+
+// ---------------------------------------------------------------------------
+// Persistent-process hardening (2026-08-16 review)
+
+test('a discarded continuation releases the active slot when its turn ends', async () => {
+  const stub = makeApiStub({ failRoutes: new Set(['/api/continuation-turn']) });
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'watch' }]));
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  // The CLI opens a continuation on its own; every registration attempt fails.
+  turn.emit(taskNotificationMessage('bash-1'));
+  turn.emit(userReplay('<task-notification>bash-1 completed</task-notification>'));
+  turn.emit(assistantText('continuation prose'));
+  await waitFor(() => runner._getProcess()?.activeCtx?.discarded, { label: 'context discarded' });
+
+  // Its top-level result must release the active slot — before the fix the
+  // dead context stayed active and every later turn wedged on it.
+  turn.emit(resultMessage('continuation prose', 'native-1'));
+  await waitFor(() => runner._getProcess()?.activeCtx === null, { label: 'active slot released' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'follow-up' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('follow-up answer'));
+  turn.emit(resultMessage('follow-up answer', 'native-1'));
+  assert.equal(await second, true);
+  const followUp = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(followUp.body.text, 'follow-up answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('between-turn subagent chatter never opens a continuation turn', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'agent', description: 'background research' }]));
+  turn.emit(resultMessage('spawned a background agent', 'native-1'));
+  assert.equal(await first, true);
+
+  // The background agent streams between turns (parented frames) and a stray
+  // top-level tool_result lands. None of it follows a self-opened boundary,
+  // so none of it may open a continuation: no top-level result would ever
+  // close that context and the process could never idle out.
+  turn.emit({ type: 'assistant', parent_tool_use_id: 'tool-1', message: { content: [{ type: 'text', text: 'subagent prose' }] } });
+  turn.emit({ type: 'stream_event', parent_tool_use_id: 'tool-1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } } });
+  turn.emit({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'done' }] } });
+  await tick(50);
+  assert.ok(
+    !stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    'between-turn chatter must not register a continuation',
+  );
+  assert.equal(runner._getProcess().activeCtx, null);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a push-race respawn closes the old process and keeps the task panel intact', async () => {
+  const stub = makeApiStub();
+  const turns = [];
+  const runner = makeRunner({
+    stub,
+    startImpl: () => {
+      const turn = scriptedTurn({ echoPushes: true });
+      if (turns.length === 0) {
+        // The first process's stream dies between the liveness check and the
+        // second push: pushUserMessage throws without the runner having seen
+        // the stream end yet.
+        const originalPush = turn.pushUserMessage;
+        let pushes = 0;
+        turn.pushUserMessage = (content) => {
+          pushes += 1;
+          if (pushes >= 2) throw new Error('user message stream already ended');
+          originalPush(content);
+        };
+      }
+      turns.push(turn);
+      return turn;
+    },
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'dev server' }]));
+  turns[0].emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second' } });
+  await waitFor(() => turns.length === 2, { label: 'respawn after push race' });
+  assert.equal(turns[0].closed, true, 'the superseded process must be torn down');
+  turns[1].emit(initMessage('native-1'));
+  turns[1].emit(assistantText('second answer'));
+  turns[1].emit(resultMessage('second answer', 'native-1'));
+  assert.equal(await second, true);
+
+  // The old process died holding bash-1; its cleanup must not blank the panel
+  // now owned by the replacement process.
+  const emptyPanelPost = stub.calls.find(
+    (call) => call.routePath === '/api/background-tasks' && Array.isArray(call.body.tasks) && call.body.tasks.length === 0,
+  );
+  assert.ok(!emptyPanelPost, 'a superseded process must not clear the replacement\'s task panel');
+  turns[1].endInput();
+  await settled(runner);
+});
+
+test('an AskUserQuestion between turns attaches to a fresh continuation turn instead of being denied', async () => {
+  const calls = [];
+  const api = async (method, routePath, body) => {
+    calls.push({ method, routePath, body });
+    if (routePath === '/api/continuation-turn') return { messageId: 'cont-1' };
+    if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+    if (routePath === '/api/relay-question/rq-1') {
+      return { question: { id: 'rq-1', status: 'answered', answer: 'option A' } };
+    }
+    return { ok: true };
+  };
+  let capturedCanUseTool = null;
+  const turn = scriptedTurn();
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: 'conv-1',
+    cwd: '/tmp',
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeSessionImpl: (params) => {
+      capturedCanUseTool = params.canUseTool;
+      return turn;
+    },
+    continuationRetryDelayMs: 10,
+    askUserBridgeOptions: { questionPollMs: 10 },
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'agent', description: 'background agent' }]));
+  turn.emit(resultMessage('spawned', 'native-1'));
+  assert.equal(await first, true);
+
+  // Between turns, the background agent asks a question. Before the fix the
+  // bridge posted queueId undefined, the route 409ed, and the question was
+  // silently denied.
+  const decision = await capturedCanUseTool('AskUserQuestion', {
+    questions: [{ question: 'Proceed?', options: [{ label: 'option A' }, { label: 'option B' }] }],
+  }, {});
+  assert.equal(decision.behavior, 'allow');
+  assert.equal(decision.updatedInput.answers['Proceed?'], 'option A');
+  const questionPost = calls.find((call) => call.routePath === '/api/relay-question');
+  assert.equal(questionPost.body.queueId, 'cont-1', 'the question must ride the registered continuation turn');
+
+  // The flow's eventual result closes the continuation like any other.
+  turn.emit(resultMessage('acted on option A', 'native-1'));
+  await waitFor(
+    () => calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  turn.endInput();
+  await settled(runner);
+});

@@ -79,7 +79,16 @@ export function createControlPoller({
     return state;
   }
 
-  function stop() {
+  function stop(handle) {
+    // Handle-scoped stop: a caller finishing an old turn must only stop that
+    // turn's poller. Without the scoping, a late finalize for a previous
+    // context would kill the poller of the turn currently running — leaving
+    // its Stop button dead. A bare stop() still stops whatever is active.
+    if (handle) {
+      handle.stopped = true;
+      if (active === handle) active = null;
+      return;
+    }
     if (active) active.stopped = true;
     active = null;
   }

@@ -263,6 +263,8 @@ export function createClaudeSessionRunner({
       if (!response?.messageId) {
         ctx.discarded = true;
         ctx.bufferedActions = [];
+        controlPoller?.stop?.(ctx.controlState);
+        ctx.controlState = null;
         dbg('continuation turn discarded (no relay message id)');
         return;
       }
@@ -290,6 +292,14 @@ export function createClaudeSessionRunner({
     return ctx;
   }
 
+  /** Wait until a continuation context has its relay queue row (or gave up). */
+  async function waitForContextRegistration(ctx, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!ctx.registered && !ctx.discarded && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   /**
    * Decide which turn context an SDK message belongs to, opening or attaching
    * one when the message begins a turn. Delivered turns attach on their user
@@ -312,7 +322,16 @@ export function createClaudeSessionRunner({
     }
 
     if (type === 'assistant' || type === 'stream_event' || type === 'user') {
-      if (proc.lastBoundary !== 'self-opened' && proc.pendingDelivered.length) return attachDeliveredContext();
+      if (proc.lastBoundary !== 'self-opened') {
+        if (proc.pendingDelivered.length) return attachDeliveredContext();
+        // Between-turn chatter — a background subagent's stream, a stray
+        // top-level tool_result — is not a turn of its own. Only traffic that
+        // follows a self-opened boundary (the CLI's task-notification replay)
+        // may open a continuation; without that boundary there is no top-level
+        // result coming to ever close the context, and an open context wedges
+        // the process. The dropped frames still land in the native transcript.
+        return null;
+      }
       return openContinuationContext();
     }
 
@@ -333,7 +352,13 @@ export function createClaudeSessionRunner({
     // Background-task membership is process state, observed from the raw
     // stream; the normalizer's mirror actions must not reach the relay APIs.
     if (action.channel === 'background_tasks' || action.channel === 'background_task_settled') return;
-    if (ctx.discarded) return;
+    if (ctx.discarded) {
+      // The turn's relay output is deliberately dropped, but the turn still
+      // ends: its result must release the active slot, or every later message
+      // routes into this dead context and the process can never idle out.
+      if (action.channel === 'result') closeContext(ctx, false);
+      return;
+    }
     if (!ctx.registered) {
       ctx.bufferedActions.push(action);
       return;
@@ -363,7 +388,7 @@ export function createClaudeSessionRunner({
     await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model: procModel, sdkSessionId });
     await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId });
 
-    if (ctx.interrupted || proc.aborted) {
+    if (ctx.interrupted || proc?.aborted) {
       // Same shape as the per-turn runner's abort path: surface what streamed,
       // let the server-side abort control own the queue row's fate.
       await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
@@ -542,8 +567,12 @@ export function createClaudeSessionRunner({
     }
   }
 
-  async function onSdkMessage(sdkMessage) {
-    if (!proc) return;
+  async function onSdkMessage(processRef, sdkMessage) {
+    // A superseded process (push-race respawn, mode-recycle timeout) may still
+    // be draining its stream; its late messages must not mutate the state of
+    // the process that replaced it. Its own open contexts are settled by
+    // cleanupProcess when the old stream ends.
+    if (!proc || proc !== processRef) return;
     proc.lastEventAt = Date.now();
     observeProcessLevel(sdkMessage);
     const ctx = resolveContext(sdkMessage);
@@ -625,15 +654,20 @@ export function createClaudeSessionRunner({
   }
 
   async function cleanupProcess(processRef, streamError) {
+    const wasCurrent = proc === processRef;
     stopLifecycleTimer(processRef);
     if (processRef.taskPublishTimer) {
       clearTimeout(processRef.taskPublishTimer);
       processRef.taskPublishTimer = null;
     }
-    // The process took its background tasks with it; clear the panel.
+    // The process took its background tasks with it; clear the panel — but
+    // only when this process still owns it. A superseded process clearing the
+    // panel would blank the replacement's live task set.
     if (processRef.liveTasks.size) {
       processRef.liveTasks = new Map();
-      api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks: [] }).catch(() => {});
+      if (wasCurrent) {
+        api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks: [] }).catch(() => {});
+      }
     }
     const openContexts = [
       ...(processRef.activeCtx ? [processRef.activeCtx] : []),
@@ -725,6 +759,21 @@ export function createClaudeSessionRunner({
       // request with "Tool permission stream closed".
       processRef.pendingControlRequests += 1;
       try {
+        // A question from a background agent between turns has no active turn
+        // to attach to, and /api/relay-question requires a processing queue
+        // row — without one the bridge 409s and the question is silently
+        // denied. Register a continuation turn first: it is born processing,
+        // gives the card a real queue row, and the flow's eventual top-level
+        // result (or stream end) closes it like any other continuation.
+        if (
+          toolName === 'AskUserQuestion'
+          && proc === processRef
+          && !processRef.activeCtx
+          && !processRef.pendingDelivered.length
+        ) {
+          const ctx = openContinuationContext();
+          await waitForContextRegistration(ctx);
+        }
         return await baseCanUseTool(toolName, input, options);
       } finally {
         processRef.pendingControlRequests -= 1;
@@ -756,7 +805,7 @@ export function createClaudeSessionRunner({
       let streamError = null;
       try {
         for await (const sdkMessage of processRef.turn) {
-          await onSdkMessage(sdkMessage);
+          await onSdkMessage(processRef, sdkMessage);
         }
       } catch (error) {
         if (!processRef.aborted && !abortController.signal.aborted) streamError = error;
@@ -785,7 +834,12 @@ export function createClaudeSessionRunner({
         previous.consumer,
         new Promise((resolve) => setTimeout(resolve, 10_000)),
       ]);
-      if (proc === previous) proc = null;
+      if (proc === previous) {
+        // The drain timed out: force the old CLI down so it cannot keep
+        // streaming next to the replacement the caller is about to spawn.
+        try { previous.turn.close?.(); } catch {}
+        proc = null;
+      }
       return null;
     }
 
@@ -851,6 +905,9 @@ export function createClaudeSessionRunner({
           procRef.pendingDelivered = procRef.pendingDelivered.filter((entry) => entry.ctx !== ctx);
           dbg('push raced process teardown', pushError?.message || String(pushError));
           if (proc === procRef) proc = null;
+          // Belt and braces: the stream was already ending, but make sure the
+          // superseded CLI cannot linger next to its replacement.
+          try { procRef.turn.close?.(); } catch {}
           spawnProcess(message);
           continue;
         }
