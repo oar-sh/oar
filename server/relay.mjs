@@ -21,6 +21,7 @@ import path from 'path';
 import fs from 'fs';
 import { resolveStartupWorkspaceRoot } from './workspace-root.mjs';
 import { resolveInstalledCopilotPaths } from './copilot-sdk-runtime.mjs';
+import { isLegacyRelayProviderType } from '../shared/provider-routing.mjs';
 import {
   buildWindowsTerminalForegroundArgs,
   buildWindowsTerminalWindowName,
@@ -886,15 +887,17 @@ async function processNext(approveAll) {
   // openai is allowed through because routing-disabled installs still run
   // OpenAI BYOK conversations here. Note this process gets plain env from
   // start.js, so such a turn does execute on the Copilot plan and is reported
-  // as a mismatch by the provenance check in /api/response. Keep this list in
-  // sync with the findPendingForLegacyRelay denylist in
-  // repositories/message-repository.mjs — this file is a standalone CLI and
-  // must not import the express routes.
+  // as a mismatch by the provenance check in /api/response. The eligible set
+  // is shared with findPendingForLegacyRelay via shared/provider-routing.mjs,
+  // so both sides derive from one constant.
   const msgProviderType = String(msg.providerType || '').trim().toLowerCase();
-  if (msgProviderType && msgProviderType !== 'github' && msgProviderType !== 'openai') {
+  if (!isLegacyRelayProviderType(msgProviderType)) {
     err(`Refusing msg ${msg.id.slice(0, 8)}: it belongs to provider "${msgProviderType}", not the Copilot relay`);
     try {
-      await apiJson('POST', '/api/requeue', { messageId: msg.id }, { auth: true });
+      // The distinct code keeps the row's retry budget and backoff untouched:
+      // this is a routing refusal, not a delivery failure — the owner worker
+      // must be able to claim it immediately.
+      await apiJson('POST', '/api/requeue', { messageId: msg.id, code: 'relay.provider-mismatch' }, { auth: true });
     } catch (_) {}
     return;
   }
@@ -910,6 +913,10 @@ async function processNext(approveAll) {
 
   try {
     const session = await getOrCreateSession(msg.runtimeSessionId, msg.conversationId, msg.model, approveAll);
+    // A cached session keeps the model it was created with; without this a
+    // second message on the same conversation with a different model silently
+    // executed on the old one (the switch helper existed but had no caller).
+    await setModelForMessage(session, msg.model);
     await publishModelSnapshot(session, 'process-message');
 
     activeUserInputHandler = (request) => relayUserInputQuestion(msg, request);

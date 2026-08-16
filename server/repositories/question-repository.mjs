@@ -83,6 +83,19 @@ export function createQuestionRepository(db) {
           WHERE queue_message_id = ?
           ORDER BY started_at ASC, id ASC
         `),
+        // Terminal-state reconciliation: whatever ends a turn (response, fail,
+        // abort) also ends its subagent runs — nothing else ever will, and an
+        // un-reconciled row renders as a bubble stuck "running" forever.
+        listRunningSubagentRunsByQueueMessage: db.prepare(`
+          SELECT id, conversation_id, parent_subagent_id, display_name
+          FROM subagent_runs
+          WHERE queue_message_id = ? AND status = 'running'
+        `),
+        closeRunningSubagentRunsByQueueMessage: db.prepare(`
+          UPDATE subagent_runs
+          SET status = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
+          WHERE queue_message_id = ? AND status = 'running'
+        `),
         listSubagentRunsByResponse: db.prepare(`
           SELECT sr.id, sr.queue_message_id, sr.conversation_id, sr.parent_subagent_id, sr.display_name, sr.status, sr.started_at, sr.updated_at, sr.completed_at
           FROM subagent_runs sr

@@ -4298,6 +4298,18 @@ async function reconcileUnstartedConversationProviders({ enabled, model, provide
           new Date().toISOString(),
           row.id,
         );
+      } else if (providerWasUpdated) {
+        // The previous provider is no longer configured, so the DB stays on
+        // the new one with no running worker. That state must be loud, not
+        // buried in the result object: without the event the conversation
+        // just looks bound-and-idle while every turn on it will fail.
+        console.warn(`${runtimeLogPrefix()}PROVIDER REBIND stranded conv=${String(conversationId).slice(0, 8)} newProvider=${managedProvider} — relaunch failed and ${currentProvider || 'previous provider'} is no longer configured`);
+        io.emit('provider_rebind_failed', {
+          conversationId,
+          provider: managedProvider,
+          previousProvider: currentProvider || null,
+          restored: false,
+        });
       }
       if (workerWasStopped && ownerSessionId) {
         sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
@@ -6947,6 +6959,24 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
     if (Number(row.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES) {
       failRecoveredRowTerminally(row, `worker-died-${reason}`);
       continue;
+    }
+    // The dead worker's subagent runs can never be terminated by the replay
+    // (fresh worker, fresh call ids) — close them out now.
+    const strandedRuns = stmts.listRunningSubagentRunsByQueueMessage?.all?.(row.id) || [];
+    if (strandedRuns.length) {
+      const nowIso = new Date().toISOString();
+      stmts.closeRunningSubagentRunsByQueueMessage?.run?.('failed', nowIso, nowIso, row.id);
+      for (const run of strandedRuns) {
+        io.emit('subagent_status', {
+          conversationId: run.conversation_id,
+          subagentRunId: run.id,
+          parentSubagentId: run.parent_subagent_id || null,
+          displayName: run.display_name || null,
+          status: 'failed',
+          queueMessageId: row.id,
+          reconciled: true,
+        });
+      }
     }
     stmts.recoverProcessingRowKeepOwner?.run?.(requeueAt, row.id);
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });

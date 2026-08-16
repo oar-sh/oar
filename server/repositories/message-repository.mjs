@@ -1,6 +1,7 @@
 'use strict';
 
 import { createShareVisibilityStatements } from './share-visibility-statements.mjs';
+import { sessionWorkerProviderSqlList } from '../../shared/provider-routing.mjs';
 
 export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
@@ -146,7 +147,7 @@ export function createMessageRepository(db) {
               NULLIF(rs.provider_type, ''),
               NULLIF(rsc.provider_type, ''),
               'github'
-            )) NOT IN ('claude', 'cursor', 'grok')
+            )) NOT IN (${sessionWorkerProviderSqlList()})
           ORDER BY
             q.retry_count ASC,
             CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
@@ -165,11 +166,20 @@ export function createMessageRepository(db) {
             AND COALESCE(q.kind, '') != 'continuation'
             AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
             AND (
-              COALESCE(
-                NULLIF(q.owner_sdk_session_id, ''),
-                NULLIF(rs.sdk_session_id, ''),
-                NULLIF(c.sdk_session_id, '')
-              ) IS NULL
+              (
+                COALESCE(
+                  NULLIF(q.owner_sdk_session_id, ''),
+                  NULLIF(rs.sdk_session_id, ''),
+                  NULLIF(c.sdk_session_id, '')
+                ) IS NULL
+                -- Defense in depth: session-worker-provider turns are always
+                -- born owned, so an unowned one is a routing anomaly — it must
+                -- never be claimable by an arbitrary worker of a different
+                -- provider (isolation would otherwise rest on owner assignment
+                -- alone).
+                AND LOWER(COALESCE(NULLIF(rs.provider_type, ''), 'github'))
+                  NOT IN (${sessionWorkerProviderSqlList()})
+              )
               OR COALESCE(
                 NULLIF(q.owner_sdk_session_id, ''),
                 NULLIF(rs.sdk_session_id, ''),

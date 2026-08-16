@@ -1,3 +1,5 @@
+import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
+
 const MAX_TOOL_DETAIL_LENGTH = 140;
 // Matches the Copilot reasoning-stream bridge's per-thought cap.
 const MAX_THOUGHT_CHARS = 16 * 1024;
@@ -184,7 +186,9 @@ export function createSdkMessageNormalizer() {
 
   function actionsForToolCall(message) {
     const actions = [];
-    const callId = String(message?.call_id || '').trim();
+    // call_id becomes a relay row id; malformed ones (embedded newline, two
+    // concatenated ids) have been seen live from this SDK.
+    const callId = sanitizeSubagentRunId(message?.call_id) || '';
     const status = String(message?.status || '').trim();
     if (!callId || !status) return actions;
     const frameKey = `${callId}\u0000${status}`;

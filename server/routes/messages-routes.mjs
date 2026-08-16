@@ -23,6 +23,7 @@ import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services
 import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
+import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
@@ -1843,6 +1844,25 @@ export function registerMessagesRoutes(app, deps) {
     return res.status(status).json({ error, ...extra });
   }
 
+  function reconcileSubagentRunsForTerminalTurn(messageId, { status = 'failed' } = {}) {
+    const running = stmts.listRunningSubagentRunsByQueueMessage?.all?.(messageId) || [];
+    if (!running.length) return 0;
+    const now = new Date().toISOString();
+    stmts.closeRunningSubagentRunsByQueueMessage?.run?.(status, now, now, messageId);
+    for (const run of running) {
+      io.emit('subagent_status', {
+        conversationId: run.conversation_id,
+        subagentRunId: run.id,
+        parentSubagentId: run.parent_subagent_id || null,
+        displayName: run.display_name || null,
+        status,
+        queueMessageId: messageId,
+        reconciled: true,
+      });
+    }
+    return running.length;
+  }
+
   function failQueueMessage({
     queueRow,
     messageId,
@@ -1894,6 +1914,10 @@ export function registerMessagesRoutes(app, deps) {
     });
     const failed = tx();
     if (!failed) return null;
+    // A failed turn ends its subagents: whatever was still 'running' can
+    // never receive a terminal transition from a worker that just gave up,
+    // and an un-reconciled row renders as a bubble stuck running forever.
+    reconcileSubagentRunsForTerminalTurn(messageId, { status: 'failed' });
     io.emit('assistant_message', {
       conversationId,
       sourceMessageId: messageId,
@@ -4367,6 +4391,18 @@ export function registerMessagesRoutes(app, deps) {
       ) {
         stmts.updateRuntimeSessionProvider.run('cursor', cursorModel, cursorModel, now, runtimeSession.id);
       }
+      // Claude switches per turn too, and the worker launch env reads
+      // provider_model || model — without this a relaunched worker came up on
+      // the model chosen at bootstrap, not the one the composer last used.
+      if (
+        runtimeUsesClaude
+        && claudeModel
+        && runtimeSession?.id
+        && claudeModel !== String(existingRuntimeSession?.provider_model || '').trim()
+        && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
+      ) {
+        stmts.updateRuntimeSessionProvider.run('claude', claudeModel, claudeModel, now, runtimeSession.id);
+      }
       conversationPreferences = persistConversationModelPreference(
         convId,
         requestedRelayMode,
@@ -6657,8 +6693,10 @@ export function registerMessagesRoutes(app, deps) {
   app.post('/api/subagent-run', auth, (req, res) => {
     touchCli();
     const { messageId, conversationId, subagentRunId, parentSubagentId, displayName, status } = req.body || {};
-    const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
-    const normalizedParentSubagentId = parentSubagentId ? String(parentSubagentId).trim() : null;
+    // Provider call ids become row ids verbatim; malformed ones (embedded
+    // newlines, concatenated ids — seen live) are sanitized at the door.
+    const normalizedSubagentRunId = sanitizeSubagentRunId(subagentRunId);
+    const normalizedParentSubagentId = sanitizeSubagentRunId(parentSubagentId);
     const normalizedDisplayName = displayName ? String(displayName).trim() : null;
     const normalizedStatus = status ? String(status).trim() : 'running';
 
@@ -6770,6 +6808,20 @@ export function registerMessagesRoutes(app, deps) {
       io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'failed' });
       console.log(`[${ts()}] CONTINUATION DROPPED ${messageId?.slice(0,8)} reason=requeue`);
       return res.json({ ok: true, dropped: 'continuation' });
+    }
+    if (q && q.status === 'processing' && String(req.body?.code || '').trim() === 'relay.provider-mismatch') {
+      // A routing refusal, not a delivery failure: the legacy relay handed
+      // back a turn that belongs to a session worker. No retry increment and
+      // no backoff — the owner worker must be able to claim it immediately
+      // instead of paying a 60s ladder for the relay's mistake.
+      db.prepare(`
+        UPDATE queue
+        SET status = 'pending', processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL
+        WHERE id = ? AND status = 'processing'
+      `).run(messageId);
+      io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'pending' });
+      console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=provider-mismatch retry=${Number(q.retry_count || 0)}`);
+      return res.json({ ok: true, mismatch: true });
     }
     if (q && q.status === 'processing') {
       const retryCount = Number(q.retry_count || 0) + 1;
