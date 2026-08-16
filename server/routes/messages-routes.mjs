@@ -748,6 +748,29 @@ export function resolveExecutedProviderForResponse({
   return 'github';
 }
 
+// The provider check above cannot see same-provider cross-*conversation*
+// execution: worker A answering conversation B's turn resolves to the right
+// provider and stays invisible. This companion check compares the responder's
+// own conversation binding against the turn's conversation. Absent identity or
+// an unmatched runtime row prove nothing and report no mismatch.
+export function resolveResponderConversationMismatch({
+  stmts,
+  responseBridgeIdentity,
+  targetConversationId = null,
+} = {}) {
+  const target = String(targetConversationId || '').trim();
+  const responderSessionId = normalizeSessionWorkerId(responseBridgeIdentity?.sessionId);
+  if (!target || !responderSessionId) {
+    return { crossConversation: false, responderConversationId: null };
+  }
+  const runtimeSession = stmts?.getRuntimeSessionBySdkSessionId?.get?.(responderSessionId) || null;
+  const responderConversationId = String(runtimeSession?.conversation_id || '').trim() || null;
+  return {
+    crossConversation: Boolean(responderConversationId && responderConversationId !== target),
+    responderConversationId,
+  };
+}
+
 export function dequeuePendingMessage({
   db,
   stmts,
@@ -1829,6 +1852,7 @@ export function registerMessagesRoutes(app, deps) {
     responseText,
     failureRecord,
     markWorkerError = true,
+    executedProvider = null,
   }) {
     const now = new Date().toISOString();
     const responseId = uuidv4();
@@ -1855,8 +1879,15 @@ export function registerMessagesRoutes(app, deps) {
         modelActual,
         modelOrigin,
       );
+      // Provenance travels with terminal failures too — the original hijack
+      // incident's signature was stolen turns dying on 402, which exited
+      // exactly here with no executed_provider recorded.
+      if (executedProvider) stmts.setMessageExecutedProvider?.run(executedProvider, responseId);
       stmts.linkActivityToResponse?.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
+      // A failed turn keeps its reasoning: without this link the thoughts
+      // stayed response_message_id NULL and vanished from the transcript.
+      stmts.linkThoughtsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, conversationId);
       stmts.pruneQueue?.run();
       return true;
@@ -5856,6 +5887,30 @@ export function registerMessagesRoutes(app, deps) {
 
     const relayMode = normalizeRelayMode(mode || q?.relay_mode) || DEFAULT_RELAY_MODE;
     if (terminalFailure) {
+      // Terminal failures carry provenance too: the original hijack incident
+      // presented exactly as stolen turns dying on 402 through this path.
+      const terminalConversationProvider = String(
+        stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type || '',
+      ).trim().toLowerCase() || 'github';
+      const terminalExecutedProvider = resolveExecutedProviderForResponse({
+        stmts,
+        responseBridgeIdentity,
+        conversationProvider: terminalConversationProvider,
+        serverExecutedOperation: !!q?.image_operation_id,
+      });
+      if (terminalExecutedProvider === 'unknown') {
+        console.warn(`[${ts()}] PROVIDER UNRESOLVED ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${terminalConversationProvider} responder=${normalizeSessionWorkerId(responseBridgeIdentity?.sessionId)?.slice(0, 8) || 'none'} — terminal failure from a responder identity matching no runtime session`);
+      } else if (terminalExecutedProvider !== terminalConversationProvider) {
+        console.warn(`[${ts()}] PROVIDER MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${terminalConversationProvider} executed=${terminalExecutedProvider} — terminal failure answered by the wrong provider`);
+      }
+      const terminalCrossConversation = resolveResponderConversationMismatch({
+        stmts,
+        responseBridgeIdentity,
+        targetConversationId,
+      });
+      if (terminalCrossConversation.crossConversation) {
+        console.warn(`[${ts()}] CONVERSATION MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} responderConv=${terminalCrossConversation.responderConversationId?.slice(0, 8)} — terminal failure posted by another conversation's worker`);
+      }
       const failureText = buildTerminalFailureTextForChat(terminalFailure, trimmedText);
       const failed = failQueueMessage({
         queueRow: q,
@@ -5864,6 +5919,7 @@ export function registerMessagesRoutes(app, deps) {
         relayMode,
         model: model || q?.model || null,
         responseText: failureText,
+        executedProvider: terminalExecutedProvider,
         failureRecord: {
           kind: 'terminal',
           code: terminalFailure.code,
@@ -5940,6 +5996,14 @@ export function registerMessagesRoutes(app, deps) {
       console.warn(`[${ts()}] PROVIDER UNRESOLVED ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${conversationProvider} responder=${normalizeSessionWorkerId(responseBridgeIdentity?.sessionId)?.slice(0, 8) || 'none'} — responder identity matches no runtime session`);
     } else if (executedProvider !== conversationProvider) {
       console.warn(`[${ts()}] PROVIDER MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${conversationProvider} executed=${executedProvider} — turn answered by the wrong provider`);
+    }
+    const responderConversationCheck = resolveResponderConversationMismatch({
+      stmts,
+      responseBridgeIdentity,
+      targetConversationId,
+    });
+    if (responderConversationCheck.crossConversation) {
+      console.warn(`[${ts()}] CONVERSATION MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} responderConv=${responderConversationCheck.responderConversationId?.slice(0, 8)} — turn answered by another conversation's worker`);
     }
     const explicitModel = String(model || '').trim() || null;
     const resolvedAssistantModel = explicitModel
