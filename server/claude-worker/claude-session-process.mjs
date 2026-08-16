@@ -1004,12 +1004,30 @@ export function createClaudeSessionRunner({
     }
   }
 
+  /**
+   * Targeted subagent stop: the relay's subagentRunId IS the spawning
+   * tool_use id, and task_started/task_progress report the same id per task —
+   * so a BACKGROUNDED subagent maps to a stoppable SDK task. In-turn
+   * subagents have no task id and remain full-turn-Stop only.
+   */
+  async function stopBackgroundTaskByToolUseId(toolUseId) {
+    const normalized = String(toolUseId || '').trim();
+    if (!normalized || !proc) return false;
+    for (const [taskId, task] of proc.liveTasks.entries()) {
+      if (String(task?.toolUseId || '').trim() === normalized) {
+        return stopBackgroundTask(taskId);
+      }
+    }
+    return false;
+  }
+
   return {
     handlePendingPayload,
     getActiveQueueMessageId,
     getActiveQueueMessageIds,
     isTurnActive,
     stopBackgroundTask,
+    stopBackgroundTaskByToolUseId,
     shutdown,
     // Test seams / observability.
     _getProcess: () => proc,

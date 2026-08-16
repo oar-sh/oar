@@ -81,10 +81,12 @@ export function shouldEmitStreamUpdate(nextText, previousText) {
  * Tool lifecycle is owned by stream `tool_call` messages; the delta surface's
  * tool-call updates are ignored.
  *
- * Limitation: the Cursor SDK does not attribute text, thinking, or tool frames
- * to subagent threads, so stream/thought/activity payloads always carry
- * `subagentRunId: null`; subagent rows exist only for the agent/task tool
- * lifecycle, keyed by `call_id`.
+ * Subagent attribution rides `tool-call-delta` updates: each carries the task
+ * tool_call's `callId` (live-verified identical to the stream `call_id`,
+ * 2026-08-16 probe) plus one nested frame (`taskUpdate`) from inside the
+ * subagent — text, thinking, and nested tool starts publish under that
+ * `subagentRunId`. One nesting level only; deeper levels are dropped by the
+ * SDK at convert time.
  */
 export function createSdkMessageNormalizer() {
   let initModel = '';
@@ -101,6 +103,20 @@ export function createSdkMessageNormalizer() {
   const knownSubagentRuns = new Map(); // call_id -> displayName
   const openSubagentRuns = new Set(); // call_ids currently 'running'
   const seenToolFrames = new Set(); // `${call_id}\u0000${status}` de-dupe
+  // Per-subagent nested-delta accumulators (tool-call-delta frames).
+  const subagentDeltas = new Map(); // runId -> { streamText, lastEmittedStreamText, openThought, thoughtIndex }
+
+  function subagentDeltaState(runId) {
+    if (!subagentDeltas.has(runId)) {
+      subagentDeltas.set(runId, {
+        streamText: '',
+        lastEmittedStreamText: '',
+        openThought: null,
+        thoughtIndex: 0,
+      });
+    }
+    return subagentDeltas.get(runId);
+  }
 
   function allocateThoughtId() {
     const id = `cursor-thought-main-${stepIndex}-${thoughtIndex}`;
@@ -179,7 +195,83 @@ export function createSdkMessageNormalizer() {
       return actions;
     }
 
-    // tool-call-started/-completed/-delta, partial-tool-call, token-delta,
+    if (type === 'tool-call-delta') {
+      // Nested interaction updates streamed from a task/subagent tool call.
+      // `callId` is the task tool_call's own id — live-verified byte-equal on
+      // 2026-08-16 (probe: tool_f68aee7f… on both surfaces) — which is
+      // exactly the subagentRunId the lifecycle chips already use, so these
+      // frames fill the bubbles that used to render header-and-nothing.
+      const runId = sanitizeSubagentRunId(update?.callId);
+      const nested = update?.taskUpdate && typeof update.taskUpdate === 'object' ? update.taskUpdate : null;
+      if (!runId || !nested) return actions;
+      const nestedType = String(nested.type || '');
+      const state = subagentDeltaState(runId);
+      if (nestedType === 'text-delta') {
+        state.streamText += String(nested.text || '');
+        if (shouldEmitStreamUpdate(state.streamText, state.lastEmittedStreamText)) {
+          state.lastEmittedStreamText = state.streamText;
+          actions.push({
+            channel: 'stream',
+            payload: { text: state.streamText, done: false, subagentRunId: runId },
+          });
+        }
+        return actions;
+      }
+      if (nestedType === 'thinking-delta') {
+        if (!state.openThought) {
+          state.openThought = { reasoningId: `cursor-thought-${runId}-${state.thoughtIndex++}`, text: '' };
+        }
+        state.openThought.text = capThought(state.openThought.text + String(nested.text || ''));
+        actions.push({
+          channel: 'thought',
+          payload: {
+            reasoningId: state.openThought.reasoningId,
+            text: state.openThought.text,
+            done: false,
+            subagentRunId: runId,
+          },
+        });
+        return actions;
+      }
+      if (nestedType === 'thinking-completed' || nestedType === 'step-completed') {
+        if (state.openThought && state.openThought.text.trim()) {
+          actions.push({
+            channel: 'thought',
+            payload: {
+              reasoningId: state.openThought.reasoningId,
+              text: state.openThought.text,
+              done: true,
+              subagentRunId: runId,
+            },
+          });
+        }
+        if (state.openThought) state.openThought = null;
+        // A finished subagent step flushes its streamed text as final so the
+        // bubble keeps the prose even though the run's own turn never emits a
+        // top-level stream terminator for it.
+        if (nestedType === 'step-completed' && state.streamText.trim() && state.streamText !== state.lastEmittedStreamText) {
+          state.lastEmittedStreamText = state.streamText;
+          actions.push({
+            channel: 'stream',
+            payload: { text: state.streamText, done: false, subagentRunId: runId },
+          });
+        }
+        return actions;
+      }
+      if (nestedType === 'tool-call-started' || nestedType === 'tool-call-completed') {
+        const nestedName = String(nested.name || nested.toolName || nested.title || 'tool').trim() || 'tool';
+        if (nestedType === 'tool-call-started') {
+          actions.push({
+            channel: 'activity',
+            payload: { text: formatToolActivityText(nestedName, nested.args || nested.input || null), subagentRunId: runId },
+          });
+        }
+        return actions;
+      }
+      return actions;
+    }
+
+    // tool-call-started/-completed, partial-tool-call, token-delta,
     // summary*, user-message-appended, shell-output-delta: intentionally ignored.
     return actions;
   }

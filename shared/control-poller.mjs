@@ -6,9 +6,11 @@ function sleepDefault(ms) {
  * Poll the relay's control API while a turn is in flight, mirroring the
  * Copilot extension's `checkActiveAbortControl` semantics:
  * - `abort_turn`   → invoke `onAbortTurn()` and acknowledge the control.
- * - `abort_subagent` → report "not supported" (neither the Claude Agent SDK
- *   nor the Cursor SDK expose per-subagent cancellation); the full-turn Stop
- *   still works.
+ * - `abort_subagent` → try `onAbortSubagent(subagentRunId)` when the worker
+ *   provides one (the Claude worker can stop a BACKGROUNDED subagent via
+ *   `query.stopTask` using the task↔tool_use_id map); otherwise — or when the
+ *   handler reports the run unknown — answer "not supported". The full-turn
+ *   Stop always works.
  *
  * Provider workers customize the acknowledgement note via `abortAckNote`.
  */
@@ -18,6 +20,7 @@ export function createControlPoller({
   pollMs = 1200,
   sleep = sleepDefault,
   abortAckNote = 'query aborted',
+  onAbortSubagent = null,
   dbg = () => {},
 } = {}) {
   let active = null;
@@ -34,6 +37,21 @@ export function createControlPoller({
     if (!control || !controlType) return false;
 
     if (controlType === 'abort_subagent') {
+      const subagentRunId = String(control.subagentRunId || control.subagent_run_id || '').trim();
+      if (typeof onAbortSubagent === 'function' && subagentRunId) {
+        try {
+          const stopped = await onAbortSubagent(subagentRunId);
+          if (stopped) {
+            await api('POST', `/api/control/${encodeURIComponent(control.id)}/result`, {
+              ok: true,
+              note: 'subagent task stopped',
+            }).catch(() => {});
+            return false;
+          }
+        } catch (error) {
+          dbg('abort_subagent handler failed', error?.message || String(error));
+        }
+      }
       await api('POST', `/api/control/${encodeURIComponent(control.id)}/result`, {
         ok: false,
         error: 'Targeted subagent cancellation is not supported by this runtime.',

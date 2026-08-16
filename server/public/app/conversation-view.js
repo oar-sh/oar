@@ -1488,6 +1488,16 @@ function updateSubagentBubbleStatus(bubble, status) {
   statusSpan.textContent = normalized === 'running' ? '● Running' : normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
+const subagentStopUnsupported = new Set();
+
+/** The provider answered "not supported": the control must not re-arm. */
+export function markSubagentStopUnsupported(subagentRunId) {
+  const id = String(subagentRunId || '').trim();
+  if (!id) return;
+  subagentStopUnsupported.add(id);
+  updateSubagentStopButton(id, false);
+}
+
 function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverride = null) {
   const id = String(subagentRunId || '').trim();
   if (!id) return;
@@ -1496,6 +1506,13 @@ function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverr
   if (IS_SHARED_VIEW) {
     btn.hidden = true;
     btn.disabled = true;
+    return;
+  }
+  if (subagentStopUnsupported.has(id)) {
+    btn.disabled = true;
+    btn.textContent = 'Stop unavailable';
+    btn.title = 'Targeted subagent stop is not supported by this provider; use Stop on the whole turn.';
+    btn.classList.remove('stopping');
     return;
   }
   const status = normalizeSubagentBubbleStatus(statusOverride || getSubagentStatus(id));

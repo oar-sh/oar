@@ -2996,6 +2996,7 @@ export function registerMessagesRoutes(app, deps) {
           const parentSubagentId = targetRun.parent_subagent_id ? String(targetRun.parent_subagent_id).trim() : null;
           const displayName = targetRun.display_name ? String(targetRun.display_name).trim() : null;
           const status = String(targetRun.status || 'running').trim().toLowerCase() || 'running';
+          const stopUnsupported = /not supported/i.test(errorText);
           io.emit('subagent_status', {
             messageId: messageId || null,
             conversationId: conversationId || null,
@@ -3004,6 +3005,9 @@ export function registerMessagesRoutes(app, deps) {
             displayName: displayName || undefined,
             status,
             timestamp: now,
+            // Lets the client pin a "not supported by provider" state on the
+            // stop control instead of re-arming a button that can never work.
+            ...(stopUnsupported ? { stopUnsupported: true } : {}),
           });
           if (messageId && conversationId) {
             io.emit('relay_activity', {

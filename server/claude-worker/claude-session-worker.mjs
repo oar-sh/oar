@@ -63,7 +63,16 @@ async function main() {
     }),
   });
 
-  const controlPoller = createControlPoller({ api, sdkSessionId, abortAckNote: 'claude query aborted', dbg });
+  const controlPoller = createControlPoller({
+    api,
+    sdkSessionId,
+    abortAckNote: 'claude query aborted',
+    // Backgrounded subagents are SDK tasks; their relay run id is the
+    // spawning tool_use id, which maps to a stoppable task id. (Late-bound:
+    // controls only poll while a turn is live, well after turnRunner exists.)
+    onAbortSubagent: (subagentRunId) => turnRunner.stopBackgroundTaskByToolUseId(subagentRunId),
+    dbg,
+  });
   const turnRunner = createClaudeSessionRunner({
     api,
     sdkSessionId,

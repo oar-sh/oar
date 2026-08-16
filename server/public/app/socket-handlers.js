@@ -58,6 +58,7 @@ import {
   clearBubbleCancelState,
   removeUserBubbleCancelButton,
   updateSubagentBubbleFromStatus,
+  markSubagentStopUnsupported,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, refreshRepoBrowserIfWorkspaceOpen } from './attachments-view.js';
 import { clearMessageSearchRuntimeState } from './message-search-view.js';
@@ -478,7 +479,7 @@ export async function connectSocket(overrideDeps) {
       appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
     }
   });
-  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp }) => {
+  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp, stopUnsupported }) => {
     if (!messageId || !subagentRunId) return;
     upsertSubagentRun({
       subagentRunId,
@@ -490,6 +491,9 @@ export async function connectSocket(overrideDeps) {
       timestamp,
     });
     clearSubagentCancelInFlight(subagentRunId);
+    // The provider answered "not supported": pin the state so the button does
+    // not re-arm into an endless click-and-fail loop.
+    if (stopUnsupported) markSubagentStopUnsupported(subagentRunId);
     if (conversationId === currentConvId) {
       updateSubagentBubbleFromStatus(subagentRunId, status);
     }

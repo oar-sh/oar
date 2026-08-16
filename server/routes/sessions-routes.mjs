@@ -4849,6 +4849,39 @@ export function registerSessionsRoutes(app, deps) {
         activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
       });
     }
+    // A rotated API key only reaches a worker's environment at spawn: live
+    // Cursor workers keep the old key (every handle rebuild reuses it) and
+    // fail each turn after the rotation. Stop them now; the primer or the
+    // next delivery respawns them with the fresh key from settings.
+    if (parsed.apiKey && previous?.configured === true) {
+      const cursorSessionRows = db.prepare(`
+        SELECT DISTINCT NULLIF(sdk_session_id, '') AS sdk_session_id
+        FROM runtime_sessions
+        WHERE LOWER(COALESCE(provider_type, '')) = 'cursor'
+          AND NULLIF(sdk_session_id, '') IS NOT NULL
+      `).all();
+      for (const row of cursorSessionRows) {
+        const sid = String(row.sdk_session_id || '').trim();
+        if (!sid) continue;
+        const workerState = sessionWorkerSupervisor?.getWorkerState?.(sid) || null;
+        if (!workerState) continue;
+        try {
+          const stopped = await stopIdleWorkspaceRootSession({
+            sdkSessionId: sid,
+            worker: sessionWorkerRegistry?.getWorker?.(sid) || null,
+            sessionWorkerSupervisor,
+            sessionWorkerRegistry,
+            sessionWorkerProcessInspector,
+          });
+          if (stopped.ok) {
+            sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
+            console.log(`[sessions] cursor worker ${sid.slice(0, 8)} stopped for API key rotation`);
+          }
+        } catch (error) {
+          console.warn(`[sessions] cursor worker ${sid.slice(0, 8)} stop failed on key rotation: ${error?.message || error}`);
+        }
+      }
+    }
     const shouldDiscover = result.enabled === true && (
       !!parsed.apiKey
       || previous?.enabled !== true

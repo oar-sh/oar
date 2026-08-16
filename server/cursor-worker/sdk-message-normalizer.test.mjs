@@ -342,3 +342,45 @@ test('non-actionable events are ignored', () => {
     assert.deepEqual(normalizer.normalize(event), []);
   }
 });
+
+test('tool-call-delta frames attribute subagent text and thinking to their run', () => {
+  const normalizer = createSdkMessageNormalizer();
+  // The task tool call opens the run (stream surface)…
+  normalizer.normalize({
+    source: 'stream',
+    message: { type: 'tool_call', call_id: 'tool_probe-1', name: 'task', status: 'running', args: { description: 'echo probe' } },
+  });
+  // …and the delta surface streams the subagent's own frames under the same id
+  // (the live-probed shape: callId === call_id, nested taskUpdate).
+  const thinking = normalizer.normalize({
+    source: 'delta',
+    update: { type: 'tool-call-delta', callId: 'tool_probe-1', taskUpdate: { type: 'thinking-delta', text: 'The user wants PING.' } },
+  });
+  const thought = thinking.find((a) => a.channel === 'thought');
+  assert.ok(thought, 'nested thinking must surface as a thought');
+  assert.equal(thought.payload.subagentRunId, 'tool_probe-1');
+
+  const texted = normalizer.normalize({
+    source: 'delta',
+    update: { type: 'tool-call-delta', callId: 'tool_probe-1', taskUpdate: { type: 'text-delta', text: 'PING — the probe answered fine.' } },
+  });
+  const stream = texted.find((a) => a.channel === 'stream');
+  assert.ok(stream, 'nested text streams into the subagent bubble');
+  assert.equal(stream.payload.subagentRunId, 'tool_probe-1');
+  assert.match(stream.payload.text, /PING/);
+
+  // A short trailing fragment below the emit gate is flushed by the step end.
+  normalizer.normalize({
+    source: 'delta',
+    update: { type: 'tool-call-delta', callId: 'tool_probe-1', taskUpdate: { type: 'text-delta', text: ' ok' } },
+  });
+  const flushed = normalizer.normalize({
+    source: 'delta',
+    update: { type: 'tool-call-delta', callId: 'tool_probe-1', taskUpdate: { type: 'step-completed', stepId: 2 } },
+  });
+  const finalStream = flushed.find((a) => a.channel === 'stream');
+  assert.ok(finalStream, 'step completion flushes unemitted subagent text');
+  assert.match(finalStream.payload.text, /PING.*ok/s);
+  // The main thread's accumulators are untouched by subagent frames.
+  assert.equal(normalizer.finalStreamText(), '');
+});
