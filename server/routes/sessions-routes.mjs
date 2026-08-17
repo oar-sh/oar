@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
+import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
@@ -3121,6 +3122,24 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  // Revoke every active share for a conversation. Without this a share link was
+  // permanent (revoked_at existed in the schema and was checked on read, but no
+  // route ever set it), so a leaked URL could never be invalidated.
+  app.delete('/api/conversation/:id/share', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const share = stmts.getConversationShareByConversationId?.get(conversationId) || null;
+    if (!share?.token) {
+      return res.status(404).json({ error: 'No active share to revoke' });
+    }
+    const now = new Date().toISOString();
+    const result = stmts.revokeConversationSharesByConversationId?.run(now, conversationId);
+    // Drop any live shared viewers so they lose access immediately.
+    io.emit('share_revoked', { conversationId });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, conversationId, revokedAt: now, revokedCount: Number(result?.changes || 0) });
+  });
+
   app.get('/api/shared/:token', (req, res) => {
     const token = normalizeShareToken(req.params.token);
     if (!token) return res.status(404).json({ error: 'Shared conversation not found' });
@@ -3240,9 +3259,11 @@ export function registerSessionsRoutes(app, deps) {
     if (!file) return res.status(404).json({ error: 'Shared attachment not found' });
     const filePath = uploadPathForSha(sha256);
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
-    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+    // Unauthenticated share viewers: neutralize executable types (HTML/SVG),
+    // force nosniff + sandbox so an attachment can't run as script on this origin.
     res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    applySafeServedContentHeaders(res, file.mime_type, { fileName: file.name || file.file_name || '' });
     const stream = fs.createReadStream(filePath);
     stream.on('error', () => {
       if (!res.headersSent) {
@@ -3293,9 +3314,9 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(404).json({ error: 'Shared attachment not found' });
     }
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Shared attachment not found' });
-    res.setHeader('Content-Type', attachment.type || 'application/octet-stream');
     res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    applySafeServedContentHeaders(res, attachment.type);
     const stream = fs.createReadStream(filePath);
     stream.on('error', () => {
       if (!res.headersSent) {

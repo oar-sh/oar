@@ -169,3 +169,21 @@ test('shared upload route handles stream errors explicitly', () => {
   assert.match(source, /stream\.on\('error', \(\) => \{/);
   assert.match(source, /res\.status\(500\)\.json\(\{ error: 'Failed to stream shared attachment' \}\);/);
 });
+
+test('an authenticated share revoke route exists and invalidates active shares (M2)', () => {
+  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const source = fs.readFileSync(filePath, 'utf8');
+  assert.match(source, /app\.delete\('\/api\/conversation\/:id\/share', auth/);
+  assert.match(source, /stmts\.revokeConversationSharesByConversationId\?\.run\(now, conversationId\)/);
+  assert.match(source, /io\.emit\('share_revoked'/);
+});
+
+test('shared attachment content is served with neutralized type + nosniff + sandbox CSP (H3)', () => {
+  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const source = fs.readFileSync(filePath, 'utf8');
+  // The shared (unauthenticated) upload + generated-image routes route through
+  // the safe-served-content helper instead of echoing the stored MIME inline.
+  assert.match(source, /applySafeServedContentHeaders\(res, file\.mime_type/);
+  assert.match(source, /applySafeServedContentHeaders\(res, attachment\.type\)/);
+  assert.doesNotMatch(source, /res\.setHeader\('Content-Type', file\.mime_type \|\| 'application\/octet-stream'\)/);
+});

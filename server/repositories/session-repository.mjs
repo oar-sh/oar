@@ -310,5 +310,11 @@ export function createSessionRepository(db) {
           WHERE token = ?
             AND (revoked_at IS NULL OR revoked_at = '')
         `),
+        revokeConversationSharesByConversationId: db.prepare(`
+          UPDATE conversation_shares
+          SET revoked_at = ?
+          WHERE conversation_id = ?
+            AND (revoked_at IS NULL OR revoked_at = '')
+        `),
     };
 }

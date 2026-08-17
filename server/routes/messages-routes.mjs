@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
+import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
 import {
   shouldParkForRestart,
   parkPendingQueueForRestart,
@@ -1516,10 +1517,11 @@ function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDe
   const rangeHeader = req.headers['range'];
 
   res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Content-Type', meta.contentType);
-  res.setHeader('Content-Disposition', `inline; filename="${name}"`);
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Neutralize browser-executable types (HTML/SVG/XML), force nosniff, and
+  // sandbox the response so a worker-written workspace file can't run as script
+  // on this origin. Media stays inline for preview; everything else downloads.
+  applySafeServedContentHeaders(res, meta.contentType, { fileName: name });
 
   const onStreamError = (error) => {
     if (cacheDelete) cacheDelete(filePath);
@@ -3102,8 +3104,8 @@ export function registerMessagesRoutes(app, deps) {
     if (!file) return res.status(404).json({ error: 'Not found' });
     const filePath = uploadPathForSha(sha256);
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
-    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
     res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    applySafeServedContentHeaders(res, file.mime_type, { fileName: file.name || file.file_name || '' });
     fs.createReadStream(filePath).pipe(res);
   });
 

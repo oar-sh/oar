@@ -24,6 +24,7 @@ import {
   normalizeWorkspaceRootKey,
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
+import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { rebuildRecentWorkspaceRootsTable } from './migrations/0002-recent-workspace-roots-path-key.mjs';
 import { ensurePushSubscriptionsTable } from './migrations/0003-push-subscriptions.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
@@ -1519,8 +1520,12 @@ if (fs.existsSync(CONFIG_PATH)) {
   try { config = { ...config, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) }; }
   catch (e) { console.error('Failed to read config.json, using defaults.'); }
 } else {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
+// config.json stores the auth token in plaintext; keep it owner-only regardless
+// of how it was created (umask, an older build, or a manual edit). Best-effort:
+// chmod is a no-op on filesystems that don't support POSIX modes.
+try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
 
 // --token <value> on the command line overrides config.json (in-memory only, not persisted)
 const tokenArgIdx = process.argv.indexOf('--token');
@@ -5205,6 +5210,10 @@ function resolveWorkspaceFilePath(rawPath, rootPath = null) {
   const relativeToRoot = path.relative(activeWorkspaceRoot, absolutePath);
   if (!relativeToRoot || relativeToRoot === '.') return null;
   if (relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot)) return null;
+  // Lexical containment is not enough: a symlink inside the workspace resolves to
+  // a real path outside it and the serve path follows it. Match the tree/list
+  // walkers' symlink rejection by verifying the real path stays within the root.
+  if (!isRealPathWithinRoot(absolutePath, activeWorkspaceRoot)) return null;
   return absolutePath;
 }
 
@@ -6559,6 +6568,13 @@ const cursorSessionRootResolver = createCursorSessionRootResolver({ fs, path, se
 
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
+// Trust boundary for X-Forwarded-* headers. Default 'loopback' matches the
+// localhost-first deployment (a cloudflared/caddy tunnel runs on the same host
+// and connects over 127.0.0.1), so req.protocol/req.secure/req.ip reflect the
+// real edge only when the immediate peer is trusted — a direct client can no
+// longer forge those headers. Operators behind a remote proxy can widen this
+// via config.trustProxy (e.g. a hop count or subnet).
+app.set('trust proxy', config.trustProxy ?? 'loopback');
 const httpServer = http.createServer(app);
 httpServer.prependListener('request', (req, _res) => {
   rewriteSocketIoRequestPath(req, remotePath);
@@ -7106,6 +7122,16 @@ app.use((req, _res, next) => {
   stripRequestPathPrefix(req, remotePath);
   next();
 });
+// Baseline security headers on every response. Served-file/attachment endpoints
+// layer a stricter sandbox CSP on top (see applySafeServedContentHeaders). A
+// global script-src CSP is intentionally omitted for now: the SPA relies on
+// inline event handlers, so a strict policy needs a refactor first (follow-up).
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
 app.get('/socket.io/socket.io.js', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   res.sendFile(SOCKET_IO_CLIENT_JS_PATH, (error) => {
@@ -7456,18 +7482,30 @@ function runtimeLogPrefix() {
 }
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
+// Constant-time comparison so the auth token can't be recovered through response
+// timing. The token length is fixed (a UUID), so the length short-circuit leaks
+// nothing secret; any empty/missing value is a non-match.
+function tokensMatch(presented, expected) {
+  const a = Buffer.from(String(presented || ''), 'utf8');
+  const b = Buffer.from(String(expected || ''), 'utf8');
+  if (a.length === 0 || b.length === 0 || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
 function auth(req, res, next) {
   const cookies = parseCookies(req.headers.cookie);
-  const secureAttr = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https'
-    ? '; Secure'
-    : '';
+  // req.secure is derived through the configured `trust proxy` boundary, so a
+  // direct (untrusted) client can no longer force a non-Secure cookie by
+  // omitting X-Forwarded-Proto.
+  const secureAttr = req.secure ? '; Secure' : '';
+  // Note: the token is intentionally NOT read from req.body — a request body is
+  // an easy CSRF/logging vector and has no legitimate use here. Header, query
+  // (first-load bootstrap only), and the HttpOnly cookie remain.
   const token =
     (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
     req.query.token ||
-    req.body?.token ||
     cookies[AUTH_COOKIE];
-  if (token === config.authToken) {
-    if (res && cookies[AUTH_COOKIE] !== config.authToken) {
+  if (tokensMatch(token, config.authToken)) {
+    if (res && !tokensMatch(cookies[AUTH_COOKIE], config.authToken)) {
       appendSetCookie(res, `${AUTH_COOKIE}=${encodeURIComponent(config.authToken)}; Path=${COOKIE_PATH}; Max-Age=2592000; SameSite=Lax; HttpOnly${secureAttr}`);
     }
     return next();
@@ -7681,10 +7719,12 @@ function sanitizeRelayQuestionContext(rawContext) {
 
 
 // ─── Socket.io Auth ───────────────────────────────────────────────────────────
-io.use((socket, next) => {
+function socketAuthToken(socket) {
   const cookies = parseCookies(socket.request.headers.cookie);
-  const token = socket.handshake.auth?.token || socket.handshake.query?.token || cookies[AUTH_COOKIE];
-  if (token === config.authToken) return next();
+  return socket.handshake.auth?.token || socket.handshake.query?.token || cookies[AUTH_COOKIE];
+}
+io.use((socket, next) => {
+  if (tokensMatch(socketAuthToken(socket), config.authToken)) return next();
   next(new Error('Unauthorized'));
 });
 
@@ -7694,6 +7734,14 @@ io.engine.on('initial_headers', (headers, req) => {
 });
 
 io.on('connection', (socket) => {
+  // connectionStateRecovery runs with skipMiddlewares: true, so a recovered
+  // socket bypasses the io.use() token gate above. Re-validate here and drop it
+  // on mismatch so a recovered session still requires the auth token (and a
+  // rotated token takes effect immediately).
+  if (socket.recovered && !tokensMatch(socketAuthToken(socket), config.authToken)) {
+    socket.disconnect(true);
+    return;
+  }
   const cookies = parseCookies(socket.request.headers.cookie);
   socket.data.sessionId = socket.handshake.auth?.clientId || socket.handshake.query?.clientId || cookies[SESSION_COOKIE] || null;
   // Liveness probe ack for verifySocketLiveness() in public/app/socket-handlers.js:
