@@ -65,3 +65,18 @@ test('with nothing usable the first non-off tier is chosen', () => {
   assert.equal(resolveComposerReasoningEffort({ supportedEfforts: ['none'] }), 'none');
   assert.equal(resolveComposerReasoningEffort({ supportedEfforts: [] }), '');
 });
+
+test('ultracode follows a preference but is never the fallback tier', () => {
+  const claudeLadder = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'];
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'ultracode',
+    supportedEfforts: claudeLadder,
+  }), 'ultracode');
+  // Nothing stored: the expensive top rung must not be a silent default.
+  assert.equal(resolveComposerReasoningEffort({ supportedEfforts: claudeLadder }), 'low');
+  // Model switch to a non-xhigh model drops the remembered ultracode cleanly.
+  assert.equal(resolveComposerReasoningEffort({
+    preferredEffort: 'ultracode',
+    supportedEfforts: ['none', 'low', 'medium', 'high'],
+  }), 'low');
+});

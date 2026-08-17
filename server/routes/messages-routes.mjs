@@ -23,6 +23,7 @@ import {
 import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services/plan-usage-claude.mjs';
 import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
+import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning-effort.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
@@ -4153,7 +4154,7 @@ export function registerMessagesRoutes(app, deps) {
       const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
       const supported = Array.isArray(configuredClaude?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
         ? configuredClaude.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
-        : ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+        : [...DEFAULT_CLAUDE_REASONING_EFFORTS];
       const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort: effort === 'none' ? 'none' : effort, supported };
     };

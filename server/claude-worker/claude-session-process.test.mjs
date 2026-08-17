@@ -330,6 +330,69 @@ test('per-turn model and effort reach the SDK spawn', async () => {
   assert.equal(capturedSpawns[0].reasoningEffort, 'xhigh');
 });
 
+test('ultracode reaches the SDK spawn as the sentinel, not a bare effort', async () => {
+  const stub = makeApiStub();
+  const capturedSpawns = [];
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      capturedSpawns.push(params);
+      return fakeTurn([initMessage('native-1'), resultMessage('ok', 'native-1')]);
+    },
+  });
+  await runner.handlePendingPayload({
+    message: { ...baseMessage, reasoningEffort: 'ultracode' },
+  });
+  // The adapter owns the translation to effort 'xhigh' + settings flags; the
+  // runner must hand it the sentinel untouched.
+  assert.equal(capturedSpawns[0].reasoningEffort, 'ultracode');
+});
+
+test('mid-session effort changes toggle the ultracode flags, idempotently', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const flagCalls = [];
+  turn.applyFlagSettings = async (settings) => { flagCalls.push(settings); };
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, reasoningEffort: 'medium' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+  assert.deepEqual(flagCalls, [], 'spawn-time effort must not produce a flag-settings call');
+
+  const second = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', text: 'go ultracode', reasoningEffort: 'ultracode' },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('ultracode answer', 'native-1'));
+  assert.equal(await second, true);
+  assert.deepEqual(flagCalls, [
+    { ultracode: true, enableWorkflows: true, effortLevel: 'xhigh' },
+  ]);
+
+  // Same effort again: no redundant control request.
+  const third = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-3', text: 'still ultracode', reasoningEffort: 'ultracode' },
+  });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  turn.emit(resultMessage('still ultracode', 'native-1'));
+  assert.equal(await third, true);
+  assert.equal(flagCalls.length, 1, 'unchanged effort must not re-send flag settings');
+
+  // Leaving ultracode clears the session flags alongside the new effort.
+  const fourth = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-4', text: 'back to high', reasoningEffort: 'high' },
+  });
+  await waitFor(() => turn.pushed.length === 4, { label: 'fourth push' });
+  turn.emit(resultMessage('back to high', 'native-1'));
+  assert.equal(await fourth, true);
+  assert.deepEqual(flagCalls[1], { ultracode: null, enableWorkflows: null, effortLevel: 'high' });
+
+  turn.endInput();
+  await settled(runner);
+});
+
 test('sdk failure publishes a terminal response instead of hanging the queue', async () => {
   const stub = makeApiStub();
   const runner = makeRunner({

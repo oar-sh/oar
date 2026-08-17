@@ -12,8 +12,10 @@ import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs'
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 import {
+  DEFAULT_CLAUDE_REASONING_EFFORTS,
   resolveProviderReasoningEffort,
   supportedReasoningEffortsForProviderModel,
+  withClaudeUltracodeTier,
 } from '../services/provider-reasoning-effort.mjs';
 import { mapUsageSnapshotRow, fetchUsageSummaryPromise } from '../services/usage-snapshot-helpers.mjs';
 import { readStoredClaudeContextUsage } from '../services/claude-context-usage.mjs';
@@ -338,7 +340,7 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
   const effortsByModel = claudeSettings?.effortsByModel && typeof claudeSettings.effortsByModel === 'object'
     ? claudeSettings.effortsByModel
     : {};
-  const defaultClaudeEfforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+  const defaultClaudeEfforts = [...DEFAULT_CLAUDE_REASONING_EFFORTS];
   const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
   const providersByModel = { ...(modelState?.providersByModel || {}) };
   for (const claudeModel of claudeBaseModels) {
@@ -348,8 +350,10 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
     const effortsForModel = Array.isArray(effortsByModel[lowerKey]) && effortsByModel[lowerKey].length
       ? effortsByModel[lowerKey]
       : effortsByModel[`${lowerKey}[1m]`];
+    // Idempotent augmentation: getClaudeProviderSettings already derives the
+    // ultracode tier, but this function is also fed raw effort maps.
     const claudeEfforts = Array.isArray(effortsForModel) && effortsForModel.length
-      ? effortsForModel
+      ? withClaudeUltracodeTier(effortsForModel)
       : defaultClaudeEfforts;
     claudeReasoningByModel[lowerKey] = [...claudeEfforts];
     if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {

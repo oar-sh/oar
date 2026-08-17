@@ -6,6 +6,7 @@ import {
   readContextUsage,
   readPlanUsage,
   normalizeClaudeEffort,
+  claudeUltracodeFlagSettings,
   permissionModeForRelayMode,
 } from './claude-sdk-adapter.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
@@ -1027,7 +1028,11 @@ export function createClaudeSessionRunner({
       if (model) proc.modelFallback = '';
     }
     if (effort !== proc.effort) {
-      await Promise.resolve(proc.turn.applyFlagSettings?.({ effortLevel: effort || null })).catch((error) => {
+      // 'ultracode' is not an effortLevel the CLI accepts — it maps to the
+      // session-scoped ultracode/enableWorkflows flags (with the effort pinned
+      // to the xhigh the flag implies); every other change clears those flags
+      // alongside the new effortLevel.
+      await Promise.resolve(proc.turn.applyFlagSettings?.(claudeUltracodeFlagSettings(effort))).catch((error) => {
         dbg('applyFlagSettings effort failed', error?.message || String(error));
       });
       proc.effort = effort;

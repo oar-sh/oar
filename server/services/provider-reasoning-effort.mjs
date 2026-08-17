@@ -2,8 +2,26 @@
 
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 
-export const DEFAULT_CLAUDE_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+// 'ultracode' is not an Agent SDK EffortLevel: it is a relay-side sentinel for
+// the SDK's session-scoped `ultracode` settings flag (xhigh effort plus
+// standing workflow orchestration). It rides the effort ladder end to end —
+// selector option, queue column, message field — and only the Claude worker
+// translates it into `effort: 'xhigh'` + `settings: { ultracode: true }`.
+// It must never be sent as an `effort`/`effortLevel` value: the CLI's schema
+// silently discards unknown levels.
+export const CLAUDE_ULTRACODE_EFFORT = 'ultracode';
+export const DEFAULT_CLAUDE_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max', CLAUDE_ULTRACODE_EFFORT]);
 export const DEFAULT_GROK_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high']);
+
+// Ultracode requires an xhigh-capable model (the SDK's stated gate), so the
+// tier is derived from a model's discovered efforts rather than discovery —
+// `supportedModels()` never reports it. Idempotent: augmenting an
+// already-augmented ladder is a no-op.
+export function withClaudeUltracodeTier(efforts) {
+  const levels = (Array.isArray(efforts) ? efforts : []).map(normalizeEffort).filter(Boolean);
+  if (!levels.includes('xhigh') || levels.includes(CLAUDE_ULTRACODE_EFFORT)) return levels;
+  return [...levels, CLAUDE_ULTRACODE_EFFORT];
+}
 
 function normalizeEffort(value) {
   return String(value || '').trim().toLowerCase();

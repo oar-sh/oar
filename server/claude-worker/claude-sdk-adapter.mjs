@@ -7,9 +7,33 @@ const MODE_SYSTEM_PROMPT_APPEND = {
 
 const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
+// Relay sentinel for the SDK's session-scoped `ultracode` settings flag
+// (xhigh effort plus standing workflow orchestration). It arrives on the same
+// `reasoningEffort` wire field as real effort levels but must never be sent
+// as an `effort`/`effortLevel` value — the CLI's schema silently discards
+// unknown levels. `claudeUltracodeFlagSettings` is the translation.
+export const CLAUDE_ULTRACODE_EFFORT = 'ultracode';
+
 export function normalizeClaudeEffort(value) {
   const effort = String(value || '').trim().toLowerCase();
+  if (effort === CLAUDE_ULTRACODE_EFFORT) return effort;
   return CLAUDE_EFFORT_LEVELS.has(effort) ? effort : '';
+}
+
+/**
+ * The flag-settings payload that moves a live session into or out of
+ * ultracode. `enableWorkflows` is explicit because the worker loads no
+ * filesystem settings, so nothing else would switch the feature on; the
+ * effort is pinned to xhigh (what the flag implies) rather than left to the
+ * flag layer's previous `effortLevel`, so enabling ultracode always lands on
+ * the same tier regardless of adapt history. Leaving ultracode clears both
+ * flags back to their defaults alongside the newly requested effort.
+ */
+export function claudeUltracodeFlagSettings(effort) {
+  if (effort === CLAUDE_ULTRACODE_EFFORT) {
+    return { ultracode: true, enableWorkflows: true, effortLevel: 'xhigh' };
+  }
+  return { ultracode: null, enableWorkflows: null, effortLevel: effort || null };
 }
 
 export function permissionModeForRelayMode(relayMode) {
@@ -92,13 +116,18 @@ export function startClaudeSession({
 } = {}) {
   const normalizedModel = String(model || '').trim().toLowerCase();
   const effort = normalizeClaudeEffort(reasoningEffort);
+  const ultracode = effort === CLAUDE_ULTRACODE_EFFORT;
+  const effortOption = ultracode ? 'xhigh' : effort;
   const options = {
     cwd,
     permissionMode: permissionModeForRelayMode(relayMode),
     systemPrompt: systemPromptForRelayMode(relayMode),
     includePartialMessages: true,
     forwardSubagentText: true,
-    ...(effort ? { effort } : {}),
+    ...(effortOption ? { effort: effortOption } : {}),
+    // Spawn-time twin of claudeUltracodeFlagSettings: the settings layer is
+    // the only way to hand the session-scoped ultracode flag to a fresh CLI.
+    ...(ultracode ? { settings: { ultracode: true, enableWorkflows: true } } : {}),
     ...(normalizedModel && normalizedModel !== 'auto' ? { model: String(model).trim() } : {}),
     ...(String(resume || '').trim() ? { resume: String(resume).trim() } : {}),
     ...(abortController ? { abortController } : {}),

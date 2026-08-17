@@ -19,9 +19,24 @@ export function isReasoningOffUnsupported(catalog = null, providerType = '', mod
   return catalog?.reasoningOffUnsupportedByProvider?.[provider]?.[model] === true;
 }
 
+// Claude's top tier is a mode, not just more thinking: the session fans out
+// multi-agent workflows. It gets a display name and a tooltip so the ladder
+// jump in cost/behavior is visible before it is selected.
+export const CLAUDE_ULTRACODE_EFFORT = 'ultracode';
+export const ULTRACODE_EFFORT_LABEL = 'Ultracode';
+export const ULTRACODE_EFFORT_OPTION_TITLE =
+  'xhigh effort plus multi-agent workflow orchestration — expect much higher token use';
+
 export function reasoningEffortOptionLabel(effort, { reasoningOffUnsupported = false } = {}) {
   const value = String(effort || '').trim().toLowerCase();
   if (!value) return '';
   if (value === 'none' && reasoningOffUnsupported) return PROVIDER_DEFAULT_EFFORT_LABEL;
+  if (value === CLAUDE_ULTRACODE_EFFORT) return ULTRACODE_EFFORT_LABEL;
   return value;
+}
+
+export function reasoningEffortOptionTitle(effort) {
+  return String(effort || '').trim().toLowerCase() === CLAUDE_ULTRACODE_EFFORT
+    ? ULTRACODE_EFFORT_OPTION_TITLE
+    : '';
 }

@@ -233,3 +233,71 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
     await expect(reasoning.locator("option[value='high']")).toHaveText("high");
   });
 });
+
+// The Claude provider's Ultracode tier: derived from xhigh capability, shown
+// with its display label, and never the silent default. The stored efforts
+// mirror what SDK discovery persists (bare EffortLevel lists — 'none' and
+// 'ultracode' are added by the settings/catalog layers).
+const CLAUDE_SETTINGS = {
+  claude_enabled: "true",
+  claude_model: "claude-opus-5",
+  claude_models: JSON.stringify(["claude-opus-5", "claude-haiku-4-5-20251001"]),
+  claude_model_efforts: JSON.stringify({
+    "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+    "claude-haiku-4-5-20251001": ["low", "medium", "high"],
+  }),
+};
+
+test.describe("New Chat offers Ultracode only on xhigh-capable Claude models", () => {
+  const token = relayToken();
+  let db = null;
+
+  test.beforeAll(() => {
+    db = new Database(relayDbPath());
+    const now = new Date().toISOString();
+    const upsert = db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `);
+    for (const [key, value] of Object.entries(CLAUDE_SETTINGS)) upsert.run(key, value, now);
+  });
+
+  test.afterAll(() => {
+    if (!db) return;
+    const remove = db.prepare(`DELETE FROM app_settings WHERE key = ?`);
+    for (const key of Object.keys(CLAUDE_SETTINGS)) remove.run(key);
+    db.close();
+    db = null;
+  });
+
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.removeItem("copilot_selected_model");
+      localStorage.removeItem("copilot_selected_reasoning_effort");
+      localStorage.removeItem("copilot_new_chat_cwd");
+    });
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("the ladder ends in a labelled Ultracode option that is not preselected", async ({ page }) => {
+    await expect(page.locator("#new-conv-btn")).toBeEnabled();
+    await page.locator("#new-conv-btn").click();
+    await expect(page.locator("#new-conversation-model-modal")).toHaveClass(/visible/);
+    await page.locator("#new-conversation-provider-select").selectOption("claude");
+    await page.locator("#new-conversation-model-select").selectOption("claude-opus-5");
+
+    const reasoning = page.locator("#new-conversation-reasoning-select");
+    const ultracode = reasoning.locator("option[value='ultracode']");
+    await expect(ultracode).toHaveText("Ultracode");
+    await expect(reasoning.locator("option").last()).toHaveAttribute("value", "ultracode");
+    // The expensive top rung must never be the silent default.
+    await expect(reasoning).toHaveValue("low");
+
+    // A model without xhigh support gets no Ultracode rung.
+    await page.locator("#new-conversation-model-select").selectOption("claude-haiku-4-5-20251001");
+    await expect(reasoning.locator("option[value='high']")).toHaveCount(1);
+    await expect(reasoning.locator("option[value='ultracode']")).toHaveCount(0);
+    await expect(reasoning.locator("option[value='xhigh']")).toHaveCount(0);
+  });
+});

@@ -58,18 +58,19 @@ test('claude catalog appends models with the claude provider id', () => {
   assert.deepEqual(result.providersByModel['claude-sonnet-5'], ['claude']);
   assert.deepEqual(result.providersByModel['claude-opus-5'], ['claude']);
   assert.equal(result.modelMetadataByModel['claude-sonnet-5'].provider, 'claude');
-  // Without discovered effort metadata every level is offered; the SDK
-  // silently downgrades unsupported ones.
+  // Without discovered effort metadata every level is offered (the SDK
+  // silently downgrades unsupported ones), including the derived ultracode
+  // tier the full ladder's xhigh implies.
   assert.deepEqual(
     result.reasoningByProvider.claude['claude-sonnet-5'],
-    ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+    ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
   );
   // Existing entries untouched.
   assert.deepEqual(result.providersByModel['gpt-5.4-mini'], ['github-copilot']);
   assert.deepEqual(result.reasoningByProvider.github, { 'gpt-5.4-mini': ['medium'] });
 });
 
-test('claude catalog uses discovered per-model effort levels', () => {
+test('claude catalog uses discovered per-model effort levels and gates ultracode on xhigh', () => {
   const base = { models: [], providersByModel: {}, reasoningByModel: {}, modelMetadataByModel: {} };
   const result = buildModelCatalogWithClaudeProvider(base, {
     enabled: true,
@@ -80,10 +81,12 @@ test('claude catalog uses discovered per-model effort levels', () => {
       'claude-haiku-4-5-20251001': ['none', 'low', 'medium', 'high'],
     },
   });
+  // xhigh-capable: the derived ultracode tier tops the ladder.
   assert.deepEqual(
     result.reasoningByProvider.claude['claude-sonnet-5'],
-    ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+    ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
   );
+  // Not xhigh-capable: no ultracode.
   assert.deepEqual(
     result.reasoningByProvider.claude['claude-haiku-4-5-20251001'],
     ['none', 'low', 'medium', 'high'],

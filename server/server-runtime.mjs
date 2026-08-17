@@ -54,6 +54,7 @@ import {
   toDriveWebPath as _toDriveWebPath,
   normalizeLinuxAbsolutePath as _normalizeLinuxAbsolutePath,
 } from './services/drives-path-helpers.mjs';
+import { DEFAULT_CLAUDE_REASONING_EFFORTS, withClaudeUltracodeTier } from './services/provider-reasoning-effort.mjs';
 import { createPlanUsageService } from './services/plan-usage-service.mjs';
 import { normalizeCursorAllowanceSettings } from './services/plan-usage-cursor.mjs';
 import { normalizeGrokAllowanceSettings } from './services/plan-usage-grok.mjs';
@@ -352,12 +353,13 @@ function getClaudeProviderSettings() {
     const key = String(availableModel || '').trim().toLowerCase();
     if (!key) continue;
     const discoveredEfforts = storedEfforts[key];
-    // 'none' (SDK default) is always offered; discovered levels follow. When a
-    // model was never discovered, offer the full ladder — the SDK silently
-    // downgrades unsupported levels.
+    // 'none' (SDK default) is always offered; discovered levels follow, with
+    // the derived 'ultracode' tier on xhigh-capable models. When a model was
+    // never discovered, offer the full ladder — the SDK silently downgrades
+    // unsupported levels.
     effortsByModel[key] = Array.isArray(discoveredEfforts) && discoveredEfforts.length
-      ? ['none', ...discoveredEfforts]
-      : [...CLAUDE_REASONING_EFFORTS];
+      ? withClaudeUltracodeTier(['none', ...discoveredEfforts])
+      : [...DEFAULT_CLAUDE_REASONING_EFFORTS];
   }
   return {
     // The Claude runtime authenticates through the host's logged-in Claude
@@ -1208,9 +1210,10 @@ const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
 const CLAUDE_ENABLED_MODELS_SETTING_KEY = 'claude_enabled_models';
 const CLAUDE_MODEL_EFFORTS_SETTING_KEY = 'claude_model_efforts';
-// 'none' = let the SDK use its default effort (high); the rest map straight
-// onto the Agent SDK's EffortLevel values.
-const CLAUDE_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+// The set of levels the SDK itself can report/accept as EffortLevel values.
+// Discovery results are filtered through this, so it must NOT contain the
+// relay's derived 'ultracode' sentinel — supportedModels() never reports it
+// and getClaudeProviderSettings derives it from 'xhigh' instead.
 const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 const DEFAULT_CLAUDE_MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];

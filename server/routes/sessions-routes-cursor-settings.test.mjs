@@ -287,7 +287,7 @@ test('cursor catalog composes onto the openai and claude layers', () => {
   assert.deepEqual(combined.providersByModel['gpt-5.4-mini'], ['github-copilot']);
   assert.ok(combined.reasoningByProvider.github);
   assert.ok(combined.reasoningByProvider.openai);
-  assert.deepEqual(combined.reasoningByProvider.claude['claude-sonnet-5'], ['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+  assert.deepEqual(combined.reasoningByProvider.claude['claude-sonnet-5'], ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode']);
   assert.deepEqual(combined.reasoningByProvider.cursor, {
     'composer-2.5': ['none'],
     cheetah: ['none'],

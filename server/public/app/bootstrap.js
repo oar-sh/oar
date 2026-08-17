@@ -111,7 +111,7 @@ import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserS
 import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import { dataTransferHasFiles } from './composer-paste.mjs';
-import { isReasoningOffUnsupported, reasoningEffortOptionLabel } from './reasoning-effort-labels.mjs';
+import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
 import {
   firstDefinedPreference,
   normalizePreferenceValue,
@@ -1399,6 +1399,8 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '', { persis
     const opt = document.createElement('option');
     opt.value = effort;
     opt.textContent = reasoningEffortOptionLabel(effort, { reasoningOffUnsupported });
+    const optionTitle = reasoningEffortOptionTitle(effort);
+    if (optionTitle) opt.title = optionTitle;
     select.appendChild(opt);
   }
   const resolved = resolveComposerReasoningEffort({

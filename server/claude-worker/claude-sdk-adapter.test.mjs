@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  CLAUDE_ULTRACODE_EFFORT,
+  claudeUltracodeFlagSettings,
   createCanUseTool,
   normalizeClaudeEffort,
   permissionModeForRelayMode,
@@ -160,13 +162,55 @@ test('none/invalid reasoning effort omits the effort option (SDK default)', () =
   }
 });
 
-test('normalizeClaudeEffort accepts exactly the SDK effort ladder', () => {
-  for (const value of ['low', 'medium', 'high', 'xhigh', 'max']) {
+test('normalizeClaudeEffort accepts the SDK effort ladder plus the ultracode sentinel', () => {
+  for (const value of ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']) {
     assert.equal(normalizeClaudeEffort(value), value);
     assert.equal(normalizeClaudeEffort(value.toUpperCase()), value);
   }
   assert.equal(normalizeClaudeEffort('none'), '');
   assert.equal(normalizeClaudeEffort('extreme'), '');
+});
+
+test('ultracode spawns as xhigh effort plus the session-scoped settings flags', () => {
+  let captured = null;
+  startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/workspace',
+    reasoningEffort: CLAUDE_ULTRACODE_EFFORT,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  // 'ultracode' is not an EffortLevel — the CLI schema would silently drop it.
+  assert.equal(captured.options.effort, 'xhigh');
+  assert.deepEqual(captured.options.settings, { ultracode: true, enableWorkflows: true });
+});
+
+test('non-ultracode spawns pass no settings layer', () => {
+  for (const value of ['xhigh', 'max', 'none', '']) {
+    let captured = null;
+    startClaudeSession({
+      content: [{ type: 'text', text: 'hi' }],
+      cwd: '/workspace',
+      reasoningEffort: value,
+      queryImpl: (params) => { captured = params; return {}; },
+    });
+    assert.equal('settings' in captured.options, false, `settings should be omitted for "${value}"`);
+  }
+});
+
+test('claudeUltracodeFlagSettings translates the sentinel both ways', () => {
+  assert.deepEqual(
+    claudeUltracodeFlagSettings(CLAUDE_ULTRACODE_EFFORT),
+    { ultracode: true, enableWorkflows: true, effortLevel: 'xhigh' },
+  );
+  assert.deepEqual(
+    claudeUltracodeFlagSettings('medium'),
+    { ultracode: null, enableWorkflows: null, effortLevel: 'medium' },
+  );
+  // Effort 'none' (normalized to '') resets the flag layer entirely.
+  assert.deepEqual(
+    claudeUltracodeFlagSettings(''),
+    { ultracode: null, enableWorkflows: null, effortLevel: null },
+  );
 });
 
 test('canUseTool tells the model to restate the plan when no board was surfaced', async () => {

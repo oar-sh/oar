@@ -4,6 +4,9 @@ import assert from 'node:assert/strict';
 import {
   isReasoningOffUnsupported,
   reasoningEffortOptionLabel,
+  reasoningEffortOptionTitle,
+  ULTRACODE_EFFORT_LABEL,
+  ULTRACODE_EFFORT_OPTION_TITLE,
 } from './reasoning-effort-labels.mjs';
 
 const catalog = {
@@ -24,4 +27,12 @@ test('"none" is labelled as the provider default only where it means that', () =
   assert.equal(reasoningEffortOptionLabel('none', { reasoningOffUnsupported: false }), 'none');
   assert.equal(reasoningEffortOptionLabel('high', { reasoningOffUnsupported: true }), 'high');
   assert.equal(reasoningEffortOptionLabel(''), '');
+});
+
+test('ultracode gets a display name and a tooltip; plain tiers get neither', () => {
+  assert.equal(reasoningEffortOptionLabel('ultracode'), ULTRACODE_EFFORT_LABEL);
+  assert.equal(reasoningEffortOptionLabel('ULTRACODE'), ULTRACODE_EFFORT_LABEL);
+  assert.equal(reasoningEffortOptionTitle('ultracode'), ULTRACODE_EFFORT_OPTION_TITLE);
+  assert.equal(reasoningEffortOptionTitle('xhigh'), '');
+  assert.equal(reasoningEffortOptionTitle(''), '');
 });

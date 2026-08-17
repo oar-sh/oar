@@ -49,7 +49,7 @@ import {
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
 } from './new-conversation-model-choice.mjs';
-import { isReasoningOffUnsupported, reasoningEffortOptionLabel } from './reasoning-effort-labels.mjs';
+import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
 import {
   conversationProviderIndicatorKey,
   conversationProviderIndicatorLabel,
@@ -673,6 +673,8 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
     const option = document.createElement('option');
     option.value = effort;
     option.textContent = reasoningEffortOptionLabel(effort, { reasoningOffUnsupported });
+    const optionTitle = reasoningEffortOptionTitle(effort);
+    if (optionTitle) option.title = optionTitle;
     select.appendChild(option);
   }
   const preferred = resolvePreferredReasoningEffort(efforts, [

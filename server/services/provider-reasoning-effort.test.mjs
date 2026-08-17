@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  CLAUDE_ULTRACODE_EFFORT,
   resolveProviderReasoningEffort,
   supportedReasoningEffortsForProviderModel,
+  withClaudeUltracodeTier,
 } from './provider-reasoning-effort.mjs';
 
 test('cursor tiers come from discovery and stay unknown when undiscovered', () => {
@@ -21,11 +23,41 @@ test('cursor tiers come from discovery and stay unknown when undiscovered', () =
 test('claude and grok fall back to their full ladders', () => {
   assert.deepEqual(
     supportedReasoningEffortsForProviderModel({ providerType: 'claude', model: 'claude-opus-5' }),
-    ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+    ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
   );
   assert.deepEqual(
     supportedReasoningEffortsForProviderModel({ providerType: 'grok', model: 'grok-4.5' }),
     ['none', 'low', 'medium', 'high'],
+  );
+});
+
+test('ultracode is derived from xhigh capability, never from discovery', () => {
+  // The SDK's supportedModels() never reports 'ultracode'; the tier exists
+  // exactly for models that can run xhigh (the flag's own requirement).
+  assert.deepEqual(
+    withClaudeUltracodeTier(['none', 'low', 'medium', 'high', 'xhigh']),
+    ['none', 'low', 'medium', 'high', 'xhigh', CLAUDE_ULTRACODE_EFFORT],
+  );
+  assert.deepEqual(
+    withClaudeUltracodeTier(['none', 'low', 'medium', 'high']),
+    ['none', 'low', 'medium', 'high'],
+  );
+  // Idempotent: augmenting an already-augmented ladder must not double it.
+  assert.deepEqual(
+    withClaudeUltracodeTier(['xhigh', CLAUDE_ULTRACODE_EFFORT]),
+    ['xhigh', CLAUDE_ULTRACODE_EFFORT],
+  );
+  assert.deepEqual(withClaudeUltracodeTier(null), []);
+});
+
+test('ultracode never leaks into non-claude ladders', () => {
+  assert.ok(
+    !supportedReasoningEffortsForProviderModel({ providerType: 'grok', model: 'grok-4.5' }).includes('ultracode'),
+  );
+  const cursorSettings = { effortsByModel: { 'composer-2.5': ['none', 'low', 'high', 'xhigh'] } };
+  assert.ok(
+    !supportedReasoningEffortsForProviderModel({ providerType: 'cursor', model: 'composer-2.5', cursorSettings })
+      .includes('ultracode'),
   );
 });
 
