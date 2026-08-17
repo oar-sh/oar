@@ -436,6 +436,25 @@ export function createSdkMessageNormalizer() {
       return [{ channel: 'init', payload: { sessionId: initSessionId, model: initModel } }];
     }
 
+    // The CLI retried a safeguards-refused request on a fallback model
+    // (e.g. Fable 5 → Opus 4.8, scope "session"). From here on this turn's
+    // output comes from the fallback model, so the recorded model must follow
+    // it — the init-channel action updates the turn's responseModel in place.
+    // The CLI's own notice is surfaced as an activity line; silently flipping
+    // models is exactly the confusion this exists to prevent (conv 3366b9d3).
+    if (type === 'system' && sdkMessage.subtype === 'model_refusal_fallback') {
+      const actions = [];
+      const fallbackModel = String(sdkMessage.fallbackModel || '').trim();
+      if (fallbackModel) {
+        initModel = fallbackModel;
+        actions.push({ channel: 'init', payload: { sessionId: initSessionId, model: fallbackModel } });
+      }
+      const notice = String(sdkMessage.content || '').trim()
+        || `Model switched to ${fallbackModel || 'a fallback model'} after a refusal.`;
+      actions.push({ channel: 'activity', payload: { text: truncate(notice, 500), subagentRunId: null } });
+      return actions;
+    }
+
     if (type === 'stream_event') {
       return normalizeStreamEvent(sdkMessage);
     }

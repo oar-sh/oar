@@ -1155,6 +1155,99 @@ test('an AskUserQuestion between turns attaches to a fresh continuation turn ins
   await settled(runner);
 });
 
+test('a session-scoped refusal fallback is recorded truthfully and the pinned model is repinned next turn', async () => {
+  // Live incident (conv 3366b9d3): a security-audit session pinned to
+  // claude-fable-5[1m] tripped Fable's safeguards; the CLI switched the whole
+  // session to Opus 4.8 (system/model_refusal_fallback, scope "session") and
+  // every later turn silently ran — and was partly mis-recorded as — the
+  // wrong model until a process respawn reset it.
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const setModelCalls = [];
+  turn.setModel = async (model) => { setModelCalls.push(model); };
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pinned = { ...baseMessage, model: 'claude-fable-5[1m]' };
+  const first = runner.handlePendingPayload({ message: pinned });
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5' });
+  // Mid-turn, the API refuses on Fable and the CLI retries on the fallback.
+  turn.emit({
+    type: 'system',
+    subtype: 'model_refusal_fallback',
+    direction: 'retry',
+    scope: 'session',
+    trigger: 'refusal',
+    originalModel: 'claude-fable-5',
+    fallbackModel: 'claude-opus-4-8',
+    content: 'Safeguards flagged this message. Switched to Opus 4.8.',
+  });
+  turn.emit(assistantText('answer from the fallback model'));
+  turn.emit(resultMessage('answer from the fallback model', 'native-1'));
+  assert.equal(await first, true);
+
+  const firstResponse = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(
+    firstResponse.body.model,
+    'claude-opus-4-8',
+    'the fallback turn must be attributed to the model that actually ran',
+  );
+  const notice = stub.calls.find(
+    (call) => call.routePath === '/api/activity' && /Switched to Opus 4.8/.test(call.body.text || ''),
+  );
+  assert.ok(notice, 'the model switch must be visible to the user');
+
+  // The next delivered turn re-asserts the pinned model even though the
+  // relay-side request never changed.
+  const second = runner.handlePendingPayload({ message: { ...pinned, id: 'q-2', text: 'next question' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  assert.deepEqual(setModelCalls, ['claude-fable-5[1m]'], 'the drifted session must be repinned');
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5' });
+  turn.emit(resultMessage('back on the pinned model', 'native-1'));
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.model, 'claude-fable-5');
+  // The repin is one-shot: a third turn with no new fallback stays quiet.
+  const third = runner.handlePendingPayload({ message: { ...pinned, id: 'q-3', text: 'third' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  assert.equal(setModelCalls.length, 1, 'no redundant setModel once repinned');
+  turn.emit(resultMessage('third answer', 'native-1'));
+  assert.equal(await third, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an auto composer keeps the CLI\'s refusal fallback instead of repinning', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const setModelCalls = [];
+  turn.setModel = async (model) => { setModelCalls.push(model); };
+  const runner = makeRunner({ stub, startImpl: () => turn, defaultModel: '' });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, model: 'auto' } });
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5' });
+  turn.emit({
+    type: 'system',
+    subtype: 'model_refusal_fallback',
+    direction: 'retry',
+    scope: 'session',
+    originalModel: 'claude-fable-5',
+    fallbackModel: 'claude-opus-4-8',
+    content: 'Safeguards flagged this message. Switched to Opus 4.8.',
+  });
+  turn.emit(resultMessage('fallback answer', 'native-1'));
+  assert.equal(await first, true);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'auto', text: 'again' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  assert.deepEqual(setModelCalls, [], 'auto means the CLI owns the model; no repin');
+  turn.emit(resultMessage('still on the fallback', 'native-1'));
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.model, 'claude-opus-4-8', 'attribution follows what actually runs');
+  turn.endInput();
+  await settled(runner);
+});
+
 test('the CLI-reported model backs the response when the composer says auto', async () => {
   const stub = makeApiStub();
   const turn = scriptedTurn();

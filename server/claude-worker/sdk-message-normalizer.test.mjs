@@ -620,3 +620,25 @@ test('redacted thinking surfaces as a placeholder instead of vanishing', () => {
   assert.ok(thought);
   assert.match(thought.payload.text, /redacted/i);
 });
+
+test('a model refusal fallback updates the turn model and surfaces the notice', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({ type: 'system', subtype: 'init', session_id: 'sess-1', model: 'claude-fable-5' });
+  const actions = normalizer.normalize({
+    type: 'system',
+    subtype: 'model_refusal_fallback',
+    direction: 'retry',
+    scope: 'session',
+    originalModel: 'claude-fable-5',
+    fallbackModel: 'claude-opus-4-8',
+    content: 'Safeguards flagged this message. Switched to Opus 4.8.',
+  });
+  assert.deepEqual(actions[0], { channel: 'init', payload: { sessionId: 'sess-1', model: 'claude-opus-4-8' } });
+  assert.equal(actions[1].channel, 'activity');
+  assert.match(actions[1].payload.text, /Switched to Opus 4.8/);
+  // The turn's result now reports the model that actually produced it.
+  const [result] = normalizer.normalize({
+    type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: 'sess-1', num_turns: 1, duration_api_ms: 5,
+  });
+  assert.equal(result.payload.model, 'claude-opus-4-8');
+});

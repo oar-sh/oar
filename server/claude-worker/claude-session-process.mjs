@@ -542,6 +542,30 @@ export function createClaudeSessionRunner({
       }
       return;
     }
+    if (subtype === 'model_refusal_fallback') {
+      // The CLI retried a safeguards-refused request on a fallback model
+      // (Fable 5 → Opus 4.8 in conv 3366b9d3). Track it at process level:
+      // later contexts must seed the model that is actually running, and a
+      // session-scoped switch must be undone on the next delivered turn when
+      // the composer pinned a model (adaptProcess repins via setModel). An
+      // `auto` composer keeps the CLI's own behavior — only the recorded
+      // model follows the switch.
+      const fallbackModel = String(sdkMessage.fallbackModel || '').trim();
+      if (fallbackModel) {
+        proc.initModel = fallbackModel;
+        if (String(sdkMessage.scope || '').trim().toLowerCase() === 'session') {
+          proc.modelFallback = fallbackModel;
+        }
+      }
+      // With a turn active the normalizer surfaces the CLI's notice (and the
+      // attribution update); between turns the notice carries to the next one.
+      if (!proc.activeCtx) {
+        const notice = String(sdkMessage.content || '').trim()
+          || `Model switched to ${fallbackModel || 'a fallback model'} after a refusal.`;
+        proc.pendingActivities.push(notice.slice(0, 2000));
+      }
+      return;
+    }
     if (subtype === 'background_tasks_changed') {
       const tasks = Array.isArray(sdkMessage.tasks) ? sdkMessage.tasks : [];
       const previous = proc.liveTasks;
@@ -800,6 +824,11 @@ export function createClaudeSessionRunner({
       liveTasks: new Map(),
       knownTasks: new Set(),
       initModel: '',
+      // Set when the CLI reported a session-scoped refusal fallback; the next
+      // delivered turn repins the composer's model instead of trusting
+      // `model !== proc.model` (the relay's request never changed — the CLI
+      // drifted underneath it).
+      modelFallback: '',
       notificationPendingAt: 0,
       pendingActivities: [],
       activeCtx: null,
@@ -938,11 +967,20 @@ export function createClaudeSessionRunner({
     // to `auto` (model '') or effort `none` must reset the live process to the
     // SDK default — setModel(undefined) and effortLevel null exist for exactly
     // that. The old truthiness gate left the previous pin in place forever.
-    if (model !== proc.model) {
+    // A session-scoped refusal fallback moved the CLI off the pinned model
+    // without the relay's request ever changing, so `model !== proc.model`
+    // alone can never see the drift — a pinned (non-auto) model is re-asserted
+    // on the next delivered turn. The flagged request itself stays on the
+    // fallback (that retry already happened, by API policy); this only stops
+    // the whole session from silently staying there. An `auto` composer
+    // (model '') keeps whatever the CLI chose.
+    const repinAfterFallback = Boolean(proc.modelFallback) && Boolean(model);
+    if (model !== proc.model || repinAfterFallback) {
       await Promise.resolve(proc.turn.setModel?.(model || undefined)).catch((error) => {
         dbg('setModel failed', error?.message || String(error));
       });
       proc.model = model;
+      if (model) proc.modelFallback = '';
     }
     if (effort !== proc.effort) {
       await Promise.resolve(proc.turn.applyFlagSettings?.({ effortLevel: effort || null })).catch((error) => {
