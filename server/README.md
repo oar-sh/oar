@@ -307,7 +307,15 @@ provider, and other providers' bindings are never touched.
 
 - **Model and reasoning effort are per turn.** Each turn is a fresh `query()` with `resume`, so both
   can change between messages. Effort levels are `none` (SDK default) plus whatever the model reports
-  (`low`, `medium`, `high`, `xhigh`, `max`).
+  (`low`, `medium`, `high`, `xhigh`, `max`), plus **Ultracode** — see below.
+- **Ultracode** is offered on every model whose discovered efforts include `xhigh`. It is not an SDK
+  effort level but a session-scoped settings flag, so the relay carries `ultracode` as a sentinel on
+  the ordinary effort ladder (`withClaudeUltracodeTier` in `services/provider-reasoning-effort.mjs`,
+  the single source for all Claude effort lists) and only the worker translates it: a fresh session
+  spawns with `effort: 'xhigh'` and `settings: { ultracode: true, enableWorkflows: true }`, and a
+  live session is toggled in or out with `applyFlagSettings` (`claudeUltracodeFlagSettings`).
+  `enableWorkflows` is passed explicitly because the worker loads no filesystem settings. It is never
+  a silent default — the selectors label the rung "Ultracode" and warn about the token cost.
 - **Tools are auto-allowed**, matching the Copilot workers' `--allow-all` posture. Only two tools are
   intercepted: `AskUserQuestion` (bridged to relay question cards) and `ExitPlanMode` (plan board;
   denied after the board posts — the plan text comes from the tool input, or from the CLI's
@@ -315,8 +323,8 @@ provider, and other providers' bindings are never touched.
 - **Attachments** — images up to 5 MB are inlined as base64 content blocks; larger images and all
   non-image files are passed as absolute path references for Claude's `Read` tool.
 - **Subagents** — `forwardSubagentText` is on, so subagent text, thoughts, and activity stream into
-  their own nested bubbles. Targeted subagent cancellation is *not* supported; `abort_subagent`
-  control requests are answered with an explicit "not supported" result. Full-turn **Stop** works.
+  their own nested bubbles. `abort_subagent` maps to `query.stopTask()` for a backgrounded subagent;
+  one running inside the current turn is still answered "not supported". Full-turn **Stop** works.
 - **Thinking** — the worker requests summarized thinking *display* without passing a `thinking`
   option, so it never switches thinking on for a session that has it off, and never changes a budget.
 
@@ -326,6 +334,42 @@ The native Agent SDK session id observed on the first turn is posted to
 `POST /api/claude-native-session` and stored in `runtime_sessions.claude_native_session_id`. Later
 turns pass it back as `resume`, so a Claude conversation survives worker restarts. The id is only
 cached in the worker after the server accepts it, so a failed persist is retried next turn.
+
+### Background tasks and workflow progress
+
+The worker keeps one persistent CLI process per conversation, so background tasks survive the reply
+that started them. The live task set is posted to `POST /api/background-tasks` (REPLACE semantics)
+and broadcast as the `background_tasks` socket event; the composer's task panel renders it and can
+stop an individual task over a `worker.control` push.
+
+Tasks of type `local_workflow` carry an extra `workflowProgress` digest, because the SDK exposes no
+workflow-progress surface — the worker reads it off disk:
+
+- While the workflow runs, `subagents/workflows/<runId>/journal.jsonl` under the session directory
+  gives the agent set and their running/done state; agent labels come from the first line of each
+  `agent-<id>.jsonl`.
+- The run record `workflows/<runId>.json` is written **only at completion**, and takes over as the
+  authoritative tree once it exists — it is the only source of phase titles, logs, token totals, and
+  per-agent tool counts.
+- Parsing lives in `claude-worker/workflow-progress-digest.mjs` (`digestFromJournal`,
+  `digestFromRunRecord`), polling in `claude-session-process.mjs` (`syncWorkflowPoller`, 2 s, only
+  while such a task is live, published only when the digest actually changed). Reads are bounded by
+  byte caps and a filename pattern, and the digest is clamped (≤100 agents, ≤50 phases, ≤5 log lines,
+  per-field length caps). A run is joined to its task by the record's `taskId`, with a start-time
+  mtime window as the mid-run fallback.
+- The relay never trusts the worker's JSON: `sanitizeWorkflowProgress` (`routes/messages-routes.mjs`)
+  re-applies every clamp before storing or broadcasting, and drops a digest with no phases and no
+  agents.
+
+When a workflow settles, the worker buffers its final digest (at most five, terminal status never
+downgraded) and attaches it to the next `POST /api/response` as `workflowRuns`. Runs that settled on
+a journal snapshot get one more run-record read at drain time, since the CLI often flushes the record
+a few seconds after the task disappears. The relay writes those rows into `workflow_runs` inside the
+same transaction that finalizes the assistant message, keyed on the response message id, and returns
+them with the message — so the transcript's collapsed **Finished background task** card (the same
+tree renderer as the live panel, `buildWorkflowRunCard` in `public/app/background-tasks-view.mjs`)
+survives a reload. A history rebuild deletes a conversation's `workflow_runs` alongside its
+`subagent_runs`, because both key on message ids the rebuild replaces.
 
 ### Context usage
 
@@ -1297,6 +1341,11 @@ and on `messages`:
 
 - `hidden_from_shares` / `share_hidden_at` — per-message share visibility (see
   [Conversation sharing](#conversation-sharing-and-per-message-visibility))
+
+New tables are likewise created at startup with `CREATE TABLE IF NOT EXISTS` in both the fresh-schema
+and migration blocks — most recently `workflow_runs` (final workflow digest per assistant message,
+keyed on `response_message_id`, cascade-deleted with the conversation; see
+[Background tasks and workflow progress](#background-tasks-and-workflow-progress)).
 
 Statements that depend on these columns are prepared conditionally, so an older database keeps
 working with the corresponding feature inert rather than crashing at startup.

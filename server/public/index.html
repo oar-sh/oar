@@ -1453,6 +1453,12 @@
     overflow-wrap: anywhere;
     word-break: break-word;
   }
+  /* Persisted "Finished background task" cards under an assistant message:
+     they ride the .msg-activity fold chrome and the composer panel's
+     .bg-task-tree classes; only the panel's row-alignment indent needs
+     undoing inside a message bubble. */
+  .msg-workflow-run .bg-task-tree { margin: 6px 0 2px 10px; }
+  .msg-workflow-run .bg-task-tree:empty { display: none; }
   /* ── Agent thoughts (reasoning) ── */
   .thinking-thought {
     min-width: 0;
@@ -2053,19 +2059,26 @@
   }
   .bg-task-icon { flex-shrink: 0; }
   .bg-task-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-  .bg-task-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .bg-task-desc {
-    color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* The kind badge and the status cluster live in their own right-hand column
+     (badge above tokens/elapsed/Stop) so the badge cannot float mid-row when
+     the wrapped description spans two lines. */
+  .bg-task-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+  .bg-task-side-status { display: flex; align-items: center; gap: 10px; }
+  /* Mobile readability: bounded wrapping instead of single-line ellipsis.
+     Long text clamps to two lines so the tail (the part that distinguishes
+     one task/agent from another) stays on screen instead of hiding in "…". */
+  .bg-task-desc, .bg-task-detail, .bg-task-tree-log, .bg-task-agent-label {
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; overflow-wrap: anywhere;
   }
+  .bg-task-desc { color: var(--text); }
   .bg-task-badge {
     flex-shrink: 0; border: 1px solid var(--border); border-radius: 999px;
     padding: 0 7px; font-size: var(--fs-meta-sm); color: var(--muted);
     background: var(--bg3); white-space: nowrap;
   }
-  .bg-task-detail {
-    color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    font-size: var(--fs-meta-sm);
-  }
+  .bg-task-detail { color: var(--muted); font-size: var(--fs-meta-sm); }
+  .bg-task-tokens { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .bg-task-elapsed { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .bg-task-stop {
     flex-shrink: 0; background: transparent; border: 1px solid var(--border);
@@ -2074,6 +2087,35 @@
   }
   .bg-task-stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
   .bg-task-stop:disabled { opacity: 0.5; cursor: default; }
+  /* Workflow progress tree: fold chevron on the row, then an indented block of
+     narrator logs, phase headers and compact per-agent lines. */
+  .bg-task-fold {
+    flex-shrink: 0; background: transparent; border: none; cursor: pointer;
+    color: var(--muted); padding: 0 2px; font-size: var(--fs-meta-sm); line-height: 1;
+  }
+  .bg-task-fold:hover { color: var(--text); }
+  .bg-task-tree {
+    display: flex; flex-direction: column; gap: 2px;
+    margin: 4px 0 2px 34px; font-size: var(--fs-meta-sm); color: var(--muted);
+  }
+  .bg-task-tree[hidden] { display: none; }
+  .bg-task-tree-log { opacity: 0.8; }
+  .bg-task-tree-phase { color: var(--text); margin-top: 2px; }
+  /* Two-line agent rows: label line (clamped), then a short muted metrics
+     line below it that also carries the running agent's live activity as its
+     last segment — outside the clamp, so a long label can never hide it. */
+  .bg-task-tree-agent {
+    display: flex; align-items: flex-start; gap: 6px; margin-left: 12px; min-width: 0;
+  }
+  .bg-task-agent-state { flex-shrink: 0; }
+  .bg-task-agent-state-running { animation: bg-task-pulse 1.6s ease-in-out infinite; }
+  .bg-task-agent-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .bg-task-agent-activity { opacity: 0.8; }
+  .bg-task-agent-meta {
+    opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .bg-task-tree-omitted { margin-left: 12px; }
   .msg-continuation {
     background: rgba(63, 185, 80, 0.12); color: var(--relay-tone-online);
     border-radius: 6px; padding: 0 6px; font-size: var(--fs-meta-sm);

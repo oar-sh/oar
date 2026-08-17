@@ -267,6 +267,29 @@ export async function connectSocket(overrideDeps) {
     transports: ['websocket', 'polling'],
   });
 
+  // The connect-time view resync is the only correction path for state whose
+  // change events this client missed while suspended (e.g. a background-task
+  // set the server has since emptied — an empty store never re-announces
+  // itself). A connect that races the relay's own restart loses a one-shot
+  // resync to a failed fetch and the stale state then survives indefinitely,
+  // so failures retry with backoff until one pass lands on a live server.
+  let connectResyncTimer = null;
+  let connectResyncGeneration = 0;
+  function resyncAfterConnect(attempt = 0) {
+    const generation = attempt === 0 ? ++connectResyncGeneration : connectResyncGeneration;
+    if (connectResyncTimer) {
+      clearTimeout(connectResyncTimer);
+      connectResyncTimer = null;
+    }
+    refreshCurrentView().catch(() => {
+      if (generation !== connectResyncGeneration || attempt >= 4 || !socket?.connected) return;
+      connectResyncTimer = setTimeout(() => {
+        connectResyncTimer = null;
+        resyncAfterConnect(attempt + 1);
+      }, 2000 * (attempt + 1));
+    });
+  }
+
   socket.on('connect', () => {
     lastSocketErrorSignature = '';
     lastSocketErrorAt = 0;
@@ -278,7 +301,7 @@ export async function connectSocket(overrideDeps) {
     setRelayOnline(true);
     setCliOnline(true);
     renderConvList();
-    refreshCurrentView().catch(() => {});
+    resyncAfterConnect();
     refreshSessionWorkerStatus().catch(() => {});
     refreshModelCatalog().catch(() => {});
   });

@@ -48,6 +48,7 @@ import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConv
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { buildWorkflowRunCard } from './background-tasks-view.mjs';
 import {
   serializeDraftAttachments,
   hydrateDraftAttachments,
@@ -163,6 +164,24 @@ async function loadConversationHistoryPage(conversationId, options = {}) {
   return payload;
 }
 
+// The loaders' cursors belong to the conversation recorded in
+// conversationHistoryState. Between a conversation switch and the new
+// conversation's first render they still hold the previous conversation's
+// cursors; the switch entry point lives outside this module, so staleness is
+// detected here and the loaders are reset before any fetch can spend an old
+// cursor against the new conversation. Returns true when a reset happened.
+function resetConversationPaginationIfStale() {
+  const conversationId = String(currentConvId || '').trim();
+  if (String(conversationHistoryState.conversationId || '').trim() === conversationId) return false;
+  conversationHistoryLoader.reset({ hasMore: false, nextCursor: null });
+  conversationFutureLoader.reset({ hasMore: false, nextCursor: null });
+  return true;
+}
+
+function conversationPaginationCursorIsStale(conversationId) {
+  return String(conversationHistoryState.conversationId || '').trim() !== String(conversationId || '').trim();
+}
+
 const conversationHistoryLoader = createInfiniteLoader({
   fetchPage: async (cursor) => {
     const conversationId = String(currentConvId || '').trim();
@@ -173,6 +192,7 @@ const conversationHistoryLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
+    if (conversationPaginationCursorIsStale(conversationId)) return null;
     const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       beforeMessageId: String(cursor?.beforeMessageId || '').trim(),
@@ -190,6 +210,9 @@ const conversationHistoryLoader = createInfiniteLoader({
     const currentId = String(currentConvId || '').trim();
     const el = getMessagesElement();
     if (!currentId || !el) return;
+    // Covers the prefetch buffer: a page fetched before a conversation switch
+    // must not be applied to the newly opened conversation.
+    if (conversationPaginationCursorIsStale(currentId)) return;
     const previousScrollTop = el.scrollTop;
     const previousScrollHeight = el.scrollHeight;
     const inserted = prependMessageNodes(page.items || []);
@@ -239,6 +262,7 @@ const conversationFutureLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
+    if (conversationPaginationCursorIsStale(conversationId)) return null;
     const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       afterMessageId: String(cursor?.afterMessageId || '').trim(),
@@ -254,6 +278,7 @@ const conversationFutureLoader = createInfiniteLoader({
   },
   applyPage: async (page) => {
     const currentId = String(currentConvId || '').trim();
+    if (!currentId || conversationPaginationCursorIsStale(currentId)) return;
     const ordered = sortConversationMessages(page.items || []);
     let inserted = 0;
     for (const m of ordered) {
@@ -627,6 +652,7 @@ export function initConversationHistoryLazyLoading() {
   if (!el || el.dataset.historyLazyLoadBound === '1') return;
   el.dataset.historyLazyLoadBound = '1';
   el.addEventListener('scroll', () => {
+    if (resetConversationPaginationIfStale()) return;
     void conversationHistoryLoader.handleBoundaryDistance(el.scrollTop);
     const forwardDistance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
     void conversationFutureLoader.handleBoundaryDistance(forwardDistance);
@@ -729,7 +755,10 @@ function createMessageNode(msg, msgId = null, force = false) {
   const usage = (msg.role === 'assistant' && msg?.usage && typeof msg.usage === 'object') ? msg.usage : null;
   const deltaCredits = Number(usage?.premium?.deltaCredits ?? usage?.premium?.deltaUsed);
   const deltaMonthlyPercent = Number(usage?.plan?.deltaMonthlyPercent);
-  const monthlyPercentRemaining = Number(usage?.plan?.percentRemaining);
+  // Number(null) is 0, which would make missing data render as "0% left".
+  const monthlyPercentRemaining = usage?.plan?.percentRemaining == null
+    ? NaN
+    : Number(usage.plan.percentRemaining);
   const usageTurnParts = [];
   if (Number.isFinite(deltaCredits) && deltaCredits > 0) {
     usageTurnParts.push(`+${escHtml(String(deltaCredits))}`);
@@ -740,7 +769,8 @@ function createMessageNode(msg, msgId = null, force = false) {
   const usageTurnTag = usageTurnParts.length
     ? ` <span class="msg-usage">${usageTurnParts.join(' (')}${usageTurnParts.length > 1 ? ')' : ''}</span>`
     : '';
-  const usageRemainingTag = Number.isFinite(monthlyPercentRemaining) && monthlyPercentRemaining > 0
+  // Exactly 0% remaining is real data and must render; only absent/NaN hides.
+  const usageRemainingTag = Number.isFinite(monthlyPercentRemaining)
     ? ` <span class="msg-usage">month ${escHtml(monthlyPercentRemaining.toFixed(1))}% left</span>`
     : '';
   const usageStaleTag = usage?.stale
@@ -758,6 +788,14 @@ function createMessageNode(msg, msgId = null, force = false) {
   const activityHtml = mainActivities.length ? renderActivityMarkup(mainActivities) : '';
   const thoughtsHtml = mainThoughts.length ? renderThoughtsMarkup(mainThoughts) : '';
   const subagentHtml = renderSubagentRunsMarkup(subagentRuns, activities, thoughts);
+  // Finished background workflows persisted with this assistant message
+  // (docs/plans/workflow-progress-tree.md, Phase 4). The template only
+  // reserves a placeholder; the cards are DOM-built below so digest text
+  // never passes through innerHTML.
+  const workflowRuns = (msg.role === 'assistant' && Array.isArray(msg.workflowRuns))
+    ? msg.workflowRuns.filter((run) => run && typeof run === 'object').slice(0, 5)
+    : [];
+  const workflowRunsHtml = workflowRuns.length ? '<div class="msg-workflow-runs"></div>' : '';
   const hasVisibleText = Boolean(String(msg.text || '').trim());
   const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
     ? 'msg-bubble msg-bubble-media-only'
@@ -782,12 +820,28 @@ function createMessageNode(msg, msgId = null, force = false) {
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${userBubbleActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${userBubbleActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
   rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });
   linkifyWorkspaceMentionsInNode(bubble);
+  // One collapsed "Finished background task" card per persisted run, sharing
+  // the live panel's tree renderer. The native <details> owns the fold; open
+  // state is deliberately not keyed across re-renders — the runs are
+  // immutable once persisted, and this node is only rebuilt on a full
+  // renderMessages pass, which runs only when the snapshot key changes
+  // (buildMessageSnapshotKey covers the message fields INCLUDING a
+  // runId/status signature of these runs, and short-circuits otherwise).
+  if (workflowRuns.length) {
+    const runsHolder = div.querySelector('.msg-workflow-runs');
+    if (runsHolder) {
+      for (const run of workflowRuns) {
+        const card = buildWorkflowRunCard(run);
+        if (card) runsHolder.appendChild(card);
+      }
+    }
+  }
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
   return div;
 }
@@ -2025,15 +2079,20 @@ async function toggleMessageShareVisibility(conversationId, messageId, hiddenFro
     return;
   }
 
-  const response = await loadConversationApi(conversationKey, {
-    limit: Math.max(CONVERSATION_HISTORY_PAGE_SIZE, getConversationLoadedMessageCount()),
-  });
-  if (response?.messages) {
-    renderMessages(response.messages, false, response);
-  }
   showTransientRelayNotice(result.hiddenFromShares
     ? 'Message hidden from shared viewers.'
     : 'Message visible to shared viewers.');
+  // The reload below only refreshes the open view; if the user switched
+  // conversations while the toggle round trip was in flight, rendering it
+  // would replace the new conversation's messages with this one's.
+  if (String(currentConvId || '').trim() !== conversationKey) return;
+  const response = await loadConversationApi(conversationKey, {
+    limit: Math.max(CONVERSATION_HISTORY_PAGE_SIZE, getConversationLoadedMessageCount()),
+  });
+  if (String(currentConvId || '').trim() !== conversationKey) return;
+  if (response?.messages) {
+    renderMessages(response.messages, false, response);
+  }
 }
 
 function handleBubbleActionClick(event) {
@@ -2151,6 +2210,14 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
         done: !!thought?.done,
         timestamp: String(thought?.timestamp || '').trim(),
         subagentRunId: String(thought?.subagentRunId || '').trim(),
+      })),
+      // Cheap signature only — runs are immutable once persisted, so runId +
+      // status is enough to catch a payload that differs only in its runs
+      // (without one, such a payload would short-circuit and the card would
+      // stay invisible until an unrelated change).
+      workflowRuns: (Array.isArray(item?.workflowRuns) ? item.workflowRuns : []).map((run) => ({
+        runId: String(run?.runId || '').trim(),
+        status: String(run?.status || '').trim(),
       })),
     })),
   });
@@ -2332,14 +2399,32 @@ export async function sendMessage() {
     return;
   }
 
-  if (!(await validateSelectedConversationBeforeSend())) {
+  // Capture the send target and its composer payload before any await: the
+  // message belongs to the conversation the user typed it in. If the user
+  // opens another conversation while a round trip below is in flight, the
+  // message still posts to this validated conversation and is simply not
+  // rendered into (or drafted onto) the newly opened one — it shows up there
+  // when that conversation is next loaded. The model/effort/tier/mode selects
+  // and the image-edit target are captured here too: opening another
+  // conversation rewrites the selects (applyConversationPreferences) and
+  // clears the image-edit target, so a mid-await switch must not respell this
+  // send with the other conversation's preferences.
+  const targetConversationId = String(currentConvId || '').trim() || null;
+  const draftAttachments = selectedAttachments.slice();
+  const selectedModel = document.getElementById('model-select').value || '';
+  const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+  const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
+  const selectedMode = document.getElementById('mode-select').value || 'agent';
+  const draftImageEditTarget = imageEditTarget;
+  let composerConversationId = targetConversationId;
+  const viewingSendConversation = () => String(currentConvId || '').trim() === String(composerConversationId || '').trim();
+  if (!(await validateSelectedConversationBeforeSend(targetConversationId))) {
     return;
   }
   if (window.isModelMetadataBlocked?.()) {
     showTransientRelayNotice('Model metadata is unavailable. Refresh models to continue.');
     return;
   }
-  const targetConversationId = String(currentConvId || '').trim() || null;
   if (hasPendingUserMessageDuplicate(targetConversationId, text)) {
     showTransientRelayNotice('That message is already pending.');
     return;
@@ -2352,27 +2437,25 @@ export async function sendMessage() {
   let attachments = [];
   let clientMessageId = null;
   try {
-    attachments = await uploadAttachments(selectedAttachments.slice());
+    attachments = await uploadAttachments(draftAttachments);
 
     const isNew = !targetConversationId;
     const msgTimestamp = new Date().toISOString();
-    const selectedModel = document.getElementById('model-select').value || '';
-    const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
-    const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
     if (!selectedReasoningEffort) {
       showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
       return;
     }
-    const selectedMode = document.getElementById('mode-select').value || 'agent';
     const titleSeed = text || (attachments[0]?.name || 'Attachment');
     clientMessageId = generateId();
     trackPendingUserMessage(clientMessageId, targetConversationId, text);
-    input.value = '';
-    autoResize(input);
-    releaseComposerFocusAfterSend(input);
     pendingUserMessageIds.add(clientMessageId);
-    appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
-    scrollBottomAfterSend();
+    if (viewingSendConversation()) {
+      input.value = '';
+      autoResize(input);
+      releaseComposerFocusAfterSend(input);
+      appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
+      scrollBottomAfterSend();
+    }
 
     const body = {
       messageId: clientMessageId,
@@ -2385,11 +2468,11 @@ export async function sendMessage() {
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,
       attachments,
-      imageTarget: imageEditTarget
+      imageTarget: draftImageEditTarget
         ? {
-            messageId: imageEditTarget.messageId,
-            imageId: imageEditTarget.imageId,
-            nodeId: imageEditTarget.nodeId,
+            messageId: draftImageEditTarget.messageId,
+            imageId: draftImageEditTarget.imageId,
+            nodeId: draftImageEditTarget.nodeId,
           }
         : undefined,
     };
@@ -2410,7 +2493,7 @@ export async function sendMessage() {
         if (queued) {
           void registerOutboxSync();
           showTransientRelayNotice('You are offline. Message queued — it will send when the connection returns.', 7000);
-          clearAttachments();
+          if (viewingSendConversation()) clearAttachments();
           return;
         }
       }
@@ -2419,14 +2502,16 @@ export async function sendMessage() {
       pendingNode?.remove();
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
-      input.value = originalComposerText;
-      autoResize(input);
+      if (viewingSendConversation()) {
+        input.value = originalComposerText;
+        autoResize(input);
+      }
       void scheduleConversationDraftSave({
         conversationId: targetConversationId,
         draftText: originalComposerText,
         immediate: true,
       });
-      if (!mobileSend) input.focus();
+      if (!mobileSend && viewingSendConversation()) input.focus();
       setModelBanner('⚠️ Message could not be sent. Please try again.');
       return;
     }
@@ -2437,12 +2522,12 @@ export async function sendMessage() {
       pendingNode?.remove();
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
-      if (!mobileSend) input.focus();
+      if (!mobileSend && viewingSendConversation()) input.focus();
       showTransientRelayNotice('That message was already sent recently.');
       return;
     }
 
-    if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
+    if ((r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) && viewingSendConversation()) {
       updateWorkspaceRootHints(r);
       if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
         // Restoring refresh: if the root really changed, the restore walk
@@ -2452,10 +2537,14 @@ export async function sendMessage() {
     }
     if (r.compactedConversationId) {
       await window.refreshConversations?.();
-      await window.openConversation?.(r.compactedConversationId);
-      clearAttachments();
-      if (!mobileSend) input.focus();
-      scrollBottomAfterSend();
+      // Only follow the auto-compact redirect while the user is still in the
+      // conversation that was compacted.
+      if (viewingSendConversation()) {
+        await window.openConversation?.(r.compactedConversationId);
+        clearAttachments();
+        if (!mobileSend) input.focus();
+        scrollBottomAfterSend();
+      }
       return;
     }
     if (r.warning) setModelBanner(`⚠️ ${r.warning}`);
@@ -2465,9 +2554,17 @@ export async function sendMessage() {
       const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
       setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
     }
-    if (imageEditTarget) clearImageEditTarget();
+    // Clear only while the user still views the send conversation: a mid-await
+    // switch may have set a fresh image-edit target on the newly opened one.
+    if (draftImageEditTarget && viewingSendConversation()) clearImageEditTarget();
     if (isNew || !targetConversationId) {
-      setCurrentConv(r.conversationId);
+      // Adopt the created conversation as the current view only while the
+      // user is still on the blank view the message was sent from.
+      const adoptNewConversation = viewingSendConversation();
+      if (adoptNewConversation) {
+        setCurrentConv(r.conversationId);
+        composerConversationId = r.conversationId;
+      }
       conversations[r.conversationId] = {
         id: r.conversationId,
         title: titleSeed.slice(0, 60),
@@ -2481,12 +2578,16 @@ export async function sendMessage() {
         preferredReasoningEffort: r.preferredReasoningEffort || selectedReasoningEffort || 'none',
       };
       window.syncAutoModelAvailability?.();
-      document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
-      window.syncChatTitleControls?.();
-      updateCompactButton();
+      if (adoptNewConversation) {
+        document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
+        window.syncChatTitleControls?.();
+        updateCompactButton();
+      }
       window.renderConvList?.();
-      applyContextUsageBar(null);
-      scheduleContextUsageRefresh(r.conversationId, 0);
+      if (adoptNewConversation) {
+        applyContextUsageBar(null);
+        scheduleContextUsageRefresh(r.conversationId, 0);
+      }
     }
     if (conversations[r.conversationId]) {
       conversations[r.conversationId] = {
@@ -2511,11 +2612,13 @@ export async function sendMessage() {
         draftUpdatedByClientId: CLIENT_ID,
       });
     }
-    if (cliOnline) showThinking(r.messageId || null);
+    if (cliOnline && viewingSendConversation()) showThinking(r.messageId || null);
 
-    clearAttachments();
-    if (!mobileSend) input.focus();
-    scrollBottomAfterSend();
+    if (viewingSendConversation()) {
+      clearAttachments();
+      if (!mobileSend) input.focus();
+      scrollBottomAfterSend();
+    }
   } catch (e) {
     if (clientMessageId) {
       clearPendingUserMessage(clientMessageId);
@@ -2524,10 +2627,12 @@ export async function sendMessage() {
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
     }
-    input.value = originalComposerText;
-    autoResize(input);
+    if (viewingSendConversation()) {
+      input.value = originalComposerText;
+      autoResize(input);
+    }
     void scheduleConversationDraftSave({
-      conversationId: String(currentConvId || '').trim(),
+      conversationId: targetConversationId,
       draftText: originalComposerText,
       immediate: true,
     });
@@ -2544,8 +2649,8 @@ export function handleKey(e) {
   }
 }
 
-async function validateSelectedConversationBeforeSend() {
-  const convId = String(currentConvId || '').trim();
+async function validateSelectedConversationBeforeSend(conversationId = currentConvId) {
+  const convId = String(conversationId || '').trim();
   if (!convId) return true;
 
   const current = await loadConversationApi(convId, { limit: 1 });
@@ -2572,7 +2677,12 @@ async function validateSelectedConversationBeforeSend() {
     sdkSessionId: conversationSessionId,
     runtimeSessionId: current.runtimeSession?.id || null,
   };
-  setRepoBrowserSessionInfo(current.sessionRootPath || '', current.sessionRootName || current.title || '');
-  updateSessionPill(conversations[convId], current.runtimeSession || null);
+  // The pill and repo browser describe the conversation being viewed; if the
+  // user opened another conversation during the round trip above, applying
+  // this one's session info would clobber the new view's.
+  if (String(currentConvId || '').trim() === convId) {
+    setRepoBrowserSessionInfo(current.sessionRootPath || '', current.sessionRootName || current.title || '');
+    updateSessionPill(conversations[convId], current.runtimeSession || null);
+  }
   return true;
 }

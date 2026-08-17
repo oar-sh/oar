@@ -110,6 +110,24 @@ export function createQuestionRepository(db) {
         `),
         deleteConvSubagentRuns: db.prepare(`DELETE FROM subagent_runs WHERE conversation_id = ?`),
 
+        // workflow runs — final digests of settled background workflows,
+        // attached to the assistant message that reports the completion.
+        // Inserted inside the /api/response finalize transaction, so rows key
+        // directly on the response message id (unlike subagent_runs, which are
+        // written before the response id exists and need queue-id resolution).
+        insertWorkflowRun: db.prepare(`
+          INSERT INTO workflow_runs (
+            id, response_message_id, conversation_id, run_index, digest_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `),
+        listWorkflowRunsByResponse: db.prepare(`
+          SELECT id, response_message_id, conversation_id, run_index, digest_json, created_at
+          FROM workflow_runs
+          WHERE response_message_id = ?
+          ORDER BY run_index ASC, id ASC
+        `),
+        deleteConvWorkflowRuns: db.prepare(`DELETE FROM workflow_runs WHERE conversation_id = ?`),
+
         // relay boards
         insertBoard: db.prepare(`INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`),
         getBoard: db.prepare(`SELECT * FROM relay_boards WHERE id = ?`),

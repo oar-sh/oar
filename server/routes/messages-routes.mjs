@@ -1563,6 +1563,81 @@ function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDe
   }
 }
 
+// Structural sanitizer for the workflow-progress digest a Claude session
+// worker attaches to its background-task rows (docs/plans/workflow-progress-tree.md,
+// Phase 2). The relay never trusts worker JSON: strings are trimmed and
+// length-clamped, arrays hard-capped, numbers accepted only when finite, and
+// unknown fields dropped at every level. A wrong-typed field degrades to
+// null; a wrong-typed digest (or one with no phases and no agents) returns
+// null so the row simply carries no workflowProgress — the ingest never 400s
+// because of this field.
+export function sanitizeWorkflowProgress(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const cleanString = (raw, maxLength) => {
+    if (typeof raw !== 'string' && typeof raw !== 'number') return null;
+    const text = String(raw).trim().slice(0, maxLength);
+    return text || null;
+  };
+  const cleanNumber = (raw) => {
+    if (raw === null || raw === undefined || typeof raw === 'object' || typeof raw === 'boolean') return null;
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : null;
+  };
+  const cleanCount = (raw) => {
+    const num = cleanNumber(raw);
+    return num === null ? null : Math.max(0, Math.floor(num));
+  };
+  const isEntryObject = (entry) => !!entry && typeof entry === 'object' && !Array.isArray(entry);
+  const phases = (Array.isArray(value.phases) ? value.phases : [])
+    .filter(isEntryObject)
+    .slice(0, 50)
+    .map((phase) => ({
+      index: cleanNumber(phase.index),
+      title: cleanString(phase.title, 120),
+    }));
+  const agentEntries = (Array.isArray(value.agents) ? value.agents : []).filter(isEntryObject);
+  const agents = agentEntries
+    .slice(0, 100)
+    .map((agent) => ({
+      index: cleanNumber(agent.index),
+      label: cleanString(agent.label, 160),
+      phaseIndex: cleanNumber(agent.phaseIndex),
+      phaseTitle: cleanString(agent.phaseTitle, 120),
+      model: cleanString(agent.model, 80),
+      state: cleanString(agent.state, 32),
+      attempt: cleanNumber(agent.attempt),
+      lastToolName: cleanString(agent.lastToolName, 160),
+      tokens: cleanNumber(agent.tokens),
+      toolCalls: cleanNumber(agent.toolCalls),
+      durationMs: cleanNumber(agent.durationMs),
+      startedAt: cleanNumber(agent.startedAt),
+    }));
+  if (!phases.length && !agents.length) return null;
+  // Agents dropped by the relay's own cap are added to the worker-reported
+  // omission count so the client's "N more" stays truthful.
+  const truncatedAgents = agentEntries.length - agents.length;
+  const reportedOmitted = cleanCount(value.agentsOmitted);
+  const agentsOmitted = (reportedOmitted === null && truncatedAgents === 0)
+    ? null
+    : (reportedOmitted ?? 0) + truncatedAgents;
+  const logs = (Array.isArray(value.logs) ? value.logs : [])
+    .map((line) => cleanString(line, 300))
+    .filter(Boolean)
+    .slice(0, 5);
+  return {
+    runId: cleanString(value.runId, 64),
+    workflowName: cleanString(value.workflowName, 120),
+    status: cleanString(value.status, 32),
+    agentCount: cleanCount(value.agentCount),
+    totalTokens: cleanCount(value.totalTokens),
+    durationMs: cleanCount(value.durationMs),
+    phases,
+    logs,
+    agents,
+    agentsOmitted,
+  };
+}
+
 export function registerMessagesRoutes(app, deps) {
   const {
     auth,
@@ -5922,6 +5997,14 @@ export function registerMessagesRoutes(app, deps) {
     const { messageId, conversationId, text, model, mode, generatedImages: rawGeneratedImages } = req.body;
     const trimmedText = String(text || '').trim();
     const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
+    // Final digests of background workflows that settled during this turn —
+    // the transcript's "Finished background task" cards. Same structural
+    // sanitizer as the live panel rows; junk entries drop silently (this
+    // field must never fail a response), and the array caps at 5.
+    const workflowRuns = (Array.isArray(req.body.workflowRuns) ? req.body.workflowRuns : [])
+      .map((entry) => sanitizeWorkflowProgress(entry))
+      .filter(Boolean)
+      .slice(0, 5);
     let generatedImages = [];
     try {
       generatedImages = normalizeGeneratedImageResponses(rawGeneratedImages, {
@@ -6113,6 +6196,18 @@ export function registerMessagesRoutes(app, deps) {
       );
       if (String(q?.kind || '') === 'continuation') {
         stmts.setMessageKind?.run('continuation', responseId);
+      }
+      // The workflow cards persist atomically with the assistant message they
+      // annotate — keyed directly on the response id (see workflow_runs DDL).
+      for (const [runIndex, digest] of workflowRuns.entries()) {
+        stmts.insertWorkflowRun?.run(
+          `wfr_${uuidv4()}`,
+          responseId,
+          targetConversationId,
+          runIndex,
+          JSON.stringify(digest),
+          now,
+        );
       }
       stmts.setMessageExecutedProvider?.run(executedProvider, responseId);
       stmts.linkActivityToResponse.run(responseId, messageId);
@@ -6335,6 +6430,9 @@ export function registerMessagesRoutes(app, deps) {
         thoughts,
         executedProvider,
         kind: String(q?.kind || '') === 'continuation' ? 'continuation' : undefined,
+        // Live-appended messages must show their workflow cards without a
+        // reload; conversation reloads serve the same digests from the DB.
+        workflowRuns: workflowRuns.length ? workflowRuns : undefined,
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
@@ -6410,6 +6508,9 @@ export function registerMessagesRoutes(app, deps) {
         subagentType: String(task?.subagentType || '').trim().slice(0, 120) || null,
         model: String(task?.model || '').trim().slice(0, 120) || null,
         modelInherited: task?.modelInherited === true,
+        // Sanitized digest or undefined: JSON serialization (store broadcast,
+        // conversation payload) drops the key entirely for flat rows.
+        workflowProgress: sanitizeWorkflowProgress(task?.workflowProgress) || undefined,
       }))
       .filter((task) => task.taskId);
     backgroundTaskStore?.replace?.(conversationId, tasks);

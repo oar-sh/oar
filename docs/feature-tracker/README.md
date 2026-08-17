@@ -1,6 +1,6 @@
 # SDK Feature Tracker
 
-Updated: 2026-08-16
+Updated: 2026-08-17
 Scope: `server/` + `server/claude-worker/` + `.github/extensions/web-relay/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
@@ -37,7 +37,7 @@ checklist for a new provider (details per column in the per-SDK files).
 | Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | Implemented **with text/thinking attribution** via `tool-call-delta` nested frames (live-verified 2026-08-16) | Implemented (title/name-shaped detection; lifecycle chips) |
 | Per-message model switch | Implemented (both paths since 2026-08-16) | Implemented | Implemented (re-pinned every send — sticky overrides) | Not implemented (locked; 409 + composer pin) |
 | Model discovery / catalog | Implemented | Implemented | Implemented (`Cursor.models.list()`) | Implemented (initialize `_meta.modelState` + CLI fallback) |
-| Reasoning effort per turn | Implemented | Implemented | Implemented (model params; per-model discovery) | Partial (best-effort `_meta`) |
+| Reasoning effort per turn | Implemented | Implemented (plus the derived **Ultracode** tier on xhigh-capable models — a settings flag, not an `EffortLevel`) | Implemented (model params; per-model discovery) | Partial (best-effort `_meta`) |
 | Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) | Partial (path notes only) |
 | Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) | Implemented (`session/load`, capability-checked; visible note on fallback) |
 | Context usage display | Implemented (server-derived from `events.jsonl`) | Implemented | Implemented (window from the model's `context` parameter; shared static fallback) | Implemented (`_meta` tokens; shared static fallback) |
@@ -61,6 +61,27 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-08-17: Claude background tasks stopped being opaque rows. `local_workflow` tasks now carry a
+  live progress digest the worker reads off the CLI's on-disk workflow state (journal while running,
+  run record once it lands — the record is written only at completion), clamped in the worker and
+  re-clamped independently by the relay (`sanitizeWorkflowProgress`); the background-task panel folds
+  it out as a phase/agent tree with per-agent state, model, and tokens. Completed workflows persist
+  their final digest per response message (new `workflow_runs` table, written inside the finalize
+  transaction) and render as a collapsed **Finished background task** card in the transcript from the
+  same renderer, so it survives reloads. Panel rows were reworked for phones: kind badge stacked over
+  Stop, an always-visible token count, and 2-line wrapped text instead of single-line ellipsis. Also
+  the client's conversation-switch staleness class: seven guards in `conversation-view.js` (send
+  target + composer settings captured before any await, share-toggle reload, both paginators, session
+  pill, and a `0%` quota badge that was hidden by `Number(null) === 0`), connect-resync now retries
+  with backoff instead of dying on one failed fetch, and foreground recovery isolates its five steps.
+- 2026-08-17: Added the **Ultracode** effort tier for Claude sessions. The Agent SDK exposes
+  `ultracode` as a session-scoped settings flag (xhigh effort plus standing workflow orchestration),
+  not an `EffortLevel`, so the relay carries it as a sentinel on the normal effort ladder — derived
+  for xhigh-capable models, clamped like any tier on the send path, and translated only in the worker
+  (spawn `settings`, mid-session `applyFlagSettings`). Both selectors label the rung "Ultracode" with
+  a cost tooltip; it is never a silent default. The four duplicated Claude effort ladders are now one
+  (`server/services/provider-reasoning-effort.mjs`). Live-verified both toggle paths on
+  `claude-opus-5`.
 - 2026-08-16: Merge-readiness review wave (all providers). Queue/provenance: terminal failures
   now record `executed_provider` + run the mismatch check (the original hijack signature exited
   uninstrumented), keep their thoughts, and reconcile still-running `subagent_runs`; the

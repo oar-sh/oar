@@ -553,11 +553,25 @@ async function runForegroundRecovery(reason = 'visible') {
       await pulseSharedViewerPresence();
       return;
     }
-    await refreshSessionWorkerStatus();
-    await refreshCurrentView();
-    await refreshModelCatalog(true);
-    await loadRelayQuestions(currentConvId);
-    await loadRelayBoards();
+    // Each step recovers a different slice of missed state; isolate their
+    // failures so one fetch losing a race with a restarting relay cannot
+    // skip the rest — refreshCurrentView in particular is the only
+    // correction path for change events this client missed while suspended
+    // (an emptied background-task store never re-announces itself).
+    const recoverySteps = [
+      ['session-worker-status', () => refreshSessionWorkerStatus()],
+      ['current-view', () => refreshCurrentView()],
+      ['model-catalog', () => refreshModelCatalog(true)],
+      ['relay-questions', () => loadRelayQuestions(currentConvId)],
+      ['relay-boards', () => loadRelayBoards()],
+    ];
+    for (const [step, run] of recoverySteps) {
+      try {
+        await run();
+      } catch (error) {
+        console.warn(`[foreground-recovery:${reason}] ${step}`, error?.message || error);
+      }
+    }
   } catch (error) {
     console.warn(`[foreground-recovery:${reason}]`, error?.message || error);
   } finally {

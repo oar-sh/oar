@@ -63,6 +63,7 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Per-message **model** and **reasoning effort** pickers (live model discovery + fallback catalog)
 - Streaming tool/activity updates *and* live assistant reply text while a turn runs
 - Nested **subagent bubbles**: each subagent gets its own live bubble with its own thoughts, activity, and streamed text, kept as collapsible sections after the turn finishes
+- **Background task panel** with live per-task state, model, and token use; Claude workflow tasks fold out into a progress tree of phases and agents, and leave a *Finished background task* card in the transcript when they complete
 - Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
 - Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
 - Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
@@ -258,17 +259,18 @@ Enabling it also runs model discovery against the Agent SDK and adds the discove
 
 What Claude conversations support:
 
-- Per-message model and reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`), changeable between turns
+- Per-message model and reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`), changeable between turns, plus **Ultracode** on models that support `xhigh` — `xhigh` effort *and* multi-agent workflow orchestration, at a matching jump in token use
 - All four relay modes — `plan` maps to the SDK's plan permission mode and produces a **Plan ready** board, `ask` and `autopilot` adjust the system prompt
 - Image and file attachments (images up to ~5 MB are inlined; larger files are passed as paths for Claude to read)
 - Question cards, thinking/thought streams, live reply streaming, and nested subagent bubbles
 - **Stop** to abort the running turn
+- Background tasks that outlive the reply that started them: the composer's task panel lists them live with their own **Stop**, and an **Ultracode** workflow folds out into a tree of its phases and agents (state, model, tokens). When the workflow finishes, the summarizing reply keeps a collapsed *Finished background task* card holding the final tree, which survives reloads
 - Session continuity across worker restarts — the native Agent SDK session id is stored and resumed
 - Real context-window metrics, reported after each turn
 
 Differences from Copilot conversations:
 
-- Cancelling one individual subagent is not supported — **Stop** ends the whole turn instead
+- Cancelling one individual subagent works only for backgrounded ones; a subagent running inside the current turn can be stopped only by stopping the whole turn
 - Claude turns are not included in the Copilot usage line, and no usage line is attached to their replies (Claude's own plan limits appear in **Check Usage**)
 - The browsable **Session** root points at the Agent SDK's project directory rather than a Copilot session-state folder
 

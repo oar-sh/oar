@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fsSync from 'node:fs';
+import osModule from 'node:os';
+import nodePathModule from 'node:path';
 
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildClaudePlanReadyBoardPayload } from './claude-turn-publisher.mjs';
@@ -1376,6 +1379,435 @@ test('an auto composer keeps the CLI\'s refusal fallback instead of repinning', 
   assert.equal(await second, true);
   const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
   assert.equal(secondResponse.body.model, 'claude-opus-4-8', 'attribution follows what actually runs');
+  turn.endInput();
+  await settled(runner);
+});
+
+// ---------------------------------------------------------------------------
+// Workflow progress poller
+
+function makeWorkflowSessionDir(t, runId) {
+  const sessionDir = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'wf-session-'));
+  t.after(() => fsSync.rmSync(sessionDir, { recursive: true, force: true }));
+  const runDir = nodePathModule.join(sessionDir, 'subagents', 'workflows', runId);
+  fsSync.mkdirSync(runDir, { recursive: true });
+  return { sessionDir, runDir };
+}
+
+function digestPublishes(stub) {
+  return stub.calls.filter(
+    (call) => call.routePath === '/api/background-tasks'
+      && call.body.tasks?.some((task) => task.workflowProgress),
+  );
+}
+
+test('a live workflow task publishes a journal digest, and only on change', async (t) => {
+  const { sessionDir, runDir } = makeWorkflowSessionDir(t, 'wf_live-1');
+  fsSync.writeFileSync(
+    nodePathModule.join(runDir, 'journal.jsonl'),
+    '{"type":"started","key":"v2:a","agentId":"agent-a"}\n'
+    + '{"type":"started","key":"v2:b","agentId":"agent-b"}\n',
+  );
+  // agent-a has a transcript whose first line carries the prompt (the live
+  // label); agent-b has none yet, so its label falls back.
+  fsSync.writeFileSync(
+    nodePathModule.join(runDir, 'agent-agent-a.jsonl'),
+    `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'Review the logic of shared/model-id.mjs' }, agentId: 'agent-a' })}\n`,
+  );
+
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    workflowPollMs: 20,
+    resolveWorkflowSessionDirImpl: () => sessionDir,
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'wf-task-1', task_type: 'local_workflow', description: 'ultracode run' }]));
+  turn.emit(resultMessage('workflow dispatched', 'native-1'));
+  assert.equal(await pending, true);
+
+  const withDigest = await waitFor(
+    () => digestPublishes(stub)[0],
+    { label: 'live digest publish' },
+  );
+  const digest = withDigest.body.tasks[0].workflowProgress;
+  assert.equal(digest.status, 'running');
+  assert.equal(digest.runId, 'wf_live-1');
+  assert.deepEqual(digest.agents.map((agent) => [agent.label, agent.state]), [
+    ['Review the logic of shared/model-id.mjs', 'running'],
+    ['agent 2', 'running'],
+  ]);
+
+  // Nothing on disk changed: several poll intervals must add no publish.
+  const before = digestPublishes(stub).length;
+  await tick(150);
+  assert.equal(digestPublishes(stub).length, before, 'an unchanged digest must not republish');
+
+  // The journal grows → the digest changes → exactly the changed tree ships.
+  fsSync.appendFileSync(
+    nodePathModule.join(runDir, 'journal.jsonl'),
+    '{"type":"result","key":"v2:a","agentId":"agent-a","result":{"ok":true}}\n',
+  );
+  await waitFor(() => {
+    const latest = digestPublishes(stub).at(-1);
+    return latest?.body.tasks[0].workflowProgress.agents?.[0]?.state === 'done';
+  }, { label: 'done-state republish' });
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the settle notification publishes the completed run record and the poller stops', async (t) => {
+  const { sessionDir, runDir } = makeWorkflowSessionDir(t, 'wf_live-2');
+  fsSync.writeFileSync(
+    nodePathModule.join(runDir, 'journal.jsonl'),
+    '{"type":"started","key":"v2:a","agentId":"agent-a"}\n',
+  );
+
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    workflowPollMs: 20,
+    resolveWorkflowSessionDirImpl: () => sessionDir,
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'wf-task-2', task_type: 'local_workflow', description: 'ultracode run' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await pending, true);
+  await waitFor(() => digestPublishes(stub).length >= 1, { label: 'live digest publish' });
+
+  // Completion: the CLI writes the run record (the only live→record switch
+  // point) and then notifies. The final read must ship the completed tree —
+  // with the previews stripped — before the row clears.
+  fsSync.mkdirSync(nodePathModule.join(sessionDir, 'workflows'), { recursive: true });
+  fsSync.writeFileSync(
+    nodePathModule.join(sessionDir, 'workflows', 'wf_live-2.json'),
+    JSON.stringify({
+      runId: 'wf_live-2',
+      taskId: 'wf-task-2',
+      status: 'completed',
+      workflowName: 'demo-run',
+      agentCount: 1,
+      totalTokens: 4242,
+      phases: [{ title: 'Review' }],
+      logs: ['1 finding verified'],
+      workflowProgress: [
+        { type: 'workflow_phase', index: 1, title: 'Review' },
+        {
+          type: 'workflow_agent',
+          index: 1,
+          label: 'review:logic',
+          phaseIndex: 1,
+          phaseTitle: 'Review',
+          model: 'claude-sonnet-5',
+          state: 'done',
+          attempt: 1,
+          lastToolName: 'StructuredOutput',
+          tokens: 4242,
+          toolCalls: 3,
+          durationMs: 1000,
+          startedAt: 123,
+          promptPreview: 'PREVIEW-MUST-NOT-SHIP',
+          resultPreview: 'PREVIEW-MUST-NOT-SHIP',
+        },
+      ],
+    }),
+  );
+  turn.emit(taskNotificationMessage('wf-task-2'));
+  const finalPublish = await waitFor(() => {
+    const latest = digestPublishes(stub).at(-1);
+    return latest?.body.tasks[0].workflowProgress.status === 'completed' ? latest : null;
+  }, { label: 'final record digest' });
+  const finalDigest = finalPublish.body.tasks[0].workflowProgress;
+  assert.equal(finalDigest.workflowName, 'demo-run');
+  assert.equal(finalDigest.totalTokens, 4242);
+  assert.deepEqual(finalDigest.phases, [{ index: 1, title: 'Review' }]);
+  assert.equal(finalDigest.agents[0].label, 'review:logic');
+  assert.ok(!JSON.stringify(finalDigest).includes('PREVIEW-MUST-NOT-SHIP'), 'previews must be stripped');
+
+  // The task leaves the live set: the poller must stop and its state prune.
+  turn.emit(backgroundTasksMessage([]));
+  await waitFor(() => runner._getProcess()?.workflowPollTimer === null, { label: 'poller stopped' });
+  assert.equal(runner._getProcess().workflowStates.size, 0, 'settled workflow state must not linger');
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a workflow task with nothing on disk polls silently and settles clean', async (t) => {
+  const missingDir = nodePathModule.join(osModule.tmpdir(), `wf-missing-${process.pid}-${Date.now()}`);
+  t.after(() => fsSync.rmSync(missingDir, { recursive: true, force: true }));
+
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    workflowPollMs: 10,
+    resolveWorkflowSessionDirImpl: () => missingDir,
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'wf-task-3', task_type: 'local_workflow', description: 'authoring' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await pending, true);
+
+  // Many poll intervals against a session dir that does not exist: no digest,
+  // no error, the row keeps publishing bare.
+  await tick(100);
+  assert.equal(digestPublishes(stub).length, 0, 'nothing to digest means nothing attached');
+  assert.ok(runner._getProcess().workflowPollTimer, 'the poller keeps waiting for the dir to appear');
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('wf-task-3'));
+  await waitFor(() => runner._getProcess()?.workflowPollTimer === null, { label: 'poller stopped' });
+  turn.endInput();
+  await settled(runner);
+});
+
+// ---------------------------------------------------------------------------
+// Settled-workflow digests on the summarizing response (`workflowRuns`)
+
+function workflowRunRecordJson(runId, taskId, overrides = {}) {
+  return JSON.stringify({
+    runId,
+    taskId,
+    status: 'completed',
+    workflowName: 'demo-run',
+    agentCount: 1,
+    totalTokens: 4242,
+    durationMs: 927637,
+    phases: [{ title: 'Review' }],
+    logs: ['1 finding verified'],
+    workflowProgress: [
+      { type: 'workflow_phase', index: 1, title: 'Review' },
+      { type: 'workflow_agent', index: 1, label: 'review:logic', phaseIndex: 1, phaseTitle: 'Review', state: 'done', tokens: 4242 },
+    ],
+    ...overrides,
+  });
+}
+
+test('a settled workflow rides the NEXT response as workflowRuns, exactly once', async (t) => {
+  const { sessionDir, runDir } = makeWorkflowSessionDir(t, 'wf_card-1');
+  fsSync.writeFileSync(
+    nodePathModule.join(runDir, 'journal.jsonl'),
+    '{"type":"started","key":"v2:a","agentId":"agent-a"}\n',
+  );
+
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    workflowPollMs: 20,
+    resolveWorkflowSessionDirImpl: () => sessionDir,
+  });
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'wf-card-task', task_type: 'local_workflow', description: 'ultracode run' }]));
+  turn.emit(resultMessage('workflow dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  // The dispatching turn's own response carries no runs — nothing settled yet.
+  const firstResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.equal('workflowRuns' in firstResponse.body, false, 'no workflowRuns before any settle');
+
+  // Completion in the live SDK's order: the run record lands, the task row
+  // drops (background_tasks_changed), THEN the notification arrives.
+  fsSync.mkdirSync(nodePathModule.join(sessionDir, 'workflows'), { recursive: true });
+  fsSync.writeFileSync(
+    nodePathModule.join(sessionDir, 'workflows', 'wf_card-1.json'),
+    workflowRunRecordJson('wf_card-1', 'wf-card-task'),
+  );
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('wf-card-task'));
+  turn.emit(userReplay('<task-notification>wf-card-task completed</task-notification>'));
+  turn.emit(assistantText('The workflow finished.'));
+  turn.emit(resultMessage('The workflow finished.', 'native-1'));
+
+  const contResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.ok(Array.isArray(contResponse.body.workflowRuns), 'the summarizing response carries workflowRuns');
+  assert.equal(contResponse.body.workflowRuns.length, 1);
+  const run = contResponse.body.workflowRuns[0];
+  assert.equal(run.runId, 'wf_card-1');
+  assert.equal(run.status, 'completed');
+  assert.equal(run.workflowName, 'demo-run');
+  assert.equal(run.durationMs, 927637, 'the record-level run duration rides the digest');
+  assert.equal(run.agents[0].label, 'review:logic');
+
+  // A later turn must not re-attach the already-delivered digest.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'status?' } });
+  await tick(20);
+  turn.emit(assistantText('nothing new'));
+  turn.emit(resultMessage('nothing new', 'native-1'));
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal('workflowRuns' in secondResponse.body, false, 'the buffer drains on attach');
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stopped workflow with no run record attaches its live digest with the notification status', async (t) => {
+  const { sessionDir, runDir } = makeWorkflowSessionDir(t, 'wf_card-2');
+  fsSync.writeFileSync(
+    nodePathModule.join(runDir, 'journal.jsonl'),
+    '{"type":"started","key":"v2:a","agentId":"agent-a"}\n',
+  );
+
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    workflowPollMs: 20,
+    resolveWorkflowSessionDirImpl: () => sessionDir,
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'wf-stop-task', task_type: 'local_workflow', description: 'ultracode run' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await pending, true);
+  // The poller must have digested the journal before the settle, or there is
+  // no live digest to fall back on.
+  await waitFor(() => digestPublishes(stub).length >= 1, { label: 'live digest publish' });
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('wf-stop-task', 'stopped'));
+  turn.emit(userReplay('<task-notification>wf-stop-task stopped</task-notification>'));
+  turn.emit(assistantText('The workflow was stopped.'));
+  turn.emit(resultMessage('The workflow was stopped.', 'native-1'));
+
+  const contResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.equal(contResponse.body.workflowRuns.length, 1);
+  const run = contResponse.body.workflowRuns[0];
+  assert.equal(run.runId, 'wf_card-2');
+  assert.equal(run.status, 'stopped', "the notification's status replaces the stale 'running'");
+  assert.equal(run.durationMs, null, 'the journal knows no run duration');
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a run record that lands after the settle still upgrades the card at drain time', async (t) => {
+  // Observed live (session 713eeda8): the task row dropped and the
+  // notification fired a beat BEFORE the CLI flushed the run record, so the
+  // persisted card froze on the journal snapshot — a done workflow showing a
+  // "running" verify agent and no token/duration totals.
+  const { sessionDir, runDir } = makeWorkflowSessionDir(t, 'wf_card-3');
+  fsSync.writeFileSync(
+    nodePathModule.join(runDir, 'journal.jsonl'),
+    '{"type":"started","key":"v2:a","agentId":"agent-a"}\n',
+  );
+
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    workflowPollMs: 20,
+    resolveWorkflowSessionDirImpl: () => sessionDir,
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'wf-late-task', task_type: 'local_workflow', description: 'ultracode run' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await pending, true);
+  await waitFor(() => digestPublishes(stub).length >= 1, { label: 'live digest publish' });
+
+  // Both settle signals arrive with NO record on disk: the buffer holds the
+  // stale journal snapshot (agent still 'running').
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('wf-late-task'));
+
+  // The record lands only now — after the settle, before the summarizing
+  // response drains the buffer.
+  fsSync.mkdirSync(nodePathModule.join(sessionDir, 'workflows'), { recursive: true });
+  fsSync.writeFileSync(
+    nodePathModule.join(sessionDir, 'workflows', 'wf_card-3.json'),
+    workflowRunRecordJson('wf_card-3', 'wf-late-task'),
+  );
+
+  turn.emit(userReplay('<task-notification>wf-late-task completed</task-notification>'));
+  turn.emit(assistantText('The workflow finished.'));
+  turn.emit(resultMessage('The workflow finished.', 'native-1'));
+
+  const contResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.equal(contResponse.body.workflowRuns.length, 1);
+  const run = contResponse.body.workflowRuns[0];
+  assert.equal(run.runId, 'wf_card-3');
+  assert.equal(run.status, 'completed');
+  assert.equal(run.workflowName, 'demo-run', 'the drain-time retry upgraded to the record digest');
+  assert.equal(run.durationMs, 927637, 'record-level totals ride the upgraded digest');
+  assert.ok(
+    run.agents.every((agent) => agent.state !== 'running'),
+    'no agent stays frozen in a running state on a finished card',
+  );
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the settled-workflow buffer caps at 5, dropping the oldest', async (t) => {
+  const sessionDir = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'wf-session-'));
+  t.after(() => fsSync.rmSync(sessionDir, { recursive: true, force: true }));
+  fsSync.mkdirSync(nodePathModule.join(sessionDir, 'workflows'), { recursive: true });
+  const taskIds = Array.from({ length: 6 }, (_, i) => `wf-cap-${i + 1}`);
+  for (const [i, taskId] of taskIds.entries()) {
+    fsSync.writeFileSync(
+      nodePathModule.join(sessionDir, 'workflows', `wf_cap-${i + 1}.json`),
+      workflowRunRecordJson(`wf_cap-${i + 1}`, taskId),
+    );
+  }
+
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    workflowPollMs: 20,
+    resolveWorkflowSessionDirImpl: () => sessionDir,
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage(taskIds.map((taskId) => ({
+    task_id: taskId, task_type: 'local_workflow', description: `run ${taskId}`,
+  }))));
+  turn.emit(resultMessage('six workflows dispatched', 'native-1'));
+  assert.equal(await pending, true);
+
+  // All six leave the live set at once; the buffer holds only the last five.
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(userReplay('<task-notification>all settled</task-notification>'));
+  turn.emit(assistantText('All workflows finished.'));
+  turn.emit(resultMessage('All workflows finished.', 'native-1'));
+
+  const contResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.equal(contResponse.body.workflowRuns.length, 5, 'capped at 5');
+  assert.deepEqual(
+    contResponse.body.workflowRuns.map((entry) => entry.runId),
+    ['wf_cap-2', 'wf_cap-3', 'wf_cap-4', 'wf_cap-5', 'wf_cap-6'],
+    'the oldest settled digest is the one dropped',
+  );
+
   turn.endInput();
   await settled(runner);
 });

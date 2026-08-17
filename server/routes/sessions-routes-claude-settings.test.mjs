@@ -173,3 +173,47 @@ test('buildConversationMessages attaches per-message subagentRuns', () => {
   const user = messages.find((message) => message.id === 'user-1');
   assert.deepEqual(user.subagentRuns ?? [], []);
 });
+
+test('buildConversationMessages attaches per-message workflowRuns', () => {
+  const digest = {
+    runId: 'wf_1',
+    workflowName: 'code-review',
+    status: 'completed',
+    agentCount: 2,
+    totalTokens: 321498,
+    durationMs: 927637,
+    phases: [{ index: 1, title: 'Review' }],
+    logs: [],
+    agents: [{ index: 1, label: 'review:logic', state: 'done' }],
+    agentsOmitted: 0,
+  };
+  const messages = buildConversationMessages({
+    dbMessages: [
+      { id: 'resp-1', role: 'assistant', text: 'The workflow finished.', timestamp: '2026-08-17T00:00:00Z' },
+      { id: 'user-1', role: 'user', text: 'hi', timestamp: '2026-08-16T23:59:00Z' },
+    ],
+    workflowRunsByMessageId: new Map([['resp-1', [digest]]]),
+  });
+  const assistant = messages.find((message) => message.id === 'resp-1');
+  assert.ok(assistant);
+  assert.deepEqual(assistant.workflowRuns, [digest], 'the digest serves untouched on its message');
+  const user = messages.find((message) => message.id === 'user-1');
+  assert.deepEqual(user.workflowRuns ?? [], [], 'user rows never carry workflow cards');
+});
+
+test('buildConversationMessages prefers a transcript message\'s own workflowRuns, with the map as fallback', () => {
+  const transcriptDigest = { runId: 'wf_transcript', status: 'completed', agents: [], phases: [], logs: [] };
+  const mapDigest = { runId: 'wf_map', status: 'completed', agents: [], phases: [], logs: [] };
+  const messages = buildConversationMessages({
+    transcriptMessages: [
+      { id: 'resp-1', role: 'assistant', text: 'own runs', timestamp: '2026-08-17T00:00:00Z', workflowRuns: [transcriptDigest] },
+      { id: 'resp-2', role: 'assistant', text: 'map runs', timestamp: '2026-08-17T00:01:00Z' },
+    ],
+    workflowRunsByMessageId: new Map([
+      ['resp-1', [mapDigest]],
+      ['resp-2', [mapDigest]],
+    ]),
+  });
+  assert.equal(messages.find((message) => message.id === 'resp-1').workflowRuns[0].runId, 'wf_transcript');
+  assert.equal(messages.find((message) => message.id === 'resp-2').workflowRuns[0].runId, 'wf_map');
+});

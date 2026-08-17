@@ -3327,6 +3327,27 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_subagent_runs_conversation
     ON subagent_runs(conversation_id, status);
 
+  -- Final workflow digests attached to the assistant message that reports a
+  -- background workflow's completion (the transcript's "Finished background
+  -- task" card). Written inside the /api/response finalize transaction, so the
+  -- rows key directly on the response message id — no queue-id resolution
+  -- needed. digest_json is the sanitized workflowProgress contract, ≤ a few KB.
+  -- Also declared in the upgrade db.exec below for existing databases.
+  CREATE TABLE IF NOT EXISTS workflow_runs (
+    id                  TEXT PRIMARY KEY,
+    response_message_id TEXT NOT NULL,
+    conversation_id     TEXT NOT NULL,
+    run_index           INTEGER NOT NULL DEFAULT 0,
+    digest_json         TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_workflow_runs_response
+    ON workflow_runs(response_message_id, run_index);
+  CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
+    ON workflow_runs(conversation_id);
+
   CREATE TABLE IF NOT EXISTS uploaded_files (
     sha256        TEXT PRIMARY KEY,
     original_name TEXT,
@@ -3711,6 +3732,25 @@ db.exec(`
     ON subagent_runs(queue_message_id, started_at);
   CREATE INDEX IF NOT EXISTS idx_subagent_runs_conversation
     ON subagent_runs(conversation_id, status);
+`);
+
+// Existing databases pick up the workflow_runs side table here; fresh ones get
+// it from the main schema block above (same dual-declaration pattern as
+// subagent_runs).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS workflow_runs (
+    id                  TEXT PRIMARY KEY,
+    response_message_id TEXT NOT NULL,
+    conversation_id     TEXT NOT NULL,
+    run_index           INTEGER NOT NULL DEFAULT 0,
+    digest_json         TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_workflow_runs_response
+    ON workflow_runs(response_message_id, run_index);
+  CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
+    ON workflow_runs(conversation_id);
 `);
 
 const relayActivityColumns = db.prepare(`PRAGMA table_info(relay_activity)`).all().map((c) => c.name);
@@ -6131,6 +6171,24 @@ function mapSubagentRunRow(row) {
   };
 }
 
+// Final workflow digests persisted with an assistant message (the "Finished
+// background task" card). digest_json was sanitized at ingest; a row whose
+// JSON no longer parses is dropped rather than failing the conversation read.
+function workflowRunsForResponse(responseMessageId) {
+  const rows = stmts.listWorkflowRunsByResponse?.all(responseMessageId) || [];
+  return rows
+    .map((row) => {
+      try {
+        const digest = JSON.parse(String(row?.digest_json || ''));
+        return digest && typeof digest === 'object' && !Array.isArray(digest) ? digest : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .slice(0, 5);
+}
+
 // Live background-task sets per conversation, published by Claude session
 // workers (REPLACE semantics, mirroring the SDK's background_tasks_changed
 // signal). In-memory only: the worker republishes on every change and clears
@@ -7310,6 +7368,7 @@ const sharedRouteDeps = {
   relayThoughtsForResponse,
   relayThoughtsForQueueMessage,
   subagentRunsForResponse,
+  workflowRunsForResponse,
   sanitizeActivityText,
   inFlightStateForConversation,
   backgroundTaskStore,

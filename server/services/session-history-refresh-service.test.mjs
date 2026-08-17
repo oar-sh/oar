@@ -90,6 +90,14 @@ function makeDb() {
       updated_at TEXT NOT NULL,
       completed_at TEXT
     );
+    CREATE TABLE workflow_runs (
+      id TEXT PRIMARY KEY,
+      response_message_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      run_index INTEGER NOT NULL DEFAULT 0,
+      digest_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE uploaded_files (
       sha256 TEXT PRIMARY KEY,
       original_name TEXT,
@@ -146,6 +154,7 @@ test('clearRetrievableHistory removes only retrievable tables', () => {
   db.prepare(`INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, created_at) VALUES ('q1', 'm2', 'conv-1', 'agent', 1, 'thinking', '2026-01-01T00:00:03Z')`).run();
   db.prepare(`INSERT INTO relay_stream_events (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, done, created_at) VALUES ('q1', 'm2', 'conv-1', 'agent', 1, 'partial', 0, '2026-01-01T00:00:04Z')`).run();
   db.prepare(`INSERT INTO subagent_runs (id, queue_message_id, conversation_id, status, started_at, updated_at) VALUES ('sub-1', 'q1', 'conv-1', 'running', '2026-01-01T00:00:05Z', '2026-01-01T00:00:05Z')`).run();
+  db.prepare(`INSERT INTO workflow_runs (id, response_message_id, conversation_id, run_index, digest_json, created_at) VALUES ('wfr-1', 'm2', 'conv-1', 0, '{"runId":"wf_1"}', '2026-01-01T00:00:06Z')`).run();
   db.prepare(`INSERT INTO relay_questions (id, conversation_id) VALUES ('rq-1', 'conv-1')`).run();
   db.prepare(`INSERT INTO queue (id, conversation_id, status) VALUES ('q1', 'conv-1', 'done')`).run();
 
@@ -157,6 +166,7 @@ test('clearRetrievableHistory removes only retrievable tables', () => {
   assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM relay_thought WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 0);
   assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM relay_stream_events WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 0);
   assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM subagent_runs WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 0);
+  assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM workflow_runs WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 0);
   assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM relay_questions WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 1);
   assert.equal(Number(db.prepare(`SELECT COUNT(*) AS cnt FROM queue WHERE conversation_id = 'conv-1'`).get()?.cnt || 0), 1);
 });

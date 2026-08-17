@@ -1,5 +1,10 @@
+import nodeFs from 'node:fs';
+import nodePath from 'node:path';
+
 import { buildClaudeUserContent } from './claude-attachments.mjs';
 import { createSdkMessageNormalizer, isSubagentToolName } from './sdk-message-normalizer.mjs';
+import { digestFromRunRecord, digestFromJournal } from './workflow-progress-digest.mjs';
+import { createClaudeSessionRootResolver } from '../services/claude-session-root-service.mjs';
 import {
   startClaudeSession,
   createCanUseTool,
@@ -28,6 +33,208 @@ function modeAppendClass(relayMode) {
 
 /** Task types that run a model of their own (vs. bash/monitor/workflow). */
 const AGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
+
+// ---------------------------------------------------------------------------
+// Workflow progress sources (CLI 2.1.226 on-disk formats)
+//
+// A `local_workflow` task's tree lives under the native session's project
+// directory: `<sessionDir>/subagents/workflows/<runId>/journal.jsonl` is
+// appended live while the run executes, and `<sessionDir>/workflows/
+// <runId>.json` (the run record, the only place carrying `taskId`) is written
+// only at completion. The poller reads the journal mid-run and switches to the
+// run record the moment it exists.
+
+/** Run ids and agent ids are joined into paths, so both are validated first. */
+const WORKFLOW_FS_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/**
+ * Mid-run nothing on disk maps runId→taskId, so run directories are matched
+ * to the task by time instead: the task's startedAt is worker wall clock while
+ * dir mtimes come from the filesystem, and this slack absorbs the skew.
+ */
+const WORKFLOW_RUN_MATCH_SLACK_MS = 15_000;
+const MAX_WORKFLOW_RECORDS_SCANNED = 25;
+const MAX_WORKFLOW_JOURNAL_BYTES = 2 * 1024 * 1024;
+const MAX_WORKFLOW_RECORD_BYTES = 8 * 1024 * 1024;
+const AGENT_LABEL_READ_BYTES = 8_192;
+
+function workflowMtimeMs(candidate) {
+  try {
+    return Number(nodeFs.statSync(candidate).mtimeMs) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Up to `maxBytes` of a file as utf8, or null when it cannot be read. */
+function readBoundedUtf8(filePath, maxBytes) {
+  let fd = null;
+  try {
+    fd = nodeFs.openSync(filePath, 'r');
+    const buffer = Buffer.alloc(maxBytes);
+    const bytes = nodeFs.readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.toString('utf8', 0, bytes);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try { nodeFs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+/** Parse `<sessionDir>/workflows/<runId>.json`, or null. */
+function readWorkflowRunRecord(sessionDir, runId) {
+  if (!WORKFLOW_FS_NAME_PATTERN.test(runId)) return null;
+  const text = readBoundedUtf8(nodePath.join(sessionDir, 'workflows', `${runId}.json`), MAX_WORKFLOW_RECORD_BYTES);
+  if (!text) return null;
+  try {
+    const record = JSON.parse(text);
+    return record && typeof record === 'object' ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find the run record whose `taskId` matches — the only authoritative
+ * runId↔taskId join, available once the record is written (completion). Only
+ * records touched since the task started (minus slack) are parsed, so a
+ * session's pile of past run records costs one stat each, not a parse.
+ */
+function scanWorkflowRunRecords({ sessionDir, taskId, startedAt }) {
+  const workflowsDir = nodePath.join(sessionDir, 'workflows');
+  let entries = [];
+  try {
+    entries = nodeFs.readdirSync(workflowsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const runId = entry.name.slice(0, -'.json'.length);
+    if (!WORKFLOW_FS_NAME_PATTERN.test(runId)) continue;
+    const modifiedAt = workflowMtimeMs(nodePath.join(workflowsDir, entry.name));
+    if (startedAt && modifiedAt < startedAt - WORKFLOW_RUN_MATCH_SLACK_MS) continue;
+    candidates.push({ runId, modifiedAt });
+  }
+  candidates.sort((a, b) => b.modifiedAt - a.modifiedAt);
+  for (const candidate of candidates.slice(0, MAX_WORKFLOW_RECORDS_SCANNED)) {
+    const record = readWorkflowRunRecord(sessionDir, candidate.runId);
+    if (record && String(record.taskId || '').trim() === taskId) return record;
+  }
+  return null;
+}
+
+/**
+ * Locate the LIVE run directory for a task, heuristically: among the run
+ * directories under `<sessionDir>/subagents/workflows/`, keep those whose own
+ * mtime or journal mtime is at or after the task's startedAt minus the slack,
+ * and pick the newest. The caller caches the match per taskId; a later run record
+ * whose taskId disagrees clears that cache (concurrent workflows can tie the
+ * newest-dir pick to the wrong task until their records land).
+ */
+function findLiveWorkflowRunId({ sessionDir, startedAt }) {
+  const runsDir = nodePath.join(sessionDir, 'subagents', 'workflows');
+  let entries = [];
+  try {
+    entries = nodeFs.readdirSync(runsDir, { withFileTypes: true });
+  } catch {
+    return '';
+  }
+  let bestRunId = '';
+  let bestModifiedAt = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !WORKFLOW_FS_NAME_PATTERN.test(entry.name)) continue;
+    const runDir = nodePath.join(runsDir, entry.name);
+    const modifiedAt = Math.max(
+      workflowMtimeMs(runDir),
+      workflowMtimeMs(nodePath.join(runDir, 'journal.jsonl')),
+    );
+    if (startedAt && modifiedAt < startedAt - WORKFLOW_RUN_MATCH_SLACK_MS) continue;
+    if (modifiedAt > bestModifiedAt) {
+      bestModifiedAt = modifiedAt;
+      bestRunId = entry.name;
+    }
+  }
+  return bestRunId;
+}
+
+/** Parsed lines of a run directory's journal.jsonl, or null when unreadable. */
+function readWorkflowJournal(runDir) {
+  const text = readBoundedUtf8(nodePath.join(runDir, 'journal.jsonl'), MAX_WORKFLOW_JOURNAL_BYTES);
+  if (text === null) return null;
+  const entries = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      entries.push(JSON.parse(trimmed));
+    } catch {
+      // A half-appended (or truncated-by-cap) line parses on a later poll.
+    }
+  }
+  return entries;
+}
+
+/** JSON string body → text, tolerating a fragment cut mid-escape-sequence. */
+function unescapeJsonStringFragment(fragment) {
+  for (let cut = 0; cut < 6 && cut < fragment.length; cut += 1) {
+    try {
+      return JSON.parse(`"${fragment.slice(0, fragment.length - cut)}"`);
+    } catch {
+      // The tail may be a split escape sequence; trim one char and retry.
+    }
+  }
+  return '';
+}
+
+/**
+ * The live label for one workflow agent: the first line of its
+ * `agent-<agentId>.jsonl` is `{"type":"user","message":{role,content},...}`
+ * where `message.content` is the agent's prompt — its first ~160 chars are
+ * the best mid-run label (the run record's `label` only exists at
+ * completion). Only the first ~8KB is read; a first line longer than that is
+ * recovered via a raw `"content":"…"` match on the chunk.
+ */
+function readWorkflowAgentLabel(runDir, agentId) {
+  if (!WORKFLOW_FS_NAME_PATTERN.test(agentId)) return '';
+  const chunk = readBoundedUtf8(nodePath.join(runDir, `agent-${agentId}.jsonl`), AGENT_LABEL_READ_BYTES);
+  if (!chunk) return '';
+  const newlineIndex = chunk.indexOf('\n');
+  const firstLine = newlineIndex === -1 ? chunk : chunk.slice(0, newlineIndex);
+  let content = null;
+  try {
+    content = JSON.parse(firstLine)?.message?.content;
+  } catch {
+    const match = /"content"\s*:\s*"((?:[^"\\]|\\.){1,400})/.exec(firstLine);
+    if (match) content = unescapeJsonStringFragment(match[1]);
+  }
+  if (Array.isArray(content)) {
+    content = content.find((block) => block?.type === 'text')?.text;
+  }
+  if (typeof content !== 'string') return '';
+  return content.replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+
+/**
+ * Default session-dir resolution for the workflow poller: the same
+ * `<configRoot>/projects/<slug(cwd)>/<nativeSessionId>/` derivation the
+ * transcript relocator uses, via the shared session-root resolver (which owns
+ * the cwd slug, the CLAUDE_CONFIG_DIR/~/.claude root order, the scan fallback,
+ * and caching). Injectable so tests can point the poller at a temp dir.
+ */
+function createDefaultWorkflowSessionDirResolver() {
+  let resolver = null;
+  return ({ nativeSessionId, cwd }) => {
+    if (!resolver) resolver = createClaudeSessionRootResolver();
+    const resolved = resolver.resolveClaudeSessionRoot({
+      claudeNativeSessionId: nativeSessionId,
+      workspaceRootPath: cwd,
+    });
+    return resolved?.sessionRootPath || '';
+  };
+}
 
 /** The text a user content payload streams as — the replay-matching key. */
 function contentText(content) {
@@ -109,10 +316,17 @@ export function createClaudeSessionRunner({
   // and must stop pinning the process.
   notificationGraceMs = 60_000,
   continuationRetryDelayMs = 500,
+  workflowPollMs = 2_000,
+  resolveWorkflowSessionDirImpl = null,
   askUserBridgeOptions = {},
   dbg = () => {},
 } = {}) {
-  const publisher = createClaudeTurnPublisher({ api, dbg });
+  const publisher = createClaudeTurnPublisher({
+    api,
+    dbg,
+    takeWorkflowRuns: () => drainSettledWorkflowRuns(),
+  });
+  const resolveWorkflowSessionDir = resolveWorkflowSessionDirImpl || createDefaultWorkflowSessionDirResolver();
   let claudeNativeSessionId = '';
   let proc = null;
 
@@ -515,6 +729,9 @@ export function createClaudeSessionRunner({
           subagentType: task.subagentType || null,
           model,
           modelInherited: Boolean(model && !pinnedModel),
+          // The workflow digest (poller below) rides the same row; the relay
+          // sanitizer whitelists and re-clamps it before storing.
+          ...(task.workflowProgress ? { workflowProgress: task.workflowProgress } : {}),
         };
       });
       api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks }).catch((error) => {
@@ -532,6 +749,270 @@ export function createClaudeSessionRunner({
     if (processRef.taskPublishTimer) return;
     processRef.taskPublishTimer = setTimeout(send, 2_000);
     processRef.taskPublishTimer.unref?.();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Workflow progress poller
+  //
+  // A `local_workflow` task is ONE opaque row on the task-events path; its
+  // per-agent tree lives on disk (see the module-level readers above). While
+  // such a task is live, an interval polls the tree, digests it, and attaches
+  // the digest to the task's published row as `workflowProgress` — publishing
+  // only when the digest actually changed. Same lifecycle discipline as
+  // taskPublishTimer: unref'd, cleared on settle and in cleanupProcess.
+
+  function workflowSessionDirFor(processRef) {
+    const nativeSessionId = String(processRef.nativeSessionId || claudeNativeSessionId || '').trim();
+    if (!nativeSessionId) return '';
+    try {
+      return String(resolveWorkflowSessionDir({ nativeSessionId, cwd }) || '');
+    } catch {
+      return '';
+    }
+  }
+
+  function getWorkflowState(processRef, taskId) {
+    let state = processRef.workflowStates.get(taskId);
+    if (!state) {
+      state = { runId: '', labels: new Map(), digestJson: '' };
+      processRef.workflowStates.set(taskId, state);
+    }
+    return state;
+  }
+
+  /**
+   * The freshest digest for one workflow task, or null. The run record wins
+   * whenever it exists (it is written at completion and carries the full
+   * tree); until then the live journal is the source. `recordOnly` is the
+   * settle-time final read, where a journal re-read could only regress.
+   */
+  function buildWorkflowDigest(processRef, sessionDir, taskId, task, { recordOnly = false } = {}) {
+    const state = getWorkflowState(processRef, taskId);
+    const startedAt = Number(task.startedAt) || 0;
+
+    if (state.runId) {
+      const record = readWorkflowRunRecord(sessionDir, state.runId);
+      if (record) {
+        const recordTaskId = String(record.taskId || '').trim();
+        if (recordTaskId && recordTaskId !== taskId) {
+          // The mtime heuristic bound this task to another task's run; the
+          // record's taskId is authoritative, so drop the binding and let the
+          // taskId scan re-match on a later poll.
+          state.runId = '';
+        } else {
+          const digest = digestFromRunRecord(record);
+          if (digest) return digest;
+        }
+      }
+    }
+    if (!state.runId) {
+      const record = scanWorkflowRunRecords({ sessionDir, taskId, startedAt });
+      const digest = record ? digestFromRunRecord(record) : null;
+      if (digest) {
+        state.runId = digest.runId;
+        return digest;
+      }
+    }
+    if (recordOnly) return null;
+
+    if (!state.runId) state.runId = findLiveWorkflowRunId({ sessionDir, startedAt });
+    if (!state.runId) return null;
+    const runDir = nodePath.join(sessionDir, 'subagents', 'workflows', state.runId);
+    const entries = readWorkflowJournal(runDir);
+    if (!entries) return null;
+    for (const entry of entries) {
+      const agentId = String(entry?.agentId || '').trim();
+      if (!agentId || state.labels.has(agentId)) continue;
+      // Cache label hits only: a miss may just be a first line still being
+      // flushed, and re-reading 8KB per poll until it lands is cheap.
+      const label = readWorkflowAgentLabel(runDir, agentId);
+      if (label) state.labels.set(agentId, label);
+    }
+    return digestFromJournal({
+      entries,
+      labelsByAgentId: state.labels,
+      workflowName: null,
+      runId: state.runId,
+    });
+  }
+
+  function stopWorkflowPoller(processRef) {
+    if (processRef.workflowPollTimer) {
+      clearInterval(processRef.workflowPollTimer);
+      processRef.workflowPollTimer = null;
+    }
+  }
+
+  function pollWorkflowProgress(processRef) {
+    if (processRef !== proc || processRef.closing) {
+      stopWorkflowPoller(processRef);
+      return;
+    }
+    const workflowTasks = [...processRef.liveTasks.entries()]
+      .filter(([, task]) => String(task.taskType || '') === 'local_workflow');
+    if (!workflowTasks.length) {
+      stopWorkflowPoller(processRef);
+      return;
+    }
+    const sessionDir = workflowSessionDirFor(processRef);
+    if (!sessionDir) return;
+    let changed = false;
+    for (const [taskId, task] of workflowTasks) {
+      let digest = null;
+      try {
+        digest = buildWorkflowDigest(processRef, sessionDir, taskId, task);
+      } catch {
+        // Advisory by contract: a digest failure must never disturb the turn.
+      }
+      if (!digest) continue;
+      const digestJson = JSON.stringify(digest);
+      const state = getWorkflowState(processRef, taskId);
+      if (state.digestJson === digestJson) continue;
+      state.digestJson = digestJson;
+      task.workflowProgress = digest;
+      changed = true;
+    }
+    if (changed) publishBackgroundTasks();
+  }
+
+  /** Start/stop the poller to match the live task set; prune settled state. */
+  function syncWorkflowPoller(processRef) {
+    for (const taskId of [...processRef.workflowStates.keys()]) {
+      if (!processRef.liveTasks.has(taskId)) processRef.workflowStates.delete(taskId);
+    }
+    const hasWorkflowTask = [...processRef.liveTasks.values()]
+      .some((task) => String(task.taskType || '') === 'local_workflow');
+    if (!hasWorkflowTask) {
+      stopWorkflowPoller(processRef);
+      return;
+    }
+    if (processRef.workflowPollTimer || processRef.closing) return;
+    processRef.workflowPollTimer = setInterval(() => pollWorkflowProgress(processRef), workflowPollMs);
+    processRef.workflowPollTimer.unref?.();
+  }
+
+  // How many settled workflows can wait for their summarizing response at
+  // once — matches the relay-side cap on `workflowRuns` per message.
+  const MAX_SETTLED_WORKFLOW_RUNS = 5;
+
+  /** True for any status that names an outcome (not in-flight, not absent). */
+  function isSettledWorkflowStatus(value) {
+    const status = String(value || '').trim().toLowerCase();
+    return Boolean(status) && status !== 'running';
+  }
+
+  /**
+   * Remember a settled workflow's final digest for the next /api/response
+   * publish (the "Finished background task" card on the summarizing turn).
+   * The run record's digest is authoritative; a run that never wrote one
+   * (stopped early) settles with its last live digest, whose stale 'running'
+   * status is replaced by the settle notification's ('stopped', 'failed').
+   * Both settle signals may call this for the same task in either order —
+   * a terminal status, once seen, is never downgraded.
+   */
+  function bufferSettledWorkflowRun(taskId, task, notificationStatus = '') {
+    if (!proc || !task || String(task.taskType || '') !== 'local_workflow') return;
+    try {
+      const sessionDir = workflowSessionDirFor(proc);
+      const recordDigest = sessionDir
+        ? buildWorkflowDigest(proc, sessionDir, taskId, task, { recordOnly: true })
+        : null;
+      const digest = recordDigest
+        || (task.workflowProgress && typeof task.workflowProgress === 'object' ? task.workflowProgress : null);
+      if (!digest) return;
+      const previous = proc.settledWorkflowDigests.get(taskId) || null;
+      const status = [digest.status, notificationStatus, previous?.digest?.status]
+        .find(isSettledWorkflowStatus) || digest.status || null;
+      proc.settledWorkflowDigests.delete(taskId);
+      proc.settledWorkflowDigests.set(taskId, {
+        digest: { ...digest, status },
+        // A journal-snapshot digest gets one more record-read attempt at
+        // drain time (the CLI can flush the run record moments after the
+        // settle signals); startedAt is what the taskId scan needs then.
+        fromRecord: Boolean(recordDigest),
+        startedAt: Number(task.startedAt) || 0,
+      });
+      while (proc.settledWorkflowDigests.size > MAX_SETTLED_WORKFLOW_RUNS) {
+        proc.settledWorkflowDigests.delete(proc.settledWorkflowDigests.keys().next().value);
+      }
+    } catch {
+      // Advisory by contract: buffering must never disturb the settle path.
+    }
+  }
+
+  /**
+   * Removal-first settle order: the digest was already buffered when the task
+   * left the live set, but only the late task_notification knows how it ended.
+   */
+  function refineSettledWorkflowStatus(taskId, notificationStatus) {
+    const status = String(notificationStatus || '').trim();
+    const buffered = proc?.settledWorkflowDigests.get(taskId);
+    if (!buffered || !status) return;
+    if (!isSettledWorkflowStatus(buffered.digest.status)) buffered.digest.status = status;
+  }
+
+  /**
+   * Hand the buffered digests to the response publish and clear the buffer.
+   * Entries that settled on a journal snapshot (record not on disk yet — the
+   * CLI flushes it moments after the settle signals, observed live as a card
+   * frozen with a "running" verify agent) retry the authoritative record read
+   * here: the summarizing response publishes seconds later, when the record
+   * exists.
+   */
+  function drainSettledWorkflowRuns() {
+    if (!proc || !proc.settledWorkflowDigests.size) return null;
+    const entries = [...proc.settledWorkflowDigests.entries()];
+    proc.settledWorkflowDigests.clear();
+    const sessionDir = workflowSessionDirFor(proc);
+    return entries.map(([taskId, entry]) => {
+      if (!entry.fromRecord && sessionDir) {
+        try {
+          const record = buildWorkflowDigest(
+            proc,
+            sessionDir,
+            taskId,
+            { startedAt: entry.startedAt },
+            { recordOnly: true },
+          );
+          if (record) {
+            return isSettledWorkflowStatus(record.status)
+              ? record
+              : { ...record, status: entry.digest.status };
+          }
+        } catch {
+          // Advisory: the snapshot digest below is still a valid card.
+        }
+      }
+      return entry.digest;
+    });
+  }
+
+  /**
+   * Settle-time final read: the run record lands at completion, so the
+   * task_notification is the one moment the completed tree (final states,
+   * tokens, logs) can still ride the row before it clears.
+   */
+  function publishFinalWorkflowDigest(taskId, notificationStatus = '') {
+    const task = proc?.liveTasks.get(taskId);
+    if (!task || String(task.taskType || '') !== 'local_workflow') {
+      refineSettledWorkflowStatus(taskId, notificationStatus);
+      return;
+    }
+    bufferSettledWorkflowRun(taskId, task, notificationStatus);
+    try {
+      const sessionDir = workflowSessionDirFor(proc);
+      if (!sessionDir) return;
+      const digest = buildWorkflowDigest(proc, sessionDir, taskId, task, { recordOnly: true });
+      if (!digest) return;
+      const digestJson = JSON.stringify(digest);
+      const state = getWorkflowState(proc, taskId);
+      if (state.digestJson === digestJson) return;
+      state.digestJson = digestJson;
+      task.workflowProgress = digest;
+      publishBackgroundTasks();
+    } catch {
+      // Advisory: a failed final read leaves the last live digest standing.
+    }
   }
 
   // Remember the model each subagent spawn pinned explicitly: only the
@@ -562,6 +1043,10 @@ export function createClaudeSessionRunner({
     const subtype = String(sdkMessage.subtype || '');
     if (subtype === 'init') {
       persistNativeSessionId(sdkSessionId, sdkMessage.session_id).catch(() => {});
+      // Tracked on the process too (not only through the persist round-trip):
+      // the workflow poller needs the native id to find the session dir even
+      // when the persist call is still in flight or failed.
+      proc.nativeSessionId = String(sdkMessage.session_id || '').trim() || proc.nativeSessionId;
       // Init always lands before any context is active, so the per-context
       // normalizer never sees it — capture the CLI's actual model here and
       // seed it into every context at activation. Without this, a composer
@@ -644,6 +1129,14 @@ export function createClaudeSessionRunner({
           break;
         }
       }
+      // The live SDK usually drops a settled task's row BEFORE its
+      // task_notification arrives, so this removal is the reliable moment to
+      // capture a settling workflow's final digest for the transcript card
+      // (the notification then refines the status when it lands).
+      for (const [taskId, task] of previous) {
+        if (!proc.liveTasks.has(taskId)) bufferSettledWorkflowRun(taskId, task);
+      }
+      syncWorkflowPoller(proc);
       publishBackgroundTasks();
       evaluateLifecycle();
       return;
@@ -660,6 +1153,9 @@ export function createClaudeSessionRunner({
         // bubbles key on — recorded so the panel and the bubbles can be
         // correlated (and a targeted stop can find its task).
         known.toolUseId = String(sdkMessage.tool_use_id || '').trim() || known.toolUseId || '';
+        // task_started can be the first event carrying the task_type; a
+        // workflow revealed here must start its poller too.
+        syncWorkflowPoller(proc);
         publishBackgroundTasks({ throttled: true });
       }
       return;
@@ -680,6 +1176,10 @@ export function createClaudeSessionRunner({
     }
     if (subtype === 'task_notification') {
       const taskId = String(sdkMessage.task_id || '').trim();
+      // A settling workflow gets one final run-record read so the completed
+      // tree publishes before the row clears (best-effort: the CLI may have
+      // already removed the task via background_tasks_changed).
+      if (taskId) publishFinalWorkflowDigest(taskId, String(sdkMessage.status || '').trim());
       // A settled session-level task means the CLI is about to dequeue a
       // continuation turn — the process must not idle out under it. The SDK
       // flags silent notifications explicitly: skip_transcript means no
@@ -807,6 +1307,7 @@ export function createClaudeSessionRunner({
       clearTimeout(processRef.taskPublishTimer);
       processRef.taskPublishTimer = null;
     }
+    stopWorkflowPoller(processRef);
     // The process took its background tasks with it; clear the panel — but
     // only when this process still owns it. A superseded process clearing the
     // panel would blank the replacement's live task set.
@@ -865,6 +1366,18 @@ export function createClaudeSessionRunner({
       permissionMode: permissionModeForRelayMode(relayMode),
       liveTasks: new Map(),
       knownTasks: new Set(),
+      // taskId → { runId, labels, digestJson } for live local_workflow tasks;
+      // pruned by syncWorkflowPoller when a task leaves the live set.
+      workflowStates: new Map(),
+      // taskId → final digest of a workflow that settled, waiting to ride the
+      // next /api/response publish as `workflowRuns` (the transcript's
+      // "Finished background task" card). Capped at 5, drained on attach; if
+      // the process dies before a response publishes, these are lost (v1).
+      settledWorkflowDigests: new Map(),
+      // The freshest native session id the process itself has seen (seeded
+      // from `resume`, updated on init) — the workflow poller's key into
+      // `~/.claude/projects`.
+      nativeSessionId: '',
       // tool_use id → explicitly pinned model of a subagent spawn block; the
       // task panel's model column resolves through this at publish time.
       subagentSpawns: new Map(),
@@ -889,6 +1402,7 @@ export function createClaudeSessionRunner({
       closing: false,
       lifecycleTimer: null,
       taskPublishTimer: null,
+      workflowPollTimer: null,
       consumer: null,
     };
 
@@ -940,6 +1454,7 @@ export function createClaudeSessionRunner({
     };
 
     const resume = String(message.claudeNativeSessionId || claudeNativeSessionId || '').trim();
+    processRef.nativeSessionId = resume;
     // The CLI resolves `resume` inside the project directory for *this* CWD, so
     // a session whose workspace root changed has to bring its transcript along
     // or every turn from here on fails with "No conversation found".

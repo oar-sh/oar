@@ -1652,6 +1652,7 @@ export function buildConversationMessages({
   relayActivitiesByMessageId = new Map(),
   relayThoughtsByMessageId = new Map(),
   subagentRunsByMessageId = new Map(),
+  workflowRunsByMessageId = new Map(),
   responseMessageToSourceId = new Map(),
   queueRows = [],
   usageByResponseMessageId = new Map(),
@@ -1676,6 +1677,7 @@ export function buildConversationMessages({
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
           thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
           subagentRuns: message?.role === 'assistant' ? (subagentRunsByMessageId.get(id) || []) : [],
+          workflowRuns: message?.role === 'assistant' ? (workflowRunsByMessageId.get(id) || []) : [],
           id,
           role: message?.role,
           text: stripRelayPromptContext(message?.text, message?.mode),
@@ -1716,6 +1718,9 @@ export function buildConversationMessages({
       subagentRuns: (Array.isArray(message?.subagentRuns) && message.subagentRuns.length)
         ? message.subagentRuns
         : (id ? (subagentRunsByMessageId.get(id) || []) : []),
+      workflowRuns: (Array.isArray(message?.workflowRuns) && message.workflowRuns.length)
+        ? message.workflowRuns
+        : (id ? (workflowRunsByMessageId.get(id) || []) : []),
       text: stripRelayPromptContext(message?.text, message?.mode),
       sourceMessageId,
       modelOrigin: message?.modelOrigin
@@ -1859,6 +1864,7 @@ export function registerSessionsRoutes(app, deps) {
     relayActivityForResponse,
     relayThoughtsForResponse,
     subagentRunsForResponse,
+    workflowRunsForResponse,
     buildContextResponseText,
     readContextFromSessionEvents,
     inFlightStateForConversation,
@@ -2326,6 +2332,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
     );
+    const workflowRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -2343,6 +2354,7 @@ export function registerSessionsRoutes(app, deps) {
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
+      workflowRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -3016,6 +3028,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
     );
+    const workflowRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conversationId) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -3030,6 +3047,7 @@ export function registerSessionsRoutes(app, deps) {
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
+      workflowRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -3406,6 +3424,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
     );
+    const workflowRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -3420,6 +3443,7 @@ export function registerSessionsRoutes(app, deps) {
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
+      workflowRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,

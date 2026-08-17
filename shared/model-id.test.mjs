@@ -127,6 +127,17 @@ test('canonicalizeModelId normalizes provider-prefixed and cased ids', () => {
   assert.equal(canonicalizeModelId('GPT-5.3-Codex'), 'gpt-5.3-codex');
 });
 
+test('canonicalizeModelId strips provider prefixes from bare o1/o3 ids', () => {
+  assert.equal(canonicalizeModelId('openai/o1'), 'o1');
+  assert.equal(canonicalizeModelId('openai/o3'), 'o3');
+  assert.equal(canonicalizeModelId('o1'), 'o1');
+  assert.equal(canonicalizeModelId('openai/other-model'), 'openai/other-model');
+});
+
+test('filterValidModelIds dedupes bare and provider-prefixed o1', () => {
+  assert.deepEqual(filterValidModelIds(['o1', 'openai/o1']), ['o1']);
+});
+
 test('filterValidModelIds dedupes case and provider aliases', () => {
   const result = filterValidModelIds([
     'GPT-5.4',

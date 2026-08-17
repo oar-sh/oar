@@ -37,7 +37,7 @@ export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}
  * mutable turn state, so the session process can run any number of turns
  * (delivered or background-continuation) through one publisher.
  */
-export function createClaudeTurnPublisher({ api, dbg = () => {} } = {}) {
+export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRuns = null } = {}) {
   async function postActivity(message, text, subagentRunId = null) {
     if (!text) return;
     await api('POST', '/api/activity', {
@@ -158,6 +158,15 @@ export function createClaudeTurnPublisher({ api, dbg = () => {} } = {}) {
   }
 
   async function publishResponse(message, { text, model, terminalError = null, modelOrigin }) {
+    // Final digests of workflows that settled since the last response ride the
+    // next successful response publish — the summarizing turn is the natural
+    // transcript anchor for the "Finished background task" card. Terminal
+    // failures skip the drain so the digests stay buffered for a later turn;
+    // if this POST fails (→ requeue) or the process dies before any response
+    // publishes, the drained digests are lost — acceptable v1.
+    const workflowRuns = (!terminalError && typeof takeWorkflowRuns === 'function')
+      ? takeWorkflowRuns()
+      : null;
     await api('POST', '/api/response', {
       messageId: message.id,
       conversationId: message.conversationId,
@@ -165,6 +174,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {} } = {}) {
       model: model || null,
       modelOrigin: modelOrigin
         || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
+      ...(Array.isArray(workflowRuns) && workflowRuns.length ? { workflowRuns } : {}),
       ...(terminalError ? { terminalError } : {}),
     }).catch(async () => {
       await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});

@@ -111,7 +111,9 @@ export function canonicalizeModelId(value) {
   for (const providerPrefix of PROVIDER_PREFIXES) {
     if (!candidate.startsWith(providerPrefix)) continue;
     const stripped = candidate.slice(providerPrefix.length);
-    // Provider prefixes are redundant for known base model families.
+    // Provider prefixes are redundant for known base model families,
+    // including the bare "o1"/"o3" ids that carry no dash suffix.
+    if (stripped === 'o1' || stripped === 'o3') return stripped;
     if (BASE_MODEL_PREFIXES.some((prefix) => stripped.startsWith(prefix))) {
       return stripped;
     }
