@@ -3667,6 +3667,10 @@
     padding: 12px 14px;
     display: grid;
     gap: 10px;
+    /* Grid items default to min-width:auto, so a wide <pre> or a long
+       unbreakable token would blow the track past the container's max-width
+       and overflow horizontally. Pin to 0 so children wrap/scroll instead. */
+    min-width: 0;
   }
   .relay-board-head {
     display: flex;
@@ -3680,6 +3684,19 @@
     color: var(--text);
     white-space: normal;
     word-break: break-word;
+    min-width: 0;
+  }
+  /* Mirror the .msg-bubble wrapping rules so plan/board cards read the same as
+     speech bubbles: constrain every descendant to the card width and wrap long
+     content, but let code blocks scroll horizontally inside the card. */
+  .relay-board-body * { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+  .relay-board-body pre { overflow-x: auto; max-width: 100%; }
+  .relay-board-body pre,
+  .relay-board-body pre *,
+  .relay-board-body pre code,
+  .relay-board-body pre code * {
+    overflow-wrap: normal;
+    word-break: normal;
   }
   .relay-board-actions {
     display: flex;

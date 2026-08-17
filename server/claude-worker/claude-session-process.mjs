@@ -205,6 +205,7 @@ export function createClaudeSessionRunner({
     proc.activeCtx = ctx;
     proc.lastBoundary = null;
     proc.notificationPendingAt = 0;
+    proc.taskSettledAt = 0;
     if (proc.initModel && !ctx.state.responseModel) ctx.state.responseModel = proc.initModel;
     ctx.controlState = controlPoller?.start?.({
       queueMessageId: ctx.message?.id || '',
@@ -526,6 +527,19 @@ export function createClaudeSessionRunner({
       // seed it into every context at activation. Without this, a composer
       // set to `auto` published responses with model: null.
       proc.initModel = String(sdkMessage.model || '').trim() || proc.initModel;
+      // A fresh init with no active turn AND nothing queued to deliver is the CLI
+      // opening a turn on its own — a background-task continuation ("you will be
+      // notified"). The real SDK does NOT emit a user-message replay for these
+      // (verified against the live SDK: the settle is background_tasks_changed +
+      // task_notification, then a bare init, then assistant/result), so without
+      // marking the boundary here resolveContext() drops the continuation's
+      // assistant frames as between-turn chatter and nothing publishes. A
+      // delivered turn always has its row in pendingDelivered before its init is
+      // processed (spawnProcess + pendingDelivered.push run synchronously ahead
+      // of the async stream consumer), so it is correctly excluded here.
+      if (!proc.activeCtx && !proc.pendingDelivered.length) {
+        proc.lastBoundary = 'self-opened';
+      }
       return;
     }
     if (subtype === 'background_tasks_changed') {
@@ -552,6 +566,19 @@ export function createClaudeSessionRunner({
           proc.heldForTasksSince = 0;
         }
         proc.knownTasks.add(taskId);
+      }
+      // A task the process knew about just left the live set: it settled, and
+      // the CLI is likely about to dequeue its continuation turn ("you will be
+      // notified"). Pin the process for the grace window so it can't idle out in
+      // the gap before that continuation's first traffic arrives. This is the
+      // reliable "continuation imminent" signal and does not depend on the
+      // settling task_notification (which may be silent — skip_transcript — or
+      // arrive after this message); the notification-based pin is secondary.
+      for (const taskId of previous.keys()) {
+        if (!proc.liveTasks.has(taskId)) {
+          proc.taskSettledAt = Date.now();
+          break;
+        }
       }
       publishBackgroundTasks();
       evaluateLifecycle();
@@ -629,11 +656,16 @@ export function createClaudeSessionRunner({
     if (!proc) return false;
     const notificationFresh = proc.notificationPendingAt
       && Date.now() - proc.notificationPendingAt < notificationGraceMs;
+    // A background task that just settled may still have a continuation turn on
+    // the way; keep the process alive across that gap (see background_tasks_changed).
+    const settleFresh = proc.taskSettledAt
+      && Date.now() - proc.taskSettledAt < notificationGraceMs;
     return Boolean(
       proc.activeCtx
       || proc.pendingDelivered.length
       || proc.liveTasks.size
       || notificationFresh
+      || settleFresh
       || proc.pendingControlRequests > 0,
     );
   }
@@ -776,6 +808,7 @@ export function createClaudeSessionRunner({
       pendingControlRequests: 0,
       lastEventAt: Date.now(),
       heldForTasksSince: 0,
+      taskSettledAt: 0,
       tasksExpired: false,
       tasksExpiredAt: 0,
       aborted: false,

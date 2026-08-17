@@ -132,8 +132,15 @@ function backgroundTasksMessage(tasks) {
   return { type: 'system', subtype: 'background_tasks_changed', tasks };
 }
 
-function taskNotificationMessage(taskId, status = 'completed') {
-  return { type: 'system', subtype: 'task_notification', task_id: taskId, status, summary: 'settled' };
+function taskNotificationMessage(taskId, status = 'completed', { skipTranscript = false } = {}) {
+  return {
+    type: 'system',
+    subtype: 'task_notification',
+    task_id: taskId,
+    status,
+    summary: 'settled',
+    skip_transcript: skipTranscript,
+  };
 }
 
 function userReplay(text) {
@@ -585,6 +592,86 @@ test('a backgrounded bash task keeps the process alive and its continuation publ
   const activity = stub.calls.find((call) => call.routePath === '/api/activity' && call.body.messageId === 'cont-1');
   assert.match(activity.body.text, /bash-1 completed/);
   assert.equal(turn.endInputCalls, 0, 'still alive after the continuation');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a background-task continuation with no user-replay (real SDK shape) still publishes', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'sleep 8' }]));
+  turn.emit(resultMessage('Started; I will be notified.', 'native-1'));
+  assert.equal(await pending, true);
+
+  // Real SDK continuation shape, captured from the live SDK via a scratch probe:
+  // the task settles (background_tasks_changed []), a completion notification
+  // arrives, then a BARE init opens the continuation turn followed straight by
+  // assistant/result — there is NO user-message replay. Before the init-boundary
+  // fix, resolveContext() dropped the assistant frame as between-turn chatter and
+  // the continuation never reached the relay (the live "silent continuation" bug).
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('bash-1'));
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('FINISHED'));
+  turn.emit(resultMessage('FINISHED', 'native-1'));
+
+  const continuationResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.equal(continuationResponse.body.text, 'FINISHED');
+  const registration = stub.calls.find((call) => call.routePath === '/api/continuation-turn');
+  assert.ok(registration, 'the continuation registered its own relay turn');
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a settled task keeps the process alive for its continuation even when the notification is silent', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  // A short idle window with a fast lifecycle poll so an idle-out would fire
+  // within the test; the settle-grace must hold the process open regardless.
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    idleShutdownMs: 40,
+    lifecyclePollMs: 10,
+    notificationGraceMs: 500,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'e2e suite' }]));
+  turn.emit(resultMessage('Runs started; I will be notified.', 'native-1'));
+  assert.equal(await pending, true);
+
+  // The task settles and its completion notification is silent (skip_transcript).
+  // Before the settle-grace fix this left nothing pinning the process, so it
+  // idled out in the gap before the continuation's first traffic and the
+  // "you will be notified" turn was lost until the next user message respawned it.
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('bash-1', 'completed', { skipTranscript: true }));
+
+  // Wait well past idleShutdownMs; the process must still be alive.
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.ok(runner._getProcess(), 'the process must survive the settle→continuation gap');
+  assert.equal(turn.endInputCalls, 0, 'no idle-out endInput during the settle grace');
+
+  // The continuation then arrives and publishes as its own turn.
+  turn.emit(userReplay('<task-notification>bash-1 completed</task-notification>'));
+  turn.emit(assistantText('All three runs passed.'));
+  turn.emit(resultMessage('All three runs passed.', 'native-1'));
+  const continuationResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.equal(continuationResponse.body.text, 'All three runs passed.');
+
   turn.endInput();
   await settled(runner);
 });
