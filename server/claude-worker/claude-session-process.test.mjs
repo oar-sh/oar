@@ -808,6 +808,75 @@ test('the background-task timeout stops every live task', async () => {
   await settled(runner);
 });
 
+test('subagent tasks publish model, inheritance, and subagent type', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  // The spawn block is the only place a pinned model exists (task events
+  // carry subagent_type but no model — live-verified against SDK 0.3.226).
+  turn.emit({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: {
+      content: [{
+        type: 'tool_use',
+        id: 'toolu-pin',
+        name: 'Task',
+        input: { model: 'haiku', subagent_type: 'Explore', prompt: 'dig' },
+      }],
+    },
+  });
+  turn.emit(backgroundTasksMessage([
+    { task_id: 'agent-1', task_type: 'local_agent', description: 'pinned job' },
+    { task_id: 'agent-2', task_type: 'local_agent', description: 'unpinned job' },
+    { task_id: 'bash-1', task_type: 'local_bash', description: 'dev server' },
+  ]));
+  turn.emit({
+    type: 'system', subtype: 'task_started', task_id: 'agent-1', tool_use_id: 'toolu-pin', task_type: 'local_agent', subagent_type: 'Explore', description: 'pinned job',
+  });
+  turn.emit({
+    type: 'system', subtype: 'task_started', task_id: 'agent-2', tool_use_id: 'toolu-unpin', task_type: 'local_agent', subagent_type: 'general-purpose', description: 'unpinned job',
+  });
+  turn.emit({
+    type: 'system', subtype: 'task_progress', task_id: 'agent-2', tool_use_id: 'toolu-unpin', subagent_type: 'general-purpose', last_tool_name: 'Bash', usage: { total_tokens: 12345 },
+  });
+  // Membership republish flushes the throttled task_started/progress merges
+  // into one immediate publish carrying the enriched fields.
+  turn.emit(backgroundTasksMessage([
+    { task_id: 'agent-1', task_type: 'local_agent', description: 'pinned job' },
+    { task_id: 'agent-2', task_type: 'local_agent', description: 'unpinned job' },
+    { task_id: 'bash-1', task_type: 'local_bash', description: 'dev server' },
+  ]));
+  turn.emit(resultMessage('spawned', 'native-1'));
+  assert.equal(await pending, true);
+
+  const publish = await waitFor(() => stub.calls.findLast(
+    (call) => call.routePath === '/api/background-tasks'
+      && call.body.tasks?.length === 3
+      && call.body.tasks.some((task) => task.subagentType),
+  ), { label: 'enriched task publish' });
+  const byId = new Map(publish.body.tasks.map((task) => [task.taskId, task]));
+  const pinned = byId.get('agent-1');
+  assert.equal(pinned.model, 'haiku', 'the spawn block\'s explicit model wins');
+  assert.equal(pinned.modelInherited, false);
+  assert.equal(pinned.subagentType, 'Explore');
+  const unpinned = byId.get('agent-2');
+  assert.equal(unpinned.model, 'claude-sonnet-5', 'no pin falls back to the session model');
+  assert.equal(unpinned.modelInherited, true);
+  assert.equal(unpinned.subagentType, 'general-purpose');
+  assert.equal(unpinned.totalTokens, 12345);
+  assert.equal(unpinned.lastToolName, 'Bash');
+  const bash = byId.get('bash-1');
+  assert.equal(bash.model, null, 'bash tasks run no model of their own');
+  assert.equal(bash.modelInherited, false);
+  assert.equal(bash.subagentType, null);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('an abort control interrupts the turn but keeps the process alive', async () => {
   const stub = makeApiStub();
   const turn = scriptedTurn();

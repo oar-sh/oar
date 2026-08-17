@@ -14,13 +14,46 @@ let elapsedTimer = null;
 const TASK_TYPE_ICONS = {
   local_bash: '⌨️',
   local_agent: '🤖',
+  agent: '🤖',
   subagent: '🤖',
   local_workflow: '🧩',
   monitor: '👁️',
 };
 
+const TASK_TYPE_LABELS = {
+  local_bash: 'Bash',
+  local_agent: 'Subagent',
+  agent: 'Subagent',
+  subagent: 'Subagent',
+  local_workflow: 'Workflow',
+  monitor: 'Monitor',
+};
+
 function taskIcon(taskType) {
   return TASK_TYPE_ICONS[String(taskType || '').trim()] || '⚙️';
+}
+
+// Badge text: the specific agent type when the worker knows it ("Explore",
+// "code-reviewer"), the generic kind otherwise.
+function taskKindLabel(task) {
+  const label = TASK_TYPE_LABELS[String(task?.taskType || '').trim()] || 'Task';
+  const subagentType = String(task?.subagentType || '').trim();
+  return label === 'Subagent' && subagentType ? subagentType : label;
+}
+
+function formatTaskModel(task) {
+  const model = String(task?.model || '').trim();
+  if (!model) return '';
+  const short = model.replace(/^claude-/, '');
+  return task?.modelInherited === true ? `${short} (inherited)` : short;
+}
+
+function formatTaskTokens(totalTokens) {
+  const tokens = Number(totalTokens);
+  if (!Number.isFinite(tokens) || tokens <= 0) return '';
+  if (tokens < 1000) return `${tokens} tok`;
+  const thousands = tokens / 1000;
+  return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k tok`;
 }
 
 function escHtml(value) {
@@ -84,12 +117,23 @@ function renderTaskRow(conversationId, task) {
   const key = `${conversationId}:${task.taskId}`;
   const stopping = stopsInFlight.has(key);
   const elapsed = formatElapsed(task.startedAt);
-  const detail = String(task.summary || task.lastToolName || '').trim();
+  // Second line: progress first ("using Bash" prefixed so a bare tool name
+  // can't read as the task's kind), then model and usage.
+  const summary = String(task.summary || '').trim();
+  const lastToolName = String(task.lastToolName || '').trim();
+  const detail = [
+    summary || (lastToolName ? `using ${lastToolName}` : ''),
+    formatTaskModel(task),
+    formatTaskTokens(task.totalTokens),
+  ].filter(Boolean).join(' · ');
   return `
     <div class="bg-task-row" data-task-id="${escHtml(task.taskId)}">
       <span class="bg-task-icon" title="${escHtml(task.taskType || 'task')}">${taskIcon(task.taskType)}</span>
       <span class="bg-task-main">
-        <span class="bg-task-desc">${escHtml(task.description || task.taskId)}</span>
+        <span class="bg-task-title">
+          <span class="bg-task-desc">${escHtml(task.description || task.taskId)}</span>
+          <span class="bg-task-badge">${escHtml(taskKindLabel(task))}</span>
+        </span>
         ${detail ? `<span class="bg-task-detail">${escHtml(detail)}</span>` : ''}
       </span>
       <span class="bg-task-elapsed">${escHtml(elapsed)}</span>

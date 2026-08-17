@@ -1,5 +1,5 @@
 import { buildClaudeUserContent } from './claude-attachments.mjs';
-import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
+import { createSdkMessageNormalizer, isSubagentToolName } from './sdk-message-normalizer.mjs';
 import {
   startClaudeSession,
   createCanUseTool,
@@ -24,6 +24,9 @@ function modeAppendClass(relayMode) {
   const mode = String(relayMode || 'agent').trim().toLowerCase();
   return mode === 'ask' || mode === 'autopilot' ? mode : 'none';
 }
+
+/** Task types that run a model of their own (vs. bash/monitor/workflow). */
+const AGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
 
 /** The text a user content payload streams as — the replay-matching key. */
 function contentText(content) {
@@ -489,16 +492,30 @@ export function createClaudeSessionRunner({
     if (!processRef) return;
     const send = () => {
       processRef.taskPublishTimer = null;
-      const tasks = [...processRef.liveTasks.entries()].map(([taskId, task]) => ({
-        taskId,
-        taskType: task.taskType,
-        description: task.description,
-        startedAt: task.startedAt || null,
-        summary: task.summary || null,
-        lastToolName: task.lastToolName || null,
-        totalTokens: task.totalTokens ?? null,
-        toolUseId: task.toolUseId || null,
-      }));
+      const tasks = [...processRef.liveTasks.entries()].map(([taskId, task]) => {
+        // The SDK's task events never carry a model (verified against
+        // 0.3.226): a pinned one lives on the spawning tool_use block
+        // (subagentSpawns, keyed by the task's tool_use_id); without a pin an
+        // agent-like task runs on the session model. Resolved at publish
+        // time so the spawn block landing after task_started still heals on
+        // the next publish. Bash & co. get no model at all.
+        const agentLike = AGENT_TASK_TYPES.has(String(task.taskType || ''));
+        const pinnedModel = (task.toolUseId && processRef.subagentSpawns.get(task.toolUseId)) || '';
+        const model = agentLike ? (pinnedModel || processRef.initModel || null) : null;
+        return {
+          taskId,
+          taskType: task.taskType,
+          description: task.description,
+          startedAt: task.startedAt || null,
+          summary: task.summary || null,
+          lastToolName: task.lastToolName || null,
+          totalTokens: task.totalTokens ?? null,
+          toolUseId: task.toolUseId || null,
+          subagentType: task.subagentType || null,
+          model,
+          modelInherited: Boolean(model && !pinnedModel),
+        };
+      });
       api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks }).catch((error) => {
         dbg('background task publish failed', error?.message || String(error));
       });
@@ -516,8 +533,30 @@ export function createClaudeSessionRunner({
     processRef.taskPublishTimer.unref?.();
   }
 
+  // Remember the model each subagent spawn pinned explicitly: only the
+  // spawning Agent/Task tool_use block carries it (input.model), and
+  // task_started.tool_use_id links that block to its task. Capped so a
+  // long-lived process holding many spawns can't grow the map unbounded.
+  function recordSubagentSpawns(sdkMessage) {
+    const blocks = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
+    for (const block of blocks) {
+      if (block?.type !== 'tool_use' || !isSubagentToolName(block.name)) continue;
+      const toolUseId = String(block.id || '').trim();
+      const model = String(block.input?.model || '').trim();
+      if (!toolUseId || !model) continue;
+      proc.subagentSpawns.set(toolUseId, model);
+      while (proc.subagentSpawns.size > 100) {
+        proc.subagentSpawns.delete(proc.subagentSpawns.keys().next().value);
+      }
+    }
+  }
+
   function observeProcessLevel(sdkMessage) {
     const type = String(sdkMessage?.type || '');
+    if (type === 'assistant') {
+      recordSubagentSpawns(sdkMessage);
+      return;
+    }
     if (type !== 'system') return;
     const subtype = String(sdkMessage.subtype || '');
     if (subtype === 'init') {
@@ -615,6 +654,7 @@ export function createClaudeSessionRunner({
       if (known) {
         known.description = String(sdkMessage.description || '').trim() || known.description;
         known.taskType = String(sdkMessage.task_type || '').trim() || known.taskType;
+        known.subagentType = String(sdkMessage.subagent_type || '').trim() || known.subagentType || '';
         // The task's spawning tool_use id is the same identity the subagent
         // bubbles key on — recorded so the panel and the bubbles can be
         // correlated (and a targeted stop can find its task).
@@ -629,6 +669,7 @@ export function createClaudeSessionRunner({
       if (known) {
         known.summary = String(sdkMessage.summary || '').trim() || known.summary;
         known.lastToolName = String(sdkMessage.last_tool_name || '').trim() || known.lastToolName;
+        known.subagentType = String(sdkMessage.subagent_type || '').trim() || known.subagentType || '';
         known.toolUseId = String(sdkMessage.tool_use_id || '').trim() || known.toolUseId || '';
         const totalTokens = Number(sdkMessage.usage?.total_tokens);
         if (Number.isFinite(totalTokens)) known.totalTokens = totalTokens;
@@ -823,6 +864,9 @@ export function createClaudeSessionRunner({
       permissionMode: permissionModeForRelayMode(relayMode),
       liveTasks: new Map(),
       knownTasks: new Set(),
+      // tool_use id → explicitly pinned model of a subagent spawn block; the
+      // task panel's model column resolves through this at publish time.
+      subagentSpawns: new Map(),
       initModel: '',
       // Set when the CLI reported a session-scoped refusal fallback; the next
       // delivered turn repins the composer's model instead of trusting

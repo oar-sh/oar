@@ -6406,6 +6406,9 @@ export function registerMessagesRoutes(app, deps) {
         summary: String(task?.summary || '').trim().slice(0, 500) || null,
         lastToolName: String(task?.lastToolName || '').trim() || null,
         totalTokens: Number.isFinite(Number(task?.totalTokens)) ? Number(task.totalTokens) : null,
+        subagentType: String(task?.subagentType || '').trim().slice(0, 120) || null,
+        model: String(task?.model || '').trim().slice(0, 120) || null,
+        modelInherited: task?.modelInherited === true,
       }))
       .filter((task) => task.taskId);
     backgroundTaskStore?.replace?.(conversationId, tasks);
