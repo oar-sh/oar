@@ -91,6 +91,8 @@ test('worker websocket service accepts both root and prefixed worker websocket p
 
   assert.equal(rootHandled, true);
   assert.equal(prefixedHandled, true);
+  // platform-agnostic: these are HTTP route paths, not filesystem paths — a URL
+  // prefix is joined with '/' on every platform, never with the host separator.
   assert.deepEqual(service.status().acceptedPaths, ['/api/session-worker/ws', '/cpr2/api/session-worker/ws']);
 });
 

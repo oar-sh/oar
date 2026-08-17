@@ -31,9 +31,15 @@ function normalizeExtraArgs(rawValue) {
 
 // The npm `cloudflared` package downloads the official binary on demand; it is an
 // optional dependency, so absence must degrade to a config error, never a crash.
-export function resolveCloudflaredBinaryFromPackage({ existsSync = fs.existsSync } = {}) {
+// `requireImpl` is a seam: the package is optional, so a suite running under
+// `npm ci --omit=optional` (or after a failed postinstall download) must still be
+// able to exercise this logic instead of silently testing the host's install state.
+export function resolveCloudflaredBinaryFromPackage({
+  existsSync = fs.existsSync,
+  requireImpl = requireFromHere,
+} = {}) {
   try {
-    const mod = requireFromHere('cloudflared');
+    const mod = requireImpl('cloudflared');
     const bin = toText(mod?.bin);
     // `bin` is where the package *will* place the binary; it only exists after
     // the on-demand download has run, so an un-downloaded path is not usable.
@@ -46,6 +52,7 @@ export function normalizeCloudflaredTunnelConfig(rawConfig = {}, {
   env = process.env,
   resolveBinary = resolveCloudflaredBinaryFromPackage,
   configBaseDir = process.cwd(),
+  pathImpl = path,
 } = {}) {
   const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
   const envMode = toText(env?.COPILOT_CLOUDFLARED_MODE).toLowerCase();
@@ -61,7 +68,7 @@ export function normalizeCloudflaredTunnelConfig(rawConfig = {}, {
   let binarySource = null;
   if (binaryInput) {
     binary = binaryInput.includes('/') || binaryInput.includes('\\')
-      ? path.resolve(configBaseDir, binaryInput)
+      ? pathImpl.resolve(configBaseDir, binaryInput)
       : binaryInput;
     binarySource = 'config';
   } else {
@@ -139,11 +146,13 @@ export function createCloudflaredTunnelManager({
   configBaseDir = process.cwd(),
   env = process.env,
   resolveBinary = resolveCloudflaredBinaryFromPackage,
+  pathImpl = path,
 } = {}) {
   const tunnelConfig = normalizeCloudflaredTunnelConfig(rawTunnelConfig, {
     env,
     resolveBinary,
     configBaseDir,
+    pathImpl,
   });
   const log = (msg) => logger.log(`${runtimeLogPrefix()}[cloudflared-tunnel] ${msg}`);
   const warn = (msg) => logger.warn(`${runtimeLogPrefix()}[cloudflared-tunnel] ${msg}`);

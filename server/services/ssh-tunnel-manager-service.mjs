@@ -38,6 +38,7 @@ function normalizeIdentityFile(rawValue) {
 export function normalizeSshTunnelConfig(rawConfig = {}, {
   defaultCommand = 'ssh',
   configBaseDir = process.cwd(),
+  pathImpl = path,
 } = {}) {
   const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
   const mode = normalizeTunnelMode(raw);
@@ -52,7 +53,7 @@ export function normalizeSshTunnelConfig(rawConfig = {}, {
   const identityFile = normalizeIdentityFile(raw.identityFile);
   const commandInput = toText(raw.command || defaultCommand);
   const command = commandInput.includes('/') || commandInput.includes('\\')
-    ? path.resolve(configBaseDir, commandInput)
+    ? pathImpl.resolve(configBaseDir, commandInput)
     : commandInput;
 
   const errors = [];
@@ -176,8 +177,9 @@ export function createSshTunnelManager({
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
   configBaseDir = process.cwd(),
+  pathImpl = path,
 } = {}) {
-  const tunnelConfig = normalizeSshTunnelConfig(rawTunnelConfig, { configBaseDir });
+  const tunnelConfig = normalizeSshTunnelConfig(rawTunnelConfig, { configBaseDir, pathImpl });
   const log = (msg) => logger.log(`${runtimeLogPrefix()}[ssh-tunnel] ${msg}`);
   const warn = (msg) => logger.warn(`${runtimeLogPrefix()}[ssh-tunnel] ${msg}`);
 

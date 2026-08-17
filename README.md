@@ -88,7 +88,7 @@ Only Node.js and the runtime you actually intend to use are required.
 
 | Requirement                  | Needed for                    | Notes                                     |
 | ---------------------------- | ----------------------------- | ----------------------------------------- |
-| Node.js 18+                  | always                        | Runs the relay server                     |
+| Node.js 24+                  | always                        | Runs the relay server. Verified on 24; the unit suite requires 24+ (20 and 22 fail — see DEVELOPING.md) |
 | GitHub CLI (`gh`)            | Copilot provider              | Must be available in PATH                 |
 | GitHub Copilot CLI extension | Copilot provider              | `gh extension install github/gh-copilot`  |
 | Copilot subscription         | Copilot provider              | Individual, Business, or Enterprise       |

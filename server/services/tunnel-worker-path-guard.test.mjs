@@ -82,6 +82,8 @@ test('guard ignores an empty marker header value', () => {
 
 test('guard covers the prefixed worker path', () => {
   const guard = createTunnelWorkerPathGuard({ pathPrefix: '/relay', logger: quietLogger });
+  // platform-agnostic: an HTTP route path, not a filesystem path — the prefix is
+  // joined with '/' on every platform, never with the host separator.
   assert.ok(guard.workerPaths.includes('/relay/api/session-worker/ws'));
   const { res } = runRequest(guard, {
     url: '/relay/api/session-worker/ws',

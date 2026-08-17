@@ -4,6 +4,7 @@ import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
@@ -314,16 +315,21 @@ export function createWorkerSecretEnvFile(env = {}, {
  * incident undiagnosable. Best-effort by design: a log problem must never
  * block a worker spawn. Naive rotation: >10 MB rolls to `<file>.1`.
  */
-export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, { fsImpl = fs } = {}) {
+export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, {
+  fsImpl = fs,
+  pathImpl = path,
+} = {}) {
   try {
     const explicitDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_LOG_DIR);
     const serverDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_SERVER_DIR);
-    const moduleDir = path.dirname(new URL(import.meta.url).pathname);
+    // `new URL(...).pathname` yields '/C:/git/...' on Windows, which pathImpl.join
+    // then mangles into '\C:\git\...'; fileURLToPath decodes it to a real host path.
+    const moduleDir = path.dirname(fileURLToPath(import.meta.url));
     const baseDir = explicitDir
-      || (serverDir ? path.join(serverDir, 'logs') : path.join(moduleDir, '..', 'logs'));
+      || (serverDir ? pathImpl.join(serverDir, 'logs') : pathImpl.join(moduleDir, '..', 'logs'));
     fsImpl.mkdirSync(baseDir, { recursive: true });
     const safeId = String(targetSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'worker';
-    const logPath = path.join(baseDir, `worker-${safeId}.log`);
+    const logPath = pathImpl.join(baseDir, `worker-${safeId}.log`);
     try {
       const stats = fsImpl.statSync(logPath);
       if (stats.size > 10 * 1024 * 1024) fsImpl.renameSync(logPath, `${logPath}.1`);

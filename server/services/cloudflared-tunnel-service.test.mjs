@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import path from 'node:path';
 
 import {
   createCloudflaredTunnelManager,
@@ -131,8 +132,28 @@ test('normalizeCloudflaredTunnelConfig resolves the binary config path first', (
     mode: 'managed',
     token: 'tok',
     binary: './bin/cloudflared',
-  }, { env: {}, resolveBinary: () => '/opt/cloudflared', configBaseDir: '/srv/relay' });
+  }, {
+    env: {},
+    resolveBinary: () => '/opt/cloudflared',
+    configBaseDir: '/srv/relay',
+    pathImpl: path.posix,
+  });
   assert.equal(normalized.binary, '/srv/relay/bin/cloudflared');
+  assert.equal(normalized.binarySource, 'config');
+});
+
+test('normalizeCloudflaredTunnelConfig resolves a relative binary against the win32 base dir', () => {
+  const normalized = normalizeCloudflaredTunnelConfig({
+    mode: 'managed',
+    token: 'tok',
+    binary: '.\\bin\\cloudflared.exe',
+  }, {
+    env: {},
+    resolveBinary: () => null,
+    configBaseDir: 'C:\\srv\\relay',
+    pathImpl: path.win32,
+  });
+  assert.equal(normalized.binary, 'C:\\srv\\relay\\bin\\cloudflared.exe');
   assert.equal(normalized.binarySource, 'config');
 });
 
@@ -338,11 +359,28 @@ test('manager emits status on process error', () => {
   assert.equal(ctx.emitted.at(-1).payload.lastError, 'ENOENT');
 });
 
+// `cloudflared` is an optionalDependency whose postinstall downloads a binary over
+// the network, so these must not depend on it actually being installed on the host.
+const fakeCloudflaredModule = { bin: '/opt/cloudflared/cloudflared' };
+
 test('resolveCloudflaredBinaryFromPackage ignores a not-yet-downloaded binary path', () => {
-  assert.equal(resolveCloudflaredBinaryFromPackage({ existsSync: () => false }), null);
+  assert.equal(resolveCloudflaredBinaryFromPackage({
+    existsSync: () => false,
+    requireImpl: () => fakeCloudflaredModule,
+  }), null);
 });
 
 test('resolveCloudflaredBinaryFromPackage returns the downloaded binary path', () => {
-  const resolved = resolveCloudflaredBinaryFromPackage({ existsSync: () => true });
-  assert.match(String(resolved), /cloudflared/);
+  const resolved = resolveCloudflaredBinaryFromPackage({
+    existsSync: () => true,
+    requireImpl: () => fakeCloudflaredModule,
+  });
+  assert.equal(resolved, '/opt/cloudflared/cloudflared');
+});
+
+test('resolveCloudflaredBinaryFromPackage returns null when the package is not installed', () => {
+  assert.equal(resolveCloudflaredBinaryFromPackage({
+    existsSync: () => true,
+    requireImpl: () => { throw new Error("Cannot find module 'cloudflared'"); },
+  }), null);
 });

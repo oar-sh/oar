@@ -681,11 +681,46 @@ test('prepareWorkerLogFile creates the log dir, sanitizes the id, and rotates ov
     statSync: () => ({ size: 11 * 1024 * 1024 }),
     renameSync: (from, to) => { renames.push([from, to]); },
   };
-  const logPath = prepareWorkerLogFile('sid/../evil', { COPILOT_WEB_RELAY_LOG_DIR: '/var/log/relay' }, { fsImpl });
+  const logPath = prepareWorkerLogFile('sid/../evil', { COPILOT_WEB_RELAY_LOG_DIR: '/var/log/relay' }, {
+    fsImpl,
+    pathImpl: path.posix,
+  });
   assert.equal(logPath, '/var/log/relay/worker-sidevil.log');
   assert.deepEqual(mkdirs, ['/var/log/relay']);
   assert.equal(renames.length, 1, 'an oversized log rotates');
   assert.equal(renames[0][1], '/var/log/relay/worker-sidevil.log.1');
+});
+
+test('prepareWorkerLogFile builds the win32 log path under the server dir', async () => {
+  const { prepareWorkerLogFile } = await import('./session-worker-launch-service.mjs');
+  const mkdirs = [];
+  const logPath = prepareWorkerLogFile('sid-1', { COPILOT_WEB_RELAY_SERVER_DIR: 'C:\\srv\\relay' }, {
+    fsImpl: {
+      mkdirSync: (dir) => { mkdirs.push(dir); },
+      statSync: () => { throw new Error('missing'); },
+      renameSync: () => {},
+    },
+    pathImpl: path.win32,
+  });
+  assert.equal(logPath, 'C:\\srv\\relay\\logs\\worker-sid-1.log');
+  assert.deepEqual(mkdirs, ['C:\\srv\\relay\\logs']);
+});
+
+// Regression: the default base dir used `new URL(import.meta.url).pathname`, which
+// is '/C:/git/...' on Windows and joined into a malformed '\C:\git\...\logs'.
+test('prepareWorkerLogFile falls back to a well-formed dir beside the module', async () => {
+  const { prepareWorkerLogFile } = await import('./session-worker-launch-service.mjs');
+  const mkdirs = [];
+  const logPath = prepareWorkerLogFile('sid-2', {}, {
+    fsImpl: {
+      mkdirSync: (dir) => { mkdirs.push(dir); },
+      statSync: () => { throw new Error('missing'); },
+      renameSync: () => {},
+    },
+  });
+  assert.equal(logPath, path.join(mkdirs[0], 'worker-sid-2.log'));
+  assert.equal(mkdirs[0], path.normalize(mkdirs[0]), 'the fallback dir is a normalized host path');
+  assert.ok(!/^[\\/][A-Za-z]:/.test(mkdirs[0]), `fallback dir must not carry a URL-style root: ${mkdirs[0]}`);
 });
 
 test('prepareWorkerLogFile never throws when the filesystem misbehaves', async () => {

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import path from 'node:path';
 
 import {
   createSshTunnelManager,
@@ -80,6 +81,27 @@ test('normalizeSshTunnelConfig defaults to disabled mode', () => {
   assert.equal(normalized.enabled, false);
   assert.equal(normalized.valid, true);
   assert.deepEqual(normalized.errors, []);
+});
+
+test('normalizeSshTunnelConfig leaves a bare command unresolved', () => {
+  const normalized = normalizeSshTunnelConfig({ command: 'ssh' }, { configBaseDir: '/srv/relay' });
+  assert.equal(normalized.command, 'ssh');
+});
+
+test('normalizeSshTunnelConfig resolves a relative command against the posix base dir', () => {
+  const normalized = normalizeSshTunnelConfig({ command: './bin/ssh' }, {
+    configBaseDir: '/srv/relay',
+    pathImpl: path.posix,
+  });
+  assert.equal(normalized.command, '/srv/relay/bin/ssh');
+});
+
+test('normalizeSshTunnelConfig resolves a relative command against the win32 base dir', () => {
+  const normalized = normalizeSshTunnelConfig({ command: '.\\bin\\ssh.exe' }, {
+    configBaseDir: 'C:\\srv\\relay',
+    pathImpl: path.win32,
+  });
+  assert.equal(normalized.command, 'C:\\srv\\relay\\bin\\ssh.exe');
 });
 
 test('normalizeSshTunnelConfig validates managed mode requirements', () => {

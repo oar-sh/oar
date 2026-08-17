@@ -80,6 +80,30 @@ Useful overrides: `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary),
 
 ## Tests
 
+### Node version
+
+**The unit suite requires Node.js 24+.** This is not a style preference — Node 20 and 22
+both fail `createWorkerSecretEnvFile uses owner-only permissions and cleans up` with
+`failureType: 'cancelledByParent'`, because their test runner cancels subtests that outlive
+the parent. Node 24 awaits them. Measured on the same tree:
+
+| Node | Result |
+| ---- | ------ |
+| 20.19.2 | 26/28 in `session-worker-launch-service.test.mjs` — 1 failure |
+| 22.23.2 | 26/28 — same failure |
+| 24.19.0 | 28/28 |
+
+If you hit exactly that one failure, check `node -v` before assuming a regression. Debian's
+apt `nodejs` is still on 20, so use nvm:
+
+```bash
+nvm install 24 && nvm alias default 24
+```
+
+On Debian, add nvm's init to `~/.profile` as well as `~/.bashrc` — `~/.bashrc` returns early
+for non-interactive shells, so `bash -lc 'node …'` (CI, scripts, `wsl -e`) would silently keep
+using `/usr/bin/node`.
+
 ### Unit tests
 
 Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
@@ -87,6 +111,9 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 ```bash
 npm test
 ```
+
+Expected: **1608 pass / 0 fail / 4 skip on Windows**, **1612 pass / 0 fail / 0 skip on Linux**.
+The 4 Windows skips are host-gated (0600 file modes, symlinks) and run on Linux.
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns
@@ -151,8 +178,31 @@ Do not run tests that spawn Copilot CLI clients unless explicitly permitted.
   suite runs identically on any OS. Do not write tests that branch on `process.platform` —
   if a test genuinely cannot run on the host OS, skip it explicitly:
   `test('…', { skip: process.platform !== 'win32' }, …)`.
+- **The path module is injected too.** A service that joins onto a caller-supplied base dir
+  takes `pathImpl` (or `path`), defaulting to the host's — see `normalizeCloudflaredTunnelConfig`,
+  `prepareWorkerLogFile`, `normalizeSshTunnelConfig`, `resolveClaudeProjectsRoots`. Tests then
+  pass `path.posix` **and** `path.win32`, so both halves run on both machines:
+
+  ```js
+  const cfg = normalizeCloudflaredTunnelConfig(raw, { configBaseDir: '/srv/relay', pathImpl: path.posix });
+  ```
+
+  Without this, `path.join('/var/log/relay', 'w.log')` yields `\var\log\relay\w.log` on Windows,
+  and a hardcoded POSIX expectation passes on Linux while failing on Windows.
 - Paths in fixtures should be built with `path.join()` or use both-separator expectations
   where the code under test normalizes separators.
+
+`server/test-hygiene.test.mjs` enforces the three rules above mechanically:
+
+1. bare `process.platform` in a test,
+2. an undeclared win32 path shape (`"C:\…"`, `/^[A-Za-z]:$/`),
+3. an undeclared **POSIX join** — an assertion expecting a literal that strictly extends a POSIX
+   literal the same test block passed in, which is the exact signature of "the implementation
+   joined onto my base dir with the host's separator".
+
+Each is escaped file-wide by naming `path.posix` / `path.win32` / `win32`, gating with `skip`, or
+annotating a line `host-platform:` (real host behavior is under test) or `platform-agnostic:` (the
+value never reaches path semantics — e.g. an HTTP route path, which is `/`-separated everywhere).
 
 ## Notes
 
