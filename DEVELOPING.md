@@ -4,10 +4,16 @@ This document covers day-to-day development workflows for the web relay and Copi
 
 ## Runtime ownership
 
+Everything starts the same way — `node server/server.js` (which is all `npm start` does).
+The role is chosen by argv: bare, the process stays attached as a supervisor and runs the
+server in a `--relay-runtime` worker child; with `--supervised` it runs the server in-process
+and exits 75 so its spawner handles restarts. Never set a role via the environment: the
+server's env is inherited by tmux workers and by the Copilot CLI, so it would leak downward.
+
 Use a **single runtime owner** at a time:
 
-- **Extension-managed**: start `gh copilot` or `copilot-remote` and let the extension supervise `server.js`
-- **Standalone**: use `npm start` only when you intentionally want the standalone relay flow
+- **Extension-managed**: start `gh copilot` or `copilot-remote` and let the extension supervise `server.js --supervised`
+- **Standalone**: start the server yourself, then `node server/relay.mjs` by hand — only when you intentionally want the standalone relay flow
 
 Do **not** run extension-managed polling and standalone relay processes together.
 

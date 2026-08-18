@@ -388,9 +388,9 @@ test("linkifies workspace file mentions in assistant messages and question cards
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
   const seedText = `File-link test seed ${stamp}`;
-  const absoluteRespawnPath = `${process.cwd()}\\server\\respawn.bat`;
-  const prompt = `Can you open README.md and ${absoluteRespawnPath}?`;
-  const responseText = `Please read README.md, then inspect ${absoluteRespawnPath}.`;
+  const absoluteWindowsPath = `${process.cwd()}\\server\\relay.mjs`;
+  const prompt = `Can you open README.md and ${absoluteWindowsPath}?`;
+  const responseText = `Please read README.md, then inspect ${absoluteWindowsPath}.`;
   let conversationId = "";
   let messageId = "";
 
@@ -451,10 +451,10 @@ test("linkifies workspace file mentions in assistant messages and question cards
     await expect(assistantReadmeLink).toHaveAttribute("href", /\/api\/files\/README\.md$/);
     await expect(assistantReadmeLink).toHaveAttribute("target", "_blank");
 
-    const assistantRespawnLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "respawn.bat" }).first();
-    await expect(assistantRespawnLink).toBeVisible();
-    await expect(assistantRespawnLink).toHaveAttribute("href", /\/api\/files\/server\/respawn\.bat$/);
-    await expect(assistantRespawnLink).not.toHaveAttribute("href", /\/api\/files\/git\/copilot\/server\/respawn\.bat$/);
+    const assistantWindowsPathLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "relay.mjs" }).first();
+    await expect(assistantWindowsPathLink).toBeVisible();
+    await expect(assistantWindowsPathLink).toHaveAttribute("href", /\/api\/files\/server\/relay\.mjs$/);
+    await expect(assistantWindowsPathLink).not.toHaveAttribute("href", /\/api\/files\/git\/copilot\/server\/relay\.mjs$/);
 
     const questionReadmeLink = page.locator(".relay-question-body a", { hasText: "README.md" }).first();
     await expect(questionReadmeLink).toBeVisible();

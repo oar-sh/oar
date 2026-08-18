@@ -24,7 +24,11 @@ export function createManagedServerLifecycle({
   let restartTimer = null;
   let restartAttempts = 0;
   let attemptedSqliteRepair = false;
-  const RELAY_SUPERVISED_ENV = "COPILOT_WEB_RELAY_SUPERVISED";
+  // Keep in sync with server/relay-self-restart.mjs. Passing this on argv (not
+  // in the env) is deliberate: this extension's own env is inherited from the
+  // relay worker that launched the CLI, so an env flag here would be read by
+  // unrelated servers further down the tree.
+  const RELAY_SUPERVISED_FLAG = "--supervised";
 
   const RESTART_BACKOFF_MS = [1000, 2000, 5000, 10000, 20000];
   // Keep in sync with server/relay-exit-codes.mjs
@@ -277,11 +281,11 @@ export function createManagedServerLifecycle({
         dbg("starting managed web server", serverDir);
         managedServerOwned = true;
         startedOwnedProcess = true;
-        const serverArgs = ["server.js", "--token", token];
+        const serverArgs = ["server.js", RELAY_SUPERVISED_FLAG, "--token", token];
         if (legacyOwnerPidWatchdog) {
           serverArgs.push("--owner-pid", String(process.pid));
         }
-        const serverEnv = { ...process.env, [RELAY_SUPERVISED_ENV]: "1" };
+        const serverEnv = { ...process.env };
         if (startupWorkspaceRoot) {
           serverEnv.COPILOT_WORKSPACE_ROOT = startupWorkspaceRoot;
         }

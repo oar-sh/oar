@@ -2,26 +2,25 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 
-export const RELAY_SUPERVISED_ENV = 'COPILOT_WEB_RELAY_SUPERVISED';
-export const RELAY_SELF_RESTART_MODE_ENV = 'COPILOT_WEB_RELAY_SELF_RESTART_MODE';
-export const RELAY_SELF_RESTART_COUNT_ENV = 'COPILOT_WEB_RELAY_SELF_RESTART_COUNT';
-export const RELAY_SELF_RESTART_CRASH_COUNT_ENV = 'COPILOT_WEB_RELAY_SELF_RESTART_CRASH_COUNT';
+// Role selection travels on argv, never in the environment. The runtime's env is
+// inherited by tmux worker sessions and by the Copilot CLI it launches, and the
+// CLI extension spawns the next server from that same env — so an env-based role
+// flag silently decided the role of unrelated future servers.
+export const RELAY_RUNTIME_FLAG = '--relay-runtime';
+export const RELAY_SUPERVISED_FLAG = '--supervised';
 
-export function isRelayRestartSupervised(env = process.env) {
-  const raw = String(env?.[RELAY_SUPERVISED_ENV] || '').trim().toLowerCase();
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+function hasFlag(argv, flag) {
+  return Array.isArray(argv) && argv.includes(flag);
 }
 
-export function isRelaySelfRestartWorker(env = process.env) {
-  return String(env?.[RELAY_SELF_RESTART_MODE_ENV] || '').trim().toLowerCase() === 'worker';
+/** True for the child this supervisor spawned: run the runtime in-process. */
+export function isRelayRuntimeInvocation(argv = process.argv.slice(2)) {
+  return hasFlag(argv, RELAY_RUNTIME_FLAG);
 }
 
-export function buildRelayRuntimeEnv(env = process.env, overrides = {}) {
-  return {
-    ...env,
-    [RELAY_SUPERVISED_ENV]: '1',
-    ...overrides,
-  };
+/** True when an outer supervisor owns restarts and wants the runtime here. */
+export function isExternallySupervised(argv = process.argv.slice(2)) {
+  return hasFlag(argv, RELAY_SUPERVISED_FLAG);
 }
 
 export function spawnRelayRuntime({
@@ -30,21 +29,15 @@ export function spawnRelayRuntime({
   scriptPath,
   args = [],
   execArgv = process.execArgv,
-  restartCount = 0,
-  crashCount = 0,
   spawnImpl = spawn,
   stdio = ['ignore', 'pipe', 'pipe'],
   detached = false,
   windowsHide = true,
   logger = console,
 } = {}) {
-  const child = spawnImpl(process.execPath, [...execArgv, scriptPath, ...args], {
+  const child = spawnImpl(process.execPath, [...execArgv, scriptPath, RELAY_RUNTIME_FLAG, ...args], {
     cwd,
-    env: buildRelayRuntimeEnv(env, {
-      [RELAY_SELF_RESTART_MODE_ENV]: 'worker',
-      [RELAY_SELF_RESTART_COUNT_ENV]: String(restartCount),
-      [RELAY_SELF_RESTART_CRASH_COUNT_ENV]: String(crashCount),
-    }),
+    env,
     detached,
     stdio,
     windowsHide,
@@ -114,7 +107,6 @@ export async function runDirectRelaySupervisor({
   }
 
   try {
-    let restartCount = 0;
     let crashCount = 0;
     while (true) {
       runtimeProc = spawnRelayRuntime({
@@ -123,8 +115,6 @@ export async function runDirectRelaySupervisor({
         scriptPath,
         args,
         execArgv,
-        restartCount,
-        crashCount,
         spawnImpl,
         stdio,
         detached: false,
@@ -152,7 +142,6 @@ export async function runDirectRelaySupervisor({
       const exitCode = Number.isInteger(Number(result.code)) ? Number(result.code) : null;
       if (exitCode === RELAY_RESTART_EXIT_CODE) {
         logger?.log?.(`[relay] runtime requested restart; relaunching ${path.basename(String(scriptPath || ''))}...`);
-        restartCount += 1;
         crashCount = 0;
         await delay(restartDelayMs);
         continue;

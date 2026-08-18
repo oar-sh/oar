@@ -8,10 +8,7 @@
     "copilot-remote": "./bin/copilot-remote.js"
   },
   "scripts": {
-    "start": "node server/start.js",
-    "start:server": "node server/server.js",
-    "start:server:respawn": "server\\respawn.bat",
-    "start:server:respawn:posix": "bash server/respawn.sh",
+    "start": "node server/server.js",
     "copilot:relay": "gh copilot -- --allow-all",
     "test": "node --test \"server/**/*.test.mjs\" \"shared/**/*.test.mjs\" \".github/extensions/web-relay/**/*.test.mjs\"",
     "test:agents:smoke": "node --test \"tests/agents/**/*.test.mjs\"",

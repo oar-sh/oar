@@ -441,7 +441,7 @@ test('an identity-less response for a non-github conversation still reports gith
   };
 
   // The theft case. server/relay.mjs is the only identity-less responder for a
-  // normal turn and start.js gives it plain env, so it runs on the Copilot plan
+  // normal turn and it is launched with plain env, so it runs on the Copilot plan
   // whatever the conversation is bound to. openai belongs in this list: a BYOK
   // chat turn answered without an identity did NOT use the BYOK key.
   for (const provider of ['cursor', 'claude', 'grok', 'openai']) {

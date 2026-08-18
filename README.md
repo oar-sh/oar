@@ -152,15 +152,32 @@ For day-to-day development workflows, relay restart steps, and worker debugging 
 | `copilot-remote`        | Global npm command (after `npm link` or `npm install -g .`) that starts the web relay if needed, then runs `gh copilot` in the same shell |
 | `copilot-remote --install-extension` | Installs/updates a user-global `web-relay` wrapper entrypoint and exits                                                                |
 | `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and the relay worker link comes online                                      |
-| `npm run start:server`  | Server only (use with an active Copilot CLI session that loads the extension)                                                             |
-| `npm start`             | Standalone development mode (`server.js` + `relay.mjs`)                                                                                   |
+| `node server/server.js` | The one way to start the relay server. `npm start` is an alias for exactly this command                                                    |
+
+### The single server entry point
+
+`server/server.js` is the only entry point, in every mode — manual runs, the CLI
+extension, `copilot-remote`, Windows autostart, and the e2e runner all start it.
+Its role is chosen by argv, never by the environment:
+
+- `node server/server.js` — the process stays attached to your terminal as a
+  supervisor and runs the real server (`server-runtime.mjs`) in a worker child it
+  marks with `--relay-runtime`. Exit code 75 relaunches the worker; any other
+  non-zero exit is retried up to 3 times before the supervisor gives up.
+- `node server/server.js --supervised` — runs the server in this process and
+  exits 75 on restart, leaving restarts to whoever spawned it. The CLI extension
+  passes this so its own bounded-backoff supervision is the only one in play.
+
+Role flags travel on argv because the server's environment is inherited by tmux
+worker sessions and by the Copilot CLI it launches — an env-based flag would be
+read by unrelated servers started further down that tree.
 
 ### Single runtime owner rule
 
 Run only one relay owner at a time:
 
-1. **Extension-managed mode**: Copilot CLI extension owns the relay worker WebSocket and fallback dequeue loop.
-2. **Standalone mode**: `npm start` handles the relay runtime itself.
+1. **Extension-managed mode** (the normal one): the Copilot CLI extension owns the relay worker WebSocket and fallback dequeue loop. `github`/`openai` turns run in Copilot CLI sessions the server launches per conversation.
+2. **Standalone mode** (manual escape hatch): start the server, then run `node server/relay.mjs` by hand. It spawns its own Copilot CLI process and polls `GET /api/pending` over HTTP. Use it only when the extension transport is unavailable — there is no npm script for it.
 
 Do not run extension-managed relay transport together with standalone relay runtime transport.
 Do not restart the web relay unless the user has explicitly given permission.
@@ -174,8 +191,7 @@ When the CLI extension connects, it also prints the relay info window (local/net
 
 On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry. It opens a visible terminal at sign-in and runs the installed `node server\server.js` path. This starts only the web relay server; a Copilot CLI session using the extension must attach separately before queued turns can be processed. Turning the setting off removes the copilot-remote Startup entry.
 
-Respawner scripts (`start:server:respawn`*) are legacy/manual troubleshooting tools only and are not part of the extension-managed startup path.
-Do not use them for manual restarts; use `POST /api/relay/shutdown` instead.
+Do not restart the relay by killing processes; use `POST /api/relay/shutdown` instead.
 
 Manual relay control details:
 
@@ -184,10 +200,9 @@ Manual relay control details:
 - Requests are localhost-only and still require relay auth.
 - The relay waits until the queue is idle before acting; this endpoint does not interrupt an in-flight turn.
 - `/api/status` exposes the queued relay exit state as `relayShutdown` so the UI/logs can distinguish idle, queued, and shutting-down restart/shutdown flows.
-- Self-restart stays owner-aware:
-  - extension-managed mode restarts under the extension-managed server lifecycle
-  - `npm start` restarts under `server/start.js`
-  - bare `node server/server.js` now follows the `playground/scripts/self_restart` pattern: `server.js` stays attached as the supervisor and respawns a worker child in the same terminal session
+- Restart ownership follows the argv role, so exactly one supervisor acts on exit code 75:
+  - `node server/server.js` — the attached supervisor respawns its worker child in the same terminal session
+  - `node server/server.js --supervised` — the server exits 75 and the CLI extension relaunches it (bounded backoff, and it stops trying once the CLI session shuts down)
 
 ### Global npm command (Windows first)
 

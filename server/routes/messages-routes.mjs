@@ -721,8 +721,8 @@ export function shouldTakeOverStrandedPendingMessage({
 // payload has no say — a misrouted responder must not be able to mask itself.
 //
 // Identity-less responders are the interesting case. Two of them exist:
-//   - server/relay.mjs, spawned by start.js with plain env (see the spawn in
-//     start.js: no COPILOT_PROVIDER_TYPE), so it authenticates on the Copilot
+//   - server/relay.mjs, launched by hand with plain env (nothing sets
+//     COPILOT_PROVIDER_TYPE for it), so it authenticates on the Copilot
 //     plan no matter what the conversation is bound to. A turn it answers for
 //     a non-github conversation really did run on the wrong plan.
 //   - this server finalizing an image operation it executed itself: it calls

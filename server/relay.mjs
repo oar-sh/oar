@@ -885,8 +885,8 @@ async function processNext(approveAll) {
   // the wrong plan under the wrong provider label. The server-side dequeue
   // already filters these; this guard covers a server that predates it.
   // openai is allowed through because routing-disabled installs still run
-  // OpenAI BYOK conversations here. Note this process gets plain env from
-  // start.js, so such a turn does execute on the Copilot plan and is reported
+  // OpenAI BYOK conversations here. Note this process is launched by hand with
+  // plain env, so such a turn does execute on the Copilot plan and is reported
   // as a mismatch by the provenance check in /api/response. The eligible set
   // is shared with findPendingForLegacyRelay via shared/provider-routing.mjs,
   // so both sides derive from one constant.
