@@ -36,6 +36,40 @@ export function claudeUltracodeFlagSettings(effort) {
   return { ultracode: null, enableWorkflows: null, effortLevel: effort || null };
 }
 
+/**
+ * The flag-settings payload that moves a live session onto another auto-compact
+ * window. `null` clears the flag layer back to the CLI's model-tuned default,
+ * which is exactly what "Auto" means — leaving the previous window pinned would
+ * make the setting one-way.
+ */
+export function claudeAutoCompactFlagSettings(autoCompactWindow) {
+  const window = normalizeAutoCompactWindow(autoCompactWindow);
+  return { autoCompactWindow: window };
+}
+
+/** A token count, or null for Auto. Junk is Auto, never a pinned window. */
+export function normalizeAutoCompactWindow(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return Math.round(numeric);
+}
+
+/**
+ * The single `settings` object a spawn gets. Both the ultracode flags and the
+ * auto-compact window live in `Settings`, so they must be merged here — two
+ * spreads of `settings` in the options literal would silently clobber each
+ * other. Returns null when nothing needs to be set.
+ */
+export function claudeSpawnSettings({ ultracode = false, autoCompactWindow = null } = {}) {
+  const window = normalizeAutoCompactWindow(autoCompactWindow);
+  const settings = {
+    ...(ultracode ? { ultracode: true, enableWorkflows: true } : {}),
+    ...(window !== null ? { autoCompactWindow: window } : {}),
+  };
+  return Object.keys(settings).length ? settings : null;
+}
+
 export function permissionModeForRelayMode(relayMode) {
   const mode = String(relayMode || 'agent').trim().toLowerCase();
   if (mode === 'plan') return 'plan';
@@ -108,6 +142,7 @@ export function startClaudeSession({
   resume = '',
   relayMode = 'agent',
   reasoningEffort = '',
+  autoCompactWindow = null,
   abortController,
   canUseTool,
   pathToClaudeCodeExecutable = '',
@@ -118,6 +153,10 @@ export function startClaudeSession({
   const effort = normalizeClaudeEffort(reasoningEffort);
   const ultracode = effort === CLAUDE_ULTRACODE_EFFORT;
   const effortOption = ultracode ? 'xhigh' : effort;
+  // Spawn-time twin of the flag-settings helpers: the settings layer is the
+  // only way to hand a fresh CLI the session-scoped ultracode flag and the
+  // auto-compact window, and both share one `settings` object.
+  const spawnSettings = claudeSpawnSettings({ ultracode, autoCompactWindow });
   const options = {
     cwd,
     permissionMode: permissionModeForRelayMode(relayMode),
@@ -125,9 +164,7 @@ export function startClaudeSession({
     includePartialMessages: true,
     forwardSubagentText: true,
     ...(effortOption ? { effort: effortOption } : {}),
-    // Spawn-time twin of claudeUltracodeFlagSettings: the settings layer is
-    // the only way to hand the session-scoped ultracode flag to a fresh CLI.
-    ...(ultracode ? { settings: { ultracode: true, enableWorkflows: true } } : {}),
+    ...(spawnSettings ? { settings: spawnSettings } : {}),
     ...(normalizedModel && normalizedModel !== 'auto' ? { model: String(model).trim() } : {}),
     ...(String(resume || '').trim() ? { resume: String(resume).trim() } : {}),
     ...(abortController ? { abortController } : {}),

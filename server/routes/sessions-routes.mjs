@@ -10,6 +10,7 @@ import { createSdkSessionSyncService } from '../services/sdk-session-sync-servic
 import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 import {
   DEFAULT_CLAUDE_REASONING_EFFORTS,
@@ -2853,8 +2854,19 @@ export function registerSessionsRoutes(app, deps) {
         contextUsage: null,
       };
 
+    // The modal renders the stored preference next to the measured threshold,
+    // so both come from this one fetch. The lookup id may be an sdk_session_id.
+    const conversationRow = resolveConversationByIdOrSdkSessionId(
+      String(runtimeSession?.conversation_id || '').trim() || lookupId,
+    );
+
     return {
       conversationId: lookupId,
+      // The lookup id above may be an sdk_session_id (that echo is load-bearing
+      // for the modal's refresh handle), so the id a preferences PATCH needs is
+      // reported separately.
+      resolvedConversationId: conversationRow?.id || null,
+      autoCompactWindow: parseAutoCompactWindow(conversationRow?.auto_compact_window),
       runtimeSessionId: runtimeSession?.id || null,
       copilotSessionId,
       providerType: usesStoredContextUsage ? providerType : 'github',
@@ -3592,12 +3604,28 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     const now = new Date().toISOString();
-    const preferredRelayMode = normalizeRelayModePreference(req.body?.preferredRelayMode, {
-      supportedRelayModes: SUPPORTED_RELAY_MODES,
-      fallbackMode: DEFAULT_RELAY_MODE,
-    });
-    const preferredModel = normalizePreferredModel(req.body?.preferredModel);
-    const preferredReasoningEffort = normalizePreferredReasoningEffort(req.body?.preferredReasoningEffort);
+    // Every write replaces all four columns, so a caller that only wants to
+    // change one field (the context modal's auto-compact slider) must not have
+    // the others reset to their defaults: an unmentioned key keeps the stored
+    // value. The composer always sends all three, so its behaviour — including
+    // clearing a preference with an explicit '' — is unchanged.
+    const mentions = (key) => Object.prototype.hasOwnProperty.call(req.body || {}, key);
+    const preferredRelayMode = normalizeRelayModePreference(
+      mentions('preferredRelayMode') ? req.body?.preferredRelayMode : existing?.preferred_relay_mode,
+      {
+        supportedRelayModes: SUPPORTED_RELAY_MODES,
+        fallbackMode: DEFAULT_RELAY_MODE,
+      },
+    );
+    const preferredModel = normalizePreferredModel(
+      mentions('preferredModel') ? req.body?.preferredModel : existing?.preferred_model,
+    );
+    const preferredReasoningEffort = normalizePreferredReasoningEffort(
+      mentions('preferredReasoningEffort') ? req.body?.preferredReasoningEffort : existing?.preferred_reasoning_effort,
+    );
+    // Only an explicit mention rewrites the window (null = Auto is a real
+    // value, so a plain falsy check would not do).
+    const mentionsAutoCompactWindow = mentions('autoCompactWindow');
     const persisted = persistConversationPreferences({
       db,
       stmts,
@@ -3605,6 +3633,9 @@ export function registerSessionsRoutes(app, deps) {
       preferredRelayMode,
       preferredModel,
       preferredReasoningEffort,
+      ...(mentionsAutoCompactWindow
+        ? { autoCompactWindow: parseAutoCompactWindow(req.body?.autoCompactWindow) }
+        : {}),
       updatedAt: now,
       createIfMissing: !existing,
       createTitle: 'Session',
@@ -3615,6 +3646,7 @@ export function registerSessionsRoutes(app, deps) {
       preferredRelayMode: persisted.preferredRelayMode,
       preferredModel: persisted.preferredModel,
       preferredReasoningEffort: persisted.preferredReasoningEffort,
+      autoCompactWindow: persisted.autoCompactWindow ?? null,
       updatedAt: persisted.updatedAt,
       senderClientId,
     });
@@ -3625,6 +3657,7 @@ export function registerSessionsRoutes(app, deps) {
       preferredRelayMode: persisted.preferredRelayMode,
       preferredModel: persisted.preferredModel,
       preferredReasoningEffort: persisted.preferredReasoningEffort,
+      autoCompactWindow: persisted.autoCompactWindow ?? null,
       updatedAt: persisted.updatedAt,
       created: persisted.created,
       senderClientId,

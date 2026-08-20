@@ -167,7 +167,12 @@ import {
   registerPwaShell,
   updatePwaAppName,
 } from './pwa-install.js';
-import { renderContextUsageHtml } from './context-usage-view.mjs';
+import { renderAutoCompactControlHtml, renderContextUsageHtml } from './context-usage-view.mjs';
+import {
+  autoCompactWindowFromIndex,
+  autoCompactWindowToIndex,
+  formatAutoCompactWindowLabel,
+} from './auto-compact-window-options.mjs';
 import { renderPlanUsageHtml, planUsageSubtitle } from './plan-usage-view.mjs';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
@@ -2717,6 +2722,89 @@ async function loadUsageSummaryAndRender() {
   });
 }
 
+// The context modal is rendered from scratch on every refresh, so the slider's
+// conversation binding lives here rather than on the element.
+let autoCompactControlConversationId = '';
+let autoCompactWindowUpdateInFlight = false;
+// The server's last known window for the rendered control. Kept so a rejected
+// PATCH can put the slider back instead of leaving the rejected value on
+// screen until the next refresh.
+let autoCompactControlStoredWindow = null;
+
+// Snaps both the range input and its label back to `window`.
+function setAutoCompactControlValue(window) {
+  const slider = document.getElementById('ctx-autocompact-slider');
+  if (slider) slider.value = String(autoCompactWindowToIndex(window));
+  const label = document.getElementById('ctx-autocompact-value');
+  if (label) label.textContent = formatAutoCompactWindowLabel(window);
+}
+
+/**
+ * Delegated because #summary-modal-body's innerHTML is replaced on every modal
+ * render (store.js renderSummaryModalContent) — a listener on the input itself
+ * would die with the first refresh.
+ */
+function initAutoCompactWindowControl() {
+  const body = document.getElementById('summary-modal-body');
+  if (!body || body.dataset.autoCompactBound === '1') return;
+  body.dataset.autoCompactBound = '1';
+  const sliderFrom = (event) => {
+    const target = event?.target;
+    return target && target.id === 'ctx-autocompact-slider' ? target : null;
+  };
+  // Dragging only previews the label; nothing is persisted until the value
+  // settles, matching the settings-modal sliders.
+  body.addEventListener('input', (event) => {
+    const slider = sliderFrom(event);
+    if (!slider) return;
+    const label = document.getElementById('ctx-autocompact-value');
+    if (label) label.textContent = formatAutoCompactWindowLabel(autoCompactWindowFromIndex(slider.value));
+  });
+  body.addEventListener('change', (event) => {
+    const slider = sliderFrom(event);
+    if (!slider) return;
+    void applyAutoCompactWindowSelection(autoCompactWindowFromIndex(slider.value));
+  });
+}
+
+async function applyAutoCompactWindowSelection(autoCompactWindow) {
+  const convId = String(autoCompactControlConversationId || '').trim();
+  const slider = document.getElementById('ctx-autocompact-slider');
+  if (!convId || autoCompactWindowUpdateInFlight) {
+    // Nothing will be written, so leave the control showing what is stored
+    // rather than a position the server never heard about.
+    setAutoCompactControlValue(autoCompactControlStoredWindow);
+    return;
+  }
+  autoCompactWindowUpdateInFlight = true;
+  if (slider) slider.disabled = true;
+  try {
+    // Only the window is sent: the route keeps every unmentioned preference as
+    // stored, so this cannot clobber the composer's model/effort choice.
+    const response = await updateConversationPreferences(convId, {
+      clientId: CLIENT_ID,
+      autoCompactWindow,
+    });
+    if (!response) throw new Error('Failed to update the auto-compact window');
+    // The server, not the slider, decides what got stored (values snap to a
+    // stop), so the control follows the response.
+    const stored = response.autoCompactWindow ?? null;
+    autoCompactControlStoredWindow = stored;
+    setAutoCompactControlValue(stored);
+    showTransientRelayNotice(stored === null
+      ? 'Auto-compact window back to the model default; applies to the next message.'
+      : `Auto-compact window set to ${formatAutoCompactWindowLabel(stored)} tokens; applies to the next message.`);
+  } catch (error) {
+    // The write was refused, so the rejected position is a lie: put the
+    // control back on the last value the server confirmed.
+    setAutoCompactControlValue(autoCompactControlStoredWindow);
+    alert(error?.message || 'Failed to update the auto-compact window.');
+  } finally {
+    autoCompactWindowUpdateInFlight = false;
+    if (slider) slider.disabled = false;
+  }
+}
+
 async function loadContextSummaryAndRender(convId) {
   const trimmedConvId = String(convId || '').trim();
   const payload = await loadContextSummary(trimmedConvId);
@@ -2733,14 +2821,40 @@ async function loadContextSummaryAndRender(convId) {
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
 
   const usageHtml = renderContextUsageHtml(payload.contextUsage);
+  // Claude-only: no other provider exposes a compaction window (or any
+  // session-settings surface) to steer.
+  const autoCompactHtml = payload.providerType === 'claude'
+    ? renderAutoCompactControlHtml({
+      autoCompactWindow: payload.autoCompactWindow ?? null,
+      autoCompactThreshold: payload.contextUsage?.autoCompactThreshold ?? null,
+      autocompactSource: payload.contextUsage?.autocompactSource ?? null,
+      // Tri-state: only a real snapshot can say "disabled". Collapsing this to
+      // a boolean made a brand-new conversation (no snapshot yet) claim
+      // auto-compact was off, which is both false and self-contradictory next
+      // to "Effective: — (known after the first turn)".
+      isAutoCompactEnabled: payload.contextUsage
+        ? (payload.contextUsage.isAutoCompactEnabled ?? null)
+        : null,
+      maxTokens: payload.contextUsage?.maxTokens ?? null,
+      rawMaxTokens: payload.contextUsage?.rawMaxTokens ?? null,
+    })
+    : '';
+  // The slider's writes need the conversation id even when the modal was
+  // opened through an sdk_session_id.
+  autoCompactControlConversationId = String(
+    payload.resolvedConversationId || (payload.providerType === 'claude' ? trimmedConvId : '') || '',
+  ).trim();
+  // Baseline for the failure path below: what the server says is stored right
+  // now, refreshed every time the control is re-rendered.
+  autoCompactControlStoredWindow = payload.autoCompactWindow ?? null;
   const detailText = String(payload.text || '').trim();
   // The structured breakdown is the answer; the runtime's own text dump stays
   // available underneath for the details it carries that categories don't.
   const bodyHtml = usageHtml
-    ? `${usageHtml}${detailText
+    ? `${usageHtml}${autoCompactHtml}${detailText
       ? `<details class="ctx-usage-raw"><summary>Raw details</summary><pre>${escHtml(detailText)}</pre></details>`
       : ''}`
-    : `<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
+    : `${autoCompactHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
 
   renderSummaryModalContent({
     title: 'Context usage',
@@ -3774,6 +3888,7 @@ async function initApp() {
     await initSharedConversationReader();
     return;
   }
+  initAutoCompactWindowControl();
   initModeSelector();
   initModelSelector();
   initReasoningSelector();

@@ -5,6 +5,13 @@
  * Kept DOM-free and dependency-light so it can be unit tested directly.
  */
 
+import {
+  AUTO_COMPACT_WINDOW_STOPS,
+  autoCompactWindowToIndex,
+  formatAutoCompactWindowLabel,
+  parseAutoCompactWindow,
+} from './auto-compact-window-options.mjs';
+
 // The SDK labels categories with names, not CSS. Anything unmapped falls back
 // to a neutral swatch rather than rendering an invalid color.
 const CATEGORY_COLORS = Object.freeze({
@@ -107,6 +114,97 @@ function renderRow({ name, tokens, percent, color, muted = false }) {
       <td class="ctx-usage-num">${escapeHtml(formatCompactTokens(tokens))}</td>
       <td class="ctx-usage-num ctx-usage-pct">${escapeHtml(formatUsagePercent(percent))}</td>
     </tr>
+  `;
+}
+
+// How the CLI describes where the effective threshold came from. Unknown
+// sources are rendered verbatim rather than dropped, so a new CLI vocabulary
+// still tells the user something.
+const AUTOCOMPACT_SOURCE_LABELS = Object.freeze({
+  auto: 'auto (model-tuned)',
+  'model-default': 'model default',
+  settings: 'from settings',
+  env: 'from CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  clientdata: 'from client data',
+});
+
+function autocompactSourceLabel(source) {
+  const key = String(source || '').trim();
+  if (!key) return '';
+  return AUTOCOMPACT_SOURCE_LABELS[key.toLowerCase()] || key;
+}
+
+/**
+ * The Claude-only auto-compact window control: a snap-stop slider over
+ * AUTO_COMPACT_WINDOW_STOPS plus the measured effective threshold.
+ *
+ * The setting is a token count the CLI clamps to the model's own window
+ * (`min(setting, model max)`), so stops above `rawMaxTokens` are annotated
+ * rather than hidden — the same conversation can move to a bigger model.
+ * Applied on the next message delivery, which is why there is no live preview
+ * of the effect.
+ *
+ * `isAutoCompactEnabled` is tri-state on purpose: `null`/`undefined` means the
+ * runtime has not reported yet (no context-usage snapshot exists before the
+ * first turn) and must not be read as "disabled" — auto-compact is on by
+ * default, so claiming otherwise next to an unknown threshold is a lie.
+ *
+ * @returns {string} HTML, or '' when there is nothing to control
+ */
+export function renderAutoCompactControlHtml({
+  autoCompactWindow = null,
+  autoCompactThreshold = null,
+  autocompactSource = null,
+  isAutoCompactEnabled = null,
+  maxTokens = null,
+  rawMaxTokens = null,
+} = {}) {
+  const window = parseAutoCompactWindow(autoCompactWindow);
+  const index = autoCompactWindowToIndex(window);
+  const modelMax = toNullableNumber(rawMaxTokens) ?? toNullableNumber(maxTokens);
+  const cappedStops = AUTO_COMPACT_WINDOW_STOPS
+    .filter((stop) => stop !== null && modelMax !== null && stop > modelMax)
+    .map((stop) => formatAutoCompactWindowLabel(stop));
+  const cappedNote = cappedStops.length
+    ? `<div class="ctx-autocompact-note">${escapeHtml(cappedStops.join(', '))} capped to model limit (${escapeHtml(formatCompactTokens(modelMax))}).</div>`
+    : '';
+
+  const threshold = toNullableNumber(autoCompactThreshold);
+  const sourceLabel = autocompactSourceLabel(autocompactSource);
+  const effective = threshold === null
+    ? '<span class="ctx-autocompact-muted">— (known after the first turn)</span>'
+    : `compacts at ${escapeHtml(formatCompactTokens(threshold))}${toNullableNumber(maxTokens) === null
+      ? ''
+      : ` of ${escapeHtml(formatCompactTokens(maxTokens))}`} tokens${sourceLabel ? ` · ${escapeHtml(sourceLabel)}` : ''}`;
+
+  // No toggle by design: the window is the only thing this control owns. Only
+  // an explicit `false` from a real snapshot renders the note — unknown stays
+  // silent rather than contradicting the "known after the first turn" line.
+  const disabledNote = isAutoCompactEnabled === false
+    ? '<div class="ctx-autocompact-note">Auto-compact is disabled for this session.</div>'
+    : '';
+
+  return `
+    <div class="ctx-autocompact">
+      <div class="ctx-autocompact-row">
+        <label for="ctx-autocompact-slider">Auto-compact window:</label>
+        <b id="ctx-autocompact-value">${escapeHtml(formatAutoCompactWindowLabel(window))}</b>
+      </div>
+      <input
+        id="ctx-autocompact-slider"
+        class="ctx-autocompact-slider"
+        type="range"
+        min="0"
+        max="${AUTO_COMPACT_WINDOW_STOPS.length - 1}"
+        step="1"
+        value="${index}"
+        aria-label="Auto-compact window"
+      >
+      <div class="ctx-autocompact-effective">Effective: ${effective}</div>
+      ${cappedNote}
+      ${disabledNote}
+      <div class="ctx-autocompact-note">Applied on the next message in this conversation.</div>
+    </div>
   `;
 }
 

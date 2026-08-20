@@ -12,6 +12,8 @@ import {
   readPlanUsage,
   normalizeClaudeEffort,
   claudeUltracodeFlagSettings,
+  claudeAutoCompactFlagSettings,
+  normalizeAutoCompactWindow,
   permissionModeForRelayMode,
 } from './claude-sdk-adapter.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
@@ -317,6 +319,10 @@ export function createClaudeSessionRunner({
   relocateTranscriptImpl = relocateClaudeTranscriptForCwd,
   idleShutdownMs = 10 * 60_000,
   getBackgroundTaskTimeoutMs = () => 0,
+  // The per-conversation auto-compact window (token count, null = Auto). Read
+  // per turn rather than captured, so a slider change picked up on the next
+  // delivery reaches a process that is already running.
+  getAutoCompactWindow = () => null,
   lifecyclePollMs = 5_000,
   // A settled task's continuation normally begins within ~1s; when nothing
   // arrives inside this window the notification was silent (skip_transcript)
@@ -1550,6 +1556,7 @@ export function createClaudeSessionRunner({
     const relayMode = message.relayMode || 'agent';
     const model = resolvePerTurnModel(message);
     const effort = normalizeClaudeEffort(message.reasoningEffort);
+    const autoCompactWindow = normalizeAutoCompactWindow(getAutoCompactWindow());
     const abortController = new AbortController();
     const processRef = {
       turn: null,
@@ -1557,6 +1564,7 @@ export function createClaudeSessionRunner({
       model,
       relayMode,
       effort,
+      autoCompactWindow,
       appendClass: modeAppendClass(relayMode),
       permissionMode: permissionModeForRelayMode(relayMode),
       liveTasks: new Map(),
@@ -1664,6 +1672,7 @@ export function createClaudeSessionRunner({
       resume,
       relayMode,
       reasoningEffort: effort,
+      autoCompactWindow,
       abortController,
       canUseTool,
       pathToClaudeCodeExecutable,
@@ -1748,6 +1757,16 @@ export function createClaudeSessionRunner({
         dbg('applyFlagSettings effort failed', error?.message || String(error));
       });
       proc.effort = effort;
+    }
+    // The window is a delivery-scoped setting, not a per-message one: it only
+    // reaches a live process through the flag layer, and `null` (Auto) has to
+    // be pushed too or clearing the slider would never take effect.
+    const autoCompactWindow = normalizeAutoCompactWindow(getAutoCompactWindow());
+    if (autoCompactWindow !== proc.autoCompactWindow) {
+      await Promise.resolve(proc.turn.applyFlagSettings?.(claudeAutoCompactFlagSettings(autoCompactWindow))).catch((error) => {
+        dbg('applyFlagSettings autoCompactWindow failed', error?.message || String(error));
+      });
+      proc.autoCompactWindow = autoCompactWindow;
     }
     proc.relayMode = relayMode;
     return proc;

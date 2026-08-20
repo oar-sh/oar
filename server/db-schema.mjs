@@ -26,6 +26,7 @@ export const SCHEMA_SQL = `
     preferred_relay_mode TEXT,
     preferred_model TEXT,
     preferred_reasoning_effort TEXT,
+    auto_compact_window INTEGER,
     configured_workspace_root_path TEXT,
     runtime_workspace_root_path TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
@@ -722,6 +723,11 @@ if (!conversationColumns.includes('preferred_reasoning_effort')) {
       if (model || effort) seedFlatPreference.run(model, effort, legacyRow.id);
     }
   }
+}
+if (!conversationColumns.includes('auto_compact_window')) {
+  // Token count (not a percent); NULL = "Auto", i.e. the model-tuned default
+  // the Claude CLI picks on its own. See shared/auto-compact-window.mjs.
+  db.exec(`ALTER TABLE conversations ADD COLUMN auto_compact_window INTEGER`);
 }
 if (!conversationColumns.includes('configured_workspace_root_path')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN configured_workspace_root_path TEXT`);

@@ -1622,6 +1622,32 @@
     color: var(--muted);
     margin: -6px 0 12px;
   }
+  /* Claude-only auto-compact window control, rendered under the breakdown. */
+  .ctx-autocompact {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .ctx-autocompact-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 0.85rem;
+  }
+  .ctx-autocompact-slider { width: 100%; }
+  .ctx-autocompact-effective {
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .ctx-autocompact-muted { color: var(--muted); }
+  .ctx-autocompact-note {
+    font-size: 0.76rem;
+    color: var(--muted);
+  }
   .ctx-usage-raw {
     margin-top: 14px;
     font-size: 0.8rem;

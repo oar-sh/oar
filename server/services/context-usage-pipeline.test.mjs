@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { readStoredClaudeContextUsage } from './claude-context-usage.mjs';
 import { buildContextUsageView } from './context-usage-view.mjs';
-import { renderContextUsageHtml } from '../public/app/context-usage-view.mjs';
+import { renderAutoCompactControlHtml, renderContextUsageHtml } from '../public/app/context-usage-view.mjs';
 
 /**
  * End-to-end over the whole context pipeline, mirroring what
@@ -98,4 +98,29 @@ test('the window comes from modelUsage when the breakdown omits it', () => {
   const view = buildContextUsageView({ snapshot, contextUsage });
   assert.equal(view.maxTokens, 1000000, 'a [1m] session must not be reported as 200k');
   assert.equal(view.percentage, 24.71);
+});
+
+test('the auto-compact control rides the same payload the modal renders', () => {
+  const { snapshot, contextUsage } = readStoredClaudeContextUsage(storedRow());
+  const view = buildContextUsageView({ snapshot, contextUsage });
+  // Mirrors what bootstrap's loadContextSummaryAndRender appends for a Claude
+  // conversation, with the stored preference from resolveContextPayload.
+  const html = renderAutoCompactControlHtml({
+    autoCompactWindow: 200000,
+    autoCompactThreshold: view.autoCompactThreshold,
+    autocompactSource: view.autocompactSource,
+    isAutoCompactEnabled: view.isAutoCompactEnabled,
+    maxTokens: view.maxTokens,
+    rawMaxTokens: view.rawMaxTokens,
+  });
+  assert.equal(view.autoCompactThreshold, 967000, 'tokens, not a percent');
+  assert.equal(view.rawMaxTokens, 1000000);
+  assert.match(html, /id="ctx-autocompact-value">200k</);
+  assert.match(html, /compacts at 967\.0k of 1\.0M tokens · auto \(model-tuned\)/);
+});
+
+test('the buffer derived for a Claude session is the reserve above the threshold', () => {
+  // Regression: the old percent formula made this 0 for every real payload.
+  const { snapshot } = readStoredClaudeContextUsage(storedRow());
+  assert.equal(snapshot.buffer_tokens, 33000);
 });

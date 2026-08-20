@@ -96,12 +96,14 @@ import {
   readTurnCeilingSetting,
   turnCeilingMinutesToMs,
 } from '../shared/turn-ceiling.mjs';
+import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
 import {
   parseBackgroundTaskTimeoutUpdate,
   readBackgroundTaskTimeoutSetting,
   backgroundTaskTimeoutMinutesToMs,
 } from '../shared/background-task-timeout.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
+import { capRelayActivityEntries } from './public/app/activity-replay-state.mjs';
 import {
   canonicalizeModelId,
   filterValidModelIds,
@@ -6125,6 +6127,12 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       // watchdogs (Grok's prompt ceiling) must honor it rather than imposing
       // their own cap on a turn the user asked to leave unbounded.
       turnCeilingMs: turnCeilingMinutesToMs(getTurnCeilingMinutes()),
+      // Per-conversation, unlike the two above: delivery is already scoped to
+      // one conversation, so the worker picks the window up on its next turn
+      // without a new queue column or push channel. null = Auto.
+      autoCompactWindow: parseAutoCompactWindow(out.conversationId
+        ? stmts.getConvAnyStatus.get(out.conversationId)?.auto_compact_window
+        : null),
     },
     routing: {
       enabled: true,

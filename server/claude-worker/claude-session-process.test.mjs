@@ -243,6 +243,57 @@ test('mid-session effort changes toggle the ultracode flags, idempotently', asyn
   await settled(runner);
 });
 
+test('the auto-compact window reaches the spawn and reconciles drift live', async () => {
+  const stub = makeApiStub();
+  const capturedSpawns = [];
+  const turn = scriptedTurn({ echoPushes: true });
+  const flagCalls = [];
+  turn.applyFlagSettings = async (settings) => { flagCalls.push(settings); };
+  // The window arrives piggybacked on each delivery, so the runner reads it
+  // through a getter rather than off the message.
+  let deliveredWindow = 150000;
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      capturedSpawns.push(params);
+      return turn;
+    },
+    getAutoCompactWindow: () => deliveredWindow,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(capturedSpawns[0].autoCompactWindow, 150000, 'spawn carries the window');
+  assert.deepEqual(flagCalls, [], 'a spawn-time window needs no flag-settings call');
+
+  // Unchanged window: no redundant control request.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('second', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(flagCalls.length, 0);
+
+  deliveredWindow = 500000;
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  turn.emit(resultMessage('third', 'native-1'));
+  assert.equal(await third, true);
+  assert.deepEqual(flagCalls, [{ autoCompactWindow: 500000 }]);
+
+  // Back to Auto: the flag layer must be cleared, or the setting is one-way.
+  deliveredWindow = null;
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4' } });
+  await waitFor(() => turn.pushed.length === 4, { label: 'fourth push' });
+  turn.emit(resultMessage('fourth', 'native-1'));
+  assert.equal(await fourth, true);
+  assert.deepEqual(flagCalls[1], { autoCompactWindow: null });
+
+  turn.endInput();
+  await settled(runner);
+});
+
 test('sdk failure publishes a terminal response instead of hanging the queue', async () => {
   const stub = makeApiStub();
   const runner = makeRunner({

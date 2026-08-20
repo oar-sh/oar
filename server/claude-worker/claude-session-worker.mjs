@@ -14,6 +14,7 @@ import { createApiClient } from '../../.github/extensions/web-relay/runtime/api-
 import { createWorkerWebSocketLink } from '../../.github/extensions/web-relay/runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../.github/extensions/web-relay/polling/heartbeat.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
+import { resolveDeliveredAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 
@@ -51,6 +52,9 @@ async function main() {
   // limit). Seeded from the environment; refreshed from every delivery payload
   // so the settings slider applies without a worker restart.
   let backgroundTaskTimeoutMs = Number(process.env.CLAUDE_RELAY_BACKGROUND_TASK_TIMEOUT_MS) || 0;
+  // Per-conversation auto-compact window (token count, null = Auto); arrives
+  // piggybacked on each queue delivery, like the timeouts above.
+  let autoCompactWindow = null;
 
   const api = createApiClient({
     serverUrl,
@@ -91,6 +95,7 @@ async function main() {
       return raw !== '' && Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
     })(),
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
+    getAutoCompactWindow: () => autoCompactWindow,
     dbg,
   });
 
@@ -118,6 +123,9 @@ async function main() {
       if (Number.isFinite(deliveredTimeout) && deliveredTimeout >= 0) {
         backgroundTaskTimeoutMs = deliveredTimeout;
       }
+      // Absent (an older relay) leaves the last known value alone; an explicit
+      // null is the user choosing Auto and must clear the pin.
+      autoCompactWindow = resolveDeliveredAutoCompactWindow(autoCompactWindow, pending?.settings);
       try {
         return await turnRunner.handlePendingPayload(pending);
       } catch (error) {
