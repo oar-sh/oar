@@ -1305,9 +1305,14 @@ export function buildConversationSessionRootPayload({
   };
 }
 
+function activityEntryMetadata(value) {
+  const metadata = value && typeof value === 'object' ? value.metadata : null;
+  return (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) ? metadata : null;
+}
+
 function mergeUniqueActivityTexts(primary = [], secondary = []) {
   const merged = [];
-  const seen = new Set();
+  const indexByKey = new Map();
   for (const value of [...(Array.isArray(primary) ? primary : []), ...(Array.isArray(secondary) ? secondary : [])]) {
     const text = value && typeof value === 'object'
       ? String(value.text || '').trim()
@@ -1316,9 +1321,20 @@ function mergeUniqueActivityTexts(primary = [], secondary = []) {
       ? String(value.subagentRunId).trim()
       : '';
     const key = `${subagentRunId}::${text}`;
-    if (!text || seen.has(key)) continue;
-    seen.add(key);
-    merged.push(value && typeof value === 'object' ? { ...value, text } : text);
+    if (!text) continue;
+    const entry = value && typeof value === 'object' ? { ...value, text } : text;
+    if (indexByKey.has(key)) {
+      // Same prose from two sources: the structured copy wins. A compaction
+      // boundary reaches the transcript branch as prose only, and dropping
+      // the metadata-bearing duplicate would cost the client its break row.
+      const existingIndex = indexByKey.get(key);
+      if (activityEntryMetadata(entry) && !activityEntryMetadata(merged[existingIndex])) {
+        merged[existingIndex] = entry;
+      }
+      continue;
+    }
+    indexByKey.set(key, merged.length);
+    merged.push(entry);
   }
   return merged;
 }

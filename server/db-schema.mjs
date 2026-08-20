@@ -325,6 +325,7 @@ export const SCHEMA_SQL = `
     relay_mode          TEXT NOT NULL DEFAULT 'agent',
     text                TEXT NOT NULL,
     created_at          TEXT NOT NULL,
+    metadata_json       TEXT,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
   );
 
@@ -830,6 +831,13 @@ db.exec(`
 const relayActivityColumns = db.prepare(`PRAGMA table_info(relay_activity)`).all().map((c) => c.name);
 if (relayActivityColumns.length && !relayActivityColumns.includes('subagent_run_id')) {
   db.exec(`ALTER TABLE relay_activity ADD COLUMN subagent_run_id TEXT`);
+}
+// Structured payload for activity rows that the transcript renders as more
+// than prose — today only the Claude compaction boundary
+// ({kind:'compact_boundary', preTokens, postTokens}), which becomes a
+// full-width break row instead of a line inside the tool-activity details.
+if (relayActivityColumns.length && !relayActivityColumns.includes('metadata_json')) {
+  db.exec(`ALTER TABLE relay_activity ADD COLUMN metadata_json TEXT`);
 }
 const relayThoughtColumns = db.prepare(`PRAGMA table_info(relay_thought)`).all().map((c) => c.name);
 if (relayThoughtColumns.length && !relayThoughtColumns.includes('subagent_run_id')) {

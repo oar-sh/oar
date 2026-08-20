@@ -448,11 +448,12 @@ export async function connectSocket(overrideDeps) {
   socket.on('background_tasks', ({ conversationId, tasks }) => {
     setConversationBackgroundTasks(conversationId, tasks);
   });
-  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId }) => {
+  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId, metadata }) => {
     if (!messageId || !text) return;
     const entry = {
       text: String(text || '').trim(),
       subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
+      metadata: (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) ? metadata : null,
     };
     if (!entry.text) return;
     const items = relayActivities.get(messageId) || [];
@@ -468,7 +469,7 @@ export async function connectSocket(overrideDeps) {
     }
     if (conversationId === currentConvId) {
       const autoScroll = isMessagesAtBottom();
-      appendThinkingActivity(entry.text, entry.subagentRunId, autoScroll);
+      appendThinkingActivity(entry, entry.subagentRunId, autoScroll);
     }
   });
   socket.on('relay_stream', ({ conversationId, messageId, text, done, seq, subagentRunId }) => {

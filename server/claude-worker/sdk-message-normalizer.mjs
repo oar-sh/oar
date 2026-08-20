@@ -519,8 +519,14 @@ export function createSdkMessageNormalizer() {
         payload: {
           text: `Context compacted${detail}`,
           subagentRunId: null,
-          preTokens: Number.isFinite(preTokens) ? preTokens : null,
-          postTokens: Number.isFinite(postTokens) ? postTokens : null,
+          // Structured twin of the prose: the transcript promotes this row to
+          // a full-width break instead of burying it in the tool-activity
+          // details, and needs the token counts to label it.
+          metadata: {
+            kind: 'compact_boundary',
+            preTokens: Number.isFinite(preTokens) ? preTokens : null,
+            postTokens: Number.isFinite(postTokens) ? postTokens : null,
+          },
         },
       }];
     }

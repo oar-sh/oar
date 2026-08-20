@@ -96,11 +96,14 @@ function normalizeActivityEntry(value) {
     const text = String(value.text || '').trim();
     if (!text) return null;
     const subagentRunId = value.subagentRunId ? String(value.subagentRunId).trim() : null;
-    return { text, subagentRunId };
+    const metadata = (value.metadata && typeof value.metadata === 'object' && !Array.isArray(value.metadata))
+      ? value.metadata
+      : null;
+    return { text, subagentRunId, metadata };
   }
   const text = String(value || '').trim();
   if (!text) return null;
-  return { text, subagentRunId: null };
+  return { text, subagentRunId: null, metadata: null };
 }
 
 function normalizeThoughtEntry(value, index) {
@@ -342,6 +345,7 @@ export function createSessionHistoryRefreshService({
           activity.text,
           timestamp,
           activity.subagentRunId,
+          activity.metadata ? JSON.stringify(activity.metadata) : null,
         );
       }
       const thoughts = ensureArray(message?.thoughts)

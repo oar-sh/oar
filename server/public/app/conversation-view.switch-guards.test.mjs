@@ -26,21 +26,38 @@ class FakeClassList {
   contains(name) { return this.names.has(name); }
 }
 
-function parseSimpleSelector(selector) {
+// One compound selector: `.a.b`, `[data-x="1"]`, `.msg[data-message-timestamp]`.
+// Attribute *presence* is supported as well as equality, because the transcript
+// code selects on `.msg[data-message-timestamp]`; without it every separator
+// query would silently return nothing and the feature under test would be a
+// no-op here.
+function parseCompoundSelector(selector) {
   const sel = String(selector || '').trim();
-  if (!sel || /[\s>+~,]/.test(sel)) return null;
+  if (!sel || /[\s>+~]/.test(sel)) return null;
   const attrs = [];
-  const rest = sel.replace(/\[([^\]=]+)="([^"]*)"\]/g, (_, name, value) => {
-    attrs.push([name, value]);
+  let rest = sel.replace(/\[([^\]=]+)="([^"]*)"\]/g, (_, name, value) => {
+    attrs.push([name.trim(), value]);
     return '';
   });
-  if (rest.includes('[')) return null;
+  rest = rest.replace(/\[([^\]=]+)\]/g, (_, name) => {
+    attrs.push([name.trim(), null]);
+    return '';
+  });
+  if (rest.includes('[') || rest.includes(']')) return null;
   const classes = rest.split('.').map((part) => part.trim()).filter(Boolean);
   return { classes, attrs };
 }
 
-function elementMatches(el, parsed) {
-  if (!parsed) return false;
+// A selector list (`.msg, .transcript-separator`) matches if any branch does.
+function parseSimpleSelector(selector) {
+  const parts = String(selector || '').split(',').map((part) => part.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  const parsed = parts.map((part) => parseCompoundSelector(part));
+  if (parsed.some((entry) => !entry)) return null;
+  return parsed;
+}
+
+function matchesCompound(el, parsed) {
   for (const cls of parsed.classes) {
     const tokens = String(el.className || '').split(/\s+/).filter(Boolean);
     if (!tokens.includes(cls) && !el.classList.contains(cls)) return false;
@@ -48,9 +65,19 @@ function elementMatches(el, parsed) {
   for (const [name, value] of parsed.attrs) {
     if (!name.startsWith('data-')) return false;
     const key = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    const has = !!el.dataset && Object.prototype.hasOwnProperty.call(el.dataset, key);
+    if (value === null) {
+      if (!has) return false;
+      continue;
+    }
     if (String(el.dataset?.[key] ?? '') !== value) return false;
   }
   return true;
+}
+
+function elementMatches(el, parsedList) {
+  if (!parsedList) return false;
+  return parsedList.some((parsed) => matchesCompound(el, parsed));
 }
 
 function* walkDescendants(el) {
@@ -76,7 +103,10 @@ class FakeElement {
     this.hidden = false;
     this.disabled = false;
     this.scrollTop = 0;
-    this.scrollHeight = 0;
+    // Every row is 100px tall unless a test pins a height, so scroll
+    // assertions can tell "scrolled before the separator was inserted" from
+    // "scrolled after".
+    this._scrollHeight = null;
     this.clientHeight = 0;
     this.focusCount = 0;
     this._innerHTML = '';
@@ -97,13 +127,54 @@ class FakeElement {
   getAttribute() { return null; }
   setAttribute() {}
   removeAttribute() {}
+  get scrollHeight() {
+    return this._scrollHeight === null ? this.children.length * 100 : this._scrollHeight;
+  }
+  set scrollHeight(value) { this._scrollHeight = Number(value) || 0; }
+  get lastElementChild() { return this.children[this.children.length - 1] || null; }
+  get nodeType() { return this.tagName === '#FRAGMENT' ? 11 : 1; }
+  get previousSibling() {
+    const siblings = this.parentNode?.children || [];
+    const idx = siblings.indexOf(this);
+    return idx > 0 ? siblings[idx - 1] : null;
+  }
+  get nextSibling() {
+    const siblings = this.parentNode?.children || [];
+    const idx = siblings.indexOf(this);
+    return (idx !== -1 && idx + 1 < siblings.length) ? siblings[idx + 1] : null;
+  }
+  // A fragment splices its children in and empties itself, like the real DOM —
+  // otherwise a prepended history page would land as one opaque node and the
+  // ordering this file asserts would be meaningless.
+  _spliceNodes(node) {
+    if (node?.tagName !== '#FRAGMENT') return null;
+    const moved = node.children.slice();
+    node.children = [];
+    return moved;
+  }
   appendChild(node) {
+    const fragmentChildren = this._spliceNodes(node);
+    if (fragmentChildren) {
+      for (const child of fragmentChildren) {
+        child.parentNode = this;
+        this.children.push(child);
+      }
+      return node;
+    }
     if (node?.parentNode) node.remove();
     node.parentNode = this;
     this.children.push(node);
     return node;
   }
   insertBefore(node, ref) {
+    const fragmentChildren = this._spliceNodes(node);
+    if (fragmentChildren) {
+      const at = this.children.indexOf(ref);
+      const target = at === -1 ? this.children.length : at;
+      for (const child of fragmentChildren) child.parentNode = this;
+      this.children.splice(target, 0, ...fragmentChildren);
+      return node;
+    }
     if (node?.parentNode) node.remove();
     node.parentNode = this;
     const idx = this.children.indexOf(ref);
@@ -259,6 +330,16 @@ function resetSessionIndicators() {
   repoBrowserState.sessionRootName = 'Session';
 }
 
+// The transcript container holds message bubbles AND full-width separator
+// rows, so message assertions go through these rather than raw children.
+function messageRows() {
+  return messagesEl.children.filter((node) => node.classList.contains('msg'));
+}
+
+function separatorRows() {
+  return messagesEl.children.filter((node) => node.classList.contains('transcript-separator'));
+}
+
 function fireShareToggleClick(messageId, hiddenFromShares) {
   const btn = new FakeElement('button');
   btn.dataset = {
@@ -301,7 +382,7 @@ test('sendMessage posts to the validated conversation when the user switches mid
   const post = fetchLog.find((entry) => entry.url.includes('/api/message'));
   assert.ok(post, 'the message must still be posted');
   assert.equal(JSON.parse(post.body).conversationId, convA, 'the post targets the conversation the message was typed in');
-  assert.equal(messagesEl.children.length, 0, 'no user bubble is rendered into the newly opened conversation');
+  assert.equal(messageRows().length, 0, 'no user bubble is rendered into the newly opened conversation');
   assert.equal(getById('msg-input').value, 'draft of b', 'the new conversation\'s composer draft is untouched');
   const draftPatch = fetchLog.find((entry) => entry.url.includes(`/api/conversation/${convA}/draft`));
   assert.ok(draftPatch, 'the sent conversation\'s draft is still cleared');
@@ -330,9 +411,9 @@ test('sendMessage happy path: unswitched flow posts, renders the bubble, and cle
   const post = fetchLog.find((entry) => entry.url.includes('/api/message') && JSON.parse(entry.body).text === 'hello there');
   assert.ok(post, 'the message was posted');
   assert.equal(JSON.parse(post.body).conversationId, convA);
-  assert.equal(messagesEl.children.length, 1, 'the user bubble is rendered');
-  assert.match(messagesEl.children[0].className, /\bmsg\b/);
-  assert.match(messagesEl.children[0].className, /\buser\b/);
+  assert.equal(messageRows().length, 1, 'the user bubble is rendered');
+  assert.match(messageRows()[0].className, /\bmsg\b/);
+  assert.match(messageRows()[0].className, /\buser\b/);
   assert.equal(getById('msg-input').value, '', 'the composer is cleared');
 });
 
@@ -449,7 +530,7 @@ test('share-visibility toggle: a reload resolving after a switch is not rendered
   const msgA1 = makeMessage(nextId('msg-a'));
   const msgA2 = makeMessage(nextId('msg-a'), { role: 'assistant' });
   view.renderMessages([msgA1, msgA2], false, { conversationId: convA });
-  assert.equal(messagesEl.children.length, 2, 'precondition: conversation A is rendered');
+  assert.equal(messageRows().length, 2, 'precondition: conversation A is rendered');
 
   const reload = deferred();
   fetchHandler = async (url, opts) => {
@@ -464,14 +545,14 @@ test('share-visibility toggle: a reload resolving after a switch is not rendered
   setCurrentConv(convB);
   const msgB1 = makeMessage(nextId('msg-b'));
   view.renderMessages([msgB1], false, { conversationId: convB });
-  assert.equal(messagesEl.children.length, 1);
+  assert.equal(messageRows().length, 1);
 
   reload.resolve({ messages: [msgA1, { ...msgA2, hiddenFromShares: true }], pageInfo: {} });
   await settle();
   await settle();
 
-  assert.equal(messagesEl.children.length, 1, 'conversation B still shows only its own message');
-  assert.equal(messagesEl.children[0].dataset.messageId, msgB1.id);
+  assert.equal(messageRows().length, 1, 'conversation B still shows only its own message');
+  assert.equal(messageRows()[0].dataset.messageId, msgB1.id);
   const viewStateKeyB = [...localStorageStore.keys()].find((key) => key.includes(convB));
   assert.ok(viewStateKeyB, 'conversation B has its own persisted view state');
   assert.equal(
@@ -525,9 +606,9 @@ test('share-visibility toggle happy path: unswitched flow reloads and re-renders
   await settle();
   await settle();
 
-  assert.equal(messagesEl.children.length, 2, 'the reloaded conversation is rendered');
+  assert.equal(messageRows().length, 2, 'the reloaded conversation is rendered');
   assert.match(
-    messagesEl.children[0].innerHTML,
+    messageRows()[0].innerHTML,
     /Hidden from shared viewers/,
     'the re-render reflects the new share visibility',
   );
@@ -611,23 +692,162 @@ test('pagination: an in-flight older-page response for the previous conversation
   assert.equal(view.getConversationLoadedMessageCount(), 2, 'the stale page is not applied');
 });
 
-test('pagination happy path: load-older on the same conversation prepends the page', async () => {
+test('pagination happy path: load-older on the same conversation prepends the page above the rows already shown', async () => {
   const convA = nextId('conv-a');
   conversations[convA] = { id: convA, title: 'A' };
   setCurrentConv(convA);
   const cursorId = nextId('cursor-a');
-  primeHistoryPage(convA, [makeMessage(nextId('msg-a')), makeMessage(nextId('msg-a'))], cursorId);
+  const first = makeMessage(nextId('msg-a'), { timestamp: '2026-02-11T09:00:00.000Z' });
+  const second = makeMessage(nextId('msg-a'), { timestamp: '2026-02-11T09:01:00.000Z' });
+  primeHistoryPage(convA, [first, second], cursorId);
   assert.equal(view.getConversationLoadedMessageCount(), 2);
 
+  const older = makeMessage(nextId('msg-a-old'), { timestamp: '2026-02-10T09:00:00.000Z' });
   fetchHandler = async (url) => {
     if (url.includes(`beforeMessageId=${cursorId}`)) {
-      return { messages: [makeMessage(nextId('msg-a-old'))], pageInfo: { hasMore: false } };
+      return { messages: [older], pageInfo: { hasMore: false } };
     }
     throw new Error(`unexpected fetch: ${url}`);
   };
   await view.loadOlderConversationMessages();
 
   assert.equal(view.getConversationLoadedMessageCount(), 3, 'the older page was applied');
+  // Position, not just count: the older page must land ABOVE the rows that
+  // were already there (an appendChild fallback would bury it at the bottom).
+  assert.deepEqual(
+    messageRows().map((node) => node.dataset.messageId),
+    [older.id, first.id, second.id],
+    'the older message is the topmost bubble',
+  );
+  // …and the separator pass reruns over the merged transcript: the prepended
+  // day gets its own row on top, the original day keeps its own.
+  assert.deepEqual(
+    messagesEl.children.map((node) => node.dataset.separatorKind || `msg:${node.dataset.messageId}`),
+    ['day', `msg:${older.id}`, 'day', `msg:${first.id}`, `msg:${second.id}`],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Transcript separators — day rollovers and compaction boundaries are
+// full-width rows synced after every insertion path.
+// ---------------------------------------------------------------------------
+
+function separatorLayout() {
+  return messagesEl.children.map((node) => node.dataset.separatorKind || `msg:${node.dataset.messageId}`);
+}
+
+test('separators: a day row opens each local day and a compaction row sits before the message that compacted', () => {
+  const convId = nextId('conv-sep');
+  conversations[convId] = { id: convId, title: 'S' };
+  setCurrentConv(convId);
+  const dayOne = makeMessage(nextId('msg-sep'), { timestamp: '2026-02-10T10:00:00.000Z' });
+  const dayTwo = makeMessage(nextId('msg-sep'), {
+    role: 'assistant',
+    timestamp: '2026-02-11T10:00:00.000Z',
+    activities: [
+      { text: 'Read foo.txt' },
+      { text: 'Compacted the context', metadata: { kind: 'compact_boundary', preTokens: 120000, postTokens: 30000 } },
+    ],
+  });
+  view.renderMessages([dayOne, dayTwo], false, { conversationId: convId });
+
+  assert.deepEqual(separatorLayout(), ['day', `msg:${dayOne.id}`, 'day', 'compact', `msg:${dayTwo.id}`]);
+  const compactRow = separatorRows().find((node) => node.dataset.separatorKind === 'compact');
+  assert.match(compactRow.dataset.separatorLabel, /Context compacted · 120k → 30k tokens/);
+  // The promoted boundary is the break row, so it is not repeated as prose.
+  assert.doesNotMatch(messageRows()[1].innerHTML, /Compacted the context/);
+  assert.match(messageRows()[1].innerHTML, /Read foo\.txt/);
+});
+
+test('separators: an appended message that opens a new day still leaves the transcript at the bottom', () => {
+  const convId = nextId('conv-scroll');
+  conversations[convId] = { id: convId, title: 'Scroll' };
+  setCurrentConv(convId);
+  const dayOne = makeMessage(nextId('msg-scroll'), { timestamp: '2026-02-10T10:00:00.000Z' });
+  view.renderMessages([dayOne], false, { conversationId: convId });
+  // The user is pinned to the bottom when the reply arrives.
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  const dayTwo = makeMessage(nextId('msg-scroll'), { role: 'assistant', timestamp: '2026-02-11T10:00:00.000Z' });
+  view.appendMessage(dayTwo, true, dayTwo.id, true);
+
+  assert.deepEqual(separatorLayout(), ['day', `msg:${dayOne.id}`, 'day', `msg:${dayTwo.id}`]);
+  // Scrolling before the separator row existed would leave the viewport a
+  // separator-height short — which then reads as "not at bottom" and
+  // suppresses auto-scroll for the next message too.
+  assert.equal(
+    messagesEl.scrollTop,
+    messagesEl.scrollHeight,
+    'the scroll accounts for the separator the append introduced',
+  );
+});
+
+test('live bubble: a compaction boundary is never appended as thinking prose', () => {
+  const box = getById('thinking-activity');
+  box.children = [];
+  view.appendThinkingActivity({ text: 'Read foo.txt' }, null, false);
+  view.appendThinkingActivity(
+    { text: 'Compacted the context', metadata: { kind: 'compact_boundary', preTokens: 120000, postTokens: 30000 } },
+    null,
+    false,
+  );
+  view.appendThinkingActivity('Wrote bar.txt', null, false);
+
+  assert.deepEqual(
+    box.children.map((node) => node.textContent),
+    ['Read foo.txt', 'Wrote bar.txt'].map((text) => view.decorateActivityText(text)),
+    'the boundary is left to the persisted break row',
+  );
+});
+
+test('live bubble: a replayed activity list renders every entry except the compaction boundary', () => {
+  const convId = nextId('conv-live');
+  conversations[convId] = { id: convId, title: 'L' };
+  setCurrentConv(convId);
+  const messageId = nextId('msg-live');
+  view.showThinking(messageId, false);
+  const box = getById('thinking-activity');
+  box.children = [];
+  store.relayActivities.set(messageId, [
+    { text: 'Read foo.txt', subagentRunId: null },
+    {
+      text: 'Compacted the context',
+      subagentRunId: null,
+      metadata: { kind: 'compact_boundary', preTokens: 120000, postTokens: 30000 },
+    },
+    { text: 'Wrote bar.txt', subagentRunId: null },
+  ]);
+
+  view.renderThinkingActivities();
+
+  assert.deepEqual(
+    box.children.map((node) => node.textContent),
+    ['Read foo.txt', 'Wrote bar.txt'].map((text) => view.decorateActivityText(text)),
+  );
+  store.relayActivities.delete(messageId);
+  view.removeThinking();
+});
+
+test('separators: a turn that compacted twice promotes the last boundary and keeps the earlier one visible', () => {
+  const convId = nextId('conv-sep2');
+  conversations[convId] = { id: convId, title: 'S2' };
+  setCurrentConv(convId);
+  const msg = makeMessage(nextId('msg-sep'), {
+    role: 'assistant',
+    timestamp: '2026-02-12T10:00:00.000Z',
+    activities: [
+      { text: 'compaction one', metadata: { kind: 'compact_boundary', preTokens: 100000, postTokens: 20000 } },
+      { text: 'compaction two', metadata: { kind: 'compact_boundary', preTokens: 110000, postTokens: 25000 } },
+    ],
+  });
+  view.renderMessages([msg], false, { conversationId: convId });
+
+  assert.deepEqual(separatorLayout(), ['day', 'compact', `msg:${msg.id}`]);
+  const compactRow = separatorRows().find((node) => node.dataset.separatorKind === 'compact');
+  assert.match(compactRow.dataset.separatorLabel, /110k → 25k/, 'the last boundary is the promoted one');
+  // Lossless: the boundary that could not be promoted stays in the bubble.
+  assert.match(messageRows()[0].innerHTML, /compaction one/);
+  assert.doesNotMatch(messageRows()[0].innerHTML, /compaction two/);
 });
 
 // ---------------------------------------------------------------------------
@@ -696,8 +916,8 @@ function renderAssistantWithQuota(percentRemaining) {
     ...(percentRemaining === undefined ? {} : { usage: { plan: { percentRemaining } } }),
   });
   view.renderMessages([message], false, { conversationId: convId });
-  assert.equal(messagesEl.children.length, 1);
-  return messagesEl.children[0].innerHTML;
+  assert.equal(messageRows().length, 1);
+  return messageRows()[0].innerHTML;
 }
 
 test('quota badge renders "0.0% left" for exactly 0% remaining', () => {
