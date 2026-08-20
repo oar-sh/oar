@@ -3,118 +3,26 @@ import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
 import { createSessionHistoryRefreshService } from './session-history-refresh-service.mjs';
+import { applySchema } from '../db-schema.mjs';
 
 function makeDb() {
   const db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE conversations (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      sdk_session_id TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE messages (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      text TEXT NOT NULL,
-      model TEXT,
-      mode TEXT,
-      attachments TEXT,
-      model_requested TEXT,
-      model_actual TEXT,
-      model_origin TEXT,
-      hidden_from_shares INTEGER NOT NULL DEFAULT 0,
-      share_hidden_at TEXT,
-      timestamp TEXT NOT NULL
-    );
-    CREATE TABLE queue (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT NOT NULL,
-      status TEXT NOT NULL,
-      attachments TEXT,
-      timestamp TEXT
-    );
-    CREATE TABLE relay_activity (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      queue_message_id TEXT NOT NULL,
-      response_message_id TEXT,
-      conversation_id TEXT NOT NULL,
-      relay_mode TEXT NOT NULL DEFAULT 'agent',
-      text TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      subagent_run_id TEXT
-    );
-    CREATE TABLE relay_stream_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      queue_message_id TEXT NOT NULL,
-      response_message_id TEXT,
-      conversation_id TEXT NOT NULL,
-      relay_mode TEXT NOT NULL DEFAULT 'agent',
-      seq INTEGER NOT NULL,
-      text TEXT NOT NULL,
-      done INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      subagent_run_id TEXT
-    );
-    CREATE TABLE relay_thought (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      queue_message_id TEXT NOT NULL,
-      response_message_id TEXT,
-      conversation_id TEXT NOT NULL,
-      relay_mode TEXT NOT NULL DEFAULT 'agent',
-      reasoning_id TEXT,
-      seq INTEGER NOT NULL,
-      text TEXT NOT NULL,
-      done INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      subagent_run_id TEXT
-    );
-    CREATE TABLE relay_questions (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT NOT NULL
-    );
-    CREATE TABLE relay_boards (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT NOT NULL
-    );
-    CREATE TABLE subagent_runs (
-      id TEXT PRIMARY KEY,
-      queue_message_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      parent_subagent_id TEXT,
-      display_name TEXT,
-      status TEXT NOT NULL DEFAULT 'running',
-      started_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      completed_at TEXT
-    );
-    CREATE TABLE workflow_runs (
-      id TEXT PRIMARY KEY,
-      response_message_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      run_index INTEGER NOT NULL DEFAULT 0,
-      digest_json TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE uploaded_files (
-      sha256 TEXT PRIMARY KEY,
-      original_name TEXT,
-      mime_type TEXT,
-      size_bytes INTEGER NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE upload_refs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      file_sha256 TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      message_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      UNIQUE(file_sha256, message_id)
-    );
-  `);
+  applySchema(db);
   return db;
+}
+
+// messages/relay tables have a foreign key to conversations in the real
+// schema, so fixtures need the parent row before inserting history.
+function insertConversation(db, id) {
+  db.prepare(`INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+    .run(id, `Conversation ${id}`, id);
+}
+
+// upload_refs has a foreign key to uploaded_files in the real schema, so any
+// sha256 the service may re-reference needs its durable file row.
+function insertUploadedFile(db, sha256) {
+  db.prepare(`INSERT OR IGNORE INTO uploaded_files (sha256, original_name, mime_type, size_bytes, created_at) VALUES (?, 'fixture.bin', 'application/octet-stream', 1, '2026-01-01T00:00:00Z')`)
+    .run(sha256);
 }
 
 function makeStmts(db) {
@@ -155,8 +63,8 @@ test('clearRetrievableHistory removes only retrievable tables', () => {
   db.prepare(`INSERT INTO relay_stream_events (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, done, created_at) VALUES ('q1', 'm2', 'conv-1', 'agent', 1, 'partial', 0, '2026-01-01T00:00:04Z')`).run();
   db.prepare(`INSERT INTO subagent_runs (id, queue_message_id, conversation_id, status, started_at, updated_at) VALUES ('sub-1', 'q1', 'conv-1', 'running', '2026-01-01T00:00:05Z', '2026-01-01T00:00:05Z')`).run();
   db.prepare(`INSERT INTO workflow_runs (id, response_message_id, conversation_id, run_index, digest_json, created_at) VALUES ('wfr-1', 'm2', 'conv-1', 0, '{"runId":"wf_1"}', '2026-01-01T00:00:06Z')`).run();
-  db.prepare(`INSERT INTO relay_questions (id, conversation_id) VALUES ('rq-1', 'conv-1')`).run();
-  db.prepare(`INSERT INTO queue (id, conversation_id, status) VALUES ('q1', 'conv-1', 'done')`).run();
+  db.prepare(`INSERT INTO queue (id, conversation_id, status, text, timestamp) VALUES ('q1', 'conv-1', 'done', 'prompt', '2026-01-01T00:00:00Z')`).run();
+  db.prepare(`INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, prompt, created_at, expires_at) VALUES ('rq-1', 'q1', 'conv-1', 'm2', 'Question?', '2026-01-01T00:00:07Z', '2026-01-01T01:00:00Z')`).run();
 
   const service = createSessionHistoryRefreshService({ db, stmts });
   assert.equal(service.clearRetrievableHistory('conv-1'), true);
@@ -175,7 +83,7 @@ test('evaluateRefreshIdleState rejects busy queue and in-flight processing', () 
   const db = makeDb();
   const stmts = makeStmts(db);
   db.prepare(`INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at) VALUES ('conv-3', 'Three', 'conv-3', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run();
-  db.prepare(`INSERT INTO queue (id, conversation_id, status) VALUES ('q-3', 'conv-3', 'processing')`).run();
+  db.prepare(`INSERT INTO queue (id, conversation_id, status, text, timestamp) VALUES ('q-3', 'conv-3', 'processing', 'prompt', '2026-01-01T00:00:00Z')`).run();
 
   const busyQueueService = createSessionHistoryRefreshService({
     db,
@@ -316,8 +224,8 @@ test('replaceRetrievableHistory remaps durable uploads when SDK message ids chan
     }]);
     db.prepare(`INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at) VALUES ('conv-upload', 'Upload', 'conv-upload', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run();
     db.prepare(`
-      INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
-      VALUES ('relay-message', 'conv-upload', 'done', ?, '2026-01-01T00:00:01Z')
+      INSERT INTO queue (id, conversation_id, status, text, attachments, timestamp)
+      VALUES ('relay-message', 'conv-upload', 'done', 'prompt', ?, '2026-01-01T00:00:01Z')
     `).run(storedAttachments);
     db.prepare(`
       INSERT INTO uploaded_files (sha256, original_name, mime_type, size_bytes, created_at)
@@ -355,6 +263,7 @@ test('replaceRetrievableHistory remaps durable uploads when SDK message ids chan
 test('replaceRetrievableHistory restores full mixed attachment sets from image-only SDK hints', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
+  insertConversation(db, 'conv-mixed');
   const imageSha = 'b'.repeat(64);
   const documentSha = 'c'.repeat(64);
   const storedAttachments = [{
@@ -369,9 +278,11 @@ test('replaceRetrievableHistory restores full mixed attachment sets from image-o
     sha256: documentSha,
   }];
   db.prepare(`
-    INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
-    VALUES ('mixed-relay', 'conv-mixed', 'done', ?, '2026-01-01T00:00:01Z')
+    INSERT INTO queue (id, conversation_id, status, text, attachments, timestamp)
+    VALUES ('mixed-relay', 'conv-mixed', 'done', 'prompt', ?, '2026-01-01T00:00:01Z')
   `).run(JSON.stringify(storedAttachments));
+  insertUploadedFile(db, imageSha);
+  insertUploadedFile(db, documentSha);
 
   const service = createSessionHistoryRefreshService({ db, stmts });
   service.replaceRetrievableHistory('conv-mixed', [{
@@ -391,17 +302,20 @@ test('replaceRetrievableHistory restores full mixed attachment sets from image-o
 test('replaceRetrievableHistory matches duplicate filenames one-to-one by nearest timestamp', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
+  insertConversation(db, 'conv-duplicate');
   const firstSha = 'd'.repeat(64);
   const secondSha = 'e'.repeat(64);
   db.prepare(`
-    INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
+    INSERT INTO queue (id, conversation_id, status, text, attachments, timestamp)
     VALUES
-      ('relay-first', 'conv-duplicate', 'done', ?, '2026-01-01T00:00:01Z'),
-      ('relay-second', 'conv-duplicate', 'done', ?, '2026-01-01T00:10:01Z')
+      ('relay-first', 'conv-duplicate', 'done', 'prompt', ?, '2026-01-01T00:00:01Z'),
+      ('relay-second', 'conv-duplicate', 'done', 'prompt', ?, '2026-01-01T00:10:01Z')
   `).run(
     JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', sha256: firstSha }]),
     JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', sha256: secondSha }]),
   );
+  insertUploadedFile(db, firstSha);
+  insertUploadedFile(db, secondSha);
 
   const service = createSessionHistoryRefreshService({ db, stmts });
   service.replaceRetrievableHistory('conv-duplicate', [{
@@ -425,6 +339,7 @@ test('replaceRetrievableHistory matches duplicate filenames one-to-one by neares
 test('replaceRetrievableHistory preserves hidden-from-shares state by message id', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
+  insertConversation(db, 'conv-hidden');
   const service = createSessionHistoryRefreshService({
     db,
     stmts,
@@ -463,6 +378,7 @@ test('replaceRetrievableHistory preserves hidden-from-shares state by message id
 test('replaceRetrievableHistory remaps hidden-from-shares state when SDK message ids change', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
+  insertConversation(db, 'conv-remap');
   db.prepare(`
     INSERT INTO messages (
       id, conversation_id, role, text, hidden_from_shares, share_hidden_at, timestamp
@@ -494,6 +410,7 @@ test('replaceRetrievableHistory remaps hidden-from-shares state when SDK message
 test('replaceRetrievableHistory maps two remapped hidden duplicates one-to-one by nearest timestamp', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
+  insertConversation(db, 'conv-dup-hidden');
   db.prepare(`
     INSERT INTO messages (
       id, conversation_id, role, text, hidden_from_shares, share_hidden_at, timestamp
@@ -522,19 +439,22 @@ test('replaceRetrievableHistory maps two remapped hidden duplicates one-to-one b
 test('replaceRetrievableHistory keeps same-name candidates with distinct sha256 apart', () => {
   const db = makeDb();
   const stmts = makeStmts(db);
+  insertConversation(db, 'conv-sha');
   const firstSha = 'f'.repeat(64);
   const secondSha = '0'.repeat(63) + '1';
   // Same filename, type, and timestamp: only sha256/size distinguish the
   // candidate keys, so both sets must survive candidate collection.
   db.prepare(`
-    INSERT INTO queue (id, conversation_id, status, attachments, timestamp)
+    INSERT INTO queue (id, conversation_id, status, text, attachments, timestamp)
     VALUES
-      ('relay-a', 'conv-sha', 'done', ?, '2026-01-01T00:00:01Z'),
-      ('relay-b', 'conv-sha', 'done', ?, '2026-01-01T00:10:01Z')
+      ('relay-a', 'conv-sha', 'done', 'prompt', ?, '2026-01-01T00:00:01Z'),
+      ('relay-b', 'conv-sha', 'done', 'prompt', ?, '2026-01-01T00:10:01Z')
   `).run(
     JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', size: 111, sha256: firstSha }]),
     JSON.stringify([{ name: 'photo.jpg', type: 'image/jpeg', size: 999, sha256: secondSha }]),
   );
+  insertUploadedFile(db, firstSha);
+  insertUploadedFile(db, secondSha);
 
   const service = createSessionHistoryRefreshService({ db, stmts });
   service.replaceRetrievableHistory('conv-sha', [{

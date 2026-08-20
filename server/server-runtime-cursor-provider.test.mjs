@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
 import { createSessionRepository } from './repositories/session-repository.mjs';
+import { applySchema } from './db-schema.mjs';
 
 // server-runtime.mjs boots a live server on import, so these tests inspect the
 // source as text instead of importing it.
@@ -45,10 +46,15 @@ test('cursor discovery records whether a model can actually turn reasoning off',
 });
 
 test('runtime_sessions migration adds the cursor_agent_id column', () => {
-  const migrationSource = sliceBetween(
-    'const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`)',
-    'const conversationColumns = ',
-  );
+  // The schema/migration block moved verbatim to db-schema.mjs.
+  const dbSchemaSource = fs
+    .readFileSync(fileURLToPath(new URL('./db-schema.mjs', import.meta.url)), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const start = dbSchemaSource.indexOf('const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`)');
+  assert.notEqual(start, -1, 'expected db-schema.mjs to contain the runtime_sessions migration');
+  const end = dbSchemaSource.indexOf('const conversationColumns = ', start);
+  assert.notEqual(end, -1, 'expected conversations migration after runtime_sessions migration');
+  const migrationSource = dbSchemaSource.slice(start, end);
   assert.match(migrationSource, /if \(!runtimeSessionColumns\.includes\('cursor_agent_id'\)\) \{/);
   assert.match(migrationSource, /ALTER TABLE runtime_sessions ADD COLUMN cursor_agent_id TEXT/);
 });
@@ -196,60 +202,22 @@ test('shared route deps export the cursor session-root resolver', () => {
 
 // ─── updateRuntimeSessionCursorAgentId column gating ─────────────────────────
 
-const BASE_SCHEMA = `
-  CREATE TABLE conversations (
-    id TEXT PRIMARY KEY, title TEXT, title_source TEXT, archived INTEGER NOT NULL DEFAULT 0,
-    compacted_into TEXT, compacted_from TEXT, sdk_session_id TEXT, preferred_relay_mode TEXT,
-    preferred_model TEXT, preferred_reasoning_effort TEXT, configured_workspace_root_path TEXT,
-    runtime_workspace_root_path TEXT, draft_text TEXT, draft_updated_at TEXT,
-    draft_updated_by_client_id TEXT, draft_attachments TEXT, summary_seed TEXT, seed_pending INTEGER,
-    status TEXT NOT NULL DEFAULT 'active', created_at TEXT, updated_at TEXT
-  );
-  CREATE TABLE messages (
-    id TEXT PRIMARY KEY, conversation_id TEXT, role TEXT, text TEXT, model TEXT, mode TEXT,
-    attachments TEXT, timestamp TEXT, model_requested TEXT, model_actual TEXT, model_origin TEXT
-  );
-  CREATE TABLE queue (
-    id TEXT PRIMARY KEY, conversation_id TEXT, runtime_session_id TEXT, is_new_conversation INTEGER,
-    model TEXT, model_variant_id TEXT, reasoning_effort TEXT, relay_mode TEXT, text TEXT,
-    attachments TEXT, status TEXT, timestamp TEXT, retry_count INTEGER, next_attempt_at TEXT,
-    processing_at TEXT, response TEXT, response_message_id TEXT
-  );
-  CREATE TABLE deleted_sdk_sessions (sdk_session_id TEXT PRIMARY KEY, deleted_at TEXT);
-  CREATE TABLE recent_workspace_roots (path_key TEXT PRIMARY KEY, path TEXT NOT NULL, last_seen_at TEXT NOT NULL);
-  CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
-  CREATE TABLE sdk_delete_requests (
-    sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT, status TEXT, requested_at TEXT,
-    updated_at TEXT, processing_at TEXT, retry_count INTEGER, next_attempt_at TEXT, last_error TEXT
-  );
-  CREATE TABLE sdk_session_imports (
-    sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT, status TEXT, attempt_count INTEGER,
-    started_at TEXT, completed_at TEXT, source_started_at TEXT, source_modified_at TEXT,
-    updated_at TEXT, last_error TEXT
-  );
-  CREATE TABLE conversation_shares (
-    token TEXT PRIMARY KEY, conversation_id TEXT, created_at TEXT, last_accessed_at TEXT, revoked_at TEXT
-  );
-  CREATE TABLE relay_session_links (
-    sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, created_at TEXT NOT NULL
-  );
-`;
-
-function runtimeSessionsSchema({ withCursorAgentId }) {
-  return `
-    CREATE TABLE runtime_sessions (
-      id TEXT PRIMARY KEY, conversation_id TEXT UNIQUE, strategy TEXT, runtime_key TEXT,
-      model TEXT, status TEXT, created_at TEXT, last_used_at TEXT, sdk_session_id TEXT,
-      provider_type TEXT NOT NULL DEFAULT 'github', provider_model TEXT
-      ${withCursorAgentId ? ', cursor_agent_id TEXT' : ''}
-    );
-  `;
-}
-
 function newDb({ withCursorAgentId }) {
   const db = new Database(':memory:');
-  db.exec(BASE_SCHEMA);
-  db.exec(runtimeSessionsSchema({ withCursorAgentId }));
+  applySchema(db);
+  if (!withCursorAgentId) {
+    // The real schema always has cursor_agent_id; this variant deliberately
+    // recreates the pre-migration runtime_sessions shape so the repository's
+    // column gating (updateRuntimeSessionCursorAgentId === null) is testable.
+    db.exec(`
+      DROP TABLE runtime_sessions;
+      CREATE TABLE runtime_sessions (
+        id TEXT PRIMARY KEY, conversation_id TEXT UNIQUE, strategy TEXT, runtime_key TEXT,
+        model TEXT, status TEXT, created_at TEXT, last_used_at TEXT, sdk_session_id TEXT,
+        provider_type TEXT NOT NULL DEFAULT 'github', provider_model TEXT
+      );
+    `);
+  }
   return db;
 }
 

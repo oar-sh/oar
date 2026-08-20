@@ -4,124 +4,18 @@ import Database from 'better-sqlite3';
 import { createMessageRepository } from './message-repository.mjs';
 import { dequeuePendingMessage, resolveExecutedProviderForResponse } from '../routes/messages-routes.mjs';
 import { mapUsageSnapshotRow } from '../routes/sessions-routes.mjs';
+import { applySchema } from '../db-schema.mjs';
 
 function createTestDb() {
   const db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE conversations (
-      id TEXT PRIMARY KEY,
-      title TEXT,
-      status TEXT,
-      sdk_session_id TEXT
-    );
-
-    CREATE TABLE runtime_sessions (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT,
-      sdk_session_id TEXT,
-      status TEXT,
-      provider_type TEXT NOT NULL DEFAULT 'github'
-    );
-
-    CREATE TABLE messages (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT,
-      role TEXT,
-      text TEXT,
-      model TEXT,
-      mode TEXT,
-      attachments TEXT,
-      model_requested TEXT,
-      model_actual TEXT,
-      model_origin TEXT,
-      executed_provider TEXT,
-      hidden_from_shares INTEGER NOT NULL DEFAULT 0,
-      share_hidden_at TEXT,
-      kind TEXT,
-      timestamp TEXT
-    );
-
-    CREATE VIRTUAL TABLE messages_fts USING fts5(text);
-
-    CREATE TABLE queue (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT,
-      runtime_session_id TEXT,
-      is_new_conversation INTEGER,
-      model TEXT,
-      model_variant_id TEXT,
-      reasoning_effort TEXT,
-      context_tier TEXT,
-      relay_mode TEXT,
-      text TEXT,
-      attachments TEXT,
-      status TEXT,
-      timestamp TEXT,
-      processing_at TEXT,
-      response_message_id TEXT,
-      response TEXT,
-      retry_count INTEGER NOT NULL DEFAULT 0,
-      next_attempt_at TEXT,
-      owner_sdk_session_id TEXT,
-      owner_assigned_at TEXT,
-      owner_lease_expires_at TEXT,
-      owner_last_claimed_at TEXT,
-      parked_at TEXT,
-      parked_target_session_id TEXT,
-      parked_transaction_id TEXT,
-      parked_reason TEXT,
-      kind TEXT
-    );
-
-    CREATE TABLE message_usage_snapshots (
-      response_message_id TEXT PRIMARY KEY,
-      queue_message_id TEXT,
-      conversation_id TEXT NOT NULL,
-      source TEXT NOT NULL DEFAULT 'live',
-      stale INTEGER NOT NULL DEFAULT 0,
-      premium_remaining REAL,
-      premium_entitlement REAL,
-      premium_used_percent REAL,
-      premium_delta_used REAL,
-      chat_remaining REAL,
-      chat_entitlement REAL,
-      chat_used_percent REAL,
-      chat_delta_used REAL,
-      plan_remaining REAL,
-      plan_entitlement REAL,
-      plan_used_percent REAL,
-      plan_delta_used REAL,
-      captured_at TEXT NOT NULL
-    );
-
-    CREATE TABLE relay_questions (
-      id TEXT PRIMARY KEY,
-      queue_id TEXT,
-      status TEXT NOT NULL DEFAULT 'pending'
-    );
-
-    CREATE TABLE uploaded_files (
-      sha256 TEXT PRIMARY KEY,
-      original_name TEXT,
-      mime_type TEXT,
-      size_bytes INTEGER,
-      created_at TEXT
-    );
-
-    CREATE TABLE upload_refs (
-      file_sha256 TEXT,
-      conversation_id TEXT,
-      message_id TEXT,
-      created_at TEXT
-    );
-  `);
+  applySchema(db);
   return db;
 }
 
 test('message share visibility preserves owner history and filters shared history', () => {
   const db = createTestDb();
   const repository = createMessageRepository(db);
-  db.prepare('INSERT INTO conversations (id, title, status) VALUES (?, ?, ?)').run('conv-1', 'Demo', 'active');
+  db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run('conv-1', 'Demo', 'active');
   db.prepare(`
     INSERT INTO messages (
       id, conversation_id, role, text, hidden_from_shares, timestamp
@@ -177,13 +71,13 @@ test('routed worker dequeue uses runtime session binding when queue owner is emp
   `);
   const now = '2026-06-11T20:00:00.000Z';
 
-  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)').run(
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run(
     'conv-a',
     'Conversation A',
     'active',
     'sdk-a',
   );
-  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id) VALUES (?, ?, ?)').run(
+  db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, runtime_key, created_at, last_used_at) VALUES (?, ?, ?, 'rk', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run(
     'runtime-a',
     'conv-a',
     'sdk-a',
@@ -218,24 +112,24 @@ test('repository lists pending worker owners including rows still in retry backo
   const repo = createMessageRepository(db);
   const now = '2026-06-11T20:00:00.000Z';
 
-  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)').run(
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run(
     'conv-owned',
     'Owned',
     'active',
     'conv-sdk',
   );
-  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)').run(
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run(
     'conv-runtime',
     'Runtime',
     'active',
     '',
   );
-  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id) VALUES (?, ?, ?)').run(
+  db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, runtime_key, created_at, last_used_at) VALUES (?, ?, ?, 'rk', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run(
     'runtime-owned',
     'conv-owned',
     'runtime-sdk-ignored',
   );
-  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id) VALUES (?, ?, ?)').run(
+  db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, runtime_key, created_at, last_used_at) VALUES (?, ?, ?, 'rk', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run(
     'runtime-bound',
     'conv-runtime',
     'runtime-sdk',
@@ -267,9 +161,9 @@ test('repository lists pending worker owners including rows still in retry backo
 // passed verbatim, and ids like claude-opus-5 exist on both sides).
 
 function seedProviderConversation(db, { key, providerType, ownerSdkSessionId = '', timestamp }) {
-  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)')
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
     .run(`conv-${key}`, key, 'active', ownerSdkSessionId);
-  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type) VALUES (?, ?, ?, ?)')
+  db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type, runtime_key, created_at, last_used_at) VALUES (?, ?, ?, ?, 'rk', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
     .run(`runtime-${key}`, `conv-${key}`, ownerSdkSessionId, providerType);
   db.prepare(`
     INSERT INTO queue (
@@ -333,7 +227,7 @@ test('legacy-relay dequeue serves openai rows and rows with no runtime session',
   assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-openai');
 
   // No runtime session at all (brand-new conversation): defaults to github.
-  db.prepare('INSERT INTO conversations (id, title, status, sdk_session_id) VALUES (?, ?, ?, ?)')
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
     .run('conv-fresh', 'fresh', 'active', '');
   db.prepare(`
     INSERT INTO queue (
@@ -378,7 +272,8 @@ test('anonymous dequeue skips provider-worker rows but the owning worker still g
 
 test('executed provider derives from responder identity, never from the response payload', () => {
   const db = createTestDb();
-  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type) VALUES (?, ?, ?, ?)')
+  db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES ('conv-cursor', 'Cursor', 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type, runtime_key, created_at, last_used_at) VALUES (?, ?, ?, ?, 'rk', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
     .run('runtime-cursor', 'conv-cursor', 'cursor-session', 'cursor');
   const stmts = {
     getRuntimeSessionBySdkSessionId: db.prepare('SELECT * FROM runtime_sessions WHERE sdk_session_id = ?'),
@@ -454,7 +349,8 @@ test('an identity-less response for a non-github conversation still reports gith
 
   // An OpenAI BYOK chat turn from its properly configured worker carries an
   // identity and resolves through the runtime row instead.
-  db.prepare('INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type) VALUES (?, ?, ?, ?)')
+  db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES ('conv-openai', 'OpenAI', 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  db.prepare(`INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, provider_type, runtime_key, created_at, last_used_at) VALUES (?, ?, ?, ?, 'rk', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
     .run('runtime-openai', 'conv-openai', 'openai-session', 'openai');
   assert.equal(resolveExecutedProviderForResponse({
     stmts,
@@ -515,8 +411,8 @@ function createRecoveryFixture() {
   const db = createTestDb();
   const stmts = createMessageRepository(db);
   const insertTurn = db.prepare(`
-    INSERT INTO queue (id, conversation_id, status, timestamp, processing_at, owner_sdk_session_id, owner_last_claimed_at)
-    VALUES (@id, 'conv-1', 'processing', @timestamp, @processingAt, @owner, @lastClaimedAt)
+    INSERT INTO queue (id, conversation_id, status, text, timestamp, processing_at, owner_sdk_session_id, owner_last_claimed_at)
+    VALUES (@id, 'conv-1', 'processing', 'prompt', @timestamp, @processingAt, @owner, @lastClaimedAt)
   `);
   return {
     db,
@@ -531,7 +427,7 @@ function createRecoveryFixture() {
       });
     },
     askQuestion(queueId, status = 'pending') {
-      db.prepare(`INSERT INTO relay_questions (id, queue_id, status) VALUES (?, ?, ?)`)
+      db.prepare(`INSERT INTO relay_questions (id, queue_id, status, conversation_id, message_id, prompt, created_at, expires_at) VALUES (?, ?, ?, 'conv-1', 'm-1', 'Question?', '2026-01-01T00:00:00.000Z', '2026-01-01T08:00:00.000Z')`)
         .run(`question-${queueId}`, queueId, status);
     },
     recoverable({ inactiveMinutes = 10, ceilingMinutes = null } = {}) {
@@ -628,7 +524,7 @@ test('active-turn lookup reports only conversations with live queue rows', () =>
   const db = createTestDb();
   const repo = createMessageRepository(db);
   const insert = db.prepare(`
-    INSERT INTO queue (id, conversation_id, status, timestamp) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')
+    INSERT INTO queue (id, conversation_id, status, text, timestamp) VALUES (?, ?, ?, 'prompt', '2026-01-01T00:00:00.000Z')
   `);
   insert.run('q-processing', 'conv-busy', 'processing');
   insert.run('q-pending', 'conv-queued', 'pending');

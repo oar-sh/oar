@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const runtimeSource = fs.readFileSync(path.join(__dirname, 'server-runtime.mjs'), 'utf8');
 const launchSource = fs.readFileSync(path.join(__dirname, 'services', 'session-worker-launch-service.mjs'), 'utf8');
+const dbSchemaSource = fs.readFileSync(path.join(__dirname, 'db-schema.mjs'), 'utf8');
 const sessionsSource = fs.readFileSync(path.join(__dirname, 'routes', 'sessions-routes.mjs'), 'utf8');
 const messagesSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-routes.mjs'), 'utf8');
 
@@ -25,7 +26,9 @@ test('server-runtime exposes grok settings and launch binding', () => {
   assert.match(runtimeSource, /async function refreshGrokProviderModels\(/);
   assert.match(runtimeSource, /providerType === 'grok'/);
   assert.match(runtimeSource, /getGrokProviderSettings,/);
-  assert.match(runtimeSource, /grok_native_session_id/);
+  // The schema/migration block (including the grok_native_session_id column)
+  // moved verbatim to db-schema.mjs.
+  assert.match(dbSchemaSource, /grok_native_session_id/);
   assert.match(runtimeSource, /managedProvider = \['claude', 'cursor', 'grok'\]/);
 });
 
