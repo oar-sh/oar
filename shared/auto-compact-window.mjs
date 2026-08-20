@@ -12,10 +12,24 @@
 // server/public/app/auto-compact-window-options.mjs (only server/public is
 // served) and a unit test asserts the two lists stay identical.
 
+/**
+ * The CLI silently refuses windows below 100k: it does not merely decline to
+ * compact, it drops the value and resolves back to the model default. Probed
+ * against the bundled CLI on 2026-08-20 (`claude-opus-5[1m]`):
+ *
+ *   setting 50_000  -> maxTokens 1_000_000, source 'auto'      (ignored)
+ *   setting 60_000  -> maxTokens 1_000_000, source 'auto'      (ignored)
+ *   setting 100_000 -> maxTokens   100_000, source 'settings'  (applied)
+ *
+ * The bundled CLI carries a matching 1e5 constant beside its auto-compact
+ * resolver. Offering a smaller stop would put a number on the slider that
+ * changes nothing, so the floor is enforced here instead.
+ */
+export const AUTO_COMPACT_WINDOW_MIN_TOKENS = 100_000;
+
 /** Index 0 is `null` = Auto (model default). Every other stop is a token count. */
 export const AUTO_COMPACT_WINDOW_STOPS = Object.freeze([
   null,
-  50_000,
   100_000,
   150_000,
   200_000,
@@ -55,7 +69,7 @@ export function parseAutoCompactWindow(value) {
   return best;
 }
 
-/** 'Auto' | '50k' | '1M' — the slider's own label, so it must stay short. */
+/** 'Auto' | '100k' | '1M' — the slider's own label, so it must stay short. */
 export function formatAutoCompactWindowLabel(value) {
   const window = parseAutoCompactWindow(value);
   if (window === null) return 'Auto';

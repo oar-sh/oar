@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  AUTO_COMPACT_WINDOW_MIN_TOKENS,
   AUTO_COMPACT_WINDOW_STOPS,
   autoCompactWindowFromIndex,
   autoCompactWindowToIndex,
@@ -21,7 +22,10 @@ test('every stop round-trips through index and back', () => {
 });
 
 test('off-stop values snap to the nearest stop', () => {
-  assert.equal(parseAutoCompactWindow(48_000), 50_000);
+  // Below the CLI's 100k floor: snapped up to the smallest window it honors
+  // rather than pinned to a value it would silently ignore.
+  assert.equal(parseAutoCompactWindow(48_000), 100_000);
+  assert.equal(parseAutoCompactWindow(50_000), 100_000);
   assert.equal(parseAutoCompactWindow(120_000), 100_000);
   assert.equal(parseAutoCompactWindow(130_000), 150_000);
   assert.equal(parseAutoCompactWindow(9_999_999), 1_000_000);
@@ -36,7 +40,7 @@ test('absent, blank and junk all mean Auto rather than a pinned window', () => {
 
 test('labels are short enough for the slider', () => {
   assert.equal(formatAutoCompactWindowLabel(null), 'Auto');
-  assert.equal(formatAutoCompactWindowLabel(50_000), '50k');
+  assert.equal(formatAutoCompactWindowLabel(100_000), '100k');
   assert.equal(formatAutoCompactWindowLabel(150_000), '150k');
   assert.equal(formatAutoCompactWindowLabel(1_000_000), '1M');
   assert.equal(formatAutoCompactWindowLabel('junk'), 'Auto');
@@ -91,4 +95,14 @@ test('an out-of-range slider index reads as Auto', () => {
   assert.equal(autoCompactWindowFromIndex(-1), null);
   assert.equal(autoCompactWindowFromIndex(AUTO_COMPACT_WINDOW_STOPS.length), null);
   assert.equal(autoCompactWindowFromIndex('2'), AUTO_COMPACT_WINDOW_STOPS[2]);
+});
+
+test('no stop sits below the window the CLI actually honors', () => {
+  // Probed 2026-08-20 against the bundled CLI: 50k and 60k are dropped (the
+  // resolved source stays 'auto'), 100k applies as source 'settings'. A stop
+  // the CLI ignores would be a slider position that silently does nothing.
+  for (const stop of AUTO_COMPACT_WINDOW_STOPS) {
+    if (stop === null) continue;
+    assert.ok(stop >= AUTO_COMPACT_WINDOW_MIN_TOKENS, `stop ${stop} is below the CLI floor`);
+  }
 });

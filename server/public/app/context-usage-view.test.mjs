@@ -139,8 +139,10 @@ test('the control renders the stored window and the measured threshold', () => {
   });
   assert.match(html, /id="ctx-autocompact-slider"/);
   assert.match(html, /type="range"/);
-  assert.match(html, /min="0"[\s\S]*max="7"[\s\S]*step="1"/);
-  assert.match(html, /value="3"/, '150k is stop index 3');
+  // 7 stops: Auto, 100k, 150k, 200k, 300k, 500k, 1M — nothing below the
+  // CLI's 100k floor, which it would silently ignore.
+  assert.match(html, /min="0"[\s\S]*max="6"[\s\S]*step="1"/);
+  assert.match(html, /value="2"/, '150k is stop index 2');
   assert.match(html, /id="ctx-autocompact-value">150k</);
   // Tokens straight through — no percent conversion anywhere in this line.
   assert.match(html, /Effective: compacts at 967\.0k of 1\.0M tokens · auto \(model-tuned\)/);

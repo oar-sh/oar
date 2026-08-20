@@ -8,7 +8,6 @@
 
 export const AUTO_COMPACT_WINDOW_STOPS = Object.freeze([
   null,
-  50000,
   100000,
   150000,
   200000,
