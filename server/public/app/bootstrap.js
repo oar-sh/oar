@@ -123,6 +123,10 @@ import {
   normalizeModelSelectorOptions,
 } from './model-selector-options.mjs';
 import {
+  buildContextTierOptions,
+  resolveContextTierValue,
+} from './context-tier-options.mjs';
+import {
   isOpenAIImageModelId,
   sessionLockNoteText,
   sessionLockProviderKey,
@@ -356,6 +360,7 @@ let modelCatalogState = {
   providersByModel: {},
   reasoningEfforts: [],
   modelMetadataByModel: {},
+  claudeContextTiersByModel: {},
   stale: true,
   metadataValid: false,
   reasoningMetadataValid: false,
@@ -1530,6 +1535,12 @@ function updateModelCatalogState(payload) {
     modelMetadataByModel: payload?.modelMetadataByModel && typeof payload.modelMetadataByModel === 'object'
       ? payload.modelMetadataByModel
       : {},
+    claudeContextTiersByModel: payload?.claudeContextTiersByModel && typeof payload.claudeContextTiersByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.claudeContextTiersByModel).map(([modelId, tiers]) => [
+        String(modelId || '').trim().toLowerCase(),
+        Array.isArray(tiers) ? tiers : [],
+      ]))
+      : {},
     stale: !!payload?.stale,
     metadataValid: payload?.metadataValid === true,
     reasoningMetadataValid: payload?.reasoningMetadataValid === true,
@@ -1652,26 +1663,21 @@ function updateContextTierSelector(modelId) {
     updateModelPricingDetails(modelId, 'default');
     return;
   }
-  const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
-  const defaultLimit = Number(metadata.defaultContextLimitTokens);
-  const longLimit = Number(metadata.longContextLimitTokens);
+  const tierOptions = buildContextTierOptions({
+    modelId,
+    providerType: activeComposerProviderType(),
+    metadata: modelCatalogState.modelMetadataByModel?.[modelId] || {},
+    claudeTiers: modelCatalogState.claudeContextTiersByModel,
+  });
   const current = select.value;
   select.innerHTML = '';
-  const defaultOption = document.createElement('option');
-  defaultOption.value = 'default';
-  defaultOption.textContent = Number.isFinite(defaultLimit) && defaultLimit > 0
-    ? `${Math.round(defaultLimit / 1000)}K`
-    : '—';
-  select.appendChild(defaultOption);
-  if (Number.isFinite(longLimit) && longLimit > 0) {
-    const longOption = document.createElement('option');
-    longOption.value = 'long_context';
-    longOption.textContent = `${Math.round(longLimit / 1000)}K`;
-    select.appendChild(longOption);
+  for (const tier of tierOptions) {
+    const option = document.createElement('option');
+    option.value = tier.value;
+    option.textContent = tier.label;
+    select.appendChild(option);
   }
-  select.value = current === 'long_context' && select.querySelector('option[value="long_context"]')
-    ? 'long_context'
-    : 'default';
+  select.value = resolveContextTierValue(tierOptions, current);
   select.title = 'Context window';
   updateModelPricingDetails(modelId, select.value);
 }

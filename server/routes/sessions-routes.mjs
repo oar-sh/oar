@@ -323,6 +323,7 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
   // one into its base model as a long_context tier that the context-size
   // dropdown offers, mirroring how the Copilot catalog models long context.
   const longContextBases = new Set();
+  const defaultContextBases = new Set();
   const claudeBaseModels = [];
   const seenClaudeBases = new Set();
   for (const claudeModelId of [model, ...claudeModels]) {
@@ -330,6 +331,7 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
     const baseId = claudeModelId.replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '');
     if (!baseId) continue;
     if (isLongContextVariant) longContextBases.add(baseId.toLowerCase());
+    else defaultContextBases.add(baseId.toLowerCase());
     if (seenClaudeBases.has(baseId.toLowerCase())) continue;
     seenClaudeBases.add(baseId.toLowerCase());
     claudeBaseModels.push(baseId);
@@ -343,10 +345,19 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
   const defaultClaudeEfforts = [...DEFAULT_CLAUDE_REASONING_EFFORTS];
   const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
   const providersByModel = { ...(modelState?.providersByModel || {}) };
+  // modelMetadataByModel is keyed by model id alone, so a model served by both
+  // Copilot and the Claude SDK cannot describe two different sets of context
+  // windows there. The tiers the SDK actually offers are exactly the enabled
+  // catalog ids, so they get their own provider-scoped map.
+  const claudeContextTiersByModel = {};
   for (const claudeModel of claudeBaseModels) {
     const providersKey = String(claudeModel || '').trim();
     if (!providersKey) continue;
     const lowerKey = providersKey.toLowerCase();
+    claudeContextTiersByModel[lowerKey] = [
+      ...(defaultContextBases.has(lowerKey) ? [{ value: 'default' }] : []),
+      ...(longContextBases.has(lowerKey) ? [{ value: 'long_context' }] : []),
+    ];
     const effortsForModel = Array.isArray(effortsByModel[lowerKey]) && effortsByModel[lowerKey].length
       ? effortsByModel[lowerKey]
       : effortsByModel[`${lowerKey}[1m]`];
@@ -392,6 +403,7 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
     },
     modelMetadataByModel,
     providersByModel,
+    claudeContextTiersByModel,
   };
 }
 
@@ -5402,6 +5414,7 @@ export function registerSessionsRoutes(app, deps) {
       reasoningEfforts: modelState.reasoningEfforts || [],
       contextLimitsByModel: modelState.contextLimitsByModel || {},
       modelMetadataByModel: modelState.modelMetadataByModel || {},
+      claudeContextTiersByModel: modelState.claudeContextTiersByModel || {},
       providersByModel: modelState.providersByModel || {},
       stale: modelState.stale,
       metadataValid: modelState.metadataValid === true,
