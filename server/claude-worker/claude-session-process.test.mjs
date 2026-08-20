@@ -7,177 +7,24 @@ import nodePathModule from 'node:path';
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildClaudePlanReadyBoardPayload } from './claude-turn-publisher.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
-
-// Keeps the tests off the real `~/.claude/projects`; transcript relocation has
-// its own suite in claude-transcript-relocator.test.mjs.
-const noopRelocate = () => ({ status: 'skipped' });
-
-const tick = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function waitFor(predicate, { timeoutMs = 3000, label = 'condition' } = {}) {
-  const start = Date.now();
-  for (;;) {
-    const value = predicate();
-    if (value) return value;
-    if (Date.now() - start > timeoutMs) throw new Error(`waitFor timed out: ${label}`);
-    await tick();
-  }
-}
-
-function makeApiStub({ failRoutes = new Set(), continuationIds = [] } = {}) {
-  const calls = [];
-  let continuationCounter = 0;
-  return {
-    calls,
-    api: async (method, routePath, body) => {
-      calls.push({ method, routePath, body });
-      if (failRoutes.has(routePath)) throw new Error(`stubbed failure for ${routePath}`);
-      if (routePath === '/api/continuation-turn') {
-        continuationCounter += 1;
-        return { messageId: continuationIds[continuationCounter - 1] || `cont-${continuationCounter}` };
-      }
-      return { ok: true };
-    },
-  };
-}
-
-/**
- * A scriptable stand-in for the SDK Query: the test emits SDK messages when it
- * chooses, the stream only ends on endInput/close (like the real CLI), and
- * pushed user turns are recorded (and optionally echoed back as replays, which
- * is what the real stream does).
- */
-function scriptedTurn({ echoPushes = false } = {}) {
-  const queued = [];
-  let wake = null;
-  let ended = false;
-  const turn = {
-    pushed: [],
-    endInputCalls: 0,
-    closed: false,
-    interrupts: 0,
-    stoppedTasks: [],
-    pushUserMessage(content) {
-      if (ended) throw new Error('user message stream already ended');
-      turn.pushed.push(content);
-      if (echoPushes) {
-        turn.emit({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content } });
-      }
-    },
-    endInput() {
-      turn.endInputCalls += 1;
-      ended = true;
-      wake?.();
-    },
-    close() {
-      turn.closed = true;
-      ended = true;
-      wake?.();
-    },
-    async interrupt() {
-      turn.interrupts += 1;
-    },
-    async stopTask(taskId) {
-      turn.stoppedTasks.push(taskId);
-    },
-    emit(message) {
-      queued.push(message);
-      wake?.();
-    },
-    fail(error) {
-      queued.push({ __throw: error });
-      wake?.();
-    },
-    async* [Symbol.asyncIterator]() {
-      for (;;) {
-        while (queued.length) {
-          const next = queued.shift();
-          if (next?.__throw) throw next.__throw;
-          yield next;
-        }
-        if (ended) return;
-        await new Promise((resolve) => { wake = resolve; });
-        wake = null;
-      }
-    },
-  };
-  return turn;
-}
-
-/** Emits the given messages, then the stream ends by itself. */
-function fakeTurn(messages) {
-  return {
-    pushUserMessage() {},
-    endInput() {},
-    async* [Symbol.asyncIterator]() {
-      for (const message of messages) yield message;
-    },
-  };
-}
-
-function initMessage(sessionId) {
-  return { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet-5' };
-}
-
-function resultMessage(text, sessionId) {
-  return {
-    type: 'result', subtype: 'success', is_error: false, result: text, session_id: sessionId, num_turns: 1, duration_api_ms: 100,
-  };
-}
-
-function phantomResultMessage(sessionId) {
-  return {
-    type: 'result', subtype: 'success', is_error: false, result: '', session_id: sessionId, num_turns: 0, duration_api_ms: 0,
-  };
-}
-
-function backgroundTasksMessage(tasks) {
-  return { type: 'system', subtype: 'background_tasks_changed', tasks };
-}
-
-function taskNotificationMessage(taskId, status = 'completed', { skipTranscript = false } = {}) {
-  return {
-    type: 'system',
-    subtype: 'task_notification',
-    task_id: taskId,
-    status,
-    summary: 'settled',
-    skip_transcript: skipTranscript,
-  };
-}
-
-function userReplay(text) {
-  return { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'text', text }] } };
-}
-
-function assistantText(text) {
-  return { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'text', text }] } };
-}
-
-const baseMessage = {
-  id: 'q-1',
-  conversationId: 'conv-1',
-  relayMode: 'agent',
-  text: 'hello',
-  model: 'claude-sonnet-5',
-  attachments: [],
-};
-
-function makeRunner({ stub, startImpl, ...overrides }) {
-  return createClaudeSessionRunner({
-    api: stub.api,
-    sdkSessionId: 'conv-1',
-    cwd: '/tmp',
-    relocateTranscriptImpl: noopRelocate,
-    startClaudeSessionImpl: startImpl,
-    continuationRetryDelayMs: 10,
-    ...overrides,
-  });
-}
-
-async function settled(runner) {
-  await waitFor(() => !runner._getProcess(), { label: 'process teardown' });
-}
+import {
+  noopRelocate,
+  tick,
+  waitFor,
+  makeApiStub,
+  scriptedTurn,
+  fakeTurn,
+  initMessage,
+  resultMessage,
+  phantomResultMessage,
+  backgroundTasksMessage,
+  taskNotificationMessage,
+  userReplay,
+  assistantText,
+  baseMessage,
+  makeRunner,
+  settled,
+} from './claude-session-test-harness.mjs';
 
 // ---------------------------------------------------------------------------
 // Ported per-turn contract tests
@@ -778,7 +625,10 @@ test('a second user message reuses the live process instead of respawning', asyn
 
 test('a delivered message queued behind a continuation keeps its own reply', async () => {
   const stub = makeApiStub();
-  const turn = scriptedTurn({ echoPushes: true });
+  // No echo: the real CLI replays a queued message only when it dequeues it,
+  // which for this test's scenario is AFTER the continuation's own result
+  // (an immediate mid-turn replay means absorption — covered separately).
+  const turn = scriptedTurn();
   const runner = makeRunner({ stub, startImpl: () => turn });
 
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
@@ -804,11 +654,229 @@ test('a delivered message queued behind a continuation keeps its own reply', asy
   assert.equal(contResponse.body.text, 'agent finished; wrapping up');
 
   // Now the CLI dequeues the pushed user message as its own turn.
+  turn.emit(userReplay('status?'));
   turn.emit(assistantText('here is the status'));
   turn.emit(resultMessage('here is the status', 'native-1'));
   assert.equal(await second, true);
   const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
   assert.equal(secondResponse.body.text, 'here is the status');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a message absorbed into a running continuation completes on that turn result', async () => {
+  // The 2026-08-18 deadlock (conv f93135ac row 962c36b1): the CLI dequeued a
+  // pushed message INTO the running background-continuation turn (its replay
+  // arrived while the continuation context was active) and emitted ONE result
+  // for the whole turn. The delivered row must get that result — not sit in
+  // pendingDelivered forever while the continuation swallows the answer.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  // Continuation opens and is mid-flight...
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  turn.emit(userReplay('<task-notification>agent-1 completed</task-notification>'));
+  turn.emit(assistantText('checking what the agent produced'));
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  // ...and the CLI dequeues the pushed message into the SAME turn (steering):
+  // replay mid-turn, then the turn's single result.
+  turn.emit(userReplay('quick question'));
+  turn.emit(assistantText('here is the answer'));
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await second, true);
+  const secondResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    { label: 'absorbed message response' },
+  );
+  assert.equal(secondResponse.body.text, 'here is the answer');
+  // The handed-off continuation streamed no text, so it settles by requeue
+  // (the server drops a processing continuation quietly) — never a response
+  // that would swallow the answer.
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'cont-1'),
+    { label: 'continuation requeue-drop' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    undefined,
+  );
+  assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a message absorbed into a running delivered turn frees both rows', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  // Second message lands while the first turn is still streaming; the CLI
+  // absorbs it: replay mid-turn, one result for the combined turn.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and also this' } });
+  await tick(20);
+  turn.emit(userReplay('and also this'));
+  turn.emit(resultMessage('did both things', 'native-1'));
+
+  // The first row settles at the handoff boundary with a merge note — NEVER
+  // a requeue, which would re-deliver a prompt the CLI already consumed and
+  // execute it twice. The second row owns the turn's result. Both
+  // handlePendingPayload calls resolve — nothing is orphaned.
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-1'),
+    undefined,
+  );
+  const firstResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.match(firstResponse.body.text, /merged into the next message/);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.text, 'did both things');
+  assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the watchdog fails over a delivered entry the CLI never opens a turn for', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 60,
+    lifecyclePollMs: 10,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  // No user replay ever arrives — the CLI dropped (or silently absorbed) the
+  // push. The watchdog must fail the row over instead of renewing its lease
+  // forever.
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.ok(response?.body?.terminalError, 'terminal error published');
+  assert.match(String(response.body.text || ''), /watchdog/);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an api_retry during a turn surfaces as an activity on that turn', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit({
+    type: 'system',
+    subtype: 'api_retry',
+    attempt: 2,
+    max_retries: 10,
+    retry_delay_ms: 6110,
+    error_status: 529,
+    session_id: 'native-1',
+  });
+  const activity = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/activity' && /529/.test(call.body.text || '')),
+    { label: 'api_retry activity' },
+  );
+  assert.equal(activity.body.messageId, 'q-1');
+  assert.match(activity.body.text, /overloaded \(529\) — retrying 2\/10 in ~6s/);
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an api_retry before the turn attaches posts immediately on the waiting row', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  // The request stalls before the CLI replays the pushed message: the notice
+  // must land on the waiting delivered row NOW, not after the stall ends.
+  turn.emit({
+    type: 'system',
+    subtype: 'api_retry',
+    attempt: 1,
+    max_retries: 10,
+    retry_delay_ms: 611,
+    error_status: 529,
+    session_id: 'native-1',
+  });
+  const activity = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/activity' && /529/.test(call.body.text || '')),
+    { label: 'immediate api_retry activity' },
+  );
+  assert.equal(activity.body.messageId, 'q-1');
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an api_retry between turns is carried into the next turn as an activity', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 10, error_status: 500, session_id: 'native-1' });
+  await tick(20);
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'again' } });
+  await tick(20);
+  turn.emit(userReplay('again'));
+  const carried = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/activity' && /500/.test(call.body.text || '')),
+    { label: 'carried api_retry activity' },
+  );
+  assert.equal(carried.body.messageId, 'q-2');
+  turn.emit(resultMessage('done again', 'native-1'));
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a cold start posts an activity so the wait is explained', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  const activity = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/activity' && /cold start/.test(call.body.text || '')),
+    { label: 'cold start activity' },
+  );
+  assert.equal(activity.body.messageId, 'q-1');
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
   turn.endInput();
   await settled(runner);
 });

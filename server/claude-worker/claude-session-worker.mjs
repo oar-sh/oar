@@ -83,6 +83,13 @@ async function main() {
     idleShutdownMs: Number(process.env.CLAUDE_RELAY_IDLE_SHUTDOWN_MS) > 0
       ? Number(process.env.CLAUDE_RELAY_IDLE_SHUTDOWN_MS)
       : undefined,
+    // 0 disables the watchdog (matching the background-task timeout's
+    // 0 = no-limit convention); unset/invalid falls back to the default.
+    pendingDeliveredTimeoutMs: (() => {
+      const raw = String(process.env.CLAUDE_RELAY_PENDING_DELIVERED_TIMEOUT_MS || '').trim();
+      const parsed = Number(raw);
+      return raw !== '' && Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+    })(),
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     dbg,
   });

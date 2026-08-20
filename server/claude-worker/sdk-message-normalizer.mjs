@@ -22,6 +22,24 @@ function capThought(text) {
   return value.length <= MAX_THOUGHT_CHARS ? value : value.slice(0, MAX_THOUGHT_CHARS);
 }
 
+/**
+ * One user-readable line for a `system`/`api_retry` stream message. Exported
+ * because the session process needs the identical wording for retries that
+ * arrive between turns (carried into the next context as a pending activity).
+ */
+export function formatApiRetryNotice(sdkMessage) {
+  const status = Number(sdkMessage?.error_status) || 0;
+  const attempt = Number(sdkMessage?.attempt) || 0;
+  const max = Number(sdkMessage?.max_retries) || 0;
+  const delaySec = Math.round((Number(sdkMessage?.retry_delay_ms) || 0) / 1000);
+  const cause = status === 529
+    ? 'Anthropic API overloaded (529)'
+    : `Anthropic API error${status ? ` (${status})` : ''}`;
+  const counter = attempt && max ? ` ${attempt}/${max}` : '';
+  const wait = delaySec > 0 ? ` in ~${delaySec}s` : '';
+  return `${cause} — retrying${counter}${wait}…`;
+}
+
 export function isSubagentToolName(name) {
   return SUBAGENT_TOOL_NAMES.has(String(name || '').trim().toLowerCase());
 }
@@ -453,6 +471,18 @@ export function createSdkMessageNormalizer() {
         || `Model switched to ${fallbackModel || 'a fallback model'} after a refusal.`;
       actions.push({ channel: 'activity', payload: { text: truncate(notice, 500), subagentRunId: null } });
       return actions;
+    }
+
+    // An upstream API request failed and the CLI is retrying with backoff.
+    // While that happens the CLI emits no assistant traffic at all, so
+    // without this line the relay UI shows a bare typing indicator that is
+    // indistinguishable from a wedged worker (three 529 stalls read as relay
+    // freezes on 2026-08-18). At most max_retries lines per request.
+    if (type === 'system' && sdkMessage.subtype === 'api_retry') {
+      return [{
+        channel: 'activity',
+        payload: { text: formatApiRetryNotice(sdkMessage), subagentRunId: null },
+      }];
     }
 
     if (type === 'stream_event') {

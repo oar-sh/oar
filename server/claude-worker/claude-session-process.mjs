@@ -2,7 +2,7 @@ import nodeFs from 'node:fs';
 import nodePath from 'node:path';
 
 import { buildClaudeUserContent } from './claude-attachments.mjs';
-import { createSdkMessageNormalizer, isSubagentToolName } from './sdk-message-normalizer.mjs';
+import { createSdkMessageNormalizer, formatApiRetryNotice, isSubagentToolName } from './sdk-message-normalizer.mjs';
 import { digestFromRunRecord, digestFromJournal } from './workflow-progress-digest.mjs';
 import { createClaudeSessionRootResolver } from '../services/claude-session-root-service.mjs';
 import {
@@ -251,13 +251,20 @@ function contentText(content) {
  * carrying prompt text rather than tool_result blocks. Both our own pushed
  * messages and the CLI's task-notification continuations replay this way.
  */
-function turnOpeningUserText(sdkMessage) {
+function turnOpeningUserSignature(sdkMessage) {
   if (sdkMessage?.type !== 'user' || sdkMessage?.parent_tool_use_id) return null;
   const content = sdkMessage?.message?.content;
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return null;
   if (content.some((block) => block?.type === 'tool_result')) return null;
-  const text = contentText(content);
+  // Unlike turnOpeningUserText this keeps '' — an attachment-only message
+  // replays with an empty text block, and the absorbed-steering match must
+  // still recognize it (expectedText is '' for those too).
+  return contentText(content);
+}
+
+function turnOpeningUserText(sdkMessage) {
+  const text = turnOpeningUserSignature(sdkMessage);
   return text || null;
 }
 
@@ -315,6 +322,11 @@ export function createClaudeSessionRunner({
   // arrives inside this window the notification was silent (skip_transcript)
   // and must stop pinning the process.
   notificationGraceMs = 60_000,
+  // How long a delivered entry may sit unattached (no active turn, no live
+  // tasks, quiet stream) before the watchdog fails its row over. Must exceed
+  // the slowest cold start observed; the primary absorbed-steering fix in
+  // resolveContext should make this fire only for unknown variants.
+  pendingDeliveredTimeoutMs = 5 * 60_000,
   continuationRetryDelayMs = 500,
   workflowPollMs = 2_000,
   resolveWorkflowSessionDirImpl = null,
@@ -471,6 +483,8 @@ export function createClaudeSessionRunner({
       // Retry on any registration that produced no message id — a truthy but
       // empty response body must not end the loop early.
       for (let attempt = 0; attempt < 3 && !response?.messageId; attempt += 1) {
+        // Handed off / settled before a row was created: stop before making one.
+        if (ctx.finalized || ctx.discarded) return;
         response = await api('POST', '/api/continuation-turn', {
           conversationId: sdkSessionId,
           sdkSessionId,
@@ -488,6 +502,16 @@ export function createClaudeSessionRunner({
         controlPoller?.stop?.(ctx.controlState);
         ctx.controlState = null;
         dbg('continuation turn discarded (no relay message id)');
+        return;
+      }
+      if (ctx.discarded || ctx.finalized) {
+        // The context was handed off or settled while registration was in
+        // flight; drop the just-created server row (requeue fails a
+        // processing continuation quietly) instead of leaving it orphaned.
+        await api('POST', '/api/requeue', { messageId: String(response.messageId) }).catch(() => {});
+        controlPoller?.stop?.(ctx.controlState);
+        ctx.controlState = null;
+        dbg('continuation turn dropped (handed off during registration)');
         return;
       }
       ctx.message.id = String(response.messageId);
@@ -534,7 +558,33 @@ export function createClaudeSessionRunner({
    * that traffic; anything the CLI starts by itself becomes a continuation.
    */
   function resolveContext(sdkMessage) {
-    if (proc.activeCtx) return proc.activeCtx;
+    if (proc.activeCtx) {
+      // The CLI dequeues a message pushed mid-turn INTO the running turn
+      // (steering) instead of opening a new turn after it: the replay arrives
+      // while another context is active, so the turn's single result would
+      // land on that context and the delivered row would stay `processing`
+      // forever while its lease renews (conv f93135ac row 962c36b1,
+      // 2026-08-18). Detect the absorbed replay and hand the turn off — the
+      // active context settles with what it already streamed, and everything
+      // from the replay on, including the result, belongs to the delivered
+      // message it answers.
+      if (proc.pendingDelivered.length) {
+        const signature = turnOpeningUserSignature(sdkMessage);
+        if (signature !== null && signature === proc.pendingDelivered[0].expectedText) {
+          const outgoing = proc.activeCtx;
+          // onSdkMessage awaits this before dispatching the new context's
+          // actions, so the handed-off row's publishes stay ordered ahead
+          // of the absorbed turn's.
+          proc.handoffSettling = handoffAbsorbedTurn(outgoing);
+          const ctx = attachDeliveredContext();
+          // Continuity: open thinking blocks and tool_use/tool_result
+          // pairing must survive the boundary — the stream did not restart.
+          ctx.normalizer = outgoing.normalizer;
+          return ctx;
+        }
+      }
+      return proc.activeCtx;
+    }
     const type = String(sdkMessage?.type || '');
 
     const openingText = turnOpeningUserText(sdkMessage);
@@ -666,13 +716,75 @@ export function createClaudeSessionRunner({
     closeContext(ctx, true);
   }
 
-  function closeContext(ctx, handled) {
+  function detachActiveContext(ctx) {
     if (proc && proc.activeCtx === ctx) {
       proc.activeCtx = null;
       proc.lastBoundary = null;
     }
+  }
+
+  function closeContext(ctx, handled) {
+    detachActiveContext(ctx);
     ctx.resolveDone?.(handled);
     evaluateLifecycle();
+  }
+
+  /**
+   * The active turn absorbed a delivered message (steering): settle the
+   * active context NOW. The caller attaches the delivered context
+   * synchronously; onSdkMessage awaits the returned promise before
+   * dispatching the new context's actions so the two rows' publishes stay
+   * ordered.
+   */
+  function handoffAbsorbedTurn(ctx) {
+    detachActiveContext(ctx);
+    if (ctx.kind === 'continuation' && !ctx.registered) {
+      // Registration (or its buffered-action drain) is still in flight:
+      // discard, and empty the buffer so the drain loop halts instead of
+      // writing to a row that is about to be dropped. The registration path
+      // drops the server row itself when the id arrives after this.
+      ctx.discarded = true;
+      ctx.bufferedActions = [];
+    }
+    // Captured synchronously: the incoming context inherits this normalizer,
+    // so reading it later would see the absorbed turn's text too.
+    const fallbackText = String(ctx.state.lastStreamedText || ctx.normalizer.finalStreamText() || '').trim();
+    dbg('active turn absorbed a delivered message; handing off', ctx.message?.id || '(unregistered continuation)');
+    return settleHandedOffContext(ctx, fallbackText).catch((error) => {
+      dbg('absorbed-turn handoff settle failed', error?.message || String(error));
+    });
+  }
+
+  async function settleHandedOffContext(ctx, fallbackText) {
+    if (ctx.finalized) return;
+    ctx.finalized = true;
+    controlPoller?.stop?.(ctx.controlState);
+    if (ctx.discarded) {
+      // A discarded continuation that already has its server row must still
+      // drop it (requeue fails a processing continuation quietly).
+      if (ctx.message?.id) {
+        await api('POST', '/api/requeue', { messageId: ctx.message.id }).catch(() => {});
+      }
+      closeContext(ctx, true);
+      return;
+    }
+    const model = ctx.state.responseModel || proc?.model || null;
+    if (ctx.kind === 'delivered') {
+      // NEVER requeue an absorbed delivered row: the CLI already consumed
+      // the prompt into the running turn — re-delivery would execute it a
+      // second time (and the requeue route marks the healthy worker errored).
+      const text = fallbackText
+        ? `${fallbackText}\n\n_(This turn was merged into the next message — the reply continues there.)_`
+        : '_(This turn was merged into the next message — see the following reply.)_';
+      await publisher.publishFinalStream(ctx.message, text);
+      await publisher.publishResponse(ctx.message, { text, model });
+    } else if (fallbackText) {
+      await publisher.publishFinalStream(ctx.message, fallbackText);
+      await publisher.publishResponse(ctx.message, { text: fallbackText, model });
+    } else if (ctx.message?.id) {
+      await api('POST', '/api/requeue', { messageId: ctx.message.id }).catch(() => {});
+    }
+    closeContext(ctx, true);
   }
 
   async function interruptActiveTurn(ctx) {
@@ -1033,6 +1145,19 @@ export function createClaudeSessionRunner({
     }
   }
 
+  // Between-turn notices carried into the next activated context. Capped —
+  // api_retry made this the only accumulator a retry storm could grow
+  // unboundedly (subagentSpawns and settledWorkflowDigests already cap).
+  const MAX_PENDING_ACTIVITIES = 50;
+  function carryPendingActivity(text) {
+    const line = String(text || '').trim().slice(0, 2000);
+    if (!line) return;
+    proc.pendingActivities.push(line);
+    if (proc.pendingActivities.length > MAX_PENDING_ACTIVITIES) {
+      proc.pendingActivities.splice(0, proc.pendingActivities.length - MAX_PENDING_ACTIVITIES);
+    }
+  }
+
   function observeProcessLevel(sdkMessage) {
     const type = String(sdkMessage?.type || '');
     if (type === 'assistant') {
@@ -1042,6 +1167,7 @@ export function createClaudeSessionRunner({
     if (type !== 'system') return;
     const subtype = String(sdkMessage.subtype || '');
     if (subtype === 'init') {
+      proc.sawInit = true;
       persistNativeSessionId(sdkSessionId, sdkMessage.session_id).catch(() => {});
       // Tracked on the process too (not only through the persist round-trip):
       // the workflow poller needs the native id to find the session dir even
@@ -1087,7 +1213,27 @@ export function createClaudeSessionRunner({
       if (!proc.activeCtx) {
         const notice = String(sdkMessage.content || '').trim()
           || `Model switched to ${fallbackModel || 'a fallback model'} after a refusal.`;
-        proc.pendingActivities.push(notice.slice(0, 2000));
+        carryPendingActivity(notice);
+      }
+      return;
+    }
+    if (subtype === 'api_retry') {
+      // With a turn active the normalizer surfaces this as an activity on
+      // that turn. Otherwise: a delivered row waiting on this very request
+      // gets the notice NOW — buffering it until attach would publish the
+      // explanation only after the stall is over (silent 529 retries read
+      // as relay freezes on 2026-08-18). With no addressable row, carry it,
+      // collapsing consecutive retry lines — only the latest matters.
+      if (!proc.activeCtx) {
+        const notice = formatApiRetryNotice(sdkMessage);
+        const waiting = proc.pendingDelivered[0]?.ctx.message;
+        if (waiting?.id) {
+          publisher.postActivity(waiting, notice);
+        } else {
+          const last = proc.pendingActivities[proc.pendingActivities.length - 1];
+          if (last && last.startsWith('Anthropic API')) proc.pendingActivities.pop();
+          carryPendingActivity(notice);
+        }
       }
       return;
     }
@@ -1190,7 +1336,7 @@ export function createClaudeSessionRunner({
       if (!proc.activeCtx) {
         const status = String(sdkMessage.status || '').trim() || 'unknown';
         const summary = String(sdkMessage.summary || '').trim();
-        proc.pendingActivities.push(`Background task ${taskId || 'unknown'} ${status}: ${summary}`.slice(0, 2000));
+        carryPendingActivity(`Background task ${taskId || 'unknown'} ${status}: ${summary}`);
       }
       return;
     }
@@ -1208,6 +1354,13 @@ export function createClaudeSessionRunner({
     proc.lastEventAt = Date.now();
     observeProcessLevel(sdkMessage);
     const ctx = resolveContext(sdkMessage);
+    if (proc.handoffSettling) {
+      // An absorbed-steering handoff just settled the previous context;
+      // publishes for the incoming context must not overtake it.
+      const settling = proc.handoffSettling;
+      proc.handoffSettling = null;
+      await settling;
+    }
     if (!ctx) return;
     const actions = ctx.normalizer.normalize(sdkMessage);
     for (const action of actions) {
@@ -1236,9 +1389,51 @@ export function createClaudeSessionRunner({
     );
   }
 
+  /**
+   * Watchdog: a delivered entry whose replay never attached — the CLI
+   * absorbed the message into a turn that already ended, or dropped it —
+   * would renew its queue row's lease forever while blocking every later
+   * message (the 2026-08-18 deadlock's failure mode). With no active turn,
+   * no live tasks, no control round-trip in flight, and a quiet stream,
+   * nothing can attach it anymore: reject its ctx.done so
+   * handlePendingPayload's catch publishes a terminal error and the row
+   * fails over instead of wedging the conversation.
+   */
+  function reapStalePendingDelivered(now) {
+    if (!proc || !proc.pendingDelivered.length) return;
+    if (!(pendingDeliveredTimeoutMs > 0)) return; // 0 = watchdog disabled
+    // A silent cold boot (no init yet) is slow, not wedged: a CLI that never
+    // inits dies on its own and cleanupProcess rejects the contexts then.
+    if (!proc.sawInit) return;
+    if (proc.activeCtx || proc.liveTasks.size || proc.pendingControlRequests > 0) {
+      // A turn, task, or control round-trip may still attach these entries —
+      // the unattached clock starts over once the process actually goes quiet.
+      for (const entry of proc.pendingDelivered) entry.unattachedSince = 0;
+      return;
+    }
+    const stale = [];
+    proc.pendingDelivered = proc.pendingDelivered.filter((entry) => {
+      if (!entry.unattachedSince) {
+        entry.unattachedSince = now;
+        return true;
+      }
+      if (now - entry.unattachedSince < pendingDeliveredTimeoutMs) return true;
+      stale.push(entry);
+      return false;
+    });
+    for (const entry of stale) {
+      dbg('pending delivered watchdog fired', entry.ctx.message?.id || '(no id)');
+      entry.ctx.finalized = true;
+      entry.ctx.rejectDone?.(new Error(
+        `claude worker watchdog: the CLI never opened a turn for this message within ${Math.round(pendingDeliveredTimeoutMs / 1000)}s of going idle (absorbed or dropped); the row is failed — resend the message to retry`,
+      ));
+    }
+  }
+
   function evaluateLifecycle() {
     if (!proc || proc.closing) return;
     const now = Date.now();
+    reapStalePendingDelivered(now);
     if (hasLiveWork()) {
       // Track how long background tasks alone have held the process, for the
       // user-configurable timeout (0 = unlimited).
@@ -1389,6 +1584,8 @@ export function createClaudeSessionRunner({
       modelFallback: '',
       notificationPendingAt: 0,
       pendingActivities: [],
+      sawInit: false,
+      handoffSettling: null,
       activeCtx: null,
       pendingDelivered: [],
       lastBoundary: null,
@@ -1581,12 +1778,19 @@ export function createClaudeSessionRunner({
           }
         }
         spawnProcess(message);
+        // A cold start is the one moment a turn can sit silent for many
+        // seconds (transcript load + first request); say so instead of
+        // showing bare dots. Posted once here — not in spawnProcess — so a
+        // push-race respawn cannot duplicate the line.
+        publisher.postActivity(message, (message.claudeNativeSessionId || claudeNativeSessionId)
+          ? 'Starting the Claude CLI (cold start — resuming the session transcript)…'
+          : 'Starting the Claude CLI (cold start)…');
       }
       const content = buildClaudeUserContent(message);
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const procRef = proc;
         const ctx = createDeliveredContext(message);
-        procRef.pendingDelivered.push({ ctx, expectedText: contentText(content) });
+        procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now() });
         try {
           procRef.turn.pushUserMessage(content);
         } catch (pushError) {
