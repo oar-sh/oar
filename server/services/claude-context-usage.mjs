@@ -87,7 +87,18 @@ export function normalizeClaudeContextUsage(raw) {
         tokens: toNullableInt(raw.skills.tokens),
       }
       : null,
-    autoCompactThreshold: toNullablePercent(raw.autoCompactThreshold),
+    // The model's own context window before any tier/override math. Used by
+    // the modal to cap the window slider at what the model can actually hold.
+    rawMaxTokens: toNullableInt(raw.rawMaxTokens),
+    // A TOKEN COUNT, not a percent: the CLI compacts once the conversation
+    // crosses it (measured: 967000 on a 1M-window model). It was run through a
+    // percent normalizer here until 2026-08-20, which is why the derived
+    // buffer below was always 0.
+    autoCompactThreshold: toNullableInt(raw.autoCompactThreshold),
+    // Where that threshold came from: 'auto' | 'model-default' | 'settings' |
+    // 'env' | 'clientdata' (the CLI's own vocabulary). The modal renders it so
+    // a user can tell a default from their own setting.
+    autocompactSource: normalizeText(raw.autocompactSource) || null,
     isAutoCompactEnabled: raw.isAutoCompactEnabled === true,
     apiUsage: apiUsage
       ? {
@@ -170,11 +181,15 @@ export function buildClaudeContextSnapshot({
     max_context_tokens: maxContextTokens,
     used_percent: usedPercent,
     free_tokens: freeTokens,
-    // The auto-compact threshold is the share of the window Claude keeps in
-    // reserve, so it is the closest analogue to Copilot's buffer.
-    buffer_tokens: (usage?.isAutoCompactEnabled && usage?.autoCompactThreshold !== null
+    // Derived from `max - used`, so it still spans the buffer below; the view
+    // layer splits the two before rendering them side by side.
+    free_tokens_includes_buffer: freeTokens !== null,
+    // Everything above the auto-compact threshold is context Claude will never
+    // let the conversation occupy, so it is the closest analogue to Copilot's
+    // buffer. Both values are token counts.
+    buffer_tokens: (usage?.isAutoCompactEnabled && usage?.autoCompactThreshold != null
       && maxContextTokens !== null)
-      ? Math.max(0, Math.round(maxContextTokens * (1 - (usage.autoCompactThreshold / 100))))
+      ? Math.max(0, maxContextTokens - usage.autoCompactThreshold)
       : null,
     system_tokens: systemTokens,
     messages_tokens: messagesTokens,

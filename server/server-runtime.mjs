@@ -52,6 +52,7 @@ import {
 } from './services/drives-path-helpers.mjs';
 import { DEFAULT_CLAUDE_REASONING_EFFORTS, withClaudeUltracodeTier } from './services/provider-reasoning-effort.mjs';
 import { createPlanUsageService } from './services/plan-usage-service.mjs';
+import { splitFreeAndBufferTokens } from './services/context-usage-view.mjs';
 import { normalizeCursorAllowanceSettings } from './services/plan-usage-cursor.mjs';
 import { normalizeGrokAllowanceSettings } from './services/plan-usage-grok.mjs';
 import { createGrokBillingUsageFetcher } from './services/grok-billing-usage.mjs';
@@ -3807,8 +3808,9 @@ function buildContextUsageBlock(snapshot, runtimeSession, extraEntries = []) {
   const usedPct = toNullablePercent(snapshot?.used_percent);
   const systemTools = toNullableInt(snapshot?.system_tools_tokens);
   const messages = toNullableInt(snapshot?.messages_tokens);
-  const freeTokens = toNullableInt(snapshot?.free_tokens);
-  const bufferTokens = toNullableInt(snapshot?.buffer_tokens);
+  // Disjoint slices: the snapshot's free space still contains the buffer, and
+  // the grid below lays all four out as if they partition the window.
+  const { freeTokens, bufferTokens } = splitFreeAndBufferTokens(snapshot);
   const cacheRead = toNullableInt(snapshot?.cache_read_tokens);
   const cacheWrite = toNullableInt(snapshot?.cache_write_tokens);
 

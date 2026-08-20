@@ -27,7 +27,11 @@ const workerPayload = {
       { name: 'Messages', tokens: 221300, color: 'orange' },
     ],
     skills: { totalSkills: 12, includedSkills: 12, tokens: 1800 },
-    isAutoCompactEnabled: false,
+    // Measured shape of a live claude-opus-5 row: a token-count threshold plus
+    // its provenance.
+    autoCompactThreshold: 967000,
+    autocompactSource: 'auto',
+    isAutoCompactEnabled: true,
     apiUsage: {
       input_tokens: 120,
       output_tokens: 640,
@@ -60,7 +64,10 @@ test('a Claude worker payload renders the reference modal', () => {
   assert.match(html, /System tools[\s\S]*19\.2k[\s\S]*1\.9%/);
   assert.match(html, /Skills[\s\S]*1\.8k[\s\S]*0\.2%/);
   assert.match(html, /Messages[\s\S]*221\.3k[\s\S]*22\.1%/);
-  assert.match(html, /Free space[\s\S]*752\.9k[\s\S]*75\.3%/);
+  // 752.9k of the window is unused, but 33k of that is the reserve above the
+  // auto-compact threshold — free space is what a conversation may still
+  // occupy, so the buffer is carved out rather than counted twice.
+  assert.match(html, /Free space[\s\S]*719\.9k[\s\S]*72\.0%/);
 });
 
 test('the composer indicator ratio is derived from the same payload', () => {

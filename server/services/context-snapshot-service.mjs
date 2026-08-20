@@ -172,12 +172,16 @@ function buildSnapshotFromEvent({ event, data, eventsPath, sessionId, pathModule
     ?? ((usedTotalTokens !== null && contextLimitTokens !== null && contextLimitTokens > 0)
       ? Math.round((usedTotalTokens / contextLimitTokens) * 10000) / 100
       : null);
-  const freeTokens = toNullableInt(data?.freeTokens)
+  const reportedFreeTokens = toNullableInt(data?.freeTokens)
     ?? toNullableInt(data?.remainingTokens)
-    ?? toNullableInt(findFirstNumericByKey(data, ['freeTokens', 'remainingTokens', 'availableTokens']))
+    ?? toNullableInt(findFirstNumericByKey(data, ['freeTokens', 'remainingTokens', 'availableTokens']));
+  const freeTokens = reportedFreeTokens
     ?? ((usedTotalTokens !== null && contextLimitTokens !== null)
       ? Math.max(0, contextLimitTokens - usedTotalTokens)
       : null);
+  // A remainder the CLI reported is already net of its own buffer; only the
+  // fallback above folds the buffer into free space.
+  const freeTokensIncludesBuffer = reportedFreeTokens === null && freeTokens !== null;
   const bufferTokens = toNullableInt(data?.bufferTokens)
     ?? toNullableInt(findFirstNumericByKey(data, ['bufferTokens', 'safeBufferTokens']))
     ?? null;
@@ -205,6 +209,7 @@ function buildSnapshotFromEvent({ event, data, eventsPath, sessionId, pathModule
       max_context_tokens: contextLimitTokens,
       used_percent: usedPercent,
       free_tokens: freeTokens,
+      free_tokens_includes_buffer: freeTokensIncludesBuffer,
       buffer_tokens: bufferTokens,
       system_tokens: systemTokens,
       messages_tokens: conversationTokens,
