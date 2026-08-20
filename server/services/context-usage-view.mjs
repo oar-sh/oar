@@ -66,11 +66,13 @@ export function splitFreeAndBufferTokens(snapshot) {
   return { freeTokens: freeTokens - reserved, bufferTokens: reserved };
 }
 
-function buildCopilotCategories(snapshot, bufferTokens) {
+function buildCopilotCategories(snapshot) {
+  // The auto-compact reserve is deliberately absent: it is not occupied
+  // context, and it now rides the view as its own field so Claude sessions
+  // (whose categories come from the SDK) account for it too.
   const raw = [
     ['System/Tools', toNullableInt(snapshot?.system_tools_tokens)],
     ['Messages', toNullableInt(snapshot?.messages_tokens)],
-    ['Buffer', toNullableInt(bufferTokens)],
   ];
   return raw
     .filter(([, tokens]) => tokens !== null && tokens > 0)
@@ -114,7 +116,7 @@ export function buildContextUsageView({ snapshot = null, contextUsage = null } =
 
   const sourceCategories = Array.isArray(contextUsage?.categories) && contextUsage.categories.length
     ? contextUsage.categories
-    : buildCopilotCategories(snapshot, bufferTokens);
+    : buildCopilotCategories(snapshot);
 
   const categories = sourceCategories
     .map((entry) => ({
@@ -136,6 +138,11 @@ export function buildContextUsageView({ snapshot = null, contextUsage = null } =
     categories,
     freeTokens,
     freePercent: percentOf(freeTokens, maxTokens),
+    // Unused, but unusable: the window above the auto-compact threshold. Split
+    // out of free space, so the two are rendered as separate rows and the
+    // table still accounts for the whole window.
+    bufferTokens,
+    bufferPercent: percentOf(bufferTokens, maxTokens),
     // A token count, not a percent — the CLI compacts once the conversation
     // crosses it. `rawMaxTokens` is the model's own window, which the modal
     // uses to mark slider stops the model cannot honor.

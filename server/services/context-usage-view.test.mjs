@@ -136,11 +136,13 @@ test('free space and buffer are disjoint slices of the unused window', () => {
   });
 
   assert.equal(view.freeTokens, 567000);
-  const buffer = view.categories.find((entry) => entry.name === 'Buffer');
-  assert.equal(buffer.tokens, 33000);
-  // The four slices partition the window exactly — this is what the ASCII grid
-  // scaled down (and thereby misdrew) when they overlapped.
-  const slices = view.categories.reduce((sum, entry) => sum + entry.tokens, 0) + view.freeTokens;
+  assert.equal(view.bufferTokens, 33000);
+  // The reserve is not a category — it is unused window, reported beside free
+  // space so the table still accounts for every token. Occupied + free +
+  // reserve partitions the window exactly; this is what the ASCII grid scaled
+  // down (and thereby misdrew) when free space and buffer overlapped.
+  const slices = view.categories.reduce((sum, entry) => sum + entry.tokens, 0)
+    + view.freeTokens + view.bufferTokens;
   assert.equal(slices, 1000000);
 });
 
@@ -181,4 +183,26 @@ test('a provider-reported remainder is left alone; only a derived one is split',
     }),
     { freeTokens: 70000, bufferTokens: 20000 },
   );
+});
+
+test('a Claude session accounts for its reserve even though the SDK sends no buffer category', () => {
+  // Regression (2026-08-20): splitting the buffer out of free space without a
+  // row to show it left 33k of a 1M window simply missing from the table.
+  const view = buildContextUsageView({
+    contextUsage: {
+      ...claudeUsage,
+      totalTokens: 397413,
+      categories: [{ name: 'Messages', tokens: 376622, color: 'orange' }],
+    },
+    snapshot: {
+      max_context_tokens: 1000000,
+      used_total_tokens: 397413,
+      free_tokens: 602587,
+      free_tokens_includes_buffer: true,
+      buffer_tokens: 33000,
+    },
+  });
+  assert.equal(view.freeTokens, 569587);
+  assert.equal(view.bufferTokens, 33000);
+  assert.equal(view.totalTokens + view.freeTokens + view.bufferTokens, 1000000);
 });

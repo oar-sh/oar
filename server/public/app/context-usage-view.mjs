@@ -233,6 +233,18 @@ export function renderContextUsageHtml(usage) {
       muted: true,
     })
     : '';
+  // Unused window the conversation may not occupy: without its own row the
+  // reserve would just be missing from the table, since free space has it
+  // subtracted out.
+  const bufferRow = toNullableNumber(usage.bufferTokens) !== null && Number(usage.bufferTokens) > 0
+    ? renderRow({
+      name: 'Auto-compact reserve',
+      tokens: usage.bufferTokens,
+      percent: usage.bufferPercent,
+      color: null,
+      muted: true,
+    })
+    : '';
 
   const estimateNote = usage.isEstimate
     ? `<div class="ctx-usage-note">${escapeHtml(estimateNoteText(usage.estimateKind))}</div>`
@@ -252,7 +264,7 @@ export function renderContextUsageHtml(usage) {
         <thead>
           <tr><th>Category</th><th class="ctx-usage-num">Tokens</th><th class="ctx-usage-num">Usage</th></tr>
         </thead>
-        <tbody>${rows}${freeRow}</tbody>
+        <tbody>${rows}${freeRow}${bufferRow}</tbody>
       </table>
     </div>
   `;
