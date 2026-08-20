@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
-import { buildDequeuedRelayMessage, registerMessagesRoutes } from './messages-routes.mjs';
+import { buildDequeuedRelayMessage } from './messages-routes.mjs';
+import { makeRouteDeps, invokePost } from './messages-routes-test-harness.mjs';
 
 const NOW = '2024-01-01T00:00:00.000Z';
 
@@ -70,57 +71,10 @@ function insertRuntimeSession(db, {
   }
 }
 
-// Stand-ins for the deps server-runtime.mjs injects. server-runtime boots a
-// server on import, so the deps are reproduced here rather than imported.
+// Deps come from the shared harness baseline; this suite only supplies its
+// session-repository statement mirrors (and per-test provider settings).
 function baseRouteDeps(stmts, overrides = {}) {
-  return {
-    auth: (_req, _res, next) => next(),
-    db: { prepare: () => ({ run() {}, get: () => null, all: () => [] }) },
-    stmts,
-    MAX_UPLOAD_BYTES: 1024 * 1024,
-    touchCli: () => {},
-    ensureSessionId: () => 'session-1',
-    normalizeRelayMode: (value) => String(value || '').trim().toLowerCase() || null,
-    DEFAULT_RELAY_MODE: 'default',
-    DEFAULT_MODEL: 'gpt-5',
-    normalizeAttachments: () => [],
-    collectReferenceAttachmentsFromText: () => ({ attachments: [] }),
-    mergeMessageAttachments: (left, right) => [...(left || []), ...(right || [])],
-    resolveRequestedModel: (model) => ({
-      ok: false,
-      error: `Model "${String(model || '')}" is not supported`,
-      available: [],
-    }),
-    getOpenAIProviderSettings: () => ({ configured: false, enabled: false, model: '', models: [] }),
-    getCursorProviderSettings: () => ({ enabled: false, model: '', models: [] }),
-    featureFlags: {},
-    ...overrides,
-  };
-}
-
-function postHandler(routePath, deps) {
-  let handler = null;
-  const app = {
-    post(registeredPath, ...handlers) {
-      if (registeredPath === routePath) handler = handlers[handlers.length - 1];
-    },
-    get() {}, patch() {}, delete() {}, put() {}, use() {},
-  };
-  registerMessagesRoutes(app, deps);
-  assert.ok(handler, `${routePath} should be registered`);
-  return handler;
-}
-
-async function invokePost(routePath, deps, body) {
-  const handler = postHandler(routePath, deps);
-  const captured = { status: 200, body: null };
-  const res = {
-    setHeader() {},
-    status(code) { captured.status = code; return res; },
-    json(payload) { captured.body = payload; return res; },
-  };
-  await handler({ body, headers: {}, query: {} }, res);
-  return captured;
+  return makeRouteDeps({ stmts, ...overrides });
 }
 
 test('cursor-agent-id rejects a missing conversationId with 400', async () => {
