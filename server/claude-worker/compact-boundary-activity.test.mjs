@@ -131,6 +131,38 @@ test('a compaction boundary reaches the client as structured metadata, not just 
   db.close();
 });
 
+test('an auto-compaction with no post_tokens keeps its metadata all the way through', async () => {
+  // Real auto-compact payloads omit post_tokens entirely (conv 563e252e): the
+  // row must still be a break, labelled with what the SDK did report, rather
+  // than degrading to prose.
+  const { db, stmts, api } = bootRelay();
+  const normalizer = createSdkMessageNormalizer();
+  const publisher = createClaudeTurnPublisher({ api });
+
+  const actions = normalizer.normalize({
+    type: 'system',
+    subtype: 'compact_boundary',
+    compact_metadata: { trigger: 'auto', pre_tokens: 614117 },
+  });
+  assert.equal(actions[0].payload.text, 'Context compacted (was 614.1k tokens)');
+  await publisher.dispatchAction({ id: QUEUE_ID, conversationId: CONV, relayMode: 'agent' }, actions[0], {});
+
+  const rows = stmts.listActivityByQueueMessage.all(QUEUE_ID);
+  assert.deepEqual(JSON.parse(rows[0].metadata_json), {
+    kind: 'compact_boundary',
+    preTokens: 614117,
+    postTokens: null,
+  });
+  const entry = normalizeRelayActivityEntry({
+    text: rows[0].text,
+    subagentRunId: rows[0].subagent_run_id,
+    metadata: JSON.parse(rows[0].metadata_json),
+  });
+  assert.equal(isCompactBoundaryActivityEntry(entry), true);
+  assert.deepEqual(compactBoundaryFromActivities([entry]), { preTokens: 614117, postTokens: null });
+  db.close();
+});
+
 test('ordinary activity rows stay metadata-free and are not mistaken for breaks', async () => {
   const { db, stmts, emitted, api } = bootRelay();
   const publisher = createClaudeTurnPublisher({ api });

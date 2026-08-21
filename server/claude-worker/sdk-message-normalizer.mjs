@@ -40,6 +40,44 @@ export function formatApiRetryNotice(sdkMessage) {
   return `${cause} — retrying${counter}${wait}…`;
 }
 
+/**
+ * The single activity action a `compact_boundary` publishes. Exported because
+ * a compaction at resume arrives with no turn context — the session process
+ * buffers this same action onto the next one rather than losing the boundary
+ * (the per-turn normalizer never sees it).
+ *
+ * `post_tokens` is optional in the SDK type and absent from every auto-compact
+ * payload observed live, so the metadata degrades to a pre-only row instead of
+ * being dropped. The wire shape is snake_case under `compact_metadata` (the
+ * CLI converts its internal camelCase before yielding); the camelCase read is
+ * a cheap hedge, since the on-disk transcript uses that spelling.
+ */
+export function compactBoundaryActivityAction(sdkMessage) {
+  const metadata = sdkMessage?.compact_metadata || sdkMessage?.compactMetadata || {};
+  const preTokens = Number(metadata.pre_tokens ?? metadata.preTokens);
+  const postTokens = Number(metadata.post_tokens ?? metadata.postTokens);
+  const hasPre = Number.isFinite(preTokens);
+  const hasPost = Number.isFinite(postTokens);
+  let detail = '';
+  if (hasPre && hasPost) detail = ` (${formatCompactTokens(preTokens)} → ${formatCompactTokens(postTokens)} tokens)`;
+  else if (hasPre) detail = ` (was ${formatCompactTokens(preTokens)} tokens)`;
+  return {
+    channel: 'activity',
+    payload: {
+      text: `Context compacted${detail}`,
+      subagentRunId: null,
+      // Structured twin of the prose: the transcript promotes this row to a
+      // full-width break instead of burying it in the tool-activity details,
+      // and needs the token counts to label it.
+      metadata: {
+        kind: 'compact_boundary',
+        preTokens: hasPre ? preTokens : null,
+        postTokens: hasPost ? postTokens : null,
+      },
+    },
+  };
+}
+
 export function isSubagentToolName(name) {
   return SUBAGENT_TOOL_NAMES.has(String(name || '').trim().toLowerCase());
 }
@@ -509,26 +547,7 @@ export function createSdkMessageNormalizer() {
     }
 
     if (type === 'system' && sdkMessage.subtype === 'compact_boundary') {
-      const preTokens = Number(sdkMessage?.compact_metadata?.pre_tokens);
-      const postTokens = Number(sdkMessage?.compact_metadata?.post_tokens);
-      const detail = Number.isFinite(preTokens) && Number.isFinite(postTokens)
-        ? ` (${formatCompactTokens(preTokens)} → ${formatCompactTokens(postTokens)} tokens)`
-        : '';
-      return [{
-        channel: 'activity',
-        payload: {
-          text: `Context compacted${detail}`,
-          subagentRunId: null,
-          // Structured twin of the prose: the transcript promotes this row to
-          // a full-width break instead of burying it in the tool-activity
-          // details, and needs the token counts to label it.
-          metadata: {
-            kind: 'compact_boundary',
-            preTokens: Number.isFinite(preTokens) ? preTokens : null,
-            postTokens: Number.isFinite(postTokens) ? postTokens : null,
-          },
-        },
-      }];
+      return [compactBoundaryActivityAction(sdkMessage)];
     }
 
     // The live background-task set, emitted on every membership change with

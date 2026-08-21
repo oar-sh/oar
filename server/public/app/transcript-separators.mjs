@@ -83,6 +83,10 @@ export function formatCompactBoundaryLabel(boundary) {
   const preTokens = formatCompactTokens(boundary?.preTokens);
   const postTokens = formatCompactTokens(boundary?.postTokens);
   if (preTokens && postTokens) return `Context compacted · ${preTokens} → ${postTokens} tokens`;
+  // Auto-compact payloads carry no post_tokens — optional in the SDK type and
+  // absent from the on-disk transcript of every compaction inspected — so the
+  // pre-only count is the whole story the break can tell.
+  if (preTokens) return `Context compacted · was ${preTokens} tokens`;
   return 'Context compacted';
 }
 

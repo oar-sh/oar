@@ -155,6 +155,20 @@ test('compaction labels degrade to prose when the SDK omitted the token counts',
   assert.deepEqual(parseCompactBoundaryValue('|'), { preTokens: null, postTokens: null });
   assert.equal(formatCompactBoundaryLabel({ preTokens: null, postTokens: null }), 'Context compacted');
   assert.equal(formatCompactBoundaryLabel({ preTokens: 900, postTokens: 400 }), 'Context compacted · 900 → 400 tokens');
+  // Every auto-compact payload seen live omits post_tokens; the break must
+  // still report what it knows rather than collapsing to bare prose.
+  assert.equal(formatCompactBoundaryLabel({ preTokens: 614117, postTokens: null }), 'Context compacted · was 614.1k tokens');
+  assert.deepEqual(parseCompactBoundaryValue('614117|'), { preTokens: 614117, postTokens: null });
+});
+
+test('a boundary with only preTokens still plans a break row', () => {
+  const plan = buildSeparatorPlan([
+    { messageId: 'm1', timestamp: localIso(2026, 8, 20, 9), compactBoundary: { preTokens: 614117, postTokens: null } },
+  ], NOW);
+  assert.deepEqual(
+    plan.map((entry) => [entry.kind, entry.label]),
+    [['day', 'Today'], ['compact', 'Context compacted · was 614.1k tokens']],
+  );
 });
 
 // ---------------------------------------------------------------------------

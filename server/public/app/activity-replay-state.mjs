@@ -23,6 +23,9 @@ export function isCompactBoundaryActivityEntry(item) {
 }
 
 function toTokenCount(value) {
+  // `Number(null)` is 0, not NaN: without this an omitted post_tokens (every
+  // real auto-compaction) would read as a compaction down to zero tokens.
+  if (value === null || value === undefined || value === '') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : null;
 }
