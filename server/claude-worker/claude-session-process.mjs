@@ -2,7 +2,12 @@ import nodeFs from 'node:fs';
 import nodePath from 'node:path';
 
 import { buildClaudeUserContent } from './claude-attachments.mjs';
-import { createSdkMessageNormalizer, formatApiRetryNotice, isSubagentToolName } from './sdk-message-normalizer.mjs';
+import {
+  compactBoundaryActivityAction,
+  createSdkMessageNormalizer,
+  formatApiRetryNotice,
+  isSubagentToolName,
+} from './sdk-message-normalizer.mjs';
 import { digestFromRunRecord, digestFromJournal } from './workflow-progress-digest.mjs';
 import { createClaudeSessionRootResolver } from '../services/claude-session-root-service.mjs';
 import {
@@ -271,6 +276,65 @@ function turnOpeningUserText(sdkMessage) {
 }
 
 /**
+ * The CLI synthesizes a user-role message when a background task settles. The
+ * SDK stamps its provenance structurally: `SDKUserMessage.origin` is an
+ * `SDKMessageOrigin`, and a settled task's continuation carries
+ * `{ kind: 'task-notification' }` (sdk.d.ts). The compaction's own summary
+ * replay carries no `origin` at all (incident transcript row 1514).
+ *
+ * The `<task-notification>` opening tag — which the CLI documents to the model
+ * as the way to recognize these ("they look like user messages but are not") —
+ * is kept as a fallback for emitters that predate the field. It can only push
+ * the answer toward "not the compaction's replay", which is the safe
+ * direction: not adopting merely restores the pre-fix behaviour, while a wrong
+ * adoption closes the user's row with another turn's answer.
+ */
+const TASK_NOTIFICATION_TAG_PREFIX = '<task-notification';
+
+/**
+ * The first text block's raw text, or null when there is none to read. Real
+ * notification rows carry `content` as a plain string (242 of them on disk),
+ * not a block array, so both spellings are read.
+ */
+function firstTextBlock(sdkMessage) {
+  const content = sdkMessage?.message?.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return null;
+  const first = content[0];
+  return first?.type === 'text' ? String(first.text || '') : null;
+}
+
+/** A settled background task's continuation, by origin or by leading tag. */
+function isTaskNotificationReplay(sdkMessage) {
+  if (String(sdkMessage?.origin?.kind || '') === 'task-notification') return true;
+  const text = firstTextBlock(sdkMessage);
+  return text !== null && text.trimStart().startsWith(TASK_NOTIFICATION_TAG_PREFIX);
+}
+
+/**
+ * Whether a turn the CLI opened by itself may be the compaction re-opening a
+ * delivered turn, rather than something else the CLI decided to say.
+ *
+ * Tested POSITIVELY, and it has to be: `SDKMessageOrigin` is a nine-member
+ * union (`human`, `channel`, `peer`, `task-notification`, `coordinator`,
+ * `unclassified`, `observer`, …), so "not a task notification" is fail-OPEN —
+ * a cross-session `peer` message or an `auto-continuation` would be read as
+ * the compaction's summary and would permanently steal the delivered row. The
+ * compact summary is the CLI's own synthesized replay and carries NO `origin`
+ * at all (incident transcript row 1514: `origin=None`), so any stamped
+ * provenance disqualifies it. The `<task-notification>` tag stays as a second
+ * disqualifier for emitters that predate `origin`.
+ *
+ * Failing closed costs only the pre-fix behaviour (the row waits for its own
+ * replay); failing open closes a user's row with another turn's answer.
+ */
+function isCompactionReplayCandidate(sdkMessage) {
+  if (firstTextBlock(sdkMessage) === null) return false;
+  if (sdkMessage?.origin !== undefined && sdkMessage?.origin !== null) return false;
+  return !isTaskNotificationReplay(sdkMessage);
+}
+
+/**
  * The bookkeeping result a resumed session emits after replaying an
  * orphaned-task notification: zero API work, nothing to publish. Detected at
  * the process level (in addition to the normalizer's own skip) so it can never
@@ -333,6 +397,22 @@ export function createClaudeSessionRunner({
   // the slowest cold start observed; the primary absorbed-steering fix in
   // resolveContext should make this fire only for unknown variants.
   pendingDeliveredTimeoutMs = 5 * 60_000,
+  // Backstop for the compaction hold. A compaction is announced ONCE by
+  // `status: 'compacting'` (the CLI's periodic re-emit is gated on the
+  // remote-control client's activity callback, which the plain SDK `query()`
+  // never registers) and is released by the boundary, by a terminating status,
+  // or by the process dying — this cap only matters when none of those ever
+  // arrives. It gates the pending-delivered watchdog, idle shutdown and the
+  // mode-change recycle, so it is sized far above any plausible compaction
+  // (measured: 133 s for 614k tokens) rather than tightly: releasing late
+  // leaves an idle CLI up a few minutes longer, releasing early kills a live
+  // compaction mid-flight.
+  compactionStaleMs = 10 * 60_000,
+  // How long after a compaction signal a delivered message may still adopt the
+  // turn the CLI opens by itself. The replay follows the boundary within
+  // milliseconds; this only has to outlast that gap, and the window is spent
+  // by the first turn to open regardless.
+  compactReplayAdoptionMs = 60_000,
   continuationRetryDelayMs = 500,
   workflowPollMs = 2_000,
   resolveWorkflowSessionDirImpl = null,
@@ -416,6 +496,15 @@ export function createClaudeSessionRunner({
         modelUsage: null,
       },
       planBoardPosted: false,
+      // Set only on a context attached by post-compaction adoption, and only
+      // until that turn produces output — see handBackAdoptedContext.
+      adoptedFromCompaction: false,
+      // The pendingDelivered entry this context was attached from, kept so a
+      // handed-back adoption can restore it verbatim.
+      deliveredEntry: null,
+      // When the provisional adoption's quiet clock started (see
+      // reapSilentProvisionalAdoption).
+      provisionalSince: 0,
       interrupted: false,
       discarded: false,
       registered: kind === 'delivered',
@@ -440,6 +529,7 @@ export function createClaudeSessionRunner({
   function activateContext(ctx) {
     proc.activeCtx = ctx;
     proc.lastBoundary = null;
+    proc.continuationInitPending = false;
     proc.notificationPendingAt = 0;
     proc.taskSettledAt = 0;
     if (proc.initModel && !ctx.state.responseModel) ctx.state.responseModel = proc.initModel;
@@ -447,11 +537,18 @@ export function createClaudeSessionRunner({
       queueMessageId: ctx.message?.id || '',
       onAbortTurn: () => interruptActiveTurn(ctx),
     }) || null;
+    // One-shot: a compaction's replay window is spent by the turn that
+    // consumes it, and a turn that opened for any other reason retires it too
+    // — a boundary must never be able to adopt a second turn (see
+    // resolveContext).
+    proc.compactReplayUntil = 0;
     // Orphan/settled-task notification lines that arrived between turns belong
     // to the turn they triggered.
     const carried = proc.pendingActivities.splice(0);
     if (carried.length) {
-      const actions = carried.map((text) => ({ channel: 'activity', payload: { text, subagentRunId: null } }));
+      const actions = carried.map((entry) => (typeof entry === 'string'
+        ? { channel: 'activity', payload: { text: entry, subagentRunId: null } }
+        : entry));
       if (ctx.registered) {
         (async () => {
           for (const action of actions) await publisher.dispatchAction(ctx.message, action, ctx.state);
@@ -462,10 +559,69 @@ export function createClaudeSessionRunner({
     }
   }
 
-  function attachDeliveredContext() {
-    const entry = proc.pendingDelivered.shift();
+  /**
+   * Attach the delivered entry at `index` — the head unless a replay matched a
+   * later one. The CLI normally dequeues in order, but two messages pushed
+   * back to back can replay out of order, and pairing by position alone would
+   * answer each with the other's turn.
+   */
+  function attachDeliveredContext(index = 0) {
+    const [entry] = proc.pendingDelivered.splice(index, 1);
+    entry.ctx.deliveredEntry = entry;
     activateContext(entry.ctx);
     return entry.ctx;
+  }
+
+  /**
+   * Undo a post-compaction adoption: this turn was never the delivered
+   * message's, and nothing has published on it (the provisional flag is
+   * cleared by the turn's first real output, so every caller runs strictly
+   * before that).
+   *
+   * The entry goes back to the HEAD of the queue — it is still the next thing
+   * the CLI owes a replay for, and anything queued behind it must stay behind
+   * it — with its unattached clock reset, exactly as `armCompactReplayAdoption`
+   * leaves it. The control poller is stopped because `activateContext` started
+   * one and will start another when the entry attaches for real.
+   *
+   * The adoption window is deliberately NOT re-armed: the replay to come
+   * carries the message's own text and attaches by the ordinary match, so
+   * re-arming would only widen the chance of adopting yet another turn.
+   */
+  function restoreAdoptedContext(ctx) {
+    // A context that has begun settling must never go back on the queue:
+    // `finalizeContext` marks `finalized` before its awaited publishes, and a
+    // finalized entry re-attached by a later turn returns from `finalizeContext`
+    // immediately — so `closeContext` never runs and `activeCtx` is pinned to a
+    // corpse for the life of the process (the 2026-08-18 deadlock shape).
+    if (ctx.finalized) return;
+    detachActiveContext(ctx);
+    ctx.adoptedFromCompaction = false;
+    ctx.provisionalSince = 0;
+    // `activateContext` started a control poller keyed on this row, so the
+    // provisional window is the one moment a still-QUEUED message is
+    // Stoppable. An abort taken there belongs to the turn that was running,
+    // not to the row: left set, `finalizeContext` would take its interrupted
+    // branch when the row finally runs for real and publish no response at all.
+    ctx.interrupted = false;
+    controlPoller?.stop?.(ctx.controlState);
+    ctx.controlState = null;
+    const entry = ctx.deliveredEntry;
+    if (!entry) return;
+    entry.unattachedSince = 0;
+    proc.pendingDelivered.unshift(entry);
+  }
+
+  /**
+   * The adopted turn turned out to belong to a settled task's continuation,
+   * which replayed its notification into the same turn after the compaction
+   * summary opened it. Give the row back and register the continuation the
+   * turn actually is.
+   */
+  function handBackAdoptedContext(ctx) {
+    restoreAdoptedContext(ctx);
+    dbg('post-compaction adoption handed back to a task continuation', ctx.message?.id || '(no id)');
+    return openContinuationContext();
   }
 
   /**
@@ -576,17 +732,87 @@ export function createClaudeSessionRunner({
       // message it answers.
       if (proc.pendingDelivered.length) {
         const signature = turnOpeningUserSignature(sdkMessage);
-        if (signature !== null && signature === proc.pendingDelivered[0].expectedText) {
+        const absorbed = signature === null
+          ? -1
+          : proc.pendingDelivered.findIndex((entry) => entry.expectedText === signature);
+        if (absorbed >= 0) {
           const outgoing = proc.activeCtx;
-          // onSdkMessage awaits this before dispatching the new context's
-          // actions, so the handed-off row's publishes stay ordered ahead
-          // of the absorbed turn's.
-          proc.handoffSettling = handoffAbsorbedTurn(outgoing);
-          const ctx = attachDeliveredContext();
-          // Continuity: open thinking blocks and tool_use/tool_result
-          // pairing must survive the boundary — the stream did not restart.
-          ctx.normalizer = outgoing.normalizer;
+          const restored = outgoing.adoptedFromCompaction;
+          if (restored) {
+            // The outgoing context was only PROVISIONALLY adopted and has
+            // published nothing. Settling it as an absorbed turn would tell
+            // the user their message was "merged into the next reply" and
+            // refuse to requeue it — but the CLI never consumed that prompt,
+            // so it is still owed a replay. Unwind the adoption instead; the
+            // row goes back to the queue and attaches for real later.
+            restoreAdoptedContext(outgoing);
+          } else {
+            // onSdkMessage awaits this before dispatching the new context's
+            // actions, so the handed-off row's publishes stay ordered ahead
+            // of the absorbed turn's.
+            proc.handoffSettling = handoffAbsorbedTurn(outgoing);
+          }
+          const ctx = attachDeliveredContext(
+            proc.pendingDelivered.findIndex((entry) => entry.expectedText === signature),
+          );
+          // Continuity: open thinking blocks and tool_use/tool_result pairing
+          // must survive the boundary — the stream did not restart. Only for a
+          // genuine hand-off, where the outgoing context is settled and never
+          // used again: a RESTORED one goes back on the queue and will run its
+          // own turn later, and a shared normalizer would then publish this
+          // turn's streamed text as that row's answer (its `streamText` is only
+          // reset by a `message_start`, so it outlives the result).
+          if (!restored) ctx.normalizer = outgoing.normalizer;
           return ctx;
+        }
+      }
+      // The turn was adopted for a delivered message on the strength of an
+      // untagged post-compaction replay — and now a task notification replays
+      // into the same turn. The compaction happened INSIDE a continuation the
+      // CLI had already opened for a settled task, so the summary row was
+      // never the delivered message's: the turn belongs to the task. Hand it
+      // back before anything publishes (see handBackAdoptedContext).
+      if (proc.activeCtx.adoptedFromCompaction) {
+        const signature = turnOpeningUserSignature(sdkMessage);
+        // The adopted message's OWN replay: the CLI has now proved it dequeued
+        // exactly this prompt, so the guess is confirmed and the turn is the
+        // row's for good. Every unwind path rests on "the CLI never consumed
+        // this prompt" — after this replay that premise is false, and putting
+        // the row back would fail or re-run a message the CLI already took.
+        if (signature !== null && signature === proc.activeCtx.deliveredEntry?.expectedText) {
+          proc.activeCtx.adoptedFromCompaction = false;
+          return proc.activeCtx;
+        }
+        if (signature !== null && isTaskNotificationReplay(sdkMessage)) {
+          return handBackAdoptedContext(proc.activeCtx);
+        }
+        // A phantom result closes the turn with nothing published. Committed,
+        // it would leave the adopted context active forever — no result to
+        // finalize it, no queue entry left for the watchdog to fail over, and
+        // `handlePendingPayload` never resolving. Give the row back and let
+        // the ordinary phantom skip run.
+        if (isPhantomResult(sdkMessage)) {
+          restoreAdoptedContext(proc.activeCtx);
+          proc.lastBoundary = null;
+          return null;
+        }
+        // The adoption commits on the turn's first real OUTPUT, and only
+        // that. `system` frames publish nothing, and the compaction's own
+        // `compact_result` status routinely lands between the summary row and
+        // a notification replay. Nor does a background subagent's stream
+        // count: it arrives at top level carrying `parent_tool_use_id`, it is
+        // a LIVE task's chatter rather than this turn's answer, and a task
+        // running while the user's message is queued is the ordinary state of
+        // the conversation this bug came from — committing on it would leave
+        // the hand-back unreachable in exactly the order it exists for.
+        const type = String(sdkMessage?.type || '');
+        // A `result` counts too. It is not "output" in the streaming sense —
+        // it is the turn ENDING — but leaving the flag set through
+        // `finalizeContext`'s several awaited relay round-trips gives the
+        // lifecycle timer a window to reap a context that is already settling.
+        if (!sdkMessage?.parent_tool_use_id
+          && (type === 'assistant' || type === 'stream_event' || type === 'result')) {
+          proc.activeCtx.adoptedFromCompaction = false;
         }
       }
       return proc.activeCtx;
@@ -595,8 +821,43 @@ export function createClaudeSessionRunner({
 
     const openingText = turnOpeningUserText(sdkMessage);
     if (openingText !== null) {
-      const expected = proc.pendingDelivered[0]?.expectedText;
-      if (expected !== undefined && openingText === expected) return attachDeliveredContext();
+      const matched = proc.pendingDelivered.findIndex((entry) => entry.expectedText === openingText);
+      if (matched >= 0) return attachDeliveredContext(matched);
+      // A compaction just replayed the conversation: the CLI re-opens the turn
+      // with its own summary message ("This session is being continued…"),
+      // whose text matches no delivered entry, and then answers the delivered
+      // message on that turn. Without adoption the answer publishes as a
+      // synthetic continuation and the real row orphans until the watchdog
+      // fails it — the user loses the message on a turn that succeeded (conv
+      // 563e252e, 2026-08-20). The turn is identified directly rather than by
+      // bookkeeping about what the CLI might owe: a settled task's
+      // continuation announces itself through `origin.kind` (see
+      // isTaskNotificationReplay), and everything else inside the window is
+      // the compaction's own replay. Only the no-active-context path adopts (a
+      // compaction mid-turn must leave the running turn alone), and the window
+      // is one-shot — attachDeliveredContext clears it through
+      // activateContext, so one boundary can never adopt two turns.
+      //
+      // `lastBoundary === 'self-opened'` is the turn-level half of the same
+      // question: the CLI had already begun a turn of its own (a task
+      // continuation, or a resumed init) and merely had not produced traffic
+      // yet, so a compaction inside THAT turn emits its untagged summary row
+      // into a turn that was never the delivered message's. The tag says which
+      // MESSAGE this is; the boundary says which TURN it belongs to, and
+      // adoption needs both.
+      if (
+        proc.pendingDelivered.length
+        && proc.lastBoundary !== 'self-opened'
+        && !proc.continuationInitPending
+        && Date.now() < proc.compactReplayUntil
+        && isCompactionReplayCandidate(sdkMessage)
+      ) {
+        const ctx = attachDeliveredContext();
+        // Provisional: the summary row alone cannot rule out a continuation
+        // whose notification replays after it (see the hand-back above).
+        ctx.adoptedFromCompaction = true;
+        return ctx;
+      }
       // A turn the CLI opened on its own (task-notification replay). The
       // context opens lazily on its first real traffic so a bookkeeping
       // replay that ends in a phantom result never creates a relay turn.
@@ -1151,17 +1412,68 @@ export function createClaudeSessionRunner({
     }
   }
 
-  // Between-turn notices carried into the next activated context. Capped —
+  // Between-turn notices carried into the next activated context, as either a
+  // plain line or a prepared publisher action (a compaction boundary has to
+  // keep the structured metadata the transcript's break row is built from —
+  // as prose it would render as an ordinary tool-activity line). Capped —
   // api_retry made this the only accumulator a retry storm could grow
   // unboundedly (subagentSpawns and settledWorkflowDigests already cap).
   const MAX_PENDING_ACTIVITIES = 50;
-  function carryPendingActivity(text) {
-    const line = String(text || '').trim().slice(0, 2000);
-    if (!line) return;
-    proc.pendingActivities.push(line);
-    if (proc.pendingActivities.length > MAX_PENDING_ACTIVITIES) {
-      proc.pendingActivities.splice(0, proc.pendingActivities.length - MAX_PENDING_ACTIVITIES);
+  function carryPendingActivity(entry) {
+    const carried = entry && typeof entry === 'object'
+      ? entry
+      : String(entry || '').trim().slice(0, 2000);
+    if (!carried) return;
+    proc.pendingActivities.push(carried);
+    // Drop the OLDEST PROSE line first, and a structured entry only when
+    // nothing else is left: the cap exists to bound a retry storm's chatter,
+    // while a structured entry carries transcript geometry no later line can
+    // restore (a compaction boundary buffered between turns, then 50 task
+    // notifications, used to lose its break row silently). The client's
+    // capRelayActivityEntries protects structured rows too, but head-caps the
+    // prose it keeps; here the newest lines are the informative ones.
+    while (proc.pendingActivities.length > MAX_PENDING_ACTIVITIES) {
+      const proseIndex = proc.pendingActivities.findIndex((carried) => typeof carried === 'string');
+      proc.pendingActivities.splice(proseIndex === -1 ? 0 : proseIndex, 1);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Compaction
+  //
+  // Compaction is a long, completely silent stretch of CLI work — 133 s on a
+  // 614k-token session resumed against a 100k window (conv 563e252e,
+  // 2026-08-20) — that produces no turn context of its own. Two things must
+  // survive it: the process (nothing else is "live" while it runs) and the
+  // delivered message that triggered it (the CLI answers it AFTER the
+  // boundary, on a stream the runner would otherwise read as self-opened).
+
+  function isCompacting() {
+    return Boolean(proc?.compactingSince) && Date.now() - proc.compactingSince < compactionStaleMs;
+  }
+
+  /**
+   * Whether a between-turn notice can reach the relay through the active
+   * context, or has to be buffered for the next one. A discarded context is
+   * active but publishes nothing (dispatchToContext drops it), so it counts as
+   * no context at all.
+   */
+  function activeContextPublishes() {
+    return Boolean(proc.activeCtx) && !proc.activeCtx.discarded;
+  }
+
+  /**
+   * The CLI is compacting, or just did: a delivered turn is still coming.
+   * Armed only while a delivered entry is actually waiting; which turn the
+   * window may then be spent on is decided when that turn opens, by reading
+   * the message itself (isCompactionReplayCandidate).
+   */
+  function armCompactReplayAdoption() {
+    if (!proc.pendingDelivered.length) return;
+    proc.compactReplayUntil = Date.now() + compactReplayAdoptionMs;
+    // Whatever the entries waited through, they were not idle: the CLI is
+    // about to replay the turn they belong to.
+    for (const entry of proc.pendingDelivered) entry.unattachedSince = 0;
   }
 
   function observeProcessLevel(sdkMessage) {
@@ -1173,6 +1485,10 @@ export function createClaudeSessionRunner({
     if (type !== 'system') return;
     const subtype = String(sdkMessage.subtype || '');
     if (subtype === 'init') {
+      // The FIRST init of a process is the spawn's, and a spawn is always
+      // driven by a delivered message; a LATER one is the CLI opening a turn
+      // by itself.
+      const firstInit = !proc.sawInit;
       proc.sawInit = true;
       persistNativeSessionId(sdkSessionId, sdkMessage.session_id).catch(() => {});
       // Tracked on the process too (not only through the persist round-trip):
@@ -1194,8 +1510,81 @@ export function createClaudeSessionRunner({
       // delivered turn always has its row in pendingDelivered before its init is
       // processed (spawnProcess + pendingDelivered.push run synchronously ahead
       // of the async stream consumer), so it is correctly excluded here.
+      //
       if (!proc.activeCtx && !proc.pendingDelivered.length) {
         proc.lastBoundary = 'self-opened';
+      } else if (!proc.activeCtx && !firstInit) {
+        // A LATER init, with a delivered row waiting, is the CLI opening a turn
+        // of its own — the live-verified continuation shape is a bare init with
+        // no user replay at all. A delivered turn cannot produce one: the
+        // process is already running, and only a spawn inits (which is
+        // `firstInit`, and always has its row queued before the stream is
+        // read). A compaction inside such a turn would otherwise see no
+        // turn-level boundary and adopt the queued row — and in this shape
+        // nothing later replays to correct it.
+        //
+        // Structural, not a clock. Gating this on "a task settled recently"
+        // fails twice over: the grace (60 s) is shorter than a compaction
+        // (133 s measured), and `activateContext` zeroes the settle timestamps,
+        // so any turn attaching in between erases the signal for good. Every
+        // freshness-clock design in this fix's history failed the same way.
+        //
+        // Deliberately NOT `lastBoundary`: that flag also diverts assistant
+        // traffic away from a waiting delivered row, and a settle timestamp is
+        // far too weak to justify that (it stays fresh for the whole
+        // notification grace after ANY task settles, compaction or not, and
+        // would fail the row over while publishing its answer on a synthetic
+        // continuation). This suppresses adoption and nothing else; if the turn
+        // really is the delivered message's, it attaches exactly as before.
+        proc.continuationInitPending = true;
+      }
+      return;
+    }
+    if (subtype === 'status') {
+      // The status line is the compaction hold's only in-progress signal, so
+      // every spelling that is NOT a permission-mode notice releases it:
+      // `{status:null, compact_result}` is the normal terminator, a BARE
+      // `{status:null}` is what an early-compact-start that produced no
+      // compaction emits (no result, no boundary — the hold would otherwise
+      // stand until the staleness cap, delaying the watchdog and blocking the
+      // mode-change recycle), and 'requesting' comes from the main loop's
+      // stream_request_start, which by definition means the CLI is past
+      // compacting (the compaction fork reports progress as `stream_mode`,
+      // which the SDK drops). `{status:null, permissionMode}` is a mode-change
+      // notice that says nothing about compaction and is ignored.
+      if (String(sdkMessage.status || '') === 'compacting') {
+        proc.compactingSince = Date.now();
+        armCompactReplayAdoption();
+      } else if (sdkMessage.permissionMode === undefined) {
+        proc.compactingSince = 0;
+        // A compaction that failed produces no boundary and no replay: the
+        // turn just carries on uncompacted and attaches the normal way, so
+        // leaving the adoption window open would only widen the chance of a
+        // later self-opened turn being adopted.
+        if (String(sdkMessage.compact_result || '') === 'failed' || sdkMessage.compact_error !== undefined) {
+          proc.compactReplayUntil = 0;
+        }
+      }
+      evaluateLifecycle();
+      return;
+    }
+    if (subtype === 'compact_boundary') {
+      proc.compactingSince = 0;
+      armCompactReplayAdoption();
+      // The boundary is a per-turn normalizer action, but a compaction at
+      // resume — exactly what lowering the window causes — lands with no
+      // context to publish onto and would be dropped. Buffer it for the next
+      // one; with a turn active the normalizer publishes it (resolveContext
+      // routes system messages to the active context and nowhere else), so
+      // the two paths can never both fire. An already-discarded context is
+      // routed here too: it is still `activeCtx`, but dispatchToContext drops
+      // everything it is handed. That does not cover every way a boundary can
+      // still be lost — a context discarded AFTER buffering it (a continuation
+      // whose registration fails all three attempts) drops the whole turn's
+      // output, boundary included — but those paths lose the turn itself, so
+      // the break row is the least of what is missing.
+      if (!activeContextPublishes()) {
+        carryPendingActivity(compactBoundaryActivityAction(sdkMessage));
       }
       return;
     }
@@ -1237,7 +1626,7 @@ export function createClaudeSessionRunner({
           publisher.postActivity(waiting, notice);
         } else {
           const last = proc.pendingActivities[proc.pendingActivities.length - 1];
-          if (last && last.startsWith('Anthropic API')) proc.pendingActivities.pop();
+          if (typeof last === 'string' && last.startsWith('Anthropic API')) proc.pendingActivities.pop();
           carryPendingActivity(notice);
         }
       }
@@ -1339,7 +1728,7 @@ export function createClaudeSessionRunner({
       if (taskId && proc.knownTasks.has(taskId) && sdkMessage.skip_transcript !== true) {
         proc.notificationPendingAt = Date.now();
       }
-      if (!proc.activeCtx) {
+      if (!activeContextPublishes()) {
         const status = String(sdkMessage.status || '').trim() || 'unknown';
         const summary = String(sdkMessage.summary || '').trim();
         carryPendingActivity(`Background task ${taskId || 'unknown'} ${status}: ${summary}`);
@@ -1377,20 +1766,28 @@ export function createClaudeSessionRunner({
   // ---------------------------------------------------------------------------
   // Process lifecycle
 
+  /**
+   * A background task settled and the CLI is about to dequeue a turn of its
+   * own ("you will be notified"). Both signals are used: the task leaving the
+   * live set (reliable, see background_tasks_changed) and the settling
+   * task_notification (secondary — it may be silent or late).
+   */
+  function isContinuationImminent() {
+    if (!proc) return false;
+    const fresh = (at) => Boolean(at) && Date.now() - at < notificationGraceMs;
+    return fresh(proc.notificationPendingAt) || fresh(proc.taskSettledAt);
+  }
+
   function hasLiveWork() {
     if (!proc) return false;
-    const notificationFresh = proc.notificationPendingAt
-      && Date.now() - proc.notificationPendingAt < notificationGraceMs;
-    // A background task that just settled may still have a continuation turn on
-    // the way; keep the process alive across that gap (see background_tasks_changed).
-    const settleFresh = proc.taskSettledAt
-      && Date.now() - proc.taskSettledAt < notificationGraceMs;
     return Boolean(
       proc.activeCtx
       || proc.pendingDelivered.length
       || proc.liveTasks.size
-      || notificationFresh
-      || settleFresh
+      || isContinuationImminent()
+      // A compaction produces no stream traffic for minutes; an idle shutdown
+      // under it would kill the CLI mid-flight.
+      || isCompacting()
       || proc.pendingControlRequests > 0,
     );
   }
@@ -1405,15 +1802,44 @@ export function createClaudeSessionRunner({
    * handlePendingPayload's catch publishes a terminal error and the row
    * fails over instead of wedging the conversation.
    */
+  /**
+   * Adoption splices a delivered entry out of `pendingDelivered` on an
+   * inference, which also takes it out of the watchdog's reach: if the turn
+   * the CLI opened then produces nothing at all (a retry storm, a dropped
+   * turn), `activeCtx` pins the process, nothing can fail the row over, and
+   * the queue row renews its lease forever — the 2026-08-18 deadlock shape.
+   * The three ways an adoption unwinds all need the CLI to say *something*,
+   * so silence gets its own: a provisional adoption that never produces
+   * output puts the row back, and the ordinary watchdog takes it from there.
+   */
+  function reapSilentProvisionalAdoption(now) {
+    const ctx = proc?.activeCtx;
+    if (!ctx?.adoptedFromCompaction) return;
+    if (!(pendingDeliveredTimeoutMs > 0)) return;
+    if (isCompacting() || proc.liveTasks.size || proc.pendingControlRequests > 0) {
+      ctx.provisionalSince = now;
+      return;
+    }
+    if (!ctx.provisionalSince) {
+      ctx.provisionalSince = now;
+      return;
+    }
+    if (now - ctx.provisionalSince < pendingDeliveredTimeoutMs) return;
+    dbg('provisional adoption produced nothing; returning the row to the queue', ctx.message?.id || '(no id)');
+    restoreAdoptedContext(ctx);
+  }
+
   function reapStalePendingDelivered(now) {
     if (!proc || !proc.pendingDelivered.length) return;
     if (!(pendingDeliveredTimeoutMs > 0)) return; // 0 = watchdog disabled
     // A silent cold boot (no init yet) is slow, not wedged: a CLI that never
     // inits dies on its own and cleanupProcess rejects the contexts then.
     if (!proc.sawInit) return;
-    if (proc.activeCtx || proc.liveTasks.size || proc.pendingControlRequests > 0) {
-      // A turn, task, or control round-trip may still attach these entries —
-      // the unattached clock starts over once the process actually goes quiet.
+    if (proc.activeCtx || proc.liveTasks.size || proc.pendingControlRequests > 0 || isCompacting()) {
+      // A turn, task, control round-trip, or compaction may still attach these
+      // entries — the unattached clock starts over once the process actually
+      // goes quiet. A compaction is silent work, not idleness: the CLI replays
+      // the turn these entries belong to once it finishes.
       for (const entry of proc.pendingDelivered) entry.unattachedSince = 0;
       return;
     }
@@ -1439,6 +1865,7 @@ export function createClaudeSessionRunner({
   function evaluateLifecycle() {
     if (!proc || proc.closing) return;
     const now = Date.now();
+    reapSilentProvisionalAdoption(now);
     reapStalePendingDelivered(now);
     if (hasLiveWork()) {
       // Track how long background tasks alone have held the process, for the
@@ -1591,6 +2018,13 @@ export function createClaudeSessionRunner({
       // drifted underneath it).
       modelFallback: '',
       notificationPendingAt: 0,
+      // When the CLI last said it was compacting (0 = not) and how long a
+      // delivered entry may still adopt the turn the CLI re-opens afterwards.
+      compactingSince: 0,
+      compactReplayUntil: 0,
+      // A non-spawn init that opened a turn while a delivered row waited: the
+      // turn is the CLI's own, so no compaction inside it may adopt that row.
+      continuationInitPending: false,
       pendingActivities: [],
       sawInit: false,
       handoffSettling: null,

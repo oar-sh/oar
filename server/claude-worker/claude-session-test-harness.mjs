@@ -148,8 +148,60 @@ export function taskNotificationMessage(taskId, status = 'completed', { skipTran
   };
 }
 
+/**
+ * The live wire shape: snake_case under `compact_metadata`, and `post_tokens`
+ * absent on every auto-compact payload observed (conv 563e252e, 2026-08-20).
+ */
+export function compactBoundaryMessage({ preTokens = 614117, postTokens = null, trigger = 'auto' } = {}) {
+  return {
+    type: 'system',
+    subtype: 'compact_boundary',
+    compact_metadata: {
+      trigger,
+      pre_tokens: preTokens,
+      ...(postTokens === null ? {} : { post_tokens: postTokens }),
+    },
+  };
+}
+
+/**
+ * The CLI's compaction announcement. Emitted ONCE, when compaction starts: the
+ * bundle's 30 s re-emit is gated on the remote-control client's activity
+ * callback, which the plain SDK `query()` this worker uses never registers.
+ */
+export function compactingStatusMessage(status = 'compacting') {
+  return { type: 'system', subtype: 'status', status };
+}
+
+/**
+ * The INFERRED shape of what re-opens the turn after an auto-compaction: the
+ * CLI's own summary message, which matches no delivered entry's text. Read off
+ * the on-disk transcript (`isCompactSummary: true`) plus the runner's observed
+ * behaviour in conv 563e252e — not captured from the SDK stream. What the
+ * tests actually pin is the runner's response to ANY turn-opening user message
+ * that follows a compaction and matches nothing pending.
+ */
+export function compactSummaryReplay() {
+  return userReplay('This session is being continued from a previous conversation that ran out of context.\n\nSummary:\n1. Primary Request…');
+}
+
 export function userReplay(text) {
   return { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'text', text }] } };
+}
+
+/**
+ * A settled task's continuation as the SDK actually stamps it: `origin.kind`
+ * carries the provenance (SDKMessageOrigin) and `content` is a plain string,
+ * not a block array. Deliberately WITHOUT the `<task-notification>` tag in the
+ * text, so anything that passes only by tag-sniffing fails here.
+ */
+export function taskNotificationReplay(text = 'The background agent has finished its work.') {
+  return {
+    type: 'user',
+    parent_tool_use_id: null,
+    origin: { kind: 'task-notification' },
+    message: { role: 'user', content: text },
+  };
 }
 
 export function assistantText(text) {
