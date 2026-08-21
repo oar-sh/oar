@@ -111,9 +111,10 @@ test('the auto-compact control rides the same payload the modal renders', () => 
     autocompactSource: view.autocompactSource,
     isAutoCompactEnabled: view.isAutoCompactEnabled,
     maxTokens: view.maxTokens,
-    rawMaxTokens: view.rawMaxTokens,
   });
   assert.equal(view.autoCompactThreshold, 967000, 'tokens, not a percent');
+  // Still recorded end to end, just not rendered: it tracks the active window,
+  // not the model's limit.
   assert.equal(view.rawMaxTokens, 1000000);
   assert.match(html, /id="ctx-autocompact-value">200k</);
   assert.match(html, /compacts at 967\.0k of 1\.0M tokens · auto \(model-tuned\)/);

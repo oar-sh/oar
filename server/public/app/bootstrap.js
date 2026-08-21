@@ -2836,7 +2836,6 @@ async function loadContextSummaryAndRender(convId) {
         ? (payload.contextUsage.isAutoCompactEnabled ?? null)
         : null,
       maxTokens: payload.contextUsage?.maxTokens ?? null,
-      rawMaxTokens: payload.contextUsage?.rawMaxTokens ?? null,
     })
     : '';
   // The slider's writes need the conversation id even when the modal was

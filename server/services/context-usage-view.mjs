@@ -144,8 +144,9 @@ export function buildContextUsageView({ snapshot = null, contextUsage = null } =
     bufferTokens,
     bufferPercent: percentOf(bufferTokens, maxTokens),
     // A token count, not a percent — the CLI compacts once the conversation
-    // crosses it. `rawMaxTokens` is the model's own window, which the modal
-    // uses to mark slider stops the model cannot honor.
+    // crosses it. `rawMaxTokens` rides along as recorded (it tracks the active
+    // window setting, NOT the model's own limit — probed 2026-08-20 — so
+    // nothing may annotate the slider from it).
     autoCompactThreshold: toNullableInt(contextUsage?.autoCompactThreshold),
     rawMaxTokens: toNullableInt(contextUsage?.rawMaxTokens),
     autocompactSource: normalizeText(contextUsage?.autocompactSource) || null,

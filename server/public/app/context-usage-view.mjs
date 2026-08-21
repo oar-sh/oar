@@ -138,11 +138,12 @@ function autocompactSourceLabel(source) {
  * The Claude-only auto-compact window control: a snap-stop slider over
  * AUTO_COMPACT_WINDOW_STOPS plus the measured effective threshold.
  *
- * The setting is a token count the CLI clamps to the model's own window
- * (`min(setting, model max)`), so stops above `rawMaxTokens` are annotated
- * rather than hidden — the same conversation can move to a bigger model.
- * Applied on the next message delivery, which is why there is no live preview
- * of the effect.
+ * No stop is annotated as out of the model's reach: the payload carries no
+ * trustworthy model-limit field. `rawMaxTokens` tracks the ACTIVE setting, not
+ * the model's own window (probed on claude-opus-5[1m]: no setting → 1000000,
+ * setting 100000 → 100000), so annotating from it told a user who had just
+ * pinned 100k that every larger stop was pointless. Applied on the next
+ * message delivery, which is why there is no live preview of the effect.
  *
  * `isAutoCompactEnabled` is tri-state on purpose: `null`/`undefined` means the
  * runtime has not reported yet (no context-usage snapshot exists before the
@@ -157,17 +158,9 @@ export function renderAutoCompactControlHtml({
   autocompactSource = null,
   isAutoCompactEnabled = null,
   maxTokens = null,
-  rawMaxTokens = null,
 } = {}) {
   const window = parseAutoCompactWindow(autoCompactWindow);
   const index = autoCompactWindowToIndex(window);
-  const modelMax = toNullableNumber(rawMaxTokens) ?? toNullableNumber(maxTokens);
-  const cappedStops = AUTO_COMPACT_WINDOW_STOPS
-    .filter((stop) => stop !== null && modelMax !== null && stop > modelMax)
-    .map((stop) => formatAutoCompactWindowLabel(stop));
-  const cappedNote = cappedStops.length
-    ? `<div class="ctx-autocompact-note">${escapeHtml(cappedStops.join(', '))} capped to model limit (${escapeHtml(formatCompactTokens(modelMax))}).</div>`
-    : '';
 
   const threshold = toNullableNumber(autoCompactThreshold);
   const sourceLabel = autocompactSourceLabel(autocompactSource);
@@ -201,7 +194,6 @@ export function renderAutoCompactControlHtml({
         aria-label="Auto-compact window"
       >
       <div class="ctx-autocompact-effective">Effective: ${effective}</div>
-      ${cappedNote}
       ${disabledNote}
       <div class="ctx-autocompact-note">Applied on the next message in this conversation.</div>
     </div>
@@ -246,6 +238,13 @@ export function renderContextUsageHtml(usage) {
     })
     : '';
 
+  // Deferred tool definitions are listed by the SDK but left out of
+  // totalTokens, so the category rows legitimately sum higher than the
+  // headline. Without this the table reads as an arithmetic error.
+  const deferredNote = categories.some((category) => category.isDeferred === true)
+    ? '<div class="ctx-usage-note">Deferred tools are listed but not loaded, so they are not counted in the total.</div>'
+    : '';
+
   const estimateNote = usage.isEstimate
     ? `<div class="ctx-usage-note">${escapeHtml(estimateNoteText(usage.estimateKind))}</div>`
     : '';
@@ -259,6 +258,7 @@ export function renderContextUsageHtml(usage) {
       ${headline ? `<div class="ctx-usage-headline">${escapeHtml(headline)}</div>` : ''}
       <div class="ctx-usage-bar">${renderBarSegments(categories, usage.maxTokens)}</div>
       ${estimateNote}
+      ${deferredNote}
       ${capturedNote}
       <table class="ctx-usage-table">
         <thead>

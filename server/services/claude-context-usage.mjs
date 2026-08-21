@@ -87,8 +87,12 @@ export function normalizeClaudeContextUsage(raw) {
         tokens: toNullableInt(raw.skills.tokens),
       }
       : null,
-    // The model's own context window before any tier/override math. Used by
-    // the modal to cap the window slider at what the model can actually hold.
+    // NOT the model's own limit: probed on claude-opus-5[1m], it follows the
+    // ACTIVE auto-compact window (no setting → 1000000, setting 100000 →
+    // 100000). Recorded because the SDK reports it, and used as the fallback
+    // for a missing maxTokens above — never to say what a model can hold. The
+    // modal annotated slider stops from it until 2026-08-21 and so told users
+    // who had just narrowed the window that widening it again was pointless.
     rawMaxTokens: toNullableInt(raw.rawMaxTokens),
     // A TOKEN COUNT, not a percent: the CLI compacts once the conversation
     // crosses it (measured: 967000 on a 1M-window model). It was run through a
