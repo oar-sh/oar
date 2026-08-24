@@ -5,7 +5,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+// Same resolution as server-runtime.mjs: an isolated server (tests, secondary
+// installs) points COPILOT_WEB_RELAY_CONFIG elsewhere and must not inherit the
+// checkout's live feature flags.
+const CONFIG_PATH = process.env.COPILOT_WEB_RELAY_CONFIG
+  ? path.resolve(String(process.env.COPILOT_WEB_RELAY_CONFIG))
+  : path.join(__dirname, 'config.json');
 
 const DEFAULT_FEATURES = Object.freeze({
   SESSION_WORKER_ROUTING_ENABLED: false,

@@ -7,6 +7,7 @@ import {
 import { getActiveSession } from "../runtime/session-registry.mjs";
 import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
 import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
+import { EMPTY_TURN_COMPLETION_NOTE } from "../../../../shared/empty-turn-completion.mjs";
 import { stripPromptContextPrefix } from "../skills/prompt-context.mjs";
 
 function isImageAttachment(att) {
@@ -240,11 +241,19 @@ export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActiv
     return { action: "publish_generated_images_only", reason: "empty-final-text:generated-images" };
   }
   const activity = String(lastActivityText || "").trim();
+  if (activity) {
+    // The turn ran tools but produced no prose: a COMPLETED turn, not a
+    // failed delivery. Requeueing re-ran work whose emptiness was
+    // deterministic until the retry cap failed it (Claude/Cursor parity via
+    // the shared completion note).
+    return {
+      action: "publish_completion_note",
+      reason: `empty-final-text:last-activity:${activity.slice(0, 120)}`,
+    };
+  }
   return {
     action: "requeue",
-    reason: activity
-      ? `empty-final-text:last-activity:${activity.slice(0, 120)}`
-      : "empty-final-text:no-stream-or-text",
+    reason: "empty-final-text:no-stream-or-text",
   };
 }
 
@@ -928,6 +937,16 @@ export function createPollingLoop({
             messageId: message.id,
             conversationId: message.conversationId,
             text: "",
+            generatedImages,
+            model,
+            modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
+          });
+        } else if (emptyHandling.action === "publish_completion_note") {
+          dbg("sendAndWait returned empty content after tool activity; publishing completion note msgId", message.id, emptyHandling.reason || "");
+          await api("POST", "/api/response", {
+            messageId: message.id,
+            conversationId: message.conversationId,
+            text: EMPTY_TURN_COMPLETION_NOTE,
             generatedImages,
             model,
             modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",

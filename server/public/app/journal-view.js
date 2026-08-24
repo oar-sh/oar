@@ -1,6 +1,10 @@
 import {
   conversations,
   currentConvId,
+  workspaceRootPath,
+  defaultSessionWorkspaceRootPath,
+  getConversationCurrentWorkspaceRootPath,
+  getRecentWorkspaceRoots,
   fmtDate,
   parseTimestampMs,
   escHtml,
@@ -28,12 +32,16 @@ import {
   scheduleContextUsageRefresh,
   loadModelCatalog,
   loadClaudeSettings,
+  loadCursorSettings,
+  loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
+import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
-import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree } from './attachments-view.js';
+import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRepoBrowserLaunchCwdPath } from './attachments-view.js';
+import { buildKnownCwdOptions, normalizeKnownCwdPath } from './known-cwd-options.mjs';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import {
@@ -41,7 +49,11 @@ import {
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
 } from './new-conversation-model-choice.mjs';
-import { conversationProviderIndicatorLabel } from './conversation-provider-indicator.mjs';
+import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
+import {
+  conversationProviderIndicatorKey,
+  conversationProviderIndicatorLabel,
+} from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
@@ -49,14 +61,38 @@ const PROCESSING_DOT_INTERVAL_MS = 1000;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const CONVERSATION_LIST_PAGE_SIZE = 40;
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
+// Shared with the composer (bootstrap.js). The modal used to read and write its
+// own 'copilot_model' key, so a New Chat selection never reached the composer.
+// (bootstrap.js migrates the old key on startup.)
+const MODEL_STORAGE_KEY = 'copilot_selected_model';
+const MODE_STORAGE_KEY = 'copilot_selected_mode';
+// Claude 1M-context ids are stored as "model[1m]"; the modal only offers base ids.
+const CLAUDE_LONG_CONTEXT_PATTERN = /\[1m\]$/i;
 const OPENAI_IMAGE_SIZE_STORAGE_KEY = 'copilot_openai_image_size';
+const NEW_CHAT_CWD_STORAGE_KEY = 'copilot_new_chat_cwd';
+const NEW_CHAT_CUSTOM_CWD_VALUE = '__custom__';
 let processingDotFrame = 0;
 let processingDotTimer = null;
+let lastConvListHtml = '';
 let openConversationVersion = 0;
 let newConversationInFlight = false;
+
+// New Chat stays in flight until the created conversation is open, which takes
+// a sidebar refresh and a full message load. The button has to say so: it used
+// to look enabled the whole time while silently ignoring clicks.
+function setNewConversationInFlight(inFlight) {
+  newConversationInFlight = inFlight;
+  const button = document.getElementById('new-conv-btn');
+  if (!button) return;
+  button.disabled = inFlight;
+  if (inFlight) button.setAttribute('aria-busy', 'true');
+  else button.removeAttribute('aria-busy');
+}
 let newConversationCatalogCache = null;
 let newConversationOpenAISettingsCache = null;
 let newConversationClaudeSettingsCache = null;
+let newConversationCursorSettingsCache = null;
+let newConversationGrokSettingsCache = null;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -192,7 +228,12 @@ function ensureProcessingDotTimer(enabled) {
     if (processingDotTimer) return;
     processingDotTimer = setInterval(() => {
       processingDotFrame = (processingDotFrame + 1) % PROCESSING_DOT_FRAMES.length;
-      renderConvList();
+      // Touch only the dot spans: rewriting the whole list every second kills
+      // sidebar selections and burns battery for a spinner frame.
+      const frame = PROCESSING_DOT_FRAMES[processingDotFrame];
+      document.querySelectorAll('#conv-list .conv-processing-dots').forEach((el) => {
+        el.textContent = ` ${frame}`;
+      });
     }, PROCESSING_DOT_INTERVAL_MS);
     return;
   }
@@ -252,6 +293,7 @@ export function renderConvList() {
   if (sorted.length === 0) {
     ensureProcessingDotTimer(false);
     list.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">No conversations yet</div>';
+    lastConvListHtml = '';
     return;
   }
   const conversationView = (conversation) => {
@@ -267,20 +309,25 @@ export function renderConvList() {
     if (processing) hasProcessingConversation = true;
     return { visualState, processing };
   };
-  list.innerHTML = `${sorted.map((c) => {
+  const listHtml = `${sorted.map((c) => {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
     const providerIndicatorLabel = conversationProviderIndicatorLabel(c);
+    const providerIndicatorKey = conversationProviderIndicatorKey(c);
     const providerIndicatorHtml = providerIndicatorLabel
-      ? ` · <span class="conv-provider-indicator">${providerIndicatorLabel}</span>`
+      ? `<span class="conv-provider-indicator"${providerIndicatorKey ? ` data-provider="${providerIndicatorKey}"` : ''}>${providerIndicatorLabel}</span>`
       : '';
     return `
     <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}" onclick="openConversation('${c.id}')">
       <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${c.archived ? ' <span style="font-size:0.68rem;color:var(--muted)">(archived)</span>' : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}${providerIndicatorHtml}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${providerIndicatorHtml}</div>
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
   }).join('')}${footerHtml}`;
+  if (listHtml !== lastConvListHtml) {
+    list.innerHTML = listHtml;
+    lastConvListHtml = listHtml;
+  }
   ensureProcessingDotTimer(hasProcessingConversation);
   window.syncChatTitleControls?.();
   scheduleConversationListBoundaryCheck();
@@ -338,16 +385,20 @@ export function applyLoadedConversationState(id, response, {
     preferredReasoningEffort: response.preferredReasoningEffort,
   });
   setRepoBrowserSessionInfo(response.sessionRootPath || '', response.sessionRootName || response.title || '');
-  if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
-    void loadRepoBrowserTree();
-  }
+  // The repo tree deliberately does NOT reload here: this runs on the 900ms
+  // live poll, and the bare loadRepoBrowserTree path resets loaded folders and
+  // deep selections. The end-of-turn message_status handler refreshes the tree
+  // through the restoring path instead.
   const didRenderMessages = renderMessages(response.messages, !restoreScroll, response);
   hydrateConversationDraft(id, {
     draftText: response.draftText,
+    draftAttachments: response.draftAttachments,
     draftUpdatedAt: response.draftUpdatedAt,
     draftUpdatedByClientId: response.draftUpdatedByClientId,
   });
   restoreInFlightThinking(response.inFlight || null, followLiveUpdates);
+  setBackgroundTasksConversation(id);
+  setConversationBackgroundTasks(id, response.backgroundTasks || []);
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
   if (!restoreScroll || !didRenderMessages) return;
@@ -458,6 +509,8 @@ function normalizeNewConversationProviderType(value = '') {
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude') return 'claude';
+  if (normalized === 'cursor') return 'cursor';
+  if (normalized === 'grok') return 'grok';
   return 'github';
 }
 
@@ -493,6 +546,8 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   const wantsOpenAI = normalizedProvider === 'openai' || normalizedProvider === 'openai-image';
   const hasOpenAIByok = providers.includes('openai-byok');
   const hasClaude = providers.includes('claude');
+  const hasCursor = providers.includes('cursor');
+  const hasGrok = providers.includes('grok');
   if (wantsOpenAI) {
     if (hasOpenAIByok) return true;
     const settingsModel = String(newConversationOpenAISettingsCache?.model || '').trim();
@@ -512,9 +567,34 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
       : [];
     return normalizedModelId === claudeModel || claudeModels.includes(normalizedModelId);
   }
+  if (normalizedProvider === 'cursor') {
+    if (hasCursor) return true;
+    const cursorModel = String(newConversationCursorSettingsCache?.model || '').trim();
+    const cursorModels = Array.isArray(newConversationCursorSettingsCache?.models)
+      ? newConversationCursorSettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    return normalizedModelId === cursorModel || cursorModels.includes(normalizedModelId);
+  }
+  if (normalizedProvider === 'grok') {
+    if (hasGrok) return true;
+    const grokModel = String(newConversationGrokSettingsCache?.model || '').trim();
+    const grokModels = Array.isArray(newConversationGrokSettingsCache?.models)
+      ? newConversationGrokSettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    return normalizedModelId === grokModel || grokModels.includes(normalizedModelId);
+  }
   const claudeOnly = hasClaude && providers.every((provider) => provider === 'claude');
   if (claudeOnly) return false;
-  return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude') || !hasOpenAIByok;
+  const cursorOnly = hasCursor && providers.every((provider) => provider === 'cursor');
+  if (cursorOnly) return false;
+  const grokOnly = hasGrok && providers.every((provider) => provider === 'grok');
+  if (grokOnly) return false;
+  return providers.some((provider) => (
+    provider !== 'openai-byok'
+    && provider !== 'claude'
+    && provider !== 'cursor'
+    && provider !== 'grok'
+  )) || !hasOpenAIByok;
 }
 
 function openAIImageSizesForModel(modelId = '') {
@@ -588,10 +668,13 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
     if (status) status.textContent = 'Reasoning metadata unavailable for this model.';
     return;
   }
+  const reasoningOffUnsupported = isReasoningOffUnsupported(catalog, provider, modelId);
   for (const effort of efforts) {
     const option = document.createElement('option');
     option.value = effort;
-    option.textContent = effort;
+    option.textContent = reasoningEffortOptionLabel(effort, { reasoningOffUnsupported });
+    const optionTitle = reasoningEffortOptionTitle(effort);
+    if (optionTitle) option.title = optionTitle;
     select.appendChild(option);
   }
   const preferred = resolvePreferredReasoningEffort(efforts, [
@@ -604,6 +687,10 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
       ? 'Choose output quality for generated images.'
       : 'Choose the effort used when this conversation starts.';
   }
+}
+
+function storedComposerModel() {
+  return String(localStorage.getItem(MODEL_STORAGE_KEY) || '').trim();
 }
 
 function updateNewConversationProviderHelp(provider = 'github') {
@@ -620,6 +707,14 @@ function updateNewConversationProviderHelp(provider = 'github') {
   }
   if (normalizedProvider === 'claude') {
     help.textContent = "Claude chats run through the Claude Agent SDK with the relay host's Claude login.";
+    return;
+  }
+  if (normalizedProvider === 'cursor') {
+    help.textContent = 'Cursor chats run through the Cursor Agent SDK using your saved Cursor API key.';
+    return;
+  }
+  if (normalizedProvider === 'grok') {
+    help.textContent = "Grok chats use the host machine's logged-in Grok credentials (grok login or XAI_API_KEY).";
     return;
   }
   help.textContent = 'Copilot models use your GitHub Copilot runtime.';
@@ -660,7 +755,7 @@ async function populateNewConversationModelSelect(providerType = 'github') {
     target.appendChild(option);
   }
   if (!target.options.length) return false;
-  const storedModel = String(localStorage.getItem('copilot_model') || '').trim();
+  const storedModel = storedComposerModel();
   if (storedModel && Array.from(target.options).some((option) => option.value === storedModel)) {
     target.value = storedModel;
   } else if (normalizedProvider !== 'openai-image' && Array.from(target.options).some((option) => option.value === 'auto')) {
@@ -673,15 +768,110 @@ async function populateNewConversationModelSelect(providerType = 'github') {
   return true;
 }
 
+function resolveNewConversationDefaultCwd() {
+  return normalizeKnownCwdPath(defaultSessionWorkspaceRootPath || workspaceRootPath || '');
+}
+
+function getNewConversationSelectedCwd() {
+  const select = document.getElementById('new-conversation-cwd-select');
+  if (!select) return '';
+  if (select.value === NEW_CHAT_CUSTOM_CWD_VALUE) {
+    return normalizeKnownCwdPath(document.getElementById('new-conversation-cwd-manual')?.value || '');
+  }
+  return normalizeKnownCwdPath(select.value || '');
+}
+
+function syncNewConversationCwdControls() {
+  const select = document.getElementById('new-conversation-cwd-select');
+  const manual = document.getElementById('new-conversation-cwd-manual');
+  const status = document.getElementById('new-conversation-cwd-status');
+  if (!select) return;
+  const isCustom = select.value === NEW_CHAT_CUSTOM_CWD_VALUE;
+  if (manual) manual.hidden = !isCustom;
+  if (!status) return;
+  if (isCustom) {
+    const manualPath = normalizeKnownCwdPath(manual?.value || '');
+    status.textContent = manualPath
+      ? `This chat starts in ${manualPath}.`
+      : 'Enter the full path of the launch directory on the relay host.';
+    return;
+  }
+  const selectedPath = normalizeKnownCwdPath(select.value || '');
+  if (selectedPath) {
+    status.textContent = `This chat starts in ${selectedPath}.`;
+    return;
+  }
+  const defaultPath = resolveNewConversationDefaultCwd();
+  status.textContent = defaultPath
+    ? `This chat starts in ${defaultPath} (relay default).`
+    : 'This chat starts in the relay default directory.';
+}
+
+function populateNewConversationCwdSelect() {
+  const select = document.getElementById('new-conversation-cwd-select');
+  if (!select) return;
+  const options = buildKnownCwdOptions({
+    currentSessionCwd: getConversationCurrentWorkspaceRootPath(currentConvId) || '',
+    workspaceRootPath,
+    browserCwd: getRepoBrowserLaunchCwdPath(),
+    recentRoots: getRecentWorkspaceRoots(),
+  });
+  select.innerHTML = '';
+  const defaultPath = resolveNewConversationDefaultCwd();
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  defaultOption.textContent = defaultPath ? `Default (${defaultPath})` : 'Default';
+  select.appendChild(defaultOption);
+  for (const option of options) {
+    const entry = document.createElement('option');
+    entry.value = option.path;
+    entry.textContent = option.path;
+    entry.title = option.note ? `${option.label} (${option.note})` : option.label;
+    select.appendChild(entry);
+  }
+  const customOption = document.createElement('option');
+  customOption.value = NEW_CHAT_CUSTOM_CWD_VALUE;
+  customOption.textContent = 'Custom path…';
+  select.appendChild(customOption);
+  const storedCwd = normalizeKnownCwdPath(localStorage.getItem(NEW_CHAT_CWD_STORAGE_KEY) || '');
+  if (storedCwd) {
+    const storedKey = storedCwd.toLowerCase();
+    const match = Array.from(select.options).find((option) => (
+      option.value !== NEW_CHAT_CUSTOM_CWD_VALUE
+      && normalizeKnownCwdPath(option.value).toLowerCase() === storedKey
+    ));
+    if (match) select.value = match.value;
+  }
+  if (select.dataset.cwdBound !== '1') {
+    select.dataset.cwdBound = '1';
+    select.addEventListener('change', () => {
+      syncNewConversationCwdControls();
+      if (select.value === NEW_CHAT_CUSTOM_CWD_VALUE) {
+        document.getElementById('new-conversation-cwd-manual')?.focus?.();
+      }
+    });
+  }
+  const manual = document.getElementById('new-conversation-cwd-manual');
+  if (manual && manual.dataset.cwdBound !== '1') {
+    manual.dataset.cwdBound = '1';
+    manual.addEventListener('input', syncNewConversationCwdControls);
+  }
+  syncNewConversationCwdControls();
+}
+
 async function openNewConversationModelModal() {
-  const [catalog, settings, claudeSettings] = await Promise.all([
+  const [catalog, settings, claudeSettings, cursorSettings, grokSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
     loadClaudeSettings(),
+    loadCursorSettings(),
+    loadGrokSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
   newConversationClaudeSettingsCache = claudeSettings || null;
+  newConversationCursorSettingsCache = cursorSettings || null;
+  newConversationGrokSettingsCache = grokSettings || null;
   const providerSelect = document.getElementById('new-conversation-provider-select');
   if (providerSelect) {
     const options = [{ value: 'github', label: 'Copilot' }];
@@ -690,7 +880,13 @@ async function openNewConversationModelModal() {
       options.push({ value: 'openai-image', label: 'OpenAI Image (BYOK)' });
     }
     if (claudeSettings?.enabled === true) {
-      options.push({ value: 'claude', label: 'Claude (Agent SDK)' });
+      options.push({ value: 'claude', label: 'Claude SDK' });
+    }
+    if (cursorSettings?.enabled === true) {
+      options.push({ value: 'cursor', label: 'Cursor SDK' });
+    }
+    if (grokSettings?.enabled === true) {
+      options.push({ value: 'grok', label: 'Grok' });
     }
     providerSelect.innerHTML = '';
     for (const option of options) {
@@ -699,6 +895,9 @@ async function openNewConversationModelModal() {
       entry.textContent = option.label;
       providerSelect.appendChild(entry);
     }
+    // With Copilot alone the provider row is a single dead option — hide it.
+    const providerRow = document.getElementById('new-conversation-provider-row');
+    if (providerRow) providerRow.hidden = options.length <= 1;
     const preferredProvider = 'github';
     providerSelect.value = options.some((option) => option.value === preferredProvider)
       ? preferredProvider
@@ -724,6 +923,7 @@ async function openNewConversationModelModal() {
       void populateNewConversationReasoningSelect(modelSelect.value);
     });
   }
+  populateNewConversationCwdSelect();
   const modal = document.getElementById('new-conversation-model-modal');
   if (!modal) return;
   modal.classList.add('visible');
@@ -731,29 +931,65 @@ async function openNewConversationModelModal() {
   setTimeout(() => document.getElementById('new-conversation-model-select')?.focus(), 0);
 }
 
-export function closeNewConversationModelModal() {
-  if (newConversationInFlight) return;
+function hideNewConversationModelModal() {
   const modal = document.getElementById('new-conversation-model-modal');
   modal?.classList.remove('visible');
   modal?.setAttribute('aria-hidden', 'true');
 }
 
-function persistReasoningSelection(reasoningEffort = '') {
-  const effort = String(reasoningEffort || '').trim().toLowerCase();
-  if (!effort) return;
-  localStorage.setItem(REASONING_STORAGE_KEY, effort);
-  const composerReasoningSelect = document.getElementById('reasoning-effort-select');
-  if (composerReasoningSelect && Array.from(composerReasoningSelect.options || []).some((option) => option.value === effort)) {
-    composerReasoningSelect.value = effort;
+export function closeNewConversationModelModal() {
+  if (newConversationInFlight) return;
+  hideNewConversationModelModal();
+}
+
+// The only writer of the shared "last used" keys on this path, and only once
+// the bootstrap has succeeded: an abandoned or rejected New Chat must not
+// change what the open conversation or the next one starts with.
+function rememberBootstrappedSelection(result = null) {
+  const bootstrappedModel = String(result?.preferredModel || result?.selectedModel || '')
+    .trim()
+    // The composer stores base ids and carries the 1M tier separately.
+    .replace(CLAUDE_LONG_CONTEXT_PATTERN, '');
+  if (bootstrappedModel) localStorage.setItem(MODEL_STORAGE_KEY, bootstrappedModel);
+  const bootstrappedEffort = String(result?.preferredReasoningEffort || '').trim().toLowerCase();
+  if (bootstrappedEffort) localStorage.setItem(REASONING_STORAGE_KEY, bootstrappedEffort);
+}
+
+// The conversation row exists in both the success and the worker-prestart
+// failure case, so both take the same post-create steps.
+async function openBootstrappedConversation({
+  conversationId,
+  payload,
+  selectedCwd = '',
+  selectedProvider = '',
+  selectedSize = '',
+}) {
+  // Only a bootstrap that actually created the conversation makes the CWD
+  // choice sticky, so a rejected path can never become the next chat's default.
+  try {
+    if (selectedCwd) localStorage.setItem(NEW_CHAT_CWD_STORAGE_KEY, selectedCwd);
+    else localStorage.removeItem(NEW_CHAT_CWD_STORAGE_KEY);
+  } catch {}
+  hideNewConversationModelModal();
+  // The server echoes what it actually bound and stored; the composer picks
+  // those up from the conversation row when it opens, so only the shared
+  // "last used" storage is updated here.
+  rememberBootstrappedSelection(payload);
+  await refreshConversations();
+  await openConversation(conversationId);
+  if (selectedProvider === 'openai-image') {
+    const contextTierSelect = document.getElementById('context-tier-select');
+    if (contextTierSelect && selectedSize && Array.from(contextTierSelect.options).some((option) => option.value === selectedSize)) {
+      contextTierSelect.value = selectedSize;
+    }
   }
 }
 
-async function createNewConversation(selectedModel, selectedReasoningEffort = '') {
+async function createNewConversation(selectedModel, selectedReasoningEffort = '', selectedCwd = '') {
   if (newConversationInFlight) return;
-  newConversationInFlight = true;
+  setNewConversationInFlight(true);
   const confirmButton = document.getElementById('new-conversation-model-confirm');
   if (confirmButton) confirmButton.disabled = true;
-  persistReasoningSelection(selectedReasoningEffort);
   const selectedProvider = normalizeNewConversationProviderType(
     String(document.getElementById('new-conversation-provider-select')?.value || '').trim(),
   );
@@ -766,6 +1002,16 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       model: selectedModel || undefined,
       providerType: bootstrapProviderType(selectedProvider),
       reasoningEffort: String(selectedReasoningEffort || '').trim().toLowerCase() || undefined,
+      // Bootstrap writes the conversation's preferences, so the current mode has
+      // to travel with it or every new chat would come back as the default one.
+      // The composer's selector wins over storage: storage holds the last
+      // explicit choice, which is not the mode of the conversation on screen.
+      relayMode: String(
+        document.getElementById('mode-select')?.value
+        || localStorage.getItem(MODE_STORAGE_KEY)
+        || '',
+      ).trim() || undefined,
+      workspaceRootPath: selectedCwd || undefined,
       title: 'New Conversation',
     });
     const nextConversationId = String(result?.conversationId || '').trim();
@@ -773,32 +1019,52 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       showTransientRelayNotice('Could not start a new conversation session. Please try again.');
       return;
     }
-    const bootstrappedModel = String(result?.selectedModel || '').trim();
-    if (bootstrappedModel) {
-      localStorage.setItem('copilot_model', bootstrappedModel);
-      const modelSelect = document.getElementById('model-select');
-      if (Array.from(modelSelect?.options || []).some((option) => option.value === bootstrappedModel)) {
-        modelSelect.value = bootstrappedModel;
-      }
-    }
-    await refreshConversations();
-    await openConversation(nextConversationId);
-    if (selectedProvider === 'openai-image') {
-      const contextTierSelect = document.getElementById('context-tier-select');
-      if (contextTierSelect && selectedSize && Array.from(contextTierSelect.options).some((option) => option.value === selectedSize)) {
-        contextTierSelect.value = selectedSize;
-      }
-    }
+    await openBootstrappedConversation({
+      conversationId: nextConversationId,
+      payload: result,
+      selectedCwd,
+      selectedProvider,
+      selectedSize,
+    });
     if (result?.warning) {
       showTransientRelayNotice(String(result.warning), 6000);
+    }
+    if (result?.workspaceRootWarning) {
+      showTransientRelayNotice(String(result.workspaceRootWarning), 7000);
     }
     if (result?.defaultSessionWorkspaceRootWarning) {
       showTransientRelayNotice(String(result.defaultSessionWorkspaceRootWarning), 7000);
     }
   } catch (error) {
-    showTransientRelayNotice(error?.message || 'Could not start a new conversation session.');
+    // A worker that fails to prestart still leaves a committed conversation
+    // bound to the requested provider. Open it so the user can retry from the
+    // chat instead of hunting for an orphaned row in the sidebar.
+    const createdConversationId = error?.payload?.conversationCreated
+      ? String(error.payload.conversationId || '').trim()
+      : '';
+    let recovered = false;
+    if (createdConversationId) {
+      try {
+        await openBootstrappedConversation({
+          conversationId: createdConversationId,
+          payload: error.payload,
+          selectedCwd,
+          selectedProvider,
+          selectedSize,
+        });
+        recovered = true;
+      } catch {
+        // Fall through to the failure notice below with the modal closed; the
+        // conversation exists and the sidebar refresh will show it.
+      }
+    }
+    showTransientRelayNotice(recovered
+      // The chat is usable, but its worker did not start, so say what broke.
+      ? `The chat was created, but its session could not start: ${error?.message || 'unknown error'}.`
+      // Otherwise the modal stays open so the user can fix the CWD/model and retry.
+      : (error?.message || 'Could not start a new conversation session.'));
   } finally {
-    newConversationInFlight = false;
+    setNewConversationInFlight(false);
     if (confirmButton) confirmButton.disabled = false;
   }
 }
@@ -808,10 +1074,10 @@ export async function confirmNewConversationModel() {
   const selectedModel = String(document.getElementById('new-conversation-model-select')?.value || '').trim();
   const selectedReasoningEffort = String(document.getElementById('new-conversation-reasoning-select')?.value || '').trim().toLowerCase();
   if (!selectedModel) return;
-  const modal = document.getElementById('new-conversation-model-modal');
-  modal?.classList.remove('visible');
-  modal?.setAttribute('aria-hidden', 'true');
-  await createNewConversation(selectedModel, selectedReasoningEffort);
+  const selectedCwd = getNewConversationSelectedCwd();
+  // The modal stays open until the bootstrap succeeds; createNewConversation
+  // closes it, so a rejected CWD or model keeps the selection editable.
+  await createNewConversation(selectedModel, selectedReasoningEffort, selectedCwd);
 }
 
 export async function newConversation() {
@@ -820,13 +1086,7 @@ export async function newConversation() {
     return;
   }
   if (newConversationInFlight) return;
-  const settings = await loadOpenAISettings();
-  if (settings?.enabled === true) {
-    void openNewConversationModelModal();
-    return;
-  }
-  const selectedModel = String(document.getElementById('model-select')?.value || '').trim();
-  await createNewConversation(selectedModel);
+  await openNewConversationModelModal();
 }
 
 export function initConversationListLazyLoading() {

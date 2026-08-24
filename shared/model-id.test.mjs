@@ -8,9 +8,19 @@ import {
   filterValidModelIds,
   isClaudeLongContextModelId,
   isOpenAIModelId,
+  isSafeCursorModelId,
   isSafeProviderModelId,
   isValidModelId,
 } from './model-id.mjs';
+
+test('isSafeCursorModelId accepts unprefixed cursor ids and rejects unsafe text', () => {
+  assert.equal(isSafeCursorModelId('composer-2.5'), true);
+  assert.equal(isSafeCursorModelId('gpt-5.5'), true);
+  assert.equal(isSafeCursorModelId('auto-smart'), true);
+  assert.equal(isSafeCursorModelId('bad model !!'), false);
+  assert.equal(isSafeCursorModelId(''), false);
+  assert.equal(isSafeCursorModelId(`m${'x'.repeat(130)}`), false);
+});
 
 test('claude long-context helpers compose and strip the [1m] suffix', () => {
   assert.equal(isClaudeLongContextModelId('claude-opus-5[1m]'), true);
@@ -115,6 +125,17 @@ test('canonicalizeModelId normalizes provider-prefixed and cased ids', () => {
   assert.equal(canonicalizeModelId('OpenAI/GPT-5.4'), 'gpt-5.4');
   assert.equal(canonicalizeModelId('ANTHROPIC/claude-sonnet-4.6'), 'claude-sonnet-4.6');
   assert.equal(canonicalizeModelId('GPT-5.3-Codex'), 'gpt-5.3-codex');
+});
+
+test('canonicalizeModelId strips provider prefixes from bare o1/o3 ids', () => {
+  assert.equal(canonicalizeModelId('openai/o1'), 'o1');
+  assert.equal(canonicalizeModelId('openai/o3'), 'o3');
+  assert.equal(canonicalizeModelId('o1'), 'o1');
+  assert.equal(canonicalizeModelId('openai/other-model'), 'openai/other-model');
+});
+
+test('filterValidModelIds dedupes bare and provider-prefixed o1', () => {
+  assert.deepEqual(filterValidModelIds(['o1', 'openai/o1']), ['o1']);
 });
 
 test('filterValidModelIds dedupes case and provider aliases', () => {

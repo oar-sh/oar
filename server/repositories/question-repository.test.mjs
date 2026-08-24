@@ -74,6 +74,14 @@ function makeDb() {
       updated_at TEXT NOT NULL,
       completed_at TEXT
     );
+    CREATE TABLE workflow_runs (
+      id TEXT PRIMARY KEY,
+      response_message_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      run_index INTEGER NOT NULL DEFAULT 0,
+      digest_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE queue (
       id TEXT PRIMARY KEY,
       conversation_id TEXT,

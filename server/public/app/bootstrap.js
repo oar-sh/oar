@@ -60,6 +60,8 @@ import {
   refreshModelVariantCatalog,
   saveEnabledModelVariants,
   updateClaudeSettings,
+  updateCursorSettings,
+  updateGrokSettings,
   loadConversation,
   refreshConversationHistory,
   updateConversationTitle,
@@ -94,6 +96,7 @@ import {
   getConversationLoadedMessageCount,
   loadOlderConversationMessages,
   syncComposerControlState,
+  persistComposerAttachments,
   flushConversationDraft,
   initConversationHistoryLazyLoading,
   initBubbleActionHandlers,
@@ -101,22 +104,56 @@ import {
   setImageEditTarget,
   clearImageEditTarget,
   jumpToImageParent,
+  flushDeferredMessageRender,
 } from './conversation-view.js';
+import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
-import { handleAttachmentInput, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
-import { resolveConversationComposerSelection } from './conversation-preferences.mjs';
+import { dataTransferHasFiles } from './composer-paste.mjs';
+import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
+import {
+  firstDefinedPreference,
+  normalizePreferenceValue,
+  resolveComposerReasoningEffort,
+  resolveConversationComposerSelection,
+} from './conversation-preferences.mjs';
 import {
   modelSelectorOptionsEqual,
   normalizeModelSelectorOptions,
 } from './model-selector-options.mjs';
 import {
+  isOpenAIImageModelId,
+  sessionLockNoteText,
+  sessionLockProviderKey,
+} from './conversation-provider-indicator.mjs';
+import {
   initMessageSearchView,
   openMessageSearchModal,
   closeMessageSearchModal,
 } from './message-search-view.js';
+import {
+  initGitChangesView,
+  openGitChangesModal,
+  closeGitChangesModal,
+  openGitDiffViewer,
+  closeGitDiffViewer,
+  setGitDiffMode,
+} from './git-changes-view.js';
 
-import { initSocketHandlers, connectSocket, setSocketActivityEnabled } from './socket-handlers.js';
+import {
+  initSocketHandlers,
+  connectSocket,
+  setSocketActivityEnabled,
+  ensureSocketConnected,
+  hardResetSocket,
+  verifySocketLiveness,
+  emitDeviceVisibility,
+} from './socket-handlers.js';
+import {
+  adviseWatchdogTick,
+  RELAY_WATCHDOG_HARD_RESET_TICKS,
+} from './relay-watchdog-policy.mjs';
 import {
   initInstallButton,
   initFullscreenButton,
@@ -127,8 +164,9 @@ import {
   updatePwaAppName,
 } from './pwa-install.js';
 import { renderContextUsageHtml } from './context-usage-view.mjs';
+import { renderPlanUsageHtml, planUsageSubtitle } from './plan-usage-view.mjs';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
-import { initClientDiagnostics } from './status-store.mjs';
+import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
 import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
 import { installExternalLinkPolicy, openExternalNavigation } from './external-link-policy.mjs';
 import {
@@ -192,10 +230,35 @@ import {
   toggleClaudeProvider,
   applyClaudeSettingsState,
   refreshClaudeSettingsState,
+  saveGrokSettings,
+  toggleGrokProvider,
+  applyGrokSettingsState,
+  refreshGrokSettingsState,
+  saveCursorSettings,
+  removeCursorSettings,
+  saveCursorAllowanceSettings,
+  resetCursorAllowanceAccounting,
+  saveCursorDashboardToken,
+  removeCursorDashboardToken,
+  saveGrokAllowanceSettings,
+  resetGrokAllowanceAccounting,
+  toggleCursorProvider,
+  applyCursorSettingsState,
+  refreshCursorSettingsState,
   updateWindowsAutostartSettingFromToggle,
   previewTurnCeilingSetting,
   updateTurnCeilingSetting,
+  previewBackgroundTaskTimeoutSetting,
+  updateBackgroundTaskTimeoutSetting,
 } from './settings-modal.js';
+import {
+  togglePushOnThisDevice,
+  updatePushPreferencesFromControls,
+} from './push-settings.js';
+import {
+  enqueueDraftFlushForBackgroundSync,
+  initOutboxFallbackReplay,
+} from './sync-outbox.mjs';
 import {
   initActionConfirmations,
   openKillSessionConfirmation,
@@ -209,6 +272,9 @@ import {
 } from './action-confirmations.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
+// The New Chat modal used to keep its own model key, so a selection made there
+// never reached the composer. Both now read MODEL_STORAGE_KEY.
+const LEGACY_MODEL_STORAGE_KEY = 'copilot_model';
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
 const MODE_STORAGE_KEY = 'copilot_selected_mode';
 const AUTO_MODEL_OPTION = 'auto';
@@ -221,8 +287,11 @@ const FALLBACK_MODE = 'agent';
 const PROVIDER_LABELS = {
   openai: 'OpenAI',
   'openai-byok': 'OpenAI (BYOK)',
-  claude: 'Anthropic (Claude SDK)',
+  claude: 'Claude SDK',
+  cursor: 'Cursor SDK',
+  grok: 'Grok',
   'github-copilot': 'GitHub Copilot',
+  // Vendor grouping for Copilot-served rows, distinct from the Claude SDK runtime.
   anthropic: 'Anthropic',
   google: 'Google',
   microsoft: 'Microsoft',
@@ -230,6 +299,27 @@ const PROVIDER_LABELS = {
 };
 const CHAT_TITLE_MAX_LENGTH = 120;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
+const FOREGROUND_RECOVERY_DEBOUNCE_MS = 1000;
+// Upper bound on how long the in-flight latch may stay set. A recovery request
+// that never settles (frozen renderer, half-open mobile socket) must not be able
+// to keep the latch closed, because that would suppress every later recovery.
+const FOREGROUND_RECOVERY_TIMEOUT_MS = 20000;
+const RELAY_WATCHDOG_INTERVAL_MS = 5000;
+// The server treats a visibility report older than 90s as stale, so a foregrounded
+// device has to keep re-asserting itself or it silently stops counting as active
+// and push suppression stops working mid-turn. 30s leaves room for two dropped
+// beats inside that window. Tests shorten this rather than waiting it out.
+const DEVICE_VISIBILITY_HEARTBEAT_MS = Number.isFinite(Number(window.__COPILOT_VISIBILITY_HEARTBEAT_MS))
+  ? Math.max(50, Number(window.__COPILOT_VISIBILITY_HEARTBEAT_MS))
+  : 30_000;
+// How long a hidden page keeps its transport before suspending it. Brief
+// app switches then never drop the socket at all. 45s matches the server's
+// ping window (pingInterval 25s + pingTimeout 20s): past that the server has
+// already dropped the client, so waiting longer would be inert. Tests override
+// this to avoid waiting out the real grace period.
+const BACKGROUND_SUSPEND_GRACE_MS = Number.isFinite(Number(window.__COPILOT_BACKGROUND_GRACE_MS))
+  ? Math.max(0, Number(window.__COPILOT_BACKGROUND_GRACE_MS))
+  : 45_000;
 
 let relayQuestionPollTimer = null;
 let relayBoardPollTimer = null;
@@ -247,6 +337,12 @@ let sharedConversationLastError = '';
 let networkLifecycleBound = false;
 let foregroundRecoveryTimer = null;
 let foregroundRecoveryInFlight = false;
+let foregroundRecoveryWatchdogTimer = null;
+let foregroundRecoveryGeneration = 0;
+let relayConnectionWatchdogTimer = null;
+let relayWatchdogDisconnectedTicks = 0;
+let deviceVisibilityHeartbeatTimer = null;
+let backgroundSuspendTimer = null;
 let appSharedMode = false;
 let viewportBaseHeight = window.innerHeight || document.documentElement.clientHeight || 0;
 let chatTitleEditingConversationId = null;
@@ -406,8 +502,15 @@ function stopSharedModeTimers() {
   liveConversationPollInFlight = false;
 }
 
+function isAppForegrounded() {
+  return document.visibilityState === 'visible';
+}
+
+// Polling gates on foreground state alone. It deliberately ignores the recovery
+// latch: polling is the fallback that keeps the UI current while the socket is
+// down, so a slow or stalled recovery pass must not silence it.
 function shouldRunForegroundNetworkWork() {
-  return document.visibilityState === 'visible' && !foregroundRecoveryInFlight;
+  return isAppForegrounded();
 }
 
 function setForegroundNetworkWorkEnabled(enabled) {
@@ -416,35 +519,190 @@ function setForegroundNetworkWorkEnabled(enabled) {
   setSocketActivityEnabled(next);
 }
 
+function clearForegroundRecoveryLatch() {
+  if (foregroundRecoveryWatchdogTimer) {
+    clearTimeout(foregroundRecoveryWatchdogTimer);
+    foregroundRecoveryWatchdogTimer = null;
+  }
+  foregroundRecoveryInFlight = false;
+}
+
 async function runForegroundRecovery(reason = 'visible') {
-  if (document.visibilityState !== 'visible') return;
-  if (foregroundRecoveryInFlight) return;
-  foregroundRecoveryInFlight = true;
+  if (!isAppForegrounded()) return;
+  // Re-enabling the transport happens ahead of the stampede guard. An explicit
+  // socket.disconnect() drops socket.io's own reconnect subscriptions, so this is
+  // the only route back online and it must never be skippable.
   setForegroundNetworkWorkEnabled(true);
+  if (foregroundRecoveryInFlight) {
+    recordStatusEvent('foreground-recovery-skipped', { reason });
+    return;
+  }
+  const generation = ++foregroundRecoveryGeneration;
+  foregroundRecoveryInFlight = true;
+  foregroundRecoveryWatchdogTimer = setTimeout(() => {
+    foregroundRecoveryWatchdogTimer = null;
+    foregroundRecoveryInFlight = false;
+    recordStatusEvent('foreground-recovery-timeout', {
+      reason,
+      timeoutMs: FOREGROUND_RECOVERY_TIMEOUT_MS,
+    });
+  }, FOREGROUND_RECOVERY_TIMEOUT_MS);
   try {
     if (appSharedMode) {
       await refreshSharedConversation();
       await pulseSharedViewerPresence();
       return;
     }
-    await refreshSessionWorkerStatus();
-    await refreshCurrentView();
-    await refreshModelCatalog(true);
-    await loadRelayQuestions(currentConvId);
-    await loadRelayBoards();
+    // Each step recovers a different slice of missed state; isolate their
+    // failures so one fetch losing a race with a restarting relay cannot
+    // skip the rest — refreshCurrentView in particular is the only
+    // correction path for change events this client missed while suspended
+    // (an emptied background-task store never re-announces itself).
+    const recoverySteps = [
+      ['session-worker-status', () => refreshSessionWorkerStatus()],
+      ['current-view', () => refreshCurrentView()],
+      ['model-catalog', () => refreshModelCatalog(true)],
+      ['relay-questions', () => loadRelayQuestions(currentConvId)],
+      ['relay-boards', () => loadRelayBoards()],
+    ];
+    for (const [step, run] of recoverySteps) {
+      try {
+        await run();
+      } catch (error) {
+        console.warn(`[foreground-recovery:${reason}] ${step}`, error?.message || error);
+      }
+    }
   } catch (error) {
     console.warn(`[foreground-recovery:${reason}]`, error?.message || error);
   } finally {
-    foregroundRecoveryInFlight = false;
+    // The watchdog may already have released the latch and let a newer pass take
+    // ownership; only the pass that still owns it may clear it.
+    if (foregroundRecoveryGeneration === generation) clearForegroundRecoveryLatch();
   }
 }
 
-function scheduleForegroundRecovery(reason = 'visible') {
-  if (foregroundRecoveryTimer) clearTimeout(foregroundRecoveryTimer);
+function scheduleForegroundRecovery(reason = 'visible', { immediate = false } = {}) {
+  if (foregroundRecoveryTimer) {
+    clearTimeout(foregroundRecoveryTimer);
+    foregroundRecoveryTimer = null;
+  }
+  if (immediate) {
+    void runForegroundRecovery(reason);
+    return;
+  }
   foregroundRecoveryTimer = setTimeout(() => {
     foregroundRecoveryTimer = null;
     void runForegroundRecovery(reason);
-  }, 1000);
+  }, FOREGROUND_RECOVERY_DEBOUNCE_MS);
+}
+
+function cancelBackgroundSuspend() {
+  if (!backgroundSuspendTimer) return;
+  clearTimeout(backgroundSuspendTimer);
+  backgroundSuspendTimer = null;
+}
+
+// Defer the background suspend by the grace period so a quick app switch keeps
+// the socket alive (and connectionStateRecovery never even has to replay).
+function scheduleBackgroundSuspend() {
+  cancelBackgroundSuspend();
+  if (BACKGROUND_SUSPEND_GRACE_MS <= 0) {
+    setForegroundNetworkWorkEnabled(false);
+    return;
+  }
+  backgroundSuspendTimer = setTimeout(() => {
+    backgroundSuspendTimer = null;
+    // A throttled or sleep-delayed timer can fire at the exact moment the user
+    // returns; re-check visibility so it cannot tear down a healthy connection.
+    if (document.visibilityState !== 'hidden') return;
+    setForegroundNetworkWorkEnabled(false);
+  }, BACKGROUND_SUSPEND_GRACE_MS);
+}
+
+// A notification tap in the service worker either messages an existing window
+// (copilot-open-conversation) or opens a fresh one with ?push_conv=<id>.
+function initPushNotificationClientHooks() {
+  if (!('serviceWorker' in navigator)) return;
+  if (window.__pushNotificationHooksBound) return;
+  window.__pushNotificationHooksBound = true;
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type !== 'copilot-open-conversation') return;
+    const conversationId = String(data.conversationId || '').trim();
+    if (!conversationId) return;
+    void openConversation(conversationId).catch(() => {});
+  });
+}
+
+function consumePushConversationDeepLink() {
+  const url = new URL(window.location.href);
+  const conversationId = String(url.searchParams.get('push_conv') || '').trim();
+  if (!conversationId) return '';
+  url.searchParams.delete('push_conv');
+  history.replaceState(null, document.title, `${url.pathname}${url.search}${url.hash}`);
+  return conversationId;
+}
+
+function handleForegroundTransition(reason, { immediate = false } = {}) {
+  if (!isAppForegrounded()) return;
+  // The app came back before the grace period elapsed; keep the socket.
+  cancelBackgroundSuspend();
+  // The transport comes back right away; only the data refresh is debounced.
+  setForegroundNetworkWorkEnabled(true);
+  // Tell the server this device is foregrounded again so push suppression
+  // resumes. If the socket is still reconnecting this is a no-op; the
+  // connect-time heartbeat covers that case.
+  emitDeviceVisibility(true);
+  // A socket that reports connected after a freeze may be a zombie whose
+  // ping-timeout timer died with the freeze; probe it instead of trusting it.
+  verifySocketLiveness();
+  scheduleForegroundRecovery(reason, { immediate });
+}
+
+// socket.io gives up permanently after an explicit disconnect or a rejected
+// handshake, so a dropped relay never comes back on its own while the app stays in
+// the foreground. This is the safety net for that. It deliberately does not
+// consult navigator.onLine: Android Chrome can report a stale `false` after a
+// standby resume while fetches work fine, and that guard once muzzled the
+// watchdog for the rest of the page's life. A failed connect attempt is cheap;
+// a silently disabled watchdog is not.
+//
+// connect() alone cannot escape every wedged manager state (see
+// relay-watchdog-policy.mjs), so ticks spent disconnected escalate to a hard
+// reset of the socket.
+function startRelayConnectionWatchdog() {
+  if (relayConnectionWatchdogTimer || appSharedMode) return;
+  relayConnectionWatchdogTimer = setInterval(() => {
+    if (!isAppForegrounded()) {
+      // Background ticks say nothing about the connection; a count carried
+      // across a resume could trigger a reset before reconnection had a chance.
+      relayWatchdogDisconnectedTicks = 0;
+      return;
+    }
+    const state = ensureSocketConnected();
+    if (state === 'forced') recordStatusEvent('relay-reconnect-forced', {});
+    const advice = adviseWatchdogTick({ state, disconnectedTicks: relayWatchdogDisconnectedTicks });
+    relayWatchdogDisconnectedTicks = advice.disconnectedTicks;
+    if (advice.hardReset) {
+      hardResetSocket();
+      recordStatusEvent('relay-socket-hard-reset', {
+        state,
+        afterTicks: RELAY_WATCHDOG_HARD_RESET_TICKS,
+      });
+    }
+  }, RELAY_WATCHDOG_INTERVAL_MS);
+}
+
+// Visibility is reported on transitions, but the server ages those reports out
+// after 90s. Without a periodic re-assert, a user who simply sits and reads for
+// longer than that stops looking active, and a turn finishing afterwards pushes a
+// notification to the phone already in their hand.
+function startDeviceVisibilityHeartbeat() {
+  if (deviceVisibilityHeartbeatTimer || appSharedMode) return;
+  deviceVisibilityHeartbeatTimer = setInterval(() => {
+    if (!isAppForegrounded()) return;
+    emitDeviceVisibility(true);
+  }, DEVICE_VISIBILITY_HEARTBEAT_MS);
 }
 
 function initNetworkLifecycleHandling() {
@@ -452,22 +710,40 @@ function initNetworkLifecycleHandling() {
   networkLifecycleBound = true;
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
-      setForegroundNetworkWorkEnabled(false);
+      // The "now hidden" heartbeat goes out immediately — the transport stays
+      // up for the grace period, so without it the device would keep looking
+      // active and suppress push notifications for every device.
+      emitDeviceVisibility(false);
+      scheduleBackgroundSuspend();
       return;
     }
-    scheduleForegroundRecovery('visibility');
+    handleForegroundTransition('visibility');
   });
   window.addEventListener('online', () => {
-    if (document.visibilityState === 'visible') scheduleForegroundRecovery('online');
+    handleForegroundTransition('online', { immediate: true });
   });
   window.addEventListener('offline', () => {
+    cancelBackgroundSuspend();
     setForegroundNetworkWorkEnabled(false);
   });
   window.addEventListener('pageshow', () => {
-    if (document.visibilityState === 'visible') scheduleForegroundRecovery('pageshow');
+    handleForegroundTransition('pageshow', { immediate: true });
   });
   window.addEventListener('pagehide', () => {
+    // The page is going away; no grace period, suspend immediately.
+    cancelBackgroundSuspend();
     setForegroundNetworkWorkEnabled(false);
+  });
+  // Android Chrome freezes backgrounded PWAs. A freeze/resume cycle can happen
+  // without any visibility transition, so resume needs its own recovery trigger.
+  document.addEventListener('freeze', () => {
+    // Timers will not run while frozen, so the pending grace timer is useless;
+    // suspend now while code can still run.
+    cancelBackgroundSuspend();
+    setForegroundNetworkWorkEnabled(false);
+  });
+  document.addEventListener('resume', () => {
+    handleForegroundTransition('resume', { immediate: true });
   });
 }
 
@@ -815,6 +1091,11 @@ function isModelMetadataHealthy(payload = modelCatalogState) {
 }
 
 function syncModelMetadataBlocker(message = '') {
+  // Shared readers have no model picker, so metadata problems are not actionable there.
+  if (isSharedReaderMode()) {
+    document.getElementById('model-metadata-blocker')?.classList.remove('visible');
+    return;
+  }
   const blocker = document.getElementById('model-metadata-blocker');
   const text = document.getElementById('model-metadata-blocker-text');
   const retryBtn = document.getElementById('model-metadata-retry-btn');
@@ -848,7 +1129,6 @@ function currentOpenAIModelLock() {
   const providerType = String(
     conversation?.runtimeProviderType
     || conversation?.runtime_provider_type
-    || document.getElementById('provider-status-pill')?.dataset?.provider
     || '',
   ).trim().toLowerCase();
   const providerIsOpenAI = providerType === 'openai' || providerType === 'openai-byok';
@@ -862,9 +1142,60 @@ function currentOpenAIModelLock() {
   };
 }
 
+// A Grok conversation's model is fixed once the first message exists: the ACP
+// session cannot switch models mid-session and the relay 409s any attempt, so
+// the composer pins the picker instead of offering a switch that would fail.
+function currentGrokModelLock() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const providerType = String(
+    conversation?.runtimeProviderType
+    || conversation?.runtime_provider_type
+    || '',
+  ).trim().toLowerCase();
+  if (providerType !== 'grok' || !currentConversationHasMessages()) return null;
+  return {
+    model: String(
+      conversation?.runtimeProviderModel
+      || conversation?.runtime_provider_model
+      || '',
+    ).trim(),
+  };
+}
+
+function currentRuntimeModelLock() {
+  return currentOpenAIModelLock() || currentGrokModelLock();
+}
+
+// The runtime model decides the OpenAI/OpenAI Image distinction. Before the
+// first message the runtime model can still be rebound, so the composer
+// selection is the fresher source there.
+function sessionLockModelForCurrentConversation() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const runtimeModel = String(
+    conversation?.runtimeProviderModel
+    || conversation?.runtime_provider_model
+    || conversation?.runtimeModel
+    || conversation?.runtime_model
+    || '',
+  ).trim();
+  if (currentConversationHasMessages()) return runtimeModel;
+  return String(document.getElementById('model-select')?.value || '').trim() || runtimeModel;
+}
+
+function currentSessionProviderLock({ pinnedModel = '' } = {}) {
+  // Shared readers have no model picker, so a lock note would be noise.
+  if (!currentConvId || isSharedReaderMode()) return null;
+  const providerType = activeComposerProviderType();
+  const model = sessionLockModelForCurrentConversation();
+  const noteText = sessionLockNoteText({ providerType, model, pinnedModel });
+  if (!noteText) return null;
+  return { providerKey: sessionLockProviderKey({ providerType, model }), noteText };
+}
+
 function syncAutoModelAvailability() {
   const select = document.getElementById('model-select');
   if (!select) return;
+  updateModeSelectorForProvider();
   const currentProviderScope = normalizeModelSelectorProviderType(activeComposerProviderType());
   if (select.dataset.providerScope !== currentProviderScope) {
     updateModelCatalogState(modelCatalogState);
@@ -872,9 +1203,9 @@ function syncAutoModelAvailability() {
   }
   const autoOption = Array.from(select.options).find((option) => option.value.toLowerCase() === AUTO_MODEL_OPTION);
   const hasMessages = currentConversationHasMessages();
-  const openAILock = currentOpenAIModelLock();
+  const runtimeLock = currentRuntimeModelLock();
   for (const option of Array.from(select.options)) {
-    if (option.dataset.runtimeModelLock === '1' && option.value !== openAILock?.model) {
+    if (option.dataset.runtimeModelLock === '1' && option.value !== runtimeLock?.model) {
       option.remove();
     }
   }
@@ -891,32 +1222,40 @@ function syncAutoModelAvailability() {
       && Array.from(select.options).some((option) => option.value === modelId));
     if (fallback) select.value = fallback;
   }
-  if (openAILock?.model && !Array.from(select.options).some((option) => option.value === openAILock.model)) {
+  if (runtimeLock?.model && !Array.from(select.options).some((option) => option.value === runtimeLock.model)) {
     const option = document.createElement('option');
-    option.value = openAILock.model;
-    option.textContent = `🔒 ${modelOptionLabel(openAILock.model)}`;
+    option.value = runtimeLock.model;
+    option.textContent = `🔒 ${modelOptionLabel(runtimeLock.model)}`;
     option.dataset.runtimeModelLock = '1';
     select.appendChild(option);
   }
-  if (openAILock?.model) {
-    select.value = openAILock.model;
+  if (runtimeLock?.model) {
+    select.value = runtimeLock.model;
   }
-  select.dataset.runtimeModelLocked = openAILock ? '1' : '0';
+  select.dataset.runtimeModelLocked = runtimeLock ? '1' : '0';
   const metadataBlocked = modelMetadataBlocked || !isModelMetadataHealthy();
-  select.disabled = metadataBlocked || !!openAILock;
-  select.title = openAILock
-    ? `Model locked to ${openAILock.model || 'the configured OpenAI model'} for this active OpenAI session`
+  select.disabled = metadataBlocked || !!runtimeLock;
+  select.title = runtimeLock
+    ? `Model locked to ${runtimeLock.model || 'the configured provider model'} for this active session`
     : (metadataBlocked ? 'Model metadata unavailable' : 'Model');
+  syncSessionLockNote({ pinnedModel: runtimeLock?.model || '' });
+}
+
+function syncSessionLockNote({ pinnedModel = '' } = {}) {
   const note = document.getElementById('model-lock-note');
-  if (note) {
-    note.hidden = !openAILock;
-    note.textContent = openAILock
-      ? `🔒 OpenAI session model locked${openAILock.model ? ` to ${openAILock.model}` : ''}.`
-      : '';
+  if (!note) return;
+  const providerLock = currentSessionProviderLock({ pinnedModel });
+  note.hidden = !providerLock;
+  note.textContent = providerLock?.noteText || '';
+  if (providerLock?.providerKey) {
+    note.dataset.provider = providerLock.providerKey;
+  } else {
+    delete note.dataset.provider;
   }
 }
 
 function applyModelMetadataHardFail(message = '') {
+  if (isSharedReaderMode()) return;
   modelMetadataBlocked = true;
   syncModelMetadataBlocker(message);
   setModelBanner(`⚠️ ${String(message || 'Model metadata is unavailable.').trim()}`);
@@ -947,7 +1286,6 @@ function activeComposerProviderType() {
   return String(
     conversation?.runtimeProviderType
     || conversation?.runtime_provider_type
-    || document.getElementById('provider-status-pill')?.dataset?.provider
     || 'github',
   ).trim().toLowerCase();
 }
@@ -956,6 +1294,8 @@ function normalizeModelSelectorProviderType(providerType = '') {
   const normalized = String(providerType || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'claude') return 'claude';
+  if (normalized === 'cursor') return 'cursor';
+  if (normalized === 'grok') return 'grok';
   return 'github';
 }
 
@@ -965,11 +1305,6 @@ function modelProvidersForId(modelId, providersByModel = {}) {
   const providers = providersByModel?.[key];
   if (!Array.isArray(providers)) return [];
   return providers.map((provider) => String(provider || '').trim().toLowerCase()).filter(Boolean);
-}
-
-function isOpenAIImageModelId(modelId = '') {
-  const normalized = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
-  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
 }
 
 function openAIImageSizesForModel(modelId = '') {
@@ -986,11 +1321,20 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
   const providers = modelProvidersForId(normalizedModelId, providersByModel);
   const hasOpenAIByok = providers.includes('openai-byok');
   const hasClaude = providers.includes('claude');
-  const hasNonExclusiveProvider = providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude');
+  const hasCursor = providers.includes('cursor');
+  const hasGrok = providers.includes('grok');
+  const hasNonExclusiveProvider = providers.some((provider) => (
+    provider !== 'openai-byok'
+    && provider !== 'claude'
+    && provider !== 'cursor'
+    && provider !== 'grok'
+  ));
   const activeProvider = normalizeModelSelectorProviderType(activeProviderType);
   if (activeProvider === 'openai') return hasOpenAIByok;
   if (activeProvider === 'claude') return hasClaude;
-  return !((hasOpenAIByok || hasClaude) && !hasNonExclusiveProvider);
+  if (activeProvider === 'cursor') return hasCursor;
+  if (activeProvider === 'grok') return hasGrok;
+  return !((hasOpenAIByok || hasClaude || hasCursor || hasGrok) && !hasNonExclusiveProvider);
 }
 
 function buildModelSelectorOptions(models = [], providersByModel = {}, activeProviderType = '') {
@@ -1040,13 +1384,17 @@ function selectedReasoningEffortValue() {
   return FALLBACK_REASONING_EFFORT;
 }
 
-function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
+// Opt in to persist=true only from a user-initiated change. Every other caller
+// is re-rendering options (catalog refresh, provider rescope, applying a stored
+// preference), and letting those write the shared fallback storage is what made
+// a transient resolution the remembered default.
+function updateReasoningSelectorForModel(modelId, preferredEffort = '', { persist = false } = {}) {
   const select = document.getElementById('reasoning-effort-select');
   if (!select) return;
   select.title = isOpenAIImageModelId(modelId) ? 'Quality' : 'Reasoning effort';
   const options = reasoningOptionsForModel(modelId);
-  const selectedBefore = String(select.value || '').trim().toLowerCase();
-  const genericStored = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
+  const currentEffort = String(select.value || '').trim().toLowerCase();
+  const storedEffort = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
   select.innerHTML = '';
   if (!options.length) {
     const opt = document.createElement('option');
@@ -1056,23 +1404,75 @@ function updateReasoningSelectorForModel(modelId, preferredEffort = '') {
     select.value = '';
     return;
   }
+  const reasoningOffUnsupported = isReasoningOffUnsupported(
+    modelCatalogState,
+    activeComposerProviderType(),
+    modelId,
+  );
   for (const effort of options) {
     const opt = document.createElement('option');
     opt.value = effort;
-    opt.textContent = effort;
+    opt.textContent = reasoningEffortOptionLabel(effort, { reasoningOffUnsupported });
+    const optionTitle = reasoningEffortOptionTitle(effort);
+    if (optionTitle) opt.title = optionTitle;
     select.appendChild(opt);
   }
-  const preferred = String(preferredEffort || '').trim().toLowerCase();
-  const resolvedPreferred = [preferred, selectedBefore, genericStored]
-    .find((value) => value && options.includes(value));
-  const resolved = resolvedPreferred
-    || options.find((value) => value !== 'none')
-    || options[0];
+  const resolved = resolveComposerReasoningEffort({
+    preferredEffort,
+    storedEffort,
+    currentEffort,
+    supportedEfforts: options,
+  });
   select.value = resolved;
-  localStorage.setItem(REASONING_STORAGE_KEY, resolved);
+  if (persist && resolved) localStorage.setItem(REASONING_STORAGE_KEY, resolved);
+}
+
+// Rebuilds the option list for the active conversation's provider without
+// touching the selection, mirroring updateModeSelectorForProvider. Preferences
+// used to be clamped against the previous provider's options, which is how a
+// Cursor conversation could keep the Claude model that was selected before it.
+function rebuildModelSelectorOptionsForProvider() {
+  const select = document.getElementById('model-select');
+  if (!select || isSharedReaderMode()) return false;
+  const activeProviderType = activeComposerProviderType();
+  const scope = normalizeModelSelectorProviderType(activeProviderType);
+  if (select.dataset.providerScope === scope) return false;
+  // Same rule as the catalog refresh: never re-render the list out from under
+  // an open picker. The scope stays unset so the rebuild happens on blur.
+  if (document.activeElement === select) return false;
+  const nextOptions = buildModelSelectorOptions(
+    modelCatalogState.models,
+    modelCatalogState.providersByModel,
+    activeProviderType,
+  );
+  const currentOptions = Array.from(select.options)
+    .filter((option) => option.dataset.runtimeModelLock !== '1')
+    .map((option) => ({ value: option.value, label: option.textContent }));
+  if (!modelSelectorOptionsEqual(currentOptions, nextOptions)) {
+    const selectedBefore = String(select.value || '').trim();
+    const lockedOptions = Array.from(select.options).filter((option) => option.dataset.runtimeModelLock === '1');
+    select.innerHTML = '';
+    for (const option of nextOptions) {
+      const opt = document.createElement('option');
+      opt.value = option.value;
+      opt.textContent = option.label;
+      select.appendChild(opt);
+    }
+    for (const locked of lockedOptions) select.appendChild(locked);
+    // Emptying the select resets the value to the first option, which would
+    // hand the clamp below "auto" instead of what was actually selected.
+    if (Array.from(select.options).some((option) => option.value === selectedBefore)) {
+      select.value = selectedBefore;
+    }
+  }
+  select.dataset.providerScope = scope;
+  return true;
 }
 
 function updateModelCatalogState(payload) {
+  // Shared readers never load the catalog, so this would only surface
+  // "metadata unavailable" warnings for a picker they cannot see.
+  if (isSharedReaderMode()) return;
   const select = document.getElementById('model-select');
   if (!select) return;
   const models = Array.isArray(payload?.models)
@@ -1103,6 +1503,17 @@ function updateModelCatalogState(payload) {
           ? Object.fromEntries(Object.entries(entries).map(([modelId, efforts]) => [
               String(modelId || '').trim().toLowerCase(),
               normalizeReasoningEffortList(efforts),
+            ]))
+          : {},
+      ]))
+      : {},
+    reasoningOffUnsupportedByProvider: payload?.reasoningOffUnsupportedByProvider && typeof payload.reasoningOffUnsupportedByProvider === 'object'
+      ? Object.fromEntries(Object.entries(payload.reasoningOffUnsupportedByProvider).map(([provider, entries]) => [
+        String(provider || '').trim().toLowerCase(),
+        entries && typeof entries === 'object'
+          ? Object.fromEntries(Object.entries(entries).map(([modelId, unsupported]) => [
+              String(modelId || '').trim().toLowerCase(),
+              unsupported === true,
             ]))
           : {},
       ]))
@@ -1186,12 +1597,20 @@ function updateModelCatalogState(payload) {
   }
   select.dataset.providerScope = normalizeModelSelectorProviderType(activeProviderType);
 
-  const preferred = [selectedBefore, localStorage.getItem(MODEL_STORAGE_KEY), modelCatalogState.currentModel, modelCatalogState.defaultModel, nextModels[0]]
-    .find((value) => value && nextModels.includes(value)) || nextModels[0];
-  select.value = preferred;
-  localStorage.setItem(MODEL_STORAGE_KEY, preferred);
-  updateReasoningSelectorForModel(preferred);
-  updateContextTierSelector(preferred);
+  // A catalog refresh re-renders options and keeps the current selection valid;
+  // it must not decide what is selected. The active conversation's preferences
+  // are reapplied at the end, so a refresh cannot overwrite the user's pick.
+  const keptSelection = nextModels.includes(selectedBefore) ? selectedBefore : '';
+  const nextSelection = keptSelection
+    || [
+      localStorage.getItem(MODEL_STORAGE_KEY),
+      modelCatalogState.currentModel,
+      modelCatalogState.defaultModel,
+    ].map((value) => String(value || '').trim()).find((value) => value && nextModels.includes(value))
+    || nextModels[0];
+  select.value = nextSelection;
+  updateReasoningSelectorForModel(nextSelection, '');
+  updateContextTierSelector(nextSelection);
 
   if (modelCatalogState.warning && isModelMetadataHealthy(modelCatalogState)) {
     setModelBanner(`⚠️ ${modelCatalogState.warning}`);
@@ -1203,6 +1622,9 @@ function updateModelCatalogState(payload) {
 
   syncModelMetadataBlocker();
   syncAutoModelAvailability();
+  // The rebuilt catalog may now contain the conversation's preferred model for
+  // the first time (provider models arrive after the initial catalog load).
+  if (currentConvId) applyConversationPreferencesForConversation(currentConvId);
 }
 
 function selectedModelValue() {
@@ -1287,6 +1709,49 @@ function updateModelPricingDetails(modelId, tier) {
   details.style.display = grid.childElementCount ? '' : 'none';
 }
 
+// Relay modes each provider backend actually honors. All four providers
+// currently support the full set — Copilot/OpenAI via prompt-context
+// injection, Claude via permissionMode + system-prompt appends, Cursor via
+// native plan mode plus message-text nudges for ask/autopilot — but the
+// composer builds its options from this table so a provider that loses (or
+// gains) a mode only needs a change here.
+const RELAY_MODE_LABELS = { agent: 'Agent', ask: 'Ask', plan: 'Plan', autopilot: 'Autopilot' };
+const RELAY_MODES_BY_PROVIDER = {
+  github: ['agent', 'ask', 'plan', 'autopilot'],
+  openai: ['agent', 'ask', 'plan', 'autopilot'],
+  claude: ['agent', 'ask', 'plan', 'autopilot'],
+  cursor: ['agent', 'ask', 'plan', 'autopilot'],
+  grok: ['agent', 'ask', 'plan', 'autopilot'],
+};
+
+function relayModesForProvider(providerType = '') {
+  const scope = normalizeModelSelectorProviderType(providerType);
+  const modes = RELAY_MODES_BY_PROVIDER[scope];
+  return Array.isArray(modes) && modes.length ? modes : RELAY_MODES_BY_PROVIDER.github;
+}
+
+// Same cache-and-rebuild idiom as the model select: dataset.providerScope
+// remembers which provider the current options were built for.
+function updateModeSelectorForProvider() {
+  const select = document.getElementById('mode-select');
+  if (!select || isSharedReaderMode()) return;
+  const scope = normalizeModelSelectorProviderType(activeComposerProviderType());
+  if (select.dataset.providerScope === scope) return;
+  const modes = relayModesForProvider(scope);
+  const selectedBefore = String(select.value || '').trim().toLowerCase();
+  select.innerHTML = '';
+  for (const mode of modes) {
+    const option = document.createElement('option');
+    option.value = mode;
+    option.textContent = RELAY_MODE_LABELS[mode] || mode;
+    select.appendChild(option);
+  }
+  select.dataset.providerScope = scope;
+  select.value = modes.includes(selectedBefore)
+    ? selectedBefore
+    : (modes.includes(FALLBACK_MODE) ? FALLBACK_MODE : modes[0]);
+}
+
 function modeOptions() {
   return Array.from(document.getElementById('mode-select')?.options || []).map((option) => option.value);
 }
@@ -1303,7 +1768,12 @@ async function persistCurrentConversationPreferences() {
   if (!modeSelect || !modelSelect) return;
   const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
   const model = String(modelSelect.value || '').trim();
-  const reasoningEffort = selectedReasoningEffortValue();
+  // The raw value, not selectedReasoningEffortValue(): a model with no reasoning
+  // options leaves the selector empty, and that helper's 'none' fallback would
+  // record an effort the user never picked when they only changed the mode.
+  const reasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+  // These keys hold the last explicit choice, so they are not rolled back when
+  // the write below fails: the user did make the choice either way.
   localStorage.setItem(MODE_STORAGE_KEY, mode);
   if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
   if (reasoningEffort) localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
@@ -1318,6 +1788,19 @@ async function persistCurrentConversationPreferences() {
     ? `${model}[1m]`
     : model;
 
+  // Record the choice locally before the round-trip: a catalog refresh landing
+  // while the PATCH is in flight reapplies preferences, and it must see the new
+  // selection rather than the one being replaced.
+  const previousRecord = conversations[convId] || null;
+  if (previousRecord) {
+    conversations[convId] = {
+      ...previousRecord,
+      preferredRelayMode: mode,
+      preferredModel: preferredModelWithTier || previousRecord.preferredModel || '',
+      preferredReasoningEffort: reasoningEffort || previousRecord.preferredReasoningEffort || '',
+    };
+  }
+
   const writeVersion = ++conversationPreferenceWriteVersion;
   const response = await updateConversationPreferences(convId, {
     clientId: CLIENT_ID,
@@ -1325,7 +1808,22 @@ async function persistCurrentConversationPreferences() {
     preferredModel: preferredModelWithTier,
     preferredReasoningEffort: reasoningEffort,
   });
-  if (!response || writeVersion !== conversationPreferenceWriteVersion) return;
+  if (writeVersion !== conversationPreferenceWriteVersion) return;
+  if (!response) {
+    // The server never took the write, so the optimistic preference has to go
+    // back rather than linger as one the next apply would trust. Only the three
+    // preference fields are restored: the poll rewrites the rest of the record
+    // (messageCount, runtime binding, title) during the round trip.
+    if (previousRecord && conversations[convId]) {
+      conversations[convId] = {
+        ...conversations[convId],
+        preferredRelayMode: previousRecord.preferredRelayMode,
+        preferredModel: previousRecord.preferredModel,
+        preferredReasoningEffort: previousRecord.preferredReasoningEffort,
+      };
+    }
+    return;
+  }
   if (conversations[convId]) {
     conversations[convId] = {
       ...conversations[convId],
@@ -1346,6 +1844,11 @@ function applyConversationPreferences({
   const modelSelect = document.getElementById('model-select');
   if (!modeSelect || !modelSelect) return;
 
+  // Options first, so the preference clamp below sees the provider's modes and
+  // models. Clamping before the model rebuild let the previous conversation's
+  // provider decide which models were "supported" for this one.
+  updateModeSelectorForProvider();
+  rebuildModelSelectorOptionsForProvider();
   const supportedModes = modeOptions();
   const supportedModels = modelOptions().length ? modelOptions() : modelCatalogState.models;
   const selection = resolveConversationComposerSelection({
@@ -1358,52 +1861,73 @@ function applyConversationPreferences({
     fallbackMode: FALLBACK_MODE,
     fallbackModel: FALLBACK_MODEL,
   });
+  // finally, because the flag also gates every composer change handler: leaking
+  // it as true would silently stop the composer from persisting anything at all
+  // until the page is reloaded.
   suppressConversationPreferenceSync = true;
-  modeSelect.value = selection.mode;
-  if (selection.model) modelSelect.value = selection.model;
-  syncAutoModelAvailability();
-  updateReasoningSelectorForModel(
-    selection.model || modelSelect.value,
-    String(preferredReasoningEffort || '').trim().toLowerCase(),
-  );
-  updateContextTierSelector(selection.model || modelSelect.value);
-  const tierSelect = document.getElementById('context-tier-select');
-  const desiredTier = String(preferredContextTier || 'default').trim().toLowerCase();
-  if (tierSelect && Array.from(tierSelect.options).some((option) => option.value === desiredTier)) {
-    tierSelect.value = desiredTier;
-    updateModelPricingDetails(selection.model || modelSelect.value, tierSelect.value);
+  try {
+    modeSelect.value = selection.mode;
+    if (selection.model) modelSelect.value = selection.model;
+    syncAutoModelAvailability();
+    updateReasoningSelectorForModel(
+      selection.model || modelSelect.value,
+      String(preferredReasoningEffort || '').trim().toLowerCase(),
+    );
+    updateContextTierSelector(selection.model || modelSelect.value);
+    const tierSelect = document.getElementById('context-tier-select');
+    const desiredTier = String(preferredContextTier || 'default').trim().toLowerCase();
+    if (tierSelect && Array.from(tierSelect.options).some((option) => option.value === desiredTier)) {
+      tierSelect.value = desiredTier;
+      updateModelPricingDetails(selection.model || modelSelect.value, tierSelect.value);
+    }
+  } finally {
+    suppressConversationPreferenceSync = false;
   }
-  suppressConversationPreferenceSync = false;
-
-  localStorage.setItem(MODE_STORAGE_KEY, selection.mode);
-  if (selection.model) localStorage.setItem(MODEL_STORAGE_KEY, selection.model);
+  // Nothing is written to the shared "last used" storage here. Applying a
+  // conversation's stored preferences is not a choice: it runs on every open,
+  // on the ~1s live poll, on a catalog refresh and on another client's edit,
+  // so persisting the clamp let one conversation's resolution become the
+  // default for the next New Chat. Only persistCurrentConversationPreferences
+  // (a user edit) and a successful bootstrap write those keys.
 }
 
 function applyConversationPreferencesForConversation(conversationId, payload = {}) {
   const convId = String(conversationId || currentConvId || '').trim();
   const conversation = convId ? conversations[convId] : null;
-  const preferredRelayMode = payload?.preferredRelayMode
-    ?? conversation?.preferredRelayMode
-    ?? localStorage.getItem(MODE_STORAGE_KEY)
-    ?? FALLBACK_MODE;
-  const preferredModel = payload?.preferredModel
-    ?? conversation?.preferredModel
-    ?? localStorage.getItem(MODEL_STORAGE_KEY)
-    ?? '';
-  const preferredReasoningEffort = payload?.preferredReasoningEffort
-    ?? conversation?.preferredReasoningEffort
-    ?? '';
-  const runtimeModel = String(
-    payload?.runtimeModel
-    ?? conversation?.runtimeModel
-    ?? conversation?.runtime_model
-    ?? '',
-  ).trim();
-  const effectivePreferredModel = String(
-    Number(conversation?.messageCount || 0) === 0 && runtimeModel
-      ? runtimeModel
-      : preferredModel,
-  ).trim();
+  // Unset preferences arrive as '', so each source has to fall through rather
+  // than stop at an empty string the way `??` did.
+  const preferredRelayMode = firstDefinedPreference(
+    payload?.preferredRelayMode,
+    conversation?.preferredRelayMode,
+    localStorage.getItem(MODE_STORAGE_KEY),
+  ) || FALLBACK_MODE;
+  const preferredModel = firstDefinedPreference(
+    payload?.preferredModel,
+    conversation?.preferredModel,
+    localStorage.getItem(MODEL_STORAGE_KEY),
+  );
+  // No localStorage fallback here on purpose: updateReasoningSelectorForModel
+  // already consults the shared "last used" effort, but below the conversation's
+  // own value. Feeding it in as `preferredEffort` would promote it above the
+  // selector's current state and let one conversation's clamp leak into the next.
+  const preferredReasoningEffort = firstDefinedPreference(
+    payload?.preferredReasoningEffort,
+    conversation?.preferredReasoningEffort,
+  );
+  const runtimeModel = firstDefinedPreference(
+    payload?.runtimeModel,
+    conversation?.runtimeProviderModel,
+    conversation?.runtime_provider_model,
+    conversation?.runtimeModel,
+    conversation?.runtime_model,
+  );
+  // The runtime binding only stands in for an unstarted conversation that has
+  // no stored preference. Preferring it over one would let every catalog
+  // refresh revert a model the user changed before sending anything.
+  const effectivePreferredModel = normalizePreferenceValue(
+    preferredModel
+    || (Number(conversation?.messageCount || 0) === 0 ? runtimeModel : ''),
+  );
   // A stored "[1m]" id decomposes into the base model plus the 1M context tier.
   const isLongContextModel = CLAUDE_LONG_CONTEXT_PATTERN.test(effectivePreferredModel);
   applyConversationPreferences({
@@ -1426,8 +1950,18 @@ function initModelSelector() {
         setModelBanner('⚠️ Auto model selection is available only for a new conversation.');
         return;
       }
-      updateReasoningSelectorForModel(select.value);
+      // Carry the current effort across the model change so switching models
+      // does not quietly downgrade a deliberate "high" to the model's default.
+      // The raw value, not selectedReasoningEffortValue(): its 'none' fallback
+      // for an empty selector would overwrite a remembered effort.
+      updateReasoningSelectorForModel(
+        select.value,
+        String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase(),
+        { persist: true },
+      );
       updateContextTierSelector(select.value);
+      syncSessionLockNote({ pinnedModel: currentRuntimeModelLock()?.model || '' });
+      refreshComposerAttachmentWarning();
       void persistCurrentConversationPreferences().catch(() => {});
     });
     select.addEventListener('blur', () => {
@@ -1509,6 +2043,20 @@ function reportOpenAIModelDiscoveryFailure(payload) {
   if (claudeDiscovery && claudeDiscovery.ok === false && !claudeDiscovery.skipped) {
     showTransientRelayNotice(
       `Claude model discovery failed. Cached Claude models were kept: ${claudeDiscovery.error || 'unknown error'}`,
+      8000,
+    );
+  }
+  const cursorDiscovery = payload?.cursorModelDiscovery;
+  if (cursorDiscovery && cursorDiscovery.ok === false && !cursorDiscovery.skipped) {
+    showTransientRelayNotice(
+      `Cursor model discovery failed. Cached Cursor models were kept: ${cursorDiscovery.error || 'unknown error'}`,
+      8000,
+    );
+  }
+  const grokDiscovery = payload?.grokModelDiscovery;
+  if (grokDiscovery && grokDiscovery.ok === false && !grokDiscovery.skipped) {
+    showTransientRelayNotice(
+      `Grok model discovery failed. Cached Grok models were kept: ${grokDiscovery.error || 'unknown error'}`,
       8000,
     );
   }
@@ -1612,6 +2160,28 @@ function applyModelVariantCatalogState(payload) {
           : [],
       }
       : null,
+    cursorModels: payload?.cursorModels && typeof payload.cursorModels === 'object'
+      ? {
+        defaultModel: String(payload.cursorModels.defaultModel || '').trim(),
+        availableModels: Array.isArray(payload.cursorModels.availableModels)
+          ? payload.cursorModels.availableModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        enabledModels: Array.isArray(payload.cursorModels.enabledModels)
+          ? payload.cursorModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+      }
+      : null,
+    grokModels: payload?.grokModels && typeof payload.grokModels === 'object'
+      ? {
+        defaultModel: String(payload.grokModels.defaultModel || '').trim(),
+        availableModels: Array.isArray(payload.grokModels.availableModels)
+          ? payload.grokModels.availableModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        enabledModels: Array.isArray(payload.grokModels.enabledModels)
+          ? payload.grokModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+      }
+      : null,
   };
 }
 
@@ -1669,19 +2239,35 @@ function renderModelVariantCatalogBody() {
     const entryProvider = String(entry?.provider || '').trim().toLowerCase();
     const providers = modelProvidersForId(baseModelId, providersByModel);
     const hasOpenAIByok = providers.includes('openai-byok');
-    // Each tab lists only rows sourced from that runtime: the Anthropic tab
-    // shows Claude-SDK rows exclusively, and Copilot never shows rows that a
-    // different runtime contributed (there is no cross-runtime switching).
+    // Each tab lists only rows sourced from that runtime: the Claude SDK tab
+    // shows Claude-SDK rows exclusively, the Cursor SDK tab Cursor rows, the
+    // Grok tab Grok rows, and Copilot never shows rows that a different runtime
+    // contributed (there is no cross-runtime switching).
     if (activeTab === 'anthropic') {
       return entryProvider === 'claude';
     }
     if (entryProvider === 'claude') return false;
+    if (activeTab === 'cursor') {
+      return entryProvider === 'cursor';
+    }
+    if (entryProvider === 'cursor') return false;
+    if (activeTab === 'grok') {
+      return entryProvider === 'grok';
+    }
+    if (entryProvider === 'grok') return false;
     if (activeTab === 'openai') {
       return hasOpenAIByok || entryProvider === 'openai-byok';
     }
     // Copilot tab: only models the Copilot CLI itself serves.
     if (entryProvider === 'openai-byok') return false;
-    if (hasOpenAIByok) return providers.some((provider) => provider !== 'openai-byok' && provider !== 'claude');
+    if (hasOpenAIByok) {
+      return providers.some((provider) => (
+        provider !== 'openai-byok'
+        && provider !== 'claude'
+        && provider !== 'cursor'
+        && provider !== 'grok'
+      ));
+    }
     return true;
   };
   const grouped = new Map();
@@ -1741,6 +2327,54 @@ function renderModelVariantCatalogBody() {
     }
     grouped.set('claude', providerRows);
   }
+  const cursorCatalog = modelVariantCatalogState.cursorModels;
+  if (cursorCatalog?.availableModels?.length) {
+    const cursorEnabledSet = new Set(cursorCatalog.enabledModels || []);
+    const cursorDefaultModel = String(cursorCatalog.defaultModel || '').trim();
+    const providerRows = [];
+    for (const [index, cursorModelId] of cursorCatalog.availableModels.entries()) {
+      const isDefaultModel = cursorModelId === cursorDefaultModel;
+      providerRows.push({
+        variantId: `${cursorModelId}--provider-cursor`,
+        baseModelId: cursorModelId,
+        provider: 'cursor',
+        label: humanizeModelLabel(cursorModelId),
+        releaseStatus: null,
+        reasoningEffort: null,
+        // The default model always stays enabled; deselecting it would leave
+        // Cursor conversations without a model.
+        selectable: !isDefaultModel,
+        enabled: cursorEnabledSet.has(cursorModelId) || isDefaultModel,
+        cursorModelId,
+        sortOrder: index,
+      });
+    }
+    grouped.set('cursor', providerRows);
+  }
+  const grokCatalog = modelVariantCatalogState.grokModels;
+  if (grokCatalog?.availableModels?.length) {
+    const grokEnabledSet = new Set(grokCatalog.enabledModels || []);
+    const grokDefaultModel = String(grokCatalog.defaultModel || '').trim();
+    const providerRows = [];
+    for (const [index, grokModelId] of grokCatalog.availableModels.entries()) {
+      const isDefaultModel = grokModelId === grokDefaultModel;
+      providerRows.push({
+        variantId: `${grokModelId}--provider-grok`,
+        baseModelId: grokModelId,
+        provider: 'grok',
+        label: humanizeModelLabel(grokModelId),
+        releaseStatus: null,
+        reasoningEffort: null,
+        // The default model always stays enabled; deselecting it would leave
+        // Grok conversations without a model.
+        selectable: !isDefaultModel,
+        enabled: grokEnabledSet.has(grokModelId) || isDefaultModel,
+        grokModelId,
+        sortOrder: index,
+      });
+    }
+    grouped.set('grok', providerRows);
+  }
   const selected = new Set(modelVariantCatalogState.enabledVariantIds);
   const selectedOrder = new Map(
     modelVariantCatalogState.enabledVariantIds.map((variantId, index) => [variantId, index]),
@@ -1774,18 +2408,26 @@ function renderModelVariantCatalogBody() {
   const hasOpenAITab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'openai'));
   const hasCopilotTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'copilot'));
   const hasAnthropicTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'anthropic'));
+  const hasCursorTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'cursor'));
+  const hasGrokTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'grok'));
   if (modelVariantCatalogProviderTab === 'openai' && !hasOpenAITab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'anthropic' && !hasAnthropicTab) modelVariantCatalogProviderTab = 'copilot';
+  if (modelVariantCatalogProviderTab === 'cursor' && !hasCursorTab) modelVariantCatalogProviderTab = 'copilot';
+  if (modelVariantCatalogProviderTab === 'grok' && !hasGrokTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'copilot' && !hasCopilotTab) {
     if (hasOpenAITab) modelVariantCatalogProviderTab = 'openai';
     else if (hasAnthropicTab) modelVariantCatalogProviderTab = 'anthropic';
+    else if (hasCursorTab) modelVariantCatalogProviderTab = 'cursor';
+    else if (hasGrokTab) modelVariantCatalogProviderTab = 'grok';
   }
   const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
   const providerTabButtons = `
     <div class="summary-tab-strip" style="display:flex;gap:8px;align-items:center;">
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
-      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Anthropic</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Claude SDK</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'cursor' ? ' active' : ''}" data-model-provider-tab="cursor" ${hasCursorTab ? '' : 'disabled'}>Cursor SDK</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'grok' ? ' active' : ''}" data-model-provider-tab="grok" ${hasGrokTab ? '' : 'disabled'}>Grok</button>
     </div>
   `;
   const warnings = [
@@ -1831,7 +2473,10 @@ function renderModelVariantCatalogBody() {
       const label = meta.label || humanizeModelLabel(baseModelId) || baseModelId;
       const variantRowsHtml = variantRows.map((row) => {
         const selectable = row.selectable !== false;
-        const checked = row.claudeModelId
+        // SDK-provider rows (Claude/Cursor/Grok) carry their own enabled flag; only
+        // Copilot variant rows read the enabledVariantIds selection.
+        const sdkProviderModelId = row.claudeModelId || row.cursorModelId || row.grokModelId || '';
+        const checked = sdkProviderModelId
           ? row.enabled === true
           : (selectable && selected.has(row.variantId));
         const effortChip = row.reasoningEffort
@@ -1842,13 +2487,18 @@ function renderModelVariantCatalogBody() {
           ? ' <span class="model-reasoning-chip model-reasoning-chip-warn">unavailable</span>'
           : '';
         const fixedChip = !selectable
-          ? (row.claudeModelId
+          ? (sdkProviderModelId
             ? ' <span class="model-reasoning-chip">default model</span>'
             : ' <span class="model-reasoning-chip">managed in settings</span>')
           : '';
+        const sdkModelAttr = row.claudeModelId
+          ? ` data-claude-model="${escHtml(row.claudeModelId)}"`
+          : (row.cursorModelId
+            ? ` data-cursor-model="${escHtml(row.cursorModelId)}"`
+            : (row.grokModelId ? ` data-grok-model="${escHtml(row.grokModelId)}"` : ''));
         return `
           <label class="model-variant-row">
-            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${row.claudeModelId ? ` data-claude-model="${escHtml(row.claudeModelId)}"` : ''} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
+            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${sdkModelAttr} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
             <span class="model-variant-row-copy">
               <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}${fixedChip}</span>
             </span>
@@ -1961,10 +2611,36 @@ async function saveSelectedModelsFromModal() {
     .filter((input) => input.checked)
     .map((input) => String(input.getAttribute('data-claude-model') || '').trim())
     .filter(Boolean);
-  const selectedVariantIds = Array.from(body.querySelectorAll('.model-variant-checkbox:checked[data-selectable="1"]:not([data-claude-model])'))
+  const cursorCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-cursor-model]'));
+  const selectedCursorModels = cursorCheckboxes
+    .filter((input) => input.checked)
+    .map((input) => String(input.getAttribute('data-cursor-model') || '').trim())
+    .filter(Boolean);
+  const grokCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-grok-model]'));
+  const selectedGrokModels = grokCheckboxes
+    .filter((input) => input.checked)
+    .map((input) => String(input.getAttribute('data-grok-model') || '').trim())
+    .filter(Boolean);
+  // Only the active provider tab's rows are in the DOM, but the PATCH
+  // replaces the WHOLE enabled set — so the save must only change rows the
+  // user could actually see. Off-screen variants keep their stored state,
+  // otherwise saving from e.g. the OpenAI tab silently disables every
+  // Copilot-only vendor group (Anthropic, Google, …).
+  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model]):not([data-grok-model])'));
+  const renderedVariantIds = new Set(renderedVariantCheckboxes
+    .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
+    .filter(Boolean));
+  const checkedVariantIds = renderedVariantCheckboxes
+    .filter((input) => input.checked)
     .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
     .filter(Boolean);
-  const hasVariantRows = !!body.querySelector('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model])');
+  const checkedVariantSet = new Set(checkedVariantIds);
+  const selectedVariantIds = (modelVariantCatalogState.enabledVariantIds || [])
+    .filter((variantId) => !renderedVariantIds.has(variantId) || checkedVariantSet.has(variantId));
+  for (const variantId of checkedVariantIds) {
+    if (!selectedVariantIds.includes(variantId)) selectedVariantIds.push(variantId);
+  }
+  const hasVariantRows = renderedVariantCheckboxes.length > 0;
   if (hasVariantRows && !selectedVariantIds.length) {
     alert('Select at least one model variant.');
     return;
@@ -1980,6 +2656,18 @@ async function saveSelectedModelsFromModal() {
       const savedClaude = await updateClaudeSettings({ enabledModels: selectedClaudeModels });
       if (!savedClaude) throw new Error('Failed to save Claude model selection');
       applyClaudeSettingsState(savedClaude);
+    }
+    if (cursorCheckboxes.length) {
+      const savedCursor = await updateCursorSettings({ enabledModels: selectedCursorModels });
+      if (!savedCursor) throw new Error('Failed to save Cursor model selection');
+      applyCursorSettingsState(savedCursor);
+    }
+    if (grokCheckboxes.length) {
+      const savedGrok = await updateGrokSettings({ enabledModels: selectedGrokModels });
+      if (!savedGrok) throw new Error('Failed to save Grok model selection');
+      applyGrokSettingsState(savedGrok);
+    }
+    if (claudeCheckboxes.length || cursorCheckboxes.length || grokCheckboxes.length) {
       const refreshedCatalog = await loadModelVariantCatalog();
       if (refreshedCatalog) applyModelVariantCatalogState(refreshedCatalog);
     }
@@ -1996,11 +2684,24 @@ async function saveSelectedModelsFromModal() {
 async function loadUsageSummaryAndRender() {
   const d = await loadUsageSummary();
   if (!d) throw new Error('Unable to load usage data');
-  const pct = d.premiumInteractions.percentRemaining != null
+  const planHtml = renderPlanUsageHtml(d);
+  if (planHtml) {
+    renderSummaryModalContent({
+      title: 'Plan usage',
+      subtitle: planUsageSubtitle(d),
+      bodyHtml: planHtml,
+      refresh: loadUsageSummaryAndRender,
+      kind: 'usage',
+    });
+    return;
+  }
+  // Legacy relay (or a relay without the plan-usage service): fall back to the
+  // Copilot-only text summary rather than showing an empty modal.
+  const pct = d.premiumInteractions?.percentRemaining != null
     ? ` (${d.premiumInteractions.percentRemaining.toFixed(1)}% left)`
     : '';
-  const msg = `Chat/Completions: ${d.chat.unlimited ? 'Unlimited ✅' : `${d.chat.remaining} remaining`}\n` +
-    `Premium interactions: ${d.premiumInteractions.remaining} / ${d.premiumInteractions.entitlement} remaining${pct}`;
+  const msg = `Chat/Completions: ${d.chat?.unlimited ? 'Unlimited ✅' : `${d.chat?.remaining} remaining`}\n` +
+    `Premium interactions: ${d.premiumInteractions?.remaining} / ${d.premiumInteractions?.entitlement} remaining${pct}`;
   renderSummaryModalContent({
     title: 'Copilot Usage',
     subtitle: `Resets ${d.resetDate || 'unknown'}`,
@@ -2016,7 +2717,11 @@ async function loadContextSummaryAndRender(convId) {
   if (!payload) throw new Error('Unable to load context');
   const sessionId = String(payload.copilotSessionId || payload.snapshot?.copilot_session_id || '').trim();
   const refreshLookupId = sessionId || trimmedConvId || null;
-  const providerLabel = payload.providerType === 'claude' ? 'Claude' : 'Copilot';
+  const providerLabel = payload.providerType === 'claude'
+    ? 'Claude'
+    : (payload.providerType === 'cursor'
+      ? 'Cursor'
+      : (payload.providerType === 'grok' ? 'Grok' : 'Copilot'));
   const subtitle = sessionId
     ? `${providerLabel} session ${sessionId.slice(0, 8)}`
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
@@ -2047,9 +2752,9 @@ async function showUsage() {
     btn.disabled = true;
   }
   openSummaryModal({
-    title: 'Copilot Usage',
+    title: 'Plan usage',
     subtitle: 'Loading…',
-    bodyHtml: '<div class="summary-loading">Fetching usage snapshot…</div>',
+    bodyHtml: '<div class="summary-loading">Fetching plan usage across providers…</div>',
     refresh: loadUsageSummaryAndRender,
     kind: 'usage',
   });
@@ -2058,7 +2763,7 @@ async function showUsage() {
     await loadUsageSummaryAndRender();
   } catch (e) {
     renderSummaryModalContent({
-      title: 'Copilot Usage',
+      title: 'Plan usage',
       subtitle: 'Unable to load',
       bodyHtml: `<div class="summary-error">Failed to fetch usage: ${escHtml(e.message || 'Unknown error')}</div>`,
       refresh: loadUsageSummaryAndRender,
@@ -2206,6 +2911,9 @@ async function pollAuthenticatedCurrentConversationLive() {
   const isProcessing = String(currentConversation?.localTurnStatus || '').trim().toLowerCase() === 'processing'
     || !!document.getElementById('thinking-indicator');
   if (!isProcessing) return;
+  // Refreshing while the user selects or drags in the chat would rebuild the
+  // DOM under the selection; the guard's release callback re-polls right away.
+  if (isChatInteractionHeld()) return;
 
   liveConversationPollInFlight = true;
   try {
@@ -2246,6 +2954,33 @@ function setupViewportTracking() {
     window.visualViewport.addEventListener('scroll', update, { passive: true });
   }
 
+  // The page root must never scroll: #app is viewport-sized and body hides its
+  // scrollbar, but programmatic scrolls (scrollIntoView, focus reveals) can
+  // still shift the root and push the header off-screen with no way back.
+  const clampRootScroll = () => {
+    if (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop) {
+      window.scrollTo(0, 0);
+    }
+  };
+  clampRootScroll();
+  window.addEventListener('scroll', clampRootScroll, { passive: true });
+
+  // The relay question cards create their reply controls dynamically, so the
+  // keyboard-open bookkeeping is delegated instead of bound per input.
+  const isQuestionTextControl = (node) => node instanceof Element
+    && (node.tagName === 'TEXTAREA' || node.tagName === 'INPUT')
+    && !!node.closest('.relay-question-container');
+  document.addEventListener('focusin', (event) => {
+    if (!isQuestionTextControl(event.target)) return;
+    document.body.classList.add('keyboard-open');
+    syncViewportMetrics();
+  });
+  document.addEventListener('focusout', (event) => {
+    if (!isQuestionTextControl(event.target)) return;
+    document.body.classList.remove('keyboard-open');
+    syncViewportMetrics();
+  });
+
   const input = document.getElementById('msg-input');
   if (input && input.dataset.viewportBound !== '1') {
     input.dataset.viewportBound = '1';
@@ -2262,6 +2997,62 @@ function setupViewportTracking() {
       void flushConversationDraft(currentConvId);
     }, { passive: true });
   }
+}
+
+function composerAttachmentsAllowed() {
+  // Shared read-only viewers must never be able to attach files.
+  return !appSharedMode && !IS_SHARED_VIEW;
+}
+
+function initComposerAttachmentInput() {
+  const input = document.getElementById('msg-input');
+  if (input && input.dataset.pasteBound !== '1') {
+    input.dataset.pasteBound = '1';
+    input.addEventListener('paste', (event) => {
+      if (!composerAttachmentsAllowed()) return;
+      void handleComposerPaste(event);
+    });
+  }
+
+  const dropZone = document.getElementById('input-area');
+  if (!dropZone || dropZone.dataset.dropBound === '1') return;
+  dropZone.dataset.dropBound = '1';
+
+  // dragenter/dragleave fire for every child element, so the highlight is
+  // reference counted instead of toggled, otherwise it flickers on each hover.
+  let dragDepth = 0;
+  const clearHighlight = () => {
+    dragDepth = 0;
+    dropZone.classList.remove('composer-dropzone-active');
+  };
+
+  dropZone.addEventListener('dragenter', (event) => {
+    if (!composerAttachmentsAllowed() || !dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepth += 1;
+    dropZone.classList.add('composer-dropzone-active');
+  });
+
+  dropZone.addEventListener('dragover', (event) => {
+    if (!composerAttachmentsAllowed() || !dataTransferHasFiles(event.dataTransfer)) return;
+    // Without preventDefault the browser refuses the drop entirely.
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+  });
+
+  dropZone.addEventListener('dragleave', (event) => {
+    if (!dragDepth) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) dropZone.classList.remove('composer-dropzone-active');
+  });
+
+  dropZone.addEventListener('drop', (event) => {
+    clearHighlight();
+    if (!composerAttachmentsAllowed()) return;
+    void handleComposerDrop(event);
+  });
+
+  window.addEventListener('dragend', clearHighlight);
 }
 
 function initMessageScrollPersistence() {
@@ -2665,7 +3456,9 @@ function applyConversationWorkspaceRootUpdate(payload = {}) {
   if (rootChanged) {
     resetWorkspaceRepoBrowserForRootChange();
   } else if (repoBrowserState.activeRoot === 'workspace' && repoBrowserState.open) {
-    void loadRepoBrowserTree();
+    // Same root: refresh through the restoring path so open folders and the
+    // current selection survive.
+    refreshRepoBrowser();
   }
 }
 
@@ -2708,6 +3501,8 @@ initSocketHandlers({
   applyConversationPreferencesForConversation,
   applyOpenAISettingsState,
   applyClaudeSettingsState,
+  applyGrokSettingsState,
+  applyCursorSettingsState,
 });
 
 initCwdPicker({
@@ -2736,7 +3531,21 @@ function showAuthGate(error = '') {
   document.getElementById('token-input')?.focus();
 }
 
+// Runs before anything reads MODEL_STORAGE_KEY so the first load after an
+// upgrade already sees the model the user last picked in the New Chat modal.
+function migrateLegacyModelStorageKey() {
+  try {
+    const legacy = String(localStorage.getItem(LEGACY_MODEL_STORAGE_KEY) || '').trim();
+    if (!legacy) return;
+    if (!String(localStorage.getItem(MODEL_STORAGE_KEY) || '').trim()) {
+      localStorage.setItem(MODEL_STORAGE_KEY, legacy);
+    }
+    localStorage.removeItem(LEGACY_MODEL_STORAGE_KEY);
+  } catch {}
+}
+
 async function initApp() {
+  migrateLegacyModelStorageKey();
   initClientDiagnostics();
   installExternalLinkPolicy({ onFallback: showExternalLinkFallback });
   const sharedMode = isSharedReaderMode();
@@ -2757,8 +3566,17 @@ async function initApp() {
     syncSuspendHostVisibility();
   }
   setupViewportTracking();
+  bindChatSelectionGuard();
+  chatSelectionGuard.onRelease(() => {
+    flushDeferredMessageRender();
+    pollAuthenticatedCurrentConversationLive().catch(() => {});
+  });
   window.addEventListener('pagehide', () => {
     stopSharedModeTimers();
+    // The direct flush below can be killed mid-flight by the browser; the
+    // queued copy survives and is replayed by Background Sync. If the direct
+    // write wins, the replay hits a draft version conflict and is dropped.
+    if (!appSharedMode) void enqueueDraftFlushForBackgroundSync(currentConvId);
     void flushConversationDraft(currentConvId);
     closeTmuxInspectorView();
   });
@@ -2853,6 +3671,14 @@ async function initApp() {
       lockChatActionsMenuShield(350);
       closeChatActionsMenu();
       openChangeCwdModal();
+    });
+    const chatMenuGitChangesBtn = document.getElementById('chat-menu-git-changes');
+    bindMenuAction(chatMenuGitChangesBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openGitChangesModal();
     });
     const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
     bindMenuAction(chatMenuSettingsBtn, (event) => {
@@ -2958,6 +3784,8 @@ async function initApp() {
   syncQueueStatusMenuEntry(status);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
   await refreshOpenAISettingsState();
+  await refreshCursorSettingsState();
+  await refreshGrokSettingsState();
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
@@ -2968,14 +3796,25 @@ async function initApp() {
   initConversationHistoryLazyLoading();
   initBubbleActionHandlers();
   initMessageScrollPersistence();
+  initComposerAttachmentInput();
   initMessageSearchView({ openConversation });
+  initGitChangesView();
   syncChatTitleControls();
   connectSocket();
+  startRelayConnectionWatchdog();
+  startDeviceVisibilityHeartbeat();
   startRelayQuestionPolling();
   startRelayBoardPolling();
   startSessionWorkerStatusPolling();
   startLiveConversationPolling();
+  initPushNotificationClientHooks();
+  // Browsers without Background Sync replay the outbox from the page instead.
+  void initOutboxFallbackReplay();
   await loadConversations();
+  const pushConversationId = consumePushConversationDeepLink();
+  if (pushConversationId) {
+    await openConversation(pushConversationId).catch(() => {});
+  }
   await loadRelayQuestions(currentConvId);
   await loadRelayBoards();
   updateCompactButton();
@@ -3044,10 +3883,25 @@ window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.saveClaudeSettings = saveClaudeSettings;
 window.toggleClaudeProvider = toggleClaudeProvider;
+window.saveGrokSettings = saveGrokSettings;
+window.toggleGrokProvider = toggleGrokProvider;
+window.saveCursorSettings = saveCursorSettings;
+window.removeCursorSettings = removeCursorSettings;
+window.saveCursorAllowanceSettings = saveCursorAllowanceSettings;
+window.resetCursorAllowanceAccounting = resetCursorAllowanceAccounting;
+window.saveCursorDashboardToken = saveCursorDashboardToken;
+window.removeCursorDashboardToken = removeCursorDashboardToken;
+window.saveGrokAllowanceSettings = saveGrokAllowanceSettings;
+window.resetGrokAllowanceAccounting = resetGrokAllowanceAccounting;
+window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;
 window.previewTurnCeilingSetting = previewTurnCeilingSetting;
 window.updateTurnCeilingSetting = updateTurnCeilingSetting;
+window.previewBackgroundTaskTimeoutSetting = previewBackgroundTaskTimeoutSetting;
+window.updateBackgroundTaskTimeoutSetting = updateBackgroundTaskTimeoutSetting;
+window.togglePushOnThisDevice = togglePushOnThisDevice;
+window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
 window.doAuth = doAuth;
@@ -3091,6 +3945,7 @@ window.toggleStatusView = toggleStatusView;
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;
 window.handleAttachmentInput = handleAttachmentInput;
+window.retryAttachmentUpload = retryAttachmentUpload;
 window.removeAttachment = removeAttachment;
 window.clearAttachments = clearAttachments;
 window.openUploadedAttachmentViewer = openUploadedAttachmentViewer;
@@ -3117,6 +3972,7 @@ window.submitRelayBoardAction = submitRelayBoardAction;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
 window.syncComposerControlState = syncComposerControlState;
+window.persistComposerAttachments = persistComposerAttachments;
 window.appendMessage = appendMessage;
 window.loadOlderConversationMessages = loadOlderConversationMessages;
 window.handleKey = handleKey;
@@ -3138,6 +3994,11 @@ window.confirmSuspendHost = confirmSuspendHost;
 window.confirmEmptyQueue = confirmEmptyQueue;
 window.openMessageSearchModal = openMessageSearchModal;
 window.closeMessageSearchModal = closeMessageSearchModal;
+window.openGitChangesModal = openGitChangesModal;
+window.closeGitChangesModal = closeGitChangesModal;
+window.openGitDiffViewer = openGitDiffViewer;
+window.closeGitDiffViewer = closeGitDiffViewer;
+window.setGitDiffMode = setGitDiffMode;
 window.copyExternalLinkUrl = copyExternalLinkUrl;
 window.retryExternalLinkOpen = retryExternalLinkOpen;
 

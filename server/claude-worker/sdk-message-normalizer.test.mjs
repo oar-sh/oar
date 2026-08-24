@@ -249,6 +249,164 @@ test('streamed thinking and its complete message share one reasoningId', () => {
   assert.equal(complete[0].payload.text, 'half a thought, now whole');
 });
 
+test('per-block complete assistant events reuse the streamed reasoningId for late thinking blocks', () => {
+  // The SDK delivers the complete message one content block at a time — every
+  // event carries the same message id and arrives BEFORE that block's
+  // content_block_stop (verified against @anthropic-ai/claude-agent-sdk 0.3.220).
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'message_start', message: { id: 'msg_01', role: 'assistant' } },
+  });
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_start', index: 0, content_block: { type: 'text' } },
+  });
+  normalizer.normalize(streamTextDelta('Status update.'));
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_start', index: 1, content_block: { type: 'thinking' } },
+  });
+  const streamed = normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'weighing the options' } },
+  });
+  normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_01', content: [{ type: 'text', text: 'Status update.' }] },
+  });
+  const complete = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_01', content: [{ type: 'thinking', thinking: 'weighing the options' }] },
+  });
+  const stopped = normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_stop', index: 1 },
+  });
+
+  // One id across all three frames → the server upserts a single relay_thought
+  // row instead of inserting a duplicate for the complete-message republish.
+  const streamedId = streamed[0].payload.reasoningId;
+  assert.equal(complete[0].payload.reasoningId, streamedId);
+  assert.equal(stopped[0].payload.reasoningId, streamedId);
+});
+
+test('per-block completes pair each thinking block with its streamed frames in order', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'message_start', message: { id: 'msg_02', role: 'assistant' } },
+  });
+  const streamThinkingBlock = (index, thinking) => {
+    normalizer.normalize({
+      type: 'stream_event',
+      parent_tool_use_id: null,
+      event: { type: 'content_block_start', index, content_block: { type: 'thinking' } },
+    });
+    return normalizer.normalize({
+      type: 'stream_event',
+      parent_tool_use_id: null,
+      event: { type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking } },
+    });
+  };
+  const firstStreamed = streamThinkingBlock(0, 'first idea');
+  const firstComplete = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_02', content: [{ type: 'thinking', thinking: 'first idea' }] },
+  });
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_stop', index: 0 },
+  });
+  const secondStreamed = streamThinkingBlock(1, 'second idea');
+  const secondComplete = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_02', content: [{ type: 'thinking', thinking: 'second idea' }] },
+  });
+
+  assert.equal(firstComplete[0].payload.reasoningId, firstStreamed[0].payload.reasoningId);
+  assert.equal(secondComplete[0].payload.reasoningId, secondStreamed[0].payload.reasoningId);
+  assert.notEqual(firstComplete[0].payload.reasoningId, secondComplete[0].payload.reasoningId);
+});
+
+test('empty thinking blocks still consume their pairing slot', () => {
+  // Under the summarized-thinking display, a message can carry an empty raw
+  // thinking block followed by the non-empty summary block (seen live with
+  // opus: [thinking(len=0), thinking(len=113)]). The empty block emits no
+  // thought, but it must still consume its slot in the streamed-id pairing —
+  // otherwise the summary consumes the empty block's id while its own streamed
+  // frames finalize under the next id, duplicating the thought row.
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'message_start', message: { id: 'msg_05', role: 'assistant' } },
+  });
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } },
+  });
+  normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_start', index: 1, content_block: { type: 'thinking' } },
+  });
+  const streamed = normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'the summary' } },
+  });
+  const emptyComplete = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_05', content: [{ type: 'thinking', thinking: '' }] },
+  });
+  const summaryComplete = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_05', content: [{ type: 'thinking', thinking: 'the summary' }] },
+  });
+  const stopped = normalizer.normalize({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_stop', index: 1 },
+  });
+
+  assert.equal(emptyComplete.length, 0, 'empty thinking emits nothing');
+  const streamedId = streamed[0].payload.reasoningId;
+  assert.equal(summaryComplete[0].payload.reasoningId, streamedId);
+  assert.equal(stopped[0].payload.reasoningId, streamedId);
+});
+
+test('complete thinking without streamed frames still gets distinct ids per message', () => {
+  // Partial frames can be unavailable; per-block completes for two different
+  // messages must not collide even though each carries its block at index 0.
+  const normalizer = createSdkMessageNormalizer();
+  const first = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_03', content: [{ type: 'thinking', thinking: 'first' }] },
+  });
+  const second = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_04', content: [{ type: 'thinking', thinking: 'second' }] },
+  });
+  assert.notEqual(first[0].payload.reasoningId, second[0].payload.reasoningId);
+});
+
 test('interim narration alongside tool calls becomes a thought', () => {
   const normalizer = createSdkMessageNormalizer();
   const actions = normalizer.normalize(assistantMessage([
@@ -358,7 +516,7 @@ test('zero-turn error results still map to result actions', () => {
   assert.equal(failure[0].payload.isError, true);
 });
 
-test('task_notification system messages surface as activity', () => {
+test('task_notification system messages surface as settled edge plus activity', () => {
   const normalizer = createSdkMessageNormalizer();
   const actions = normalizer.normalize({
     type: 'system',
@@ -367,7 +525,120 @@ test('task_notification system messages surface as activity', () => {
     status: 'stopped',
     summary: 'No completion record was found for this background shell command.',
   });
-  assert.equal(actions.length, 1);
-  assert.equal(actions[0].channel, 'activity');
-  assert.match(actions[0].payload.text, /Background task task-1 stopped/);
+  assert.equal(actions.length, 2);
+  assert.equal(actions[0].channel, 'background_task_settled');
+  assert.deepEqual(actions[0].payload, { taskId: 'task-1', status: 'stopped' });
+  assert.equal(actions[1].channel, 'activity');
+  assert.match(actions[1].payload.text, /Background task task-1 stopped/);
+});
+
+test('background_tasks_changed maps the live set with replace semantics', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const populated = normalizer.normalize({
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: [
+      { task_id: 'agent-1', task_type: 'local_agent', description: 'Implement feature' },
+      { task_id: '', task_type: 'local_bash', description: 'id-less entry is dropped' },
+    ],
+    session_id: 's1',
+  });
+  assert.equal(populated.length, 1);
+  assert.equal(populated[0].channel, 'background_tasks');
+  assert.deepEqual(populated[0].payload.tasks, [
+    { taskId: 'agent-1', taskType: 'local_agent', description: 'Implement feature' },
+  ]);
+
+  const emptied = normalizer.normalize({
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: [],
+    session_id: 's1',
+  });
+  assert.deepEqual(emptied, [{ channel: 'background_tasks', payload: { tasks: [] } }]);
+});
+
+// ---------------------------------------------------------------------------
+// Per-block delivery correctness (2026-08-16 review)
+
+test('narration demotion works across per-block assistant events sharing one message id', () => {
+  const normalizer = createSdkMessageNormalizer();
+  // One API message, delivered one block per event (the real SDK shape):
+  // text first, then a tool_use — the text is interim narration.
+  const textActions = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_A', content: [{ type: 'text', text: 'Let me check the file first.' }] },
+  });
+  assert.equal(textActions.length, 0, 'text buffers until the message proves itself narration or answer');
+  const toolActions = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_A', content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: '/tmp/x' } }] },
+  });
+  const narration = toolActions.find((action) => action.channel === 'thought');
+  assert.ok(narration, 'the buffered text becomes a narration thought once the tool_use lands');
+  assert.equal(narration.payload.text, 'Let me check the file first.');
+  // A later text block in the same (tool-bearing) message demotes immediately.
+  const followUp = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_A', content: [{ type: 'text', text: 'Now writing the fix.' }] },
+  });
+  assert.equal(followUp.filter((action) => action.channel === 'thought').length, 1);
+  // The next message's lone text block is the answer — never a thought.
+  const answer = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_B', content: [{ type: 'text', text: 'All done: the file is fixed.' }] },
+  });
+  assert.equal(answer.filter((action) => action.channel === 'thought').length, 0);
+});
+
+test('the live stream resets at each message boundary instead of concatenating', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const longNarration = 'Let me look into the failing test before answering properly.';
+  normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id: 'msg_A' } } });
+  normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: longNarration } } });
+  normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id: 'msg_B' } } });
+  const answerDelta = 'The answer is forty-two, with confidence.';
+  const actions = normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answerDelta } } });
+  const stream = actions.find((action) => action.channel === 'stream');
+  assert.ok(stream);
+  assert.equal(stream.payload.text, answerDelta, 'the second message streams alone, not appended to the first');
+  assert.equal(normalizer.finalStreamText(), answerDelta);
+});
+
+test('redacted thinking surfaces as a placeholder instead of vanishing', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const actions = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_R', content: [{ type: 'redacted_thinking', data: 'ENCRYPTED' }] },
+  });
+  const thought = actions.find((action) => action.channel === 'thought');
+  assert.ok(thought);
+  assert.match(thought.payload.text, /redacted/i);
+});
+
+test('a model refusal fallback updates the turn model and surfaces the notice', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({ type: 'system', subtype: 'init', session_id: 'sess-1', model: 'claude-fable-5' });
+  const actions = normalizer.normalize({
+    type: 'system',
+    subtype: 'model_refusal_fallback',
+    direction: 'retry',
+    scope: 'session',
+    originalModel: 'claude-fable-5',
+    fallbackModel: 'claude-opus-4-8',
+    content: 'Safeguards flagged this message. Switched to Opus 4.8.',
+  });
+  assert.deepEqual(actions[0], { channel: 'init', payload: { sessionId: 'sess-1', model: 'claude-opus-4-8' } });
+  assert.equal(actions[1].channel, 'activity');
+  assert.match(actions[1].payload.text, /Switched to Opus 4.8/);
+  // The turn's result now reports the model that actually produced it.
+  const [result] = normalizer.normalize({
+    type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: 'sess-1', num_turns: 1, duration_api_ms: 5,
+  });
+  assert.equal(result.payload.model, 'claude-opus-4-8');
 });

@@ -24,21 +24,25 @@ import {
   normalizeWorkspaceRootKey,
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
-import { rebuildRecentWorkspaceRootsTable } from './migrations/0002-recent-workspace-roots-path-key.mjs';
+import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
+import { applySchema } from './db-schema.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
 import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
-import {
-  createImageConversationRepository,
-  migrateImageConversationSchema,
-} from './repositories/image-conversation-repository.mjs';
+import { createImageConversationRepository } from './repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { buildDequeuedRelayMessage, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
+import { registerGitRoutes } from './routes/git-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
+import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
+import webpush from 'web-push';
+import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
+import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
+import { registerPushRoutes } from './routes/push-routes.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
@@ -46,12 +50,21 @@ import {
   toDriveWebPath as _toDriveWebPath,
   normalizeLinuxAbsolutePath as _normalizeLinuxAbsolutePath,
 } from './services/drives-path-helpers.mjs';
+import { DEFAULT_CLAUDE_REASONING_EFFORTS, withClaudeUltracodeTier } from './services/provider-reasoning-effort.mjs';
+import { createPlanUsageService } from './services/plan-usage-service.mjs';
+import { normalizeCursorAllowanceSettings } from './services/plan-usage-cursor.mjs';
+import { normalizeGrokAllowanceSettings } from './services/plan-usage-grok.mjs';
+import { createGrokBillingUsageFetcher } from './services/grok-billing-usage.mjs';
+import { createCursorDashboardUsageFetcher, readCursorIdeSessionToken } from './services/cursor-dashboard-usage.mjs';
+import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
 import { createInstalledCopilotClient } from './copilot-sdk-runtime.mjs';
 import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
 import { createClaudeSessionRootResolver } from './services/claude-session-root-service.mjs';
+import { createCursorSessionRootResolver } from './services/cursor-session-root-service.mjs';
+import { createGitChangesService } from './services/git-changes-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
@@ -60,8 +73,10 @@ import { createSessionWorkerRegistry } from './services/session-worker-registry-
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
-import { applyClaudeProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
+import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
+import { createTunnelWorkerPathGuard } from './services/tunnel-worker-path-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
@@ -80,12 +95,19 @@ import {
   readTurnCeilingSetting,
   turnCeilingMinutesToMs,
 } from '../shared/turn-ceiling.mjs';
+import {
+  parseBackgroundTaskTimeoutUpdate,
+  readBackgroundTaskTimeoutSetting,
+  backgroundTaskTimeoutMinutesToMs,
+} from '../shared/background-task-timeout.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
 import {
   canonicalizeModelId,
   filterValidModelIds,
   isOpenAIModelId,
   isSafeClaudeModelId,
+  isSafeCursorModelId,
+  isSafeGrokModelId,
   isSafeProviderModelId,
   isValidModelId,
 } from '../shared/model-id.mjs';
@@ -327,12 +349,13 @@ function getClaudeProviderSettings() {
     const key = String(availableModel || '').trim().toLowerCase();
     if (!key) continue;
     const discoveredEfforts = storedEfforts[key];
-    // 'none' (SDK default) is always offered; discovered levels follow. When a
-    // model was never discovered, offer the full ladder — the SDK silently
-    // downgrades unsupported levels.
+    // 'none' (SDK default) is always offered; discovered levels follow, with
+    // the derived 'ultracode' tier on xhigh-capable models. When a model was
+    // never discovered, offer the full ladder — the SDK silently downgrades
+    // unsupported levels.
     effortsByModel[key] = Array.isArray(discoveredEfforts) && discoveredEfforts.length
-      ? ['none', ...discoveredEfforts]
-      : [...CLAUDE_REASONING_EFFORTS];
+      ? withClaudeUltracodeTier(['none', ...discoveredEfforts])
+      : [...DEFAULT_CLAUDE_REASONING_EFFORTS];
   }
   return {
     // The Claude runtime authenticates through the host's logged-in Claude
@@ -471,6 +494,699 @@ async function refreshClaudeProviderModels() {
   }
 }
 
+function readCursorModelReasoningOffSetting() {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_MODEL_REASONING_OFF_SETTING_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [modelId, supported] of Object.entries(parsed)) {
+      const key = String(modelId || '').trim().toLowerCase();
+      if (!key) continue;
+      out[key] = supported === true;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function readCursorModelEffortsSetting() {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_MODEL_EFFORTS_SETTING_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [modelId, efforts] of Object.entries(parsed)) {
+      const key = String(modelId || '').trim().toLowerCase();
+      if (!key) continue;
+      const levels = (Array.isArray(efforts) ? efforts : [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => CURSOR_EFFORT_LEVELS.has(value));
+      out[key] = levels;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function getCursorProviderSettings() {
+  const apiKey = readAppSettingValue(CURSOR_API_KEY_SETTING_KEY);
+  const enabledSetting = readAppSettingValue(CURSOR_ENABLED_SETTING_KEY);
+  const enabled = !!apiKey && (enabledSetting === '' || enabledSetting === 'true');
+  const model = readAppSettingValue(CURSOR_MODEL_SETTING_KEY) || DEFAULT_CURSOR_MODEL;
+  let models = [];
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_MODELS_SETTING_KEY) || '[]');
+    if (Array.isArray(parsed)) {
+      models = parsed
+        .map((value) => String(value || '').trim())
+        .filter((modelId) => isSafeCursorModelId(modelId));
+    }
+  } catch {
+    models = [];
+  }
+  const availableModels = Array.from(new Set([model, ...(models.length ? models : DEFAULT_CURSOR_MODELS)]));
+  const availableSet = new Set(availableModels);
+  let enabledSelection = [];
+  try {
+    const parsed = JSON.parse(readAppSettingValue(CURSOR_ENABLED_MODELS_SETTING_KEY) || '[]');
+    if (Array.isArray(parsed)) {
+      enabledSelection = parsed
+        .map((value) => String(value || '').trim())
+        .filter((modelId) => isSafeCursorModelId(modelId) && availableSet.has(modelId));
+    }
+  } catch {
+    enabledSelection = [];
+  }
+  // The enabled subset (chosen in the Select Models modal) drives the model
+  // catalog and composers; an empty selection means "all available".
+  const resolvedModels = Array.from(new Set([
+    model,
+    ...(enabledSelection.length ? enabledSelection : availableModels),
+  ])).filter(Boolean);
+  const storedEfforts = readCursorModelEffortsSetting();
+  const storedReasoningOff = readCursorModelReasoningOffSetting();
+  const effortsByModel = {};
+  const reasoningOffByModel = {};
+  for (const availableModel of availableModels) {
+    const key = String(availableModel || '').trim().toLowerCase();
+    if (!key) continue;
+    reasoningOffByModel[key] = storedReasoningOff[key] === true;
+    const discoveredEfforts = storedEfforts[key] || [];
+    // 'none' is always offered; discovered tiers follow. The worker maps
+    // 'none' to an explicit off-switch where the model can express it
+    // (thinking=false / reasoning='none') and to the model default otherwise.
+    // A model with no discovered effort parameter stays at 'none' only.
+    effortsByModel[key] = ['none', ...discoveredEfforts.filter((value) => value !== 'none')];
+  }
+  return {
+    configured: !!apiKey,
+    enabled,
+    apiKey,
+    model,
+    models: resolvedModels,
+    availableModels,
+    enabledModels: resolvedModels,
+    effortsByModel,
+    reasoningOffByModel,
+    // Pre-effort installs have models but no efforts setting; the settings
+    // route uses this to re-run discovery once and backfill the tiers. The
+    // reasoning-off capability shipped later and needs the same one-shot
+    // backfill, otherwise an install that already discovered efforts would
+    // treat every Cursor model as unable to turn reasoning off.
+    effortsDiscovered: readAppSettingValue(CURSOR_MODEL_EFFORTS_SETTING_KEY) !== '',
+    reasoningOffDiscovered: readAppSettingValue(CURSOR_MODEL_REASONING_OFF_SETTING_KEY) !== '',
+    providerType: 'cursor',
+  };
+}
+
+/**
+ * Manual Cursor plan allowances. Cursor's SDK reports authoritative spend but
+ * no included-pool balance or billing reset date, so these are the only source
+ * for the "how much is left" side of the Cursor usage card.
+ */
+// Session cookie for cursor.com's dashboard API (live plan-quota bars). The
+// API key has no plan/usage surface; the token comes from the host's Cursor
+// IDE login automatically, with a user-pasted cookie or CURSOR_SESSION_TOKEN
+// as the override for headless hosts (the Linux relay has no IDE install).
+function readCursorSessionTokenFromEnv() {
+  return String(process.env.CURSOR_SESSION_TOKEN || '').trim();
+}
+
+function readCursorDashboardSessionToken() {
+  return readAppSettingValue(CURSOR_SESSION_TOKEN_SETTING_KEY) || readCursorSessionTokenFromEnv();
+}
+
+function getCursorDashboardTokenSettings() {
+  if (readAppSettingValue(CURSOR_SESSION_TOKEN_SETTING_KEY) !== '') {
+    return { configured: true, source: 'manual' };
+  }
+  if (readCursorSessionTokenFromEnv() !== '') {
+    return { configured: true, source: 'env' };
+  }
+  if (readCursorIdeSessionToken()) {
+    return { configured: true, source: 'ide' };
+  }
+  return { configured: false, source: null };
+}
+
+function setCursorDashboardTokenSettings({ sessionToken, remove = false } = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Cursor dashboard token settings are unavailable' };
+  }
+  if (remove) {
+    stmts.deleteAppSetting.run(CURSOR_SESSION_TOKEN_SETTING_KEY);
+    return { ok: true, configured: false };
+  }
+  const normalized = String(sessionToken || '').trim();
+  if (!normalized) return { ok: false, error: 'Missing sessionToken' };
+  if (/\s/.test(normalized) || normalized.length > 8192) {
+    return { ok: false, error: 'That does not look like a WorkosCursorSessionToken cookie value' };
+  }
+  stmts.upsertAppSetting.run(CURSOR_SESSION_TOKEN_SETTING_KEY, normalized, new Date().toISOString());
+  return { ok: true, configured: true };
+}
+
+function getCursorPlanAllowanceSettings() {
+  const readNumeric = (key) => {
+    const raw = readAppSettingValue(key);
+    if (raw === '' || raw === null || raw === undefined) return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  return normalizeCursorAllowanceSettings({
+    cursorModelsUsd: readNumeric(CURSOR_ALLOWANCE_CURSOR_MODELS_SETTING_KEY),
+    otherModelsUsd: readNumeric(CURSOR_ALLOWANCE_OTHER_MODELS_SETTING_KEY),
+    resetDay: readNumeric(CURSOR_ALLOWANCE_RESET_DAY_SETTING_KEY),
+  });
+}
+
+function setCursorPlanAllowanceSettings(update = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Cursor allowance settings are unavailable' };
+  }
+  const payload = update && typeof update === 'object' ? update : {};
+  const current = getCursorPlanAllowanceSettings();
+  const nowIso = new Date().toISOString();
+
+  // Plan every write before performing any of them: the form posts all three
+  // fields together, so a rejected second field must not leave the first one
+  // already persisted.
+  const writes = [];
+  const planAllowance = (key, value, label) => {
+    if (value === undefined) return null;
+    // null / '' clears the allowance so the card falls back to "spend only".
+    if (value === null || value === '') {
+      writes.push(() => stmts.deleteAppSetting.run(key));
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) return { error: `Invalid ${label} allowance` };
+    const normalized = Math.round(parsed * 100) / 100;
+    writes.push(() => stmts.upsertAppSetting.run(key, String(normalized), nowIso));
+    return null;
+  };
+
+  const cursorModelsError = planAllowance(
+    CURSOR_ALLOWANCE_CURSOR_MODELS_SETTING_KEY,
+    payload.cursorModelsUsd,
+    'Cursor Models',
+  );
+  if (cursorModelsError) return { ok: false, ...cursorModelsError };
+  const otherModelsError = planAllowance(
+    CURSOR_ALLOWANCE_OTHER_MODELS_SETTING_KEY,
+    payload.otherModelsUsd,
+    'Other Models',
+  );
+  if (otherModelsError) return { ok: false, ...otherModelsError };
+
+  let resetDay = current.resetDay;
+  if (payload.resetDay !== undefined) {
+    const parsedDay = Number(payload.resetDay);
+    if (!Number.isFinite(parsedDay) || parsedDay < 1 || parsedDay > 31) {
+      return { ok: false, error: 'Reset day must be between 1 and 31' };
+    }
+    resetDay = Math.round(parsedDay);
+    writes.push(() => stmts.upsertAppSetting.run(CURSOR_ALLOWANCE_RESET_DAY_SETTING_KEY, String(resetDay), nowIso));
+  }
+
+  const applyWrites = db.transaction(() => {
+    for (const write of writes) write();
+  });
+  applyWrites();
+
+  if (payload.resetAccounting === true) {
+    planUsageService.resetCursorAccounting({ resetDay });
+  }
+
+  return { ok: true, ...getCursorPlanAllowanceSettings() };
+}
+
+/**
+ * Manual Grok plan allowance. ACP exposes per-turn cost/tokens but no remaining
+ * plan credits, so this optional monthly USD budget is the only source for an
+ * estimated "how much is left" meter on the Grok usage card.
+ */
+function getGrokPlanAllowanceSettings() {
+  const readNumeric = (key) => {
+    const raw = readAppSettingValue(key);
+    if (raw === '' || raw === null || raw === undefined) return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  return normalizeGrokAllowanceSettings({
+    monthlyUsd: readNumeric(GROK_ALLOWANCE_MONTHLY_USD_SETTING_KEY),
+    resetDay: readNumeric(GROK_ALLOWANCE_RESET_DAY_SETTING_KEY),
+  });
+}
+
+function setGrokPlanAllowanceSettings(update = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Grok allowance settings are unavailable' };
+  }
+  const payload = update && typeof update === 'object' ? update : {};
+  const current = getGrokPlanAllowanceSettings();
+  const nowIso = new Date().toISOString();
+  const writes = [];
+
+  if (payload.monthlyUsd !== undefined) {
+    if (payload.monthlyUsd === null || payload.monthlyUsd === '') {
+      writes.push(() => stmts.deleteAppSetting.run(GROK_ALLOWANCE_MONTHLY_USD_SETTING_KEY));
+    } else {
+      const parsed = Number(payload.monthlyUsd);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        return { ok: false, error: 'Invalid monthly allowance' };
+      }
+      const normalized = Math.round(parsed * 100) / 100;
+      writes.push(() => stmts.upsertAppSetting.run(GROK_ALLOWANCE_MONTHLY_USD_SETTING_KEY, String(normalized), nowIso));
+    }
+  }
+
+  let resetDay = current.resetDay;
+  if (payload.resetDay !== undefined) {
+    const parsedDay = Number(payload.resetDay);
+    if (!Number.isFinite(parsedDay) || parsedDay < 1 || parsedDay > 31) {
+      return { ok: false, error: 'Reset day must be between 1 and 31' };
+    }
+    resetDay = Math.round(parsedDay);
+    writes.push(() => stmts.upsertAppSetting.run(GROK_ALLOWANCE_RESET_DAY_SETTING_KEY, String(resetDay), nowIso));
+  }
+
+  if (writes.length) {
+    const applyWrites = db.transaction(() => {
+      for (const write of writes) write();
+    });
+    applyWrites();
+  }
+
+  if (payload.resetAccounting === true) {
+    planUsageService.resetGrokAccounting({ resetDay });
+  }
+
+  return { ok: true, ...getGrokPlanAllowanceSettings() };
+}
+
+function setCursorProviderSettings(update = {}) {
+  const payload = update && typeof update === 'object' ? update : {};
+  const apiKey = payload.apiKey;
+  const model = payload.model;
+  const enabled = payload.enabled;
+  const enabledModels = payload.enabledModels;
+  const remove = payload.remove === true;
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Cursor settings are unavailable' };
+  }
+  const existing = getCursorProviderSettings();
+  const normalizedModel = String(model || existing.model || '').trim() || DEFAULT_CURSOR_MODEL;
+  if (!isSafeCursorModelId(normalizedModel)) {
+    return { ok: false, error: 'Invalid Cursor model ID' };
+  }
+  const nowIso = new Date().toISOString();
+  if (remove) {
+    const providerCandidates = Array.isArray(stmts?.listRuntimeSessionProviderCandidates?.all?.())
+      ? stmts.listRuntimeSessionProviderCandidates.all()
+      : [];
+    const startedConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'cursor'
+      && Number(row?.message_count || 0) > 0
+    )).length;
+    const activeQueueConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'cursor'
+      && Number(row?.active_queue_count || 0) > 0
+    )).length;
+    const activeConversationCount = providerCandidates.filter((row) => (
+      String(row?.provider_type || 'github').trim().toLowerCase() === 'cursor'
+      && (Number(row?.message_count || 0) > 0 || Number(row?.active_queue_count || 0) > 0)
+    )).length;
+    if (activeConversationCount > 0) {
+      return {
+        ok: false,
+        code: 'cursor-key-removal-blocked',
+        error: `Cannot remove Cursor API key while ${activeConversationCount} active Cursor conversation(s) still exist. Disable Cursor for new conversations instead.`,
+        activeConversationCount,
+        startedConversationCount,
+        activeQueueConversationCount,
+      };
+    }
+    stmts.deleteAppSetting.run(CURSOR_API_KEY_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY);
+    stmts.deleteAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY);
+    stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, 'false', nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  } else {
+    const normalizedApiKey = String(apiKey || '').trim();
+    if (normalizedApiKey) {
+      stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
+      stmts.deleteAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY);
+      stmts.deleteAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY);
+      stmts.upsertAppSetting.run(CURSOR_API_KEY_SETTING_KEY, normalizedApiKey, nowIso);
+    }
+    const hasApiKey = !!(normalizedApiKey || existing.apiKey);
+    const nextEnabled = typeof enabled === 'boolean' ? enabled : (normalizedApiKey ? true : existing.enabled);
+    if (nextEnabled && !hasApiKey) return { ok: false, error: 'Cursor API key is not configured' };
+    stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
+    if (Array.isArray(enabledModels)) {
+      const normalizedEnabledModels = enabledModels
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && isSafeCursorModelId(value));
+      if (normalizedEnabledModels.length) {
+        stmts.upsertAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY, JSON.stringify(normalizedEnabledModels), nowIso);
+      } else {
+        stmts.deleteAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY);
+      }
+    }
+  }
+  const current = getCursorProviderSettings();
+  return {
+    ok: true,
+    configured: current.configured,
+    enabled: current.enabled,
+    model: current.model,
+    models: current.models,
+    availableModels: current.availableModels,
+  };
+}
+
+const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
+
+// Reasoning tiers for one discovered Cursor model, in composer vocabulary.
+// Cursor exposes effort as a per-model parameter named 'effort' or 'reasoning'
+// whose value list varies by model; 'extra-high' is Cursor's spelling of the
+// composer's 'xhigh'. Values with no composer equivalent (e.g. 'minimal') are
+// dropped rather than remapped onto a tier the model does not actually have.
+// Mirrors resolveCursorReasoningParams exactly, including its parameter
+// precedence: it consults 'effort' first and only falls back to 'reasoning',
+// so scanning both would advertise an off switch the worker never sends.
+function cursorEntrySupportsReasoningOff(entry) {
+  const parameters = Array.isArray(entry?.parameters) ? entry.parameters : [];
+  const byId = new Map(parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]));
+  if (byId.has('thinking')) return true;
+  const effortParam = byId.get('effort') || byId.get('reasoning');
+  const values = Array.isArray(effortParam?.values) ? effortParam.values : [];
+  return values.some((value) => (
+    String((value && typeof value === 'object' ? value.value : value) || '').trim().toLowerCase() === 'none'
+  ));
+}
+
+function cursorEntryEffortLevels(entry) {
+  const parameters = Array.isArray(entry?.parameters) ? entry.parameters : [];
+  // Same precedence as cursorEntrySupportsReasoningOff and the adapter: a model
+  // listing both parameters must not have its tiers read from one and its off
+  // switch from the other.
+  const byId = new Map(parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]));
+  const effortParam = byId.get('effort') || byId.get('reasoning');
+  if (!effortParam) return [];
+  const levels = [];
+  for (const value of (Array.isArray(effortParam.values) ? effortParam.values : [])) {
+    const raw = String((value && typeof value === 'object' ? value.value : value) || '').trim().toLowerCase();
+    const level = raw === 'extra-high' ? 'xhigh' : raw;
+    if (CURSOR_EFFORT_LEVELS.has(level) && !levels.includes(level)) levels.push(level);
+  }
+  return levels;
+}
+
+// Discover the models the Cursor Agent SDK can serve (mirrors
+// refreshClaudeProviderModels). The SDK's model-listing entry point is
+// normalized defensively (static list vs. client instance) pending spike
+// confirmation of the exact call form.
+async function refreshCursorProviderModels() {
+  const settings = getCursorProviderSettings();
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, models: settings.models, error: 'Cursor settings are unavailable' };
+  }
+  if (settings.enabled !== true) {
+    return { ok: false, models: settings.models, error: 'Cursor API key is not configured' };
+  }
+  try {
+    const mod = await import('@cursor/sdk');
+    // The namespace form is the only working call shape: `Cursor` has a
+    // private constructor and `models` is static, so the old client-instance
+    // fallback could only throw a TypeError that replaced the real error.
+    const listModels = async () => mod.Cursor.models.list({ apiKey: settings.apiKey });
+    const payload = await Promise.race([
+      listModels(),
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`timed out after ${CURSOR_MODEL_DISCOVERY_TIMEOUT_MS}ms`)),
+          CURSOR_MODEL_DISCOVERY_TIMEOUT_MS,
+        );
+        timer.unref?.();
+      }),
+    ]);
+    const entries = Array.isArray(payload)
+      ? payload
+      : (Array.isArray(payload?.models)
+        ? payload.models
+        : (Array.isArray(payload?.data) ? payload.data : []));
+    const discovered = [];
+    const effortsByModel = {};
+    const reasoningOffByModel = {};
+    for (const entry of entries) {
+      const modelId = String(typeof entry === 'string' ? entry : (entry?.id || entry?.name || '')).trim();
+      if (!modelId || !isSafeCursorModelId(modelId)) continue;
+      discovered.push(modelId);
+      const effortLevels = cursorEntryEffortLevels(entry);
+      if (effortLevels.length) effortsByModel[modelId.toLowerCase()] = effortLevels;
+      reasoningOffByModel[modelId.toLowerCase()] = cursorEntrySupportsReasoningOff(entry);
+    }
+    if (!discovered.length) {
+      return { ok: false, models: settings.models, error: 'Cursor model discovery returned no models' };
+    }
+    const nowIso = new Date().toISOString();
+    const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
+    stmts.upsertAppSetting.run(CURSOR_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
+    stmts.upsertAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY, JSON.stringify(reasoningOffByModel), nowIso);
+    return { ok: true, models, error: null };
+  } catch (error) {
+    return {
+      ok: false,
+      models: settings.models,
+      error: `Cursor model discovery failed: ${String(error?.message || error || 'unknown error')}`,
+    };
+  }
+}
+
+function readGrokModelListSetting(settingKey) {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(settingKey) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((value) => String(value || '').trim())
+      .filter((modelId) => modelId && isSafeGrokModelId(modelId));
+  } catch {
+    return [];
+  }
+}
+
+function readGrokModelEffortsSetting() {
+  try {
+    const parsed = JSON.parse(readAppSettingValue(GROK_MODEL_EFFORTS_SETTING_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [modelId, efforts] of Object.entries(parsed)) {
+      const key = String(modelId || '').trim().toLowerCase();
+      if (!key) continue;
+      const levels = (Array.isArray(efforts) ? efforts : [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => GROK_EFFORT_LEVELS.has(value));
+      out[key] = levels;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function getGrokProviderSettings() {
+  const enabledSetting = readAppSettingValue(GROK_ENABLED_SETTING_KEY);
+  const enabled = enabledSetting === 'true';
+  const model = readAppSettingValue(GROK_MODEL_SETTING_KEY) || DEFAULT_GROK_MODEL;
+  const discovered = readGrokModelListSetting(GROK_MODELS_SETTING_KEY);
+  const modelsDiscovered = discovered.length > 0;
+  const availableModels = Array.from(new Set([
+    model,
+    ...(discovered.length ? discovered : DEFAULT_GROK_MODELS),
+  ])).filter(Boolean);
+  const availableSet = new Set(availableModels);
+  const enabledSelection = readGrokModelListSetting(GROK_ENABLED_MODELS_SETTING_KEY)
+    .filter((modelId) => availableSet.has(modelId));
+  const models = Array.from(new Set([
+    model,
+    ...(enabledSelection.length ? enabledSelection : availableModels),
+  ])).filter(Boolean);
+  const storedEfforts = readGrokModelEffortsSetting();
+  const effortsByModel = {};
+  for (const availableModel of availableModels) {
+    const key = String(availableModel || '').trim().toLowerCase();
+    if (!key) continue;
+    const discoveredEfforts = storedEfforts[key];
+    effortsByModel[key] = Array.isArray(discoveredEfforts) && discoveredEfforts.length
+      ? ['none', ...discoveredEfforts.filter((value) => value !== 'none')]
+      : [...GROK_REASONING_EFFORTS];
+  }
+  return {
+    // Host's Grok CLI login / XAI_API_KEY; enablement is the only configuration step.
+    configured: enabled,
+    enabled,
+    model,
+    models,
+    availableModels,
+    enabledModels: models,
+    effortsByModel,
+    modelsDiscovered,
+    providerType: 'grok',
+  };
+}
+
+function setGrokProviderSettings(update = {}) {
+  const payload = update && typeof update === 'object' ? update : {};
+  const enabled = payload.enabled;
+  const model = payload.model;
+  const models = payload.models;
+  const enabledModels = payload.enabledModels;
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Grok settings are unavailable' };
+  }
+  const existing = getGrokProviderSettings();
+  const normalizedModel = String(model || existing.model || '').trim() || DEFAULT_GROK_MODEL;
+  if (!isSafeGrokModelId(normalizedModel)) {
+    return { ok: false, error: 'Invalid Grok model ID' };
+  }
+  const nowIso = new Date().toISOString();
+  const nextEnabled = typeof enabled === 'boolean' ? enabled : existing.enabled;
+  stmts.upsertAppSetting.run(GROK_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
+  stmts.upsertAppSetting.run(GROK_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  if (Array.isArray(models)) {
+    const normalizedModels = models
+      .map((value) => String(value || '').trim())
+      .filter((value) => value && isSafeGrokModelId(value));
+    if (normalizedModels.length) {
+      stmts.upsertAppSetting.run(GROK_MODELS_SETTING_KEY, JSON.stringify(normalizedModels), nowIso);
+    } else {
+      stmts.deleteAppSetting?.run?.(GROK_MODELS_SETTING_KEY);
+    }
+  }
+  if (Array.isArray(enabledModels)) {
+    const normalizedEnabledModels = enabledModels
+      .map((value) => String(value || '').trim())
+      .filter((value) => value && isSafeGrokModelId(value));
+    if (normalizedEnabledModels.length) {
+      stmts.upsertAppSetting.run(GROK_ENABLED_MODELS_SETTING_KEY, JSON.stringify(normalizedEnabledModels), nowIso);
+    } else {
+      stmts.deleteAppSetting?.run?.(GROK_ENABLED_MODELS_SETTING_KEY);
+    }
+  }
+  const current = getGrokProviderSettings();
+  return {
+    ok: true,
+    configured: current.configured,
+    enabled: current.enabled,
+    model: current.model,
+    models: current.models,
+    availableModels: current.availableModels,
+  };
+}
+
+const GROK_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
+
+// Same override chain the grok session worker uses to locate the CLI.
+function resolveGrokCliCommand() {
+  return String(process.env.GROK_CLI_COMMAND || process.env.GROK_COMMAND || '').trim() || 'grok';
+}
+
+// Discover models via a short-lived Grok ACP initialize (no full prompt).
+async function refreshGrokProviderModels() {
+  const settings = getGrokProviderSettings();
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, models: settings.models, error: 'Grok settings are unavailable' };
+  }
+  if (settings.enabled !== true) {
+    return { ok: false, models: settings.models, error: 'Grok provider is disabled' };
+  }
+  const grokCommand = resolveGrokCliCommand();
+  let handle = null;
+  let handlePromise = null;
+  try {
+    const { createGrokAgentHandle, extractGrokModelsFromInitialize } = await import('./grok-worker/grok-sdk-adapter.mjs');
+    handlePromise = createGrokAgentHandle({
+      command: grokCommand,
+      cwd: os.tmpdir(),
+      alwaysApprove: true,
+      model: settings.model,
+      dbg: () => {},
+    });
+    handle = await Promise.race([
+      handlePromise,
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`timed out after ${GROK_MODEL_DISCOVERY_TIMEOUT_MS}ms`)),
+          GROK_MODEL_DISCOVERY_TIMEOUT_MS,
+        );
+        timer.unref?.();
+      }),
+    ]);
+    const discoveredInfo = handle?.discovered
+      || extractGrokModelsFromInitialize(handle?.client?.initializeResult);
+    let discovered = Array.isArray(discoveredInfo?.models) ? discoveredInfo.models : [];
+    discovered = discovered.filter((modelId) => isSafeGrokModelId(modelId));
+    // Fallback: parse `grok models` CLI if initialize meta is empty. Async so
+    // a slow CLI cannot freeze the relay event loop.
+    if (!discovered.length) {
+      try {
+        const output = await new Promise((resolve, reject) => {
+          execFile(grokCommand, ['models'], {
+            encoding: 'utf8',
+            timeout: 15_000,
+            windowsHide: true,
+          }, (error, stdout) => {
+            if (error) reject(error);
+            else resolve(stdout);
+          });
+        });
+        for (const line of String(output || '').split(/\r?\n/)) {
+          const match = line.match(/\*\s+([a-z0-9][a-z0-9._/-]*)/i);
+          if (match?.[1] && isSafeGrokModelId(match[1])) discovered.push(match[1]);
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+    if (!discovered.length) {
+      discovered = [...DEFAULT_GROK_MODELS];
+    }
+    const effortsByModel = {};
+    for (const [key, efforts] of Object.entries(discoveredInfo?.effortsByModel || {})) {
+      const levels = (Array.isArray(efforts) ? efforts : [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => GROK_EFFORT_LEVELS.has(value) && value !== 'none');
+      if (levels.length) effortsByModel[String(key).toLowerCase()] = levels;
+    }
+    const nowIso = new Date().toISOString();
+    const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
+    stmts.upsertAppSetting.run(GROK_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
+    stmts.upsertAppSetting.run(GROK_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
+    return { ok: true, models, error: null };
+  } catch (error) {
+    return {
+      ok: false,
+      models: settings.models,
+      error: `Grok model discovery failed: ${String(error?.message || error || 'unknown error')}`,
+    };
+  } finally {
+    if (handle) {
+      try { await handle.close?.(); } catch { /* best-effort */ }
+    } else if (handlePromise) {
+      // The timeout won the race: the spawn may still resolve later with a
+      // live `grok agent` child that nobody else owns — dispose it then.
+      handlePromise.then((late) => late?.close?.()).catch(() => {});
+    }
+  }
+}
+
 const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conversationSessionMode: 'isolated', localhostOnly: true };
 // How long a turn may go without any sign of life from its worker before the
 // relay assumes the worker died. This is an inactivity window, not a cap on turn
@@ -490,19 +1206,51 @@ const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
 const CLAUDE_ENABLED_MODELS_SETTING_KEY = 'claude_enabled_models';
 const CLAUDE_MODEL_EFFORTS_SETTING_KEY = 'claude_model_efforts';
-// 'none' = let the SDK use its default effort (high); the rest map straight
-// onto the Agent SDK's EffortLevel values.
-const CLAUDE_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+// The set of levels the SDK itself can report/accept as EffortLevel values.
+// Discovery results are filtered through this, so it must NOT contain the
+// relay's derived 'ultracode' sentinel — supportedModels() never reports it
+// and getClaudeProviderSettings derives it from 'xhigh' instead.
 const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 const DEFAULT_CLAUDE_MODELS = ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];
+const CURSOR_API_KEY_SETTING_KEY = 'cursor_api_key';
+const CURSOR_SESSION_TOKEN_SETTING_KEY = 'cursor_session_token';
+const CURSOR_ENABLED_SETTING_KEY = 'cursor_enabled';
+const CURSOR_MODEL_SETTING_KEY = 'cursor_model';
+const CURSOR_MODELS_SETTING_KEY = 'cursor_models';
+const CURSOR_ENABLED_MODELS_SETTING_KEY = 'cursor_enabled_models';
+const CURSOR_MODEL_EFFORTS_SETTING_KEY = 'cursor_model_efforts';
+// Whether a Cursor model can actually be told to stop reasoning ('thinking'
+// param, or an 'effort' value of 'none'). Without it, 'none' means "model
+// default" and the composer must not promise reasoning-off.
+const CURSOR_MODEL_REASONING_OFF_SETTING_KEY = 'cursor_model_reasoning_off';
+// Cursor exposes no account API for the monthly included pools, so the
+// allowances the plan-usage card measures spend against are user-supplied.
+const CURSOR_ALLOWANCE_CURSOR_MODELS_SETTING_KEY = 'cursor_allowance_cursor_models_usd';
+const CURSOR_ALLOWANCE_OTHER_MODELS_SETTING_KEY = 'cursor_allowance_other_models_usd';
+const CURSOR_ALLOWANCE_RESET_DAY_SETTING_KEY = 'cursor_allowance_reset_day';
+const GROK_ALLOWANCE_MONTHLY_USD_SETTING_KEY = 'grok_allowance_monthly_usd';
+const GROK_ALLOWANCE_RESET_DAY_SETTING_KEY = 'grok_allowance_reset_day';
+const CURSOR_EFFORT_LEVELS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+const DEFAULT_CURSOR_MODEL = 'composer-2.5';
+const DEFAULT_CURSOR_MODELS = ['composer-2.5'];
+const GROK_ENABLED_SETTING_KEY = 'grok_enabled';
+const GROK_MODEL_SETTING_KEY = 'grok_model';
+const GROK_MODELS_SETTING_KEY = 'grok_models';
+const GROK_ENABLED_MODELS_SETTING_KEY = 'grok_enabled_models';
+const GROK_MODEL_EFFORTS_SETTING_KEY = 'grok_model_efforts';
+const GROK_EFFORT_LEVELS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+const GROK_REASONING_EFFORTS = ['none', 'low', 'medium', 'high'];
+const DEFAULT_GROK_MODEL = 'grok-4.5';
+const DEFAULT_GROK_MODELS = ['grok-4.5'];
 const SUPPORTED_RELAY_MODES = ['plan', 'ask', 'agent', 'autopilot'];
 const DEFAULT_RELAY_MODE = 'agent';
 const AUTO_MODEL_SENTINEL = 'auto';
 const SUPPORTED_CONVERSATION_SESSION_MODES = ['isolated', 'shared'];
 const DEFAULT_CONVERSATION_SESSION_MODE = 'isolated';
 const MAX_UPLOAD_ATTACHMENTS = 6;
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+// Cloudflare passes bodies up to 100 MB on Free/Pro; 64 MiB leaves headroom.
+const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 const MAX_IMAGE_DATA_URL_LENGTH = 12 * 1024 * 1024;
 const MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES = 1 * 1024 * 1024;
 const DEFAULT_SESSION_WORKSPACE_ROOT_KEY = 'default_session_workspace_root_path';
@@ -771,8 +1519,12 @@ if (fs.existsSync(CONFIG_PATH)) {
   try { config = { ...config, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) }; }
   catch (e) { console.error('Failed to read config.json, using defaults.'); }
 } else {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
+// config.json stores the auth token in plaintext; keep it owner-only regardless
+// of how it was created (umask, an older build, or a manual edit). Best-effort:
+// chmod is a no-op on filesystems that don't support POSIX modes.
+try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
 
 // --token <value> on the command line overrides config.json (in-memory only, not persisted)
 const tokenArgIdx = process.argv.indexOf('--token');
@@ -1047,6 +1799,22 @@ function setTurnCeilingMinutes(value) {
   if (!parsed.ok) return parsed;
   stmts.upsertAppSetting.run(TURN_CEILING_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
   return { ok: true, ceilingMinutes: parsed.minutes };
+}
+
+const BACKGROUND_TASK_TIMEOUT_SETTING_KEY = 'background_task_timeout_minutes';
+
+function getBackgroundTaskTimeoutMinutes() {
+  return readBackgroundTaskTimeoutSetting(readAppSettingValue(BACKGROUND_TASK_TIMEOUT_SETTING_KEY));
+}
+
+function setBackgroundTaskTimeoutMinutes(value) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Background task timeout settings are unavailable' };
+  }
+  const parsed = parseBackgroundTaskTimeoutUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(BACKGROUND_TASK_TIMEOUT_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
+  return { ok: true, timeoutMinutes: parsed.minutes };
 }
 
 function resolveDefaultSessionWorkspaceRootState() {
@@ -2183,740 +2951,18 @@ if (process.platform !== 'win32') {
   }
 }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS conversations (
-    id         TEXT PRIMARY KEY,
-    title      TEXT NOT NULL,
-    title_source TEXT NOT NULL DEFAULT 'auto',
-    sdk_session_id TEXT,
-    preferred_relay_mode TEXT,
-    preferred_model TEXT,
-    preferred_reasoning_effort TEXT,
-    configured_workspace_root_path TEXT,
-    runtime_workspace_root_path TEXT,
-    archived   INTEGER NOT NULL DEFAULT 0,
-    status     TEXT NOT NULL DEFAULT 'active',
-    compacted_into TEXT,
-    compacted_from TEXT,
-    summary_seed TEXT,
-    seed_pending INTEGER NOT NULL DEFAULT 0,
-    draft_text TEXT,
-    draft_updated_at TEXT,
-    draft_updated_by_client_id TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS messages (
-    id              TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    role            TEXT NOT NULL,
-    text            TEXT NOT NULL,
-    model           TEXT,
-    mode            TEXT,
-    attachments     TEXT,
-    model_requested TEXT,
-    model_actual    TEXT,
-    model_origin    TEXT,
-    hidden_from_shares INTEGER NOT NULL DEFAULT 0,
-    share_hidden_at TEXT,
-    timestamp       TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, timestamp);
-
-  CREATE TABLE IF NOT EXISTS queue (
-    id                  TEXT PRIMARY KEY,
-    conversation_id     TEXT NOT NULL,
-    runtime_session_id  TEXT,
-    is_new_conversation INTEGER NOT NULL DEFAULT 0,
-    model               TEXT,
-    model_variant_id    TEXT,
-    reasoning_effort    TEXT,
-    context_tier        TEXT,
-    relay_mode          TEXT NOT NULL DEFAULT 'agent',
-    text                TEXT NOT NULL,
-    attachments         TEXT,
-    status              TEXT NOT NULL DEFAULT 'pending',
-    timestamp           TEXT NOT NULL,
-    processing_at       TEXT,
-    response_message_id TEXT,
-    response            TEXT,
-    retry_count         INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at     TEXT,
-    owner_sdk_session_id TEXT,
-    owner_assigned_at   TEXT,
-    owner_lease_expires_at TEXT,
-    owner_last_claimed_at TEXT,
-    parked_at           TEXT,
-    parked_target_session_id TEXT,
-    parked_transaction_id TEXT,
-    parked_reason       TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status, timestamp);
-
-  CREATE TABLE IF NOT EXISTS message_usage_snapshots (
-    response_message_id TEXT PRIMARY KEY,
-    queue_message_id TEXT,
-    conversation_id TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT 'live',
-    stale INTEGER NOT NULL DEFAULT 0,
-    premium_remaining REAL,
-    premium_entitlement REAL,
-    premium_used_percent REAL,
-    premium_delta_used REAL,
-    chat_remaining REAL,
-    chat_entitlement REAL,
-    chat_used_percent REAL,
-    chat_delta_used REAL,
-    plan_remaining REAL,
-    plan_entitlement REAL,
-    plan_used_percent REAL,
-    plan_delta_used REAL,
-    captured_at TEXT NOT NULL,
-    FOREIGN KEY (response_message_id) REFERENCES messages(id) ON DELETE CASCADE,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_message_usage_conv_time ON message_usage_snapshots(conversation_id, captured_at DESC);
-  CREATE INDEX IF NOT EXISTS idx_message_usage_queue_id ON message_usage_snapshots(queue_message_id);
-
-  CREATE TABLE IF NOT EXISTS runtime_sessions (
-    id              TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL UNIQUE,
-    sdk_session_id  TEXT,
-    strategy        TEXT NOT NULL DEFAULT 'isolated',
-    runtime_key     TEXT NOT NULL,
-    model           TEXT,
-    provider_type   TEXT NOT NULL DEFAULT 'github',
-    provider_model  TEXT,
-    status          TEXT NOT NULL DEFAULT 'active',
-    created_at      TEXT NOT NULL,
-    last_used_at    TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_runtime_sessions_last_used ON runtime_sessions(last_used_at DESC);
-
-  CREATE TABLE IF NOT EXISTS deleted_sdk_sessions (
-    sdk_session_id TEXT PRIMARY KEY,
-    deleted_at     TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS sdk_delete_requests (
-    sdk_session_id TEXT PRIMARY KEY,
-    conversation_id TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
-    requested_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    processing_at TEXT,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT,
-    last_error TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_sdk_delete_requests_status
-    ON sdk_delete_requests(status, requested_at, next_attempt_at);
-
-  CREATE TABLE IF NOT EXISTS sdk_session_imports (
-    sdk_session_id TEXT PRIMARY KEY,
-    conversation_id TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    started_at TEXT,
-    completed_at TEXT,
-    source_started_at TEXT,
-    source_modified_at TEXT,
-    updated_at TEXT NOT NULL,
-    last_error TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_sdk_session_imports_status
-    ON sdk_session_imports(status, updated_at);
-
-  -- path_key is the dedupe key: on Windows it is the whole path lower-cased, so
-  -- "C:\Git\Repo" and "c:\git\repo" occupy one row instead of two. See
-  -- migrations/0002-recent-workspace-roots-path-key.mjs for existing databases.
-  CREATE TABLE IF NOT EXISTS recent_workspace_roots (
-    path_key     TEXT PRIMARY KEY,
-    path         TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_recent_workspace_roots_last_seen
-    ON recent_workspace_roots(last_seen_at DESC);
-
-  CREATE TABLE IF NOT EXISTS app_settings (
-    key        TEXT PRIMARY KEY,
-    value      TEXT,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS model_selector_state (
-    id           INTEGER PRIMARY KEY CHECK (id = 1),
-    source       TEXT,
-    refreshed_at TEXT,
-    error        TEXT,
-    updated_at   TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS model_variants (
-    variant_id       TEXT PRIMARY KEY,
-    base_model_id    TEXT NOT NULL,
-    provider         TEXT NOT NULL,
-    label            TEXT NOT NULL,
-    release_status   TEXT,
-    reasoning_effort TEXT,
-    context_limit_tokens INTEGER,
-    long_context_limit_tokens INTEGER,
-    pricing_json     TEXT,
-    enabled          INTEGER NOT NULL DEFAULT 1,
-    sort_order       INTEGER NOT NULL DEFAULT 0,
-    updated_at       TEXT NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_model_variants_enabled
-    ON model_variants(enabled, provider, sort_order, variant_id);
-
-  CREATE TABLE IF NOT EXISTS relay_control_requests (
-    id              TEXT PRIMARY KEY,
-    type            TEXT NOT NULL,
-    conversation_id TEXT,
-    queue_message_id TEXT,
-    sdk_session_id  TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    request         TEXT,
-    result          TEXT,
-    error           TEXT,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL,
-    completed_at    TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_relay_control_requests_status
-    ON relay_control_requests(status, sdk_session_id, created_at);
-  CREATE INDEX IF NOT EXISTS idx_relay_control_requests_queue
-    ON relay_control_requests(queue_message_id, type, status, created_at);
-
-  CREATE TABLE IF NOT EXISTS relay_questions (
-    id              TEXT PRIMARY KEY,
-    queue_id        TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    message_id      TEXT NOT NULL,
-    relay_mode      TEXT NOT NULL DEFAULT 'agent',
-    prompt          TEXT NOT NULL,
-    choices         TEXT,
-    request         TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    answer          TEXT,
-    structured_answer TEXT,
-    request_schema  TEXT,
-    sdk_session_id  TEXT,
-    owner_worker_id TEXT,
-    continuation_id TEXT,
-    continuation_question_id TEXT,
-    created_at      TEXT NOT NULL,
-    answered_at     TEXT,
-    expires_at      TEXT NOT NULL,
-    FOREIGN KEY (queue_id) REFERENCES queue(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_relay_questions_status ON relay_questions(status, expires_at, created_at);
-  CREATE INDEX IF NOT EXISTS idx_relay_questions_conversation ON relay_questions(conversation_id, status, created_at);
-
-  CREATE TABLE IF NOT EXISTS relay_boards (
-    id                TEXT PRIMARY KEY,
-    queue_id          TEXT NOT NULL,
-    conversation_id   TEXT NOT NULL,
-    message_id        TEXT NOT NULL,
-    board_type        TEXT NOT NULL,
-    relay_mode        TEXT NOT NULL DEFAULT 'agent',
-    title             TEXT NOT NULL,
-    body              TEXT NOT NULL,
-    actions_json      TEXT,
-    recommended_action TEXT,
-    context_json      TEXT,
-    status            TEXT NOT NULL DEFAULT 'pending',
-    selected_action   TEXT,
-    acted_at          TEXT,
-    created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL,
-    FOREIGN KEY (queue_id) REFERENCES queue(id) ON DELETE CASCADE,
-    UNIQUE(message_id, board_type)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_relay_boards_status ON relay_boards(status, created_at);
-  CREATE INDEX IF NOT EXISTS idx_relay_boards_conversation ON relay_boards(conversation_id, status, created_at);
-
-  CREATE TABLE IF NOT EXISTS relay_activity (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    queue_message_id    TEXT NOT NULL,
-    response_message_id TEXT,
-    conversation_id     TEXT NOT NULL,
-    relay_mode          TEXT NOT NULL DEFAULT 'agent',
-    text                TEXT NOT NULL,
-    created_at          TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_relay_activity_queue ON relay_activity(queue_message_id, id);
-  CREATE INDEX IF NOT EXISTS idx_relay_activity_response ON relay_activity(response_message_id, id);
-
-  CREATE TABLE IF NOT EXISTS relay_stream_events (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    queue_message_id    TEXT NOT NULL,
-    response_message_id TEXT,
-    conversation_id     TEXT NOT NULL,
-    relay_mode          TEXT NOT NULL DEFAULT 'agent',
-    seq                 INTEGER NOT NULL,
-    text                TEXT NOT NULL DEFAULT '',
-    done                INTEGER NOT NULL DEFAULT 0,
-    created_at          TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
-    UNIQUE(queue_message_id, seq)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_relay_stream_events_queue
-    ON relay_stream_events(queue_message_id, seq);
-  CREATE INDEX IF NOT EXISTS idx_relay_stream_events_response
-    ON relay_stream_events(response_message_id, seq);
-  CREATE INDEX IF NOT EXISTS idx_relay_stream_events_conversation
-    ON relay_stream_events(conversation_id, queue_message_id, seq);
-
-  CREATE TABLE IF NOT EXISTS relay_thought (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    queue_message_id    TEXT NOT NULL,
-    response_message_id TEXT,
-    conversation_id     TEXT NOT NULL,
-    relay_mode          TEXT NOT NULL DEFAULT 'agent',
-    reasoning_id        TEXT,
-    seq                 INTEGER NOT NULL,
-    text                TEXT NOT NULL,
-    done                INTEGER NOT NULL DEFAULT 0,
-    created_at          TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
-    UNIQUE(queue_message_id, seq)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_relay_thought_queue
-    ON relay_thought(queue_message_id, seq);
-  CREATE INDEX IF NOT EXISTS idx_relay_thought_response
-    ON relay_thought(response_message_id, seq);
-
-  CREATE TABLE IF NOT EXISTS subagent_runs (
-    id                  TEXT PRIMARY KEY,
-    queue_message_id    TEXT NOT NULL,
-    conversation_id     TEXT NOT NULL,
-    parent_subagent_id  TEXT,
-    display_name        TEXT,
-    status              TEXT NOT NULL DEFAULT 'running',
-    started_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL,
-    completed_at        TEXT,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_subagent_runs_queue
-    ON subagent_runs(queue_message_id, started_at);
-  CREATE INDEX IF NOT EXISTS idx_subagent_runs_conversation
-    ON subagent_runs(conversation_id, status);
-
-  CREATE TABLE IF NOT EXISTS uploaded_files (
-    sha256        TEXT PRIMARY KEY,
-    original_name TEXT,
-    mime_type     TEXT,
-    size_bytes    INTEGER NOT NULL,
-    created_at    TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS upload_refs (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_sha256     TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    message_id      TEXT NOT NULL,
-    created_at      TEXT NOT NULL,
-    UNIQUE(file_sha256, message_id),
-    FOREIGN KEY (file_sha256) REFERENCES uploaded_files(sha256) ON DELETE CASCADE,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_upload_refs_conv ON upload_refs(conversation_id, file_sha256);
-  CREATE INDEX IF NOT EXISTS idx_upload_refs_sha ON upload_refs(file_sha256);
-
-  CREATE TABLE IF NOT EXISTS conversation_shares (
-    token            TEXT PRIMARY KEY,
-    conversation_id  TEXT NOT NULL,
-    created_at       TEXT NOT NULL,
-    last_accessed_at TEXT,
-    revoked_at       TEXT,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_conversation_shares_conversation
-    ON conversation_shares(conversation_id, revoked_at, created_at DESC);
-
-  CREATE TABLE IF NOT EXISTS status_events (
-    id           TEXT PRIMARY KEY,
-    timestamp    INTEGER NOT NULL,
-    type         TEXT NOT NULL,
-    source       TEXT NOT NULL,
-    payload_json TEXT NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_status_events_timeline
-    ON status_events(timestamp DESC, id DESC);
-`);
-
-db.exec(`
-  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-  USING fts5(text, content='messages', content_rowid='rowid');
-
-  CREATE TRIGGER IF NOT EXISTS messages_fts_after_insert
-  AFTER INSERT ON messages
-  BEGIN
-    INSERT INTO messages_fts(rowid, text)
-    VALUES (new.rowid, new.text);
-  END;
-
-  CREATE TRIGGER IF NOT EXISTS messages_fts_after_delete
-  AFTER DELETE ON messages
-  BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, text)
-    VALUES ('delete', old.rowid, old.text);
-  END;
-
-  CREATE TRIGGER IF NOT EXISTS messages_fts_after_update
-  AFTER UPDATE OF text ON messages
-  BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, text)
-    VALUES ('delete', old.rowid, old.text);
-    INSERT INTO messages_fts(rowid, text)
-    VALUES (new.rowid, new.text);
-  END;
-`);
-// The extension-backed history queue is superseded by the local SDK importer.
-db.exec(`DROP TABLE IF EXISTS sdk_history_fetch_requests`);
-// Only rebuild the FTS index if the virtual table is empty (first migration or new DB).
-// A full rebuild is O(N) in message count and blocks the sync event loop, so we skip it
-// when existing trigger-maintained rows are already present.
-{
-  const ftsRowCount = db.prepare(`SELECT COUNT(*) AS cnt FROM messages_fts`).get()?.cnt || 0;
-  if (ftsRowCount === 0) {
-    db.exec(`INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')`);
-  }
-}
-
-// Backfill schema for pre-model databases.
-const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all().map((c) => c.name);
-if (!messageColumns.includes('attachments')) {
-  db.exec(`ALTER TABLE messages ADD COLUMN attachments TEXT`);
-}
-if (!messageColumns.includes('mode')) {
-  db.exec(`ALTER TABLE messages ADD COLUMN mode TEXT`);
-}
-if (!messageColumns.includes('model_requested')) {
-  db.exec(`ALTER TABLE messages ADD COLUMN model_requested TEXT`);
-}
-if (!messageColumns.includes('model_actual')) {
-  db.exec(`ALTER TABLE messages ADD COLUMN model_actual TEXT`);
-}
-if (!messageColumns.includes('model_origin')) {
-  db.exec(`ALTER TABLE messages ADD COLUMN model_origin TEXT`);
-}
-if (!messageColumns.includes('hidden_from_shares')) {
-  db.exec(`ALTER TABLE messages ADD COLUMN hidden_from_shares INTEGER NOT NULL DEFAULT 0`);
-}
-if (!messageColumns.includes('share_hidden_at')) {
-  db.exec(`ALTER TABLE messages ADD COLUMN share_hidden_at TEXT`);
-}
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_messages_share_visibility
-  ON messages(conversation_id, hidden_from_shares, timestamp)
-`);
-
-const sdkSessionImportColumns = db.prepare(`PRAGMA table_info(sdk_session_imports)`).all().map((c) => c.name);
-if (!sdkSessionImportColumns.includes('source_started_at')) {
-  db.exec(`ALTER TABLE sdk_session_imports ADD COLUMN source_started_at TEXT`);
-}
-if (!sdkSessionImportColumns.includes('source_modified_at')) {
-  db.exec(`ALTER TABLE sdk_session_imports ADD COLUMN source_modified_at TEXT`);
-}
-
-const queueColumns = db.prepare(`PRAGMA table_info(queue)`).all().map((c) => c.name);
-if (!queueColumns.includes('model')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN model TEXT`);
-}
-if (!queueColumns.includes('model_variant_id')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN model_variant_id TEXT`);
-}
-if (!queueColumns.includes('reasoning_effort')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN reasoning_effort TEXT`);
-}
-if (!queueColumns.includes('context_tier')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN context_tier TEXT`);
-}
-if (!queueColumns.includes('runtime_session_id')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN runtime_session_id TEXT`);
-}
-if (!queueColumns.includes('relay_mode')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN relay_mode TEXT NOT NULL DEFAULT 'agent'`);
-}
-if (!queueColumns.includes('attachments')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN attachments TEXT`);
-}
-if (!queueColumns.includes('retry_count')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`);
-}
-if (!queueColumns.includes('next_attempt_at')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN next_attempt_at TEXT`);
-}
-if (!queueColumns.includes('owner_sdk_session_id')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN owner_sdk_session_id TEXT`);
-}
-if (!queueColumns.includes('owner_assigned_at')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN owner_assigned_at TEXT`);
-}
-if (!queueColumns.includes('owner_lease_expires_at')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN owner_lease_expires_at TEXT`);
-}
-if (!queueColumns.includes('owner_last_claimed_at')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN owner_last_claimed_at TEXT`);
-}
-if (!queueColumns.includes('response_message_id')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN response_message_id TEXT`);
-}
-if (!queueColumns.includes('parked_at')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN parked_at TEXT`);
-}
-if (!queueColumns.includes('parked_target_session_id')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN parked_target_session_id TEXT`);
-}
-
-// recent_workspace_roots gained a case-normalized primary key (path_key). The
-// CREATE TABLE IF NOT EXISTS above only covers fresh databases, so upgrade an
-// existing one in place before any statement referencing path_key is prepared.
-const recentWorkspaceRootsRebuild = rebuildRecentWorkspaceRootsTable(db);
-if (recentWorkspaceRootsRebuild.applied) {
-  console.log(`[workspace-root] rebuilt recent CWD history: ${recentWorkspaceRootsRebuild.rowsBefore} row(s) -> ${recentWorkspaceRootsRebuild.rowsAfter} distinct directory/ies`);
-}
-if (!queueColumns.includes('parked_transaction_id')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN parked_transaction_id TEXT`);
-}
-if (!queueColumns.includes('parked_reason')) {
-  db.exec(`ALTER TABLE queue ADD COLUMN parked_reason TEXT`);
-}
-db.exec(`UPDATE queue SET relay_mode = 'agent' WHERE relay_mode IS NULL OR relay_mode = ''`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_next_attempt ON queue(status, next_attempt_at, timestamp)`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_owner_pending ON queue(status, owner_sdk_session_id, next_attempt_at, timestamp)`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, parked_transaction_id, parked_target_session_id, parked_at, timestamp)`);
-migrateImageConversationSchema(db);
-
-const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
-if (runtimeSessionColumns.length) {
-  if (!runtimeSessionColumns.includes('strategy')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'isolated'`);
-  }
-  if (!runtimeSessionColumns.includes('sdk_session_id')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN sdk_session_id TEXT`);
-  }
-  if (!runtimeSessionColumns.includes('runtime_key')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN runtime_key TEXT NOT NULL DEFAULT ''`);
-    db.exec(`UPDATE runtime_sessions SET runtime_key = id WHERE runtime_key IS NULL OR runtime_key = ''`);
-  }
-  if (!runtimeSessionColumns.includes('model')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN model TEXT`);
-  }
-  if (!runtimeSessionColumns.includes('provider_type')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'github'`);
-  }
-  if (!runtimeSessionColumns.includes('provider_model')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN provider_model TEXT`);
-  }
-  if (!runtimeSessionColumns.includes('claude_native_session_id')) {
-    // Native Claude Agent SDK session id captured from the worker's first
-    // turn; passed back as `resume` so Claude conversations survive worker
-    // restarts.
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN claude_native_session_id TEXT`);
-  }
-  if (!runtimeSessionColumns.includes('context_usage_json')) {
-    // Latest context-window breakdown reported by the Claude Agent SDK. Claude
-    // sessions have no Copilot events.jsonl to tail, so this is the only source
-    // of context data for them.
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN context_usage_json TEXT`);
-  }
-  if (!runtimeSessionColumns.includes('context_usage_captured_at')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN context_usage_captured_at TEXT`);
-  }
-  if (!runtimeSessionColumns.includes('status')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
-  }
-  if (!runtimeSessionColumns.includes('created_at')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
-  }
-  if (!runtimeSessionColumns.includes('last_used_at')) {
-    db.exec(`ALTER TABLE runtime_sessions ADD COLUMN last_used_at TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
-  }
-}
-
-const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);
-if (!conversationColumns.includes('archived')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`);
-}
-if (!conversationColumns.includes('sdk_session_id')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN sdk_session_id TEXT`);
-}
-if (!conversationColumns.includes('preferred_relay_mode')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_relay_mode TEXT`);
-}
-if (!conversationColumns.includes('preferred_model')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_model TEXT`);
-}
-if (!conversationColumns.includes('preferred_reasoning_effort')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN preferred_reasoning_effort TEXT`);
-  // One-time carry-over from the retired per-mode preference maps: seed the flat
-  // preference from the entry stored for the conversation's preferred mode.
-  if (conversationColumns.includes('preferred_models_by_mode')) {
-    const legacyRows = db.prepare(`
-      SELECT id, preferred_relay_mode, preferred_models_by_mode, preferred_reasoning_by_mode
-      FROM conversations
-      WHERE preferred_models_by_mode IS NOT NULL OR preferred_reasoning_by_mode IS NOT NULL
-    `).all();
-    const seedFlatPreference = db.prepare(`UPDATE conversations SET preferred_model = ?, preferred_reasoning_effort = ? WHERE id = ?`);
-    for (const legacyRow of legacyRows) {
-      let modelsByMode = {};
-      let reasoningByMode = {};
-      try { modelsByMode = JSON.parse(legacyRow.preferred_models_by_mode || '{}') || {}; } catch { modelsByMode = {}; }
-      try { reasoningByMode = JSON.parse(legacyRow.preferred_reasoning_by_mode || '{}') || {}; } catch { reasoningByMode = {}; }
-      const mode = String(legacyRow.preferred_relay_mode || '').trim() || DEFAULT_RELAY_MODE;
-      const model = String(modelsByMode?.[mode] || '').trim() || null;
-      const effort = String(reasoningByMode?.[mode] || '').trim().toLowerCase() || null;
-      if (model || effort) seedFlatPreference.run(model, effort, legacyRow.id);
-    }
-  }
-}
-if (!conversationColumns.includes('configured_workspace_root_path')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN configured_workspace_root_path TEXT`);
-}
-if (!conversationColumns.includes('runtime_workspace_root_path')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN runtime_workspace_root_path TEXT`);
-}
-if (!conversationColumns.includes('compacted_into')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN compacted_into TEXT`);
-}
-if (!conversationColumns.includes('compacted_from')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN compacted_from TEXT`);
-}
-if (!conversationColumns.includes('summary_seed')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN summary_seed TEXT`);
-}
-if (!conversationColumns.includes('seed_pending')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN seed_pending INTEGER NOT NULL DEFAULT 0`);
-}
-if (!conversationColumns.includes('status')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
-}
-if (!conversationColumns.includes('title_source')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'auto'`);
-}
-if (!conversationColumns.includes('draft_text')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN draft_text TEXT`);
-}
-if (!conversationColumns.includes('draft_updated_at')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN draft_updated_at TEXT`);
-}
-if (!conversationColumns.includes('draft_updated_by_client_id')) {
-  db.exec(`ALTER TABLE conversations ADD COLUMN draft_updated_by_client_id TEXT`);
-}
-
-db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_sessions_sdk_session_id ON runtime_sessions(sdk_session_id) WHERE sdk_session_id IS NOT NULL AND sdk_session_id != ''`);
-
-const relayQuestionColumns = db.prepare(`PRAGMA table_info(relay_questions)`).all().map((c) => c.name);
-if (relayQuestionColumns.length && !relayQuestionColumns.includes('sdk_session_id')) {
-  db.exec(`ALTER TABLE relay_questions ADD COLUMN sdk_session_id TEXT`);
-}
-if (relayQuestionColumns.length && !relayQuestionColumns.includes('owner_worker_id')) {
-  db.exec(`ALTER TABLE relay_questions ADD COLUMN owner_worker_id TEXT`);
-}
-if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_id')) {
-  db.exec(`ALTER TABLE relay_questions ADD COLUMN continuation_id TEXT`);
-}
-if (relayQuestionColumns.length && !relayQuestionColumns.includes('continuation_question_id')) {
-  db.exec(`ALTER TABLE relay_questions ADD COLUMN continuation_question_id TEXT`);
-}
-if (relayQuestionColumns.length && !relayQuestionColumns.includes('structured_answer')) {
-  db.exec(`ALTER TABLE relay_questions ADD COLUMN structured_answer TEXT`);
-}
-if (relayQuestionColumns.length && !relayQuestionColumns.includes('request_schema')) {
-  db.exec(`ALTER TABLE relay_questions ADD COLUMN request_schema TEXT`);
-}
-db.exec(`CREATE INDEX IF NOT EXISTS idx_relay_questions_continuation ON relay_questions(continuation_id, continuation_question_id, status, created_at)`);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS subagent_runs (
-    id                  TEXT PRIMARY KEY,
-    queue_message_id    TEXT NOT NULL,
-    conversation_id     TEXT NOT NULL,
-    parent_subagent_id  TEXT,
-    display_name        TEXT,
-    status              TEXT NOT NULL DEFAULT 'running',
-    started_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL,
-    completed_at        TEXT,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-  CREATE INDEX IF NOT EXISTS idx_subagent_runs_queue
-    ON subagent_runs(queue_message_id, started_at);
-  CREATE INDEX IF NOT EXISTS idx_subagent_runs_conversation
-    ON subagent_runs(conversation_id, status);
-`);
-
-const relayActivityColumns = db.prepare(`PRAGMA table_info(relay_activity)`).all().map((c) => c.name);
-if (relayActivityColumns.length && !relayActivityColumns.includes('subagent_run_id')) {
-  db.exec(`ALTER TABLE relay_activity ADD COLUMN subagent_run_id TEXT`);
-}
-const relayThoughtColumns = db.prepare(`PRAGMA table_info(relay_thought)`).all().map((c) => c.name);
-if (relayThoughtColumns.length && !relayThoughtColumns.includes('subagent_run_id')) {
-  db.exec(`ALTER TABLE relay_thought ADD COLUMN subagent_run_id TEXT`);
-}
-db.exec(`
-  DELETE FROM relay_thought
-  WHERE id IN (
-    SELECT older.id
-    FROM relay_thought AS older
-    JOIN relay_thought AS newer
-      ON older.queue_message_id = newer.queue_message_id
-     AND older.reasoning_id = newer.reasoning_id
-     AND older.reasoning_id IS NOT NULL
-     AND older.reasoning_id != ''
-     AND (
-       older.seq < newer.seq
-       OR (older.seq = newer.seq AND older.id < newer.id)
-     )
-  )
-`);
-db.exec(`
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_thought_queue_reasoning
-    ON relay_thought(queue_message_id, reasoning_id)
-    WHERE reasoning_id IS NOT NULL AND reasoning_id != ''
-`);
-const relayStreamEventColumns = db.prepare(`PRAGMA table_info(relay_stream_events)`).all().map((c) => c.name);
-if (relayStreamEventColumns.length && !relayStreamEventColumns.includes('subagent_run_id')) {
-  db.exec(`ALTER TABLE relay_stream_events ADD COLUMN subagent_run_id TEXT`);
-}
-const modelVariantColumns = db.prepare(`PRAGMA table_info(model_variants)`).all().map((c) => c.name);
-if (modelVariantColumns.length && !modelVariantColumns.includes('context_limit_tokens')) {
-  db.exec(`ALTER TABLE model_variants ADD COLUMN context_limit_tokens INTEGER`);
-}
-if (modelVariantColumns.length && !modelVariantColumns.includes('long_context_limit_tokens')) {
-  db.exec(`ALTER TABLE model_variants ADD COLUMN long_context_limit_tokens INTEGER`);
-}
-if (modelVariantColumns.length && !modelVariantColumns.includes('pricing_json')) {
-  db.exec(`ALTER TABLE model_variants ADD COLUMN pricing_json TEXT`);
-}
+// Base DDL plus the column-backfill/upgrade migrations, extracted verbatim to
+// db-schema.mjs so tests can build the exact production schema. Runs the
+// CREATE TABLE IF NOT EXISTS block, the FTS setup, and every ALTER TABLE
+// upgrade in the original order.
+applySchema(db);
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
+// Owns its own schema (plan-usage tables) and the derived Cursor spend
+// bookkeeping; created before `stmts` because it prepares statements against
+// tables it creates itself.
+const planUsageService = createPlanUsageService({ db, dbg: (...args) => console.log('[plan-usage]', ...args) });
+
 const stmts = {
   ...createSessionRepository(db),
   ...createMessageRepository(db),
@@ -2924,6 +2970,33 @@ const stmts = {
   ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+
+// ─── Web Push ─────────────────────────────────────────────────────────────────
+// VAPID keys are generated once and persisted in app_settings; regenerating
+// them would invalidate every stored subscription.
+const pushVapidKeys = ensurePushVapidKeys(stmts, {
+  generateVapidKeys: () => webpush.generateVAPIDKeys(),
+});
+if (pushVapidKeys.generated) {
+  console.log('[push] generated VAPID key pair');
+}
+webpush.setVapidDetails(
+  String(config.pushVapidSubject || '').trim() || 'mailto:copilot-remote@example.com',
+  pushVapidKeys.publicKey,
+  pushVapidKeys.privateKey,
+);
+// `io` is created later in this file; the closures only run after startup.
+const activeDeviceTracker = createActiveDeviceTracker({
+  getSockets: () => io.of('/').sockets.values(),
+});
+const pushDispatchService = createPushDispatchService({
+  db,
+  webpush,
+  hasActiveDevice: () => activeDeviceTracker.hasActiveDevice(),
+  recordStatusEvent: (type, details) => statusEventService.recordEvent(type, details),
+  uuid: uuidv4,
+});
+
 const imageOperationService = createImageOperationService({
   db,
   repository: stmts,
@@ -3206,25 +3279,49 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
     || stmts.getRuntimeSessionByConversation.get(normalizedTargetSessionId)
     || null;
   const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+  // Clear every provider's variables first (the appliers' kind-guarded deletes
+  // keep the chained clears order-independent), then apply only the bound one.
+  const cleared = applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv))));
   if (providerType === 'claude') {
     const claudeSettings = getClaudeProviderSettings();
     const claudeModel = String(runtimeSession?.provider_model || runtimeSession?.model || claudeSettings.model).trim();
-    return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv), {
+    return applyClaudeProviderEnvironment(cleared, {
       enabled: true,
       model: claudeModel,
     });
   }
+  if (providerType === 'cursor') {
+    const cursorSettings = getCursorProviderSettings();
+    const cursorModel = String(runtimeSession?.provider_model || runtimeSession?.model || cursorSettings.model).trim();
+    return applyCursorProviderEnvironment(cleared, {
+      enabled: true,
+      model: cursorModel,
+      apiKey: cursorSettings.apiKey,
+    });
+  }
+  if (providerType === 'grok') {
+    const grokSettings = getGrokProviderSettings();
+    const grokModel = String(runtimeSession?.provider_model || runtimeSession?.model || grokSettings.model).trim();
+    return applyGrokProviderEnvironment(cleared, {
+      enabled: true,
+      model: grokModel,
+      // Re-thread the host-level CLI override: the clear chain above deletes
+      // GROK_CLI_COMMAND from the launch env, so without this the worker
+      // could never see it.
+      command: String(process.env.GROK_CLI_COMMAND || process.env.GROK_COMMAND || '').trim(),
+    });
+  }
   if (providerType !== 'openai') {
-    return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv));
+    return cleared;
   }
   const settings = getOpenAIProviderSettings();
   const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
-  return applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv, {
+  return applyOpenAIProviderEnvironment(cleared, {
     enabled: true,
     apiKey: settings.apiKey,
     model,
     baseUrl: settings.baseUrl,
-  }));
+  });
 }
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
@@ -3260,8 +3357,12 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
   const launchMode = String(launched?.launchMode || 'detached').trim();
   const tmuxSessionName = String(launched?.tmuxSessionName || '').trim();
-  console.log(`${runtimeLogPrefix()}worker launcher: spawned ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
-  return { workerId, pid: workerPid };
+  // "spawned" used to be logged even when the launcher reused a live tmux pane,
+  // which made spawn counts meaningless: a crash-looping session and a healthy
+  // one produced the same line. Report what actually happened.
+  const launchVerb = launched?.reused === true ? 'reused' : 'spawned';
+  console.log(`${runtimeLogPrefix()}worker launcher: ${launchVerb} ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
+  return { workerId, pid: workerPid, reused: launched?.reused === true };
 }
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   registry: sessionWorkerRegistry,
@@ -3316,8 +3417,14 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
 }
 
 async function reconcileUnstartedConversationProviders({ enabled, model, provider = 'openai' } = {}) {
-  const managedProvider = String(provider || 'openai').trim().toLowerCase() === 'claude' ? 'claude' : 'openai';
-  const managedDefaultModel = managedProvider === 'claude' ? DEFAULT_CLAUDE_MODEL : DEFAULT_OPENAI_MODEL;
+  const normalizedProvider = String(provider || 'openai').trim().toLowerCase();
+  const managedProvider = ['claude', 'cursor', 'grok'].includes(normalizedProvider) ? normalizedProvider : 'openai';
+  const managedDefaultModel = {
+    openai: DEFAULT_OPENAI_MODEL,
+    claude: DEFAULT_CLAUDE_MODEL,
+    cursor: DEFAULT_CURSOR_MODEL,
+    grok: DEFAULT_GROK_MODEL,
+  }[managedProvider];
   const providerType = enabled === true ? managedProvider : 'github';
   const providerModel = enabled === true
     ? (String(model || '').trim() || managedDefaultModel)
@@ -3386,7 +3493,11 @@ async function reconcileUnstartedConversationProviders({ enabled, model, provide
       let rollbackError = null;
       const canRestorePreviousProvider = currentProvider === 'claude'
         ? getClaudeProviderSettings().enabled === true
-        : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true);
+        : (currentProvider === 'cursor'
+          ? getCursorProviderSettings().configured === true
+          : (currentProvider === 'grok'
+            ? getGrokProviderSettings().enabled === true
+            : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true)));
       if (providerWasUpdated && canRestorePreviousProvider) {
         stmts.updateRuntimeSessionProvider.run(
           currentProvider,
@@ -3395,6 +3506,18 @@ async function reconcileUnstartedConversationProviders({ enabled, model, provide
           new Date().toISOString(),
           row.id,
         );
+      } else if (providerWasUpdated) {
+        // The previous provider is no longer configured, so the DB stays on
+        // the new one with no running worker. That state must be loud, not
+        // buried in the result object: without the event the conversation
+        // just looks bound-and-idle while every turn on it will fail.
+        console.warn(`${runtimeLogPrefix()}PROVIDER REBIND stranded conv=${String(conversationId).slice(0, 8)} newProvider=${managedProvider} — relaunch failed and ${currentProvider || 'previous provider'} is no longer configured`);
+        io.emit('provider_rebind_failed', {
+          conversationId,
+          provider: managedProvider,
+          previousProvider: currentProvider || null,
+          restored: false,
+        });
       }
       if (workerWasStopped && ownerSessionId) {
         sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
@@ -3825,9 +3948,16 @@ function buildContextResponseText({ snapshot, runtimeSession, conversationId, ev
   return buildContextUsageBlock(snapshot, runtimeSession, detailEntries);
 }
 
-function computeRetryDelayMs(retryCount) {
-  const base = 30_000;
-  const max = 10 * 60_000;
+// `transient` is for a turn that never started — the worker was still booting,
+// the session was unavailable, the model was refused at session-create. The
+// long ladder is punishing there: it freezes the row for 60s, and since the row
+// is already 'pending' no queue-count change fires, so only the periodic
+// ready-check sweep can rescue it. Measured, that is where nearly all of the
+// "message sat pending for a minute" time went. Genuine provider/model failures
+// keep the long ladder so a broken provider is not hammered.
+function computeRetryDelayMs(retryCount, { transient = false } = {}) {
+  const base = transient ? 5_000 : 30_000;
+  const max = transient ? 2 * 60_000 : 10 * 60_000;
   const n = Math.max(0, Number(retryCount) || 0);
   return Math.min(max, base * Math.pow(2, Math.min(n, 4)));
 }
@@ -4283,6 +4413,10 @@ function resolveWorkspaceFilePath(rawPath, rootPath = null) {
   const relativeToRoot = path.relative(activeWorkspaceRoot, absolutePath);
   if (!relativeToRoot || relativeToRoot === '.') return null;
   if (relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot)) return null;
+  // Lexical containment is not enough: a symlink inside the workspace resolves to
+  // a real path outside it and the serve path follows it. Match the tree/list
+  // walkers' symlink rejection by verifying the real path stays within the root.
+  if (!isRealPathWithinRoot(absolutePath, activeWorkspaceRoot)) return null;
   return absolutePath;
 }
 
@@ -5036,6 +5170,13 @@ function deleteOrphanedUploads(hashes) {
   }
 }
 
+function sweepUnreferencedUploadBlobs() {
+  return sweepUnreferencedUploads({
+    listUnreferenced: () => db.prepare(UNREFERENCED_UPLOADS_QUERY).all(),
+    deleteUploads: deleteOrphanedUploads,
+  });
+}
+
 function normalizeMessageLine(text, maxLength = 240) {
   const compact = String(text || '').replace(/\s+/g, ' ').trim();
   if (!compact) return '';
@@ -5190,6 +5331,44 @@ function mapSubagentRunRow(row) {
   };
 }
 
+// Final workflow digests persisted with an assistant message (the "Finished
+// background task" card). digest_json was sanitized at ingest; a row whose
+// JSON no longer parses is dropped rather than failing the conversation read.
+function workflowRunsForResponse(responseMessageId) {
+  const rows = stmts.listWorkflowRunsByResponse?.all(responseMessageId) || [];
+  return rows
+    .map((row) => {
+      try {
+        const digest = JSON.parse(String(row?.digest_json || ''));
+        return digest && typeof digest === 'object' && !Array.isArray(digest) ? digest : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .slice(0, 5);
+}
+
+// Live background-task sets per conversation, published by Claude session
+// workers (REPLACE semantics, mirroring the SDK's background_tasks_changed
+// signal). In-memory only: the worker republishes on every change and clears
+// on teardown, so a relay restart simply starts empty until the next update.
+const backgroundTaskStore = {
+  sets: new Map(),
+  replace(conversationId, tasks) {
+    const id = String(conversationId || '').trim();
+    if (!id) return;
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+      this.sets.delete(id);
+      return;
+    }
+    this.sets.set(id, { tasks, updatedAt: Date.now() });
+  },
+  get(conversationId) {
+    return this.sets.get(String(conversationId || '').trim())?.tasks || [];
+  },
+};
+
 function inFlightStateForConversation(conversationId) {
   const row = stmts.getLatestProcessingQueueByConversation.get(conversationId);
   if (!row) return null;
@@ -5211,9 +5390,73 @@ function inFlightStateForConversation(conversationId) {
   };
 }
 
+// A recovered row that has exhausted the retry budget is failed terminally
+// instead of looping recover → deliver → die forever (recovery increments
+// retry_count like /api/requeue does, but bypasses that route's budget check,
+// so the sweep enforces it here). Minimal mirror of the route-side
+// failQueueMessage: mark failed, insert the assistant failure message, emit.
+function failRecoveredRowTerminally(row, reason) {
+  const now = new Date().toISOString();
+  const responseId = uuidv4();
+  const retryCount = Number(row?.retry_count || 0) + 1;
+  const failureText = `Relay recovery limit reached after ${retryCount} attempts (${reason}). The worker kept dying before completing this turn, so the message was failed to keep the queue moving. Send it again to retry.`;
+  const requestedModel = String(row?.model || '').trim() || null;
+  const tx = db.transaction(() => {
+    stmts.setFailed.run(JSON.stringify({
+      kind: 'recovery-limit',
+      error: 'recovery-limit',
+      code: 'recovery-limit',
+      stableCode: 'relay.recovery-limit',
+      reason: String(reason || 'worker-died'),
+      retryCount,
+      failedAt: now,
+    }), row.id);
+    stmts.setQueueResponseMessageId?.run(responseId, row.id);
+    stmts.insertMsg.run(
+      responseId,
+      row.conversation_id,
+      'assistant',
+      failureText,
+      requestedModel || 'unknown',
+      String(row?.relay_mode || '').trim() || null,
+      null,
+      now,
+      requestedModel,
+      null,
+      requestedModel ? 'user' : 'auto',
+    );
+    stmts.linkActivityToResponse?.run(responseId, row.id);
+    stmts.linkStreamEventsToResponse?.run(responseId, row.id);
+    stmts.linkThoughtsToResponse?.run(responseId, row.id);
+    stmts.updateConvTime.run(now, row.conversation_id);
+  });
+  tx();
+  io.emit('assistant_message', {
+    conversationId: row.conversation_id,
+    sourceMessageId: row.id,
+    messageId: responseId,
+    message: { role: 'assistant', text: failureText, model: requestedModel || 'unknown', mode: String(row?.relay_mode || '').trim() || null, timestamp: now },
+  });
+  io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+  console.warn(`${runtimeLogPrefix()}RECOVERY LIMIT ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
+}
+
 function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso = null } = {}) {
   const params = { inactiveBefore: cutoffIso, ceilingBefore: ceilingBeforeIso || null };
-  const rows = stmts.listRecoverableProcessing.all(params);
+  // Stale background-continuation turns are torn down, never requeued —
+  // replaying one would deliver the CLI's own continuation as a user prompt.
+  const staleContinuations = stmts.listStaleProcessingContinuations?.all?.(params) || [];
+  for (const row of staleContinuations) {
+    stmts.dropStaleContinuation?.run?.(row.id);
+    io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+  }
+  const allRows = stmts.listRecoverableProcessing.all(params);
+  if (!allRows.length) return [];
+  // Enforce the retry budget before requeueing: failing these rows first
+  // flips them out of 'processing' so the recovery UPDATE below skips them.
+  const overBudget = allRows.filter((row) => Number(row?.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES);
+  for (const row of overBudget) failRecoveredRowTerminally(row, 'stale-recovery');
+  const rows = allRows.filter((row) => Number(row?.retry_count || 0) + 1 < MAX_REQUEUE_RETRIES);
   if (!rows.length) return [];
 
   const tx = db.transaction(() => {
@@ -5242,8 +5485,96 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
   return rows;
 }
 
-function fetchUsageSummary(cb) {
+// One `/api/usage` needs the same token for the quota read and the billing
+// read, and `gh auth token` costs a process spawn. A short TTL collapses that
+// to one spawn per modal open while still picking up a re-login promptly.
+const GITHUB_TOKEN_CACHE_TTL_MS = 60_000;
+let githubTokenCache = null;
+
+/**
+ * Resolve a GitHub token for quota/billing reads: an explicit environment
+ * token wins, otherwise the CLI's own `gh auth token`.
+ */
+function resolveGitHubToken(cb) {
   const envToken = String(process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '').trim();
+  if (envToken) {
+    cb(null, envToken);
+    return;
+  }
+  if (githubTokenCache && githubTokenCache.expiresAt > Date.now()) {
+    cb(null, githubTokenCache.token);
+    return;
+  }
+  execFile('gh', ['auth', 'token'], (err, stdout, stderr) => {
+    const ghToken = String(stdout || '').trim();
+    if (!err && ghToken) {
+      githubTokenCache = { token: ghToken, expiresAt: Date.now() + GITHUB_TOKEN_CACHE_TTL_MS };
+      cb(null, ghToken);
+      return;
+    }
+    githubTokenCache = null;
+    const reason = String(stderr || stdout || '').trim();
+    const reasonSuffix = reason ? ` (${reason})` : '';
+    cb(new Error(`GitHub token unavailable: run gh auth login or set GH_TOKEN/GITHUB_TOKEN${reasonSuffix}`));
+  });
+}
+
+// Most tokens (including every `gh auth token`) cannot read billing, and that
+// answer does not change between two opens of the usage modal. Remembering the
+// refusal keeps the modal from paying for the same three doomed requests each
+// time; the TTL is what lets a newly-scoped PAT start working without a restart.
+const COPILOT_BILLING_DENIAL_TTL_MS = 10 * 60_000;
+let copilotBillingDenial = null;
+let copilotBillingLogin = '';
+
+/**
+ * Optional, personal-scope billing detail for the plan-usage card. Never
+ * rejects: a token without billing scope simply yields `{ error }` and the card
+ * renders its quota meters without the cost breakdown.
+ */
+function fetchCopilotBillingUsage() {
+  if (copilotBillingDenial && copilotBillingDenial.expiresAt > Date.now()) {
+    return Promise.resolve({
+      items: [],
+      timePeriod: null,
+      scope: copilotBillingDenial.scope,
+      error: copilotBillingDenial.error,
+    });
+  }
+  return new Promise((resolve) => {
+    resolveGitHubToken((error, token) => {
+      if (error || !token) {
+        resolve({ items: [], timePeriod: null, scope: null, error: error?.message || 'no GitHub token available' });
+        return;
+      }
+      // The cached login skips the `/user` lookup; it is cleared alongside a
+      // denial so a token that now points at another account re-resolves.
+      fetchPersonalBillingUsage({ token, login: copilotBillingLogin })
+        .then((result) => {
+          if (result?.denied) {
+            copilotBillingDenial = {
+              expiresAt: Date.now() + COPILOT_BILLING_DENIAL_TTL_MS,
+              error: result.error || 'billing usage is unavailable',
+              scope: result.scope || null,
+            };
+            copilotBillingLogin = '';
+          } else {
+            copilotBillingDenial = null;
+            copilotBillingLogin = String(result?.scope || '').trim();
+          }
+          resolve(result);
+        })
+        .catch((billingError) => resolve({
+          items: [],
+          timePeriod: null,
+          scope: null,
+          error: String(billingError?.message || billingError || 'billing usage failed'),
+        }));
+    });
+  });
+}
+
+function fetchUsageSummary(cb) {
   const useToken = (token) => {
     fetch('https://api.github.com/copilot_internal/user', {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
@@ -5276,6 +5607,9 @@ function fetchUsageSummary(cb) {
             remaining: Math.round(premium.quota_remaining ?? premium.remaining ?? 0),
             entitlement: premium.entitlement ?? 1500,
             percentRemaining: premium.percent_remaining ?? null,
+            // Carried through so the plan-usage card can label the bucket as
+            // AI credits or premium requests from the payload itself.
+            unit: premium.unit ?? snap.unit ?? data?.quota_unit ?? null,
           },
           planQuota: {
             unlimited: planSnapshot.unlimited ?? false,
@@ -5288,20 +5622,12 @@ function fetchUsageSummary(cb) {
       .catch((e) => cb(new Error(e?.message || 'Failed to fetch usage data')));
   };
 
-  if (envToken) {
-    useToken(envToken);
-    return;
-  }
-
-  execFile('gh', ['auth', 'token'], (err, stdout, stderr) => {
-    const ghToken = String(stdout || '').trim();
-    if (!err && ghToken) {
-      useToken(ghToken);
+  resolveGitHubToken((error, token) => {
+    if (error || !token) {
+      cb(error || new Error('GitHub token unavailable'));
       return;
     }
-    const reason = String(stderr || stdout || '').trim();
-    const reasonSuffix = reason ? ` (${reason})` : '';
-    cb(new Error(`GitHub token unavailable: run gh auth login or set GH_TOKEN/GITHUB_TOKEN${reasonSuffix}`));
+    useToken(token);
   });
 }
 
@@ -5459,9 +5785,17 @@ const readContextFromSessionEvents = contextSnapshotService.readContextFromSessi
 // Claude-provider sessions live under the Agent SDK's project layout rather than
 // ~/.copilot/session-state, so their browsable session folder resolves separately.
 const claudeSessionRootResolver = createClaudeSessionRootResolver({ fs, path });
+const cursorSessionRootResolver = createCursorSessionRootResolver({ fs, path, serverDir: __dirname });
 
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
+// Trust boundary for X-Forwarded-* headers. Default 'loopback' matches the
+// localhost-first deployment (a cloudflared/caddy tunnel runs on the same host
+// and connects over 127.0.0.1), so req.protocol/req.secure/req.ip reflect the
+// real edge only when the immediate peer is trusted — a direct client can no
+// longer forge those headers. Operators behind a remote proxy can widen this
+// via config.trustProxy (e.g. a hop count or subnet).
+app.set('trust proxy', config.trustProxy ?? 'loopback');
 const httpServer = http.createServer(app);
 httpServer.prependListener('request', (req, _res) => {
   rewriteSocketIoRequestPath(req, remotePath);
@@ -5469,7 +5803,34 @@ httpServer.prependListener('request', (req, _res) => {
 httpServer.prependListener('upgrade', (req, _socket, _head) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
-const io         = new Server(httpServer, { cors: { origin: '*' }, path: socketIoPath() });
+// Public tunnels (Cloudflare, or a VPS/Caddy front) forward every path on the
+// bound hostname to this port, including the session-worker WebSocket plumbing.
+// Reject those before auth; local workers connect over 127.0.0.1 with no edge
+// marker header and are unaffected.
+const tunnelWorkerPathGuard = createTunnelWorkerPathGuard({
+  pathPrefix: remotePath,
+  extraMarkerHeaders: config.tunnelMarkerHeaders
+    || process.env.COPILOT_TUNNEL_MARKER_HEADERS
+    || [],
+  logger: console,
+});
+httpServer.prependListener('upgrade', (req, socket, _head) => {
+  tunnelWorkerPathGuard.handleUpgrade(req, socket);
+});
+// Mobile clients disconnect whenever the PWA is backgrounded. Connection state
+// recovery replays the discrete events they missed instead of forcing a full
+// resync, so a phone that was away for a few minutes comes back in sync.
+// High-volume stream chunks are emitted volatile and deliberately excluded from
+// the replay buffer; see the io.volatile.emit('relay_stream') call site.
+const SOCKET_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
+const io         = new Server(httpServer, {
+  cors: { origin: '*' },
+  path: socketIoPath(),
+  connectionStateRecovery: {
+    maxDisconnectionDuration: SOCKET_RECOVERY_WINDOW_MS,
+    skipMiddlewares: true,
+  },
+});
 const SHARED_VIEWER_STALE_MS = 45_000;
 const SHARED_VIEWER_MAX_PER_CONVERSATION = Number.isFinite(Number(config.sharedPresenceMaxPerConversation))
   ? Math.max(1, Math.trunc(Number(config.sharedPresenceMaxPerConversation)))
@@ -5665,6 +6026,20 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     };
   }
 
+  if (runtimeState.cloudflaredTunnelState?.blocking) {
+    return {
+      message: null,
+      paused: true,
+      reason: 'cloudflared_tunnel_required',
+      cloudflaredTunnel: {
+        mode: runtimeState.cloudflaredTunnelState?.mode ?? null,
+        required: runtimeState.cloudflaredTunnelState?.required ?? false,
+        connected: runtimeState.cloudflaredTunnelState?.connected ?? false,
+        lastError: runtimeState.cloudflaredTunnelState?.lastError ?? null,
+      },
+    };
+  }
+
   const counts = queueCounts();
   const existingWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
   if (!existingWorker) {
@@ -5721,6 +6096,7 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     normalizeRelayMode,
     defaultRelayMode: DEFAULT_RELAY_MODE,
     defaultModel: DEFAULT_MODEL,
+    getCursorProviderSettings,
   });
   if (out?.ownerSessionId) {
     const worker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;
@@ -5739,6 +6115,15 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
   io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
   return {
     message: out,
+    // Piggybacked settings so workers pick up slider changes on the next
+    // delivery without a restart.
+    settings: {
+      backgroundTaskTimeoutMs: backgroundTaskTimeoutMinutesToMs(getBackgroundTaskTimeoutMinutes()),
+      // The user's max-turn-duration ceiling (0 = no limit): worker-local
+      // watchdogs (Grok's prompt ceiling) must honor it rather than imposing
+      // their own cap on a turn the user asked to leave unbounded.
+      turnCeilingMs: turnCeilingMinutesToMs(getTurnCeilingMinutes()),
+    },
     routing: {
       enabled: true,
       requesterSessionId,
@@ -5778,6 +6163,113 @@ async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionI
   return true;
 }
 
+// ─── Dead-worker detection ────────────────────────────────────────────────────
+// A worker that dies mid-turn used to leave its 'processing' row to the 600s
+// stale sweep (and, before queue isolation, to the relay steal). Two paths
+// close that window: the worker socket's close event (grace + PID probe), and
+// a periodic sweep for workers that died without a close event.
+
+const WORKER_DEATH_GRACE_MS = 15_000;
+
+function isWorkerSessionProcessAlive(sessionId, hintPid = null) {
+  if (sessionWorkerWebSocketService?.hasWorkerSocket?.(sessionId)) return true;
+  try {
+    if (sessionWorkerProcessInspector?.findProcessForSession?.(sessionId)) return true;
+  } catch {}
+  const registryPid = Number(sessionWorkerRegistry?.getWorker?.(sessionId)?.pid || 0);
+  if (registryPid > 0 && isProcessAlive(registryPid)) return true;
+  const pid = Number(hintPid || 0);
+  if (pid > 0 && isProcessAlive(pid)) return true;
+  return false;
+}
+
+function recoverDeadWorkerProcessingRows(sessionId, reason) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return 0;
+  const rows = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
+  if (!rows.length) return 0;
+  let recovered = 0;
+  const requeueAt = addMsIso(2_000);
+  for (const row of rows) {
+    if (String(row.kind || '') === 'continuation') {
+      // No user prompt to replay: a dead worker's continuation is torn down.
+      stmts.dropStaleContinuation?.run?.(row.id);
+      io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+      continue;
+    }
+    if (Number(row.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES) {
+      failRecoveredRowTerminally(row, `worker-died-${reason}`);
+      continue;
+    }
+    // The dead worker's subagent runs can never be terminated by the replay
+    // (fresh worker, fresh call ids) — close them out now.
+    const strandedRuns = stmts.listRunningSubagentRunsByQueueMessage?.all?.(row.id) || [];
+    if (strandedRuns.length) {
+      const nowIso = new Date().toISOString();
+      stmts.closeRunningSubagentRunsByQueueMessage?.run?.('failed', nowIso, nowIso, row.id);
+      for (const run of strandedRuns) {
+        io.emit('subagent_status', {
+          conversationId: run.conversation_id,
+          subagentRunId: run.id,
+          parentSubagentId: run.parent_subagent_id || null,
+          displayName: run.display_name || null,
+          status: 'failed',
+          queueMessageId: row.id,
+          reconciled: true,
+        });
+      }
+    }
+    stmts.recoverProcessingRowKeepOwner?.run?.(requeueAt, row.id);
+    io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
+    recovered += 1;
+  }
+  if (recovered > 0) {
+    io.emit('queue_updated', { recovered, reason: `worker-died:${reason}` });
+    sessionWorkerWebSocketService?.emitQueueChanged?.(`worker-died:${reason}`);
+  }
+  sessionWorkerSupervisor?.markError?.(sid, `worker-died:${reason}`);
+  // The rows stay owned, so the primer is what respawns their worker.
+  void primePendingSessionWorkers(`worker-died:${reason}`);
+  return recovered;
+}
+
+function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return;
+  if (runtimeShutdownStarted) return;
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const owned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
+  if (!owned.length) return;
+  const timer = setTimeout(() => {
+    try {
+      if (runtimeShutdownStarted) return;
+      if (isWorkerSessionProcessAlive(sid, pid)) return; // reconnect or socket flap
+      const stillOwned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
+      if (!stillOwned.length) return;
+      console.warn(`${runtimeLogPrefix()}WORKER DIED session=${sid.slice(0, 8)} rows=${stillOwned.length} trigger=socket-close — recovering owned turns`);
+      recoverDeadWorkerProcessingRows(sid, 'socket-close');
+    } catch (error) {
+      console.warn(`${runtimeLogPrefix()}WORKER DEATH check failed session=${sid.slice(0, 8)} err=${error?.message || error}`);
+    }
+  }, WORKER_DEATH_GRACE_MS);
+  timer.unref?.();
+}
+
+function sweepDeadWorkerProcessingRows() {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
+  if (runtimeShutdownStarted) return 0;
+  const owners = stmts.listProcessingOwnerSessionIds?.all?.(25) || [];
+  let recovered = 0;
+  for (const owner of owners) {
+    const sid = String(owner?.sdk_session_id || '').trim();
+    if (!sid) continue;
+    if (isWorkerSessionProcessAlive(sid)) continue;
+    console.warn(`${runtimeLogPrefix()}WORKER DEAD session=${sid.slice(0, 8)} trigger=sweep — recovering owned turns`);
+    recovered += recoverDeadWorkerProcessingRows(sid, 'sweep');
+  }
+  return recovered;
+}
+
 const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   WebSocketServerImpl: WebSocketServer,
   httpServer,
@@ -5788,11 +6280,15 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
     sessionWorkerSupervisor?.noteSessionHeartbeat?.(sessionId);
   },
   onDeliverySendFailed: recoverUndeliveredSessionWorkerMessage,
+  onWorkerSocketClosed: handleWorkerSocketClosed,
   requestWork: requestSessionWorkerSocketDelivery,
+  isWorkerProcessAlive: (pid) => isProcessAlive(Number(pid)),
   pathPrefix: remotePath,
   pollIntervalMs: 500,
   logger: console,
 });
+runtimeTimers.deadWorkerSweep = setInterval(sweepDeadWorkerProcessingRows, 30_000);
+if (typeof runtimeTimers.deadWorkerSweep.unref === 'function') runtimeTimers.deadWorkerSweep.unref();
 const tmuxInspectorAccessPolicy = createTmuxInspectorAccessPolicy({
   sessionWorkerRegistry,
   sessionWorkerSupervisor,
@@ -5815,8 +6311,10 @@ async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
   if (typeof sessionWorkerSupervisor?.ensureWorker !== 'function') return 0;
   if (typeof stmts.listPendingWorkerOwnerSessionIds?.all !== 'function') return 0;
 
-  const now = new Date().toISOString();
-  const rows = stmts.listPendingWorkerOwnerSessionIds.all(now, 25);
+  // No next_attempt_at filter here: rows sitting in retry backoff still need
+  // their worker warm, otherwise the 2s relay poll wins the race the moment
+  // the backoff matures and the turn executes on the wrong provider.
+  const rows = stmts.listPendingWorkerOwnerSessionIds.all(25);
   let requested = 0;
   for (const row of rows) {
     const sdkSessionId = String(row?.sdk_session_id || '').trim();
@@ -5835,9 +6333,24 @@ async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
   return requested;
 }
 
+// Guard first, so a tunnelled request to a worker path is rejected before any
+// body is parsed and before auth runs.
+app.use(tunnelWorkerPathGuard.requestMiddleware);
+// Uploads travel as raw bodies on POST /api/upload (express.raw, capped by
+// MAX_UPLOAD_BYTES), so the JSON limit only bounds inline image data URLs.
 app.use(express.json({ limit: '20mb' }));
 app.use((req, _res, next) => {
   stripRequestPathPrefix(req, remotePath);
+  next();
+});
+// Baseline security headers on every response. Served-file/attachment endpoints
+// layer a stricter sandbox CSP on top (see applySafeServedContentHeaders). A
+// global script-src CSP is intentionally omitted for now: the SPA relies on
+// inline event handlers, so a strict policy needs a refactor first (follow-up).
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'no-referrer');
   next();
 });
 app.get('/socket.io/socket.io.js', (req, res, next) => {
@@ -5909,8 +6422,11 @@ const windowsAutostartService = createWindowsAutostartService({
   configPath: CONFIG_PATH,
 });
 
+const gitChangesService = createGitChangesService();
 const sharedRouteDeps = {
   auth,
+  gitChangesService,
+  currentWorkspaceRootPath,
   io,
   db,
   stmts,
@@ -5964,6 +6480,12 @@ const sharedRouteDeps = {
   getClaudeProviderSettings,
   setClaudeProviderSettings,
   refreshClaudeProviderModels,
+  getCursorProviderSettings,
+  setCursorProviderSettings,
+  refreshCursorProviderModels,
+  getGrokProviderSettings,
+  setGrokProviderSettings,
+  refreshGrokProviderModels,
   reconcileUnstartedConversationProviders,
   rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,
@@ -6006,8 +6528,11 @@ const sharedRouteDeps = {
   relayThoughtsForResponse,
   relayThoughtsForQueueMessage,
   subagentRunsForResponse,
+  workflowRunsForResponse,
   sanitizeActivityText,
   inFlightStateForConversation,
+  backgroundTaskStore,
+  sendWorkerControl: (sessionId, control) => sessionWorkerWebSocketService.sendControlToSession(sessionId, control),
   emitToClientsExceptSessionId,
   relayBridgeOwnerService,
   relayCliLauncherService,
@@ -6034,6 +6559,18 @@ const sharedRouteDeps = {
   path,
   uploadsDir: UPLOAD_DIR,
   fetchUsageSummary,
+  fetchCopilotBillingUsage,
+  fetchGrokBillingUsage: createGrokBillingUsageFetcher(),
+  fetchCursorDashboardUsage: createCursorDashboardUsageFetcher({
+    getSessionToken: readCursorDashboardSessionToken,
+  }),
+  getCursorDashboardTokenSettings,
+  setCursorDashboardTokenSettings,
+  planUsageService,
+  getCursorPlanAllowanceSettings,
+  setCursorPlanAllowanceSettings,
+  getGrokPlanAllowanceSettings,
+  setGrokPlanAllowanceSettings,
   bootstrapRuntimeSessionBindings,
   SUPPORTED_RELAY_MODES,
   SUPPORTED_CONVERSATION_SESSION_MODES,
@@ -6051,20 +6588,30 @@ const sharedRouteDeps = {
   relayRestartOrchestrator,
   resolveSessionStateRoot,
   resolveClaudeSessionRoot: claudeSessionRootResolver.resolveClaudeSessionRoot,
+  resolveCursorSessionRoot: cursorSessionRootResolver.resolveCursorSessionRoot,
   getTurnCeilingMinutes,
   setTurnCeilingMinutes,
+  getBackgroundTaskTimeoutMinutes,
+  setBackgroundTaskTimeoutMinutes,
   requestRelayShutdown,
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
   imageOperationService,
   windowsAutostartService,
+  pushDispatchService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
 registerAskUserRoutes(app, sharedRouteDeps);
 registerRelayBoardRoutes(app, sharedRouteDeps);
 registerCacheRoutes(app, sharedRouteDeps);
+registerGitRoutes(app, sharedRouteDeps);
+registerPushRoutes(app, {
+  auth,
+  pushDispatchService,
+  getPushVapidPublicKey: () => pushVapidKeys.publicKey,
+});
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   cliLastSeen = null;
   const wasOnline = cliOnline;
@@ -6076,6 +6623,7 @@ function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   if (wasOnline) {
     console.log(`${runtimeLogPrefix()}CLI OFFLINE${reason ? ` (${reason})` : ''}`);
     io.emit('cli_status', { online: false });
+    void pushDispatchService.notifyCliOffline();
   }
 }
 
@@ -6139,6 +6687,12 @@ runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
 expirePendingQuestions();
 runtimeTimers.sharedViewerPrune = setInterval(pruneSharedViewerPresence, 5_000);
 if (typeof runtimeTimers.sharedViewerPrune.unref === 'function') runtimeTimers.sharedViewerPrune.unref();
+const sweptUploads = sweepUnreferencedUploadBlobs();
+if (sweptUploads > 0) {
+  console.log(`${runtimeLogPrefix()}Reclaimed ${sweptUploads} unreferenced upload(s)`);
+}
+runtimeTimers.uploadSweep = setInterval(sweepUnreferencedUploadBlobs, 6 * 60 * 60 * 1000);
+if (typeof runtimeTimers.uploadSweep.unref === 'function') runtimeTimers.uploadSweep.unref();
 const runtimeBindingsBootstrapped = bootstrapRuntimeSessionBindings();
 if (runtimeBindingsBootstrapped > 0) {
   console.log(`${runtimeLogPrefix()}Runtime sessions bootstrapped: ${runtimeBindingsBootstrapped}`);
@@ -6150,18 +6704,30 @@ function runtimeLogPrefix() {
 }
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
+// Constant-time comparison so the auth token can't be recovered through response
+// timing. The token length is fixed (a UUID), so the length short-circuit leaks
+// nothing secret; any empty/missing value is a non-match.
+function tokensMatch(presented, expected) {
+  const a = Buffer.from(String(presented || ''), 'utf8');
+  const b = Buffer.from(String(expected || ''), 'utf8');
+  if (a.length === 0 || b.length === 0 || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
 function auth(req, res, next) {
   const cookies = parseCookies(req.headers.cookie);
-  const secureAttr = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https'
-    ? '; Secure'
-    : '';
+  // req.secure is derived through the configured `trust proxy` boundary, so a
+  // direct (untrusted) client can no longer force a non-Secure cookie by
+  // omitting X-Forwarded-Proto.
+  const secureAttr = req.secure ? '; Secure' : '';
+  // Note: the token is intentionally NOT read from req.body — a request body is
+  // an easy CSRF/logging vector and has no legitimate use here. Header, query
+  // (first-load bootstrap only), and the HttpOnly cookie remain.
   const token =
     (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
     req.query.token ||
-    req.body?.token ||
     cookies[AUTH_COOKIE];
-  if (token === config.authToken) {
-    if (res && cookies[AUTH_COOKIE] !== config.authToken) {
+  if (tokensMatch(token, config.authToken)) {
+    if (res && !tokensMatch(cookies[AUTH_COOKIE], config.authToken)) {
       appendSetCookie(res, `${AUTH_COOKIE}=${encodeURIComponent(config.authToken)}; Path=${COOKIE_PATH}; Max-Age=2592000; SameSite=Lax; HttpOnly${secureAttr}`);
     }
     return next();
@@ -6219,10 +6785,14 @@ function ensureRuntimeSessionBinding(
     ? 'openai'
     : (normalizedRequestedProviderType === 'claude'
       ? 'claude'
-      : (normalizedRequestedProviderType === 'github'
-        ? 'github'
-        : (openAISettings?.enabled ? 'openai' : 'github')));
-  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude')
+      : (normalizedRequestedProviderType === 'cursor'
+        ? 'cursor'
+        : (normalizedRequestedProviderType === 'grok'
+          ? 'grok'
+          : (normalizedRequestedProviderType === 'github'
+            ? 'github'
+            : (openAISettings?.enabled ? 'openai' : 'github')))));
+  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor' || resolvedProviderType === 'grok')
     ? (String(providerModel || normalizedModel || '').trim() || null)
     : null;
   try {
@@ -6371,10 +6941,12 @@ function sanitizeRelayQuestionContext(rawContext) {
 
 
 // ─── Socket.io Auth ───────────────────────────────────────────────────────────
-io.use((socket, next) => {
+function socketAuthToken(socket) {
   const cookies = parseCookies(socket.request.headers.cookie);
-  const token = socket.handshake.auth?.token || socket.handshake.query?.token || cookies[AUTH_COOKIE];
-  if (token === config.authToken) return next();
+  return socket.handshake.auth?.token || socket.handshake.query?.token || cookies[AUTH_COOKIE];
+}
+io.use((socket, next) => {
+  if (tokensMatch(socketAuthToken(socket), config.authToken)) return next();
   next(new Error('Unauthorized'));
 });
 
@@ -6384,10 +6956,27 @@ io.engine.on('initial_headers', (headers, req) => {
 });
 
 io.on('connection', (socket) => {
+  // connectionStateRecovery runs with skipMiddlewares: true, so a recovered
+  // socket bypasses the io.use() token gate above. Re-validate here and drop it
+  // on mismatch so a recovered session still requires the auth token (and a
+  // rotated token takes effect immediately).
+  if (socket.recovered && !tokensMatch(socketAuthToken(socket), config.authToken)) {
+    socket.disconnect(true);
+    return;
+  }
   const cookies = parseCookies(socket.request.headers.cookie);
   socket.data.sessionId = socket.handshake.auth?.clientId || socket.handshake.query?.clientId || cookies[SESSION_COOKIE] || null;
+  // Liveness probe ack for verifySocketLiveness() in public/app/socket-handlers.js:
+  // a PWA resuming from an Android freeze pings before trusting a socket that
+  // still claims to be connected.
+  socket.on('client_ping', (ack) => {
+    if (typeof ack === 'function') ack({ ok: true });
+  });
   // Send current CLI status immediately on connect
   socket.emit('cli_status', { online: cliOnline });
+  // Visibility heartbeats for push suppression; also clears a stale
+  // deviceVisible flag restored by connectionStateRecovery.
+  activeDeviceTracker.registerSocket(socket);
   tmuxInspectorSocketService.registerSocket(socket);
 });
 
@@ -6403,6 +6992,18 @@ const sshTunnelManager = createSshTunnelManager({
 });
 const tunnelState = sshTunnelManager.state;
 runtimeState.tunnelState = tunnelState;
+
+// ─── Cloudflare Tunnel ────────────────────────────────────────────────────────
+// Independent of the SSH tunnel above; both modes may run simultaneously.
+const cloudflaredTunnelManager = createCloudflaredTunnelManager({
+  tunnelConfig: config.cloudflaredTunnel || {},
+  runtimeLogPrefix,
+  io,
+  logger: console,
+  runtimeShutdownRef: () => runtimeShutdownStarted,
+  configBaseDir: __dirname,
+});
+runtimeState.cloudflaredTunnelState = cloudflaredTunnelManager.state;
 
 function clearRuntimeTimers() {
   for (const timer of Object.values(runtimeTimers)) {
@@ -6437,6 +7038,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();
+  cloudflaredTunnelManager.stop();
   try { relaySingletonGuard.release(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Failed to release singleton lock: ${error?.message || error}`);
   }
@@ -6559,6 +7161,7 @@ httpServer.listen(config.port, listenHost, () => {
 
   // Start SSH tunnel after server is listening
   sshTunnelManager.start();
+  cloudflaredTunnelManager.start();
   void sdkSessionImportService.runStartupImport().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session import startup failed: ${error?.message || error}`);
   });

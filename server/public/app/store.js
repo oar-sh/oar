@@ -1,5 +1,7 @@
 import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
+import { resolveRelayDotState } from './relay-dot-state.mjs';
 import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
+import { isChatInteractionHeld } from './selection-guard.mjs';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -46,11 +48,31 @@ if (!CLIENT_ID) {
   } catch {}
 }
 
+// Durable device identity for push subscriptions and visibility heartbeats.
+// Unlike CLIENT_ID (per-tab, sessionStorage) this survives restarts so a
+// device keeps its identity across subscription churn.
+let deviceIdStorageValue = '';
+try {
+  deviceIdStorageValue = localStorage.getItem('copilot_device_id') || '';
+} catch {
+  deviceIdStorageValue = '';
+}
+export let DEVICE_ID = deviceIdStorageValue;
+if (!DEVICE_ID) {
+  DEVICE_ID = generateId();
+  try {
+    localStorage.setItem('copilot_device_id', DEVICE_ID);
+  } catch {}
+}
+
 export const seenMessageIds = new Set();
 export const pendingUserMessageIds = new Set();
 export const pendingUserMessageEntries = new Map();
 export let cliOnline = false;
 export let relayOnline = false;
+// Latest cloudflared tunnel status, from /api/status on load and the
+// cloudflared_tunnel_status socket event thereafter. Null until first reported.
+export let cloudflaredTunnelState = null;
 export let activeRuntimeSessionCount = 0;
 export let runtimeSessionBindingCount = 0;
 export let conversations = {};
@@ -546,6 +568,9 @@ export function applyContextUsageBar(ratio) {
 export function scrollBottom() {
   const el = document.getElementById('messages');
   if (!el) return;
+  // Programmatic scrolling during a drag makes the browser extend the live
+  // selection over everything that moves under the cursor.
+  if (isChatInteractionHeld()) return;
   el.scrollTop = el.scrollHeight;
   saveConversationScrollTop(currentConvId, el.scrollTop);
 }
@@ -687,6 +712,7 @@ export function updateCompactButton() {
 
 export function updateCliStatus() {
   const dot = document.getElementById('cli-dot');
+  const burger = document.getElementById('sidebar-toggle');
   const text = document.getElementById('cli-status-text');
   const banner = document.getElementById('offline-banner');
   const changeCwdBtn = document.getElementById('chat-menu-change-cwd');
@@ -694,22 +720,21 @@ export function updateCliStatus() {
   const processingCount = workerStates.filter((state) => String(state?.status || '').trim().toLowerCase() === 'processing').length;
   const errorCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'error').length;
   const questionCount = workerStates.filter((state) => String(state?.uiState || state?.derivedUiState || '').trim().toLowerCase() === 'question').length;
+  const dotState = resolveRelayDotState({
+    relayOnline,
+    cliOnline,
+    cloudflaredTunnel: cloudflaredTunnelState,
+    processingCount,
+    errorCount,
+    questionCount,
+  });
   if (dot) {
-    dot.className = relayOnline ? 'online' : 'offline';
-    if (!relayOnline) {
-      dot.title = 'Web relay unreachable';
-    } else if (!cliOnline) {
-      dot.title = 'Web relay reachable; CLI offline';
-    } else if (processingCount > 0) {
-      dot.title = `Web relay reachable; ${processingCount} session worker${processingCount === 1 ? '' : 's'} processing`;
-    } else if (errorCount > 0) {
-      dot.title = `Web relay reachable; ${errorCount} session worker${errorCount === 1 ? '' : 's'} degraded`;
-    } else if (questionCount > 0) {
-      dot.title = `Web relay reachable; ${questionCount} session worker${questionCount === 1 ? '' : 's'} waiting on a question`;
-    } else {
-      dot.title = 'Web relay reachable';
-    }
+    dot.className = dotState.className;
+    dot.title = dotState.title;
   }
+  // The dot lives in the sidebar, which is an off-canvas drawer on mobile. The
+  // burger toggle stays on screen, so it carries the same tone on its bars.
+  if (burger) burger.dataset.relayTone = dotState.tone;
   if (text) text.textContent = cliOnline ? 'CLI online' : 'CLI offline';
   if (changeCwdBtn) {
     changeCwdBtn.disabled = false;
@@ -734,6 +759,11 @@ export function setRelayOnline(value) {
   const changed = relayOnline !== nextOnline;
   relayOnline = nextOnline;
   if (changed) recordRelayLifecycleEvent(nextOnline);
+  updateCliStatus();
+}
+
+export function setCloudflaredTunnelState(value) {
+  cloudflaredTunnelState = value && typeof value === 'object' ? value : null;
   updateCliStatus();
 }
 

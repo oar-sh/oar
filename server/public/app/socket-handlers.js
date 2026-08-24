@@ -2,6 +2,7 @@ import {
   BASE,
   TOKEN,
   CLIENT_ID,
+  DEVICE_ID,
   currentConvId,
   conversations,
   seenMessageIds,
@@ -14,6 +15,7 @@ import {
   repoBrowserState,
   setRelayOnline,
   setCliOnline,
+  setCloudflaredTunnelState,
   setCurrentConv,
   updateWorkspaceRootHints,
   updateCompactButton,
@@ -28,7 +30,7 @@ import {
   setConversationWatcherCount,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
-import { publishStatusEvent } from './status-store.mjs';
+import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
 import { renderConvList, refreshConversations, openConversation } from './journal-view.js';
 import {
   upsertRelayQuestion,
@@ -36,6 +38,7 @@ import {
   updatePendingQuestionBanner,
 } from './ask-user-view.js';
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
+import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import {
   showThinking,
   removeThinking,
@@ -55,8 +58,9 @@ import {
   clearBubbleCancelState,
   removeUserBubbleCancelButton,
   updateSubagentBubbleFromStatus,
+  markSubagentStopUnsupported,
 } from './conversation-view.js';
-import { loadRepoBrowserTree } from './attachments-view.js';
+import { loadRepoBrowserTree, refreshRepoBrowserIfWorkspaceOpen } from './attachments-view.js';
 import { clearMessageSearchRuntimeState } from './message-search-view.js';
 import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
@@ -64,9 +68,16 @@ import { mergeRelayThoughts } from './relay-thoughts.mjs';
 
 const FALLBACK_MODE = 'agent';
 
+// How long a liveness probe waits for its ack before declaring the transport a
+// zombie. Comfortably above one mobile round-trip, far below the ~45s the
+// engine's own ping timeout would need — which is the timer an Android freeze
+// may have discarded, making the probe necessary in the first place.
+const SOCKET_LIVENESS_TIMEOUT_MS = 5000;
+
 /** @type {import('socket.io-client').Socket | null} */
 let socket = null;
 let socketActivityEnabled = true;
+let livenessProbeInFlight = false;
 let lastSocketErrorSignature = '';
 let lastSocketErrorAt = 0;
 
@@ -86,6 +97,8 @@ let deps = null;
  * @property {(conversationId: string, payload?: object) => void} applyConversationPreferencesForConversation
  * @property {(payload?: object) => void} applyOpenAISettingsState
  * @property {(payload?: object) => void} applyClaudeSettingsState
+ * @property {(payload?: object) => void} applyGrokSettingsState
+ * @property {(payload?: object) => void} applyCursorSettingsState
  */
 
 /**
@@ -100,14 +113,118 @@ export function getSocket() {
   return socket;
 }
 
+/**
+ * Report this device's foreground state to the server, which uses it to decide
+ * whether push notifications should be suppressed. Safe to call in any state:
+ * a disconnected or absent socket makes it a no-op (the connect handler
+ * re-asserts visibility as soon as the socket is back).
+ */
+export function emitDeviceVisibility(visible) {
+  if (!socket?.connected) return;
+  socket.emit('device_visibility', { deviceId: DEVICE_ID, visible: visible === true });
+}
+
+/**
+ * Close the transport rather than the namespace socket when backgrounding.
+ *
+ * socket.disconnect() makes the server report "client namespace disconnect", which
+ * is absent from socket.io's RECOVERABLE_DISCONNECT_REASONS, so the session is
+ * discarded and connectionStateRecovery replays nothing when the phone returns.
+ * Closing the engine surfaces as "transport close", which is recoverable. Manager
+ * reconnection is suspended first so the close does not immediately trigger the
+ * backoff loop we are trying to avoid while hidden.
+ */
+function suspendSocketForBackground() {
+  // The "now hidden" heartbeat has to leave before the transport closes or it
+  // never arrives and the device looks active until its socket drops.
+  emitDeviceVisibility(false);
+  const manager = socket?.io;
+  manager?.reconnection(false);
+  if (manager?.engine) {
+    manager.engine.close();
+    return;
+  }
+  if (socket?.connected || socket?.active) socket.disconnect();
+}
+
+function resumeSocketFromBackground() {
+  socket?.io?.reconnection(true);
+  if (socket && !socket.connected) socket.connect();
+}
+
 export function setSocketActivityEnabled(value) {
   socketActivityEnabled = !!value;
   if (!socket) return;
   if (!socketActivityEnabled) {
-    if (socket.connected || socket.active) socket.disconnect();
+    suspendSocketForBackground();
     return;
   }
-  if (!socket.connected) socket.connect();
+  resumeSocketFromBackground();
+}
+
+/**
+ * Bring the relay socket back up, whatever state the manager is in. Safe to call on a
+ * timer: connect() skips the manager while it is mid-backoff, so this cannot compete
+ * with socket.io's own retry schedule.
+ *
+ * `socket.active` only distinguishes the two cases for the caller's benefit. It stays
+ * true while the manager works through its backoff, and goes false once it gives up
+ * for good — which is what happens after an explicit disconnect() or a rejected
+ * handshake, since both destroy the socket instead of scheduling a retry. That is the
+ * case worth reporting, because nothing else would have reconnected.
+ * @returns {'connected'|'retrying'|'forced'|'disabled'}
+ */
+export function ensureSocketConnected() {
+  if (!socketActivityEnabled || !socket) return 'disabled';
+  if (socket.connected) return 'connected';
+  const wasRetrying = socket.active;
+  // Reconnection is suspended while backgrounded, so re-arm it before asking the
+  // socket to connect. connect() is a no-op while the manager is mid-backoff.
+  socket.io?.reconnection(true);
+  socket.connect();
+  return wasRetrying ? 'retrying' : 'forced';
+}
+
+/**
+ * Last-resort recovery for manager states connect() cannot escape: a
+ * `_reconnecting` flag whose backoff timer was dropped by an Android freeze, or
+ * a connect attempt whose timers died with it. disconnect() forcibly clears the
+ * manager state machine (skipReconnect/_reconnecting) and destroys whatever
+ * engine is left; connect() then opens a clean handshake, and the socket's
+ * retained recovery offset still lets the server replay missed events when the
+ * outage stayed inside the recovery window.
+ */
+export function hardResetSocket() {
+  if (!socket) return;
+  try {
+    socket.disconnect();
+  } catch {}
+  if (!socketActivityEnabled) return;
+  socket.io?.reconnection(true);
+  socket.connect();
+}
+
+/**
+ * Distrust a socket that claims to be connected right after the app returns to
+ * the foreground. A page frozen mid-connection can resume with `connected`
+ * still true on a transport the server dropped hours ago, and if the engine's
+ * ping-timeout timer was discarded with the freeze nothing ever notices — the
+ * watchdog sees "connected" and stands down. An acked ping settles it: no ack
+ * within the timeout means zombie, and closing the engine hands the manager a
+ * real close event to reconnect from.
+ */
+export function verifySocketLiveness() {
+  if (!socketActivityEnabled || !socket?.connected || livenessProbeInFlight) return;
+  livenessProbeInFlight = true;
+  socket.timeout(SOCKET_LIVENESS_TIMEOUT_MS).emit('client_ping', (err) => {
+    livenessProbeInFlight = false;
+    if (!err) return;
+    // The engine may already have noticed and reconnected (or been suspended)
+    // while the probe was outstanding; only kill a socket still playing alive.
+    if (!socket?.connected) return;
+    recordStatusEvent('relay-zombie-socket', { timeoutMs: SOCKET_LIVENESS_TIMEOUT_MS });
+    socket.io?.engine?.close();
+  });
 }
 
 function requireDeps() {
@@ -150,15 +267,41 @@ export async function connectSocket(overrideDeps) {
     transports: ['websocket', 'polling'],
   });
 
+  // The connect-time view resync is the only correction path for state whose
+  // change events this client missed while suspended (e.g. a background-task
+  // set the server has since emptied — an empty store never re-announces
+  // itself). A connect that races the relay's own restart loses a one-shot
+  // resync to a failed fetch and the stale state then survives indefinitely,
+  // so failures retry with backoff until one pass lands on a live server.
+  let connectResyncTimer = null;
+  let connectResyncGeneration = 0;
+  function resyncAfterConnect(attempt = 0) {
+    const generation = attempt === 0 ? ++connectResyncGeneration : connectResyncGeneration;
+    if (connectResyncTimer) {
+      clearTimeout(connectResyncTimer);
+      connectResyncTimer = null;
+    }
+    refreshCurrentView().catch(() => {
+      if (generation !== connectResyncGeneration || attempt >= 4 || !socket?.connected) return;
+      connectResyncTimer = setTimeout(() => {
+        connectResyncTimer = null;
+        resyncAfterConnect(attempt + 1);
+      }, 2000 * (attempt + 1));
+    });
+  }
+
   socket.on('connect', () => {
     lastSocketErrorSignature = '';
     lastSocketErrorAt = 0;
     console.log('Socket connected');
+    // Connect-time heartbeat. Also re-asserts visibility after a recovered
+    // session, whose restored socket.data the server deliberately resets.
+    emitDeviceVisibility(document.visibilityState === 'visible');
     clearMessageSearchRuntimeState();
     setRelayOnline(true);
     setCliOnline(true);
     renderConvList();
-    refreshCurrentView().catch(() => {});
+    resyncAfterConnect();
     refreshSessionWorkerStatus().catch(() => {});
     refreshModelCatalog().catch(() => {});
   });
@@ -183,6 +326,10 @@ export async function connectSocket(overrideDeps) {
     refreshSessionWorkerStatus().catch(() => {});
     if (online) refreshModelCatalog().catch(() => {});
   });
+  // Keeps the relay dot's Cloudflare Tunnel colour live between status polls.
+  socket.on('cloudflared_tunnel_status', (payload) => {
+    setCloudflaredTunnelState(payload || null);
+  });
   socket.on('models_updated', (payload) => {
     updateModelCatalogState(payload || {});
     void reconcileOpenModelVariantModal();
@@ -197,6 +344,22 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('claude_settings_updated', (payload) => {
     deps?.applyClaudeSettingsState?.(payload || {});
+    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
+      void Promise.resolve()
+        .then(() => deps?.refreshCurrentView?.())
+        .catch(() => {});
+    }
+  });
+  socket.on('grok_settings_updated', (payload) => {
+    deps?.applyGrokSettingsState?.(payload || {});
+    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
+      void Promise.resolve()
+        .then(() => deps?.refreshCurrentView?.())
+        .catch(() => {});
+    }
+  });
+  socket.on('cursor_settings_updated', (payload) => {
+    deps?.applyCursorSettingsState?.(payload || {});
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())
@@ -282,6 +445,9 @@ export async function connectSocket(overrideDeps) {
   socket.on('relay_board_changed', () => {
     loadRelayBoards();
   });
+  socket.on('background_tasks', ({ conversationId, tasks }) => {
+    setConversationBackgroundTasks(conversationId, tasks);
+  });
   socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId }) => {
     if (!messageId || !text) return;
     const entry = {
@@ -336,7 +502,7 @@ export async function connectSocket(overrideDeps) {
       appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
     }
   });
-  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp }) => {
+  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp, stopUnsupported }) => {
     if (!messageId || !subagentRunId) return;
     upsertSubagentRun({
       subagentRunId,
@@ -348,6 +514,9 @@ export async function connectSocket(overrideDeps) {
       timestamp,
     });
     clearSubagentCancelInFlight(subagentRunId);
+    // The provider answered "not supported": pin the state so the button does
+    // not re-arm into an endless click-and-fail loop.
+    if (stopUnsupported) markSubagentStopUnsupported(subagentRunId);
     if (conversationId === currentConvId) {
       updateSubagentBubbleFromStatus(subagentRunId, status);
     }
@@ -408,6 +577,9 @@ export async function connectSocket(overrideDeps) {
   socket.on('message_status', ({ messageId, conversationId, status }) => {
     const normalizedStatus = String(status || '').trim().toLowerCase();
     const clearsProcessingStatus = ['done', 'failed', 'dropped', 'pending', 'parked', 'cancelled'].includes(normalizedStatus);
+    // pending/parked fire mid-turn (queueing, park/re-queue); only genuinely
+    // terminal statuses may tear down the live bubble and reload the view.
+    const isTerminalStatus = ['done', 'failed', 'dropped', 'cancelled'].includes(normalizedStatus);
     applyConversationTurnStatus({ conversationId, messageId, status });
     if (conversationId && conversations[conversationId]) {
       const conversation = conversations[conversationId];
@@ -439,12 +611,15 @@ export async function connectSocket(overrideDeps) {
       if (messageId) clearBubbleCancelState(messageId);
       if (messageId) removeUserBubbleCancelButton(messageId);
     }
-    if (conversationId === currentConvId && clearsProcessingStatus) {
+    if (conversationId === currentConvId && isTerminalStatus) {
       collapseThinkingThoughts();
       removeThinking();
       void refreshCurrentView().catch(() => {});
       scheduleContextUsageRefresh(conversationId, 220);
       refreshSessionWorkerStatus().catch(() => {});
+      // Files the agent created during the turn appear now, via the restoring
+      // path that keeps open folders and the current selection.
+      refreshRepoBrowserIfWorkspaceOpen();
     }
     renderConvList();
   });

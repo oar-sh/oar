@@ -51,3 +51,16 @@ test('prefers remembered reasoning effort and otherwise avoids none when possibl
     'low',
   );
 });
+
+test('ultracode is selectable when remembered but never a silent default', () => {
+  const claudeLadder = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'];
+  assert.equal(
+    resolvePreferredReasoningEffort(claudeLadder, ['ultracode']),
+    'ultracode',
+  );
+  // No stored preference: the first non-none tier wins, not the top rung.
+  assert.equal(
+    resolvePreferredReasoningEffort(claudeLadder, ['']),
+    'low',
+  );
+});

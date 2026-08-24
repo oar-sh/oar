@@ -211,6 +211,13 @@ export function createSessionHistoryRefreshService({
   const deleteConversationSubagentRuns = typeof stmts?.deleteConvSubagentRuns?.run === 'function'
     ? stmts.deleteConvSubagentRuns
     : db.prepare(`DELETE FROM subagent_runs WHERE conversation_id = ?`);
+  // workflow_runs rows key on assistant message ids; a history rebuild
+  // replaces those ids, so the rows must go with the messages they annotated
+  // (same lifecycle as subagent_runs). The fallback guards dbs opened before
+  // the table existed.
+  const deleteConversationWorkflowRuns = typeof stmts?.deleteConvWorkflowRuns?.run === 'function'
+    ? stmts.deleteConvWorkflowRuns
+    : db.prepare(`DELETE FROM workflow_runs WHERE conversation_id = ?`);
 
   function collectAttachmentCandidates(conversationId) {
     const candidates = new Map();
@@ -398,6 +405,7 @@ export function createSessionHistoryRefreshService({
     deleteConversationThoughts.run(conversationId);
     deleteConversationStreamEvents.run(conversationId);
     deleteConversationSubagentRuns.run(conversationId);
+    deleteConversationWorkflowRuns.run(conversationId);
   });
 
   const persistRebuiltHistoryTx = db.transaction((conversationId, messages = []) => {
@@ -412,6 +420,7 @@ export function createSessionHistoryRefreshService({
     deleteConversationThoughts.run(conversationId);
     deleteConversationStreamEvents.run(conversationId);
     deleteConversationSubagentRuns.run(conversationId);
+    deleteConversationWorkflowRuns.run(conversationId);
     insertRebuiltMessages(conversationId, messages, attachmentCandidates);
     const rebuiltMessages = ensureArray(messages);
     const consumedHiddenIds = new Set();

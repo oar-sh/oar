@@ -19,6 +19,12 @@ import {
   resolveCwdMenuPlacement,
   resolveTypeaheadIndex,
 } from './cwd-menu-placement.mjs';
+import {
+  buildKnownCwdOptions as buildKnownCwdOptionsFromInputs,
+  normalizeKnownCwdPath,
+} from './known-cwd-options.mjs';
+
+export { normalizeKnownCwdPath };
 
 const LEGACY_KNOWN_CWD_HISTORY_KEY = 'copilot_known_cwds';
 const MOBILE_PICKER_MEDIA_QUERY = '(max-width: 680px)';
@@ -56,17 +62,6 @@ export function initCwdPicker({
   }
 }
 
-// Mirrors normalizeDriveLetterOnlyPath in server/services/workspace-root-path-policy.mjs.
-// It cannot be imported: only server/public is served to the browser.
-export function normalizeKnownCwdPath(value) {
-  const stripped = String(value || '').trim().replace(/[\\/]+$/, '');
-  // Always restore the trailing backslash for Windows drive roots ("D:" → "D:\").
-  // Without it, sending "D:" to the server causes path.resolve("D:") to return the
-  // server's remembered CWD for drive D, not the drive root.
-  if (/^[A-Za-z]:$/.test(stripped)) return `${stripped}\\`;
-  return stripped;
-}
-
 export function clearLegacyKnownCwdHistoryStorage() {
   try {
     localStorage.removeItem(LEGACY_KNOWN_CWD_HISTORY_KEY);
@@ -74,29 +69,12 @@ export function clearLegacyKnownCwdHistoryStorage() {
 }
 
 function buildKnownCwdOptions() {
-  const options = [];
-  const seen = new Set();
-  const add = (label, value, note = '') => {
-    const pathValue = normalizeKnownCwdPath(value);
-    if (!pathValue) return;
-    const key = pathValue.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    options.push({ label, path: pathValue, note });
-  };
-
-  const selectedCurrentCwd = getSelectedConversationCurrentCwd();
-  add('Current session CWD', selectedCurrentCwd, 'Selected session');
-  add('Relay workspace', workspaceRootPath, 'Relay host cwd');
-  const browserCwd = normalizeKnownCwdPath(getRepoBrowserLaunchCwdPath());
-  if (browserCwd && browserCwd.toLowerCase() !== normalizeKnownCwdPath(selectedCurrentCwd).toLowerCase()) {
-    add('Current browser folder', browserCwd, 'From file explorer');
-  }
-  const history = getRecentWorkspaceRoots();
-  history.forEach((pathValue, index) => {
-    add(`Recent CWD ${index + 1}`, pathValue, 'Relay history');
+  return buildKnownCwdOptionsFromInputs({
+    currentSessionCwd: getSelectedConversationCurrentCwd(),
+    workspaceRootPath,
+    browserCwd: getRepoBrowserLaunchCwdPath(),
+    recentRoots: getRecentWorkspaceRoots(),
   });
-  return options;
 }
 
 function renderKnownCwdMenuItems(options, selectedPath) {

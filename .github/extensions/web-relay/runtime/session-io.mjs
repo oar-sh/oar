@@ -235,12 +235,23 @@ export function createSessionIoHelpers({ getSession, sleep, dbg = () => {} }) {
   }
 
   async function sendAndWaitWithHardTimeout(payload, timeoutMs) {
-    return Promise.race([
-      getSession().sendAndWait(payload, timeoutMs),
-      sleep(timeoutMs + 5_000).then(() => {
-        throw new Error(`Hard timeout after ${timeoutMs}ms waiting for sendAndWait`);
-      }),
-    ]);
+    // The loser timer is cancelled when the race settles: a fast turn must
+    // not leave a five-minute timer armed to fire a rejection into a settled
+    // race (bounded, but noisy and needlessly event-loop-pinning).
+    let timer = null;
+    try {
+      return await Promise.race([
+        getSession().sendAndWait(payload, timeoutMs),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Hard timeout after ${timeoutMs}ms waiting for sendAndWait`));
+          }, timeoutMs + 5_000);
+          if (typeof timer.unref === "function") timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async function sendWithBestEffortStreaming(payload, timeoutMs, onEvent, options = {}) {

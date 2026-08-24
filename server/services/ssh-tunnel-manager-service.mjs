@@ -4,6 +4,8 @@ import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 
+const MAX_CONSECUTIVE_FAST_RETRIES = 3;
+
 function toText(value) {
   return String(value || '').trim();
 }
@@ -36,6 +38,7 @@ function normalizeIdentityFile(rawValue) {
 export function normalizeSshTunnelConfig(rawConfig = {}, {
   defaultCommand = 'ssh',
   configBaseDir = process.cwd(),
+  pathImpl = path,
 } = {}) {
   const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
   const mode = normalizeTunnelMode(raw);
@@ -45,11 +48,12 @@ export function normalizeSshTunnelConfig(rawConfig = {}, {
   const remotePort = parsePositivePort(raw.remotePort);
   const remoteBindMode = normalizeRemoteBind(raw.remoteBind);
   const autoReclaimPort = raw.autoReclaimPort !== false;
+  const reclaimStaleSshSessions = raw.reclaimStaleSshSessions === true;
   const remoteCleanupCommand = toText(raw.remoteCleanupCommand);
   const identityFile = normalizeIdentityFile(raw.identityFile);
   const commandInput = toText(raw.command || defaultCommand);
   const command = commandInput.includes('/') || commandInput.includes('\\')
-    ? path.resolve(configBaseDir, commandInput)
+    ? pathImpl.resolve(configBaseDir, commandInput)
     : commandInput;
 
   const errors = [];
@@ -71,6 +75,7 @@ export function normalizeSshTunnelConfig(rawConfig = {}, {
     remotePort,
     remoteBindMode,
     autoReclaimPort,
+    reclaimStaleSshSessions,
     remoteCleanupCommand,
     identityFile,
     command,
@@ -111,15 +116,47 @@ function buildTunnelCommandArgs(tunnelConfig, localPort) {
 
 function buildCleanupCommand(tunnelConfig) {
   if (tunnelConfig.remoteCleanupCommand) return tunnelConfig.remoteCleanupCommand;
+  const port = tunnelConfig.remotePort;
+  // A stale `ssh -R` listener is owned by an sshd session that has dropped
+  // privileges, which sets dumpable=0 and leaves /proc/<pid>/fd owned by root.
+  // lsof and fuser therefore report nothing even though the socket's uid is
+  // ours, so the port state has to be read from /proc/net/tcp instead, and the
+  // command must exit non-zero when the port is still bound.
   return [
-    `if command -v lsof >/dev/null 2>&1; then`,
-    `  pids=$(lsof -tiTCP:${tunnelConfig.remotePort} -sTCP:LISTEN 2>/dev/null || true);`,
-    `elif command -v fuser >/dev/null 2>&1; then`,
-    `  pids=$(fuser -n tcp ${tunnelConfig.remotePort} 2>/dev/null || true);`,
+    `PORT=${port};`,
+    'port_bound() {',
+    '  if command -v ss >/dev/null 2>&1; then',
+    '    ss -ltn 2>/dev/null | grep -qE "[:.]$PORT[[:space:]]";',
+    '  else',
+    '    hex=$(printf "%04X" "$PORT");',
+    '    grep -qiE "^ *[0-9]+: [0-9A-F]+:$hex [0-9A-F]+:[0-9A-F]+ 0A" /proc/net/tcp /proc/net/tcp6 2>/dev/null;',
+    '  fi;',
+    '};',
+    'port_bound || exit 0;',
+    'if command -v lsof >/dev/null 2>&1; then',
+    '  pids=$(lsof -tiTCP:$PORT -sTCP:LISTEN 2>/dev/null || true);',
+    'elif command -v fuser >/dev/null 2>&1; then',
+    '  pids=$(fuser -n tcp "$PORT" 2>/dev/null || true);',
     'else',
     '  pids="";',
     'fi;',
-    'if [ -n "$pids" ]; then kill $pids 2>/dev/null || true; fi',
+    'if [ -n "$pids" ]; then kill $pids 2>/dev/null || true; sleep 1; fi;',
+    'port_bound || exit 0;',
+    ...(tunnelConfig.reclaimStaleSshSessions ? [
+      // Last resort: the holder is an invisible sshd forward session. Sweep our
+      // own childless `@notty` sessions, which is what `ssh -N -R` leaves
+      // behind; sessions running a shell, an IDE server or this very command
+      // all have children and are skipped.
+      'self=$PPID;',
+      'for p in $(pgrep -u "$(id -u)" -f "^sshd(-session)?: " 2>/dev/null); do',
+      '  [ "$p" = "$self" ] && continue;',
+      '  [ -n "$(pgrep -P "$p" 2>/dev/null)" ] && continue;',
+      '  kill "$p" 2>/dev/null || true;',
+      'done;',
+      'sleep 1;',
+      'port_bound || exit 0;',
+    ] : []),
+    'exit 3',
   ].join(' ');
 }
 
@@ -140,8 +177,9 @@ export function createSshTunnelManager({
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
   configBaseDir = process.cwd(),
+  pathImpl = path,
 } = {}) {
-  const tunnelConfig = normalizeSshTunnelConfig(rawTunnelConfig, { configBaseDir });
+  const tunnelConfig = normalizeSshTunnelConfig(rawTunnelConfig, { configBaseDir, pathImpl });
   const log = (msg) => logger.log(`${runtimeLogPrefix()}[ssh-tunnel] ${msg}`);
   const warn = (msg) => logger.warn(`${runtimeLogPrefix()}[ssh-tunnel] ${msg}`);
 
@@ -159,6 +197,7 @@ export function createSshTunnelManager({
     remotePort: tunnelConfig.remotePort || null,
     remoteBindMode: tunnelConfig.remoteBindMode,
     reconnectAttempts: 0,
+    fastRetries: 0,
     connectedSince: null,
     blocking: tunnelConfig.required && tunnelConfig.mode === 'managed',
     lastError: tunnelConfig.errors[0] || null,
@@ -224,8 +263,11 @@ export function createSshTunnelManager({
         proc.stdout.on('data', (d) => log(`cleanup stdout: ${d.toString().trim()}`));
         proc.stderr.on('data', (d) => log(`cleanup stderr: ${d.toString().trim()}`));
         proc.on('close', (code) => {
-          log(`Remote reclaim finished (code=${code ?? 'null'})`);
-          resolve(code === 0);
+          const freed = code === 0;
+          log(freed
+            ? `Remote reclaim finished: listen port ${tunnelConfig.remotePort} is free.`
+            : `Remote reclaim finished: listen port ${tunnelConfig.remotePort} is still held (code=${code ?? 'null'}).`);
+          resolve(freed);
         });
         proc.on('error', (error) => {
           log(`Remote reclaim error: ${error?.message || error}`);
@@ -262,6 +304,7 @@ export function createSshTunnelManager({
       state.connected = true;
       state.connectedSince = nowIso();
       state.lastError = null;
+      state.fastRetries = 0;
       updateBlockingState();
       log(`Tunnel up to ${tunnelConfig.user}@${tunnelConfig.host} remote port ${tunnelConfig.remotePort}`);
       emitStatus();
@@ -320,7 +363,12 @@ export function createSshTunnelManager({
         emitStatus();
         if (tunnelConfig.autoReclaimPort) {
           void reclaimRemoteTunnelPort().then((reclaimed) => {
-            scheduleReconnect(spawnTunnel, reclaimed ? 1_000 : null);
+            // Only retry immediately when the reclaim actually freed the port,
+            // and only a few times in a row, so a port we cannot free falls
+            // back to exponential backoff instead of respawning ssh every 1s.
+            const fastRetry = reclaimed && state.fastRetries < MAX_CONSECUTIVE_FAST_RETRIES;
+            state.fastRetries = fastRetry ? state.fastRetries + 1 : 0;
+            scheduleReconnect(spawnTunnel, fastRetry ? 1_000 : null);
           });
         } else {
           scheduleReconnect(spawnTunnel);

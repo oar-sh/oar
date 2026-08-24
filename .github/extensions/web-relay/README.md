@@ -162,7 +162,7 @@ node --test .github/extensions/web-relay/skills/*.test.mjs
 
 ### Relay won't start
 - Check `npm install` has been run
-- Verify Node.js 18+ is in PATH
+- Verify Node.js 24+ is in PATH
 - Check port 3333 is available (or use `"port"` in config)
 - See extension logs: `server/logs/ext-debug.log`
 

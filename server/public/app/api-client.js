@@ -1,8 +1,20 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform } from './store.js';
+
+// fetch() has no default timeout. Without one, a request issued while the app is
+// being backgrounded can hang indefinitely on a half-open mobile connection and
+// stall every caller awaiting it, including foreground recovery.
+const REQUEST_TIMEOUT_MS = 15000;
+// Session bootstrap, uploads and git operations do real work server-side, so they
+// get a ceiling that only catches a genuinely dead connection.
+const LONG_REQUEST_TIMEOUT_MS = 120000;
 
 let networkRequestsEnabled = true;
 let fetchOutageActive = false;
 let lastFetchOutageSignature = '';
+
+function requestTimeoutSignal(timeoutMs = REQUEST_TIMEOUT_MS) {
+  return AbortSignal.timeout?.(timeoutMs);
+}
 
 function toErrorMessage(error) {
   if (!error) return 'unknown error';
@@ -37,6 +49,7 @@ export async function apiFetch(url, opts = {}) {
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(),
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders(),
@@ -67,12 +80,16 @@ export async function verifyExistingSession(tokenCandidate = '') {
   }
   try {
     const requestStatus = async (headers = null) => {
-      const response = await fetch(`${BASE}/api/status`, headers ? { headers } : undefined);
+      const response = await fetch(`${BASE}/api/status`, {
+        signal: requestTimeoutSignal(),
+        ...(headers ? { headers } : {}),
+      });
       const payload = await response.json().catch(() => null);
       if (response.ok && payload) {
         updateWorkspaceRootHints(payload);
         setContextIndicatorMode(payload?.contextIndicatorMode);
         setCliOnline(!!payload?.cliOnline);
+        setCloudflaredTunnelState(payload?.cloudflaredTunnel || null);
         setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
         setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
         if (payload?.platform) setServerPlatform(payload.platform);
@@ -121,6 +138,7 @@ export async function verifyToken(token) {
   }
   try {
     const response = await fetch(`${BASE}/api/status`, {
+      signal: requestTimeoutSignal(),
       headers: { Authorization: `Bearer ${token}` },
     });
     const payload = await response.json().catch(() => null);
@@ -128,6 +146,7 @@ export async function verifyToken(token) {
       updateWorkspaceRootHints(payload);
       setContextIndicatorMode(payload?.contextIndicatorMode);
       setCliOnline(!!payload?.cliOnline);
+      setCloudflaredTunnelState(payload?.cloudflaredTunnel || null);
       setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
       setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
       if (payload?.platform) setServerPlatform(payload.platform);
@@ -156,6 +175,7 @@ export async function refreshWorkspaceRootHints() {
     updateWorkspaceRootHints(status);
     setContextIndicatorMode(status?.contextIndicatorMode);
     setCliOnline(!!status?.cliOnline);
+    setCloudflaredTunnelState(status?.cloudflaredTunnel || null);
     setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
     setRuntimeSessionBindingCount(status?.runtimeSessionBindingCount);
     if (status?.platform) setServerPlatform(status.platform);
@@ -212,6 +232,7 @@ export async function updateClaudeSettings({
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}/api/settings/claude`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -228,6 +249,43 @@ export async function updateClaudeSettings({
     return result;
   } catch (error) {
     noteFetchFailure('/api/settings/claude', error);
+    throw error;
+  }
+}
+
+export async function loadGrokSettings() {
+  return apiFetch('/api/settings/grok');
+}
+
+export async function updateGrokSettings({
+  enabled = undefined,
+  model = undefined,
+  enabledModels = undefined,
+} = {}) {
+  const payload = {};
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}/api/settings/grok`, {
+      signal: requestTimeoutSignal(),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = String(result?.error || `Failed to update Grok settings (${response.status})`).trim();
+      throw new Error(message);
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure('/api/settings/grok', error);
     throw error;
   }
 }
@@ -249,6 +307,7 @@ export async function updateOpenAISettings({
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}/api/settings/openai`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -265,6 +324,50 @@ export async function updateOpenAISettings({
     return result;
   } catch (error) {
     noteFetchFailure('/api/settings/openai', error);
+    throw error;
+  }
+}
+
+export async function loadCursorSettings() {
+  return apiFetch('/api/settings/cursor');
+}
+
+export async function updateCursorSettings({
+  apiKey = '',
+  model = undefined,
+  enabled = undefined,
+  enabledModels = undefined,
+  remove = false,
+} = {}) {
+  const payload = {
+    apiKey: String(apiKey || '').trim(),
+    remove: remove === true,
+  };
+  // Only send the model when the caller chose one: an enabled-models-only save
+  // must not reset the configured default model.
+  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}/api/settings/cursor`, {
+      signal: requestTimeoutSignal(),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = String(result?.error || `Failed to update Cursor settings (${response.status})`).trim();
+      throw new Error(message);
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure('/api/settings/cursor', error);
     throw error;
   }
 }
@@ -291,6 +394,17 @@ export async function updateTurnCeilingSetting(ceilingMinutes) {
   });
 }
 
+export async function loadBackgroundTaskTimeoutSetting() {
+  return apiFetch('/api/settings/background-task-timeout');
+}
+
+export async function updateBackgroundTaskTimeoutSetting(timeoutMinutes) {
+  return apiFetch('/api/settings/background-task-timeout', {
+    method: 'POST',
+    body: JSON.stringify({ timeoutMinutes: Number(timeoutMinutes) }),
+  });
+}
+
 export async function launchSessionWorker(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return null;
@@ -314,6 +428,39 @@ export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, roo
 
 export async function loadUsageSummary() {
   return apiFetch('/api/usage');
+}
+
+export async function loadCursorAllowanceSettings() {
+  return apiFetch('/api/settings/cursor-allowance');
+}
+
+export async function updateCursorAllowanceSettings(payload = {}) {
+  return apiFetch('/api/settings/cursor-allowance', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function loadCursorDashboardTokenSettings() {
+  return apiFetch('/api/settings/cursor-dashboard-token');
+}
+
+export async function updateCursorDashboardTokenSettings(payload = {}) {
+  return apiFetch('/api/settings/cursor-dashboard-token', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function loadGrokAllowanceSettings() {
+  return apiFetch('/api/settings/grok-allowance');
+}
+
+export async function updateGrokAllowanceSettings(payload = {}) {
+  return apiFetch('/api/settings/grok-allowance', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function loadContextSummary(convId = null) {
@@ -491,6 +638,7 @@ export async function loadSharedConversation(shareToken, options = {}) {
   const query = params.toString();
   try {
     const response = await fetch(`${BASE}/api/shared/${encodeURIComponent(token)}${query ? `?${query}` : ''}`, {
+      signal: requestTimeoutSignal(),
       headers: { 'Content-Type': 'application/json' },
     });
     const payload = await response.json().catch(() => null);
@@ -521,6 +669,7 @@ export async function reportSharedViewerPresence(shareToken, viewerId) {
   if (!token || !viewer) return { ok: false, status: 400, error: 'Missing shared presence payload' };
   try {
     const response = await fetch(`${BASE}/api/shared/${encodeURIComponent(token)}/presence`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ viewerId: viewer }),
@@ -552,6 +701,7 @@ export async function updateConversationDraft(id, draft = {}) {
   if (!convId) return null;
   try {
     const response = await fetch(`${BASE}/api/conversation/${convId}/draft`, {
+      signal: requestTimeoutSignal(),
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -625,11 +775,32 @@ export async function sendMessage(body) {
   return apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
 }
 
+// Raw fetch instead of apiFetch: a rejected bootstrap (bad CWD, unavailable
+// model) must surface the server's error message so the New Chat modal can
+// show it and keep the user's selection editable.
 export async function bootstrapConversationSession(body = {}) {
-  return apiFetch('/api/conversation/bootstrap', {
+  if (!areNetworkRequestsEnabled()) return null;
+  const response = await fetch(`${BASE}/api/conversation/bootstrap`, {
+    signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
     method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(),
+    },
     body: JSON.stringify(body || {}),
   });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = String(payload?.error || '').trim();
+    const error = new Error(message || `Could not start a new conversation session (HTTP ${response.status}).`);
+    // The conversation may already be committed (worker prestart failed after
+    // it was created); the caller needs the payload to open it instead of
+    // leaving an unreachable row behind.
+    error.status = response.status;
+    error.payload = payload || null;
+    throw error;
+  }
+  return payload;
 }
 
 export async function cancelConversationTurn(conversationId, body = {}) {
@@ -686,6 +857,7 @@ export async function answerRelayQuestionStructured(questionId, structuredAnswer
   const sessionId = String(sdkSessionId || '').trim();
   try {
     const response = await fetch(`${BASE}/api/relay-question/${encodeURIComponent(id)}/answer`, {
+      signal: requestTimeoutSignal(),
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ structuredAnswer, sdk_session_id: sessionId || undefined }),
@@ -723,6 +895,7 @@ export async function submitRelayBoardAction(boardId, actionId) {
 export async function uploadAttachment(item) {
   if (!item?.file) return null;
   const response = await fetch(`${BASE}/api/upload`, {
+    signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
     method: 'POST',
     headers: {
       ...authHeaders(),
@@ -784,6 +957,41 @@ export async function loadWorkspaceFilePreview(pathValue, conversationId = null)
   const convId = String(conversationId || '').trim();
   const suffix = convId ? `?conversationId=${encodeURIComponent(convId)}` : '';
   return apiFetch(`/api/files-preview/${encodedPath}${suffix}`);
+}
+
+export async function loadGitStatus(conversationId = null) {
+  const params = new URLSearchParams();
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  const suffix = params.toString();
+  return apiFetch(`/api/git/status${suffix ? `?${suffix}` : ''}`);
+}
+
+export async function loadGitDiff(pathValue, { conversationId = null, untracked = false } = {}) {
+  const path = String(pathValue || '').trim();
+  if (!path) return null;
+  const params = new URLSearchParams();
+  params.set('path', path);
+  if (untracked) params.set('untracked', '1');
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  return apiFetch(`/api/git/diff?${params.toString()}`);
+}
+
+export async function requestGitPull(conversationId = null) {
+  const params = new URLSearchParams();
+  const convId = String(conversationId || '').trim();
+  if (convId) params.set('conversationId', convId);
+  const suffix = params.toString();
+  const response = await fetch(`${BASE}/api/git/pull${suffix ? `?${suffix}` : ''}`, {
+    signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+  }).catch(() => null);
+  if (!response) return { ok: false, error: 'Network error' };
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, error: payload?.error || `Pull failed (${response.status})` };
+  return payload || { ok: false, error: 'Empty response' };
 }
 
 export async function loadDriveFilePreview(pathValue) {

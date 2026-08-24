@@ -7,9 +7,17 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
+import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
-import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
+import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
+import {
+  DEFAULT_CLAUDE_REASONING_EFFORTS,
+  resolveProviderReasoningEffort,
+  supportedReasoningEffortsForProviderModel,
+  withClaudeUltracodeTier,
+} from '../services/provider-reasoning-effort.mjs';
+import { mapUsageSnapshotRow, fetchUsageSummaryPromise } from '../services/usage-snapshot-helpers.mjs';
 import { readStoredClaudeContextUsage } from '../services/claude-context-usage.mjs';
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
@@ -34,6 +42,8 @@ import {
   CLAUDE_LONG_CONTEXT_LIMIT_TOKENS,
   CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN,
   isSafeClaudeModelId,
+  isSafeCursorModelId,
+  isSafeGrokModelId,
   isSafeProviderModelId,
 } from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
@@ -44,6 +54,13 @@ import {
   TURN_CEILING_STEP_MINUTES,
   parseTurnCeilingUpdate,
 } from '../../shared/turn-ceiling.mjs';
+import {
+  DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
+  BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
+  BACKGROUND_TASK_TIMEOUT_MIN_MINUTES,
+  BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
+  parseBackgroundTaskTimeoutUpdate,
+} from '../../shared/background-task-timeout.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -235,6 +252,61 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
   };
 }
 
+export function parseCursorSettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const remove = payload.remove === true;
+  const hasModel = Object.prototype.hasOwnProperty.call(payload, 'model');
+  const model = hasModel ? (String(payload.model || '').trim() || 'composer-2.5') : undefined;
+  const apiKey = String(payload.apiKey || '').trim();
+  const hasEnabled = typeof payload.enabled === 'boolean';
+  const hasEnabledModels = Array.isArray(payload.enabledModels);
+  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasEnabledModels) {
+    return { ok: false, error: 'No Cursor settings update provided' };
+  }
+  if (hasModel && !isSafeCursorModelId(model)) {
+    return { ok: false, error: 'Invalid Cursor model ID' };
+  }
+  if (remove) {
+    return {
+      ok: true,
+      remove: true,
+      apiKey: '',
+      ...(hasModel ? { model } : {}),
+      enabled: false,
+    };
+  }
+  return {
+    ok: true,
+    remove: false,
+    apiKey,
+    ...(hasModel ? { model } : {}),
+    ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+    enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
+  };
+}
+
+export function parseGrokSettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const hasEnabled = typeof payload.enabled === 'boolean';
+  const hasModel = Object.prototype.hasOwnProperty.call(payload, 'model');
+  const model = hasModel ? (String(payload.model || '').trim() || 'grok-4.5') : undefined;
+  const hasModels = Array.isArray(payload.models);
+  const hasEnabledModels = Array.isArray(payload.enabledModels);
+  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels) {
+    return { ok: false, error: 'No Grok settings update provided' };
+  }
+  if (hasModel && !isSafeGrokModelId(model)) {
+    return { ok: false, error: 'Invalid Grok model ID' };
+  }
+  return {
+    ok: true,
+    ...(hasEnabled ? { enabled: payload.enabled } : {}),
+    ...(hasModel ? { model } : {}),
+    ...(hasModels ? { models: payload.models } : {}),
+    ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+  };
+}
+
 export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSettings = {}) {
   const configured = claudeSettings?.enabled === true;
   const model = String(claudeSettings?.model || '').trim();
@@ -268,7 +340,7 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
   const effortsByModel = claudeSettings?.effortsByModel && typeof claudeSettings.effortsByModel === 'object'
     ? claudeSettings.effortsByModel
     : {};
-  const defaultClaudeEfforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+  const defaultClaudeEfforts = [...DEFAULT_CLAUDE_REASONING_EFFORTS];
   const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
   const providersByModel = { ...(modelState?.providersByModel || {}) };
   for (const claudeModel of claudeBaseModels) {
@@ -278,8 +350,10 @@ export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSetti
     const effortsForModel = Array.isArray(effortsByModel[lowerKey]) && effortsByModel[lowerKey].length
       ? effortsByModel[lowerKey]
       : effortsByModel[`${lowerKey}[1m]`];
+    // Idempotent augmentation: getClaudeProviderSettings already derives the
+    // ultracode tier, but this function is also fed raw effort maps.
     const claudeEfforts = Array.isArray(effortsForModel) && effortsForModel.length
-      ? effortsForModel
+      ? withClaudeUltracodeTier(effortsForModel)
       : defaultClaudeEfforts;
     claudeReasoningByModel[lowerKey] = [...claudeEfforts];
     if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
@@ -375,11 +449,169 @@ export function buildModelCatalogWithOpenAIProvider(modelState = {}, openAISetti
   };
 }
 
+export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSettings = {}) {
+  const configured = cursorSettings?.enabled === true;
+  const model = String(cursorSettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const baseModels = new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+  const cursorModelList = Array.isArray(cursorSettings?.models)
+    ? cursorSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const cursorModels = [];
+  const seenCursorModels = new Set();
+  for (const cursorModelId of [model, ...cursorModelList]) {
+    const lowerId = cursorModelId.toLowerCase();
+    if (seenCursorModels.has(lowerId)) continue;
+    seenCursorModels.add(lowerId);
+    cursorModels.push(cursorModelId);
+  }
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), ...cursorModels]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const cursorReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  const cursorEffortsByModel = cursorSettings?.effortsByModel && typeof cursorSettings.effortsByModel === 'object'
+    ? cursorSettings.effortsByModel
+    : {};
+  const cursorReasoningOffByModel = cursorSettings?.reasoningOffByModel && typeof cursorSettings.reasoningOffByModel === 'object'
+    ? cursorSettings.reasoningOffByModel
+    : {};
+  // Models that cannot be told to stop reasoning still expose 'none'; it means
+  // "model default" there, and the composer labels it that way.
+  const cursorReasoningDefaultOnly = {};
+  for (const cursorModel of cursorModels) {
+    const providersKey = String(cursorModel || '').trim();
+    if (!providersKey) continue;
+    const lowerKey = providersKey.toLowerCase();
+    // Discovered effort tiers ('none' = model default) drive the composer;
+    // models with no effort parameter stay at 'none' only.
+    const cursorEfforts = Array.isArray(cursorEffortsByModel[lowerKey]) && cursorEffortsByModel[lowerKey].length
+      ? cursorEffortsByModel[lowerKey]
+      : ['none'];
+    cursorReasoningByModel[lowerKey] = [...cursorEfforts];
+    // Only claim a model cannot turn reasoning off where discovery actually said
+    // so. Before the first refresh on an upgraded install there is no map at
+    // all, and a configured model discovery never saw has no entry in it —
+    // asserting "unsupported" in either case would relabel a working off switch.
+    if (
+      cursorSettings?.reasoningOffDiscovered === true
+      && Object.prototype.hasOwnProperty.call(cursorReasoningOffByModel, lowerKey)
+    ) {
+      cursorReasoningDefaultOnly[lowerKey] = cursorReasoningOffByModel[lowerKey] !== true;
+    }
+    if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
+      reasoningByModel[lowerKey] = [...cursorEfforts];
+    }
+    const existingProviders = Array.isArray(providersByModel[providersKey])
+      ? providersByModel[providersKey]
+      : (Array.isArray(providersByModel[lowerKey])
+          ? providersByModel[lowerKey]
+          : (modelMetadataByModel[providersKey]?.provider ? [modelMetadataByModel[providersKey].provider] : []));
+    providersByModel[providersKey] = Array.from(new Set([
+      ...existingProviders,
+      ...(baseModels.has(lowerKey) ? ['github-copilot'] : []),
+      'cursor',
+    ]));
+    modelMetadataByModel[providersKey] = {
+      ...(modelMetadataByModel[providersKey] || {}),
+      provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'cursor'),
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      cursor: cursorReasoningByModel,
+    },
+    reasoningOffUnsupportedByProvider: {
+      ...(modelState?.reasoningOffUnsupportedByProvider || {}),
+      cursor: cursorReasoningDefaultOnly,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
+export function buildModelCatalogWithGrokProvider(modelState = {}, grokSettings = {}) {
+  const configured = grokSettings?.enabled === true;
+  const model = String(grokSettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const baseModels = new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+  const grokModelList = Array.isArray(grokSettings?.models)
+    ? grokSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const grokModels = [];
+  const seenGrokModels = new Set();
+  for (const grokModelId of [model, ...grokModelList]) {
+    const lowerId = grokModelId.toLowerCase();
+    if (seenGrokModels.has(lowerId)) continue;
+    seenGrokModels.add(lowerId);
+    grokModels.push(grokModelId);
+  }
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), ...grokModels]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const grokReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  const grokEffortsByModel = grokSettings?.effortsByModel && typeof grokSettings.effortsByModel === 'object'
+    ? grokSettings.effortsByModel
+    : {};
+  for (const grokModel of grokModels) {
+    const providersKey = String(grokModel || '').trim();
+    if (!providersKey) continue;
+    const lowerKey = providersKey.toLowerCase();
+    const grokEfforts = Array.isArray(grokEffortsByModel[lowerKey]) && grokEffortsByModel[lowerKey].length
+      ? grokEffortsByModel[lowerKey]
+      : ['none', 'low', 'medium', 'high'];
+    grokReasoningByModel[lowerKey] = [...grokEfforts];
+    if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
+      reasoningByModel[lowerKey] = [...grokEfforts];
+    }
+    const existingProviders = Array.isArray(providersByModel[providersKey])
+      ? providersByModel[providersKey]
+      : (Array.isArray(providersByModel[lowerKey])
+          ? providersByModel[lowerKey]
+          : (modelMetadataByModel[providersKey]?.provider ? [modelMetadataByModel[providersKey].provider] : []));
+    providersByModel[providersKey] = Array.from(new Set([
+      ...existingProviders,
+      ...(baseModels.has(lowerKey) ? ['github-copilot'] : []),
+      'grok',
+    ]));
+    modelMetadataByModel[providersKey] = {
+      ...(modelMetadataByModel[providersKey] || {}),
+      provider: modelMetadataByModel[providersKey]?.provider || (baseModels.has(lowerKey) ? 'github-copilot' : 'grok'),
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      grok: grokReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude' || normalized === 'claude-agent-sdk' || normalized === 'anthropic') return 'claude';
+  if (normalized === 'cursor') return 'cursor';
+  if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }
@@ -387,22 +619,6 @@ function normalizeRequestedProviderType(value = '') {
 function isOpenAIImageModelId(model = '') {
   const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
   return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
-}
-
-export function resolveOpenAISessionModel({
-  requestedModel = '',
-  configuredModel = 'gpt-4o',
-  availableModels = [],
-} = {}) {
-  const requested = String(requestedModel || '').trim();
-  const fallback = String(configuredModel || '').trim() || 'gpt-4o';
-  const available = new Set(
-    (Array.isArray(availableModels) ? availableModels : [])
-      .map((value) => String(value || '').trim())
-      .filter(Boolean),
-  );
-  if (requested === fallback || available.has(requested)) return requested;
-  return fallback;
 }
 
 function runHostSuspendToRam() {
@@ -693,6 +909,69 @@ export function hasConversationDraftVersionConflict({
   return normalizeOptionalIsoTimestamp(existingDraftUpdatedAt) !== normalizeOptionalIsoTimestamp(baseDraftUpdatedAt);
 }
 
+export const MAX_CONVERSATION_DRAFT_ATTACHMENTS = 6;
+export const DRAFT_UPLOAD_MESSAGE_ID = '__draft__';
+
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+
+export function parseDraftAttachmentsColumn(value) {
+  if (Array.isArray(value)) return value;
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Validates a client-supplied draft attachment list. Every entry must reference
+ * a blob that already exists, so a draft can never point at content the server
+ * does not hold. Returns `{ ok:false, error }` instead of throwing so the route
+ * can answer with a 400.
+ */
+export function normalizeDraftAttachmentsInput(value, {
+  lookupUploadFile,
+  max = MAX_CONVERSATION_DRAFT_ATTACHMENTS,
+} = {}) {
+  if (value === undefined) return { ok: true, provided: false, attachments: [] };
+  if (value === null) return { ok: true, provided: true, attachments: [] };
+  if (!Array.isArray(value)) return { ok: false, error: 'draftAttachments must be an array' };
+  if (value.length > max) return { ok: false, error: `At most ${max} draft attachments are allowed` };
+
+  const seen = new Set();
+  const attachments = [];
+  for (const entry of value) {
+    const sha256 = String(entry?.sha256 || '').trim().toLowerCase();
+    if (!SHA256_PATTERN.test(sha256)) return { ok: false, error: 'Invalid draft attachment id' };
+    if (seen.has(sha256)) continue;
+    seen.add(sha256);
+
+    const row = typeof lookupUploadFile === 'function' ? lookupUploadFile(sha256) : null;
+    if (!row) return { ok: false, error: 'Unknown draft attachment' };
+
+    attachments.push({
+      sha256,
+      name: String(entry?.name || row.original_name || '').trim().slice(0, 255) || `upload-${sha256.slice(0, 12)}`,
+      type: String(entry?.type || row.mime_type || 'application/octet-stream').trim().toLowerCase().slice(0, 127),
+      size: Math.max(0, Number(entry?.size ?? row.size_bytes ?? 0) || 0),
+    });
+  }
+
+  return { ok: true, provided: true, attachments };
+}
+
+export function diffDraftAttachmentHashes(previous = [], next = []) {
+  const before = new Set(previous.map((item) => String(item?.sha256 || item || '').trim().toLowerCase()).filter(Boolean));
+  const after = new Set(next.map((item) => String(item?.sha256 || item || '').trim().toLowerCase()).filter(Boolean));
+  return {
+    added: [...after].filter((sha) => !before.has(sha)),
+    removed: [...before].filter((sha) => !after.has(sha)),
+  };
+}
+
 function resolveConversationPreferences(row, {
   supportedRelayModes = [],
   defaultRelayMode = FALLBACK_RELAY_MODE,
@@ -961,8 +1240,22 @@ export function buildConversationSessionRootPayload({
   claudeNativeSessionId = '',
   workspaceRootPath = '',
   resolveClaudeSessionRoot = null,
+  resolveCursorSessionRoot = null,
 } = {}) {
   const sid = String(sdkSessionId || '').trim() || String(conversationId || '').trim();
+  // Cursor sessions have no ~/.copilot/session-state entry either — their
+  // on-disk footprint is the worker's per-session agent store, created on the
+  // first turn.
+  if (String(providerType || '').trim().toLowerCase() === 'cursor') {
+    if (!sid || typeof resolveCursorSessionRoot !== 'function') return null;
+    const cursorRoot = resolveCursorSessionRoot({ sdkSessionId: sid });
+    if (!cursorRoot?.sessionRootPath) return null;
+    return {
+      sdkSessionId: sid,
+      sessionRootPath: cursorRoot.sessionRootPath,
+      sessionRootName: cursorRoot.sessionRootName || 'Session',
+    };
+  }
   // Claude sessions have no ~/.copilot/session-state entry — only the Copilot
   // CLI creates those — so they resolve against the Agent SDK's own layout and
   // never fall through to the branch below.
@@ -1359,6 +1652,7 @@ export function buildConversationMessages({
   relayActivitiesByMessageId = new Map(),
   relayThoughtsByMessageId = new Map(),
   subagentRunsByMessageId = new Map(),
+  workflowRunsByMessageId = new Map(),
   responseMessageToSourceId = new Map(),
   queueRows = [],
   usageByResponseMessageId = new Map(),
@@ -1374,11 +1668,16 @@ export function buildConversationMessages({
         const sourceMessageId = message?.role === 'assistant'
           ? (responseMessageToSourceId.get(id) || undefined)
           : undefined;
-        const queueRow = sourceMessageId ? queueRowsById.get(sourceMessageId) : null;
+        // A user row's queue entry shares its id; assistant rows reach the same
+        // entry through the response mapping. Both need it for the effort tag.
+        const queueRow = sourceMessageId
+          ? queueRowsById.get(sourceMessageId)
+          : (message?.role === 'user' ? queueRowsById.get(id) : null);
         return {
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
           thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
           subagentRuns: message?.role === 'assistant' ? (subagentRunsByMessageId.get(id) || []) : [],
+          workflowRuns: message?.role === 'assistant' ? (workflowRunsByMessageId.get(id) || []) : [],
           id,
           role: message?.role,
           text: stripRelayPromptContext(message?.text, message?.mode),
@@ -1393,6 +1692,7 @@ export function buildConversationMessages({
           hiddenFromShares: Number(message?.hidden_from_shares || 0) === 1,
           timestamp: message?.timestamp,
           sourceMessageId,
+          executedProvider: message?.executed_provider || message?.executedProvider || undefined,
         };
       })
     : [];
@@ -1401,7 +1701,10 @@ export function buildConversationMessages({
     const sourceMessageId = message?.role === 'assistant'
       ? (responseMessageToSourceId.get(id) || message?.sourceMessageId || undefined)
       : message?.sourceMessageId;
-    const queueRow = sourceMessageId ? queueRowsById.get(String(sourceMessageId || '').trim()) : null;
+    // As in the db branch: a user row's queue entry is keyed by its own id.
+    const queueRow = sourceMessageId
+      ? queueRowsById.get(String(sourceMessageId || '').trim())
+      : (message?.role === 'user' ? queueRowsById.get(id) : null);
     return {
       ...message,
       id,
@@ -1415,6 +1718,9 @@ export function buildConversationMessages({
       subagentRuns: (Array.isArray(message?.subagentRuns) && message.subagentRuns.length)
         ? message.subagentRuns
         : (id ? (subagentRunsByMessageId.get(id) || []) : []),
+      workflowRuns: (Array.isArray(message?.workflowRuns) && message.workflowRuns.length)
+        ? message.workflowRuns
+        : (id ? (workflowRunsByMessageId.get(id) || []) : []),
       text: stripRelayPromptContext(message?.text, message?.mode),
       sourceMessageId,
       modelOrigin: message?.modelOrigin
@@ -1558,9 +1864,11 @@ export function registerSessionsRoutes(app, deps) {
     relayActivityForResponse,
     relayThoughtsForResponse,
     subagentRunsForResponse,
+    workflowRunsForResponse,
     buildContextResponseText,
     readContextFromSessionEvents,
     inFlightStateForConversation,
+    backgroundTaskStore,
     createCompactedConversation,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
@@ -1582,6 +1890,12 @@ export function registerSessionsRoutes(app, deps) {
     getClaudeProviderSettings = () => ({ configured: false, enabled: false, model: 'claude-sonnet-5', models: [] }),
     setClaudeProviderSettings = () => ({ ok: false, error: 'Claude settings are unavailable' }),
     refreshClaudeProviderModels = async () => ({ ok: false, models: [], error: 'Claude model discovery is unavailable' }),
+    getCursorProviderSettings = () => ({ configured: false, enabled: false, model: 'composer-2.5', models: [] }),
+    setCursorProviderSettings = () => ({ ok: false, error: 'Cursor settings are unavailable' }),
+    refreshCursorProviderModels = async () => ({ ok: false, models: [], error: 'Cursor model discovery is unavailable' }),
+    getGrokProviderSettings = () => ({ configured: false, enabled: false, model: 'grok-4.5', models: [] }),
+    setGrokProviderSettings = () => ({ ok: false, error: 'Grok settings are unavailable' }),
+    refreshGrokProviderModels = async () => ({ ok: false, models: [], error: 'Grok model discovery is unavailable' }),
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -1604,6 +1918,24 @@ export function registerSessionsRoutes(app, deps) {
     touchCli,
     markCliOffline,
     fetchUsageSummary,
+    // Optional personal-scope billing detail; absent in tests and whenever the
+    // token cannot read billing, in which case the Copilot card degrades to its
+    // quota meters alone.
+    fetchCopilotBillingUsage = null,
+    // Optional live Grok subscription quota (weekly SuperGrok %); absent in
+    // tests and when the host CLI is not logged in, in which case the Grok
+    // card degrades to the local estimated view.
+    fetchGrokBillingUsage = null,
+    // Optional live Cursor plan quota (dashboard session token); same
+    // degradation contract as the Grok fetcher.
+    fetchCursorDashboardUsage = null,
+    getCursorDashboardTokenSettings = () => ({ configured: false }),
+    setCursorDashboardTokenSettings = () => ({ ok: false, error: 'Cursor dashboard token settings are unavailable' }),
+    planUsageService = null,
+    getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
+    setCursorPlanAllowanceSettings = () => ({ ok: false, error: 'Cursor allowance settings are unavailable' }),
+    getGrokPlanAllowanceSettings = () => ({ monthlyUsd: null, resetDay: 1 }),
+    setGrokPlanAllowanceSettings = () => ({ ok: false, error: 'Grok allowance settings are unavailable' }),
     sessionHistoryRefreshService,
     sdkSessionImportService,
     ensureRuntimeSessionBinding,
@@ -1628,8 +1960,11 @@ export function registerSessionsRoutes(app, deps) {
     sessionWorkerStopOverrides = null,
     resolveSessionStateRoot,
     resolveClaudeSessionRoot = null,
+    resolveCursorSessionRoot = null,
     getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
+    getBackgroundTaskTimeoutMinutes = () => DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
+    setBackgroundTaskTimeoutMinutes = () => ({ ok: false, error: 'Background task timeout settings are unavailable' }),
     markSharedViewerPresence,
     getSharedWatcherCount,
     statusEventService,
@@ -1638,6 +1973,28 @@ export function registerSessionsRoutes(app, deps) {
     uploadPathForSha,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
+
+  /**
+   * Drops draft references to the given blobs and reclaims any that no longer
+   * have a reference at all. Blobs still referenced by a sent message survive.
+   *
+   * Only blobs that actually held a draft reference for this conversation are
+   * considered: a blob with no references at all is either owned by someone else
+   * or still mid-upload, and must not be collected here.
+   */
+  function releaseDraftUploadReferences(conversationId, hashes = []) {
+    const list = [...new Set((hashes || []).map((sha) => String(sha || '').trim().toLowerCase()).filter(Boolean))];
+    if (!list.length) return;
+    const released = [];
+    for (const sha256 of list) {
+      const result = stmts.deleteDraftUploadRef?.run?.(conversationId, sha256);
+      if (Number(result?.changes || 0) > 0) released.push(sha256);
+    }
+    if (released.length && typeof deleteOrphanedUploads === 'function') {
+      deleteOrphanedUploads(released);
+    }
+  }
+
   const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
   const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
@@ -1733,9 +2090,15 @@ export function registerSessionsRoutes(app, deps) {
 
   // Layer every enabled provider's models onto the base Copilot catalog.
   function buildModelCatalogWithProviders(modelState, openAISettings = getOpenAIProviderSettings()) {
-    return buildModelCatalogWithClaudeProvider(
-      buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
-      getClaudeProviderSettings(),
+    return buildModelCatalogWithGrokProvider(
+      buildModelCatalogWithCursorProvider(
+        buildModelCatalogWithClaudeProvider(
+          buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
+          getClaudeProviderSettings(),
+        ),
+        getCursorProviderSettings(),
+      ),
+      getGrokProviderSettings(),
     );
   }
 
@@ -1969,6 +2332,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
     );
+    const workflowRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -1986,6 +2354,7 @@ export function registerSessionsRoutes(app, deps) {
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
+      workflowRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -2138,6 +2507,7 @@ export function registerSessionsRoutes(app, deps) {
         preferredModel: preferences.preferredModel,
         preferredReasoningEffort: preferences.preferredReasoningEffort,
         draftText: String(r.draft_text || ''),
+        draftAttachments: parseDraftAttachmentsColumn(r.draft_attachments),
         draftUpdatedAt: r.draft_updated_at || null,
         draftUpdatedByClientId: r.draft_updated_by_client_id || null,
       };
@@ -2445,9 +2815,13 @@ export function registerSessionsRoutes(app, deps) {
       || stmts.getRuntimeSessionByConversation.get(lookupId)
       || null;
     const copilotSessionId = String(runtimeSessionBySdkSessionId?.sdk_session_id || runtimeSession?.sdk_session_id || '').trim() || null;
-    const isClaude = String(runtimeSession?.provider_type || 'github').trim().toLowerCase() === 'claude';
+    const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+    // The cursor and grok workers post the same Claude-shaped usage blob, so
+    // all three providers share the stored reader.
+    const usesStoredContextUsage = providerType === 'claude' || providerType === 'cursor'
+      || providerType === 'grok';
 
-    const parsed = isClaude
+    const parsed = usesStoredContextUsage
       ? (() => {
         const stored = readStoredClaudeContextUsage(runtimeSession);
         return {
@@ -2456,7 +2830,7 @@ export function registerSessionsRoutes(app, deps) {
           eventsPath: null,
           error: stored.snapshot
             ? null
-            : 'No context data captured yet for this Claude session; it is recorded when a turn completes.',
+            : 'No context data captured yet for this session; it is recorded when a turn completes.',
         };
       })()
       : {
@@ -2471,7 +2845,7 @@ export function registerSessionsRoutes(app, deps) {
       conversationId: lookupId,
       runtimeSessionId: runtimeSession?.id || null,
       copilotSessionId,
-      providerType: isClaude ? 'claude' : 'github',
+      providerType: usesStoredContextUsage ? providerType : 'github',
       snapshot: parsed.snapshot || null,
       contextUsage: buildContextUsageView({
         snapshot: parsed.snapshot,
@@ -2626,6 +3000,7 @@ export function registerSessionsRoutes(app, deps) {
       claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
       workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
       resolveClaudeSessionRoot,
+      resolveCursorSessionRoot,
     });
     const dbMessages = stmts.getMessages.all(conversationId);
     const queueRows = db.prepare(`
@@ -2653,6 +3028,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
     );
+    const workflowRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conversationId) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -2667,6 +3047,7 @@ export function registerSessionsRoutes(app, deps) {
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
+      workflowRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -2718,6 +3099,7 @@ export function registerSessionsRoutes(app, deps) {
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,
       draftText: String(conv.draft_text || ''),
+      draftAttachments: parseDraftAttachmentsColumn(conv.draft_attachments),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
@@ -2760,6 +3142,24 @@ export function registerSessionsRoutes(app, deps) {
       shareUrl: buildShareUrl(req, token),
       path: `${String(remotePath || '').replace(/\/+$/, '')}/shared/${token}`.replace(/\/{2,}/g, '/'),
     });
+  });
+
+  // Revoke every active share for a conversation. Without this a share link was
+  // permanent (revoked_at existed in the schema and was checked on read, but no
+  // route ever set it), so a leaked URL could never be invalidated.
+  app.delete('/api/conversation/:id/share', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const share = stmts.getConversationShareByConversationId?.get(conversationId) || null;
+    if (!share?.token) {
+      return res.status(404).json({ error: 'No active share to revoke' });
+    }
+    const now = new Date().toISOString();
+    const result = stmts.revokeConversationSharesByConversationId?.run(now, conversationId);
+    // Drop any live shared viewers so they lose access immediately.
+    io.emit('share_revoked', { conversationId });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, conversationId, revokedAt: now, revokedCount: Number(result?.changes || 0) });
   });
 
   app.get('/api/shared/:token', (req, res) => {
@@ -2881,9 +3281,11 @@ export function registerSessionsRoutes(app, deps) {
     if (!file) return res.status(404).json({ error: 'Shared attachment not found' });
     const filePath = uploadPathForSha(sha256);
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
-    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+    // Unauthenticated share viewers: neutralize executable types (HTML/SVG),
+    // force nosniff + sandbox so an attachment can't run as script on this origin.
     res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    applySafeServedContentHeaders(res, file.mime_type, { fileName: file.name || file.file_name || '' });
     const stream = fs.createReadStream(filePath);
     stream.on('error', () => {
       if (!res.headersSent) {
@@ -2934,9 +3336,9 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(404).json({ error: 'Shared attachment not found' });
     }
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Shared attachment not found' });
-    res.setHeader('Content-Type', attachment.type || 'application/octet-stream');
     res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    applySafeServedContentHeaders(res, attachment.type);
     const stream = fs.createReadStream(filePath);
     stream.on('error', () => {
       if (!res.headersSent) {
@@ -2994,6 +3396,7 @@ export function registerSessionsRoutes(app, deps) {
       claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
       workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
       resolveClaudeSessionRoot,
+      resolveCursorSessionRoot,
     });
     const dbMessages = stmts.getMessages.all(resolvedConversationId);
     const queueRows = db.prepare(`
@@ -3021,6 +3424,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, subagentRunsForResponse ? subagentRunsForResponse(m.id) : []]),
     );
+    const workflowRunsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -3035,6 +3443,7 @@ export function registerSessionsRoutes(app, deps) {
       relayActivitiesByMessageId,
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
+      workflowRunsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -3082,10 +3491,12 @@ export function registerSessionsRoutes(app, deps) {
       updatedAt: conv.updated_at,
       sessionUsageSummary,
       inFlight,
+      backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,
       draftText: String(conv.draft_text || ''),
+      draftAttachments: parseDraftAttachmentsColumn(conv.draft_attachments),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       messages: history.messages,
@@ -3246,6 +3657,17 @@ export function registerSessionsRoutes(app, deps) {
     const now = new Date().toISOString();
     const draftText = normalizeConversationDraftText(req.body?.draftText ?? req.body?.text);
     const persistedDraftText = draftText || null;
+
+    const attachmentsInput = normalizeDraftAttachmentsInput(req.body?.draftAttachments, {
+      lookupUploadFile: (sha256) => stmts.getUploadFile?.get?.(sha256) || null,
+    });
+    if (!attachmentsInput.ok) {
+      return res.status(400).json({ error: attachmentsInput.error });
+    }
+
+    const previousAttachments = parseDraftAttachmentsColumn(existing.draft_attachments);
+    const nextAttachments = attachmentsInput.provided ? attachmentsInput.attachments : previousAttachments;
+
     if (typeof stmts.updateConvDraft?.run === 'function') {
       stmts.updateConvDraft.run(persistedDraftText, now, senderClientId, conversationId);
     } else {
@@ -3255,9 +3677,34 @@ export function registerSessionsRoutes(app, deps) {
         WHERE id = ?
       `).run(persistedDraftText, now, senderClientId, conversationId);
     }
+
+    if (attachmentsInput.provided) {
+      const serialized = nextAttachments.length ? JSON.stringify(nextAttachments) : null;
+      if (typeof stmts.updateConvDraftAttachments?.run === 'function') {
+        stmts.updateConvDraftAttachments.run(serialized, now, senderClientId, conversationId);
+      } else {
+        db.prepare(`
+          UPDATE conversations
+          SET draft_attachments = ?, draft_updated_at = ?, draft_updated_by_client_id = ?
+          WHERE id = ?
+        `).run(serialized, now, senderClientId, conversationId);
+      }
+
+      // Keep upload references in step with the draft so blobs stay alive while
+      // referenced and become collectable the moment they are not.
+      const { added, removed } = diffDraftAttachmentHashes(previousAttachments, nextAttachments);
+      for (const sha256 of added) {
+        stmts.insertUploadRef?.run?.(sha256, conversationId, DRAFT_UPLOAD_MESSAGE_ID, now);
+      }
+      if (removed.length && typeof releaseDraftUploadReferences === 'function') {
+        releaseDraftUploadReferences(conversationId, removed);
+      }
+    }
+
     const payload = {
       conversationId,
       draftText: persistedDraftText || '',
+      draftAttachments: nextAttachments,
       draftUpdatedAt: now,
       draftUpdatedByClientId: senderClientId,
       senderClientId,
@@ -3659,7 +4106,7 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.post('/api/conversation/bootstrap', auth, async (req, res) => {
-    ensureSessionId(req, res);
+    const clientSessionId = String(ensureSessionId(req, res) || '').trim();
     const now = new Date().toISOString();
     let conversationId = '';
     for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -3691,18 +4138,6 @@ export function registerSessionsRoutes(app, deps) {
       String(openAISettings?.model || '').trim(),
       ...(Array.isArray(openAISettings?.models) ? openAISettings.models : []),
     ].map((value) => String(value || '').trim()).filter(Boolean));
-    if (
-      (requestedProviderType === 'openai' || requestedProviderType === 'openai-image')
-      && requestedBootstrapModel
-      && requestedBootstrapModel.toLowerCase() !== 'auto'
-      && !availableOpenAIModels.has(requestedBootstrapModel)
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: `OpenAI model "${requestedBootstrapModel}" is not available`,
-        code: 'OPENAI_MODEL_UNAVAILABLE',
-      });
-    }
     const claudeSettings = getClaudeProviderSettings();
     // Include base ids of "[1m]" long-context variants: the composer and the
     // new-conversation modal only ever offer base ids (the 1M tier is picked
@@ -3713,25 +4148,28 @@ export function registerSessionsRoutes(app, deps) {
     ].map((value) => String(value || '').trim()).filter(Boolean)
       .flatMap((value) => [value, value.replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '')])
       .filter(Boolean));
-    if (
-      requestedProviderType === 'claude'
-      && requestedBootstrapModel
-      && requestedBootstrapModel.toLowerCase() !== 'auto'
-      && !availableClaudeModels.has(requestedBootstrapModel)
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: `Claude model "${requestedBootstrapModel}" is not available`,
-        code: 'CLAUDE_MODEL_UNAVAILABLE',
-      });
-    }
+    const cursorSettings = getCursorProviderSettings();
+    // Kept in the provider's own casing: the canonical id is what gets bound,
+    // persisted and echoed back, so a "Grok-4.5" request cannot drift into a
+    // different string than the one the worker later sends to the SDK.
+    const cursorModelCatalog = [
+      String(cursorSettings?.model || '').trim(),
+      ...(Array.isArray(cursorSettings?.models) ? cursorSettings.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    const availableCursorModels = new Set(cursorModelCatalog.map((value) => value.toLowerCase()));
+    const grokSettings = getGrokProviderSettings();
+    const grokModelCatalog = [
+      String(grokSettings?.model || '').trim(),
+      ...(Array.isArray(grokSettings?.models) ? grokSettings.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    const availableGrokModels = new Set(grokModelCatalog.map((value) => value.toLowerCase()));
     const useOpenAIProvider = requestedProviderType === 'openai'
       || requestedProviderType === 'openai-image'
       || (
         requestedProviderType === ''
         && requestedBootstrapModel
         && requestedBootstrapModel.toLowerCase() !== 'auto'
-        && availableOpenAIModels.has(requestedBootstrapModel)
+        && isProviderModelAvailable(requestedBootstrapModel, availableOpenAIModels)
       );
     const useClaudeProvider = !useOpenAIProvider && (
       requestedProviderType === 'claude'
@@ -3739,9 +4177,84 @@ export function registerSessionsRoutes(app, deps) {
         requestedProviderType === ''
         && requestedBootstrapModel
         && requestedBootstrapModel.toLowerCase() !== 'auto'
-        && availableClaudeModels.has(requestedBootstrapModel)
+        && isProviderModelAvailable(requestedBootstrapModel, availableClaudeModels)
       )
     );
+    const useCursorProvider = !useOpenAIProvider && !useClaudeProvider && (
+      requestedProviderType === 'cursor'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableCursorModels.has(requestedBootstrapModel.toLowerCase())
+      )
+    );
+    const useGrokProvider = !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && (
+      requestedProviderType === 'grok'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableGrokModels.has(requestedBootstrapModel.toLowerCase())
+      )
+    );
+    // Managed providers resolve the request against their own catalog only.
+    // Routing it through the merged Copilot catalog first (resolveBootstrapModelSelection)
+    // silently substituted that catalog's current model whenever the requested
+    // id was missing from it, which is how a Cursor/Grok pick could come back
+    // bound to Opus.
+    // With no model in the request the shared catalog's current model is still
+    // honoured when the provider offers it, which is what callers that omit
+    // `model` relied on before.
+    const providerRequestedModel = (availableModels) => (
+      requestedBootstrapModel
+      || (isProviderModelAvailable(catalogSelectedModel, availableModels) ? catalogSelectedModel : '')
+    );
+    const providerModelSelection = useOpenAIProvider
+      ? resolveProviderModelSelection({
+          requestedModel: providerRequestedModel(availableOpenAIModels),
+          // The removed resolveOpenAISessionModel carried this last-resort id.
+          configuredModel: openAISettings.model || 'gpt-4o',
+          availableModels: availableOpenAIModels,
+        })
+      : (useClaudeProvider
+        ? resolveProviderModelSelection({
+            requestedModel: providerRequestedModel(availableClaudeModels),
+            configuredModel: claudeSettings.model,
+            availableModels: availableClaudeModels,
+          })
+        : (useCursorProvider
+          ? resolveProviderModelSelection({
+              requestedModel: providerRequestedModel(cursorModelCatalog),
+              configuredModel: cursorSettings.model,
+              availableModels: cursorModelCatalog,
+            })
+          : (useGrokProvider
+            ? resolveProviderModelSelection({
+                requestedModel: providerRequestedModel(grokModelCatalog),
+                configuredModel: grokSettings.model,
+                availableModels: grokModelCatalog,
+              })
+            : null)));
+    // The single rejection for "this provider does not offer that model".
+    // Per-provider pre-checks used to duplicate it and had drifted apart in
+    // wording, casing rules and whether they listed the alternatives.
+    if (providerModelSelection && !providerModelSelection.ok) {
+      const providerLabel = useOpenAIProvider
+        ? 'OpenAI'
+        : (useClaudeProvider ? 'Claude' : (useCursorProvider ? 'Cursor' : 'Grok'));
+      const providerCode = useOpenAIProvider
+        ? 'OPENAI_MODEL_UNAVAILABLE'
+        : (useClaudeProvider
+          ? 'CLAUDE_MODEL_UNAVAILABLE'
+          : (useCursorProvider ? 'CURSOR_MODEL_UNAVAILABLE' : 'GROK_MODEL_UNAVAILABLE'));
+      return res.status(400).json({
+        ok: false,
+        error: `${providerLabel} model "${providerModelSelection.requestedModel}" is not available`,
+        code: providerCode,
+        supportedModels: providerModelSelection.availableModels || [],
+      });
+    }
     if (useOpenAIProvider && openAISettings?.configured !== true) {
       return res.status(400).json({
         ok: false,
@@ -3756,20 +4269,43 @@ export function registerSessionsRoutes(app, deps) {
         code: 'CLAUDE_NOT_CONFIGURED',
       });
     }
+    if (useCursorProvider && cursorSettings?.configured !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Cursor API key is not configured',
+        code: 'CURSOR_NOT_CONFIGURED',
+      });
+    }
+    if (useGrokProvider && grokSettings?.enabled !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Grok provider is not enabled',
+        code: 'GROK_NOT_CONFIGURED',
+      });
+    }
 
-    const selectedModel = useOpenAIProvider
-      ? resolveOpenAISessionModel({
-          requestedModel: catalogSelectedModel,
-          configuredModel: openAISettings.model,
-          availableModels: openAISettings.models,
-        })
-      : (useClaudeProvider
-        ? resolveOpenAISessionModel({
-            requestedModel: catalogSelectedModel,
-            configuredModel: claudeSettings.model,
-            availableModels: Array.from(availableClaudeModels),
-          })
-        : catalogSelectedModel);
+    // Optional launch CWD from the New Chat modal. Validated before insertConv
+    // so a rejected path never leaves an orphaned conversation behind.
+    const requestedWorkspaceRootPath = readWorkspaceRootPathFromBody(req.body);
+    let bootstrapWorkspaceRootPath = '';
+    if (requestedWorkspaceRootPath) {
+      const validatedRoot = validateRequestedWorkspaceRoot(requestedWorkspaceRootPath, {
+        allowList: workspaceRootAllowList,
+      });
+      if (!validatedRoot.ok) {
+        return res.status(validatedRoot.code === 'root-path-not-allowed' ? 403 : 400)
+          .json({ ok: false, code: validatedRoot.code, error: validatedRoot.error });
+      }
+      // Keyed on the browser session: there is no conversation id yet.
+      const rateLimited = consumeWorkspaceRootRateLimit(clientSessionId || 'bootstrap', req);
+      if (!rateLimited.ok) {
+        res.set?.('Retry-After', String(rateLimited.retryAfterSeconds));
+        return res.status(429).json({ ok: false, code: 'rate-limited', error: 'Too many CWD updates. Try again shortly.' });
+      }
+      bootstrapWorkspaceRootPath = validatedRoot.realPath;
+    }
+
+    const selectedModel = providerModelSelection ? providerModelSelection.model : catalogSelectedModel;
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
       return res.status(400).json({
         ok: false,
@@ -3777,7 +4313,7 @@ export function registerSessionsRoutes(app, deps) {
         code: 'OPENAI_IMAGE_MODEL_REQUIRED',
       });
     }
-    if (!useOpenAIProvider && !useClaudeProvider) {
+    if (!useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider) {
       const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
         ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
         : [];
@@ -3799,27 +4335,137 @@ export function registerSessionsRoutes(app, deps) {
           code: 'CLAUDE_PROVIDER_REQUIRED',
         });
       }
+      const cursorOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'cursor');
+      if (cursorOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the Cursor provider`,
+          code: 'CURSOR_PROVIDER_REQUIRED',
+        });
+      }
+      const grokOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'grok');
+      if (grokOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the Grok provider`,
+          code: 'GROK_PROVIDER_REQUIRED',
+        });
+      }
+    }
+
+    const bootstrapProviderType = useOpenAIProvider
+      ? 'openai'
+      : (useClaudeProvider
+        ? 'claude'
+        : (useCursorProvider
+          ? 'cursor'
+          : (useGrokProvider ? 'grok' : 'github')));
+    // Preferences are written in the same transaction as the conversation, so
+    // the caller's current mode has to arrive with the request: without it every
+    // new chat would be stored as the default one and reset the composer. An
+    // omitted or unknown mode still falls back to the default rather than 400,
+    // because a new chat is worth starting either way.
+    const bootstrapRelayMode = normalizeRelayModePreference(req.body?.relayMode ?? req.body?.preferredRelayMode, {
+      supportedRelayModes: SUPPORTED_RELAY_MODES,
+      fallbackMode: DEFAULT_RELAY_MODE,
+    });
+    // The New Chat modal's reasoning choice is validated with the same rules the
+    // first send would apply, so the composer can restore it from the server
+    // instead of guessing from localStorage.
+    const bootstrapReasoning = resolveProviderReasoningEffort({
+      requestedEffort: req.body?.reasoningEffort,
+      strict: bootstrapProviderType === 'openai',
+      supportedEfforts: supportedReasoningEffortsForProviderModel({
+        providerType: bootstrapProviderType,
+        model: selectedModel,
+        cursorSettings,
+        claudeSettings,
+        grokSettings,
+        reasoningByModel: modelState?.reasoningByModel || null,
+      }),
+    });
+    if (!bootstrapReasoning.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: bootstrapReasoning.error || 'Unsupported reasoning effort',
+        code: 'REASONING_EFFORT_UNSUPPORTED',
+        supportedReasoningEfforts: bootstrapReasoning.supported,
+      });
     }
 
     try {
-      stmts.insertConv.run(conversationId, title, now, now);
-      const runtimeSession = ensureRuntimeSessionBinding(
-        conversationId,
-        selectedModel,
-        now,
-        conversationId,
-        {
-          assignConfiguredProvider: true,
-          providerType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : 'github'),
-          providerModel: (useOpenAIProvider || useClaudeProvider) ? selectedModel : null,
-        },
-      );
+      // One transaction so a conversation can never exist without its runtime
+      // binding and preferences: every later reader treats these three as a
+      // single canonical tuple.
+      const commitBootstrapState = db.transaction(() => {
+        stmts.insertConv.run(conversationId, title, now, now);
+        const boundRuntimeSession = ensureRuntimeSessionBinding(
+          conversationId,
+          selectedModel,
+          now,
+          conversationId,
+          {
+            assignConfiguredProvider: true,
+            providerType: bootstrapProviderType,
+            providerModel: (useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider) ? selectedModel : null,
+          },
+        );
+        const preferences = persistConversationPreferences({
+          db,
+          stmts,
+          conversationId,
+          preferredRelayMode: bootstrapRelayMode,
+          preferredModel: selectedModel,
+          preferredReasoningEffort: bootstrapReasoning.effort,
+          updatedAt: now,
+        });
+        return { boundRuntimeSession, preferences };
+      });
+      const { boundRuntimeSession, preferences } = commitBootstrapState();
+      const runtimeSession = boundRuntimeSession;
+      const preferredRelayMode = preferences?.preferredRelayMode || bootstrapRelayMode;
+      const preferredModel = preferences?.preferredModel || selectedModel;
+      const preferredReasoningEffort = preferences?.preferredReasoningEffort || bootstrapReasoning.effort || '';
+      // Seed the configured root before ensureWorker so the very first launch
+      // already happens in the requested directory (resolveLaunchWorkspaceRootForSession
+      // prefers it over the relay default).
+      let workspaceRootState = null;
+      let workspaceRootWarning = null;
+      if (bootstrapWorkspaceRootPath) {
+        const workspaceRootResult = typeof updateConversationConfiguredWorkspaceRoot === 'function'
+          ? updateConversationConfiguredWorkspaceRoot({ conversationId, rootPath: bootstrapWorkspaceRootPath })
+          : null;
+        if (workspaceRootResult?.ok) {
+          workspaceRootState = workspaceRootResult.state || null;
+          const workspaceHints = workspaceRootPayload();
+          io.emit('conversation_workspace_root_updated', {
+            conversationId,
+            sdkSessionId: workspaceRootState?.sdkSessionId || null,
+            configuredWorkspaceRootPath: workspaceRootState?.configuredWorkspaceRootPath || null,
+            configuredWorkspaceRootName: workspaceRootState?.configuredWorkspaceRootName || null,
+            runtimeWorkspaceRootPath: workspaceRootState?.runtimeWorkspaceRootPath || null,
+            runtimeWorkspaceRootName: workspaceRootState?.runtimeWorkspaceRootName || null,
+            currentWorkspaceRootPath: workspaceRootState?.currentWorkspaceRootPath || null,
+            currentWorkspaceRootName: workspaceRootState?.currentWorkspaceRootName || null,
+            recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
+          });
+        } else {
+          // The directory passed validation moments ago, so a failure here is a
+          // race (deleted or unmounted since). Start the chat anyway and say so.
+          workspaceRootWarning = `The chat was created, but its working directory could not be set: ${workspaceRootResult?.error || 'unknown error'}. It starts in the default directory.`;
+        }
+      }
       const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
       const ownerSessionId = routingEnabled ? conversationId : null;
       if (ownerSessionId && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
         sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
         const ensureResult = await sessionWorkerSupervisor.ensureWorker(ownerSessionId);
         if (!ensureResult?.ok) {
+          // The conversation is already committed with its provider selection,
+          // so the failure payload carries enough for the client to open and
+          // retry it instead of leaving an unreachable row in the sidebar.
           return res.status(409).json({
             ok: false,
             error: ensureResult?.error || 'worker-bootstrap-failed',
@@ -3828,6 +4474,12 @@ export function registerSessionsRoutes(app, deps) {
             ownerSessionId,
             worker: ensureResult?.worker || null,
             lifecycle: ensureResult?.lifecycle || null,
+            conversationCreated: true,
+            selectedModel,
+            selectedProviderType: bootstrapProviderType,
+            preferredRelayMode,
+            preferredModel,
+            preferredReasoningEffort,
             ...workspaceRootPayload(),
           });
         }
@@ -3842,12 +4494,20 @@ export function registerSessionsRoutes(app, deps) {
         const pendingDepth = Number(queueCounts?.().pendingCount || 0);
         sessionWorkerSupervisor?.markIdle?.(ownerSessionId, pendingDepth);
       } else if (ownerSessionId) {
+        // Same state as the 409 above: the conversation is committed, only the
+        // worker is missing, so the client gets what it needs to open it.
         return res.status(500).json({
           ok: false,
           error: 'session-worker-launcher-unavailable',
           conversationId,
           runtimeSessionId: runtimeSession?.id || null,
           ownerSessionId,
+          conversationCreated: true,
+          selectedModel,
+          selectedProviderType: bootstrapProviderType,
+          preferredRelayMode,
+          preferredModel,
+          preferredReasoningEffort,
           ...workspaceRootPayload(),
         });
       }
@@ -3865,7 +4525,15 @@ export function registerSessionsRoutes(app, deps) {
         worker: ownerWorker,
         lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
         selectedModel,
-        selectedProviderType: useOpenAIProvider ? 'openai' : (useClaudeProvider ? 'claude' : 'github'),
+        selectedProviderType: bootstrapProviderType,
+        preferredRelayMode,
+        preferredModel,
+        preferredReasoningEffort,
+        configuredWorkspaceRootPath: workspaceRootState?.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: workspaceRootState?.configuredWorkspaceRootName || null,
+        currentWorkspaceRootPath: workspaceRootState?.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: workspaceRootState?.currentWorkspaceRootName || null,
+        workspaceRootWarning,
         warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
         ...workspaceRootPayload(),
       });
@@ -3936,6 +4604,17 @@ export function registerSessionsRoutes(app, deps) {
         connectedSince: runtimeState.tunnelState?.connectedSince ?? null,
         lastError: runtimeState.tunnelState?.lastError ?? null,
         valid: runtimeState.tunnelState?.valid ?? true,
+      },
+      cloudflaredTunnel: {
+        enabled: runtimeState.cloudflaredTunnelState?.enabled ?? false,
+        mode: runtimeState.cloudflaredTunnelState?.mode ?? 'disabled',
+        required: runtimeState.cloudflaredTunnelState?.required ?? false,
+        blocking: runtimeState.cloudflaredTunnelState?.blocking ?? false,
+        connected: runtimeState.cloudflaredTunnelState?.connected ?? false,
+        reconnectAttempts: runtimeState.cloudflaredTunnelState?.reconnectAttempts ?? 0,
+        connectedSince: runtimeState.cloudflaredTunnelState?.connectedSince ?? null,
+        lastError: runtimeState.cloudflaredTunnelState?.lastError ?? null,
+        valid: runtimeState.cloudflaredTunnelState?.valid ?? true,
       },
       workerWebSocket: runtimeState.workerWebSocketStatus || null,
       tmuxInspector: runtimeState.tmuxInspectorStatus || null,
@@ -4127,6 +4806,187 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  app.get('/api/settings/grok', auth, (_req, res) => {
+    const settings = getGrokProviderSettings();
+    return res.json({
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'grok-4.5').trim() || 'grok-4.5',
+      models: Array.isArray(settings?.models) ? settings.models : [],
+      availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+    });
+  });
+
+  app.post('/api/settings/grok', auth, async (req, res) => {
+    const parsed = parseGrokSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const previous = getGrokProviderSettings();
+    const result = setGrokProviderSettings(parsed);
+    if (!result?.ok) {
+      return res.status(400).json({
+        error: result?.error || 'Failed to update Grok settings',
+      });
+    }
+    const shouldDiscover = result.enabled === true && (
+      previous?.enabled !== true
+      || previous?.model !== result.model
+      || previous?.modelsDiscovered !== true
+    );
+    const discovery = !shouldDiscover
+      ? { ok: true, models: [], error: null }
+      : await refreshGrokProviderModels();
+    const reconciliationResult = await reconcileUnstartedConversationProviders({
+      enabled: result.enabled === true,
+      model: result.model,
+      provider: 'grok',
+    });
+    const reconciliation = {
+      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
+        ? reconciliationResult.failedConversations
+        : [],
+    };
+    const currentSettings = getGrokProviderSettings();
+    const settingsPayload = {
+      configured: currentSettings?.configured === true,
+      enabled: currentSettings?.enabled === true,
+      model: String(currentSettings?.model || result.model || 'grok-4.5').trim() || 'grok-4.5',
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
+      reconciliation,
+    };
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('grok_settings_updated', settingsPayload);
+    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
+      ? reconciliation.failedConversations
+      : [];
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      warning: reconciliationFailures.length
+        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'Grok model discovery failed')),
+    });
+  });
+
+  app.get('/api/settings/cursor', auth, (_req, res) => {
+    const settings = getCursorProviderSettings();
+    return res.json({
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'composer-2.5').trim() || 'composer-2.5',
+      models: Array.isArray(settings?.models) ? settings.models : [],
+      availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+    });
+  });
+
+  app.post('/api/settings/cursor', auth, async (req, res) => {
+    const parsed = parseCursorSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const previous = getCursorProviderSettings();
+    const result = setCursorProviderSettings(parsed);
+    if (!result?.ok) {
+      const statusCode = result?.code === 'cursor-key-removal-blocked' ? 409 : 400;
+      return res.status(statusCode).json({
+        error: result?.error || 'Failed to update Cursor settings',
+        code: result?.code || null,
+        activeConversationCount: Number(result?.activeConversationCount || 0),
+        startedConversationCount: Number(result?.startedConversationCount || 0),
+        activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
+      });
+    }
+    // A rotated API key only reaches a worker's environment at spawn: live
+    // Cursor workers keep the old key (every handle rebuild reuses it) and
+    // fail each turn after the rotation. Stop them now; the primer or the
+    // next delivery respawns them with the fresh key from settings.
+    if (parsed.apiKey && previous?.configured === true) {
+      const cursorSessionRows = db.prepare(`
+        SELECT DISTINCT NULLIF(sdk_session_id, '') AS sdk_session_id
+        FROM runtime_sessions
+        WHERE LOWER(COALESCE(provider_type, '')) = 'cursor'
+          AND NULLIF(sdk_session_id, '') IS NOT NULL
+      `).all();
+      for (const row of cursorSessionRows) {
+        const sid = String(row.sdk_session_id || '').trim();
+        if (!sid) continue;
+        const workerState = sessionWorkerSupervisor?.getWorkerState?.(sid) || null;
+        if (!workerState) continue;
+        try {
+          const stopped = await stopIdleWorkspaceRootSession({
+            sdkSessionId: sid,
+            worker: sessionWorkerRegistry?.getWorker?.(sid) || null,
+            sessionWorkerSupervisor,
+            sessionWorkerRegistry,
+            sessionWorkerProcessInspector,
+          });
+          if (stopped.ok) {
+            sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
+            console.log(`[sessions] cursor worker ${sid.slice(0, 8)} stopped for API key rotation`);
+          }
+        } catch (error) {
+          console.warn(`[sessions] cursor worker ${sid.slice(0, 8)} stop failed on key rotation: ${error?.message || error}`);
+        }
+      }
+    }
+    const shouldDiscover = result.enabled === true && (
+      !!parsed.apiKey
+      || previous?.enabled !== true
+      || previous?.model !== result.model
+      || previous?.effortsDiscovered !== true
+      || previous?.reasoningOffDiscovered !== true
+    );
+    const discovery = !shouldDiscover
+      ? { ok: true, models: [], error: null }
+      : await refreshCursorProviderModels();
+    // Removing the Cursor key rebinds unstarted Cursor conversations back to
+    // the default provider (mirrors the OpenAI key-removal reconciliation).
+    const reconciliationResult = parsed.remove === true
+      ? await reconcileUnstartedConversationProviders({
+          enabled: false,
+          model: result.model,
+          provider: 'cursor',
+        })
+      : {
+          updatedUnstartedConversations: 0,
+          skippedStartedConversations: 0,
+          skippedActiveQueueConversations: 0,
+          failedConversations: [],
+        };
+    const reconciliation = {
+      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
+        ? reconciliationResult.failedConversations
+        : [],
+    };
+    const currentSettings = getCursorProviderSettings();
+    const settingsPayload = {
+      configured: currentSettings?.configured === true,
+      enabled: currentSettings?.enabled === true,
+      model: String(currentSettings?.model || result.model || 'composer-2.5').trim() || 'composer-2.5',
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
+      reconciliation,
+    };
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('cursor_settings_updated', settingsPayload);
+    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
+      ? reconciliation.failedConversations
+      : [];
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
+      warning: reconciliationFailures.length
+        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'Cursor model discovery failed')),
+    });
+  });
+
   app.get('/api/settings/turn-ceiling', auth, (_req, res) => {
     res.json({
       ceilingMinutes: getTurnCeilingMinutes(),
@@ -4148,6 +5008,30 @@ export function registerSessionsRoutes(app, deps) {
       maxMinutes: TURN_CEILING_MAX_MINUTES,
       stepMinutes: TURN_CEILING_STEP_MINUTES,
       defaultMinutes: DEFAULT_TURN_CEILING_MINUTES,
+    });
+  });
+
+  app.get('/api/settings/background-task-timeout', auth, (_req, res) => {
+    res.json({
+      timeoutMinutes: getBackgroundTaskTimeoutMinutes(),
+      minMinutes: BACKGROUND_TASK_TIMEOUT_MIN_MINUTES,
+      maxMinutes: BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
+      stepMinutes: BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
+      defaultMinutes: DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
+    });
+  });
+
+  app.post('/api/settings/background-task-timeout', auth, (req, res) => {
+    const parsed = parseBackgroundTaskTimeoutUpdate(req.body?.timeoutMinutes);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setBackgroundTaskTimeoutMinutes(parsed.minutes);
+    if (!result.ok) return res.status(500).json({ error: result.error });
+    return res.json({
+      timeoutMinutes: result.timeoutMinutes,
+      minMinutes: BACKGROUND_TASK_TIMEOUT_MIN_MINUTES,
+      maxMinutes: BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
+      stepMinutes: BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
+      defaultMinutes: DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     });
   });
 
@@ -4372,6 +5256,8 @@ export function registerSessionsRoutes(app, deps) {
     const rows = typeof listModelVariantRows === 'function' ? listModelVariantRows() : [];
     const modelState = getModelCatalogState();
     const claudeSettings = getClaudeProviderSettings();
+    const cursorSettings = getCursorProviderSettings();
+    const grokSettings = getGrokProviderSettings();
     return {
       ...buildModelVariantCatalogPayload({
         rows,
@@ -4385,6 +5271,20 @@ export function registerSessionsRoutes(app, deps) {
             defaultModel: claudeSettings.model,
             availableModels: Array.isArray(claudeSettings.availableModels) ? claudeSettings.availableModels : [],
             enabledModels: Array.isArray(claudeSettings.models) ? claudeSettings.models : [],
+          }
+        : null,
+      cursorModels: cursorSettings?.enabled === true
+        ? {
+            defaultModel: cursorSettings.model,
+            availableModels: Array.isArray(cursorSettings.availableModels) ? cursorSettings.availableModels : [],
+            enabledModels: Array.isArray(cursorSettings.models) ? cursorSettings.models : [],
+          }
+        : null,
+      grokModels: grokSettings?.enabled === true
+        ? {
+            defaultModel: grokSettings.model,
+            availableModels: Array.isArray(grokSettings.availableModels) ? grokSettings.availableModels : [],
+            enabledModels: Array.isArray(grokSettings.models) ? grokSettings.models : [],
           }
         : null,
     };
@@ -4403,6 +5303,8 @@ export function registerSessionsRoutes(app, deps) {
     try {
       const openAISettings = getOpenAIProviderSettings();
       const claudeSettings = getClaudeProviderSettings();
+      const cursorSettings = getCursorProviderSettings();
+      const grokSettings = getGrokProviderSettings();
       const refreshTasks = [
         refreshModelVariantCatalogFromCli(),
         openAISettings?.enabled === true
@@ -4411,8 +5313,14 @@ export function registerSessionsRoutes(app, deps) {
         claudeSettings?.enabled === true
           ? refreshClaudeProviderModels()
           : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        cursorSettings?.enabled === true
+          ? refreshCursorProviderModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        grokSettings?.enabled === true
+          ? refreshGrokProviderModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
       ];
-      const [cliRefresh, openAIRefresh, claudeRefresh] = await Promise.allSettled(refreshTasks);
+      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh] = await Promise.allSettled(refreshTasks);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
       const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
         ? openAIRefresh.value
@@ -4428,6 +5336,20 @@ export function registerSessionsRoutes(app, deps) {
             models: Array.isArray(claudeSettings?.models) ? claudeSettings.models : [],
             error: claudeRefresh.reason?.message || 'Claude model discovery failed',
           };
+      const cursorModelDiscovery = cursorRefresh.status === 'fulfilled'
+        ? cursorRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(cursorSettings?.models) ? cursorSettings.models : [],
+            error: cursorRefresh.reason?.message || 'Cursor model discovery failed',
+          };
+      const grokModelDiscovery = grokRefresh.status === 'fulfilled'
+        ? grokRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(grokSettings?.models) ? grokSettings.models : [],
+            error: grokRefresh.reason?.message || 'Grok model discovery failed',
+          };
       io.emit('models_updated', buildModelCatalogWithProviders(
         getModelCatalogState(),
       ));
@@ -4436,6 +5358,8 @@ export function registerSessionsRoutes(app, deps) {
         ...buildModelVariantCatalogPayloadForRoute(),
         openAIModelDiscovery,
         claudeModelDiscovery,
+        cursorModelDiscovery,
+        grokModelDiscovery,
       });
     } catch (error) {
       return res.status(500).json({
@@ -4474,6 +5398,7 @@ export function registerSessionsRoutes(app, deps) {
       defaultModel: modelState.defaultModel,
       reasoningByModel: modelState.reasoningByModel || {},
       reasoningByProvider: modelState.reasoningByProvider || {},
+      reasoningOffUnsupportedByProvider: modelState.reasoningOffUnsupportedByProvider || {},
       reasoningEfforts: modelState.reasoningEfforts || [],
       contextLimitsByModel: modelState.contextLimitsByModel || {},
       modelMetadataByModel: modelState.modelMetadataByModel || {},
@@ -4508,11 +5433,137 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  // GET /api/usage — Copilot quota fetched live from GitHub API
-  app.get('/api/usage', auth, (req, res) => {
-    fetchUsageSummary((err, summary) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(summary);
+  // GET /api/usage — unified plan usage across every configured provider.
+  //
+  // Plan-first: subscription credits, rate-limit windows and reset times, with
+  // token/cost diagnostics carried as collapsible detail sections. Each
+  // provider is independent — a failing source yields an "unavailable" card
+  // rather than a failed response — so the modal always renders something.
+  app.get('/api/usage', auth, async (req, res) => {
+    const wantsLegacyOnly = String(req.query?.legacy || '').trim() === '1';
+
+    let summary = null;
+    let summaryError = null;
+    try {
+      summary = await fetchUsageSummaryPromise(fetchUsageSummary);
+    } catch (error) {
+      summaryError = String(error?.message || error || 'Failed to fetch usage data');
+    }
+
+    if (wantsLegacyOnly || !planUsageService) {
+      if (!summary) return res.status(500).json({ error: summaryError || 'Usage is unavailable' });
+      return res.json(summary);
+    }
+
+    // Billing detail is best-effort and must never delay or fail the card.
+    let billing = null;
+    if (typeof fetchCopilotBillingUsage === 'function') {
+      try {
+        billing = await fetchCopilotBillingUsage();
+      } catch (error) {
+        billing = { items: [], timePeriod: null, scope: null, error: String(error?.message || error) };
+      }
+    }
+
+    const claudeSettings = getClaudeProviderSettings();
+    const cursorSettings = getCursorProviderSettings();
+    const grokSettings = getGrokProviderSettings();
+    // Live Grok subscription quota is best-effort like Copilot billing.
+    let grokBilling = null;
+    if (grokSettings?.enabled === true && typeof fetchGrokBillingUsage === 'function') {
+      try {
+        grokBilling = await fetchGrokBillingUsage();
+      } catch {
+        grokBilling = null;
+      }
+    }
+    // Live Cursor plan quota (dashboard session token) — same best-effort rule.
+    let cursorBilling = null;
+    let cursorDashboardAuth = null;
+    if (cursorSettings?.enabled === true && typeof fetchCursorDashboardUsage === 'function') {
+      try {
+        cursorBilling = await fetchCursorDashboardUsage();
+      } catch {
+        cursorBilling = null;
+      }
+      // Whether a token exists at all decides which of the two very different
+      // "no live bars" explanations the card shows.
+      try {
+        cursorDashboardAuth = getCursorDashboardTokenSettings() || null;
+      } catch {
+        cursorDashboardAuth = null;
+      }
+    }
+    const report = planUsageService.buildReport({
+      copilotSummary: summary,
+      copilotError: summaryError,
+      copilotBilling: billing,
+      claudeConfigured: claudeSettings?.enabled === true,
+      cursorConfigured: cursorSettings?.enabled === true,
+      cursorAllowances: getCursorPlanAllowanceSettings(),
+      cursorBilling,
+      cursorDashboardAuth,
+      grokConfigured: grokSettings?.enabled === true,
+      grokAllowances: getGrokPlanAllowanceSettings(),
+      grokBilling,
     });
+
+    // Legacy top-level fields stay alongside `providers` so an older cached
+    // client shell keeps working through a PWA update.
+    return res.json({ ...(summary || {}), ...report });
+  });
+
+  app.get('/api/settings/cursor-allowance', auth, (_req, res) => {
+    res.json({ ok: true, ...getCursorPlanAllowanceSettings() });
+  });
+
+  app.post('/api/settings/cursor-allowance', auth, (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = setCursorPlanAllowanceSettings({
+      cursorModelsUsd: body.cursorModelsUsd,
+      otherModelsUsd: body.otherModelsUsd,
+      resetDay: body.resetDay,
+      resetAccounting: body.resetAccounting === true,
+    });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update Cursor allowances' });
+    }
+    return res.json(result);
+  });
+
+  // The Cursor dashboard session token unlocks the live plan-quota bars on
+  // the Check Usage card. GET only reports whether one is configured — the
+  // token itself is never echoed back.
+  app.get('/api/settings/cursor-dashboard-token', auth, (_req, res) => {
+    res.json({ ok: true, ...getCursorDashboardTokenSettings() });
+  });
+
+  app.post('/api/settings/cursor-dashboard-token', auth, (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = setCursorDashboardTokenSettings({
+      sessionToken: body.sessionToken,
+      remove: body.remove === true,
+    });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update the Cursor dashboard token' });
+    }
+    return res.json(result);
+  });
+
+  app.get('/api/settings/grok-allowance', auth, (_req, res) => {
+    res.json({ ok: true, ...getGrokPlanAllowanceSettings() });
+  });
+
+  app.post('/api/settings/grok-allowance', auth, (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = setGrokPlanAllowanceSettings({
+      monthlyUsd: body.monthlyUsd,
+      resetDay: body.resetDay,
+      resetAccounting: body.resetAccounting === true,
+    });
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.error || 'Failed to update Grok allowances' });
+    }
+    return res.json(result);
   });
 }

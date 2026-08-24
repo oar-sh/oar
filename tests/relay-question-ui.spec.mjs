@@ -52,9 +52,16 @@ async function openRepoBrowserFromComposer(page) {
   await page.click("#repo-browser-fab");
 }
 
-async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 30) {
+async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 30, ownerSessionId = "") {
+  // When session-worker routing is enabled the queue row is born owned and the
+  // anonymous legacy-relay poll never sees it; claiming it as its owner (the
+  // x-relay-session-id bridge identity) exercises the owned-dequeue path the
+  // production workers use. POST /api/message returns the assigned owner id.
+  const dequeueHeaders = String(ownerSessionId || "").trim()
+    ? { ...headers, "x-relay-session-id": String(ownerSessionId).trim() }
+    : headers;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers });
+    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
     expect(dequeued.ok()).toBeTruthy();
     const pendingBody = await dequeued.json();
     const msg = pendingBody?.message || null;
@@ -99,7 +106,7 @@ test("renders and answers relay question card in the web UI", async ({ page, req
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const pendingBody = await dequeueSpecificMessage(request, headers, messageId);
+    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
     expect(String(pendingBody?.message?.id || "")).toBe(messageId);
 
     const created = await request.post("/api/relay-question", {
@@ -381,9 +388,9 @@ test("linkifies workspace file mentions in assistant messages and question cards
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
   const seedText = `File-link test seed ${stamp}`;
-  const absoluteRespawnPath = `${process.cwd()}\\server\\respawn.bat`;
-  const prompt = `Can you open README.md and ${absoluteRespawnPath}?`;
-  const responseText = `Please read README.md, then inspect ${absoluteRespawnPath}.`;
+  const absoluteWindowsPath = `${process.cwd()}\\server\\relay.mjs`;
+  const prompt = `Can you open README.md and ${absoluteWindowsPath}?`;
+  const responseText = `Please read README.md, then inspect ${absoluteWindowsPath}.`;
   let conversationId = "";
   let messageId = "";
 
@@ -403,7 +410,7 @@ test("linkifies workspace file mentions in assistant messages and question cards
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const dequeuedBody = await dequeueSpecificMessage(request, headers, messageId);
+    const dequeuedBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
     expect(String(dequeuedBody?.message?.id || "")).toBe(messageId);
 
     const createdQuestion = await request.post("/api/relay-question", {
@@ -444,10 +451,10 @@ test("linkifies workspace file mentions in assistant messages and question cards
     await expect(assistantReadmeLink).toHaveAttribute("href", /\/api\/files\/README\.md$/);
     await expect(assistantReadmeLink).toHaveAttribute("target", "_blank");
 
-    const assistantRespawnLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "respawn.bat" }).first();
-    await expect(assistantRespawnLink).toBeVisible();
-    await expect(assistantRespawnLink).toHaveAttribute("href", /\/api\/files\/server\/respawn\.bat$/);
-    await expect(assistantRespawnLink).not.toHaveAttribute("href", /\/api\/files\/git\/copilot\/server\/respawn\.bat$/);
+    const assistantWindowsPathLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "relay.mjs" }).first();
+    await expect(assistantWindowsPathLink).toBeVisible();
+    await expect(assistantWindowsPathLink).toHaveAttribute("href", /\/api\/files\/server\/relay\.mjs$/);
+    await expect(assistantWindowsPathLink).not.toHaveAttribute("href", /\/api\/files\/git\/copilot\/server\/relay\.mjs$/);
 
     const questionReadmeLink = page.locator(".relay-question-body a", { hasText: "README.md" }).first();
     await expect(questionReadmeLink).toBeVisible();
@@ -717,12 +724,18 @@ test("does not reuse the previous reply text in a new thinking bubble", async ({
     await page.click("#send-btn");
 
     // The thinking bubble renders when the queued turn moves to "processing";
-    // with CLI spawn disabled nothing dequeues it, so pull it ourselves.
+    // with CLI spawn disabled nothing dequeues it, so pull it ourselves. Under
+    // session-worker routing the follow-up is owned by the bound session, so
+    // claim it with that identity; anonymously otherwise.
+    const boundSessionHeaders = { ...headers, "x-relay-session-id": `pw-sid-think-${stamp}` };
     await expect.poll(async () => {
-      const pending = await request.get("/api/pending", { headers });
-      if (!pending.ok()) return false;
-      const body = await pending.json();
-      return Boolean(body?.message?.id);
+      for (const pollHeaders of [boundSessionHeaders, headers]) {
+        const pending = await request.get("/api/pending", { headers: pollHeaders });
+        if (!pending.ok()) continue;
+        const body = await pending.json();
+        if (body?.message?.id) return true;
+      }
+      return false;
     }, { timeout: 15000 }).toBeTruthy();
 
     await expect(page.locator("#thinking-indicator")).toBeVisible();
@@ -1453,7 +1466,34 @@ test("chat title color matches active conversation list color", async ({ page, r
   }
 });
 
-test("supports drives explorer root and drive file preview API", async ({ page, request }) => {
+// The drives explorer is genuinely platform-split *on the server*: /api/drives/*
+// serve win32 drive-letter roots on Windows and the POSIX '/' tree everywhere
+// else. That branch reads the host OS of the process under test, so it cannot be
+// injected from a browser spec — hence one host-gated case per platform. The
+// platform that isn't running reports as skipped rather than silently vanishing.
+
+// Shared by both cases: the file preview API takes a native absolute path and
+// always answers with forward slashes.
+async function expectRepoReadmeDrivePreview(request, headers) {
+  const readmeDrivePath = `${process.cwd().replace(/\\/g, "/")}/README.md`;
+  const drivePreviewRes = await request.get(`/api/drives/files-preview?path=${encodeURIComponent(readmeDrivePath)}`, { headers });
+  expect(drivePreviewRes.ok()).toBeTruthy();
+  const drivePreviewBody = await drivePreviewRes.json();
+  expect(String(drivePreviewBody?.name || "")).toBe("README.md");
+  expect(String(drivePreviewBody?.path || "")).toContain("/README.md");
+  expect(String(drivePreviewBody?.rawUrl || "")).toContain("/api/drives/file?path=");
+}
+
+async function openDrivesExplorer(page, token) {
+  await page.goto(`/?token=${encodeURIComponent(token)}`);
+  await page.waitForLoadState("networkidle");
+  await openRepoBrowserFromComposer(page);
+  await page.click("#repo-root-drives-btn");
+  await expect(page.locator("#repo-root-drives-btn")).toHaveClass(/active/);
+}
+
+test("supports win32 drive-letter explorer roots and drive file preview API", async ({ page, request }) => {
+  test.skip(process.platform !== "win32", "win32 drive-letter roots; the POSIX case covers other hosts");
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
 
@@ -1466,23 +1506,38 @@ test("supports drives explorer root and drive file preview API", async ({ page, 
   const drivePath = String(drives[0]?.path || "");
   expect(drivePath).toMatch(/^[A-Za-z]:$/);
 
-  const readmeDrivePath = `${process.cwd().replace(/\\/g, "/")}/README.md`;
-  const drivePreviewRes = await request.get(`/api/drives/files-preview?path=${encodeURIComponent(readmeDrivePath)}`, { headers });
-  expect(drivePreviewRes.ok()).toBeTruthy();
-  const drivePreviewBody = await drivePreviewRes.json();
-  expect(String(drivePreviewBody?.name || "")).toBe("README.md");
-  expect(String(drivePreviewBody?.path || "")).toContain("/README.md");
-  expect(String(drivePreviewBody?.rawUrl || "")).toContain("/api/drives/file?path=");
+  await expectRepoReadmeDrivePreview(request, headers);
 
-  await page.goto(`/?token=${encodeURIComponent(token)}`);
-  await page.waitForLoadState("networkidle");
-  await openRepoBrowserFromComposer(page);
-  await page.click("#repo-root-drives-btn");
-
-  await expect(page.locator("#repo-root-drives-btn")).toHaveClass(/active/);
+  await openDrivesExplorer(page, token);
   await expect(page.locator("#repo-toggle-heavy-btn")).toBeDisabled();
   await expect(page.locator("#repo-toggle-hidden-btn")).toContainText("Hidden/System");
   await expect(page.locator("#repo-tree")).toContainText(drivePath);
+});
+
+test("supports the POSIX root explorer listing and drive file preview API", async ({ page, request }) => {
+  test.skip(process.platform === "win32", "POSIX '/' root; the win32 case covers Windows");
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const drivesRootsRes = await request.get("/api/drives/roots", { headers });
+  expect(drivesRootsRes.ok()).toBeTruthy();
+  const drivesRootsBody = await drivesRootsRes.json();
+  expect(String(drivesRootsBody?.root?.path || "")).toBe("/");
+  const entries = Array.isArray(drivesRootsBody?.root?.children) ? drivesRootsBody.root.children : [];
+  expect(entries.length).toBeGreaterThan(0);
+
+  const entryPath = String(entries[0]?.path || "");
+  expect(entryPath).toMatch(/^\/[^/]/);
+  // The tree labels POSIX entries with their basename; on win32 the drive path
+  // ("C:") doubles as its own label, which is why that case asserts the path.
+  const entryLabel = String(entries[0]?.name || "");
+  expect(entryLabel).toBeTruthy();
+
+  await expectRepoReadmeDrivePreview(request, headers);
+
+  await openDrivesExplorer(page, token);
+  await expect(page.locator("#repo-toggle-hidden-btn")).toContainText("Hidden/System");
+  await expect(page.locator("#repo-tree")).toContainText(entryLabel);
 });
 
 test("opens folder when clicking a tree node", async ({ page }) => {
@@ -1615,7 +1670,7 @@ test("keeps non-image @file references as text-only pending turns", async ({ req
   });
   expect(textRef.ok()).toBeTruthy();
   const textBody = await textRef.json();
-  const textPendingBody = await dequeueSpecificMessage(request, headers, String(textBody?.messageId || ""));
+  const textPendingBody = await dequeueSpecificMessage(request, headers, String(textBody?.messageId || ""), 30, String(textBody?.ownerSessionId || ""));
   expect(String(textPendingBody?.message?.id || "")).toBe(String(textBody?.messageId || ""));
   expect(Array.isArray(textPendingBody?.message?.attachments) ? textPendingBody.message.attachments.length : 0).toBe(0);
   await finalizePending(String(textBody?.conversationId || ""), String(textBody?.messageId || ""));

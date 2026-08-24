@@ -45,8 +45,16 @@ import {
   setImageEditTarget as setStoredImageEditTarget,
 } from './store.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
+import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
-import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
+import { buildWorkflowRunCard } from './background-tasks-view.mjs';
+import {
+  serializeDraftAttachments,
+  hydrateDraftAttachments,
+  mergeDraftAttachmentUpdate,
+  draftAttachmentsEqual,
+} from './composer-attachment-cache.mjs';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { renderRelayBoards } from './relay-board-view.js';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
@@ -57,16 +65,21 @@ import {
   computeNextRelayStreamState,
 } from './stream-state.mjs';
 import { mergeRelayActivityTexts, normalizeRelayActivityEntry, relayActivityEntryText } from './activity-replay-state.mjs';
-import { deriveComposerControlState, hasComposerDraft } from './composer-control-state.mjs';
+import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
+import { isChatInteractionHeld, selectionIntersectsNode } from './selection-guard.mjs';
+import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
+import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
 const OPAQUE_RELAY_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let thinkingMessageId = null;
+let lastInFlightSnapshotKey = '';
+let deferredMessageRender = null;
 const relayStreamStateByMessageId = new Map();
 // Cumulative main-thread stream text per message. The seq/done state above is
 // shared across threads (the server numbers stream rows per queue message, not
@@ -151,6 +164,24 @@ async function loadConversationHistoryPage(conversationId, options = {}) {
   return payload;
 }
 
+// The loaders' cursors belong to the conversation recorded in
+// conversationHistoryState. Between a conversation switch and the new
+// conversation's first render they still hold the previous conversation's
+// cursors; the switch entry point lives outside this module, so staleness is
+// detected here and the loaders are reset before any fetch can spend an old
+// cursor against the new conversation. Returns true when a reset happened.
+function resetConversationPaginationIfStale() {
+  const conversationId = String(currentConvId || '').trim();
+  if (String(conversationHistoryState.conversationId || '').trim() === conversationId) return false;
+  conversationHistoryLoader.reset({ hasMore: false, nextCursor: null });
+  conversationFutureLoader.reset({ hasMore: false, nextCursor: null });
+  return true;
+}
+
+function conversationPaginationCursorIsStale(conversationId) {
+  return String(conversationHistoryState.conversationId || '').trim() !== String(conversationId || '').trim();
+}
+
 const conversationHistoryLoader = createInfiniteLoader({
   fetchPage: async (cursor) => {
     const conversationId = String(currentConvId || '').trim();
@@ -161,6 +192,7 @@ const conversationHistoryLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
+    if (conversationPaginationCursorIsStale(conversationId)) return null;
     const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       beforeMessageId: String(cursor?.beforeMessageId || '').trim(),
@@ -178,6 +210,9 @@ const conversationHistoryLoader = createInfiniteLoader({
     const currentId = String(currentConvId || '').trim();
     const el = getMessagesElement();
     if (!currentId || !el) return;
+    // Covers the prefetch buffer: a page fetched before a conversation switch
+    // must not be applied to the newly opened conversation.
+    if (conversationPaginationCursorIsStale(currentId)) return;
     const previousScrollTop = el.scrollTop;
     const previousScrollHeight = el.scrollHeight;
     const inserted = prependMessageNodes(page.items || []);
@@ -227,6 +262,7 @@ const conversationFutureLoader = createInfiniteLoader({
         nextCursor: null,
       };
     }
+    if (conversationPaginationCursorIsStale(conversationId)) return null;
     const response = await loadConversationHistoryPage(conversationId, {
       limit: CONVERSATION_HISTORY_PAGE_SIZE,
       afterMessageId: String(cursor?.afterMessageId || '').trim(),
@@ -242,6 +278,7 @@ const conversationFutureLoader = createInfiniteLoader({
   },
   applyPage: async (page) => {
     const currentId = String(currentConvId || '').trim();
+    if (!currentId || conversationPaginationCursorIsStale(currentId)) return;
     const ordered = sortConversationMessages(page.items || []);
     let inserted = 0;
     for (const m of ordered) {
@@ -305,6 +342,7 @@ function syncSendButtonState() {
     }),
     sendInFlight,
     modelMetadataBlocked: window.isModelMetadataBlocked?.() === true,
+    attachmentsUploading: hasUploadingAttachments(selectedAttachments),
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
@@ -335,6 +373,7 @@ function clearDraftTimerForConversation(conversationId) {
 
 function upsertConversationDraftState(conversationId, {
   draftText = '',
+  draftAttachments = undefined,
   draftUpdatedAt = null,
   draftUpdatedByClientId = null,
 } = {}) {
@@ -344,12 +383,35 @@ function upsertConversationDraftState(conversationId, {
   conversations[id] = {
     ...existing,
     draftText: String(draftText || ''),
+    draftAttachments: draftAttachments === undefined
+      ? (existing.draftAttachments || [])
+      : (Array.isArray(draftAttachments) ? draftAttachments : []),
     draftUpdatedAt: draftUpdatedAt || null,
     draftUpdatedByClientId: draftUpdatedByClientId || null,
   };
 }
 
-async function persistConversationDraft(conversationId, draftText) {
+/**
+ * Persists the composer's attachment set for the active conversation. Called
+ * whenever an attachment finishes uploading or is removed, so the cache is
+ * written as a discrete action rather than riding the text debounce.
+ *
+ * Before a conversation exists there is nowhere to persist to: the attachments
+ * simply stay in the composer (they were already uploaded) and are adopted by
+ * the conversation created on the first send.
+ */
+export function persistComposerAttachments() {
+  const id = String(currentConvId || '').trim();
+  if (!id) return null;
+  return scheduleConversationDraftSave({
+    conversationId: id,
+    draftText: document.getElementById('msg-input')?.value || '',
+    draftAttachments: serializeDraftAttachments(selectedAttachments),
+    immediate: true,
+  });
+}
+
+async function persistConversationDraft(conversationId, draftText, draftAttachments = undefined) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const text = String(draftText || '');
@@ -359,12 +421,14 @@ async function persistConversationDraft(conversationId, draftText) {
       draftText: text,
       clientId: CLIENT_ID,
       baseDraftUpdatedAt,
+      ...(draftAttachments === undefined ? {} : { draftAttachments }),
     });
     if (!response?.ok) {
       if (response?.conflict === true || response?.code === 'draft-version-conflict') {
         applyIncomingConversationDraftUpdate({
           conversationId: id,
           draftText: response.draftText || '',
+          draftAttachments: response.draftAttachments,
           draftUpdatedAt: response.draftUpdatedAt || null,
           draftUpdatedByClientId: response.draftUpdatedByClientId || null,
         });
@@ -373,6 +437,7 @@ async function persistConversationDraft(conversationId, draftText) {
     }
     upsertConversationDraftState(id, {
       draftText: response.draftText,
+      draftAttachments: response.draftAttachments,
       draftUpdatedAt: response.draftUpdatedAt || response.updatedAt || null,
       draftUpdatedByClientId: response.draftUpdatedByClientId || response.senderClientId || null,
     });
@@ -394,20 +459,21 @@ async function persistConversationDraft(conversationId, draftText) {
 async function scheduleConversationDraftSave({
   conversationId,
   draftText,
+  draftAttachments = undefined,
   immediate = false,
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const text = String(draftText || '');
-  upsertConversationDraftState(id, { draftText: text });
+  upsertConversationDraftState(id, { draftText: text, draftAttachments });
   clearDraftTimerForConversation(id);
   if (immediate) {
-    return persistConversationDraft(id, text);
+    return persistConversationDraft(id, text, draftAttachments);
   }
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       draftSaveTimerByConversation.delete(id);
-      persistConversationDraft(id, text).then(resolve).catch(() => resolve(null));
+      persistConversationDraft(id, text, draftAttachments).then(resolve).catch(() => resolve(null));
     }, COMPOSER_DRAFT_DEBOUNCE_MS);
     draftSaveTimerByConversation.set(id, timer);
   });
@@ -427,21 +493,28 @@ export async function flushConversationDraft(conversationId = currentConvId) {
 
 export function hydrateConversationDraft(conversationId, {
   draftText = '',
+  draftAttachments = [],
   draftUpdatedAt = null,
   draftUpdatedByClientId = null,
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return;
   const normalizedDraftText = String(draftText || '');
+  const normalizedAttachments = Array.isArray(draftAttachments) ? draftAttachments : [];
   const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
   const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
   if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
   upsertConversationDraftState(id, {
     draftText: normalizedDraftText,
+    draftAttachments: normalizedAttachments,
     draftUpdatedAt,
     draftUpdatedByClientId,
   });
   if (String(currentConvId || '').trim() !== id) return;
+  // Restore the composer's pending attachments for the conversation being opened.
+  if (!draftAttachmentsEqual(selectedAttachments, hydrateDraftAttachments(normalizedAttachments))) {
+    setComposerAttachments(hydrateDraftAttachments(normalizedAttachments));
+  }
   const input = document.getElementById('msg-input');
   if (!input) return;
   const isFocused = document.activeElement === input;
@@ -459,6 +532,7 @@ export function hydrateConversationDraft(conversationId, {
 export function applyIncomingConversationDraftUpdate({
   conversationId,
   draftText = '',
+  draftAttachments = undefined,
   draftUpdatedAt = null,
   draftUpdatedByClientId = null,
   senderClientId = null,
@@ -472,10 +546,21 @@ export function applyIncomingConversationDraftUpdate({
   if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
   upsertConversationDraftState(id, {
     draftText: incomingDraftText,
+    draftAttachments,
     draftUpdatedAt,
     draftUpdatedByClientId: draftUpdatedByClientId || senderClientId || null,
   });
   if (String(currentConvId || '').trim() !== id) return;
+  if (draftAttachments !== undefined) {
+    const merged = mergeDraftAttachmentUpdate({
+      existing: selectedAttachments,
+      incoming: hydrateDraftAttachments(Array.isArray(draftAttachments) ? draftAttachments : []),
+      existingUpdatedAt: conversations[id]?.draftUpdatedAt || null,
+      incomingUpdatedAt: draftUpdatedAt,
+      isLocalEcho: senderClientId === CLIENT_ID,
+    });
+    if (merged.changed) setComposerAttachments(merged.attachments);
+  }
   const input = document.getElementById('msg-input');
   if (!input) return;
   const isFocused = document.activeElement === input;
@@ -567,6 +652,7 @@ export function initConversationHistoryLazyLoading() {
   if (!el || el.dataset.historyLazyLoadBound === '1') return;
   el.dataset.historyLazyLoadBound = '1';
   el.addEventListener('scroll', () => {
+    if (resetConversationPaginationIfStale()) return;
     void conversationHistoryLoader.handleBoundaryDistance(el.scrollTop);
     const forwardDistance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
     void conversationFutureLoader.handleBoundaryDistance(forwardDistance);
@@ -651,10 +737,28 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? ` <span class="msg-mode">${escHtml(msg.mode)}</span>` : '';
   const autoTag = (msg.role === 'assistant' && modelOrigin === 'auto')
     ? ' <span class="msg-auto">auto</span>' : '';
+  // A turn the agent started on its own after a background task settled — no
+  // user prompt precedes it, so say where it came from.
+  const continuationTag = (msg.role === 'assistant' && String(msg?.kind || '').trim() === 'continuation')
+    ? ' <span class="msg-continuation" title="The agent continued on its own after a background task finished.">background continuation</span>'
+    : '';
+  // A turn answered by a different provider than the conversation is bound to
+  // (e.g. the Copilot relay answering a Cursor conversation) must be visible,
+  // not silent: it ran on another plan than the header indicates.
+  const executedProvider = String(msg?.executedProvider || '').trim().toLowerCase();
+  const boundProvider = String(conversations[currentConvId]?.runtimeProviderType || 'github').trim().toLowerCase();
+  // 'unknown' means the responder identity did not resolve, not that another
+  // provider ran the turn — no chip for it.
+  const crossProviderTag = (msg.role === 'assistant' && executedProvider && executedProvider !== 'unknown' && executedProvider !== boundProvider)
+    ? ` <span class="msg-provider-mismatch" title="This turn was executed by the ${escHtml(executedProvider)} provider, not the conversation's ${escHtml(boundProvider)} provider.">ran on ${escHtml(executedProvider)}</span>`
+    : '';
   const usage = (msg.role === 'assistant' && msg?.usage && typeof msg.usage === 'object') ? msg.usage : null;
   const deltaCredits = Number(usage?.premium?.deltaCredits ?? usage?.premium?.deltaUsed);
   const deltaMonthlyPercent = Number(usage?.plan?.deltaMonthlyPercent);
-  const monthlyPercentRemaining = Number(usage?.plan?.percentRemaining);
+  // Number(null) is 0, which would make missing data render as "0% left".
+  const monthlyPercentRemaining = usage?.plan?.percentRemaining == null
+    ? NaN
+    : Number(usage.plan.percentRemaining);
   const usageTurnParts = [];
   if (Number.isFinite(deltaCredits) && deltaCredits > 0) {
     usageTurnParts.push(`+${escHtml(String(deltaCredits))}`);
@@ -665,7 +769,8 @@ function createMessageNode(msg, msgId = null, force = false) {
   const usageTurnTag = usageTurnParts.length
     ? ` <span class="msg-usage">${usageTurnParts.join(' (')}${usageTurnParts.length > 1 ? ')' : ''}</span>`
     : '';
-  const usageRemainingTag = Number.isFinite(monthlyPercentRemaining) && monthlyPercentRemaining > 0
+  // Exactly 0% remaining is real data and must render; only absent/NaN hides.
+  const usageRemainingTag = Number.isFinite(monthlyPercentRemaining)
     ? ` <span class="msg-usage">month ${escHtml(monthlyPercentRemaining.toFixed(1))}% left</span>`
     : '';
   const usageStaleTag = usage?.stale
@@ -683,6 +788,14 @@ function createMessageNode(msg, msgId = null, force = false) {
   const activityHtml = mainActivities.length ? renderActivityMarkup(mainActivities) : '';
   const thoughtsHtml = mainThoughts.length ? renderThoughtsMarkup(mainThoughts) : '';
   const subagentHtml = renderSubagentRunsMarkup(subagentRuns, activities, thoughts);
+  // Finished background workflows persisted with this assistant message
+  // (docs/plans/workflow-progress-tree.md, Phase 4). The template only
+  // reserves a placeholder; the cards are DOM-built below so digest text
+  // never passes through innerHTML.
+  const workflowRuns = (msg.role === 'assistant' && Array.isArray(msg.workflowRuns))
+    ? msg.workflowRuns.filter((run) => run && typeof run === 'object').slice(0, 5)
+    : [];
+  const workflowRunsHtml = workflowRuns.length ? '<div class="msg-workflow-runs"></div>' : '';
   const hasVisibleText = Boolean(String(msg.text || '').trim());
   const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
     ? 'msg-bubble msg-bubble-media-only'
@@ -707,12 +820,28 @@ function createMessageNode(msg, msgId = null, force = false) {
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${userBubbleActionsHtml}</div>
-    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${userBubbleActionsHtml}</div>
+    <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
   rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });
   linkifyWorkspaceMentionsInNode(bubble);
+  // One collapsed "Finished background task" card per persisted run, sharing
+  // the live panel's tree renderer. The native <details> owns the fold; open
+  // state is deliberately not keyed across re-renders — the runs are
+  // immutable once persisted, and this node is only rebuilt on a full
+  // renderMessages pass, which runs only when the snapshot key changes
+  // (buildMessageSnapshotKey covers the message fields INCLUDING a
+  // runId/status signature of these runs, and short-circuits otherwise).
+  if (workflowRuns.length) {
+    const runsHolder = div.querySelector('.msg-workflow-runs');
+    if (runsHolder) {
+      for (const run of workflowRuns) {
+        const card = buildWorkflowRunCard(run);
+        if (card) runsHolder.appendChild(card);
+      }
+    }
+  }
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
   return div;
 }
@@ -831,10 +960,43 @@ function enhanceThoughtMarkup(root) {
   });
 }
 
+// Streamed markdown grows at the tail, so only nodes from the first divergent
+// top-level block onward are replaced. Signatures are cached on the container:
+// enhancement passes (hljs, link rewriting) mutate the rendered nodes, so
+// re-deriving signatures from the DOM would break the stable prefix at the
+// first code block. Returns the appended nodes for scoped enhancement.
+function patchRenderedMarkdown(box, html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const nextNodes = [...template.content.childNodes];
+  const signatureOf = (node) => (node.nodeType === 1 ? node.outerHTML : `#text:${node.textContent}`);
+  const nextSignatures = nextNodes.map(signatureOf);
+  const cached = box.__streamSignatures;
+  const prevSignatures = Array.isArray(cached) && cached.length === box.childNodes.length
+    ? cached
+    : [...box.childNodes].map(signatureOf);
+  const stable = computeStablePrefixLength(prevSignatures, nextSignatures);
+  while (box.childNodes.length > stable) box.lastChild.remove();
+  const appended = [];
+  for (let i = stable; i < nextNodes.length; i += 1) {
+    box.appendChild(nextNodes[i]);
+    appended.push(nextNodes[i]);
+  }
+  box.__streamSignatures = nextSignatures;
+  return appended;
+}
+
 function renderThoughtBody(body, text) {
   if (!body) return;
-  body.innerHTML = renderMarkdownPreview(String(text || ''), false);
-  enhanceThoughtMarkup(body);
+  if (selectionIntersectsNode(body)) return;
+  const value = String(text || '');
+  const fingerprint = `${value.length}:${value.slice(-32)}`;
+  if (body.dataset.thoughtFingerprint === fingerprint) return;
+  body.dataset.thoughtFingerprint = fingerprint;
+  const appended = patchRenderedMarkdown(body, renderMarkdownPreview(value, false));
+  for (const node of appended) {
+    if (node.nodeType === 1) enhanceThoughtMarkup(node);
+  }
 }
 
 export function renderActivityMarkup(activities) {
@@ -933,7 +1095,21 @@ export function renderSubagentRunsMarkup(subagentRuns, activities, thoughts) {
 export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
   if (nextMessageId) thinkingMessageId = nextMessageId;
-  document.getElementById('thinking-indicator')?.remove();
+  const existing = document.getElementById('thinking-indicator');
+  if (existing && (!nextMessageId || String(existing.dataset.messageId || '') === nextMessageId)) {
+    // Reuse the live bubble: rebuilding it every poll tick destroys any text
+    // selection anchored inside and drops in-progress subagent bubbles.
+    const stopBtn = existing.querySelector('[data-action="stop-turn"]');
+    if (stopBtn && nextMessageId) {
+      const stopping = bubbleCancelInFlight.has(nextMessageId);
+      stopBtn.disabled = stopping;
+      stopBtn.textContent = stopping ? 'Stopping…' : 'Stop';
+      stopBtn.classList.toggle('stopping', stopping);
+    }
+    if (autoScroll) scrollBottom();
+    return;
+  }
+  existing?.remove();
   const el = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg assistant';
@@ -970,6 +1146,7 @@ export function showThinking(messageId = null, autoScroll = true) {
 
 export function removeThinking() {
   thinkingMessageId = null;
+  lastInFlightSnapshotKey = '';
   document.getElementById('thinking-indicator')?.remove();
 }
 
@@ -1012,6 +1189,9 @@ function rememberRelayStreamState(messageId, seq, done = false) {
 function renderThinkingStream() {
   const box = document.getElementById('thinking-stream');
   if (!box) return;
+  // The store keeps the latest text; the next frame after the selection is
+  // released repaints, so skipping here never loses content.
+  if (selectionIntersectsNode(box)) return;
   const text = thinkingMessageId ? String(relayStreamTextByMessageId.get(thinkingMessageId) || '') : '';
   if (!text.trim()) {
     box.hidden = true;
@@ -1019,7 +1199,7 @@ function renderThinkingStream() {
     return;
   }
   box.hidden = false;
-  box.innerHTML = renderMarkdownPreview(text, false);
+  patchRenderedMarkdown(box, renderMarkdownPreview(text, false));
 }
 
 function renderSubagentStream(subagentRunId, text) {
@@ -1037,6 +1217,7 @@ function renderSubagentStream(subagentRunId, text) {
     if (childrenContainer) bubble.insertBefore(box, childrenContainer);
     else bubble.appendChild(box);
   }
+  if (selectionIntersectsNode(box)) return;
   const value = String(text || '');
   if (!value.trim()) {
     box.hidden = true;
@@ -1044,31 +1225,73 @@ function renderSubagentStream(subagentRunId, text) {
     return;
   }
   box.hidden = false;
-  box.innerHTML = renderMarkdownPreview(value, false);
+  patchRenderedMarkdown(box, renderMarkdownPreview(value, false));
+}
+
+function patchActivityList(box, expectedTexts, className) {
+  const current = Array.from(box.children, (row) => row.textContent || '');
+  const plan = planListPatch(current, expectedTexts);
+  if (plan.reset) box.innerHTML = '';
+  for (const text of plan.appends) {
+    const row = document.createElement('div');
+    row.className = className;
+    row.textContent = text;
+    box.appendChild(row);
+  }
 }
 
 export function renderThinkingActivities() {
   const items = thinkingMessageId ? (relayActivities.get(thinkingMessageId) || []) : [];
   const box = document.getElementById('thinking-activity');
   if (!box) return;
-  box.innerHTML = '';
+  // Idempotent replay: the live bubble is reused across poll ticks, so a
+  // clear-and-replay (or the append path's last-row-only dedupe) would either
+  // wipe selections or duplicate rows on every changed payload.
+  const mainExpected = [];
+  const bySubagentRun = new Map();
   for (const item of items) {
     const entry = normalizeRelayActivityEntry(item);
     if (!entry) continue;
-    appendThinkingActivity(entry.text, entry.subagentRunId, false);
+    const decorated = decorateActivityText(entry.text);
+    if (entry.subagentRunId) {
+      const list = bySubagentRun.get(entry.subagentRunId) || [];
+      if (list[list.length - 1] !== decorated) list.push(decorated);
+      bySubagentRun.set(entry.subagentRunId, list);
+    } else if (mainExpected[mainExpected.length - 1] !== decorated) {
+      mainExpected.push(decorated);
+    }
+  }
+  if (!selectionIntersectsNode(box)) {
+    patchActivityList(box, mainExpected, 'thinking-activity-item');
+  }
+  for (const [subagentRunId, expected] of bySubagentRun) {
+    const bubble = ensureSubagentBubble(subagentRunId);
+    const runBox = bubble?.querySelector('.subagent-activity');
+    if (runBox && !selectionIntersectsNode(runBox)) {
+      patchActivityList(runBox, expected, 'subagent-activity-item');
+    }
   }
 }
 
 export function restoreInFlightThinking(inFlight, autoScroll = true) {
-  clearRelayStreamState();
   const messageId = String(inFlight?.messageId || '').trim();
   const status = String(inFlight?.status || '').trim().toLowerCase();
   if (!messageId || status !== 'processing') {
+    clearRelayStreamState();
     setConversationTurnState(currentConvId, null);
     thinkingMessageId = null;
     removeThinking();
     return;
   }
+  // Skip the rebuild when the payload matches the previous tick: the 900ms
+  // live poll would otherwise churn the DOM (and the user's selection) with
+  // identical content.
+  const snapshotKey = buildInFlightSnapshotKey(inFlight);
+  if (snapshotKey === lastInFlightSnapshotKey && document.getElementById('thinking-indicator')) {
+    return;
+  }
+  lastInFlightSnapshotKey = snapshotKey;
+  clearRelayStreamState();
   setConversationTurnState(currentConvId, { messageId, status: 'processing' });
   const activities = mergeRelayActivityTexts(
     relayActivities.get(messageId) || [],
@@ -1319,6 +1542,16 @@ function updateSubagentBubbleStatus(bubble, status) {
   statusSpan.textContent = normalized === 'running' ? '● Running' : normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
+const subagentStopUnsupported = new Set();
+
+/** The provider answered "not supported": the control must not re-arm. */
+export function markSubagentStopUnsupported(subagentRunId) {
+  const id = String(subagentRunId || '').trim();
+  if (!id) return;
+  subagentStopUnsupported.add(id);
+  updateSubagentStopButton(id, false);
+}
+
 function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverride = null) {
   const id = String(subagentRunId || '').trim();
   if (!id) return;
@@ -1327,6 +1560,13 @@ function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverr
   if (IS_SHARED_VIEW) {
     btn.hidden = true;
     btn.disabled = true;
+    return;
+  }
+  if (subagentStopUnsupported.has(id)) {
+    btn.disabled = true;
+    btn.textContent = 'Stop unavailable';
+    btn.title = 'Targeted subagent stop is not supported by this provider; use Stop on the whole turn.';
+    btn.classList.remove('stopping');
     return;
   }
   const status = normalizeSubagentBubbleStatus(statusOverride || getSubagentStatus(id));
@@ -1505,6 +1745,15 @@ export function applyRelayStreamEvent({
   if (runId) renderSubagentStream(runId, text);
   else renderThinkingStream();
   return true;
+}
+
+export function flushDeferredMessageRender() {
+  if (!deferredMessageRender) return;
+  const { msgs, scroll, meta } = deferredMessageRender;
+  deferredMessageRender = null;
+  const deferredConversationId = String(meta?.conversationId || '').trim();
+  if (deferredConversationId && deferredConversationId !== String(currentConvId || '').trim()) return;
+  renderMessages(msgs, scroll, meta);
 }
 
 export function clearRelayStreamStateForMessage(messageId) {
@@ -1830,15 +2079,20 @@ async function toggleMessageShareVisibility(conversationId, messageId, hiddenFro
     return;
   }
 
-  const response = await loadConversationApi(conversationKey, {
-    limit: Math.max(CONVERSATION_HISTORY_PAGE_SIZE, getConversationLoadedMessageCount()),
-  });
-  if (response?.messages) {
-    renderMessages(response.messages, false, response);
-  }
   showTransientRelayNotice(result.hiddenFromShares
     ? 'Message hidden from shared viewers.'
     : 'Message visible to shared viewers.');
+  // The reload below only refreshes the open view; if the user switched
+  // conversations while the toggle round trip was in flight, rendering it
+  // would replace the new conversation's messages with this one's.
+  if (String(currentConvId || '').trim() !== conversationKey) return;
+  const response = await loadConversationApi(conversationKey, {
+    limit: Math.max(CONVERSATION_HISTORY_PAGE_SIZE, getConversationLoadedMessageCount()),
+  });
+  if (String(currentConvId || '').trim() !== conversationKey) return;
+  if (response?.messages) {
+    renderMessages(response.messages, false, response);
+  }
 }
 
 function handleBubbleActionClick(event) {
@@ -1957,6 +2211,14 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
         timestamp: String(thought?.timestamp || '').trim(),
         subagentRunId: String(thought?.subagentRunId || '').trim(),
       })),
+      // Cheap signature only — runs are immutable once persisted, so runId +
+      // status is enough to catch a payload that differs only in its runs
+      // (without one, such a payload would short-circuit and the card would
+      // stay invisible until an unrelated change).
+      workflowRuns: (Array.isArray(item?.workflowRuns) ? item.workflowRuns : []).map((run) => ({
+        runId: String(run?.runId || '').trim(),
+        status: String(run?.status || '').trim(),
+      })),
     })),
   });
 }
@@ -1970,8 +2232,16 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   if (snapshotKey && snapshotKey === lastRenderedMessageSnapshotKey && !statusViewMounted) {
     renderRelayQuestions();
     renderRelayBoards();
+    deferredMessageRender = null;
     return false;
   }
+  if (isChatInteractionHeld()) {
+    // A full rebuild wipes the user's selection; park the latest payload and
+    // replay it once the selection/drag is released.
+    deferredMessageRender = { msgs, scroll, meta };
+    return false;
+  }
+  deferredMessageRender = null;
   const messageById = new Map(
     ordered
       .map((item) => [String(item?.id || '').trim(), item])
@@ -2129,14 +2399,32 @@ export async function sendMessage() {
     return;
   }
 
-  if (!(await validateSelectedConversationBeforeSend())) {
+  // Capture the send target and its composer payload before any await: the
+  // message belongs to the conversation the user typed it in. If the user
+  // opens another conversation while a round trip below is in flight, the
+  // message still posts to this validated conversation and is simply not
+  // rendered into (or drafted onto) the newly opened one — it shows up there
+  // when that conversation is next loaded. The model/effort/tier/mode selects
+  // and the image-edit target are captured here too: opening another
+  // conversation rewrites the selects (applyConversationPreferences) and
+  // clears the image-edit target, so a mid-await switch must not respell this
+  // send with the other conversation's preferences.
+  const targetConversationId = String(currentConvId || '').trim() || null;
+  const draftAttachments = selectedAttachments.slice();
+  const selectedModel = document.getElementById('model-select').value || '';
+  const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+  const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
+  const selectedMode = document.getElementById('mode-select').value || 'agent';
+  const draftImageEditTarget = imageEditTarget;
+  let composerConversationId = targetConversationId;
+  const viewingSendConversation = () => String(currentConvId || '').trim() === String(composerConversationId || '').trim();
+  if (!(await validateSelectedConversationBeforeSend(targetConversationId))) {
     return;
   }
   if (window.isModelMetadataBlocked?.()) {
     showTransientRelayNotice('Model metadata is unavailable. Refresh models to continue.');
     return;
   }
-  const targetConversationId = String(currentConvId || '').trim() || null;
   if (hasPendingUserMessageDuplicate(targetConversationId, text)) {
     showTransientRelayNotice('That message is already pending.');
     return;
@@ -2149,27 +2437,25 @@ export async function sendMessage() {
   let attachments = [];
   let clientMessageId = null;
   try {
-    attachments = await uploadAttachments(selectedAttachments.slice());
+    attachments = await uploadAttachments(draftAttachments);
 
     const isNew = !targetConversationId;
     const msgTimestamp = new Date().toISOString();
-    const selectedModel = document.getElementById('model-select').value || '';
-    const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
-    const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
     if (!selectedReasoningEffort) {
       showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
       return;
     }
-    const selectedMode = document.getElementById('mode-select').value || 'agent';
     const titleSeed = text || (attachments[0]?.name || 'Attachment');
     clientMessageId = generateId();
     trackPendingUserMessage(clientMessageId, targetConversationId, text);
-    input.value = '';
-    autoResize(input);
-    releaseComposerFocusAfterSend(input);
     pendingUserMessageIds.add(clientMessageId);
-    appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
-    scrollBottomAfterSend();
+    if (viewingSendConversation()) {
+      input.value = '';
+      autoResize(input);
+      releaseComposerFocusAfterSend(input);
+      appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
+      scrollBottomAfterSend();
+    }
 
     const body = {
       messageId: clientMessageId,
@@ -2182,30 +2468,50 @@ export async function sendMessage() {
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,
       attachments,
-      imageTarget: imageEditTarget
+      imageTarget: draftImageEditTarget
         ? {
-            messageId: imageEditTarget.messageId,
-            imageId: imageEditTarget.imageId,
-            nodeId: imageEditTarget.nodeId,
+            messageId: draftImageEditTarget.messageId,
+            imageId: draftImageEditTarget.imageId,
+            nodeId: draftImageEditTarget.nodeId,
           }
         : undefined,
     };
 
     const r = await sendMessageApi(body);
     if (!r) {
+      // Offline: park the send in the durable outbox instead of bouncing it
+      // back into the composer. The client-generated messageId makes a replay
+      // after an ambiguous failure idempotent (the server answers 409 for a
+      // send that already landed). Only existing conversations queue — a new
+      // conversation needs the server's response to become usable.
+      if (navigator.onLine === false && targetConversationId) {
+        const queued = await enqueueOutboxRequest({
+          kind: 'message',
+          path: '/api/message',
+          body: JSON.stringify(body),
+        });
+        if (queued) {
+          void registerOutboxSync();
+          showTransientRelayNotice('You are offline. Message queued — it will send when the connection returns.', 7000);
+          if (viewingSendConversation()) clearAttachments();
+          return;
+        }
+      }
       clearPendingUserMessage(clientMessageId);
       const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
       pendingNode?.remove();
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
-      input.value = originalComposerText;
-      autoResize(input);
+      if (viewingSendConversation()) {
+        input.value = originalComposerText;
+        autoResize(input);
+      }
       void scheduleConversationDraftSave({
         conversationId: targetConversationId,
         draftText: originalComposerText,
         immediate: true,
       });
-      if (!mobileSend) input.focus();
+      if (!mobileSend && viewingSendConversation()) input.focus();
       setModelBanner('⚠️ Message could not be sent. Please try again.');
       return;
     }
@@ -2216,24 +2522,29 @@ export async function sendMessage() {
       pendingNode?.remove();
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
-      if (!mobileSend) input.focus();
+      if (!mobileSend && viewingSendConversation()) input.focus();
       showTransientRelayNotice('That message was already sent recently.');
       return;
     }
 
-    if (r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) {
+    if ((r.workspaceRootName || r.workspaceRootEntries || r.workspaceRootPath) && viewingSendConversation()) {
       updateWorkspaceRootHints(r);
       if (repoBrowserState.open && repoBrowserState.activeRoot === 'workspace') {
-        repoBrowserState.currentPath = '';
-        await window.loadRepoBrowserTree?.();
+        // Restoring refresh: if the root really changed, the restore walk
+        // finds nothing to re-open and falls back to the new root on its own.
+        window.refreshRepoBrowser?.();
       }
     }
     if (r.compactedConversationId) {
       await window.refreshConversations?.();
-      await window.openConversation?.(r.compactedConversationId);
-      clearAttachments();
-      if (!mobileSend) input.focus();
-      scrollBottomAfterSend();
+      // Only follow the auto-compact redirect while the user is still in the
+      // conversation that was compacted.
+      if (viewingSendConversation()) {
+        await window.openConversation?.(r.compactedConversationId);
+        clearAttachments();
+        if (!mobileSend) input.focus();
+        scrollBottomAfterSend();
+      }
       return;
     }
     if (r.warning) setModelBanner(`⚠️ ${r.warning}`);
@@ -2243,9 +2554,17 @@ export async function sendMessage() {
       const firstReason = String(skippedRefs[0]?.reason || 'reference skipped');
       setModelBanner(`⚠️ Some referenced images were not attached (${firstReason}).`);
     }
-    if (imageEditTarget) clearImageEditTarget();
+    // Clear only while the user still views the send conversation: a mid-await
+    // switch may have set a fresh image-edit target on the newly opened one.
+    if (draftImageEditTarget && viewingSendConversation()) clearImageEditTarget();
     if (isNew || !targetConversationId) {
-      setCurrentConv(r.conversationId);
+      // Adopt the created conversation as the current view only while the
+      // user is still on the blank view the message was sent from.
+      const adoptNewConversation = viewingSendConversation();
+      if (adoptNewConversation) {
+        setCurrentConv(r.conversationId);
+        composerConversationId = r.conversationId;
+      }
       conversations[r.conversationId] = {
         id: r.conversationId,
         title: titleSeed.slice(0, 60),
@@ -2259,12 +2578,16 @@ export async function sendMessage() {
         preferredReasoningEffort: r.preferredReasoningEffort || selectedReasoningEffort || 'none',
       };
       window.syncAutoModelAvailability?.();
-      document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
-      window.syncChatTitleControls?.();
-      updateCompactButton();
+      if (adoptNewConversation) {
+        document.getElementById('chat-title').textContent = titleSeed.slice(0, 60);
+        window.syncChatTitleControls?.();
+        updateCompactButton();
+      }
       window.renderConvList?.();
-      applyContextUsageBar(null);
-      scheduleContextUsageRefresh(r.conversationId, 0);
+      if (adoptNewConversation) {
+        applyContextUsageBar(null);
+        scheduleContextUsageRefresh(r.conversationId, 0);
+      }
     }
     if (conversations[r.conversationId]) {
       conversations[r.conversationId] = {
@@ -2289,11 +2612,13 @@ export async function sendMessage() {
         draftUpdatedByClientId: CLIENT_ID,
       });
     }
-    if (cliOnline) showThinking(r.messageId || null);
+    if (cliOnline && viewingSendConversation()) showThinking(r.messageId || null);
 
-    clearAttachments();
-    if (!mobileSend) input.focus();
-    scrollBottomAfterSend();
+    if (viewingSendConversation()) {
+      clearAttachments();
+      if (!mobileSend) input.focus();
+      scrollBottomAfterSend();
+    }
   } catch (e) {
     if (clientMessageId) {
       clearPendingUserMessage(clientMessageId);
@@ -2302,10 +2627,12 @@ export async function sendMessage() {
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
     }
-    input.value = originalComposerText;
-    autoResize(input);
+    if (viewingSendConversation()) {
+      input.value = originalComposerText;
+      autoResize(input);
+    }
     void scheduleConversationDraftSave({
-      conversationId: String(currentConvId || '').trim(),
+      conversationId: targetConversationId,
       draftText: originalComposerText,
       immediate: true,
     });
@@ -2322,8 +2649,8 @@ export function handleKey(e) {
   }
 }
 
-async function validateSelectedConversationBeforeSend() {
-  const convId = String(currentConvId || '').trim();
+async function validateSelectedConversationBeforeSend(conversationId = currentConvId) {
+  const convId = String(conversationId || '').trim();
   if (!convId) return true;
 
   const current = await loadConversationApi(convId, { limit: 1 });
@@ -2350,7 +2677,12 @@ async function validateSelectedConversationBeforeSend() {
     sdkSessionId: conversationSessionId,
     runtimeSessionId: current.runtimeSession?.id || null,
   };
-  setRepoBrowserSessionInfo(current.sessionRootPath || '', current.sessionRootName || current.title || '');
-  updateSessionPill(conversations[convId], current.runtimeSession || null);
+  // The pill and repo browser describe the conversation being viewed; if the
+  // user opened another conversation during the round trip above, applying
+  // this one's session info would clobber the new view's.
+  if (String(currentConvId || '').trim() === convId) {
+    setRepoBrowserSessionInfo(current.sessionRootPath || '', current.sessionRootName || current.title || '');
+    updateSessionPill(conversations[convId], current.runtimeSession || null);
+  }
   return true;
 }

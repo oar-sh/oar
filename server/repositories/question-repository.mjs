@@ -21,9 +21,24 @@ export function createQuestionRepository(db) {
         listActivityByQueueMessage: db.prepare(`SELECT text, subagent_run_id FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
         deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
 
-        // relay stream events
+        // relay stream events — every update carries the full text-so-far
+        // (all workers publish cumulative snapshots), so the store keeps ONE
+        // row per (queue message, subagent thread) and replaces it in place.
         getLastStreamSeqByQueueMessage: db.prepare(`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM relay_stream_events WHERE queue_message_id = ?`),
+        getStreamEventByQueueAndThread: db.prepare(`SELECT id, seq, done FROM relay_stream_events WHERE queue_message_id = ? AND subagent_run_id IS ? LIMIT 1`),
         insertStreamEvent: db.prepare(`INSERT INTO relay_stream_events (queue_message_id, response_message_id, conversation_id, relay_mode, seq, text, done, created_at, subagent_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+        updateStreamEventByQueueAndThread: db.prepare(`
+          UPDATE relay_stream_events
+          SET response_message_id = COALESCE(response_message_id, ?),
+              conversation_id = ?,
+              relay_mode = ?,
+              seq = ?,
+              text = ?,
+              done = CASE WHEN done = 1 OR ? = 1 THEN 1 ELSE 0 END,
+              created_at = ?
+          WHERE queue_message_id = ?
+            AND subagent_run_id IS ?
+        `),
         linkStreamEventsToResponse: db.prepare(`UPDATE relay_stream_events SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
         listStreamEventsByResponse: db.prepare(`SELECT seq, text, done, created_at, subagent_run_id FROM relay_stream_events WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
         listStreamEventsByQueueMessage: db.prepare(`SELECT seq, text, done, created_at, subagent_run_id FROM relay_stream_events WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
@@ -68,6 +83,19 @@ export function createQuestionRepository(db) {
           WHERE queue_message_id = ?
           ORDER BY started_at ASC, id ASC
         `),
+        // Terminal-state reconciliation: whatever ends a turn (response, fail,
+        // abort) also ends its subagent runs — nothing else ever will, and an
+        // un-reconciled row renders as a bubble stuck "running" forever.
+        listRunningSubagentRunsByQueueMessage: db.prepare(`
+          SELECT id, conversation_id, parent_subagent_id, display_name
+          FROM subagent_runs
+          WHERE queue_message_id = ? AND status = 'running'
+        `),
+        closeRunningSubagentRunsByQueueMessage: db.prepare(`
+          UPDATE subagent_runs
+          SET status = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
+          WHERE queue_message_id = ? AND status = 'running'
+        `),
         listSubagentRunsByResponse: db.prepare(`
           SELECT sr.id, sr.queue_message_id, sr.conversation_id, sr.parent_subagent_id, sr.display_name, sr.status, sr.started_at, sr.updated_at, sr.completed_at
           FROM subagent_runs sr
@@ -81,6 +109,24 @@ export function createQuestionRepository(db) {
           ORDER BY sr.started_at ASC, sr.id ASC
         `),
         deleteConvSubagentRuns: db.prepare(`DELETE FROM subagent_runs WHERE conversation_id = ?`),
+
+        // workflow runs — final digests of settled background workflows,
+        // attached to the assistant message that reports the completion.
+        // Inserted inside the /api/response finalize transaction, so rows key
+        // directly on the response message id (unlike subagent_runs, which are
+        // written before the response id exists and need queue-id resolution).
+        insertWorkflowRun: db.prepare(`
+          INSERT INTO workflow_runs (
+            id, response_message_id, conversation_id, run_index, digest_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `),
+        listWorkflowRunsByResponse: db.prepare(`
+          SELECT id, response_message_id, conversation_id, run_index, digest_json, created_at
+          FROM workflow_runs
+          WHERE response_message_id = ?
+          ORDER BY run_index ASC, id ASC
+        `),
+        deleteConvWorkflowRuns: db.prepare(`DELETE FROM workflow_runs WHERE conversation_id = ?`),
 
         // relay boards
         insertBoard: db.prepare(`INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`),

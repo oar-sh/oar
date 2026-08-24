@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  CLAUDE_ULTRACODE_EFFORT,
+  claudeUltracodeFlagSettings,
   createCanUseTool,
   normalizeClaudeEffort,
   permissionModeForRelayMode,
-  startClaudeTurn,
+  startClaudeSession,
   systemPromptForRelayMode,
 } from './claude-sdk-adapter.mjs';
 
@@ -25,14 +27,14 @@ test('ask and autopilot get a system prompt append; plan and agent do not', () =
   assert.equal(systemPromptForRelayMode('agent').preset, 'claude_code');
 });
 
-test('startClaudeTurn builds streaming-input query options', async () => {
+test('startClaudeSession builds streaming-input query options', async () => {
   let captured = null;
   const queryImpl = (params) => {
     captured = params;
     return { async* [Symbol.asyncIterator]() {} };
   };
   const abortController = new AbortController();
-  const turn = startClaudeTurn({
+  const turn = startClaudeSession({
     content: [{ type: 'text', text: 'hi' }],
     cwd: '/workspace',
     model: 'claude-sonnet-5',
@@ -53,23 +55,27 @@ test('startClaudeTurn builds streaming-input query options', async () => {
   assert.equal(captured.options.abortController, abortController);
   assert.equal(typeof captured.options.canUseTool, 'function');
 
-  // The prompt stream yields exactly one user message with the given content,
-  // then stays open (gated) until endInput releases it.
+  // The prompt stream carries the initial content, accepts pushed follow-up
+  // turns, and only ends when endInput releases it.
   assert.equal(typeof turn.endInput, 'function');
+  assert.equal(typeof turn.pushUserMessage, 'function');
   const messages = [];
   const drained = (async () => {
     for await (const message of captured.prompt) messages.push(message);
   })();
+  turn.pushUserMessage([{ type: 'text', text: 'follow-up' }]);
   turn.endInput();
   await drained;
-  assert.equal(messages.length, 1);
+  assert.equal(messages.length, 2);
   assert.equal(messages[0].type, 'user');
   assert.deepEqual(messages[0].message.content, [{ type: 'text', text: 'hi' }]);
+  assert.deepEqual(messages[1].message.content, [{ type: 'text', text: 'follow-up' }]);
+  assert.throws(() => turn.pushUserMessage([{ type: 'text', text: 'late' }]), /ended/);
 });
 
-test('startClaudeTurn omits model for auto and resume when empty', () => {
+test('startClaudeSession omits model for auto and resume when empty', () => {
   let captured = null;
-  startClaudeTurn({
+  startClaudeSession({
     content: [{ type: 'text', text: 'hi' }],
     cwd: '/workspace',
     model: 'auto',
@@ -93,14 +99,23 @@ test('canUseTool bridges AskUserQuestion answers into updatedInput', async () =>
   assert.deepEqual(result.updatedInput.questions, input.questions);
 });
 
-test('canUseTool posts plan board on ExitPlanMode and allows', async () => {
+test('canUseTool posts plan board on ExitPlanMode and denies so the turn ends', async () => {
   let planInput = null;
   const canUseTool = createCanUseTool({
     onExitPlanMode: async (input) => { planInput = input; },
   });
   const result = await canUseTool('ExitPlanMode', { plan: '1. do\n2. done' }, {});
-  assert.equal(result.behavior, 'allow');
+  // Allowing ExitPlanMode approves the plan and the same turn implements it;
+  // deny ends the turn so the plan board's choice drives the next turn.
+  assert.equal(result.behavior, 'deny');
+  assert.match(result.message, /review/i);
   assert.deepEqual(planInput, { plan: '1. do\n2. done' });
+});
+
+test('canUseTool allows ExitPlanMode untouched when no board handler is wired', async () => {
+  const canUseTool = createCanUseTool({});
+  const result = await canUseTool('ExitPlanMode', { plan: '1. do' }, {});
+  assert.equal(result.behavior, 'allow');
 });
 
 test('canUseTool allows every other tool (allow-all parity)', async () => {
@@ -125,7 +140,7 @@ test('canUseTool denies when the bridge fails', async () => {
 test('reasoning effort maps onto the SDK effort option per turn', () => {
   let captured = null;
   const queryImpl = (params) => { captured = params; return {}; };
-  startClaudeTurn({
+  startClaudeSession({
     content: [{ type: 'text', text: 'hi' }],
     cwd: '/workspace',
     reasoningEffort: 'xhigh',
@@ -137,7 +152,7 @@ test('reasoning effort maps onto the SDK effort option per turn', () => {
 test('none/invalid reasoning effort omits the effort option (SDK default)', () => {
   for (const value of ['none', '', 'auto', 'bogus']) {
     let captured = null;
-    startClaudeTurn({
+    startClaudeSession({
       content: [{ type: 'text', text: 'hi' }],
       cwd: '/workspace',
       reasoningEffort: value,
@@ -147,11 +162,62 @@ test('none/invalid reasoning effort omits the effort option (SDK default)', () =
   }
 });
 
-test('normalizeClaudeEffort accepts exactly the SDK effort ladder', () => {
-  for (const value of ['low', 'medium', 'high', 'xhigh', 'max']) {
+test('normalizeClaudeEffort accepts the SDK effort ladder plus the ultracode sentinel', () => {
+  for (const value of ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']) {
     assert.equal(normalizeClaudeEffort(value), value);
     assert.equal(normalizeClaudeEffort(value.toUpperCase()), value);
   }
   assert.equal(normalizeClaudeEffort('none'), '');
   assert.equal(normalizeClaudeEffort('extreme'), '');
+});
+
+test('ultracode spawns as xhigh effort plus the session-scoped settings flags', () => {
+  let captured = null;
+  startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/workspace',
+    reasoningEffort: CLAUDE_ULTRACODE_EFFORT,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  // 'ultracode' is not an EffortLevel — the CLI schema would silently drop it.
+  assert.equal(captured.options.effort, 'xhigh');
+  assert.deepEqual(captured.options.settings, { ultracode: true, enableWorkflows: true });
+});
+
+test('non-ultracode spawns pass no settings layer', () => {
+  for (const value of ['xhigh', 'max', 'none', '']) {
+    let captured = null;
+    startClaudeSession({
+      content: [{ type: 'text', text: 'hi' }],
+      cwd: '/workspace',
+      reasoningEffort: value,
+      queryImpl: (params) => { captured = params; return {}; },
+    });
+    assert.equal('settings' in captured.options, false, `settings should be omitted for "${value}"`);
+  }
+});
+
+test('claudeUltracodeFlagSettings translates the sentinel both ways', () => {
+  assert.deepEqual(
+    claudeUltracodeFlagSettings(CLAUDE_ULTRACODE_EFFORT),
+    { ultracode: true, enableWorkflows: true, effortLevel: 'xhigh' },
+  );
+  assert.deepEqual(
+    claudeUltracodeFlagSettings('medium'),
+    { ultracode: null, enableWorkflows: null, effortLevel: 'medium' },
+  );
+  // Effort 'none' (normalized to '') resets the flag layer entirely.
+  assert.deepEqual(
+    claudeUltracodeFlagSettings(''),
+    { ultracode: null, enableWorkflows: null, effortLevel: null },
+  );
+});
+
+test('canUseTool tells the model to restate the plan when no board was surfaced', async () => {
+  const canUseTool = createCanUseTool({
+    onExitPlanMode: async () => false,
+  });
+  const result = await canUseTool('ExitPlanMode', { plan: '' }, {});
+  assert.equal(result.behavior, 'deny');
+  assert.match(result.message, /Restate the complete plan/);
 });

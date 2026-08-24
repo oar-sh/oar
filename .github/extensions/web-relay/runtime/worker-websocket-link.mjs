@@ -41,6 +41,9 @@ export function createWorkerWebSocketLink({
   token,
   dbg = () => {},
   onDeliver = async () => {},
+  // Fire-and-forget control pushes from the server (e.g. stop a background
+  // task). Never blocks delivery; failures are the handler's to log.
+  onControl = () => {},
   getSessionReady = () => false,
   getSessionId = () => null,
   getPid = () => null,
@@ -254,6 +257,14 @@ export function createWorkerWebSocketLink({
         void notifyReady("queue-changed");
         return;
       }
+      if (payload?.type === "worker.control") {
+        try {
+          void onControl(payload.control || null);
+        } catch (error) {
+          dbg("worker ws control handler failed", error?.message || String(error));
+        }
+        return;
+      }
       if (payload?.type === "queue.blocked") {
         dbg("worker ws blocked", payload.reason || "blocked");
       }
@@ -286,7 +297,9 @@ export function createWorkerWebSocketLink({
   }
 
   function status() {
-    const connected = !!ws && ws.readyState === ws.OPEN;
+    // Some WebSocket implementations expose OPEN only on the constructor —
+    // the same reason every other check here goes through the resolver.
+    const connected = !!ws && ws.readyState === resolveSocketStateValue(ws, "OPEN", 1);
     return {
       connected,
       delivering: !!deliveryInFlight,

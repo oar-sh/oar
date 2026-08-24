@@ -136,6 +136,7 @@
     try {
       __clearLegacyClientAuthCookie();
       const response = await fetch(`${__APP_BASE}/api/status`, {
+        signal: AbortSignal.timeout?.(15000),
         headers: { Authorization: `Bearer ${token}` },
       });
       if (response.ok) {
@@ -237,6 +238,17 @@
     --conversation-title-ready: #3fb950;
     --conversation-title-question: #f85149;
     --conversation-title-error: #d29922;
+    /* Relay reachability tones, shared by the sidebar dot and the mobile
+       burger bars so the two indicators cannot drift apart. */
+    --relay-tone-offline: #6e7681;
+    --relay-tone-online: #3fb950;
+    --relay-tone-tunnelled: #d29922;
+    --provider-github: #58a6ff;
+    --provider-openai: #56d4a0;
+    --provider-openai-image: #d98cc4;
+    --provider-claude: #e0855a;
+    --provider-cursor: #a78bfa;
+    --provider-grok: #e879f9;
     --viewport-top-offset: 0px;
     --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     --chat-header-top-base-desktop: 14px;
@@ -292,6 +304,12 @@
     --conversation-title-ready: #1a7f37;
     --conversation-title-question: #cf222e;
     --conversation-title-error: #9a6700;
+    --provider-github: #0969da;
+    --provider-openai: #0f8a63;
+    --provider-openai-image: #a3468b;
+    --provider-claude: #b4531f;
+    --provider-cursor: #6b3fd4;
+    --provider-grok: #a21caf;
     --inline-code-bg: #eff1f3;
   }
   :root {
@@ -466,40 +484,28 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
-  #provider-status-pill {
-    display: inline-flex;
-    align-items: center;
-    min-height: 24px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 2px 8px;
-    color: var(--muted);
-    background: var(--bg3);
-    font-size: var(--fs-meta-xs);
-    font-weight: 600;
-    white-space: nowrap;
-  }
-  #provider-status-pill[data-provider="openai"] {
-    color: #56d4a0;
-    border-color: rgba(86, 212, 160, 0.45);
-    background: rgba(86, 212, 160, 0.1);
-  }
   #cli-dot {
     width: 12px;
     height: 12px;
     border-radius: 50%;
     flex-shrink: 0;
     transition: background 0.2s ease, box-shadow 0.2s ease;
-    background: #6e7681;
+    background: var(--relay-tone-offline);
     box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.08);
   }
   #cli-dot.online {
-    background: #3fb950;
+    background: var(--relay-tone-online);
     box-shadow: 0 0 0 1px rgba(63, 185, 80, 0.42), 0 0 8px rgba(63, 185, 80, 0.35);
   }
   #cli-dot.offline {
-    background: #6e7681;
+    background: var(--relay-tone-offline);
     box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.08);
+  }
+  /* Reachable over Cloudflare Tunnel: amber, between the green "reachable" and
+     a warning colour, so internet exposure is visible at a glance. */
+  #cli-dot.online.tunnelled {
+    background: var(--relay-tone-tunnelled);
+    box-shadow: 0 0 0 1px rgba(210, 153, 34, 0.42), 0 0 8px rgba(210, 153, 34, 0.35);
   }
 
   #new-conv-btn {
@@ -598,20 +604,46 @@
   .conv-item:hover { background: var(--bg3); }
   .conv-item.active { background: var(--bg3); border-color: var(--border); }
   .conv-title { font-size: var(--fs-meta-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
-  .conv-meta  { font-size: var(--fs-meta-xs); color: var(--muted); margin-top: 2px; padding-right: 24px; }
+  .conv-meta  {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    margin-top: 2px;
+    padding-right: 24px;
+  }
+  /* The date/count text yields first so the provider chip never wraps onto its
+     own line once every conversation carries one. */
+  .conv-meta-primary {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The pill tints its border/background from its own text colour, so the
+     per-provider rules below only have to set `color` and stay in step with the
+     composer's session-lock note. */
   .conv-provider-indicator {
     display: inline-flex;
     align-items: center;
-    padding: 0 6px;
+    flex: 0 0 auto;
+    padding: 0 5px;
     border-radius: 999px;
-    border: 1px solid rgba(88, 166, 255, 0.4);
-    background: rgba(88, 166, 255, 0.14);
+    border: 1px solid color-mix(in srgb, currentColor 40%, transparent);
+    background: color-mix(in srgb, currentColor 14%, transparent);
     color: var(--accent);
     font-size: var(--fs-ui-chip);
     font-weight: 600;
     line-height: 1.25;
     vertical-align: middle;
   }
+  .conv-provider-indicator[data-provider="github"] { color: var(--provider-github); }
+  .conv-provider-indicator[data-provider="openai"] { color: var(--provider-openai); }
+  .conv-provider-indicator[data-provider="openai-image"] { color: var(--provider-openai-image); }
+  .conv-provider-indicator[data-provider="claude"] { color: var(--provider-claude); }
+  .conv-provider-indicator[data-provider="cursor"] { color: var(--provider-cursor); }
+  .conv-provider-indicator[data-provider="grok"] { color: var(--provider-grok); }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
   .conv-item.worker-ui-ready .conv-title,
@@ -1421,6 +1453,12 @@
     overflow-wrap: anywhere;
     word-break: break-word;
   }
+  /* Persisted "Finished background task" cards under an assistant message:
+     they ride the .msg-activity fold chrome and the composer panel's
+     .bg-task-tree classes; only the panel's row-alignment indent needs
+     undoing inside a message bubble. */
+  .msg-workflow-run .bg-task-tree { margin: 6px 0 2px 10px; }
+  .msg-workflow-run .bg-task-tree:empty { display: none; }
   /* ── Agent thoughts (reasoning) ── */
   .thinking-thought {
     min-width: 0;
@@ -1596,6 +1634,153 @@
     word-break: break-word;
   }
 
+  /* ── Plan usage modal ──
+     Shares the context-usage bar/table vocabulary so the two modals read as
+     one family, but leads with per-provider plan cards. */
+  .plan-usage { display: flex; flex-direction: column; gap: 16px; }
+  .plan-usage-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    background: var(--bg2);
+  }
+  .plan-usage-card[data-status="unavailable"],
+  .plan-usage-card[data-status="not-configured"] { opacity: 0.72; }
+  .plan-usage-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .plan-usage-card-title { font-size: 1rem; font-weight: 600; }
+  .plan-usage-badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .plan-usage-badge {
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    white-space: nowrap;
+  }
+  .plan-usage-badge-plan { color: var(--accent); border-color: var(--accent); }
+  .plan-usage-badge-status { color: var(--warn); border-color: var(--warn); }
+  .plan-usage-message {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 10px;
+    line-height: 1.45;
+  }
+  .plan-usage-meter { margin-bottom: 12px; }
+  .plan-usage-meter-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 5px;
+  }
+  .plan-usage-meter-label {
+    font-size: 0.88rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .plan-usage-meter-secondary .plan-usage-meter-label { font-weight: 500; font-size: 0.82rem; }
+  .plan-usage-flag {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 6px;
+  }
+  .plan-usage-meter-pct {
+    font-size: 0.88rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .plan-usage-bar {
+    width: 100%;
+    height: 10px;
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--bg3);
+  }
+  .plan-usage-meter-secondary .plan-usage-bar { height: 6px; border-radius: 3px; }
+  .plan-usage-bar-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    transition: width 0.25s ease, background 0.25s ease;
+  }
+  .plan-usage-bar-unknown {
+    background-image: repeating-linear-gradient(
+      45deg, rgba(255, 255, 255, 0.12) 0 6px, transparent 6px 12px
+    );
+  }
+  .plan-usage-meter-meta,
+  .plan-usage-meter-note {
+    font-size: 0.76rem;
+    color: var(--muted);
+    margin-top: 5px;
+    line-height: 1.4;
+  }
+  .plan-usage-secondary {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin-top: 4px;
+  }
+  .plan-usage-details {
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+    margin-top: 8px;
+    font-size: 0.82rem;
+  }
+  .plan-usage-details summary {
+    cursor: pointer;
+    outline: none;
+    color: var(--muted);
+    padding: 2px 0;
+  }
+  .plan-usage-details summary:hover { color: var(--text); }
+  .plan-usage-detail-note {
+    font-size: 0.74rem;
+    color: var(--muted);
+    margin: 6px 0 2px;
+    line-height: 1.4;
+  }
+  .plan-usage-detail-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  .plan-usage-detail-table td { padding: 5px 2px; border-bottom: 1px solid var(--border); }
+  .plan-usage-detail-table tr:last-child td { border-bottom: none; }
+  .plan-usage-detail-label { display: flex; flex-direction: column; gap: 2px; }
+  .plan-usage-detail-hint { font-size: 0.7rem; color: var(--muted); }
+  .plan-usage-detail-value {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    vertical-align: top;
+  }
+  .plan-usage-card-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    font-size: 0.74rem;
+    color: var(--muted);
+  }
+  .plan-usage-link { color: var(--accent); text-decoration: none; }
+  .plan-usage-link:hover { text-decoration: underline; }
+  @media (prefers-reduced-motion: reduce) {
+    .plan-usage-bar-fill { transition: none; }
+  }
+
   #attachment-preview {
     display: none; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
   }
@@ -1650,6 +1835,47 @@
     border: none; border-radius: 999px; background: rgba(0,0,0,0.65); color: var(--text);
     cursor: pointer; line-height: 22px; font-size: var(--fs-meta-md);
   }
+  .attachment-preview-status {
+    position: absolute; inset: 0 0 26px 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.55);
+    border: none; padding: 0; margin: 0;
+    color: var(--text); font-size: var(--fs-meta-md);
+  }
+  .attachment-preview-status-error {
+    cursor: pointer; color: var(--warn); font-size: 18px;
+    background: rgba(45, 26, 0, 0.75);
+  }
+  .attachment-preview-error { border-color: var(--warn); }
+  .attachment-preview-spinner {
+    width: 18px; height: 18px; border-radius: 999px;
+    border: 2px solid rgba(255,255,255,0.25); border-top-color: var(--text);
+    animation: attachment-spin 0.7s linear infinite;
+  }
+  @keyframes attachment-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .attachment-preview-spinner { animation-duration: 2.4s; }
+  }
+  #input-area.composer-dropzone-active {
+    outline: 2px dashed var(--accent);
+    outline-offset: -4px;
+    border-radius: 10px;
+  }
+  #input-area.composer-dropzone-active::after {
+    content: 'Drop files to attach';
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.45);
+    color: var(--text); font-size: var(--fs-meta-md);
+    pointer-events: none; border-radius: 10px; z-index: 5;
+  }
+  #composer-attachment-warning {
+    margin-bottom: 8px; padding: 6px 10px;
+    border: 1px solid var(--warn); border-radius: 8px;
+    background: rgba(210, 153, 34, 0.15);
+    color: var(--warn); font-size: var(--fs-meta-sm); text-align: center;
+  }
+  #composer-attachment-warning[hidden] { display: none; }
   #offline-banner {
     display: none; background: #2d1a00; border: 1px solid var(--warn); color: var(--warn);
     border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; font-size: var(--fs-meta-sm); text-align: center;
@@ -1695,10 +1921,16 @@
   #model-metadata-retry-btn:hover { background: rgba(210, 153, 34, 0.2); }
   #model-lock-note {
     margin-bottom: 6px;
-    color: #56d4a0;
+    color: var(--muted);
     font-size: var(--fs-meta-sm);
     font-weight: 600;
   }
+  #model-lock-note[data-provider="github"] { color: var(--provider-github); }
+  #model-lock-note[data-provider="openai"] { color: var(--provider-openai); }
+  #model-lock-note[data-provider="openai-image"] { color: var(--provider-openai-image); }
+  #model-lock-note[data-provider="claude"] { color: var(--provider-claude); }
+  #model-lock-note[data-provider="cursor"] { color: var(--provider-cursor); }
+  #model-lock-note[data-provider="grok"] { color: var(--provider-grok); }
   #model-select:disabled,
   #reasoning-effort-select:disabled {
     opacity: 0.55;
@@ -1802,6 +2034,93 @@
   #model-select:focus,
   #reasoning-effort-select:focus,
   #context-tier-select:focus { border-color: var(--accent); }
+  /* Live background-task fold above the composer. The summary reuses the
+     relay tones so its running state matches the sidebar dot / burger bars. */
+  #background-tasks-panel {
+    margin-bottom: 8px; color: var(--muted); font-size: var(--fs-meta-sm);
+    border: 1px solid var(--border); border-radius: 12px; padding: 6px 10px;
+    background: var(--bg3);
+  }
+  #background-tasks-panel[hidden] { display: none; }
+  #background-tasks-summary {
+    cursor: pointer; color: var(--text); width: fit-content;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .bg-task-spinner {
+    width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+    background: var(--relay-tone-online);
+    box-shadow: 0 0 0 1px rgba(63, 185, 80, 0.42), 0 0 8px rgba(63, 185, 80, 0.35);
+    animation: bg-task-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes bg-task-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .bg-task-row {
+    display: flex; align-items: center; gap: 10px; margin-top: 8px;
+    padding: 6px 8px; border-radius: 8px; background: var(--bg2);
+  }
+  .bg-task-icon { flex-shrink: 0; }
+  .bg-task-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  /* The kind badge and the status cluster live in their own right-hand column
+     (badge above tokens/elapsed/Stop) so the badge cannot float mid-row when
+     the wrapped description spans two lines. */
+  .bg-task-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+  .bg-task-side-status { display: flex; align-items: center; gap: 10px; }
+  /* Mobile readability: bounded wrapping instead of single-line ellipsis.
+     Long text clamps to two lines so the tail (the part that distinguishes
+     one task/agent from another) stays on screen instead of hiding in "…". */
+  .bg-task-desc, .bg-task-detail, .bg-task-tree-log, .bg-task-agent-label {
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; overflow-wrap: anywhere;
+  }
+  .bg-task-desc { color: var(--text); }
+  .bg-task-badge {
+    flex-shrink: 0; border: 1px solid var(--border); border-radius: 999px;
+    padding: 0 7px; font-size: var(--fs-meta-sm); color: var(--muted);
+    background: var(--bg3); white-space: nowrap;
+  }
+  .bg-task-detail { color: var(--muted); font-size: var(--fs-meta-sm); }
+  .bg-task-tokens { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .bg-task-elapsed { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .bg-task-stop {
+    flex-shrink: 0; background: transparent; border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 3px 10px; cursor: pointer;
+    font-size: var(--fs-meta-sm);
+  }
+  .bg-task-stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
+  .bg-task-stop:disabled { opacity: 0.5; cursor: default; }
+  /* Workflow progress tree: fold chevron on the row, then an indented block of
+     narrator logs, phase headers and compact per-agent lines. */
+  .bg-task-fold {
+    flex-shrink: 0; background: transparent; border: none; cursor: pointer;
+    color: var(--muted); padding: 0 2px; font-size: var(--fs-meta-sm); line-height: 1;
+  }
+  .bg-task-fold:hover { color: var(--text); }
+  .bg-task-tree {
+    display: flex; flex-direction: column; gap: 2px;
+    margin: 4px 0 2px 34px; font-size: var(--fs-meta-sm); color: var(--muted);
+  }
+  .bg-task-tree[hidden] { display: none; }
+  .bg-task-tree-log { opacity: 0.8; }
+  .bg-task-tree-phase { color: var(--text); margin-top: 2px; }
+  /* Two-line agent rows: label line (clamped), then a short muted metrics
+     line below it that also carries the running agent's live activity as its
+     last segment — outside the clamp, so a long label can never hide it. */
+  .bg-task-tree-agent {
+    display: flex; align-items: flex-start; gap: 6px; margin-left: 12px; min-width: 0;
+  }
+  .bg-task-agent-state { flex-shrink: 0; }
+  .bg-task-agent-state-running { animation: bg-task-pulse 1.6s ease-in-out infinite; }
+  .bg-task-agent-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .bg-task-agent-activity { opacity: 0.8; }
+  .bg-task-agent-meta {
+    opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .bg-task-tree-omitted { margin-left: 12px; }
+  .msg-continuation {
+    background: rgba(63, 185, 80, 0.12); color: var(--relay-tone-online);
+    border-radius: 6px; padding: 0 6px; font-size: var(--fs-meta-sm);
+  }
+  body.shared-reader-mode #background-tasks-panel { display: none; }
   #model-pricing-details {
     display: none; margin-top: 6px; color: var(--muted); font-size: var(--fs-meta-sm);
   }
@@ -1819,6 +2138,65 @@
   #mode-select:focus { border-color: var(--accent); }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   #send-btn:not(:disabled):hover { opacity: 0.85; }
+
+  /* Shared reader composer: only the read-only input plus the GitHub pill. */
+  #shared-github-pill { display: none; }
+  body.shared-reader-mode #emoji-btn,
+  body.shared-reader-mode #mode-select,
+  body.shared-reader-mode #model-select,
+  body.shared-reader-mode #repo-browser-desktop-btn,
+  body.shared-reader-mode #repo-browser-input-btn,
+  body.shared-reader-mode #attach-btn,
+  body.shared-reader-mode #context-tier-select,
+  body.shared-reader-mode #reasoning-effort-select,
+  body.shared-reader-mode #send-btn,
+  body.shared-reader-mode #model-lock-note,
+  body.shared-reader-mode #model-pricing-details {
+    display: none !important;
+  }
+  body.shared-reader-mode .input-row {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 10px;
+  }
+  body.shared-reader-mode #msg-input {
+    min-height: 46px;
+    height: 46px;
+    max-height: 46px;
+  }
+  body.shared-reader-mode #shared-github-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 46px;
+    padding: 0 18px;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg3);
+    color: var(--text);
+    font-weight: 700;
+    font-size: var(--fs-core-control);
+    text-decoration: none;
+    transition: color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  }
+  body.shared-reader-mode #shared-github-pill svg {
+    width: 20px;
+    height: 20px;
+    fill: currentColor;
+    transition: transform 0.18s ease;
+  }
+  body.shared-reader-mode #shared-github-pill:hover,
+  body.shared-reader-mode #shared-github-pill:focus-visible {
+    color: var(--accent);
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+  }
+  body.shared-reader-mode #shared-github-pill:hover svg {
+    transform: rotate(-10deg) scale(1.12);
+  }
 
   .workspace-file-link { text-decoration: underline; }
   .workspace-file-link:hover { opacity: 0.9; }
@@ -1946,7 +2324,10 @@
     object-fit: contain;
     border-radius: 6px;
     transform-origin: center center;
-    will-change: transform;
+    /* No will-change: transform here. It promotes the image to its own GPU
+       layer that is rasterised once at layout size, so zooming magnified that
+       raster instead of resampling the full-resolution source. Zoom now changes
+       layout size (see _applyImgZoom), which needs a normal repaint. */
     pointer-events: none;
     display: block;
     user-select: none;
@@ -2021,11 +2402,22 @@
   }
   #new-conversation-provider-select,
   #new-conversation-model-select,
-  #new-conversation-reasoning-select {
+  #new-conversation-reasoning-select,
+  #new-conversation-cwd-select,
+  #new-conversation-cwd-manual {
     width: 100%;
     min-height: 42px;
     margin-top: 8px;
   }
+  #new-conversation-cwd-manual {
+    box-sizing: border-box;
+    padding: 0 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+  }
+  #new-conversation-cwd-manual[hidden] { display: none; }
   .tmux-inspector-dialog {
     width: min(1120px, 100%);
     height: min(80vh, 760px);
@@ -2581,6 +2973,263 @@
     padding: 8px 6px;
   }
 
+  #git-changes-modal,
+  #git-diff-modal {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.68);
+    padding: 18px;
+  }
+  #git-changes-modal { z-index: 10500; }
+  #git-diff-modal { z-index: 10800; }
+  #git-changes-modal.visible,
+  #git-diff-modal.visible { display: flex; }
+  .git-changes-dialog {
+    width: min(760px, 100%);
+    max-height: min(88vh, 860px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .git-diff-dialog {
+    width: min(1100px, 100%);
+    max-height: min(90vh, 900px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .git-changes-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+    flex-wrap: wrap;
+  }
+  .git-changes-title {
+    font-size: var(--fs-meta-md);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .git-diff-title {
+    font-size: var(--fs-meta-md);
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .git-changes-branch-wrap {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+  }
+  .git-changes-branch {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: var(--fs-meta-sm);
+    white-space: nowrap;
+  }
+  .git-changes-meta {
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-changes-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+  }
+  .git-changes-btn {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 8px;
+    height: 30px;
+    padding: 0 10px;
+    font-size: var(--fs-meta-sm);
+    cursor: pointer;
+  }
+  .git-changes-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .git-changes-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .git-changes-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .git-changes-close {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: var(--fs-ui-icon);
+    cursor: pointer;
+    line-height: 1;
+    padding: 2px 6px;
+  }
+  .git-changes-close:hover { color: var(--text); }
+  .git-changes-notice {
+    padding: 8px 14px;
+    font-size: var(--fs-meta-sm);
+    color: var(--muted);
+    border-bottom: 1px dashed var(--border);
+  }
+  .git-changes-notice.error { color: var(--danger); }
+  .git-changes-list {
+    flex: 1;
+    min-height: 240px;
+    overflow: auto;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .git-changes-empty {
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    padding: 10px 6px;
+  }
+  .git-changes-file {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    border-radius: 10px;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+    padding: 4px 12px;
+    min-width: 0;
+  }
+  .git-changes-file:hover { border-color: var(--accent); }
+  .git-changes-file-status {
+    flex: 0 0 auto;
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    font-size: var(--fs-meta-xs);
+    font-weight: 700;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .git-changes-file-status.status-M,
+  .git-changes-file-status.status-T { color: var(--warn); border-color: var(--warn); }
+  .git-changes-file-status.status-A,
+  .git-changes-file-status.status-U { color: var(--success); border-color: var(--success); }
+  .git-changes-file-status.status-D { color: var(--danger); border-color: var(--danger); }
+  .git-changes-file-status.status-R,
+  .git-changes-file-status.status-C { color: var(--accent); border-color: var(--accent); }
+  .git-changes-file-text {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    min-width: 0;
+    line-height: 1.3;
+  }
+  .git-changes-file-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-sm);
+    color: var(--text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-changes-file-name.deleted {
+    text-decoration: line-through;
+    color: var(--muted);
+  }
+  .git-changes-file-dir {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-changes-file-orig {
+    font-size: var(--fs-meta-xs);
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-diff-body {
+    flex: 1;
+    min-height: 240px;
+    overflow: auto;
+    background: var(--bg);
+  }
+  .git-diff-lines {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-sm);
+    line-height: 1.45;
+    min-width: max-content;
+    padding: 6px 0 14px;
+  }
+  .git-diff-line {
+    display: flex;
+    align-items: stretch;
+    white-space: pre;
+  }
+  .git-diff-gutter {
+    flex: 0 0 44px;
+    text-align: right;
+    padding: 0 8px 0 4px;
+    color: var(--muted);
+    user-select: none;
+    border-right: 1px solid var(--border);
+    font-size: var(--fs-meta-xs);
+    line-height: inherit;
+  }
+  .git-diff-text {
+    padding: 0 12px 0 8px;
+  }
+  .git-diff-line.add { background: rgba(63, 185, 80, 0.14); }
+  .git-diff-line.add .git-diff-text { color: var(--success); }
+  .git-diff-line.del { background: rgba(248, 81, 73, 0.14); }
+  .git-diff-line.del .git-diff-text { color: var(--danger); }
+  .git-diff-line.gap {
+    color: var(--muted);
+    font-style: italic;
+    background: var(--bg2);
+  }
+  @media (max-width: 700px) {
+    #git-changes-modal,
+    #git-diff-modal { padding: 8px; }
+    .git-changes-dialog,
+    .git-diff-dialog { max-height: 96dvh; }
+  }
+
   #repo-browser-fab {
     display: none;
     position: fixed;
@@ -2710,6 +3359,7 @@
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+    overscroll-behavior: contain;
     padding: 8px;
     min-width: 0;
   }
@@ -2752,6 +3402,7 @@
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+    overscroll-behavior: contain;
     padding: 10px;
     min-width: 0;
   }
@@ -2914,6 +3565,11 @@
   .msg-usage-stale {
     color: var(--warn);
   }
+  .msg-provider-mismatch {
+    display: inline-block; font-size: var(--fs-ui-chip); background: rgba(248, 81, 73, 0.12);
+    border: 1px solid var(--danger, #f85149); border-radius: 4px; padding: 0 5px;
+    color: var(--danger, #f85149); margin-left: 4px; vertical-align: middle;
+  }
 
   .relay-question-card {
     background: rgba(88, 166, 255, 0.06);
@@ -3059,6 +3715,10 @@
     padding: 12px 14px;
     display: grid;
     gap: 10px;
+    /* Grid items default to min-width:auto, so a wide <pre> or a long
+       unbreakable token would blow the track past the container's max-width
+       and overflow horizontally. Pin to 0 so children wrap/scroll instead. */
+    min-width: 0;
   }
   .relay-board-head {
     display: flex;
@@ -3072,6 +3732,19 @@
     color: var(--text);
     white-space: normal;
     word-break: break-word;
+    min-width: 0;
+  }
+  /* Mirror the .msg-bubble wrapping rules so plan/board cards read the same as
+     speech bubbles: constrain every descendant to the card width and wrap long
+     content, but let code blocks scroll horizontally inside the card. */
+  .relay-board-body * { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+  .relay-board-body pre { overflow-x: auto; max-width: 100%; }
+  .relay-board-body pre,
+  .relay-board-body pre *,
+  .relay-board-body pre code,
+  .relay-board-body pre code * {
+    overflow-wrap: normal;
+    word-break: normal;
   }
   .relay-board-actions {
     display: flex;
@@ -3223,11 +3896,6 @@
     #chat-header-actions {
       margin-left: auto;
     }
-    #provider-status-pill {
-      max-width: 116px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
     #pending-question-banner {
       order: 4;
       flex: 0 0 auto;
@@ -3271,6 +3939,22 @@
       order: 1;
       font-size: 1.05rem;
       padding: 2px 6px;
+      transition: color 0.2s ease, text-shadow 0.2s ease;
+    }
+    /* The relay dot rides in the sidebar, which is off-canvas here, so the
+       burger's bars carry the relay tone instead. Only the glyph is dyed —
+       the button keeps its usual chrome. The ID+attribute selectors outrank
+       .header-icon-btn:hover, which mobile browsers leave stuck after a tap. */
+    #sidebar-toggle[data-relay-tone="offline"] {
+      color: var(--relay-tone-offline);
+    }
+    #sidebar-toggle[data-relay-tone="online"] {
+      color: var(--relay-tone-online);
+      text-shadow: 0 0 8px rgba(63, 185, 80, 0.35);
+    }
+    #sidebar-toggle[data-relay-tone="tunnelled"] {
+      color: var(--relay-tone-tunnelled);
+      text-shadow: 0 0 8px rgba(210, 153, 34, 0.35);
     }
     #chat-title-wrap { order: 2; }
     #chat-header-actions { order: 3; }
@@ -3286,16 +3970,6 @@
     }
     #pending-question-banner { font-size: var(--fs-ui-chip); padding: 3px 8px; }
     .header-icon-btn { width: 30px; height: 30px; border-radius: 8px; font-size: var(--fs-ui-icon); }
-    #provider-status-pill {
-      width: 9px;
-      min-width: 9px;
-      min-height: 9px;
-      height: 9px;
-      padding: 0;
-      border-radius: 50%;
-      color: transparent;
-      font-size: 0;
-    }
     #chat-actions-menu { min-width: 200px; }
     /* Slightly taller than desktop so the tap target barely changes; the row
        pitch still drops from 36px to 32px thanks to the tighter menu gap. */
@@ -3456,7 +4130,7 @@
     }
     .new-conversation-model-dialog {
       height: auto;
-      max-height: min(520px, calc(var(--app-height) - 16px));
+      max-height: min(640px, calc(var(--app-height) - 16px));
     }
     .summary-modal-actions {
       justify-content: stretch;
@@ -3671,7 +4345,6 @@
         </form>
       </div>
       <div id="chat-header-actions">
-        <span id="provider-status-pill" data-provider="github" title="GitHub Copilot is active">GitHub Copilot</span>
         <button id="message-search-btn" class="header-icon-btn" onclick="openMessageSearchModal()" title="Search messages" aria-label="Search messages">🔍</button>
         <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
         <div id="chat-actions-menu-wrap">
@@ -3688,6 +4361,7 @@
             <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
+            <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
             <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
@@ -3714,8 +4388,13 @@
         <button type="button" id="model-metadata-retry-btn">Refresh models</button>
       </div>
       <div id="attachment-preview"></div>
+      <div id="composer-attachment-warning" role="status" aria-live="polite" hidden></div>
       <div id="image-edit-target" aria-live="polite"></div>
       <div id="emoji-popup" aria-hidden="true"></div>
+      <details id="background-tasks-panel" hidden>
+        <summary id="background-tasks-summary"></summary>
+        <div id="background-tasks-list"></div>
+      </details>
       <div class="input-row">
         <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">
         <button id="emoji-btn" onclick="toggleEmojiPicker()" title="Emoji picker (Tip: Win + .)">🙂</button>
@@ -3739,6 +4418,10 @@
           <option value="">Unavailable</option>
         </select>
         <button id="send-btn" onclick="sendMessage()">Send</button>
+        <a id="shared-github-pill" href="https://github.com/materia79/copilot-remote" target="_blank" rel="noopener" aria-label="Fork copilot-remote on GitHub">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          <span>Fork on GitHub</span>
+        </a>
       </div>
       <details id="model-pricing-details">
         <summary id="model-pricing-summary"></summary>
@@ -3780,6 +4463,40 @@
         <div id="repo-folder"></div>
       </section>
     </div>
+  </div>
+</div>
+
+<div id="git-changes-modal" aria-hidden="true">
+  <div class="git-changes-dialog" role="dialog" aria-modal="true" aria-label="Git changes">
+    <div class="git-changes-header">
+      <div class="git-changes-title">🌿 Git changes</div>
+      <div class="git-changes-branch-wrap">
+        <span id="git-changes-branch" class="git-changes-branch"></span>
+        <span id="git-changes-meta" class="git-changes-meta"></span>
+      </div>
+      <div class="git-changes-actions">
+        <button id="git-changes-pull" class="git-changes-btn" type="button" title="Pull from upstream">⬇ Pull</button>
+        <button id="git-changes-refresh" class="git-changes-btn" type="button" title="Refresh status">↻</button>
+        <button id="git-changes-close" class="git-changes-close" type="button" aria-label="Close git changes">×</button>
+      </div>
+    </div>
+    <div id="git-changes-notice" class="git-changes-notice" hidden></div>
+    <div id="git-changes-list" class="git-changes-list"></div>
+  </div>
+</div>
+
+<div id="git-diff-modal" aria-hidden="true">
+  <div class="git-diff-dialog" role="dialog" aria-modal="true" aria-label="File diff">
+    <div class="git-changes-header">
+      <div id="git-diff-title" class="git-diff-title">Diff</div>
+      <span id="git-diff-meta" class="git-changes-meta"></span>
+      <div class="git-changes-actions">
+        <button id="git-diff-mode-changes" class="git-changes-btn active" type="button" title="Show only changed lines">Changes</button>
+        <button id="git-diff-mode-full" class="git-changes-btn" type="button" title="Show the whole file">Full file</button>
+        <button id="git-diff-close" class="git-changes-close" type="button" aria-label="Close diff viewer">×</button>
+      </div>
+    </div>
+    <div id="git-diff-body" class="git-diff-body"></div>
   </div>
 </div>
 
@@ -3831,6 +4548,21 @@
         >
       </div>
       <div class="settings-help" style="margin-top: 6px;">A hard cap on how long one turn may run before the relay requeues it. Turns are already kept alive by worker heartbeats, and a turn waiting on your answer to a question is never cut off — so this only catches a worker that has hung. Set to 0 for no limit.</div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">No limit</span></label>
+        <input
+          id="background-task-timeout-slider"
+          type="range"
+          min="0"
+          max="600"
+          step="5"
+          value="0"
+          aria-label="Background task timeout in minutes"
+          oninput="previewBackgroundTaskTimeoutSetting(this.value)"
+          onchange="updateBackgroundTaskTimeoutSetting(this.value)"
+        >
+      </div>
+      <div class="settings-help" style="margin-top: 6px;">How long background tasks (backgrounded commands, subagents, monitors) may keep a Claude session's CLI process alive after its turn ends. When the limit is reached the tasks are stopped and the agent reports what they left behind. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
       <div id="windows-autostart-setting" hidden>
         <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
           <label for="windows-autostart-toggle">Autostart (Windows)</label>
@@ -3902,7 +4634,7 @@
         <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
       </div>
       <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="claude-model-input">Claude (Agent SDK)</label>
+        <label for="claude-model-input">Claude SDK</label>
         <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
           <label for="claude-enabled-toggle">Enable Claude for New Chat model selection</label>
           <input id="claude-enabled-toggle" type="checkbox" onchange="toggleClaudeProvider(this.checked)">
@@ -3921,6 +4653,188 @@
         </div>
         <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
       </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="grok-model-input">Grok</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="grok-enabled-toggle">Enable Grok for New Chat model selection</label>
+          <input id="grok-enabled-toggle" type="checkbox" onchange="toggleGrokProvider(this.checked)">
+        </div>
+        <label for="grok-model-input" style="margin-top: 8px;">Grok model ID</label>
+        <input
+          id="grok-model-input"
+          type="text"
+          value="grok-4.5"
+          placeholder="grok-4.5"
+          aria-label="Grok model ID"
+        >
+        <div id="grok-settings-status" class="settings-help settings-provider-status">Loading Grok settings…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="grok-save-btn" type="button" class="summary-btn" onclick="saveGrokSettings()">Save Grok settings</button>
+        </div>
+        <div class="settings-help">Uses the host machine's logged-in Grok credentials (grok login or XAI_API_KEY). No API key is stored in the browser. Disabling also rebinds conversations that have not sent a message yet.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="grok-allowance-monthly-input">Grok monthly plan allowance</label>
+        <div class="settings-help">Grok does not expose remaining plan credits over ACP. Optional: enter your monthly USD budget so Check Usage can show an estimated remaining meter. Last-turn tokens and cost are always shown after a Grok turn.</div>
+        <label for="grok-allowance-monthly-input" style="margin-top: 8px;">Monthly allowance (USD)</label>
+        <input
+          id="grok-allowance-monthly-input"
+          type="number"
+          min="0"
+          step="0.01"
+          inputmode="decimal"
+          placeholder="e.g. 30"
+          aria-label="Grok monthly allowance in US dollars"
+        >
+        <label for="grok-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
+        <input
+          id="grok-allowance-reset-day-input"
+          type="number"
+          min="1"
+          max="31"
+          step="1"
+          inputmode="numeric"
+          placeholder="1"
+          aria-label="Grok billing reset day of month"
+        >
+        <div id="grok-allowance-status" class="settings-help settings-provider-status">Loading Grok allowances…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="grok-allowance-save-btn" type="button" class="summary-btn" onclick="saveGrokAllowanceSettings()">Save allowances</button>
+          <button id="grok-allowance-reset-btn" type="button" class="summary-btn" onclick="resetGrokAllowanceAccounting()">Reset tracked spend</button>
+        </div>
+        <div class="settings-help">Reset tracked spend after changing plan or account. Authoritative billing: <a href="https://console.x.ai" target="_blank" rel="noopener noreferrer">console.x.ai</a>.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="cursor-api-key-input">Cursor SDK</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="cursor-enabled-toggle">Enable Cursor for New Chat model selection</label>
+          <input id="cursor-enabled-toggle" type="checkbox" onchange="toggleCursorProvider(this.checked)" disabled>
+        </div>
+        <input
+          id="cursor-api-key-input"
+          type="password"
+          autocomplete="off"
+          placeholder="Cursor API key…"
+          aria-label="Cursor API key"
+        >
+        <label for="cursor-model-input" style="margin-top: 8px;">Cursor model ID</label>
+        <input
+          id="cursor-model-input"
+          type="text"
+          value="composer-2.5"
+          placeholder="composer-2.5"
+          aria-label="Cursor model ID"
+        >
+        <div id="cursor-settings-status" class="settings-help settings-provider-status">Loading Cursor settings…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="cursor-save-btn" type="button" class="summary-btn" onclick="saveCursorSettings()">Save Cursor settings</button>
+          <button id="cursor-remove-btn" type="button" class="summary-btn" onclick="removeCursorSettings()">Remove saved key</button>
+        </div>
+        <div class="settings-help">Runs Cursor conversations through the Cursor Agent SDK using your saved Cursor API key. The key is stored on the relay host and never sent to browsers.</div>
+      </div>
+      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label for="cursor-allowance-cursor-models-input">Cursor monthly plan allowance</label>
+        <div class="settings-help">Cursor does not expose your included pools through its SDK, so enter the monthly allowance from your plan. Spend is measured with raw model cost and reset on the day you choose.</div>
+        <label for="cursor-allowance-cursor-models-input" style="margin-top: 8px;">Cursor Models pool (USD)</label>
+        <input
+          id="cursor-allowance-cursor-models-input"
+          type="number"
+          min="0"
+          step="0.01"
+          inputmode="decimal"
+          placeholder="e.g. 20"
+          aria-label="Cursor Models monthly allowance in US dollars"
+        >
+        <label for="cursor-allowance-other-models-input" style="margin-top: 8px;">Other Models pool (USD)</label>
+        <input
+          id="cursor-allowance-other-models-input"
+          type="number"
+          min="0"
+          step="0.01"
+          inputmode="decimal"
+          placeholder="e.g. 20"
+          aria-label="Other Models monthly allowance in US dollars"
+        >
+        <label for="cursor-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
+        <input
+          id="cursor-allowance-reset-day-input"
+          type="number"
+          min="1"
+          max="31"
+          step="1"
+          inputmode="numeric"
+          placeholder="1"
+          aria-label="Cursor billing reset day of month"
+        >
+        <div id="cursor-allowance-status" class="settings-help settings-provider-status">Loading Cursor allowances…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="cursor-allowance-save-btn" type="button" class="summary-btn" onclick="saveCursorAllowanceSettings()">Save allowances</button>
+          <button id="cursor-allowance-reset-btn" type="button" class="summary-btn" onclick="resetCursorAllowanceAccounting()">Reset tracked spend</button>
+        </div>
+        <div class="settings-help">Reset tracked spend after changing plan or account: tracking re-baselines from each agent's current totals, so past spend is never counted twice.</div>
+        <label for="cursor-dashboard-token-input" style="margin-top: 12px;">Dashboard session token (live plan bars)</label>
+        <input
+          id="cursor-dashboard-token-input"
+          type="password"
+          autocomplete="off"
+          placeholder="WorkosCursorSessionToken cookie value"
+          aria-label="Cursor dashboard session token"
+        >
+        <div id="cursor-dashboard-token-status" class="settings-help settings-provider-status">Loading dashboard token state…</div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+          <button id="cursor-dashboard-token-save-btn" type="button" class="summary-btn" onclick="saveCursorDashboardToken()">Save token</button>
+          <button id="cursor-dashboard-token-remove-btn" type="button" class="summary-btn" onclick="removeCursorDashboardToken()">Remove</button>
+        </div>
+        <div class="settings-help">Unlocks the live "Included in plan" percentage bars on Check Usage. Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Headless hosts can also set <code>CURSOR_SESSION_TOKEN</code> in the relay environment. Tokens stay on the relay.</div>
+      </div>
+      <div id="push-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+        <label>Push notifications</label>
+        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+          <label for="push-enabled-toggle">Enable push notifications on this device</label>
+          <input id="push-enabled-toggle" type="checkbox" onchange="togglePushOnThisDevice(this.checked)" disabled>
+        </div>
+        <div id="push-settings-status" class="settings-help settings-provider-status">Loading push settings…</div>
+        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+          <label for="push-include-title-toggle">Include conversation title</label>
+          <input id="push-include-title-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+          <label for="push-preview-select">Message preview</label>
+          <select id="push-preview-select" onchange="updatePushPreferencesFromControls()" disabled>
+            <option value="none">None (generic text)</option>
+            <option value="truncated">Truncated</option>
+            <option value="full">Full text</option>
+          </select>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+          <label for="push-preview-chars-input">Preview length (characters)</label>
+          <input id="push-preview-chars-input" type="number" min="20" max="500" value="80" style="width: 90px;" onchange="updatePushPreferencesFromControls()" disabled>
+        </div>
+        <label style="margin-top: 10px;">Notify about</label>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-question-toggle">Questions from the agent</label>
+          <input id="push-event-question-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-turn-complete-toggle">Turn completed</label>
+          <input id="push-event-turn-complete-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-turn-failed-toggle">Turn failed</label>
+          <input id="push-event-turn-failed-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-board-toggle">Boards (plan reviews)</label>
+          <input id="push-event-board-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        </div>
+        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+          <label for="push-event-cli-offline-toggle">CLI went offline</label>
+          <input id="push-event-cli-offline-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+        </div>
+        <label style="margin-top: 10px;">Devices</label>
+        <div id="push-device-list" style="width: 100%;"></div>
+        <div class="settings-help">Notifications are only sent while no device has the app in the foreground. Content defaults to generic text; message previews are opt-in per device.</div>
+      </div>
     </div>
   </div>
 </div>
@@ -3937,12 +4851,20 @@
       </div>
     </div>
     <div class="summary-body" style="padding: 16px;">
-      <label for="new-conversation-provider-select">Provider</label>
-      <select id="new-conversation-provider-select">
-        <option value="github">Copilot</option>
+      <label for="new-conversation-cwd-select">Working directory</label>
+      <select id="new-conversation-cwd-select">
+        <option value="">Default</option>
       </select>
-      <div id="new-conversation-provider-help" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Copilot models use your GitHub Copilot runtime.</div>
-      <label for="new-conversation-model-select">Model</label>
+      <input id="new-conversation-cwd-manual" type="text" hidden autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Full path of the launch directory">
+      <div id="new-conversation-cwd-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);word-break:break-word;">New chats start in the relay default directory.</div>
+      <div id="new-conversation-provider-row">
+        <label for="new-conversation-provider-select" style="display:block;margin-top:12px;">Provider</label>
+        <select id="new-conversation-provider-select">
+          <option value="github">Copilot</option>
+        </select>
+        <div id="new-conversation-provider-help" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Copilot models use your GitHub Copilot runtime.</div>
+      </div>
+      <label for="new-conversation-model-select" style="display:block;margin-top:12px;">Model</label>
       <select id="new-conversation-model-select"></select>
       <label for="new-conversation-reasoning-select" style="display:block;margin-top:12px;">Reasoning effort</label>
       <select id="new-conversation-reasoning-select"></select>

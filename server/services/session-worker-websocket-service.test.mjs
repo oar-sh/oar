@@ -91,6 +91,8 @@ test('worker websocket service accepts both root and prefixed worker websocket p
 
   assert.equal(rootHandled, true);
   assert.equal(prefixedHandled, true);
+  // platform-agnostic: these are HTTP route paths, not filesystem paths — a URL
+  // prefix is joined with '/' on every platform, never with the host separator.
   assert.deepEqual(service.status().acceptedPaths, ['/api/session-worker/ws', '/cpr2/api/session-worker/ws']);
 });
 
@@ -297,4 +299,97 @@ test('worker websocket service preserves readiness and closes on delivery send f
   assert.equal(sendFailures[0].sessionId, 'sdk-fail');
   assert.equal(socket.closeCalls, 1);
   service.stop();
+});
+
+test('a ready check from a killed worker socket never asks for work', async () => {
+  // The socket outlives the process it belongs to: killing a worker blocks the
+  // relay's event loop, so this service's delivery timer runs before the socket
+  // close lands. Requesting work there is what respawned the killed session.
+  const httpServer = new EventEmitter();
+  const requestedSessions = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    isWorkerProcessAlive: (pid) => Number(pid) !== 4242,
+    requestWork: async ({ sessionId }) => {
+      requestedSessions.push(sessionId);
+      return { message: null };
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-dead&pid=4242', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'test' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  service.emitQueueChanged('test');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requestedSessions, [], 'a dead worker process must not be handed work');
+  service.stop();
+});
+
+test('a live worker socket still gets work through the liveness probe', async () => {
+  const httpServer = new EventEmitter();
+  const requestedSessions = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    isWorkerProcessAlive: () => true,
+    requestWork: async ({ sessionId }) => {
+      requestedSessions.push(sessionId);
+      return { message: null };
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-live&pid=4242', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const socket = lastWss?.sockets?.[0] || null;
+  assert.ok(socket);
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'test' }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requestedSessions, ['sdk-live']);
+  service.stop();
+});
+
+test('a worker socket closing invokes the death-detection hook with its identity', async () => {
+  const httpServer = new EventEmitter();
+  const closedEvents = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    onWorkerSocketClosed: (payload) => { closedEvents.push(payload); },
+  });
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-dead&pid=4242', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const ws = lastWss.sockets[lastWss.sockets.length - 1];
+  assert.ok(ws);
+  assert.equal(service.hasWorkerSocket('sdk-dead'), true);
+  ws.emit('close');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(closedEvents.length, 1);
+  assert.equal(closedEvents[0].sessionId, 'sdk-dead');
+  assert.equal(closedEvents[0].pid, 4242);
+  assert.equal(closedEvents[0].reason, 'close');
+  assert.equal(service.hasWorkerSocket('sdk-dead'), false);
 });

@@ -65,6 +65,19 @@ test('owner message payload retains shared visibility metadata', () => {
   assert.equal(messages[0]?.hiddenFromShares, true);
 });
 
+test('a user message carries the reasoning effort its own queue row recorded', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      { id: 'user-1', role: 'user', text: 'hello', timestamp: '2026-01-01T00:00:00.000Z' },
+      { id: 'assistant-1', role: 'assistant', text: 'hi', timestamp: '2026-01-01T00:00:01.000Z' },
+    ],
+    queueRows: [{ id: 'user-1', model: 'grok-4.5', reasoning_effort: 'high' }],
+    responseMessageToSourceId: new Map([['assistant-1', 'user-1']]),
+  });
+  assert.equal(messages.find((message) => message.id === 'user-1')?.reasoningEffort, 'high');
+  assert.equal(messages.find((message) => message.id === 'assistant-1')?.reasoningEffort, 'high');
+});
+
 test('shared lazy-load pagination never surfaces hidden messages on any page', () => {
   const rows = [];
   for (let index = 0; index < 8; index += 1) {
@@ -155,4 +168,22 @@ test('shared upload route handles stream errors explicitly', () => {
   assert.match(source, /const stream = fs\.createReadStream\(filePath\);/);
   assert.match(source, /stream\.on\('error', \(\) => \{/);
   assert.match(source, /res\.status\(500\)\.json\(\{ error: 'Failed to stream shared attachment' \}\);/);
+});
+
+test('an authenticated share revoke route exists and invalidates active shares (M2)', () => {
+  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const source = fs.readFileSync(filePath, 'utf8');
+  assert.match(source, /app\.delete\('\/api\/conversation\/:id\/share', auth/);
+  assert.match(source, /stmts\.revokeConversationSharesByConversationId\?\.run\(now, conversationId\)/);
+  assert.match(source, /io\.emit\('share_revoked'/);
+});
+
+test('shared attachment content is served with neutralized type + nosniff + sandbox CSP (H3)', () => {
+  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const source = fs.readFileSync(filePath, 'utf8');
+  // The shared (unauthenticated) upload + generated-image routes route through
+  // the safe-served-content helper instead of echoing the stored MIME inline.
+  assert.match(source, /applySafeServedContentHeaders\(res, file\.mime_type/);
+  assert.match(source, /applySafeServedContentHeaders\(res, attachment\.type\)/);
+  assert.doesNotMatch(source, /res\.setHeader\('Content-Type', file\.mime_type \|\| 'application\/octet-stream'\)/);
 });

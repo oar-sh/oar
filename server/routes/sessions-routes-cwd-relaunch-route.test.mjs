@@ -21,7 +21,10 @@ let ROOT_A = '';
 let ROOT_B = '';
 
 test.before(() => {
-  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cwd-route-'));
+  // realpath first: the route compares against `validated.realPath`, so a symlinked
+  // tmpdir (macOS /var -> /private/var) or an 8.3 short path (C:\Users\RUNNER~1)
+  // would otherwise never match. Same hedge as sessions-routes-bootstrap-workspace-root.
+  tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'cwd-route-')));
   ROOT_A = path.join(tempRoot, 'alpha');
   ROOT_B = path.join(tempRoot, 'beta');
   fs.mkdirSync(ROOT_A);

@@ -105,6 +105,7 @@ export function registerAskUserRoutes(app, deps) {
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
     sessionWorkerRegistry,
+    pushDispatchService,
   } = deps;
 
   const continuationRoutingEnabled = runtimeState?.featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true;
@@ -209,6 +210,7 @@ export function registerAskUserRoutes(app, deps) {
     const fieldCount = resolvedSchema ? schemaFields(resolvedSchema).length : 0;
     console.log(`[${ts()}] QUESTION  ${questionId.slice(0,8)} conv=${question.conversationId.slice(0,8)} mode=${relayMode} fields=${fieldCount} prompt="${promptText.slice(0,60)}"`);
     io.emit('relay_question', { question });
+    void pushDispatchService?.notifyQuestion?.(question);
     res.json({ question });
   });
 

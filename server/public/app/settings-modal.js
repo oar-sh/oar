@@ -6,18 +6,31 @@ import {
 } from './store.js';
 import {
   loadClaudeSettings,
+  loadCursorSettings,
+  loadCursorAllowanceSettings,
+  updateCursorAllowanceSettings,
+  loadCursorDashboardTokenSettings,
+  updateCursorDashboardTokenSettings,
+  loadGrokAllowanceSettings,
+  updateGrokAllowanceSettings,
+  loadGrokSettings,
   loadOpenAISettings,
   updateClaudeSettings,
+  updateCursorSettings,
+  updateGrokSettings,
   updateDefaultSessionWorkspaceRoot,
   updateOpenAISettings,
   loadWindowsAutostartSetting,
   updateWindowsAutostartSetting,
   loadTurnCeilingSetting,
   updateTurnCeilingSetting as requestTurnCeilingSetting,
+  loadBackgroundTaskTimeoutSetting,
+  updateBackgroundTaskTimeoutSetting as requestBackgroundTaskTimeoutSetting,
 } from './api-client.js';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
+import { refreshPushSettingsSection } from './push-settings.js';
 
 const THEME_STORAGE_KEY = 'copilot_theme';
 const SHOW_SUSPEND_HOST_STORAGE_KEY = 'copilot_show_suspend_host';
@@ -121,6 +134,72 @@ export async function updateTurnCeilingSetting(value) {
   }
 }
 
+// Mirrors shared/background-task-timeout.mjs (the browser cannot import it).
+// Bounds come from the API response; these are just pre-response defaults.
+let backgroundTaskTimeoutMinutes = 0;
+let backgroundTaskTimeoutUpdateInFlight = false;
+
+function syncBackgroundTaskTimeoutSlider() {
+  const slider = document.getElementById('background-task-timeout-slider');
+  const label = document.getElementById('background-task-timeout-value');
+  if (slider instanceof HTMLInputElement) {
+    slider.value = String(backgroundTaskTimeoutMinutes);
+    slider.disabled = backgroundTaskTimeoutUpdateInFlight;
+  }
+  if (label) label.textContent = formatTurnCeilingLabel(backgroundTaskTimeoutMinutes);
+}
+
+/** Live label feedback while dragging; nothing is persisted until change fires. */
+export function previewBackgroundTaskTimeoutSetting(value) {
+  const label = document.getElementById('background-task-timeout-value');
+  if (label) label.textContent = formatTurnCeilingLabel(value);
+}
+
+export async function refreshBackgroundTaskTimeoutSetting() {
+  syncBackgroundTaskTimeoutSlider();
+  try {
+    const result = await loadBackgroundTaskTimeoutSetting();
+    if (!result || !Number.isFinite(Number(result.timeoutMinutes))) return;
+    backgroundTaskTimeoutMinutes = Number(result.timeoutMinutes);
+    const slider = document.getElementById('background-task-timeout-slider');
+    if (slider instanceof HTMLInputElement) {
+      if (Number.isFinite(Number(result.minMinutes))) slider.min = String(result.minMinutes);
+      if (Number.isFinite(Number(result.maxMinutes))) slider.max = String(result.maxMinutes);
+      if (Number.isFinite(Number(result.stepMinutes))) slider.step = String(result.stepMinutes);
+    }
+  } catch {
+    // Leave the slider at its last known value; the setting is not critical.
+  } finally {
+    syncBackgroundTaskTimeoutSlider();
+  }
+}
+
+export async function updateBackgroundTaskTimeoutSetting(value) {
+  if (backgroundTaskTimeoutUpdateInFlight) {
+    syncBackgroundTaskTimeoutSlider();
+    return;
+  }
+  const requested = Math.max(0, Math.round(Number(value) || 0));
+  backgroundTaskTimeoutUpdateInFlight = true;
+  syncBackgroundTaskTimeoutSlider();
+  try {
+    const result = await requestBackgroundTaskTimeoutSetting(requested);
+    backgroundTaskTimeoutMinutes = Number.isFinite(Number(result?.timeoutMinutes))
+      ? Number(result.timeoutMinutes)
+      : requested;
+    showTransientRelayNotice(
+      backgroundTaskTimeoutMinutes === 0
+        ? 'Background tasks will run without a time limit.'
+        : `Background task timeout set to ${formatTurnCeilingLabel(backgroundTaskTimeoutMinutes)}.`,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to update the background task timeout.');
+  } finally {
+    backgroundTaskTimeoutUpdateInFlight = false;
+    syncBackgroundTaskTimeoutSlider();
+  }
+}
+
 function readLocalStorage(key) {
   try {
     return localStorage.getItem(key);
@@ -186,7 +265,6 @@ export function applyOpenAISettingsState(settings = {}, { resetInputs = false } 
   const toggle = document.getElementById('openai-enabled-toggle');
   const removeButton = document.getElementById('openai-remove-btn');
   const status = document.getElementById('openai-settings-status');
-  const header = document.getElementById('provider-status-pill');
   if (keyInput && (!openAISettingsInputsDirty || resetInputs)) {
     keyInput.value = '';
     keyInput.placeholder = openAISettingsState.configured ? 'Saved API key (enter to replace)' : 'sk-...';
@@ -213,15 +291,6 @@ export function applyOpenAISettingsState(settings = {}, { resetInputs = false } 
     status.dataset.state = openAISettingsState.enabled
       ? 'active'
       : (openAISettingsState.configured ? 'saved' : 'unconfigured');
-  }
-  if (header) {
-    header.textContent = 'GitHub Copilot';
-    header.dataset.provider = 'github';
-    header.title = openAISettingsState.enabled
-      ? `GitHub Copilot is active by default; OpenAI is enabled for optional new-chat selection (${openAISettingsState.model})`
-      : (openAISettingsState.configured
-          ? 'GitHub Copilot is active; OpenAI API key is saved but currently disabled'
-          : 'GitHub Copilot is active');
   }
   window.syncAutoModelAvailability?.();
   return openAISettingsState;
@@ -346,6 +415,625 @@ export async function toggleClaudeProvider(enabled) {
     claudeSettingsUpdateInFlight = false;
     setClaudeSettingsControlsDisabled(false);
     applyClaudeSettingsState(claudeSettingsState);
+  }
+}
+
+let grokSettingsUpdateInFlight = false;
+let grokSettingsState = {
+  configured: false,
+  enabled: false,
+  model: 'grok-4.5',
+  models: [],
+};
+let grokSettingsInputsDirty = false;
+
+function ensureGrokSettingsInputTracking() {
+  const input = document.getElementById('grok-model-input');
+  if (!input || input.dataset.grokDirtyTracking === '1') return;
+  input.dataset.grokDirtyTracking = '1';
+  input.addEventListener('input', () => {
+    grokSettingsInputsDirty = true;
+  });
+}
+
+function setGrokSettingsControlsDisabled(disabled) {
+  for (const id of ['grok-model-input', 'grok-enabled-toggle', 'grok-save-btn']) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyGrokSettingsState(settings = {}, { resetInputs = false } = {}) {
+  ensureGrokSettingsInputTracking();
+  grokSettingsState = {
+    configured: settings?.enabled === true,
+    enabled: settings?.enabled === true,
+    model: String(settings?.model || grokSettingsState.model || 'grok-4.5').trim() || 'grok-4.5',
+    models: Array.isArray(settings?.models) ? settings.models : grokSettingsState.models,
+  };
+  const modelInput = document.getElementById('grok-model-input');
+  const toggle = document.getElementById('grok-enabled-toggle');
+  const status = document.getElementById('grok-settings-status');
+  if (modelInput && (!grokSettingsInputsDirty || resetInputs)) modelInput.value = grokSettingsState.model;
+  if (resetInputs) grokSettingsInputsDirty = false;
+  if (toggle) {
+    toggle.checked = grokSettingsState.enabled;
+    toggle.disabled = grokSettingsUpdateInFlight;
+  }
+  if (status) {
+    status.textContent = grokSettingsState.enabled
+      ? `Grok is enabled. Select Grok in New Chat to use model ${grokSettingsState.model}. Uses the host machine's logged-in Grok credentials (grok login or XAI_API_KEY).`
+      : 'Not enabled. Enable to allow Grok selection in New Chat (requires host Grok login or XAI_API_KEY).';
+    status.dataset.state = grokSettingsState.enabled ? 'active' : 'unconfigured';
+  }
+  window.syncAutoModelAvailability?.();
+  return grokSettingsState;
+}
+
+export async function refreshGrokSettingsState() {
+  const settings = await loadGrokSettings();
+  if (!settings) return null;
+  return applyGrokSettingsState(settings);
+}
+
+async function syncGrokSettingsInputs() {
+  const status = document.getElementById('grok-settings-status');
+  if (!status) return;
+  const settings = await refreshGrokSettingsState();
+  if (!settings) {
+    status.textContent = 'Unable to load Grok settings.';
+    status.dataset.state = 'error';
+  }
+}
+
+export async function saveGrokSettings() {
+  if (grokSettingsUpdateInFlight) return;
+  const modelInput = document.getElementById('grok-model-input');
+  const model = String(modelInput?.value || '').trim() || 'grok-4.5';
+  grokSettingsUpdateInFlight = true;
+  setGrokSettingsControlsDisabled(true);
+  try {
+    const result = await updateGrokSettings({ model });
+    if (!result) throw new Error('Failed to save Grok settings.');
+    applyGrokSettingsState(result, { resetInputs: true });
+    showTransientRelayNotice(
+      result.warning
+        ? `Grok settings saved. ${result.warning}`
+        : `Grok settings saved for ${result.model}.`,
+      result.warning ? 8000 : 4000,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to save Grok settings.');
+  } finally {
+    grokSettingsUpdateInFlight = false;
+    setGrokSettingsControlsDisabled(false);
+    applyGrokSettingsState(grokSettingsState);
+  }
+}
+
+export async function toggleGrokProvider(enabled) {
+  if (grokSettingsUpdateInFlight) return;
+  grokSettingsUpdateInFlight = true;
+  setGrokSettingsControlsDisabled(true);
+  try {
+    const result = await updateGrokSettings({ enabled: enabled === true });
+    if (!result) throw new Error('Failed to update the Grok provider.');
+    applyGrokSettingsState(result);
+    const providerLabel = result.enabled ? 'Grok provider enabled' : 'Grok provider disabled';
+    showTransientRelayNotice(
+      `${providerLabel}.${result.warning ? ` ${result.warning}` : ''}`,
+      result.warning ? 8000 : 4500,
+    );
+  } catch (error) {
+    applyGrokSettingsState(grokSettingsState);
+    alert(error?.message || 'Failed to update the Grok provider.');
+  } finally {
+    grokSettingsUpdateInFlight = false;
+    setGrokSettingsControlsDisabled(false);
+    applyGrokSettingsState(grokSettingsState);
+  }
+}
+
+let cursorSettingsUpdateInFlight = false;
+let cursorSettingsState = {
+  configured: false,
+  enabled: false,
+  model: 'composer-2.5',
+};
+let cursorSettingsInputsDirty = false;
+
+function ensureCursorSettingsInputTracking() {
+  for (const id of ['cursor-api-key-input', 'cursor-model-input']) {
+    const input = document.getElementById(id);
+    if (!input || input.dataset.cursorDirtyTracking === '1') continue;
+    input.dataset.cursorDirtyTracking = '1';
+    input.addEventListener('input', () => {
+      cursorSettingsInputsDirty = true;
+    });
+  }
+}
+
+function setCursorSettingsControlsDisabled(disabled) {
+  for (const id of [
+    'cursor-api-key-input',
+    'cursor-model-input',
+    'cursor-enabled-toggle',
+    'cursor-save-btn',
+    'cursor-remove-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyCursorSettingsState(settings = {}, { resetInputs = false } = {}) {
+  ensureCursorSettingsInputTracking();
+  cursorSettingsState = {
+    configured: settings?.configured === true,
+    enabled: settings?.configured === true && settings?.enabled === true,
+    model: String(settings?.model || cursorSettingsState.model || 'composer-2.5').trim() || 'composer-2.5',
+  };
+  const keyInput = document.getElementById('cursor-api-key-input');
+  const modelInput = document.getElementById('cursor-model-input');
+  const toggle = document.getElementById('cursor-enabled-toggle');
+  const removeButton = document.getElementById('cursor-remove-btn');
+  const status = document.getElementById('cursor-settings-status');
+  if (keyInput && (!cursorSettingsInputsDirty || resetInputs)) {
+    keyInput.value = '';
+    keyInput.placeholder = cursorSettingsState.configured ? 'Saved API key (enter to replace)' : 'Cursor API key…';
+  }
+  if (modelInput && (!cursorSettingsInputsDirty || resetInputs)) modelInput.value = cursorSettingsState.model;
+  if (resetInputs) cursorSettingsInputsDirty = false;
+  if (toggle) {
+    toggle.checked = cursorSettingsState.enabled;
+    toggle.disabled = cursorSettingsUpdateInFlight || !cursorSettingsState.configured;
+  }
+  if (removeButton) {
+    removeButton.disabled = cursorSettingsUpdateInFlight || !cursorSettingsState.configured;
+  }
+  if (status) {
+    status.textContent = cursorSettingsState.enabled
+      ? 'Cursor is enabled. Select Cursor in New Chat to use it.'
+      : (cursorSettingsState.configured
+          ? 'API key saved but currently disabled. Enable it to allow Cursor selection in New Chat.'
+          : 'Not configured. New conversations use GitHub Copilot.');
+    status.dataset.state = cursorSettingsState.enabled
+      ? 'active'
+      : (cursorSettingsState.configured ? 'saved' : 'unconfigured');
+  }
+  window.syncAutoModelAvailability?.();
+  return cursorSettingsState;
+}
+
+export async function refreshCursorSettingsState() {
+  const settings = await loadCursorSettings();
+  if (!settings) return null;
+  return applyCursorSettingsState(settings);
+}
+
+// ── Cursor manual plan allowances ──
+// Cursor's SDK reports spend but not the included-pool balance, so these
+// user-entered numbers are what the plan-usage card measures spend against.
+let cursorAllowanceUpdateInFlight = false;
+
+function setCursorAllowanceControlsDisabled(disabled) {
+  for (const id of [
+    'cursor-allowance-cursor-models-input',
+    'cursor-allowance-other-models-input',
+    'cursor-allowance-reset-day-input',
+    'cursor-allowance-save-btn',
+    'cursor-allowance-reset-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyCursorAllowanceState(settings = {}) {
+  const cursorModels = document.getElementById('cursor-allowance-cursor-models-input');
+  const otherModels = document.getElementById('cursor-allowance-other-models-input');
+  const resetDay = document.getElementById('cursor-allowance-reset-day-input');
+  const status = document.getElementById('cursor-allowance-status');
+  if (cursorModels) {
+    cursorModels.value = settings?.cursorModelsUsd === null || settings?.cursorModelsUsd === undefined
+      ? ''
+      : String(settings.cursorModelsUsd);
+  }
+  if (otherModels) {
+    otherModels.value = settings?.otherModelsUsd === null || settings?.otherModelsUsd === undefined
+      ? ''
+      : String(settings.otherModelsUsd);
+  }
+  if (resetDay) resetDay.value = String(settings?.resetDay ?? 1);
+  if (status) {
+    const configured = settings?.cursorModelsUsd != null || settings?.otherModelsUsd != null;
+    status.textContent = configured
+      ? `Tracking spend against your allowances; resets on day ${settings?.resetDay ?? 1} of each month.`
+      : 'No allowance set — the usage card shows Cursor spend without a remaining balance.';
+    status.dataset.state = configured ? 'active' : 'unconfigured';
+  }
+  setCursorAllowanceControlsDisabled(cursorAllowanceUpdateInFlight);
+  return settings;
+}
+
+export async function refreshCursorAllowanceState() {
+  try {
+    const settings = await loadCursorAllowanceSettings();
+    if (!settings) return null;
+    return applyCursorAllowanceState(settings);
+  } catch {
+    const status = document.getElementById('cursor-allowance-status');
+    if (status) {
+      status.textContent = 'Unable to load Cursor allowances.';
+      status.dataset.state = 'error';
+    }
+    return null;
+  }
+}
+
+/**
+ * Read one allowance field.
+ *
+ * A `type="number"` input reports an empty `value` for text the browser could
+ * not parse, so `validity.badInput` is the only way to tell a deliberately
+ * cleared field from "12,50" typed in a comma-decimal locale. Without that
+ * check the second case silently posts `null` and wipes the allowance.
+ *
+ * @returns {number|null|undefined} the amount, null to clear, undefined when
+ *   the control is absent (leave the stored value alone)
+ * @throws {Error} when the field holds something that is not a valid amount
+ */
+function readAllowanceInput(id, label) {
+  const input = document.getElementById(id);
+  if (!input) return undefined;
+  if (input.validity?.badInput) throw new Error(`${label} must be a number, for example 20 or 20.00.`);
+  const raw = String(input.value ?? '').trim();
+  // An emptied field clears the allowance rather than leaving the old value.
+  if (raw === '') return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} must be zero or a positive amount.`);
+  return parsed;
+}
+
+function readResetDayInput() {
+  const input = document.getElementById('cursor-allowance-reset-day-input');
+  if (!input) return undefined;
+  if (input.validity?.badInput) throw new Error('Billing reset day must be a whole number between 1 and 31.');
+  const raw = String(input.value ?? '').trim();
+  if (raw === '') return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 31) {
+    throw new Error('Billing reset day must be between 1 and 31.');
+  }
+  return Math.round(parsed);
+}
+
+export async function saveCursorAllowanceSettings({ resetAccounting = false } = {}) {
+  if (cursorAllowanceUpdateInFlight) return;
+  let payload;
+  try {
+    const resetDay = readResetDayInput();
+    payload = {
+      cursorModelsUsd: readAllowanceInput('cursor-allowance-cursor-models-input', 'Cursor Models allowance'),
+      otherModelsUsd: readAllowanceInput('cursor-allowance-other-models-input', 'Other Models allowance'),
+      ...(resetDay === undefined ? {} : { resetDay }),
+      ...(resetAccounting ? { resetAccounting: true } : {}),
+    };
+  } catch (error) {
+    alert(error?.message || 'Please check the Cursor allowance values.');
+    return;
+  }
+  cursorAllowanceUpdateInFlight = true;
+  setCursorAllowanceControlsDisabled(true);
+  try {
+    const result = await updateCursorAllowanceSettings(payload);
+    cursorAllowanceUpdateInFlight = false;
+    applyCursorAllowanceState(result);
+    showTransientRelayNotice(resetAccounting
+      ? 'Cursor allowances saved and tracked spend reset.'
+      : 'Cursor allowances saved.');
+  } catch (error) {
+    cursorAllowanceUpdateInFlight = false;
+    setCursorAllowanceControlsDisabled(false);
+    alert(error?.message || 'Failed to update Cursor allowances.');
+  }
+}
+
+export async function resetCursorAllowanceAccounting() {
+  if (!confirm('Reset the tracked Cursor spend for the current billing cycle?')) return;
+  await saveCursorAllowanceSettings({ resetAccounting: true });
+}
+
+// ── Cursor dashboard session token ──
+// Unlocks the live plan-quota bars on the Check Usage card. Only a
+// configured/not-configured flag ever comes back from the server.
+let cursorDashboardTokenUpdateInFlight = false;
+
+function setCursorDashboardTokenControlsDisabled(disabled) {
+  for (const id of [
+    'cursor-dashboard-token-input',
+    'cursor-dashboard-token-save-btn',
+    'cursor-dashboard-token-remove-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyCursorDashboardTokenState(settings = {}) {
+  const status = document.getElementById('cursor-dashboard-token-status');
+  const input = document.getElementById('cursor-dashboard-token-input');
+  const configured = settings?.configured === true;
+  const source = String(settings?.source || '');
+  if (input) input.value = '';
+  if (input) input.placeholder = source === 'manual' ? 'Token saved — paste a new one to replace it' : 'WorkosCursorSessionToken cookie value';
+  if (status) {
+    const STATUS_TEXT = {
+      ide: "Using this machine's Cursor IDE login automatically — nothing to configure. Paste a token only to override it.",
+      env: 'Using the CURSOR_SESSION_TOKEN environment variable on the relay. Paste a token only to override it.',
+    };
+    status.textContent = STATUS_TEXT[source]
+      || (configured
+        ? 'Dashboard token saved. The usage card shows live plan bars while it stays valid.'
+        : 'No Cursor IDE login found on the relay host and no token pasted — the usage card shows local spend estimates only.');
+    status.dataset.state = configured ? 'active' : 'unconfigured';
+  }
+  setCursorDashboardTokenControlsDisabled(cursorDashboardTokenUpdateInFlight);
+  return settings;
+}
+
+export async function refreshCursorDashboardTokenState() {
+  try {
+    const settings = await loadCursorDashboardTokenSettings();
+    if (!settings) return null;
+    return applyCursorDashboardTokenState(settings);
+  } catch {
+    const status = document.getElementById('cursor-dashboard-token-status');
+    if (status) {
+      status.textContent = 'Unable to load the Cursor dashboard token state.';
+      status.dataset.state = 'error';
+    }
+    return null;
+  }
+}
+
+export async function saveCursorDashboardToken() {
+  if (cursorDashboardTokenUpdateInFlight) return;
+  const input = document.getElementById('cursor-dashboard-token-input');
+  const sessionToken = String(input?.value || '').trim();
+  if (!sessionToken) {
+    alert('Paste the WorkosCursorSessionToken cookie value first.');
+    return;
+  }
+  cursorDashboardTokenUpdateInFlight = true;
+  setCursorDashboardTokenControlsDisabled(true);
+  try {
+    const result = await updateCursorDashboardTokenSettings({ sessionToken });
+    cursorDashboardTokenUpdateInFlight = false;
+    applyCursorDashboardTokenState(result);
+  } catch (error) {
+    cursorDashboardTokenUpdateInFlight = false;
+    setCursorDashboardTokenControlsDisabled(false);
+    alert(error?.message || 'Failed to save the Cursor dashboard token.');
+  }
+}
+
+export async function removeCursorDashboardToken() {
+  if (cursorDashboardTokenUpdateInFlight) return;
+  if (!confirm('Remove the stored Cursor dashboard token?')) return;
+  cursorDashboardTokenUpdateInFlight = true;
+  setCursorDashboardTokenControlsDisabled(true);
+  try {
+    const result = await updateCursorDashboardTokenSettings({ remove: true });
+    cursorDashboardTokenUpdateInFlight = false;
+    applyCursorDashboardTokenState(result);
+  } catch (error) {
+    cursorDashboardTokenUpdateInFlight = false;
+    setCursorDashboardTokenControlsDisabled(false);
+    alert(error?.message || 'Failed to remove the Cursor dashboard token.');
+  }
+}
+
+// ── Grok manual plan allowance ──
+// Grok ACP reports per-turn cost/tokens but no remaining plan credits.
+let grokAllowanceUpdateInFlight = false;
+
+function setGrokAllowanceControlsDisabled(disabled) {
+  for (const id of [
+    'grok-allowance-monthly-input',
+    'grok-allowance-reset-day-input',
+    'grok-allowance-save-btn',
+    'grok-allowance-reset-btn',
+  ]) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyGrokAllowanceState(settings = {}) {
+  const monthly = document.getElementById('grok-allowance-monthly-input');
+  const resetDay = document.getElementById('grok-allowance-reset-day-input');
+  const status = document.getElementById('grok-allowance-status');
+  if (monthly) {
+    monthly.value = settings?.monthlyUsd === null || settings?.monthlyUsd === undefined
+      ? ''
+      : String(settings.monthlyUsd);
+  }
+  if (resetDay) resetDay.value = String(settings?.resetDay ?? 1);
+  if (status) {
+    const configured = settings?.monthlyUsd != null;
+    status.textContent = configured
+      ? `Tracking estimated spend against $${settings.monthlyUsd}/mo; resets on day ${settings?.resetDay ?? 1}.`
+      : 'No allowance set — Check Usage shows last-turn Grok cost/tokens without a remaining-budget meter.';
+    status.dataset.state = configured ? 'active' : 'unconfigured';
+  }
+  setGrokAllowanceControlsDisabled(grokAllowanceUpdateInFlight);
+  return settings;
+}
+
+export async function refreshGrokAllowanceState() {
+  try {
+    const settings = await loadGrokAllowanceSettings();
+    if (!settings) return null;
+    return applyGrokAllowanceState(settings);
+  } catch {
+    const status = document.getElementById('grok-allowance-status');
+    if (status) {
+      status.textContent = 'Unable to load Grok allowances.';
+      status.dataset.state = 'error';
+    }
+    return null;
+  }
+}
+
+function readGrokResetDayInput() {
+  const input = document.getElementById('grok-allowance-reset-day-input');
+  if (!input) return undefined;
+  if (input.validity?.badInput) throw new Error('Billing reset day must be a whole number between 1 and 31.');
+  const raw = String(input.value ?? '').trim();
+  if (raw === '') return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 31) {
+    throw new Error('Billing reset day must be between 1 and 31.');
+  }
+  return Math.round(parsed);
+}
+
+export async function saveGrokAllowanceSettings({ resetAccounting = false } = {}) {
+  if (grokAllowanceUpdateInFlight) return;
+  let payload;
+  try {
+    const resetDay = readGrokResetDayInput();
+    payload = {
+      monthlyUsd: readAllowanceInput('grok-allowance-monthly-input', 'Grok monthly allowance'),
+      ...(resetDay === undefined ? {} : { resetDay }),
+      ...(resetAccounting ? { resetAccounting: true } : {}),
+    };
+  } catch (error) {
+    alert(error?.message || 'Please check the Grok allowance values.');
+    return;
+  }
+  grokAllowanceUpdateInFlight = true;
+  setGrokAllowanceControlsDisabled(true);
+  try {
+    const result = await updateGrokAllowanceSettings(payload);
+    grokAllowanceUpdateInFlight = false;
+    applyGrokAllowanceState(result);
+    showTransientRelayNotice(resetAccounting
+      ? 'Grok allowances saved and tracked spend reset.'
+      : 'Grok allowances saved.');
+  } catch (error) {
+    grokAllowanceUpdateInFlight = false;
+    setGrokAllowanceControlsDisabled(false);
+    alert(error?.message || 'Failed to update Grok allowances.');
+  }
+}
+
+export async function resetGrokAllowanceAccounting() {
+  if (!confirm('Reset the tracked Grok spend for the current billing cycle?')) return;
+  await saveGrokAllowanceSettings({ resetAccounting: true });
+}
+
+async function syncCursorSettingsInputs() {
+  const keyInput = document.getElementById('cursor-api-key-input');
+  const modelInput = document.getElementById('cursor-model-input');
+  const status = document.getElementById('cursor-settings-status');
+  if (!keyInput || !modelInput || !status) return;
+  const settings = await refreshCursorSettingsState();
+  if (!settings) {
+    status.textContent = 'Unable to load Cursor settings.';
+    status.dataset.state = 'error';
+    return;
+  }
+}
+
+export async function saveCursorSettings() {
+  if (cursorSettingsUpdateInFlight) return;
+  const keyInput = document.getElementById('cursor-api-key-input');
+  const modelInput = document.getElementById('cursor-model-input');
+  const apiKey = String(keyInput?.value || '').trim();
+  const model = String(modelInput?.value || '').trim() || 'composer-2.5';
+  if (!apiKey && !cursorSettingsState.configured) {
+    alert('Enter a Cursor API key.');
+    return;
+  }
+  cursorSettingsUpdateInFlight = true;
+  setCursorSettingsControlsDisabled(true);
+  try {
+    const result = await updateCursorSettings({
+      apiKey,
+      model,
+      enabled: cursorSettingsState.configured ? cursorSettingsState.enabled : true,
+    });
+    if (!result) throw new Error('Failed to save Cursor settings.');
+    applyCursorSettingsState(result, { resetInputs: true });
+    showTransientRelayNotice(
+      result.warning
+        ? `Cursor settings saved. ${result.warning}`
+        : `Cursor settings saved for ${result.model}.`,
+      result.warning ? 8000 : 4000,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to save Cursor settings.');
+  } finally {
+    cursorSettingsUpdateInFlight = false;
+    setCursorSettingsControlsDisabled(false);
+    applyCursorSettingsState(cursorSettingsState);
+  }
+}
+
+export async function toggleCursorProvider(enabled) {
+  if (cursorSettingsUpdateInFlight) return;
+  if (enabled && !cursorSettingsState.configured) {
+    applyCursorSettingsState(cursorSettingsState);
+    alert('Save a Cursor API key before enabling Cursor.');
+    return;
+  }
+  cursorSettingsUpdateInFlight = true;
+  setCursorSettingsControlsDisabled(true);
+  try {
+    const result = await updateCursorSettings({
+      model: cursorSettingsState.model,
+      enabled: enabled === true,
+    });
+    if (!result) throw new Error('Failed to update the Cursor provider.');
+    applyCursorSettingsState(result);
+    const providerLabel = result.enabled ? 'Cursor API key enabled' : 'Cursor API key disabled';
+    showTransientRelayNotice(
+      `${providerLabel}.${result.warning ? ` ${result.warning}` : ''}`,
+      result.warning ? 8000 : 4500,
+    );
+  } catch (error) {
+    applyCursorSettingsState(cursorSettingsState);
+    alert(error?.message || 'Failed to update the Cursor provider.');
+  } finally {
+    cursorSettingsUpdateInFlight = false;
+    setCursorSettingsControlsDisabled(false);
+    applyCursorSettingsState(cursorSettingsState);
+  }
+}
+
+export async function removeCursorSettings() {
+  if (cursorSettingsUpdateInFlight) return;
+  if (!cursorSettingsState.configured) return;
+  if (!confirm('Remove the saved Cursor API key?')) return;
+  const modelInput = document.getElementById('cursor-model-input');
+  const model = String(modelInput?.value || '').trim() || 'composer-2.5';
+  cursorSettingsUpdateInFlight = true;
+  setCursorSettingsControlsDisabled(true);
+  try {
+    const result = await updateCursorSettings({ model, remove: true });
+    if (!result) throw new Error('Failed to remove Cursor settings.');
+    applyCursorSettingsState(result, { resetInputs: true });
+    showTransientRelayNotice('Cursor API key removed. New conversations use GitHub Copilot.');
+  } catch (error) {
+    // A 409 'cursor-key-removal-blocked' rejection carries the active
+    // conversation counts inside the server's error message.
+    alert(error?.message || 'Failed to remove Cursor settings.');
+  } finally {
+    cursorSettingsUpdateInFlight = false;
+    setCursorSettingsControlsDisabled(false);
+    applyCursorSettingsState(cursorSettingsState);
   }
 }
 
@@ -618,10 +1306,22 @@ export function openSettingsModal() {
   claudeSettingsInputsDirty = false;
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();
+  grokSettingsInputsDirty = false;
+  ensureGrokSettingsInputTracking();
+  void syncGrokSettingsInputs();
+  cursorSettingsInputsDirty = false;
+  ensureCursorSettingsInputTracking();
+  void syncCursorSettingsInputs();
+  void refreshCursorAllowanceState();
+  void refreshCursorDashboardTokenState();
+  void refreshGrokAllowanceState();
   syncWindowsAutostartSetting();
   void refreshWindowsAutostartSetting();
   syncTurnCeilingSlider();
   void refreshTurnCeilingSetting();
+  syncBackgroundTaskTimeoutSlider();
+  void refreshBackgroundTaskTimeoutSetting();
+  void refreshPushSettingsSection();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }

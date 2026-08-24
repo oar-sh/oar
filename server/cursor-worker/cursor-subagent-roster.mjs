@@ -1,0 +1,81 @@
+import { isSafeCursorModelId } from '../../shared/model-id.mjs';
+
+/**
+ * Turn the relay's enabled Cursor models into `AgentOptions.agents` — the only
+ * way to give a Cursor SDK session a subagent on a chosen model.
+ *
+ * The built-in `task` tool's own `model` parameter is not a lever here: its menu
+ * comes from `agent.v1.AgentRunRequest.selected_subagent_models`, which Cursor
+ * IDE fills from the user's model picker and the SDK never sets (its local
+ * executor builds run options as `{generationUUID, requestedModel,
+ * enableAgentRetries, headers?}`). With that field empty the backend offers only
+ * `inherit` and `composer-2.5-fast`, which is why a relay session refused a
+ * `grok-4.5` subagent while the same request worked in the IDE. Declared
+ * subagents route around it: each one pins its own model.
+ *
+ * Two limits are baked into the shape below, both verified against the live SDK:
+ *   - Only real catalog ids resolve. A variant string like `grok-4.5-high` fails
+ *     with "this model is unavailable in the current environment".
+ *   - `ModelSelection.params` is dropped in the SDK's conversion to its runtime
+ *     custom-subagent shape, so a subagent cannot be pinned to a reasoning
+ *     effort. Every subagent runs its model's default variant (which for
+ *     `grok-4.5` is already `cursor-grok-4.5-high-fast`).
+ */
+
+// Routing aliases, not pinnable models: Cursor resolves them per request, so a
+// subagent pinned to one would defeat the point of naming a model at all.
+const ROUTING_ALIASES = new Set(['default', 'auto']);
+
+/**
+ * Subagent names are dashed (`grok-4.5` → `grok-4-5`). Whether the runtime
+ * accepts dots in a name is untested; the dashed form is what the live probe
+ * ran, and every description carries the undashed id so the model can still
+ * match a request that spells it the catalog way.
+ */
+export function cursorSubagentName(modelId) {
+  return String(modelId || '').trim().toLowerCase().replace(/\./g, '-');
+}
+
+function usableModelIds(modelIds) {
+  const seenNames = new Set();
+  const out = [];
+  for (const value of Array.isArray(modelIds) ? modelIds : []) {
+    const modelId = String(value || '').trim();
+    if (!modelId || !isSafeCursorModelId(modelId)) continue;
+    if (ROUTING_ALIASES.has(modelId.toLowerCase())) continue;
+    const name = cursorSubagentName(modelId);
+    // `gpt-5.4` and a hypothetical `gpt-5-4` collapse to one name; first wins,
+    // so the roster stays a function of its input rather than of Map ordering.
+    if (!name || seenNames.has(name)) continue;
+    seenNames.add(name);
+    out.push({ modelId, name });
+  }
+  return out;
+}
+
+/**
+ * `Record<name, AgentDefinition>` for `Agent.create` / `Agent.resume`, in the
+ * caller's model order. Returns an empty object when nothing is usable — the
+ * caller omits the option entirely in that case.
+ */
+export function buildCursorSubagentAgents(modelIds) {
+  const agents = {};
+  for (const { modelId, name } of usableModelIds(modelIds)) {
+    agents[name] = {
+      description: `Runs a task on the \`${modelId}\` model. Use this for any request asking for a ${modelId} subagent.`,
+      prompt: `You are a subagent running on the \`${modelId}\` model. Complete exactly the task you were given, then report the result.`,
+      model: { id: modelId },
+    };
+  }
+  return agents;
+}
+
+/**
+ * Stable identity for a roster, so a worker can tell whether the live agent
+ * handle still reflects the user's model selection. The handle bakes its
+ * subagents in at create/resume time; toggling models in the Select Models
+ * modal has to rebuild it or the session keeps the stale menu.
+ */
+export function cursorSubagentRosterFingerprint(modelIds) {
+  return usableModelIds(modelIds).map((entry) => entry.modelId).join('\u0000');
+}

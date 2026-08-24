@@ -3,9 +3,10 @@
 When changing anything related to the web relay (`server/` or `.github/extensions/web-relay/`):
 
 1. Use a **single runtime owner**. Do not mix extension-managed mode with standalone relay mode.
-   - **Extension-managed (default):** let `.github/extensions/web-relay/extension.mjs` own server supervision and polling/heartbeat.
-   - **Standalone dev mode:** `npm start` (starts `server.js` + `relay.mjs`) only when you intentionally are not relying on extension polling.
-   - Never run `npm start`, `node server/relay.mjs`, and extension polling together.
+   - **Extension-managed (default):** let `.github/extensions/web-relay/extension.mjs` own server supervision (it starts `server.js --supervised`) and polling/heartbeat.
+   - **Standalone dev mode:** start the server, then `node server/relay.mjs` by hand, only when you intentionally are not relying on extension polling.
+   - Never run a second server, `node server/relay.mjs`, and extension polling together.
+   - `node server/server.js` is the only server entry point (`npm start` is an alias for it). Its role is argv-driven — `--relay-runtime` marks the supervisor's worker child, `--supervised` hands restart ownership to the spawner. Never signal the role through the environment; it is inherited by tmux workers and the Copilot CLI.
    - Never kill or restart the node process bound to port `3333` unless the user explicitly gives permission to restart the web relay.
 2. Before any restart, stop stale relay/watchdog processes from earlier runs (especially detached shells) so only one web relay remains bound to `:3333`.
    3. For extension-managed mode, only restart the web relay after explicit user permission. Manual restarts must use the authenticated localhost API (`POST /api/relay/shutdown`); do not use direct process kills or respawn scripts.

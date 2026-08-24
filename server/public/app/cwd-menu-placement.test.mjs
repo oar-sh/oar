@@ -93,6 +93,8 @@ test('resolveActiveOptionIndex clamps at both ends and handles an empty list', (
   assert.equal(resolveActiveOptionIndex(3, 0, 5), 3);
 });
 
+// platform-agnostic: typeahead matches these paths as plain lowercased strings;
+// no path semantics are involved, so the win32 fixtures behave the same anywhere.
 test('resolveTypeaheadIndex matches label or path prefixes and wraps', () => {
   const entries = [
     { label: 'Current session CWD', path: 'C:\\git\\copilot-remote' },

@@ -1,6 +1,7 @@
 const MAX_TOOL_DETAIL_LENGTH = 140;
 // Matches the Copilot reasoning-stream bridge's per-thought cap.
 const MAX_THOUGHT_CHARS = 16 * 1024;
+const REDACTED_THINKING_PLACEHOLDER = '[Reasoning redacted by the model provider]';
 const SUBAGENT_TOOL_NAMES = new Set(['task', 'agent']);
 
 function truncate(text, maxLength = MAX_TOOL_DETAIL_LENGTH) {
@@ -19,6 +20,24 @@ function formatCompactTokens(value) {
 function capThought(text) {
   const value = String(text || '');
   return value.length <= MAX_THOUGHT_CHARS ? value : value.slice(0, MAX_THOUGHT_CHARS);
+}
+
+/**
+ * One user-readable line for a `system`/`api_retry` stream message. Exported
+ * because the session process needs the identical wording for retries that
+ * arrive between turns (carried into the next context as a pending activity).
+ */
+export function formatApiRetryNotice(sdkMessage) {
+  const status = Number(sdkMessage?.error_status) || 0;
+  const attempt = Number(sdkMessage?.attempt) || 0;
+  const max = Number(sdkMessage?.max_retries) || 0;
+  const delaySec = Math.round((Number(sdkMessage?.retry_delay_ms) || 0) / 1000);
+  const cause = status === 529
+    ? 'Anthropic API overloaded (529)'
+    : `Anthropic API error${status ? ` (${status})` : ''}`;
+  const counter = attempt && max ? ` ${attempt}/${max}` : '';
+  const wait = delaySec > 0 ? ` in ~${delaySec}s` : '';
+  return `${cause} — retrying${counter}${wait}…`;
 }
 
 export function isSubagentToolName(name) {
@@ -81,6 +100,9 @@ export function shouldEmitStreamUpdate(nextText, previousText) {
  *   server upserts rather than duplicating)
  * - `activity` → `{ text, subagentRunId? }`
  * - `subagent` → `{ subagentRunId, parentSubagentId, displayName, status }`
+ * - `background_tasks` → `{ tasks: [{ taskId, taskType, description }] }`
+ *   (REPLACE semantics: the full live set after each membership change)
+ * - `background_task_settled` → `{ taskId, status }`
  * - `result`   → `{ text, isError, subtype, sessionId, model, usage }`
  */
 export function createSdkMessageNormalizer() {
@@ -101,17 +123,29 @@ export function createSdkMessageNormalizer() {
         streamText: '',
         lastEmittedStreamText: '',
         thinking: new Map(), // block index -> { reasoningId, text }
-        // Assistant-message counter for the thread. Reasoning ids are keyed on
-        // (thread, message, block) so the partial `stream_event` frames and the
-        // complete `assistant` message for the same block produce the SAME id —
-        // the server upserts thoughts by reasoningId, so the complete message
-        // updates the streamed thought in place instead of duplicating it.
+        // The SDK delivers one complete `assistant` event PER CONTENT BLOCK
+        // (all sharing the message's API id, each arriving before that block's
+        // content_block_stop), so positional bookkeeping alone cannot pair a
+        // complete thinking block with its streamed frames. The streamed
+        // reasoning ids are recorded here per API message id and consumed in
+        // block order by the complete events — the server upserts thoughts by
+        // reasoningId, so the complete republish updates the streamed thought
+        // in place instead of duplicating it.
+        currentMessageId: '',
+        streamedThinkingIds: new Map(), // API message id -> [reasoningId, ...] in stream order
+        consumedThinkingIds: new Map(), // API message id -> count consumed by complete events
+        // Assistant-message counter for the thread; the fallback id key when
+        // partial frames (and thus recorded streamed ids) are unavailable.
         messageIndex: 0,
         // Set when `message_start` opens a message, so the complete `assistant`
         // message reuses that index instead of allocating a new one. Without
         // partial messages there is no `message_start`, and each complete
         // message allocates its own index.
         messageStarted: false,
+        // Which complete message the thread is currently inside, for the
+        // one-event-per-block delivery model.
+        lastCompleteMessageId: '',
+        currentComplete: null,
       });
     }
     return threads.get(key);
@@ -121,15 +155,42 @@ export function createSdkMessageNormalizer() {
     return `claude-${kind}-${state.key}-${state.messageIndex}-${blockIndex}`;
   }
 
+  // Reasoning id for a thinking block on a complete assistant event: reuse the
+  // id its streamed frames already published (matched by API message id, in
+  // block order), falling back to a fresh positional id when no partial frames
+  // were seen for the message.
+  function completeThinkingIdFor(state, messageId, blockIndex) {
+    const streamedIds = messageId ? state.streamedThinkingIds.get(messageId) : null;
+    if (streamedIds?.length) {
+      const consumed = state.consumedThinkingIds.get(messageId) || 0;
+      if (consumed < streamedIds.length) {
+        state.consumedThinkingIds.set(messageId, consumed + 1);
+        return streamedIds[consumed];
+      }
+    }
+    return thoughtIdFor(state, 'thought', blockIndex);
+  }
+
   // Called when a new assistant message begins on a thread, from whichever
   // signal arrives first (`message_start`, or the complete message itself).
-  function beginAssistantMessage(state, { fromStreamEvent }) {
+  // Complete events arrive one per content block, all sharing message.id, so
+  // later blocks of the same message must not open a new message (that would
+  // drift the positional thought ids and re-trigger the boundary logic).
+  function beginAssistantMessage(state, { fromStreamEvent, messageId = '' }) {
     if (fromStreamEvent) {
       state.messageIndex += 1;
       state.messageStarted = true;
       state.thinking.clear();
+      // New API message: the pending bubble must show this message's prose,
+      // not the previous message's narration concatenated onto it. The
+      // stream channel publishes cumulative text, so the accumulator resets
+      // at the message boundary.
+      state.streamText = '';
+      state.lastEmittedStreamText = '';
       return;
     }
+    if (messageId && state.lastCompleteMessageId === messageId) return;
+    state.lastCompleteMessageId = messageId;
     if (state.messageStarted) {
       state.messageStarted = false;
       return;
@@ -218,22 +279,56 @@ export function createSdkMessageNormalizer() {
    * Copilot extension's reasoning-stream bridge; text on a final, tool-free
    * message is the answer itself and must not be duplicated as a thought.
    */
-  function actionsForAssistantMessage(content, parentToolUseId) {
+  function actionsForAssistantMessage(content, parentToolUseId, messageId) {
     const actions = [];
     const state = threadState(parentToolUseId);
     const subagentRunId = subagentRunIdFor(parentToolUseId);
-    beginAssistantMessage(state, { fromStreamEvent: false });
-    const hasToolUse = content.some((block) => block?.type === 'tool_use');
+    beginAssistantMessage(state, { fromStreamEvent: false, messageId });
+
+    // Whether a text block is interim narration (a thought) or the answer is
+    // a property of the whole API message, but the SDK delivers one complete
+    // event per content block — so within one event a text block can never
+    // share `content` with a tool_use. Track tool-bearing per message.id:
+    // text seen before the message's first tool_use buffers until either a
+    // tool_use proves it narration or the message ends (answer text is
+    // published from the result message and must never double as a thought).
+    if (messageId && state.currentComplete?.id !== messageId) {
+      state.currentComplete = { id: messageId, sawToolUse: false, pendingTexts: [] };
+    }
+    const tracker = messageId ? state.currentComplete : null;
+    const hasToolUseInEvent = content.some((block) => block?.type === 'tool_use');
+
+    const emitNarration = (text, index) => {
+      const capped = capThought(text || '');
+      if (!capped.trim()) return;
+      actions.push({
+        channel: 'thought',
+        payload: {
+          reasoningId: thoughtIdFor(state, 'narration', index),
+          text: capped,
+          done: true,
+          subagentRunId,
+        },
+      });
+    };
 
     for (const [index, block] of content.entries()) {
       const blockType = String(block?.type || '');
       if (blockType === 'thinking' || blockType === 'redacted_thinking') {
-        const text = capThought(block?.thinking || '');
+        // Consume the pairing slot BEFORE the empty check: the summarized
+        // display can deliver an empty raw block ahead of the summary block,
+        // and skipping the empty one would hand its streamed id to the summary.
+        const reasoningId = completeThinkingIdFor(state, messageId, index);
+        const text = blockType === 'redacted_thinking'
+          // Redacted blocks carry encrypted `data`, never `thinking` — a
+          // placeholder keeps the reasoning visible instead of vanishing.
+          ? (String(block?.data || '').trim() ? REDACTED_THINKING_PLACEHOLDER : '')
+          : capThought(block?.thinking || '');
         if (!text.trim()) continue;
         actions.push({
           channel: 'thought',
           payload: {
-            reasoningId: thoughtIdFor(state, 'thought', index),
+            reasoningId,
             text,
             done: true,
             subagentRunId,
@@ -241,21 +336,23 @@ export function createSdkMessageNormalizer() {
         });
         continue;
       }
-      if (blockType === 'text' && hasToolUse) {
-        const text = capThought(block?.text || '');
-        if (!text.trim()) continue;
-        actions.push({
-          channel: 'thought',
-          payload: {
-            reasoningId: thoughtIdFor(state, 'narration', index),
-            text,
-            done: true,
-            subagentRunId,
-          },
-        });
+      if (blockType === 'text') {
+        if (tracker) {
+          if (tracker.sawToolUse) emitNarration(block?.text, index);
+          else tracker.pendingTexts.push({ index, text: String(block?.text || '') });
+        } else if (hasToolUseInEvent) {
+          // No message id to correlate on: fall back to the per-event check.
+          emitNarration(block?.text, index);
+        }
         continue;
       }
       if (blockType === 'tool_use') {
+        if (tracker) {
+          tracker.sawToolUse = true;
+          for (const pending of tracker.pendingTexts.splice(0)) {
+            emitNarration(pending.text, pending.index);
+          }
+        }
         actions.push(...actionsForToolUseBlock(block, parentToolUseId));
       }
     }
@@ -272,6 +369,7 @@ export function createSdkMessageNormalizer() {
 
     if (eventType === 'message_start') {
       beginAssistantMessage(state, { fromStreamEvent: true });
+      state.currentMessageId = String(event?.message?.id || '').trim();
       return actions;
     }
 
@@ -279,10 +377,13 @@ export function createSdkMessageNormalizer() {
       const blockType = String(event?.content_block?.type || '');
       if (blockType === 'thinking' || blockType === 'redacted_thinking') {
         const index = Number(event?.index ?? 0);
-        state.thinking.set(index, {
-          reasoningId: thoughtIdFor(state, 'thought', index),
-          text: '',
-        });
+        const reasoningId = thoughtIdFor(state, 'thought', index);
+        state.thinking.set(index, { reasoningId, text: '' });
+        if (state.currentMessageId) {
+          const ids = state.streamedThinkingIds.get(state.currentMessageId) || [];
+          ids.push(reasoningId);
+          state.streamedThinkingIds.set(state.currentMessageId, ids);
+        }
       }
       return actions;
     }
@@ -353,6 +454,37 @@ export function createSdkMessageNormalizer() {
       return [{ channel: 'init', payload: { sessionId: initSessionId, model: initModel } }];
     }
 
+    // The CLI retried a safeguards-refused request on a fallback model
+    // (e.g. Fable 5 → Opus 4.8, scope "session"). From here on this turn's
+    // output comes from the fallback model, so the recorded model must follow
+    // it — the init-channel action updates the turn's responseModel in place.
+    // The CLI's own notice is surfaced as an activity line; silently flipping
+    // models is exactly the confusion this exists to prevent (conv 3366b9d3).
+    if (type === 'system' && sdkMessage.subtype === 'model_refusal_fallback') {
+      const actions = [];
+      const fallbackModel = String(sdkMessage.fallbackModel || '').trim();
+      if (fallbackModel) {
+        initModel = fallbackModel;
+        actions.push({ channel: 'init', payload: { sessionId: initSessionId, model: fallbackModel } });
+      }
+      const notice = String(sdkMessage.content || '').trim()
+        || `Model switched to ${fallbackModel || 'a fallback model'} after a refusal.`;
+      actions.push({ channel: 'activity', payload: { text: truncate(notice, 500), subagentRunId: null } });
+      return actions;
+    }
+
+    // An upstream API request failed and the CLI is retrying with backoff.
+    // While that happens the CLI emits no assistant traffic at all, so
+    // without this line the relay UI shows a bare typing indicator that is
+    // indistinguishable from a wedged worker (three 529 stalls read as relay
+    // freezes on 2026-08-18). At most max_retries lines per request.
+    if (type === 'system' && sdkMessage.subtype === 'api_retry') {
+      return [{
+        channel: 'activity',
+        payload: { text: formatApiRetryNotice(sdkMessage), subagentRunId: null },
+      }];
+    }
+
     if (type === 'stream_event') {
       return normalizeStreamEvent(sdkMessage);
     }
@@ -360,7 +492,8 @@ export function createSdkMessageNormalizer() {
     if (type === 'assistant') {
       const parentToolUseId = sdkMessage?.parent_tool_use_id || null;
       const content = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
-      return actionsForAssistantMessage(content, parentToolUseId);
+      const messageId = String(sdkMessage?.message?.id || '').trim();
+      return actionsForAssistantMessage(content, parentToolUseId, messageId);
     }
 
     if (type === 'user') {
@@ -392,16 +525,37 @@ export function createSdkMessageNormalizer() {
       }];
     }
 
+    // The live background-task set, emitted on every membership change with
+    // REPLACE semantics. The turn runner gates the input-gate release on it: a
+    // released gate closes the CLI's control transport, and background agents
+    // that outlive the visible turn then lose every permission request.
+    if (type === 'system' && sdkMessage.subtype === 'background_tasks_changed') {
+      const tasks = (Array.isArray(sdkMessage.tasks) ? sdkMessage.tasks : [])
+        .map((task) => ({
+          taskId: String(task?.task_id || '').trim(),
+          taskType: String(task?.task_type || '').trim(),
+          description: String(task?.description || '').trim(),
+        }))
+        .filter((task) => task.taskId);
+      return [{ channel: 'background_tasks', payload: { tasks } }];
+    }
+
     if (type === 'system' && sdkMessage.subtype === 'task_notification') {
       const taskId = String(sdkMessage.task_id || '').trim() || 'unknown';
       const status = String(sdkMessage.status || '').trim() || 'unknown';
-      return [{
-        channel: 'activity',
-        payload: {
-          text: truncate(`Background task ${taskId} ${status}: ${String(sdkMessage.summary || '').trim()}`),
-          subagentRunId: null,
+      return [
+        // Settling is the edge the runner pairs with the level signal above: a
+        // settled session-level task means a continuation turn is about to be
+        // dequeued, so the gate must stay held even though the set is empty.
+        { channel: 'background_task_settled', payload: { taskId, status } },
+        {
+          channel: 'activity',
+          payload: {
+            text: truncate(`Background task ${taskId} ${status}: ${String(sdkMessage.summary || '').trim()}`),
+            subagentRunId: null,
+          },
         },
-      }];
+      ];
     }
 
     if (type === 'result') {

@@ -55,11 +55,12 @@ globally, plain `gh copilot` from any repository is enough.
 Or manually:
 
 ```bash
-npm start
+node server/server.js
 ```
 
-This starts both the web server and relay automatically.
-Stopping the main process (Ctrl+C / closing the terminal) also stops the relay.
+This starts the web server and stays attached to the terminal, respawning its
+worker child across restarts. Ctrl+C (or closing the terminal) stops both.
+A Copilot CLI session with the extension attaches separately.
 
 If you install this repo locally with `npm link` or `npm install -g .`, the `copilot-remote`
 command starts the web relay server if needed and then launches `gh copilot` in the same shell
@@ -79,19 +80,19 @@ If you need a specific `server/config.json` for token or tunnel settings, set
 `COPILOT_WEB_RELAY_CONFIG` to that file before launching. The global npm install does not include
 the repo-local gitignored config file by default.
 
-If you want CLI-extension mode (your active Copilot CLI session does the work),
-start only the web server manually:
+Mode summary — one entry point, role chosen by argv:
 
-```bash
-npm run start:server
-```
+- `node server/server.js` (= `npm start`): the process stays attached as a supervisor and runs
+  `server-runtime.mjs` in a worker child it marks with `--relay-runtime`. Exit 75 relaunches the
+  worker; other non-zero exits are retried 3 times before the supervisor gives up.
+- `node server/server.js --supervised`: runs the server in this process and exits 75 instead of
+  restarting itself, leaving that to whoever spawned it. This is what the CLI extension passes.
+- `node server/relay.mjs`: the standalone Copilot relay, started by hand after the server is up.
+  Manual escape hatch only — never alongside extension-managed transport.
 
-Mode summary:
-
-- `npm start`: server + standalone SDK relay (manual development / local end-to-end testing)
-- `npm run start:server`: server only; `server.js` now acts like the `playground/scripts/self_restart` supervisor entry for manual terminal runs
-- `npm run start:server:respawn`: legacy/manual watchdog tool (`respawn.bat`, outside extension-managed flow)
-- `npm run start:server:respawn:posix`: legacy/manual watchdog tool (`respawn.sh`, outside extension-managed flow)
+Role flags are argv, not env, on purpose: the server's environment is inherited by tmux worker
+sessions and by the Copilot CLI it launches, and the extension spawns the next server from that
+same environment — so an env flag would decide the role of unrelated servers down the tree.
 
 On Windows, the visible relay launcher path now targets a stable per-workspace Windows Terminal window name so later foreground launches reuse the same window instead of opening new desktop windows. Keep the hidden/stdio path as a fallback only.
 
@@ -100,7 +101,7 @@ On Windows, the visible relay launcher path now targets a stable per-workspace W
 1. Stop stale detached watchdog/relay processes before restart.
 2. Keep exactly one listener on port `3333`.
 3. The relay singleton lock is stored at `server/data/relay-server.lock` (stale locks are auto-recovered).
-4. In extension-managed mode, do not run `npm start` or `node relay.mjs`.
+4. In extension-managed mode, do not start a second server or run `node relay.mjs`.
 5. Verify `/api/status` shows `cliOnline: true` and queue counts are moving or zero.
 6. Follow relay restart policy from `.github/copilot-instructions.md`.
 7. In extension-managed mode, use `POST /api/relay/shutdown` for manual restart requests.
@@ -110,11 +111,10 @@ On Windows, the visible relay launcher path now targets a stable per-workspace W
 
 Script necessity note:
 
-- Extension-managed relay does not call npm scripts directly; it starts `server.js` itself.
-- Extension-managed relay supervision now includes bounded auto-restart while the CLI session is active.
-- Keep `npm start` for manual local development (starts server + standalone relay).
-- Keep `npm run start:server` for server-only manual runs and extension-parity testing.
-- Treat `npm run start:server:respawn` / `npm run start:server:respawn:posix` as legacy troubleshooting only; do not use them for manual restarts.
+- Extension-managed relay does not call npm scripts directly; it starts `server.js --supervised` itself.
+- Extension-managed relay supervision includes bounded auto-restart while the CLI session is active,
+  and is now the only supervisor in that mode.
+- `npm start` is a plain alias for `node server/server.js`; there is no other start script.
 - Manual restart policy is defined in `.github/copilot-instructions.md`.
 
 ## Global extension install (user-scoped)
@@ -157,7 +157,7 @@ If `localhostOnly` is enabled in `config.json`, the server listens only on loopb
 http://localhost:3333/
 ```
 
-`localhostOnly` affects only the local relay listener. SSH reverse tunnel exposure is configured separately with `sshTunnel.remoteBind`.
+`localhostOnly` affects only the local relay listener. SSH reverse tunnel exposure is configured separately with `sshTunnel.remoteBind`. The Cloudflare Tunnel mode (`cloudflaredTunnel`) needs no public bind at all: `cloudflared` connects outbound to Cloudflare and proxies back into `127.0.0.1`.
 
 Sign in once with the token prompt; the browser stores the session in an HttpOnly cookie.
 Each CLI session now tracks its own workspace root:
@@ -257,11 +257,12 @@ When the Claude provider is enabled, discovered `claude-*` IDs join the same cat
 only offers models the active conversation's provider can serve, so Claude models are hidden in
 Copilot/OpenAI conversations and vice versa.
 
-**Select Models** has one tab per runtime — **Copilot**, **OpenAI**, **Anthropic** — and each tab
-lists only rows contributed by that runtime. The Claude tab writes its selection through
-`POST /api/settings/claude` (`enabledModels`) rather than the model-variant catalog; the configured
-default model is always enabled and cannot be deselected, since deselecting it would leave Claude
-conversations without a model. An empty selection means "all available".
+**Select Models** has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK** —
+and each tab lists only rows contributed by that runtime. The Claude and Cursor tabs write their
+selection through `POST /api/settings/claude` / `POST /api/settings/cursor` (`enabledModels`) rather
+than the model-variant catalog; the configured default model is always enabled and cannot be
+deselected, since deselecting it would leave that provider's conversations without a model. An empty
+selection means "all available".
 
 `POST /api/model-variants/refresh` refreshes all enabled providers concurrently and reports
 `openAIModelDiscovery` and `claudeModelDiscovery` separately, so one provider's failed discovery does
@@ -299,21 +300,31 @@ provider, and other providers' bindings are never touched.
 
 | Relay mode  | Claude mapping                                                              |
 | ----------- | --------------------------------------------------------------------------- |
-| `plan`      | SDK `permissionMode: 'plan'`; `ExitPlanMode` publishes a **plan_ready** board |
+| `plan`      | SDK `permissionMode: 'plan'`; `ExitPlanMode` publishes a **plan_ready** board, then the tool call is **denied** so the turn ends for review instead of rolling straight into implementation — the board's choice starts the next turn in the chosen mode |
 | `ask`       | System prompt appended to prefer `AskUserQuestion` before implementing        |
 | `agent`     | Default permission mode, unmodified preset prompt                            |
 | `autopilot` | System prompt appended to keep moving unless input is truly blocking          |
 
 - **Model and reasoning effort are per turn.** Each turn is a fresh `query()` with `resume`, so both
   can change between messages. Effort levels are `none` (SDK default) plus whatever the model reports
-  (`low`, `medium`, `high`, `xhigh`, `max`).
+  (`low`, `medium`, `high`, `xhigh`, `max`), plus **Ultracode** — see below.
+- **Ultracode** is offered on every model whose discovered efforts include `xhigh`. It is not an SDK
+  effort level but a session-scoped settings flag, so the relay carries `ultracode` as a sentinel on
+  the ordinary effort ladder (`withClaudeUltracodeTier` in `services/provider-reasoning-effort.mjs`,
+  the single source for all Claude effort lists) and only the worker translates it: a fresh session
+  spawns with `effort: 'xhigh'` and `settings: { ultracode: true, enableWorkflows: true }`, and a
+  live session is toggled in or out with `applyFlagSettings` (`claudeUltracodeFlagSettings`).
+  `enableWorkflows` is passed explicitly because the worker loads no filesystem settings. It is never
+  a silent default — the selectors label the rung "Ultracode" and warn about the token cost.
 - **Tools are auto-allowed**, matching the Copilot workers' `--allow-all` posture. Only two tools are
-  intercepted: `AskUserQuestion` (bridged to relay question cards) and `ExitPlanMode` (plan board).
+  intercepted: `AskUserQuestion` (bridged to relay question cards) and `ExitPlanMode` (plan board;
+  denied after the board posts — the plan text comes from the tool input, or from the CLI's
+  `planFilePath` when no inline plan is sent).
 - **Attachments** — images up to 5 MB are inlined as base64 content blocks; larger images and all
   non-image files are passed as absolute path references for Claude's `Read` tool.
 - **Subagents** — `forwardSubagentText` is on, so subagent text, thoughts, and activity stream into
-  their own nested bubbles. Targeted subagent cancellation is *not* supported; `abort_subagent`
-  control requests are answered with an explicit "not supported" result. Full-turn **Stop** works.
+  their own nested bubbles. `abort_subagent` maps to `query.stopTask()` for a backgrounded subagent;
+  one running inside the current turn is still answered "not supported". Full-turn **Stop** works.
 - **Thinking** — the worker requests summarized thinking *display* without passing a `thinking`
   option, so it never switches thinking on for a session that has it off, and never changes a budget.
 
@@ -323,6 +334,42 @@ The native Agent SDK session id observed on the first turn is posted to
 `POST /api/claude-native-session` and stored in `runtime_sessions.claude_native_session_id`. Later
 turns pass it back as `resume`, so a Claude conversation survives worker restarts. The id is only
 cached in the worker after the server accepts it, so a failed persist is retried next turn.
+
+### Background tasks and workflow progress
+
+The worker keeps one persistent CLI process per conversation, so background tasks survive the reply
+that started them. The live task set is posted to `POST /api/background-tasks` (REPLACE semantics)
+and broadcast as the `background_tasks` socket event; the composer's task panel renders it and can
+stop an individual task over a `worker.control` push.
+
+Tasks of type `local_workflow` carry an extra `workflowProgress` digest, because the SDK exposes no
+workflow-progress surface — the worker reads it off disk:
+
+- While the workflow runs, `subagents/workflows/<runId>/journal.jsonl` under the session directory
+  gives the agent set and their running/done state; agent labels come from the first line of each
+  `agent-<id>.jsonl`.
+- The run record `workflows/<runId>.json` is written **only at completion**, and takes over as the
+  authoritative tree once it exists — it is the only source of phase titles, logs, token totals, and
+  per-agent tool counts.
+- Parsing lives in `claude-worker/workflow-progress-digest.mjs` (`digestFromJournal`,
+  `digestFromRunRecord`), polling in `claude-session-process.mjs` (`syncWorkflowPoller`, 2 s, only
+  while such a task is live, published only when the digest actually changed). Reads are bounded by
+  byte caps and a filename pattern, and the digest is clamped (≤100 agents, ≤50 phases, ≤5 log lines,
+  per-field length caps). A run is joined to its task by the record's `taskId`, with a start-time
+  mtime window as the mid-run fallback.
+- The relay never trusts the worker's JSON: `sanitizeWorkflowProgress` (`routes/messages-routes.mjs`)
+  re-applies every clamp before storing or broadcasting, and drops a digest with no phases and no
+  agents.
+
+When a workflow settles, the worker buffers its final digest (at most five, terminal status never
+downgraded) and attaches it to the next `POST /api/response` as `workflowRuns`. Runs that settled on
+a journal snapshot get one more run-record read at drain time, since the CLI often flushes the record
+a few seconds after the task disappears. The relay writes those rows into `workflow_runs` inside the
+same transaction that finalizes the assistant message, keyed on the response message id, and returns
+them with the message — so the transcript's collapsed **Finished background task** card (the same
+tree renderer as the live panel, `buildWorkflowRunCard` in `public/app/background-tasks-view.mjs`)
+survives a reload. A history rebuild deletes a conversation's `workflow_runs` alongside its
+`subagent_runs`, because both key on message ids the rebuild replaces.
 
 ### Context usage
 
@@ -354,6 +401,34 @@ On Windows it opens a `Claude Worker <id>` terminal window.
 `fetchUsageSummary` reads GitHub Copilot plan quota, so it is skipped entirely for OpenAI and Claude
 turns. Those replies carry no usage line rather than displaying Copilot premium-request numbers under
 a reply that never touched Copilot.
+
+## Cursor Agent SDK provider
+
+Cursor conversations run through `server/cursor-worker/cursor-session-worker.mjs`, a per-conversation
+Node worker like the Claude one, backed by the Cursor Agent SDK. Authentication uses a Cursor API key
+saved via **Settings → Cursor SDK** (`POST /api/settings/cursor`); saving or replacing the key resets
+and re-runs model discovery, which also records each model's supported reasoning-effort tiers
+(`effortsByModel`).
+
+Per-turn behavior:
+
+| Relay mode  | Cursor mapping                                                               |
+| ----------- | ---------------------------------------------------------------------------- |
+| `plan`      | SDK native plan mode; a plan-shaped final message publishes a **plan_ready** board |
+| `ask` / `autopilot` | The SDK's send options carry no per-turn instruction channel, so a `[Relay mode: …]` nudge is prepended to the user message — injected only when the mode changes, and a change away from a nudged mode sends an explicit cancellation |
+| `agent`     | Default behavior, no injection                                                |
+
+- **Model and reasoning effort are per turn.** Effort is validated against the model's discovered
+  tiers (`none` = model default); for `auto`/undiscovered models the request passes through and the
+  worker validates it against the resolved model's live params.
+- **Stale agent handles are retried once.** A cached agent handle whose exchanged auth expired fails
+  as a terminal error result even though the API key is still valid, so the worker recreates the
+  handle and retries a single time; a second auth failure is treated as a real key problem.
+- **Session root** — the worker keeps its per-session agent store at
+  `$CURSOR_AGENT_STORE_DIR` or `server/data/cursor-agents/<sdkSessionId>`, created on the first turn.
+  The explorer's Session root resolves to it via `resolveCursorSessionRoot`.
+- Cursor turns are skipped by `fetchUsageSummary` like OpenAI and Claude turns — no Copilot usage
+  line is attached.
 
 ## Turn recovery and the max turn duration
 
@@ -642,6 +717,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/message` | Send a message from the browser |
 | POST | `/api/upload` | Upload binary file content (deduped by SHA-256) |
 | GET | `/api/upload/:sha256/content` | Stream stored upload content by hash |
+| PATCH | `/api/conversation/:id/draft` | Save composer draft text and optional `draftAttachments` |
 | GET | `/api/files/*` | Stream a workspace file by repo-relative path (token required) |
 | GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image/video files |
 | GET | `/api/repo/tree` | Return repository root + first-level entries for lazy workspace browsing |
@@ -651,6 +727,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/session-root/list` | List the explorer's Session root (`path`, optional `includeHidden`) — like `/api/drives/list`, but a not-yet-created root returns an empty folder (`exists: false`) instead of 404, and the sibling `<path>.jsonl` transcript is appended as a child |
 | GET | `/api/drives/file` | Stream a file by path — Windows drive path or Linux absolute path depending on server platform |
 | GET | `/api/drives/files-preview` | Return structured preview JSON for a file — Windows drive path or Linux absolute path depending on server platform |
+| GET | `/api/git/status` | Git status for the conversation's workspace root (`branch`, `upstream`, `ahead`, `behind`, `files[]` incl. untracked); a non-repo root returns `isRepo: false` rather than an error |
+| GET | `/api/git/diff` | Full-context unified diff for one changed file (`path`, optional `untracked=1`); the client renders both "changes only" and "full file" views from this single patch |
+| POST | `/api/git/pull` | Run `git pull` in the conversation's workspace root and return the combined output |
 | GET | `/api/conversations` | List all conversations |
 | GET | `/api/sessions` | List runtime sessions bound 1:1 to conversations |
 | GET | `/api/conversation/:id` | Get conversation message windows (`before*`, `after*`, or `aroundMessageId`) plus session-root metadata |
@@ -683,13 +762,19 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
 | GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored. Both return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
 | GET | `/api/context` | Same payload when a `conversationId` query is provided; otherwise returns a missing-selection response |
-| GET | `/api/usage` | Live Copilot usage snapshot |
+| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
+| GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
+| POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`) |
 | POST | `/api/settings/claude` | Enable/disable Claude, set the default model or the enabled model subset; triggers discovery and unstarted-conversation reconciliation |
+| GET | `/api/settings/cursor` | Read Cursor provider settings — same shape as Claude's: `models` is the enabled subset, `availableModels` the full discovered list, plus per-model `efforts` |
+| POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
 | POST | `/api/claude-native-session` | (Claude worker) Persist the native Agent SDK session id for resume |
 | POST | `/api/claude-context-usage` | (Claude worker) Report the session's context-window breakdown after a turn |
+| POST | `/api/claude-plan-usage` | (Claude worker) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot |
+| POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run for the active turn |
 | POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Request cancellation of one subagent run (unsupported by the Claude runtime) |
 | PATCH | `/api/conversation/:id/message/:messageId/share-visibility` | Hide or unhide a single message from shared views |
@@ -724,10 +809,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   - `requestedAt`, `reason`, `requestedBy`
   - `queue`: current `pendingCount` / `processingCount` / `parkedCount`
 - The relay waits until the queue is idle before acting; this API is not an interrupt or cancel mechanism.
-- Ownership after an intentional restart depends on the active runtime owner:
-  - extension-managed `server.js` relaunches under `.github/extensions/web-relay/server-lifecycle/managed-server.mjs`
-  - standalone `npm start` relaunches under `server/start.js`
-  - bare `node server.js` keeps `server.js` attached as the self-restart supervisor, respawns a worker-mode child, and keeps the same terminal session alive
+- Ownership after an intentional restart follows the argv role, so exactly one supervisor acts on exit 75:
+  - `server.js --supervised` exits 75 and relaunches under `.github/extensions/web-relay/server-lifecycle/managed-server.mjs`
+  - bare `node server/server.js` keeps its supervisor attached, respawns the `--relay-runtime` child, and keeps the same terminal session alive
 
 ### Upload storage model
 
@@ -738,6 +822,68 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - Image attachments are forwarded to the Copilot SDK as multimodal attachments
   (`file` when a disk path is available, otherwise inline `blob`).
 - Non-image uploads continue to be exposed as file references.
+- `POST /api/upload` sniffs the payload's magic bytes and reconciles them against the
+  client-supplied `X-File-Type` header. The detected type wins on disagreement, so a
+  disguised executable is stored as what it actually is. Unrecognised bytes (plain text,
+  CSV, source files) keep the claimed type. The response reports `mimeTypeCorrected`.
+
+### Composer attachments: paste, drag-and-drop and eager upload
+
+- Files reach the composer through three paths, all sharing one ingestion function:
+  the 📎 picker, `Ctrl+V` paste, and drag-and-drop onto the input area.
+- **Paste attaches, it never sends.** When the clipboard holds both an image and text,
+  the image wins and the text is discarded. When it holds only text, the handler does
+  nothing so the browser's native paste is untouched.
+- Clipboard bitmaps arrive unnamed (or as a generic `image.png`) and are renamed
+  `pasted-<ISO-timestamp>.<ext>`.
+- Images over ~2 MB are downscaled client-side to a 2560 px longest edge and re-encoded
+  to **JPEG** before upload. GIF and SVG are never re-encoded, and a re-encode that fails,
+  grows the file, or yields anything other than JPEG/PNG falls back to the original bytes.
+- The output format is deliberately restricted to JPEG/PNG: Copilot's image-input docs call
+  these "the most widely supported formats". WebP compresses better and previews correctly
+  in the browser, but arrives at the model unreadable.
+- Re-encoding therefore has two triggers, tracked by `reencodeReason()`:
+  - `'size'` — the image is over the byte threshold. Abandoned if the result is no smaller.
+  - `'format'` — the source is not PNG/JPEG/GIF (e.g. WebP, AVIF, HEIC), so it is converted
+    at its original dimensions **regardless of size**, and kept even if the result is larger:
+    a bigger image the model can read beats a smaller one it cannot.
+- Without the `'format'` trigger a WebP small enough to skip the size threshold would reach
+  the model invisible.
+- Attachments upload **eagerly** on selection rather than on Send. Chips show an
+  uploading spinner, and a failed upload becomes a clickable retry.
+- Send is disabled while any upload is in flight. Failed uploads are deliberately not
+  counted as in-flight, so a failure can never wedge the button.
+- Exceeding the 6-attachment cap keeps the first 6 and reports the overflow in a toast
+  (previously the overflow was dropped silently).
+- Shared read-only viewers cannot paste or drop.
+
+### Composer attachment cache
+
+- Pending attachments persist **per conversation**, mirroring how text drafts already work.
+  Switching conversations and returning restores them, as does reloading the page.
+- Storage is `conversations.draft_attachments`: a JSON array of `{sha256, name, type, size}`.
+  Only already-uploaded attachments are persisted — never file bytes.
+- `PATCH /api/conversation/:id/draft` accepts an optional `draftAttachments` array.
+  Omitting the field leaves the stored attachments untouched; passing `null` or `[]` clears
+  them. Every entry must reference a blob the server already holds, otherwise the request
+  is rejected with a 400.
+- Removing an attachment is expressed as a draft save carrying the remaining list, so it is
+  ordered against in-flight draft writes rather than racing them. The server diffs the list
+  and releases the reference itself; there is deliberately no delete-by-hash endpoint, since
+  blobs are content-addressed and shared, and such a route would let one caller destroy
+  another conversation's freshly uploaded blob.
+- Draft blobs are kept alive by an `upload_refs` row using the sentinel
+  `message_id = '__draft__'`. On send, the real message reference is inserted and the
+  sentinel row is dropped. Reference release only reclaims blobs whose sentinel row this
+  conversation actually held.
+- Conversation deletion needs no special handling: the existing foreign-key cascade and
+  orphan sweep already collect draft blobs.
+- Because uploads are eager, a blob can exist before anything references it (pasting into a
+  conversation that is then abandoned, or switching conversations mid-upload). A sweep runs
+  at startup and every 6 hours to reclaim unreferenced blobs older than 24 hours; the age
+  floor guarantees an in-flight upload is never collected.
+- Attachments added before a conversation exists stay in the composer (already uploaded) and
+  are adopted by the conversation created on first send.
 
 ### Chat file reference tokens
 
@@ -764,7 +910,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 - Use `/api/repo/list?path=<repo-relative-dir>&includeHidden=0|1&includeHeavy=0|1` for lazy-loaded workspace directory browsing.
 - Use `/api/drives/roots` + `/api/drives/list?path=<path>&includeHidden=0|1` for lazy-loaded drive/root browsing (separate from workspace heavy mode).
 - Use `/api/drives/file?path=<path>` and `/api/drives/files-preview?path=<path>` for drive/root file raw/preview access.
-- Use `/api/session-root/list?path=<sessionRootPath>&includeHidden=0|1` for the explorer's Session root. Child directories below it lazy-load through `/api/drives/list` as usual. The Claude Agent SDK creates a session's directory lazily — only once the session writes `subagents/` or `tool-results/` files — so the root is served as an empty folder until then rather than 404ing, and the transcript that lives one level up in the project directory is listed as a child of it.
+- Use `/api/session-root/list?path=<sessionRootPath>&includeHidden=0|1` for the explorer's Session root. Child directories below it lazy-load through `/api/drives/list` as usual. The Claude Agent SDK creates a session's directory lazily — only once the session writes `subagents/` or `tool-results/` files — so the root is served as an empty folder until then rather than 404ing, and the transcript that lives one level up in the project directory is listed as a child of it. Cursor sessions resolve their Session root the same lazy way: the worker's per-session agent store (`$CURSOR_AGENT_STORE_DIR` or `server/data/cursor-agents/<sdkSessionId>`) exists only after the session's first turn, and the Session button stays disabled until it does.
 - Requests are auth-protected and restricted to files inside the workspace root.
 - **Platform split** — the drives API adapts automatically based on the server OS:
   - **Windows:** drive roots are discovered via `fsutil.exe`; paths use Windows drive-letter format (`C:/foo/bar`); directory listing uses PowerShell.
@@ -776,6 +922,25 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   > **TODO:** add an optional `drivesAllowList` config key (array of absolute path prefixes) so operators can restrict drive access to a set of directories (e.g. home folder or workspace root). When the list is non-empty, requests whose resolved path does not start with one of the listed prefixes should be rejected with `403`.
   >
   > When implementing it, reuse `isWithinAllowedPrefix()` from `services/workspace-root-path-policy.mjs` rather than writing a second `startsWith` check — a bare prefix match would let `C:\work` admit `C:\work-secrets`. See `workspaceRootAllowList` below, which already follows this pattern.
+
+### Git changes modal
+
+The **🌿 Git changes** entry in the conversation `⋯` menu opens a modal over the conversation's
+workspace root, backed by `services/git-changes-service.mjs` and `routes/git-routes.mjs`:
+
+- `GET /api/git/status?conversationId=…` — branch, upstream, ahead/behind, and every changed file
+  (staged, unstaged, and untracked; porcelain v1 parsing). The root is resolved server-side from the
+  conversation scope exactly like the file-preview routes — the client never sends a path — and a
+  workspace root that is not a git repository returns `isRepo: false` rather than an error.
+- `GET /api/git/diff?path=…&untracked=0|1&conversationId=…` — one full-context unified diff
+  (`-U999999`, untracked files via `git diff --no-index /dev/null`). The client renders both the
+  **Changes only** view (context collapsed to gap markers) and the **Full file** view from this
+  single patch; the parsing lives in `public/app/git-diff-model.mjs`.
+- `POST /api/git/pull?conversationId=…` — runs `git pull` in the workspace root and returns the
+  combined output.
+
+File paths passed to `/api/git/diff` go through the same `resolveWorkspaceFilePath` containment
+check as the file bridge, so traversal outside the workspace root is rejected.
 
 ### Changing the launch CWD
 
@@ -925,7 +1090,11 @@ The CLI extension (`.github/extensions/web-relay/extension.mjs`) loads `relay-to
 for shared tool guidance.
 
 The browser UI keeps the usage button in the sidebar header, and that button continues to
-call `/api/usage` directly.
+call `/api/usage` directly. It now renders the unified plan-usage report — one card per
+provider with meters, reset countdowns and collapsible cost detail — via
+`public/app/plan-usage-view.mjs`, falling back to the old Copilot-only text summary when
+the response carries no `providers` array (an older relay, or one without the plan-usage
+service).
 
 ## Config (`config.json`)
 
@@ -951,6 +1120,13 @@ call `/api/usage` directly.
     "remotePort": 4444,
     "identityFile": "~/.ssh/id_rsa",
     "autoReclaimPort": true
+  },
+  "cloudflaredTunnel": {
+    "mode": "disabled",
+    "required": false,
+    "token": "",
+    "binary": "",
+    "extraArgs": []
   }
 }
 ```
@@ -983,7 +1159,15 @@ call `/api/usage` directly.
 | `sshTunnel.remotePort` | — | Port opened on the VPS |
 | `sshTunnel.identityFile` | *(optional)* | SSH private key path (`~` expanded); uses ssh-agent if omitted |
 | `sshTunnel.autoReclaimPort` | `true` | When remote bind fails, run a remote reclaim step before retrying |
+| `sshTunnel.reclaimStaleSshSessions` | `false` | Also kill your own childless `@notty` SSH sessions when the port stays held (see caveat below) |
 | `sshTunnel.remoteCleanupCommand` | *(optional)* | Override reclaim command (`ssh user@host <command>`) for custom VPS cleanup |
+| `cloudflaredTunnel.mode` | `disabled` | Cloudflare tunnel mode (`disabled` or `managed`) |
+| `cloudflaredTunnel.enabled` | `false` | Legacy alias for mode (`true` => `managed`) |
+| `cloudflaredTunnel.required` | `false` | Pause dequeue when the Cloudflare tunnel is disconnected in managed mode |
+| `cloudflaredTunnel.token` | — | Tunnel token from the router panel (never logged) |
+| `cloudflaredTunnel.binary` | *(auto)* | `cloudflared` path; falls back to the optional npm package, then `PATH` |
+| `cloudflaredTunnel.extraArgs` | `[]` | Extra arguments appended to `cloudflared tunnel run` |
+| `tunnelMarkerHeaders` | `[]` | Extra edge-injected header names that mark tunnel traffic for the session-worker path guard |
 
 ### SDK auto-detection behavior
 
@@ -1019,10 +1203,24 @@ exponential backoff (5 s → 10 s → 20 s → 40 s → 60 s cap, no retry limit
 The counter resets after a connection is stable for >30 s.
 
 **Remote stale-forward reclaim** — on `remote port forwarding failed for listen port`,
-the relay runs a one-shot remote cleanup over SSH (default: kill listeners
-for that remote port via `lsof`/`fuser` when available) and retries quickly on the same
+the relay runs a one-shot remote cleanup over SSH and retries quickly on the same
 fixed port. Set `sshTunnel.autoReclaimPort` to `false` to disable, or provide
 `sshTunnel.remoteCleanupCommand` for your own server-specific cleanup command.
+
+The reclaim reads the port state from `ss` / `/proc/net/tcp` rather than trusting
+`lsof`. This matters: when the port is held by a stale `ssh -R` forward, the owning
+`sshd` session has dropped privileges, so `/proc/<pid>/fd` is root-owned and both
+`lsof` and `fuser` report nothing even though the socket belongs to your own uid.
+The cleanup exits non-zero while the port is still bound, so a port that cannot be
+freed falls back to exponential backoff instead of respawning `ssh` every second.
+
+Killing such a forward requires killing the `sshd` session that owns it. That is
+off by default because the session cannot be identified precisely without root.
+Enabling `sshTunnel.reclaimStaleSshSessions` sweeps your own `sshd` sessions that
+have no child processes — the shape `ssh -N -R` leaves behind. Interactive shells,
+IDE remote servers (VS Code / Cursor) and the reclaim command itself all have
+children and are skipped, but any *other* `-N` forward you rely on for a different
+port would also be killed, so leave it off unless the relay owns the account.
 
 **Caddy VPS config:**
 
@@ -1143,6 +1341,11 @@ and on `messages`:
 - `hidden_from_shares` / `share_hidden_at` — per-message share visibility (see
   [Conversation sharing](#conversation-sharing-and-per-message-visibility))
 
+New tables are likewise created at startup with `CREATE TABLE IF NOT EXISTS` in both the fresh-schema
+and migration blocks — most recently `workflow_runs` (final workflow digest per assistant message,
+keyed on `response_message_id`, cascade-deleted with the conversation; see
+[Background tasks and workflow progress](#background-tasks-and-workflow-progress)).
+
 Statements that depend on these columns are prepared conditionally, so an older database keeps
 working with the corresponding feature inert rather than crashing at startup.
 
@@ -1171,4 +1374,6 @@ working with the corresponding feature inert rather than crashing at startup.
 | `claude-worker/` | Claude Agent SDK session worker (turn runner, ask-user bridge, attachments, SDK message normalizer) |
 | `services/claude-session-root-service.mjs` | Resolves the browsable session folder for Claude conversations |
 | `services/context-usage-view.mjs` | Normalizes Copilot and Claude context data into one payload |
+| `services/cloudflared-tunnel-service.mjs` | Supervises the `cloudflared` child process for the Cloudflare Tunnel mode |
+| `services/tunnel-worker-path-guard.mjs` | Rejects session-worker WebSocket paths that arrive through a public tunnel |
 | `../shared/turn-ceiling.mjs` | Shared bounds/formatting for the max turn duration setting |

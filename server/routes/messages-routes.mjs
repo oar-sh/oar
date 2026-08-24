@@ -3,6 +3,8 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
+import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
+import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
 import {
   shouldParkForRestart,
   parkPendingQueueForRestart,
@@ -18,8 +20,13 @@ import {
   usageSnapshotFromRow,
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
+import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services/plan-usage-claude.mjs';
+import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
+import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning-effort.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
+import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
+import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -53,15 +60,21 @@ export function resolveOpenAIReasoningEffort(explicitReasoningEffort = '', model
   return { ok: true, effort: explicit || fallback, supported };
 }
 
+// runtimeBoundToOtherProvider covers sessions already pinned to a non-OpenAI
+// provider (Claude, Cursor). Those resolve model ids against their own catalog,
+// and providers reuse each other's ids, so matching the configured OpenAI model
+// id there says nothing about the request targeting OpenAI.
 export function shouldRequireNewOpenAIConversation({
   shouldCreateConversation = false,
   runtimeUsesOpenAI = false,
   requestedConfiguredOpenAIModel = false,
   githubModelAvailable = false,
+  runtimeBoundToOtherProvider = false,
 } = {}) {
   return (
     !shouldCreateConversation
     && !runtimeUsesOpenAI
+    && !runtimeBoundToOtherProvider
     && requestedConfiguredOpenAIModel
     && !githubModelAvailable
   );
@@ -71,8 +84,19 @@ function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok' || normalized === 'openai-image') return 'openai';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
+  if (normalized === 'cursor') return 'cursor';
+  // Without these, an explicit request for a bootstrap-only provider read as
+  // "no provider stated" and the guards below could never fire.
+  if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
+  if (normalized === 'claude' || normalized === 'anthropic') return 'claude';
   return '';
 }
+
+const BOOTSTRAP_ONLY_PROVIDER_LABELS = Object.freeze({
+  cursor: 'Cursor',
+  grok: 'Grok',
+  claude: 'Claude',
+});
 
 function deriveModelOrigin(model) {
   const requested = String(model || '').trim().toLowerCase();
@@ -691,6 +715,65 @@ export function shouldTakeOverStrandedPendingMessage({
   return degradedReason === 'startup-heartbeat-timeout' || degradedReason === 'stale-pid';
 }
 
+// Which provider actually executed a turn, derived from the authenticated
+// responder identity: a session worker names its sdk session via the bridge
+// header, and that session's runtime row names the provider. The response
+// payload has no say — a misrouted responder must not be able to mask itself.
+//
+// Identity-less responders are the interesting case. Two of them exist:
+//   - server/relay.mjs, launched by hand with plain env (nothing sets
+//     COPILOT_PROVIDER_TYPE for it), so it authenticates on the Copilot
+//     plan no matter what the conversation is bound to. A turn it answers for
+//     a non-github conversation really did run on the wrong plan.
+//   - this server finalizing an image operation it executed itself: it calls
+//     the provider's own API with the conversation's BYOK key and then
+//     self-posts to /api/response with no bridge headers. That one genuinely
+//     ran on the bound provider.
+// OpenAI BYOK chat turns are not identity-less: they run on a Copilot CLI
+// launched with COPILOT_PROVIDER_TYPE=openai whose web-relay extension does
+// send X-Relay-Session-Id, so they resolve through the runtime row above.
+export function resolveExecutedProviderForResponse({
+  stmts,
+  responseBridgeIdentity,
+  conversationProvider = null,
+  serverExecutedOperation = false,
+} = {}) {
+  const boundProvider = String(conversationProvider || '').trim().toLowerCase() || 'github';
+  const responderSessionId = normalizeSessionWorkerId(responseBridgeIdentity?.sessionId);
+  if (responderSessionId) {
+    const runtimeSession = stmts?.getRuntimeSessionBySdkSessionId?.get?.(responderSessionId) || null;
+    const providerType = String(runtimeSession?.provider_type || '').trim().toLowerCase();
+    // A session id that names no runtime row proves nothing; reporting
+    // 'github' here would fabricate a mismatch out of a stale identity.
+    return providerType || 'unknown';
+  }
+  if (serverExecutedOperation) return boundProvider;
+  return 'github';
+}
+
+// The provider check above cannot see same-provider cross-*conversation*
+// execution: worker A answering conversation B's turn resolves to the right
+// provider and stays invisible. This companion check compares the responder's
+// own conversation binding against the turn's conversation. Absent identity or
+// an unmatched runtime row prove nothing and report no mismatch.
+export function resolveResponderConversationMismatch({
+  stmts,
+  responseBridgeIdentity,
+  targetConversationId = null,
+} = {}) {
+  const target = String(targetConversationId || '').trim();
+  const responderSessionId = normalizeSessionWorkerId(responseBridgeIdentity?.sessionId);
+  if (!target || !responderSessionId) {
+    return { crossConversation: false, responderConversationId: null };
+  }
+  const runtimeSession = stmts?.getRuntimeSessionBySdkSessionId?.get?.(responderSessionId) || null;
+  const responderConversationId = String(runtimeSession?.conversation_id || '').trim() || null;
+  return {
+    crossConversation: Boolean(responderConversationId && responderConversationId !== target),
+    responderConversationId,
+  };
+}
+
 export function dequeuePendingMessage({
   db,
   stmts,
@@ -716,7 +799,13 @@ export function dequeuePendingMessage({
     }
     if (!next && affinityOnly) return null;
     if (!next) {
-      next = stmts.findPending.get(currentIso);
+      // Requesters that reach the global fallback carry no worker identity
+      // (the legacy Copilot relay CLI, or a bridge client whose affinity scan
+      // came up empty). Conversations bound to a session-worker provider are
+      // off limits here: their turns must only ever run on their own worker.
+      next = stmts.findPendingForLegacyRelay
+        ? stmts.findPendingForLegacyRelay.get(currentIso)
+        : stmts.findPending.get(currentIso);
     }
     if (!next) return null;
     if (routingEnabled && requesterSid && stmts.setProcessingWithWorkerLease) {
@@ -739,6 +828,28 @@ export function dequeuePendingMessage({
     };
   });
   return dequeue();
+}
+
+// A requeue for a turn that produced nothing and was only briefly in flight is
+// a startup/routing hiccup, not a provider failure: the worker was still
+// booting, or the bound session was not available yet. Those deserve a short
+// retry. Anything that streamed text, logged activity, or ran for a while is
+// treated as a real failure and keeps the long backoff ladder.
+export const TRANSIENT_REQUEUE_MAX_PROCESSING_MS = 15_000;
+
+export function isTransientRequeue({
+  queueRow = null,
+  relayActivityCount = 0,
+  relayStreamCount = 0,
+  nowMs = Date.now(),
+  maxProcessingMs = TRANSIENT_REQUEUE_MAX_PROCESSING_MS,
+} = {}) {
+  if (Math.max(0, Number(relayActivityCount || 0)) > 0) return false;
+  if (Math.max(0, Number(relayStreamCount || 0)) > 0) return false;
+  const startedAtMs = Date.parse(String(queueRow?.processing_at || '').trim());
+  // No processing_at means the row never even began; treat that as transient.
+  if (!Number.isFinite(startedAtMs)) return true;
+  return (nowMs - startedAtMs) < Math.max(0, Number(maxProcessingMs) || 0);
 }
 
 export function shouldFailRecoveredProcessingRow({
@@ -938,6 +1049,7 @@ export function buildDequeuedRelayMessage({
   normalizeRelayMode,
   defaultRelayMode,
   defaultModel,
+  getCursorProviderSettings = () => null,
 } = {}) {
   if (!msg) return null;
   const attachments = parseAttachments(msg.attachments).map(hydrateAttachment).filter(Boolean);
@@ -954,6 +1066,19 @@ export function buildDequeuedRelayMessage({
       stmts.setQueueRuntimeSession.run(runtimeSession.id, msg.id);
     }
   }
+  const providerType = String(runtimeSession?.provider_type || '').trim().toLowerCase() || null;
+  // The Cursor worker declares one subagent per enabled model, because the
+  // SDK's built-in subagent model menu is stuck at `inherit` +
+  // `composer-2.5-fast` (see cursor-subagent-roster.mjs). Delivered per turn
+  // rather than baked into the worker's launch env so toggling models in the
+  // Select Models modal takes effect on the next turn, with no respawn.
+  let cursorSubagentModels = [];
+  if (providerType === 'cursor') {
+    const cursorSettings = getCursorProviderSettings();
+    cursorSubagentModels = (Array.isArray(cursorSettings?.enabledModels) ? cursorSettings.enabledModels : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+  }
   return {
     id: msg.id,
     conversationId: msg.conversation_id,
@@ -961,9 +1086,12 @@ export function buildDequeuedRelayMessage({
     isNewConversation: msg.is_new_conversation === 1,
     model: String(msg.model || '').trim() || defaultModel,
     modelVariantId: String(msg.model_variant_id || '').trim() || String(msg.model || '').trim() || null,
-    providerType: String(runtimeSession?.provider_type || '').trim().toLowerCase() || null,
+    providerType,
     providerModel: String(runtimeSession?.provider_model || '').trim() || null,
     claudeNativeSessionId: String(runtimeSession?.claude_native_session_id || '').trim() || null,
+    cursorAgentId: String(runtimeSession?.cursor_agent_id || '').trim() || null,
+    cursorSubagentModels,
+    grokNativeSessionId: String(runtimeSession?.grok_native_session_id || '').trim() || null,
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
     quality: normalizeOpenAIImageQuality(msg.reasoning_effort),
@@ -1390,10 +1518,11 @@ function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDe
   const rangeHeader = req.headers['range'];
 
   res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Content-Type', meta.contentType);
-  res.setHeader('Content-Disposition', `inline; filename="${name}"`);
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Neutralize browser-executable types (HTML/SVG/XML), force nosniff, and
+  // sandbox the response so a worker-written workspace file can't run as script
+  // on this origin. Media stays inline for preview; everything else downloads.
+  applySafeServedContentHeaders(res, meta.contentType, { fileName: name });
 
   const onStreamError = (error) => {
     if (cacheDelete) cacheDelete(filePath);
@@ -1434,12 +1563,88 @@ function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDe
   }
 }
 
+// Structural sanitizer for the workflow-progress digest a Claude session
+// worker attaches to its background-task rows (docs/plans/workflow-progress-tree.md,
+// Phase 2). The relay never trusts worker JSON: strings are trimmed and
+// length-clamped, arrays hard-capped, numbers accepted only when finite, and
+// unknown fields dropped at every level. A wrong-typed field degrades to
+// null; a wrong-typed digest (or one with no phases and no agents) returns
+// null so the row simply carries no workflowProgress — the ingest never 400s
+// because of this field.
+export function sanitizeWorkflowProgress(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const cleanString = (raw, maxLength) => {
+    if (typeof raw !== 'string' && typeof raw !== 'number') return null;
+    const text = String(raw).trim().slice(0, maxLength);
+    return text || null;
+  };
+  const cleanNumber = (raw) => {
+    if (raw === null || raw === undefined || typeof raw === 'object' || typeof raw === 'boolean') return null;
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : null;
+  };
+  const cleanCount = (raw) => {
+    const num = cleanNumber(raw);
+    return num === null ? null : Math.max(0, Math.floor(num));
+  };
+  const isEntryObject = (entry) => !!entry && typeof entry === 'object' && !Array.isArray(entry);
+  const phases = (Array.isArray(value.phases) ? value.phases : [])
+    .filter(isEntryObject)
+    .slice(0, 50)
+    .map((phase) => ({
+      index: cleanNumber(phase.index),
+      title: cleanString(phase.title, 120),
+    }));
+  const agentEntries = (Array.isArray(value.agents) ? value.agents : []).filter(isEntryObject);
+  const agents = agentEntries
+    .slice(0, 100)
+    .map((agent) => ({
+      index: cleanNumber(agent.index),
+      label: cleanString(agent.label, 160),
+      phaseIndex: cleanNumber(agent.phaseIndex),
+      phaseTitle: cleanString(agent.phaseTitle, 120),
+      model: cleanString(agent.model, 80),
+      state: cleanString(agent.state, 32),
+      attempt: cleanNumber(agent.attempt),
+      lastToolName: cleanString(agent.lastToolName, 160),
+      tokens: cleanNumber(agent.tokens),
+      toolCalls: cleanNumber(agent.toolCalls),
+      durationMs: cleanNumber(agent.durationMs),
+      startedAt: cleanNumber(agent.startedAt),
+    }));
+  if (!phases.length && !agents.length) return null;
+  // Agents dropped by the relay's own cap are added to the worker-reported
+  // omission count so the client's "N more" stays truthful.
+  const truncatedAgents = agentEntries.length - agents.length;
+  const reportedOmitted = cleanCount(value.agentsOmitted);
+  const agentsOmitted = (reportedOmitted === null && truncatedAgents === 0)
+    ? null
+    : (reportedOmitted ?? 0) + truncatedAgents;
+  const logs = (Array.isArray(value.logs) ? value.logs : [])
+    .map((line) => cleanString(line, 300))
+    .filter(Boolean)
+    .slice(0, 5);
+  return {
+    runId: cleanString(value.runId, 64),
+    workflowName: cleanString(value.workflowName, 120),
+    status: cleanString(value.status, 32),
+    agentCount: cleanCount(value.agentCount),
+    totalTokens: cleanCount(value.totalTokens),
+    durationMs: cleanCount(value.durationMs),
+    phases,
+    logs,
+    agents,
+    agentsOmitted,
+  };
+}
+
 export function registerMessagesRoutes(app, deps) {
   const {
     auth,
     io,
     db,
     stmts,
+    pushDispatchService,
     runtimeState,
     config,
     uuidv4,
@@ -1493,6 +1698,8 @@ export function registerMessagesRoutes(app, deps) {
     queueCounts,
     getModelCatalogState,
     buildRelayReadyBannerData,
+    backgroundTaskStore,
+    sendWorkerControl,
     ensureSessionId,
     touchCli,
     recoverProcessingOlderThan,
@@ -1502,6 +1709,8 @@ export function registerMessagesRoutes(app, deps) {
     resolveRequestedReasoningEffort = () => ({ ok: false, error: 'Reasoning metadata unavailable', supported: [] }),
     getOpenAIProviderSettings = () => ({ enabled: false, model: '' }),
     getClaudeProviderSettings = () => ({ enabled: false, model: '', models: [] }),
+    getCursorProviderSettings = () => ({ enabled: false, model: '', models: [] }),
+    getGrokProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
@@ -1526,6 +1735,9 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerProcessInspector,
     resolveSessionStateRoot,
     fetchUsageSummary = null,
+    planUsageService = null,
+    getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
+    getGrokPlanAllowanceSettings = () => ({ monthlyUsd: null, resetDay: 1 }),
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
     relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
@@ -1710,6 +1922,25 @@ export function registerMessagesRoutes(app, deps) {
     return res.status(status).json({ error, ...extra });
   }
 
+  function reconcileSubagentRunsForTerminalTurn(messageId, { status = 'failed' } = {}) {
+    const running = stmts.listRunningSubagentRunsByQueueMessage?.all?.(messageId) || [];
+    if (!running.length) return 0;
+    const now = new Date().toISOString();
+    stmts.closeRunningSubagentRunsByQueueMessage?.run?.(status, now, now, messageId);
+    for (const run of running) {
+      io.emit('subagent_status', {
+        conversationId: run.conversation_id,
+        subagentRunId: run.id,
+        parentSubagentId: run.parent_subagent_id || null,
+        displayName: run.display_name || null,
+        status,
+        queueMessageId: messageId,
+        reconciled: true,
+      });
+    }
+    return running.length;
+  }
+
   function failQueueMessage({
     queueRow,
     messageId,
@@ -1719,6 +1950,7 @@ export function registerMessagesRoutes(app, deps) {
     responseText,
     failureRecord,
     markWorkerError = true,
+    executedProvider = null,
   }) {
     const now = new Date().toISOString();
     const responseId = uuidv4();
@@ -1745,14 +1977,25 @@ export function registerMessagesRoutes(app, deps) {
         modelActual,
         modelOrigin,
       );
+      // Provenance travels with terminal failures too — the original hijack
+      // incident's signature was stolen turns dying on 402, which exited
+      // exactly here with no executed_provider recorded.
+      if (executedProvider) stmts.setMessageExecutedProvider?.run(executedProvider, responseId);
       stmts.linkActivityToResponse?.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
+      // A failed turn keeps its reasoning: without this link the thoughts
+      // stayed response_message_id NULL and vanished from the transcript.
+      stmts.linkThoughtsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, conversationId);
       stmts.pruneQueue?.run();
       return true;
     });
     const failed = tx();
     if (!failed) return null;
+    // A failed turn ends its subagents: whatever was still 'running' can
+    // never receive a terminal transition from a worker that just gave up,
+    // and an un-reconciled row renders as a bubble stuck running forever.
+    reconcileSubagentRunsForTerminalTurn(messageId, { status: 'failed' });
     io.emit('assistant_message', {
       conversationId,
       sourceMessageId: messageId,
@@ -1768,6 +2011,7 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId, status: 'failed' });
+    void pushDispatchService?.notifyTurnFailed?.({ conversationId, messageId: responseId, text: responseText });
     cancelPendingRelayQuestionsForMessage(messageId);
     const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
       ? normalizeSessionWorkerId(queueRow?.owner_sdk_session_id)
@@ -2195,24 +2439,37 @@ export function registerMessagesRoutes(app, deps) {
     sdkSessionId,
     {
       excludeMessageId = null,
+      excludeMessageIds = null,
       reason = 'owner-heartbeat-idle',
       graceMs = SESSION_WORKER_IDLE_RECOVERY_GRACE_MS,
     } = {},
   ) {
     const normalizedSessionId = normalizeSessionWorkerId(sdkSessionId);
     if (!normalizedSessionId) return [];
-    const excludedId = String(excludeMessageId || '').trim();
+    const excludedIds = new Set(
+      [excludeMessageId, ...(Array.isArray(excludeMessageIds) ? excludeMessageIds : [])]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    );
     const cutoffIso = new Date(Date.now() - Math.max(1_000, Number(graceMs) || SESSION_WORKER_IDLE_RECOVERY_GRACE_MS)).toISOString();
-    const rows = listRecoverableProcessingOwnedBySession.all(
+    const rows = (listRecoverableProcessingOwnedBySession.all(
       normalizedSessionId,
-      excludedId,
-      excludedId,
+      '',
+      '',
       cutoffIso,
-    ) || [];
+    ) || []).filter((row) => !excludedIds.has(String(row.id)));
     if (!rows.length) return [];
     const rowsToFail = [];
     const rowsToRecover = [];
     for (const row of rows) {
+      if (String(row.kind || '') === 'continuation') {
+        // A background continuation whose worker stopped claiming it has no
+        // user to answer and must never be replayed as a prompt: tear it down
+        // quietly.
+        stmts.dropStaleContinuation?.run?.(row.id);
+        io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+        continue;
+      }
       const relayActivityRows = stmts.listActivityByQueueMessage?.all?.(row.id);
       const relayStreamRows = stmts.listStreamEventsByQueueMessage?.all?.(row.id);
       const fallbackRelayActivities = Array.isArray(relayActivityRows)
@@ -2361,6 +2618,13 @@ export function registerMessagesRoutes(app, deps) {
     sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
     sessionWorkerSupervisor?.clearRestartSchedule?.(sdkSessionId);
     sessionWorkerSupervisor?.resetHealth?.(sdkSessionId, { clearFailureCount: false });
+    // Re-arm the kill block now that the processes are actually gone. Windows
+    // process-tree discovery and the kill itself are synchronous and take
+    // seconds — longer than the block's grace window — so the marker set at the
+    // top of this route has already expired by the time the worker dies, and
+    // the first delivery check after this handler yields spawns a replacement
+    // for the session that was just killed.
+    sessionWorkerSupervisor?.markKilled?.(sdkSessionId);
 
     // Drain ALL owned processing rows, not just first
     const queueRows = findAllProcessingOwnedBySession.all(sdkSessionId) || [];
@@ -2369,6 +2633,18 @@ export function registerMessagesRoutes(app, deps) {
 
     if (queueRows.length > 0) {
       for (const queueRow of queueRows) {
+        if (String(queueRow.kind || '') === 'continuation') {
+          // A background continuation has no user prompt behind it, so it is
+          // torn down quietly instead of answering the chat with a terminal
+          // failure for a turn nobody asked for.
+          stmts.dropStaleContinuation?.run?.(queueRow.id);
+          io.emit('message_status', {
+            messageId: queueRow.id,
+            conversationId: queueRow.conversation_id,
+            status: 'failed',
+          });
+          continue;
+        }
         const failureRecord = {
           kind: 'manual-session-kill',
           code: 'worker-session-killed',
@@ -2798,6 +3074,7 @@ export function registerMessagesRoutes(app, deps) {
           const parentSubagentId = targetRun.parent_subagent_id ? String(targetRun.parent_subagent_id).trim() : null;
           const displayName = targetRun.display_name ? String(targetRun.display_name).trim() : null;
           const status = String(targetRun.status || 'running').trim().toLowerCase() || 'running';
+          const stopUnsupported = /not supported/i.test(errorText);
           io.emit('subagent_status', {
             messageId: messageId || null,
             conversationId: conversationId || null,
@@ -2806,6 +3083,9 @@ export function registerMessagesRoutes(app, deps) {
             displayName: displayName || undefined,
             status,
             timestamp: now,
+            // Lets the client pin a "not supported by provider" state on the
+            // stop control instead of re-arming a button that can never work.
+            ...(stopUnsupported ? { stopUnsupported: true } : {}),
           });
           if (messageId && conversationId) {
             io.emit('relay_activity', {
@@ -2878,12 +3158,16 @@ export function registerMessagesRoutes(app, deps) {
     let decodedName = '';
     try { decodedName = decodeURIComponent(rawNameHeader); } catch { decodedName = rawNameHeader; }
     const fileName = decodedName || `upload-${Date.now()}`;
-    const fileType = String(req.headers['x-file-type'] || req.headers['content-type'] || req.query.type || 'application/octet-stream').trim().toLowerCase();
+    const claimedType = String(req.headers['x-file-type'] || req.headers['content-type'] || req.query.type || 'application/octet-stream').trim().toLowerCase();
+    // The MIME type is client supplied, so verify it against the actual bytes
+    // before it is stored and later handed to a model or a download.
+    const resolvedType = resolveUploadMimeType(payload, claimedType);
+    const fileType = resolvedType.mimeType;
 
     try {
       const attachment = persistUploadBuffer(payload, { name: fileName, type: fileType });
       if (!attachment) return res.status(500).json({ error: 'Upload persistence failed' });
-      res.json({ ok: true, attachment });
+      res.json({ ok: true, attachment, mimeTypeCorrected: resolvedType.corrected });
     } catch (e) {
       res.status(400).json({ error: e?.message || 'Upload failed' });
     }
@@ -2896,8 +3180,8 @@ export function registerMessagesRoutes(app, deps) {
     if (!file) return res.status(404).json({ error: 'Not found' });
     const filePath = uploadPathForSha(sha256);
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
-    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
     res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    applySafeServedContentHeaders(res, file.mime_type, { fileName: file.name || file.file_name || '' });
     fs.createReadStream(filePath).pipe(res);
   });
 
@@ -3611,7 +3895,21 @@ export function registerMessagesRoutes(app, deps) {
       : (stmts.getRuntimeSessionByConversation.get(conversationId) || null);
     const configuredOpenAI = getOpenAIProviderSettings();
     const requestedProviderType = normalizeRequestedProviderType(providerType || provider);
-    const runtimeUsesOpenAI = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase() === 'openai';
+    const runtimeProviderType = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase();
+    const runtimeUsesOpenAI = runtimeProviderType === 'openai';
+    // Providers that resell each other's model ids ("claude-opus-5" is served by
+    // Claude, Copilot and Cursor alike) make a model id useless for deciding
+    // which provider a request targets. A session already bound to an explicit
+    // provider resolves ids against that provider's own catalog, so the
+    // cross-provider guards below must not infer a switch from the id alone.
+    // A session already bound to a managed provider resolves models against
+    // that provider's catalog. Include every non-github worker provider here
+    // so cross-provider mid-chat guards do not mis-fire (e.g. Cursor listing
+    // a Grok model id must not 409 a Grok-bound conversation).
+    const runtimeBoundToExplicitProvider = runtimeProviderType === 'openai'
+      || runtimeProviderType === 'claude'
+      || runtimeProviderType === 'cursor'
+      || runtimeProviderType === 'grok';
     const configuredOpenAIModel = String(configuredOpenAI?.model || '').trim();
     const availableOpenAIModels = new Set(
       (Array.isArray(configuredOpenAI?.models) ? configuredOpenAI.models : [])
@@ -3640,7 +3938,7 @@ export function registerMessagesRoutes(app, deps) {
       && requestedModelLooksOpenAI
       && (
         requestedProviderType === 'openai'
-        || !requestedModelAvailableInGitHub
+        || (!requestedModelAvailableInGitHub && !runtimeBoundToExplicitProvider)
       )
     ) {
       return res.status(409).json({
@@ -3654,6 +3952,20 @@ export function registerMessagesRoutes(app, deps) {
         code: 'OPENAI_NOT_CONFIGURED',
       });
     }
+    // This create path can only bind github/openai sessions. Accepting a
+    // Cursor, Grok or Claude request here would silently produce a GitHub
+    // conversation running a model the caller never asked for.
+    const bootstrapOnlyProvider = shouldCreateConversation
+      ? BOOTSTRAP_ONLY_PROVIDER_LABELS[requestedProviderType]
+      : null;
+    if (bootstrapOnlyProvider) {
+      // 409 to match its siblings (CURSOR/GROK_MODEL_REQUIRES_NEW_CONVERSATION),
+      // which report the same "wrong entry point for this provider" condition.
+      return res.status(409).json({
+        error: `Creating a ${bootstrapOnlyProvider} conversation requires POST /api/conversation/bootstrap`,
+        code: 'PROVIDER_REQUIRES_BOOTSTRAP',
+      });
+    }
     const requestedConfiguredOpenAIModel = configuredOpenAI?.enabled
       && String(model || '').trim() === String(configuredOpenAI.model || '').trim();
     if (shouldRequireNewOpenAIConversation({
@@ -3661,11 +3973,65 @@ export function registerMessagesRoutes(app, deps) {
       runtimeUsesOpenAI,
       requestedConfiguredOpenAIModel,
       githubModelAvailable: requestedConfiguredOpenAIModel && requestedModelAvailableInGitHub,
+      runtimeBoundToOtherProvider: runtimeBoundToExplicitProvider && !runtimeUsesOpenAI,
     })) {
       return res.status(409).json({
         error: 'The configured OpenAI model is available only when creating a new conversation',
         code: 'OPENAI_MODEL_REQUIRES_NEW_CONVERSATION',
       });
+    }
+    // Cursor conversations are bootstrap-created only, so an existing
+    // github/openai/claude conversation cannot cross to the Cursor provider
+    // mid-conversation. Cursor settings are read lazily so the hot path stays
+    // untouched for non-Cursor requests.
+    const runtimeUsesCursor = runtimeProviderType === 'cursor';
+    if (!shouldCreateConversation && !runtimeUsesCursor) {
+      let requestTargetsCursor = requestedProviderType === 'cursor';
+      if (
+        !requestTargetsCursor
+        && !runtimeBoundToExplicitProvider
+        && requestedOpenAIModel
+        && !requestedModelAvailableInGitHub
+      ) {
+        const cursorSettings = getCursorProviderSettings();
+        const cursorOnlyModels = new Set([
+          String(cursorSettings?.model || '').trim(),
+          ...(Array.isArray(cursorSettings?.models) ? cursorSettings.models : [])
+            .map((value) => String(value || '').trim()),
+        ].filter(Boolean));
+        requestTargetsCursor = cursorSettings?.enabled === true && cursorOnlyModels.has(requestedOpenAIModel);
+      }
+      if (requestTargetsCursor) {
+        return res.status(409).json({
+          error: 'Cursor model selection requires creating a new Cursor conversation',
+          code: 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION',
+        });
+      }
+    }
+    // Grok conversations are bootstrap-created only (same isolation as Cursor).
+    const runtimeUsesGrok = runtimeProviderType === 'grok';
+    if (!shouldCreateConversation && !runtimeUsesGrok) {
+      let requestTargetsGrok = requestedProviderType === 'grok';
+      if (
+        !requestTargetsGrok
+        && !runtimeBoundToExplicitProvider
+        && requestedOpenAIModel
+        && !requestedModelAvailableInGitHub
+      ) {
+        const grokSettings = getGrokProviderSettings();
+        const grokOnlyModels = new Set([
+          String(grokSettings?.model || '').trim(),
+          ...(Array.isArray(grokSettings?.models) ? grokSettings.models : [])
+            .map((value) => String(value || '').trim()),
+        ].filter(Boolean));
+        requestTargetsGrok = grokSettings?.enabled === true && grokOnlyModels.has(requestedOpenAIModel);
+      }
+      if (requestTargetsGrok) {
+        return res.status(409).json({
+          error: 'Grok model selection requires creating a new Grok conversation',
+          code: 'GROK_MODEL_REQUIRES_NEW_CONVERSATION',
+        });
+      }
     }
     if (
       useOpenAIProvider
@@ -3714,7 +4080,7 @@ export function registerMessagesRoutes(app, deps) {
     // Claude conversations resolve models against the Claude provider
     // catalog (the Copilot catalog does not know these ids). Per-turn model
     // switching is allowed: each Claude turn is a fresh query() with resume.
-    const runtimeUsesClaude = String(existingRuntimeSession?.provider_type || '').trim().toLowerCase() === 'claude';
+    const runtimeUsesClaude = runtimeProviderType === 'claude';
     const configuredClaude = runtimeUsesClaude ? getClaudeProviderSettings() : null;
     const requestedClaudeModel = runtimeUsesClaude ? String(model || '').trim() : '';
     const availableClaudeModels = new Set([
@@ -3746,6 +4112,59 @@ export function registerMessagesRoutes(app, deps) {
             : (String(existingRuntimeSession?.provider_model || '').trim() || String(configuredClaude?.model || '').trim()),
         )
       : '';
+    // Cursor conversations resolve models against the Cursor provider catalog
+    // (the Copilot catalog does not know these ids). Per-turn model switching
+    // is allowed: each Cursor turn resumes the persisted agent.
+    const configuredCursor = runtimeUsesCursor ? getCursorProviderSettings() : null;
+    const requestedCursorModel = runtimeUsesCursor ? String(model || '').trim() : '';
+    const availableCursorModels = [
+      String(configuredCursor?.model || '').trim(),
+      String(existingRuntimeSession?.provider_model || '').trim(),
+      ...(Array.isArray(configuredCursor?.models) ? configuredCursor.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    // A model the Cursor provider does not offer is refused instead of quietly
+    // relabelled: silently answering with the pinned/default model is how a
+    // conversation ended up running a different model than the composer showed.
+    const cursorModelSelection = runtimeUsesCursor
+      ? resolveProviderModelSelection({
+          requestedModel: requestedCursorModel,
+          configuredModel: String(existingRuntimeSession?.provider_model || '').trim()
+            || String(configuredCursor?.model || '').trim(),
+          availableModels: availableCursorModels,
+        })
+      : null;
+    if (cursorModelSelection && !cursorModelSelection.ok) {
+      return res.status(400).json({
+        error: `Cursor model "${cursorModelSelection.requestedModel}" is not available`,
+        code: 'CURSOR_MODEL_UNAVAILABLE',
+        supportedModels: cursorModelSelection.availableModels || [],
+      });
+    }
+    const cursorModel = cursorModelSelection ? cursorModelSelection.model : '';
+    const configuredGrok = runtimeUsesGrok ? getGrokProviderSettings() : null;
+    const requestedGrokModel = runtimeUsesGrok ? String(model || '').trim() : '';
+    const pinnedGrokModel = runtimeUsesGrok
+      ? String(existingRuntimeSession?.provider_model || '').trim()
+      : '';
+    // The Grok ACP surface has no mid-session model switch (the model rides
+    // only on session/new `_meta`), so the model pinned at bootstrap is
+    // locked for the conversation's lifetime. A different request is refused
+    // rather than silently relabeled.
+    if (
+      runtimeUsesGrok
+      && requestedGrokModel
+      && requestedGrokModel.toLowerCase() !== AUTO_MODEL_SENTINEL
+      && pinnedGrokModel
+      && requestedGrokModel.toLowerCase() !== pinnedGrokModel.toLowerCase()
+    ) {
+      return res.status(409).json({
+        error: 'Grok model switching requires creating a new Grok conversation',
+        code: 'GROK_MODEL_REQUIRES_NEW_CONVERSATION',
+      });
+    }
+    const grokModel = runtimeUsesGrok
+      ? (pinnedGrokModel || String(configuredGrok?.model || '').trim())
+      : '';
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -3762,7 +4181,23 @@ export function registerMessagesRoutes(app, deps) {
             reasoningEffort: null,
             error: claudeModel ? null : 'Claude model is not configured',
           }
-        : resolveRequestedModel(model));
+        : (runtimeUsesCursor
+          ? {
+              ok: !!cursorModel,
+              model: cursorModel,
+              modelVariantId: cursorModel,
+              reasoningEffort: null,
+              error: cursorModel ? null : 'Cursor model is not configured',
+            }
+          : (runtimeUsesGrok
+            ? {
+                ok: !!grokModel,
+                model: grokModel,
+                modelVariantId: grokModel,
+                reasoningEffort: null,
+                error: grokModel ? null : 'Grok model is not configured',
+              }
+            : resolveRequestedModel(model))));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -3794,18 +4229,47 @@ export function registerMessagesRoutes(app, deps) {
       const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
       const supported = Array.isArray(configuredClaude?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
         ? configuredClaude.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
-        : ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+        : [...DEFAULT_CLAUDE_REASONING_EFFORTS];
       const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort: effort === 'none' ? 'none' : effort, supported };
+    };
+    // Cursor conversations validate effort against the discovered per-model
+    // tiers ('none' = reasoning/thinking off where the model can express it,
+    // model default otherwise). Effort is per-turn: it maps onto model params
+    // on each agent.send, so it can change between messages.
+    const resolveCursorReasoningEffort = () => {
+      const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
+      const discovered = configuredCursor?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()];
+      if (!Array.isArray(discovered)) {
+        // 'auto' / undiscovered model: pass the request through untouched —
+        // the worker validates it against the resolved model's live params
+        // and falls back to the model default on any mismatch. Clamping to
+        // 'none' here would actively disable thinking on the resolved model.
+        return { ok: true, effort: requestedEffort, supported: [] };
+      }
+      const effort = discovered.includes(requestedEffort) ? requestedEffort : 'none';
+      return { ok: true, effort, supported: discovered };
+    };
+    const resolveGrokReasoningEffort = () => {
+      const requestedEffort = String(explicitReasoningEffort || '').trim().toLowerCase();
+      const supported = Array.isArray(configuredGrok?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
+        ? configuredGrok.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
+        : ['none', 'low', 'medium', 'high'];
+      const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
+      return { ok: true, effort, supported };
     };
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
       : (runtimeUsesClaude
         ? resolveClaudeReasoningEffort()
-        : resolveRequestedReasoningEffort(
-            requestedModel,
-            explicitReasoningEffort || modelResolution.reasoningEffort || null,
-          ));
+        : (runtimeUsesCursor
+          ? resolveCursorReasoningEffort()
+          : (runtimeUsesGrok
+            ? resolveGrokReasoningEffort()
+            : resolveRequestedReasoningEffort(
+                requestedModel,
+                explicitReasoningEffort || modelResolution.reasoningEffort || null,
+              ))));
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
@@ -3985,6 +4449,42 @@ export function registerMessagesRoutes(app, deps) {
           WHERE id = ?
         `).run(now, sessionId || null, convId);
       }
+      // The message now owns these blobs, so the draft placeholders can go. The
+      // sent-message references were just inserted above, so nothing is orphaned.
+      if (typeof stmts.updateConvDraftAttachments?.run === 'function') {
+        stmts.updateConvDraftAttachments.run(null, now, sessionId || null, convId);
+      } else {
+        db.prepare(`
+          UPDATE conversations
+          SET draft_attachments = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
+          WHERE id = ?
+        `).run(now, sessionId || null, convId);
+      }
+      stmts.deleteDraftUploadRefs?.run?.(convId);
+      // Cursor allows per-turn model switching, so the pinned provider_model has
+      // to follow the accepted model; otherwise the conversation list and the
+      // composer keep restoring the model chosen at bootstrap.
+      if (
+        runtimeUsesCursor
+        && cursorModel
+        && runtimeSession?.id
+        && cursorModel !== String(existingRuntimeSession?.provider_model || '').trim()
+        && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
+      ) {
+        stmts.updateRuntimeSessionProvider.run('cursor', cursorModel, cursorModel, now, runtimeSession.id);
+      }
+      // Claude switches per turn too, and the worker launch env reads
+      // provider_model || model — without this a relaunched worker came up on
+      // the model chosen at bootstrap, not the one the composer last used.
+      if (
+        runtimeUsesClaude
+        && claudeModel
+        && runtimeSession?.id
+        && claudeModel !== String(existingRuntimeSession?.provider_model || '').trim()
+        && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
+      ) {
+        stmts.updateRuntimeSessionProvider.run('claude', claudeModel, claudeModel, now, runtimeSession.id);
+      }
       conversationPreferences = persistConversationModelPreference(
         convId,
         requestedRelayMode,
@@ -4033,10 +4533,27 @@ export function registerMessagesRoutes(app, deps) {
         });
       }
     });
-    persistMessageAndQueue();
+    try {
+      persistMessageAndQueue();
+    } catch (error) {
+      // A replayed send (Background Sync outbox) with a caller-supplied id hits
+      // the messages.id primary key. Surface it as a clean 409 so the replay
+      // can treat "already accepted" as success instead of retrying forever.
+      const constraintViolation = String(error?.code || '').startsWith('SQLITE_CONSTRAINT');
+      if (clientMessageId && constraintViolation && stmts.getMessageByConversation?.get?.(msgId, convId)) {
+        return res.status(409).json({
+          error: 'Message already exists',
+          code: 'DUPLICATE_MESSAGE_ID',
+          messageId: msgId,
+          conversationId: convId,
+        });
+      }
+      throw error;
+    }
     io.emit('conversation_draft_updated', {
       conversationId: convId,
       draftText: '',
+      draftAttachments: [],
       draftUpdatedAt: now,
       draftUpdatedByClientId: sessionId || null,
       senderClientId: sessionId || null,
@@ -4171,6 +4688,16 @@ export function registerMessagesRoutes(app, deps) {
     const requester = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
     const activeQueueMessageId = String(req.body?.activeQueueMessageId || '').trim();
+    // A persistent-process worker can hold several live rows at once (the
+    // running turn plus a delivered message queued behind it plus a
+    // background continuation); every one of them needs its lease refreshed
+    // or the owner-recovery below replays a turn the worker still owns.
+    const activeQueueMessageIds = [...new Set(
+      [
+        activeQueueMessageId,
+        ...(Array.isArray(req.body?.activeQueueMessageIds) ? req.body.activeQueueMessageIds : []),
+      ].map((value) => String(value || '').trim()).filter(Boolean),
+    )];
     if (requesterSessionId) {
       const existingRequesterWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
       const requesterPid = Number(requester?.pid);
@@ -4196,12 +4723,14 @@ export function registerMessagesRoutes(app, deps) {
         });
       }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
-      if (activeQueueMessageId) {
+      if (activeQueueMessageIds.length) {
         const now = new Date().toISOString();
         const leaseExpiresAt = addMsToIso(now, SESSION_WORKER_OWNER_LEASE_MS);
-        refreshProcessingLeaseForOwnedMessage.run(leaseExpiresAt, now, activeQueueMessageId, requesterSessionId);
+        for (const id of activeQueueMessageIds) {
+          refreshProcessingLeaseForOwnedMessage.run(leaseExpiresAt, now, id, requesterSessionId);
+        }
         recoverOwnedProcessingRowsForSession(requesterSessionId, {
-          excludeMessageId: activeQueueMessageId,
+          excludeMessageIds: activeQueueMessageIds,
           reason: 'owner-heartbeat-mismatch',
         });
       } else {
@@ -4213,6 +4742,33 @@ export function registerMessagesRoutes(app, deps) {
     relayBridgeOwnerService?.observe?.(requester);
     const { pendingCount } = queueCounts();
     res.json({ ok: true, pendingCount });
+  });
+
+  // POST /api/grok-native-session — Grok worker persists the ACP session id so
+  // later turns can session/load it across worker restarts.
+  app.post('/api/grok-native-session', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const grokNativeSessionId = String(req.body?.grokNativeSessionId || '').trim();
+    if (!conversationId || !grokNativeSessionId) {
+      return res.status(400).json({ error: 'Missing conversationId or grokNativeSessionId' });
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'grok') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Grok provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionGrokNativeSessionId?.run !== 'function') {
+      return res.status(500).json({ error: 'Grok native session storage is unavailable' });
+    }
+    stmts.updateRuntimeSessionGrokNativeSessionId.run(
+      grokNativeSessionId,
+      new Date().toISOString(),
+      conversationId,
+    );
+    res.json({ ok: true });
   });
 
   // POST /api/claude-native-session — Claude worker persists the native Agent
@@ -4281,6 +4837,235 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true });
   });
 
+  // POST /api/grok-plan-usage — Grok worker reports per-prompt tokens/cost from
+  // the session/prompt result `_meta`. There is no ACP plan-quota API; the
+  // relay stores the last turn and optionally accumulates spend into a local
+  // monthly cycle when the user sets an allowance.
+  app.post('/api/grok-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'grok') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Grok provider' });
+    }
+    const usage = normalizeGrokTurnUsage({
+      ...(req.body?.usage && typeof req.body.usage === 'object' ? req.body.usage : {}),
+      model: req.body?.model,
+      modelId: req.body?.model || req.body?.usage?.modelId,
+      capturedAt: req.body?.capturedAt,
+    });
+    if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
+    const allowances = getGrokPlanAllowanceSettings();
+    const applied = planUsageService.recordGrokUsageReport(usage, {
+      resetDay: allowances.resetDay,
+    });
+    if (!applied) return res.status(400).json({ error: 'Missing usable usage metrics' });
+    res.json({ ok: true, cycle: applied.cycle.key });
+  });
+
+  // POST /api/claude-plan-usage — Claude worker reports the session's
+  // structured /usage data (plan rate-limit windows + session cost totals).
+  //
+  // Read from the live query transport at the end of a turn; the relay never
+  // opens an extra turn to refresh it, so the newest reading is whatever the
+  // last real turn produced.
+  app.post('/api/claude-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    // Same binding validation as every other provider usage route: only a
+    // Claude-bound conversation's worker may write the Claude card. The
+    // snapshot itself is global, so a misrouted poster would corrupt it for
+    // everyone.
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (conversationId) {
+      const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+      const boundProvider = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+      if (runtimeSession && boundProvider !== 'claude') {
+        return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+      }
+    }
+    const usage = normalizeClaudePlanUsage(req.body?.usage)
+      || claudePlanUsageFromResult({
+        modelUsage: req.body?.modelUsage,
+        totalCostUsd: req.body?.totalCostUsd,
+      });
+    if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
+    planUsageService.saveSnapshot('claude', usage, {
+      source: 'worker',
+      error: String(req.body?.error || '').trim() || null,
+    });
+    res.json({ ok: true });
+  });
+
+  // POST /api/cursor-plan-usage — Cursor worker reports the agent's cumulative
+  // billed usage. The relay diffs it against the stored checkpoint and books
+  // the increase into the current billing cycle under the pool implied by the
+  // model that ran the turn.
+  app.post('/api/cursor-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    const agentId = String(req.body?.agentId || '').trim();
+    if (!agentId) return res.status(400).json({ error: 'Missing agentId' });
+    // The worker sends its conversation id; require the binding like the
+    // sibling routes so spend cannot be booked from a misrouted poster.
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (conversationId) {
+      const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+      const boundProvider = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+      if (runtimeSession && boundProvider !== 'cursor') {
+        return res.status(409).json({ error: 'Conversation is not bound to the Cursor provider' });
+      }
+    }
+    const allowances = getCursorPlanAllowanceSettings();
+    const applied = planUsageService.recordCursorUsageReport(
+      {
+        agentId,
+        model: req.body?.model,
+        agentCreated: req.body?.agentCreated === true,
+        rawCostCents: req.body?.rawCostCents,
+        chargedCents: req.body?.chargedCents,
+        inputTokens: req.body?.inputTokens,
+        outputTokens: req.body?.outputTokens,
+        cacheReadTokens: req.body?.cacheReadTokens,
+        cacheWriteTokens: req.body?.cacheWriteTokens,
+        totalTokens: req.body?.totalTokens,
+        runCount: req.body?.runCount,
+        capturedAt: req.body?.capturedAt,
+      },
+      { resetDay: allowances.resetDay },
+    );
+    if (!applied) return res.status(400).json({ error: 'Missing usable usage metrics' });
+    res.json({ ok: true, pool: applied.pool, cycle: applied.cycle.key, changed: applied.changed });
+  });
+
+  // POST /api/cursor-agent-id — Cursor worker persists the Cursor agent id so
+  // later turns can resume the agent across worker restarts.
+  app.post('/api/cursor-agent-id', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const cursorAgentId = String(req.body?.cursorAgentId || '').trim();
+    if (!conversationId || !cursorAgentId) {
+      return res.status(400).json({ error: 'Missing conversationId or cursorAgentId' });
+    }
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'cursor') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Cursor provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionCursorAgentId?.run !== 'function') {
+      return res.status(500).json({ error: 'Cursor agent id storage is unavailable' });
+    }
+    stmts.updateRuntimeSessionCursorAgentId.run(
+      cursorAgentId,
+      new Date().toISOString(),
+      conversationId,
+    );
+    res.json({ ok: true });
+  });
+
+  // POST /api/relay-session-link — the Copilot relay reports which SDK session
+  // it created to execute a conversation's turns. The startup import sweep
+  // consults these links so relay execution vehicles are never surfaced as
+  // stand-alone conversations ("shadow" duplicates in the conversation list).
+  app.post('/api/relay-session-link', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const sdkSessionId = String(req.body?.sdkSessionId || '').trim();
+    if (!conversationId || !sdkSessionId) {
+      return res.status(400).json({ error: 'Missing conversationId or sdkSessionId' });
+    }
+    if (typeof stmts.upsertRelaySessionLink?.run !== 'function') {
+      return res.status(500).json({ error: 'Relay session link storage is unavailable' });
+    }
+    stmts.upsertRelaySessionLink.run(sdkSessionId, conversationId, new Date().toISOString());
+    res.json({ ok: true });
+  });
+
+  // POST /api/cursor-context-usage — Cursor worker reports the session's
+  // context-window breakdown after a turn. Cursor sessions have no Copilot
+  // events.jsonl to tail, so this is what feeds the composer indicator and the
+  // context-usage modal for them.
+  app.post('/api/cursor-context-usage', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+
+    const contextUsage = req.body?.contextUsage && typeof req.body.contextUsage === 'object'
+      ? req.body.contextUsage
+      : null;
+    const modelUsage = req.body?.modelUsage && typeof req.body.modelUsage === 'object'
+      ? req.body.modelUsage
+      : null;
+    if (!contextUsage && !modelUsage) {
+      return res.status(400).json({ error: 'Missing contextUsage or modelUsage' });
+    }
+
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'cursor') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Cursor provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
+      return res.status(500).json({ error: 'Context usage storage is unavailable' });
+    }
+
+    const payload = JSON.stringify({
+      model: String(req.body?.model || '').trim() || null,
+      contextUsage,
+      modelUsage,
+    });
+    stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
+    res.json({ ok: true });
+  });
+
+  // POST /api/grok-context-usage — Grok worker reports the session's
+  // context-window breakdown after a turn (per-prompt tokens from the ACP
+  // result `_meta`). Grok sessions have no Copilot events.jsonl to tail, so
+  // this is what feeds the composer indicator and the context-usage modal.
+  app.post('/api/grok-context-usage', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+
+    const contextUsage = req.body?.contextUsage && typeof req.body.contextUsage === 'object'
+      ? req.body.contextUsage
+      : null;
+    const modelUsage = req.body?.modelUsage && typeof req.body.modelUsage === 'object'
+      ? req.body.modelUsage
+      : null;
+    if (!contextUsage && !modelUsage) {
+      return res.status(400).json({ error: 'Missing contextUsage or modelUsage' });
+    }
+
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'grok') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Grok provider' });
+    }
+    if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
+      return res.status(500).json({ error: 'Context usage storage is unavailable' });
+    }
+
+    const payload = JSON.stringify({
+      model: String(req.body?.model || '').trim() || null,
+      contextUsage,
+      modelUsage,
+    });
+    stmts.updateRuntimeSessionContextUsage.run(payload, new Date().toISOString(), conversationId);
+    res.json({ ok: true });
+  });
+
   // GET /api/pending — CLI fetches next pending message
   app.get('/api/pending', auth, async (req, res) => {
     touchCli();
@@ -4334,6 +5119,19 @@ export function registerMessagesRoutes(app, deps) {
           required: runtimeState.tunnelState?.required ?? false,
           connected: runtimeState.tunnelState?.connected ?? false,
           lastError: runtimeState.tunnelState?.lastError ?? null,
+        },
+      });
+    }
+    if (runtimeState.cloudflaredTunnelState?.blocking) {
+      return res.json({
+        message: null,
+        paused: true,
+        reason: 'cloudflared_tunnel_required',
+        cloudflaredTunnel: {
+          mode: runtimeState.cloudflaredTunnelState?.mode ?? null,
+          required: runtimeState.cloudflaredTunnelState?.required ?? false,
+          connected: runtimeState.cloudflaredTunnelState?.connected ?? false,
+          lastError: runtimeState.cloudflaredTunnelState?.lastError ?? null,
         },
       });
     }
@@ -4660,6 +5458,7 @@ export function registerMessagesRoutes(app, deps) {
         normalizeRelayMode,
         defaultRelayMode: DEFAULT_RELAY_MODE,
         defaultModel: DEFAULT_MODEL,
+        getCursorProviderSettings,
       });
       
       if (out.attachments.length) {
@@ -5198,6 +5997,14 @@ export function registerMessagesRoutes(app, deps) {
     const { messageId, conversationId, text, model, mode, generatedImages: rawGeneratedImages } = req.body;
     const trimmedText = String(text || '').trim();
     const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
+    // Final digests of background workflows that settled during this turn —
+    // the transcript's "Finished background task" cards. Same structural
+    // sanitizer as the live panel rows; junk entries drop silently (this
+    // field must never fail a response), and the array caps at 5.
+    const workflowRuns = (Array.isArray(req.body.workflowRuns) ? req.body.workflowRuns : [])
+      .map((entry) => sanitizeWorkflowProgress(entry))
+      .filter(Boolean)
+      .slice(0, 5);
     let generatedImages = [];
     try {
       generatedImages = normalizeGeneratedImageResponses(rawGeneratedImages, {
@@ -5229,6 +6036,30 @@ export function registerMessagesRoutes(app, deps) {
 
     const relayMode = normalizeRelayMode(mode || q?.relay_mode) || DEFAULT_RELAY_MODE;
     if (terminalFailure) {
+      // Terminal failures carry provenance too: the original hijack incident
+      // presented exactly as stolen turns dying on 402 through this path.
+      const terminalConversationProvider = String(
+        stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type || '',
+      ).trim().toLowerCase() || 'github';
+      const terminalExecutedProvider = resolveExecutedProviderForResponse({
+        stmts,
+        responseBridgeIdentity,
+        conversationProvider: terminalConversationProvider,
+        serverExecutedOperation: !!q?.image_operation_id,
+      });
+      if (terminalExecutedProvider === 'unknown') {
+        console.warn(`[${ts()}] PROVIDER UNRESOLVED ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${terminalConversationProvider} responder=${normalizeSessionWorkerId(responseBridgeIdentity?.sessionId)?.slice(0, 8) || 'none'} — terminal failure from a responder identity matching no runtime session`);
+      } else if (terminalExecutedProvider !== terminalConversationProvider) {
+        console.warn(`[${ts()}] PROVIDER MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${terminalConversationProvider} executed=${terminalExecutedProvider} — terminal failure answered by the wrong provider`);
+      }
+      const terminalCrossConversation = resolveResponderConversationMismatch({
+        stmts,
+        responseBridgeIdentity,
+        targetConversationId,
+      });
+      if (terminalCrossConversation.crossConversation) {
+        console.warn(`[${ts()}] CONVERSATION MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} responderConv=${terminalCrossConversation.responderConversationId?.slice(0, 8)} — terminal failure posted by another conversation's worker`);
+      }
       const failureText = buildTerminalFailureTextForChat(terminalFailure, trimmedText);
       const failed = failQueueMessage({
         queueRow: q,
@@ -5237,6 +6068,7 @@ export function registerMessagesRoutes(app, deps) {
         relayMode,
         model: model || q?.model || null,
         responseText: failureText,
+        executedProvider: terminalExecutedProvider,
         failureRecord: {
           kind: 'terminal',
           code: terminalFailure.code,
@@ -5295,6 +6127,33 @@ export function registerMessagesRoutes(app, deps) {
     const responseId = uuidv4();
     const requestedModel = String(q?.model || '').trim() || null;
     const modelOrigin = deriveModelOrigin(requestedModel);
+    const conversationProvider = String(
+      stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type || '',
+    ).trim().toLowerCase() || 'github';
+    const executedProvider = resolveExecutedProviderForResponse({
+      stmts,
+      responseBridgeIdentity,
+      conversationProvider,
+      // Image operations are executed by this server against the conversation's
+      // own provider API, then finalized through an identity-less self-post.
+      serverExecutedOperation: !!q?.image_operation_id,
+    });
+    if (executedProvider === 'unknown') {
+      // An identity that names no runtime session is itself an anomaly (a stale
+      // or forged header), just not evidence of cross-provider execution. Say so
+      // rather than staying silent.
+      console.warn(`[${ts()}] PROVIDER UNRESOLVED ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${conversationProvider} responder=${normalizeSessionWorkerId(responseBridgeIdentity?.sessionId)?.slice(0, 8) || 'none'} — responder identity matches no runtime session`);
+    } else if (executedProvider !== conversationProvider) {
+      console.warn(`[${ts()}] PROVIDER MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} bound=${conversationProvider} executed=${executedProvider} — turn answered by the wrong provider`);
+    }
+    const responderConversationCheck = resolveResponderConversationMismatch({
+      stmts,
+      responseBridgeIdentity,
+      targetConversationId,
+    });
+    if (responderConversationCheck.crossConversation) {
+      console.warn(`[${ts()}] CONVERSATION MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} responderConv=${responderConversationCheck.responderConversationId?.slice(0, 8)} — turn answered by another conversation's worker`);
+    }
     const explicitModel = String(model || '').trim() || null;
     const resolvedAssistantModel = explicitModel
       || (modelOrigin === 'auto' ? 'unknown' : requestedModel)
@@ -5335,6 +6194,22 @@ export function registerMessagesRoutes(app, deps) {
         explicitModel,
         modelOrigin,
       );
+      if (String(q?.kind || '') === 'continuation') {
+        stmts.setMessageKind?.run('continuation', responseId);
+      }
+      // The workflow cards persist atomically with the assistant message they
+      // annotate — keyed directly on the response id (see workflow_runs DDL).
+      for (const [runIndex, digest] of workflowRuns.entries()) {
+        stmts.insertWorkflowRun?.run(
+          `wfr_${uuidv4()}`,
+          responseId,
+          targetConversationId,
+          runIndex,
+          JSON.stringify(digest),
+          now,
+        );
+      }
+      stmts.setMessageExecutedProvider?.run(executedProvider, responseId);
       stmts.linkActivityToResponse.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
       stmts.linkThoughtsToResponse?.run(responseId, messageId);
@@ -5553,10 +6428,109 @@ export function registerMessagesRoutes(app, deps) {
         timestamp: now,
         activities,
         thoughts,
+        executedProvider,
+        kind: String(q?.kind || '') === 'continuation' ? 'continuation' : undefined,
+        // Live-appended messages must show their workflow cards without a
+        // reload; conversation reloads serve the same digests from the DB.
+        workflowRuns: workflowRuns.length ? workflowRuns : undefined,
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
+    void pushDispatchService?.notifyTurnComplete?.({
+      conversationId: targetConversationId,
+      messageId: responseId,
+      text: resolvedText,
+    });
     cancelPendingRelayQuestionsForMessage(messageId);
+    res.json({ ok: true });
+  });
+
+  // POST /api/continuation-turn — a session worker's CLI started a turn on its
+  // own (a background task's notification). The synthetic queue row gives that
+  // turn the full relay surface — stream, thoughts, activity, questions, and a
+  // response of its own — without any user message: born 'processing', owned
+  // by the session, and excluded from every delivery/recovery path.
+  app.post('/api/continuation-turn', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+    const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+    if (providerType !== 'claude') {
+      return res.status(409).json({ error: 'Background continuations are only supported for Claude conversations' });
+    }
+    const requester = readBridgeIdentity(req);
+    const ownerSessionId = normalizeSessionWorkerId(requester?.sessionId)
+      || normalizeSessionWorkerId(req.body?.sdkSessionId)
+      || String(conversation.sdk_session_id || conversationId);
+    const relayMode = normalizeRelayMode(req.body?.relayMode) || DEFAULT_RELAY_MODE;
+    const messageId = uuidv4();
+    const now = new Date().toISOString();
+    const leaseExpiresAt = addMsToIso(now, SESSION_WORKER_OWNER_LEASE_MS);
+    stmts.insertContinuationQ.run(
+      messageId,
+      conversationId,
+      runtimeSession?.id || null,
+      String(req.body?.model || '').trim() || null,
+      relayMode,
+      '[background continuation]',
+      now,
+      now,
+      ownerSessionId,
+      now,
+      leaseExpiresAt,
+      now,
+    );
+    console.log(`[${ts()}] CONTINUATION ${messageId.slice(0, 8)} conv=${conversationId.slice(0, 8)} owner=${ownerSessionId.slice(0, 8)} trigger=${String(req.body?.trigger || 'background_task')}`);
+    io.emit('message_status', { messageId, conversationId, status: 'processing', kind: 'continuation' });
+    io.emit('queue_updated', { continuation: 1 });
+    res.json({ ok: true, messageId, conversationId });
+  });
+
+  // POST /api/background-tasks — a session worker publishes its live
+  // background-task set (REPLACE semantics, mirroring the SDK's
+  // background_tasks_changed signal) so the composer panel tracks it live.
+  app.post('/api/background-tasks', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const tasks = (Array.isArray(req.body?.tasks) ? req.body.tasks : [])
+      .map((task) => ({
+        taskId: String(task?.taskId || '').trim(),
+        taskType: String(task?.taskType || '').trim(),
+        description: String(task?.description || '').trim().slice(0, 500),
+        startedAt: Number(task?.startedAt) || null,
+        summary: String(task?.summary || '').trim().slice(0, 500) || null,
+        lastToolName: String(task?.lastToolName || '').trim() || null,
+        totalTokens: Number.isFinite(Number(task?.totalTokens)) ? Number(task.totalTokens) : null,
+        subagentType: String(task?.subagentType || '').trim().slice(0, 120) || null,
+        model: String(task?.model || '').trim().slice(0, 120) || null,
+        modelInherited: task?.modelInherited === true,
+        // Sanitized digest or undefined: JSON serialization (store broadcast,
+        // conversation payload) drops the key entirely for flat rows.
+        workflowProgress: sanitizeWorkflowProgress(task?.workflowProgress) || undefined,
+      }))
+      .filter((task) => task.taskId);
+    backgroundTaskStore?.replace?.(conversationId, tasks);
+    io.emit('background_tasks', { conversationId, tasks });
+    res.json({ ok: true, count: tasks.length });
+  });
+
+  // POST /api/conversation/:conversationId/background-task/:taskId/stop —
+  // fire-and-forget stop push to the conversation's session worker. The
+  // resulting background_tasks_changed replaces the panel's set.
+  app.post('/api/conversation/:conversationId/background-task/:taskId/stop', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const taskId = String(req.params.taskId || '').trim();
+    if (!conversationId || !taskId) return res.status(400).json({ error: 'Missing conversationId or taskId' });
+    const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    const sessionId = String(conversation.sdk_session_id || conversationId);
+    const sent = sendWorkerControl?.(sessionId, { type: 'stop_background_task', taskId });
+    if (!sent) return res.status(409).json({ error: 'Session worker is not connected' });
+    console.log(`[${ts()}] BG-TASK STOP ${taskId} conv=${conversationId.slice(0, 8)}`);
     res.json({ ok: true });
   });
 
@@ -5636,6 +6610,30 @@ export function registerMessagesRoutes(app, deps) {
         const row = stmts.getLastStreamSeqByQueueMessage?.get(messageId);
         const maxSeq = Math.max(0, Number(row?.max_seq || 0));
         const nextSeq = maxSeq + 1;
+        // Each update carries the full text-so-far, so the row for this thread
+        // is replaced in place — appending would persist the whole reply once
+        // per update. seq still advances per update so readers and the client
+        // stream state machine can order snapshots across threads.
+        const existing = stmts.getStreamEventByQueueAndThread?.get(messageId, normalizedSubagentRunId) || null;
+        if (existing) {
+          // A done snapshot is final for its thread; drop stale non-done
+          // stragglers, mirroring the client's stream state machine.
+          if (Number(existing.done || 0) === 1 && !done) {
+            return Math.max(0, Number(existing.seq || 0));
+          }
+          stmts.updateStreamEventByQueueAndThread?.run(
+            responseMessageId,
+            conversationId,
+            normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
+            nextSeq,
+            streamText,
+            done ? 1 : 0,
+            now,
+            messageId,
+            normalizedSubagentRunId,
+          );
+          return nextSeq;
+        }
         stmts.insertStreamEvent?.run(
           messageId,
           responseMessageId,
@@ -5669,7 +6667,11 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(500).json({ error: error?.message || 'Failed to persist stream event' });
     }
 
-    io.emit('relay_stream', {
+    // Volatile keeps these out of the connection-state-recovery buffer. Each chunk
+    // carries the full text so far, so replaying a turn's worth of them costs
+    // megabytes to deliver what one reconnect resync already fetches from
+    // relay_stream_events. Live delivery to connected clients is unchanged.
+    io.volatile.emit('relay_stream', {
       messageId,
       conversationId,
       mode: normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
@@ -5802,8 +6804,10 @@ export function registerMessagesRoutes(app, deps) {
   app.post('/api/subagent-run', auth, (req, res) => {
     touchCli();
     const { messageId, conversationId, subagentRunId, parentSubagentId, displayName, status } = req.body || {};
-    const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
-    const normalizedParentSubagentId = parentSubagentId ? String(parentSubagentId).trim() : null;
+    // Provider call ids become row ids verbatim; malformed ones (embedded
+    // newlines, concatenated ids — seen live) are sanitized at the door.
+    const normalizedSubagentRunId = sanitizeSubagentRunId(subagentRunId);
+    const normalizedParentSubagentId = sanitizeSubagentRunId(parentSubagentId);
     const normalizedDisplayName = displayName ? String(displayName).trim() : null;
     const normalizedStatus = status ? String(status).trim() : 'running';
 
@@ -5908,6 +6912,28 @@ export function registerMessagesRoutes(app, deps) {
       }
       return res.json({ ok: true, terminal: true, code: terminalFailure.stableCode });
     }
+    if (q && q.status === 'processing' && String(q.kind || '') === 'continuation') {
+      // A continuation has no user prompt to replay; a worker that gives up on
+      // one just tears it down.
+      stmts.dropStaleContinuation?.run?.(messageId);
+      io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'failed' });
+      console.log(`[${ts()}] CONTINUATION DROPPED ${messageId?.slice(0,8)} reason=requeue`);
+      return res.json({ ok: true, dropped: 'continuation' });
+    }
+    if (q && q.status === 'processing' && String(req.body?.code || '').trim() === 'relay.provider-mismatch') {
+      // A routing refusal, not a delivery failure: the legacy relay handed
+      // back a turn that belongs to a session worker. No retry increment and
+      // no backoff — the owner worker must be able to claim it immediately
+      // instead of paying a 60s ladder for the relay's mistake.
+      db.prepare(`
+        UPDATE queue
+        SET status = 'pending', processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL
+        WHERE id = ? AND status = 'processing'
+      `).run(messageId);
+      io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'pending' });
+      console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=provider-mismatch retry=${Number(q.retry_count || 0)}`);
+      return res.json({ ok: true, mismatch: true });
+    }
     if (q && q.status === 'processing') {
       const retryCount = Number(q.retry_count || 0) + 1;
       if (retryCount >= MAX_REQUEUE_RETRIES) {
@@ -5933,7 +6959,14 @@ export function registerMessagesRoutes(app, deps) {
       } else {
         const restartState = relayRestartOrchestrator?.getState?.() || null;
         const parkForRestart = shouldParkForRestart(restartState);
-        const nextAttemptAt = parkForRestart ? null : addMsIso(computeRetryDelayMs(retryCount));
+        const transientRequeue = isTransientRequeue({
+          queueRow: q,
+          relayActivityCount: stmts.listActivityByQueueMessage?.all?.(messageId)?.length || 0,
+          relayStreamCount: stmts.listStreamEventsByQueueMessage?.all?.(messageId)?.length || 0,
+        });
+        const nextAttemptAt = parkForRestart
+          ? null
+          : addMsIso(computeRetryDelayMs(retryCount, { transient: transientRequeue }));
         const result = db.prepare(`
           UPDATE queue
           SET
@@ -5980,7 +7013,7 @@ export function registerMessagesRoutes(app, deps) {
               extra: parkForRestart ? { parkedForRestart: true } : null,
             });
           }
-          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} status=${parkForRestart ? 'parked' : 'pending'}${nextAttemptAt ? ` next=${nextAttemptAt}` : ''}`);
+          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} class=${transientRequeue ? 'transient' : 'failure'} status=${parkForRestart ? 'parked' : 'pending'}${nextAttemptAt ? ` next=${nextAttemptAt}` : ''}`);
           io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: parkForRestart ? 'parked' : 'pending' });
         }
       }
