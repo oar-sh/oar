@@ -40,11 +40,39 @@ function percentOf(tokens, maxTokens) {
   return Math.round((tokens / maxTokens) * 10000) / 100;
 }
 
+/**
+ * Split the unused window into the part a conversation may actually occupy and
+ * the reserve above the auto-compact threshold.
+ *
+ * Every snapshot writer derives free space as `max - used`, which still
+ * *contains* the region the buffer describes. Anything rendering the two side
+ * by side (the usage grid, the modal's free row) needs disjoint slices, or the
+ * pair overshoots the window — latent until Claude began reporting a real
+ * buffer instead of a always-zero one.
+ */
+export function splitFreeAndBufferTokens(snapshot) {
+  const freeTokens = toNullableInt(snapshot?.free_tokens);
+  const bufferTokens = toNullableInt(snapshot?.buffer_tokens);
+  if (freeTokens === null || bufferTokens === null) return { freeTokens, bufferTokens };
+  // Only a writer that derived free space from `max - used` folded the buffer
+  // into it. A provider-reported remainder (Copilot's remainingTokens /
+  // availableTokens, which sit alongside its own safeBufferTokens) is already
+  // net of that reserve, and subtracting twice would understate it — so an
+  // unflagged snapshot is left alone.
+  if (snapshot?.free_tokens_includes_buffer !== true) return { freeTokens, bufferTokens };
+  // Past the threshold the reserve is bigger than what is left, so the buffer
+  // takes the remainder and free space reads as spent.
+  const reserved = Math.max(0, Math.min(bufferTokens, freeTokens));
+  return { freeTokens: freeTokens - reserved, bufferTokens: reserved };
+}
+
 function buildCopilotCategories(snapshot) {
+  // The auto-compact reserve is deliberately absent: it is not occupied
+  // context, and it now rides the view as its own field so Claude sessions
+  // (whose categories come from the SDK) account for it too.
   const raw = [
     ['System/Tools', toNullableInt(snapshot?.system_tools_tokens)],
     ['Messages', toNullableInt(snapshot?.messages_tokens)],
-    ['Buffer', toNullableInt(snapshot?.buffer_tokens)],
   ];
   return raw
     .filter(([, tokens]) => tokens !== null && tokens > 0)
@@ -73,6 +101,19 @@ export function buildContextUsageView({ snapshot = null, contextUsage = null } =
     ?? toNullablePercent(snapshot?.used_percent)
     ?? percentOf(totalTokens, maxTokens);
 
+  // Free space and buffer are two slices of the same unused window, so they are
+  // resolved together before either is rendered.
+  const storedFreeTokens = toNullableInt(snapshot?.free_tokens);
+  const { freeTokens, bufferTokens } = splitFreeAndBufferTokens({
+    free_tokens: storedFreeTokens
+      ?? ((totalTokens !== null && maxTokens !== null) ? Math.max(0, maxTokens - totalTokens) : null),
+    buffer_tokens: snapshot?.buffer_tokens,
+    // Deriving the value here means it necessarily contains the buffer.
+    free_tokens_includes_buffer: storedFreeTokens === null
+      ? true
+      : snapshot?.free_tokens_includes_buffer === true,
+  });
+
   const sourceCategories = Array.isArray(contextUsage?.categories) && contextUsage.categories.length
     ? contextUsage.categories
     : buildCopilotCategories(snapshot);
@@ -87,9 +128,6 @@ export function buildContextUsageView({ snapshot = null, contextUsage = null } =
     .filter((entry) => entry.name && entry.tokens !== null && entry.tokens > 0)
     .map((entry) => ({ ...entry, percent: percentOf(entry.tokens, maxTokens) }));
 
-  const freeTokens = toNullableInt(snapshot?.free_tokens)
-    ?? ((totalTokens !== null && maxTokens !== null) ? Math.max(0, maxTokens - totalTokens) : null);
-
   return {
     model: normalizeText(contextUsage?.model) || normalizeText(snapshot?.model) || null,
     totalTokens,
@@ -100,7 +138,18 @@ export function buildContextUsageView({ snapshot = null, contextUsage = null } =
     categories,
     freeTokens,
     freePercent: percentOf(freeTokens, maxTokens),
-    autoCompactThreshold: toNullablePercent(contextUsage?.autoCompactThreshold),
+    // Unused, but unusable: the window above the auto-compact threshold. Split
+    // out of free space, so the two are rendered as separate rows and the
+    // table still accounts for the whole window.
+    bufferTokens,
+    bufferPercent: percentOf(bufferTokens, maxTokens),
+    // A token count, not a percent — the CLI compacts once the conversation
+    // crosses it. `rawMaxTokens` rides along as recorded (it tracks the active
+    // window setting, NOT the model's own limit — probed 2026-08-20 — so
+    // nothing may annotate the slider from it).
+    autoCompactThreshold: toNullableInt(contextUsage?.autoCompactThreshold),
+    rawMaxTokens: toNullableInt(contextUsage?.rawMaxTokens),
+    autocompactSource: normalizeText(contextUsage?.autocompactSource) || null,
     isAutoCompactEnabled: contextUsage?.isAutoCompactEnabled === true,
     // Copilot's degraded path reports a lower bound only; the UI labels it
     // rather than presenting it as measured.

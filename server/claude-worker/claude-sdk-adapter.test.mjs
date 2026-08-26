@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   CLAUDE_ULTRACODE_EFFORT,
+  claudeAutoCompactFlagSettings,
+  claudeSpawnSettings,
   claudeUltracodeFlagSettings,
   createCanUseTool,
   normalizeClaudeEffort,
@@ -195,6 +197,50 @@ test('non-ultracode spawns pass no settings layer', () => {
     });
     assert.equal('settings' in captured.options, false, `settings should be omitted for "${value}"`);
   }
+});
+
+test('ultracode and an auto-compact window share one settings object', () => {
+  let captured = null;
+  startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/workspace',
+    reasoningEffort: CLAUDE_ULTRACODE_EFFORT,
+    autoCompactWindow: 150000,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  // Both live in Settings; two spreads of `settings` would clobber each other.
+  assert.deepEqual(captured.options.settings, {
+    ultracode: true,
+    enableWorkflows: true,
+    autoCompactWindow: 150000,
+  });
+});
+
+test('an auto-compact window alone still reaches the spawn settings', () => {
+  let captured = null;
+  startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/workspace',
+    reasoningEffort: 'high',
+    autoCompactWindow: 500000,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.deepEqual(captured.options.settings, { autoCompactWindow: 500000 });
+  assert.equal(captured.options.effort, 'high');
+});
+
+test('claudeSpawnSettings omits itself when nothing is set', () => {
+  assert.equal(claudeSpawnSettings(), null);
+  assert.equal(claudeSpawnSettings({ ultracode: false, autoCompactWindow: null }), null);
+  // Junk is Auto, never a pinned window.
+  assert.equal(claudeSpawnSettings({ autoCompactWindow: 'nonsense' }), null);
+  assert.equal(claudeSpawnSettings({ autoCompactWindow: 0 }), null);
+});
+
+test('claudeAutoCompactFlagSettings clears the layer for Auto', () => {
+  assert.deepEqual(claudeAutoCompactFlagSettings(150000), { autoCompactWindow: 150000 });
+  assert.deepEqual(claudeAutoCompactFlagSettings(null), { autoCompactWindow: null });
+  assert.deepEqual(claudeAutoCompactFlagSettings('junk'), { autoCompactWindow: null });
 });
 
 test('claudeUltracodeFlagSettings translates the sentinel both ways', () => {

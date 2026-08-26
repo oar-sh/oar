@@ -1,5 +1,7 @@
 'use strict';
 
+import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
+
 function normalizeModeWith(value, normalizeMode) {
   if (typeof normalizeMode === 'function') {
     const normalized = normalizeMode(value);
@@ -25,6 +27,9 @@ export function persistConversationPreferences({
   preferredRelayMode = '',
   preferredModel = '',
   preferredReasoningEffort = '',
+  // `undefined` means "not part of this write" — the composer PATCHes the same
+  // route without ever mentioning the window, and must not clear it.
+  autoCompactWindow = undefined,
   updatedAt = new Date().toISOString(),
   createIfMissing = false,
   createTitle = 'Session',
@@ -34,6 +39,8 @@ export function persistConversationPreferences({
   const mode = String(preferredRelayMode || '').trim();
   const model = normalizePreferredModel(preferredModel);
   const reasoningEffort = normalizePreferredReasoningEffort(preferredReasoningEffort);
+  const writesAutoCompactWindow = autoCompactWindow !== undefined;
+  const window = writesAutoCompactWindow ? parseAutoCompactWindow(autoCompactWindow) : null;
   if (!db || !stmts || !convId || !mode) {
     return {
       ok: false,
@@ -41,6 +48,7 @@ export function persistConversationPreferences({
       preferredRelayMode: mode,
       preferredModel: '',
       preferredReasoningEffort: '',
+      autoCompactWindow: null,
       updatedAt,
     };
   }
@@ -53,7 +61,17 @@ export function persistConversationPreferences({
       stmts.insertConv.run(convId, safeTitle, updatedAt, updatedAt);
     }
     try {
-      if (typeof stmts.updateConvPreferences?.run === 'function') {
+      if (writesAutoCompactWindow) {
+        // The prepared statement can't carry the extra column, and this write
+        // is rare (one slider change) — the inline form keeps the hot composer
+        // path on the prepared statement.
+        db.prepare(`
+          UPDATE conversations
+          SET preferred_relay_mode = ?, preferred_model = ?, preferred_reasoning_effort = ?,
+              auto_compact_window = ?, updated_at = ?
+          WHERE id = ?
+        `).run(mode, model || null, reasoningEffort || null, window, updatedAt, convId);
+      } else if (typeof stmts.updateConvPreferences?.run === 'function') {
         stmts.updateConvPreferences.run(mode, model || null, reasoningEffort || null, updatedAt, convId);
       } else {
         db.prepare(`
@@ -71,6 +89,11 @@ export function persistConversationPreferences({
       preferredRelayMode: mode,
       preferredModel: model,
       preferredReasoningEffort: reasoningEffort,
+      // Always echoed, so a write that didn't touch the window still tells the
+      // client what the stored value is.
+      autoCompactWindow: writesAutoCompactWindow
+        ? window
+        : parseAutoCompactWindow(existing?.auto_compact_window),
       updatedAt,
     };
   });

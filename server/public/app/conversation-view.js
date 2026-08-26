@@ -64,7 +64,16 @@ import {
   deriveInFlightStreamTextByThread,
   computeNextRelayStreamState,
 } from './stream-state.mjs';
-import { mergeRelayActivityTexts, normalizeRelayActivityEntry, relayActivityEntryText } from './activity-replay-state.mjs';
+import {
+  capRelayActivityEntries,
+  compactBoundaryFromActivities,
+  isCompactBoundaryActivityEntry,
+  mergeRelayActivityTexts,
+  normalizeRelayActivityEntry,
+  promotedCompactBoundaryEntry,
+  relayActivityEntryText,
+} from './activity-replay-state.mjs';
+import { SEPARATOR_CLASS, syncSeparatorRail, syncTranscriptSeparators } from './transcript-separators.mjs';
 import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
@@ -75,6 +84,45 @@ import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
+// The topmost transcript row, whichever kind it is: a day/compaction separator
+// can sit above the first `.msg`, and anything that inserts "above the
+// transcript" (the load-older control, a prepended history page) must land
+// above that separator, not between it and its message.
+const FIRST_TRANSCRIPT_ROW_SELECTOR = `.msg, .${SEPARATOR_CLASS}`;
+
+// Batch guard: appendMessage syncs separators per insertion, which is right
+// for a single live message but quadratic when a whole page is appended in a
+// loop. Bulk paths suspend it and run one pass at the end.
+let separatorSyncSuspended = 0;
+let transcriptResizeObserved = null;
+
+function syncSeparatorsNow() {
+  if (separatorSyncSuspended > 0) return;
+  const el = getMessagesElement();
+  if (!el) return;
+  syncTranscriptSeparators(el);
+  observeTranscriptResize(el);
+}
+
+// Render-time offsets go stale whenever the transcript changes height without
+// a message being added — an image finishing, a <details> opening, a font-size
+// change — which would leave the rail's dots pointing at the wrong rows.
+// Re-laying out the dots is cheap and touches no message nodes.
+function observeTranscriptResize(el) {
+  if (transcriptResizeObserved === el || typeof ResizeObserver !== 'function') return;
+  transcriptResizeObserved = el;
+  const observer = new ResizeObserver(() => syncSeparatorRail(el));
+  observer.observe(el);
+}
+
+function withSuspendedSeparatorSync(fn) {
+  separatorSyncSuspended += 1;
+  try {
+    return fn();
+  } finally {
+    separatorSyncSuspended -= 1;
+  }
+}
 const OPAQUE_RELAY_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let thinkingMessageId = null;
@@ -230,6 +278,10 @@ const conversationHistoryLoader = createInfiniteLoader({
     });
     renderRelayQuestions();
     renderRelayBoards();
+    // Before the scroll restore below: the prepended page can add (or retire)
+    // separator rows, and the height delta the restore measures has to include
+    // them or the viewport jumps.
+    syncTranscriptSeparators(el);
     requestAnimationFrame(() => {
       if (!el || String(currentConvId || '').trim() !== currentId) return;
       const nextScrollHeight = el.scrollHeight;
@@ -281,11 +333,14 @@ const conversationFutureLoader = createInfiniteLoader({
     if (!currentId || conversationPaginationCursorIsStale(currentId)) return;
     const ordered = sortConversationMessages(page.items || []);
     let inserted = 0;
-    for (const m of ordered) {
-      const msgId = String(m?.id || '').trim() || null;
-      const node = appendMessage(m, false, msgId, true, null, false);
-      if (node) inserted += 1;
-    }
+    withSuspendedSeparatorSync(() => {
+      for (const m of ordered) {
+        const msgId = String(m?.id || '').trim() || null;
+        const node = appendMessage(m, false, msgId, true, null, false);
+        if (node) inserted += 1;
+      }
+    });
+    syncSeparatorsNow();
     setConversationHistoryState({
       conversationId: currentId,
       hasMoreOlder: conversationHistoryState.hasMoreOlder,
@@ -676,7 +731,7 @@ function syncHistoryLoadMoreControl() {
     return;
   }
   if (!box) {
-    const marker = el.querySelector('.msg');
+    const marker = el.querySelector(FIRST_TRANSCRIPT_ROW_SELECTOR);
     if (!marker) {
       el.insertAdjacentHTML('beforeend', buildHistoryLoadMoreMarkup(conversationHistoryState.loadingOlder));
       return;
@@ -778,14 +833,27 @@ function createMessageNode(msg, msgId = null, force = false) {
     : '';
   const content = renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
-  const activities = Array.isArray(msg.activities) ? msg.activities.filter(Boolean).slice(0, 48) : [];
-  if (activities.length) div.classList.add('msg-with-activity');
+  // capRelayActivityEntries, not slice: a boundary past the cap would take
+  // the break row with it.
+  const activities = Array.isArray(msg.activities)
+    ? capRelayActivityEntries(msg.activities.filter(Boolean), 48)
+    : [];
+  // A compaction that happened during this turn is rendered as a full-width
+  // break row immediately above this message (syncTranscriptSeparators reads
+  // the stamp), so it must not also show up inside the bubble's activity list.
+  // Only the promoted (last) boundary is hidden — see renderActivityMarkup.
+  const promotedBoundaryEntry = promotedCompactBoundaryEntry(activities);
+  const compactBoundary = compactBoundaryFromActivities(activities);
+  if (compactBoundary) {
+    div.dataset.compactBoundary = `${compactBoundary.preTokens ?? ''}|${compactBoundary.postTokens ?? ''}`;
+  }
+  if (activities.some((item) => item !== promotedBoundaryEntry)) div.classList.add('msg-with-activity');
   const thoughts = Array.isArray(msg.thoughts) ? msg.thoughts.filter((t) => t && String(t.text || '').trim()) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments, { messageId: msgId }) : '';
   const subagentRuns = Array.isArray(msg.subagentRuns) ? msg.subagentRuns.filter(Boolean) : [];
   const mainActivities = activities.filter((item) => !(normalizeRelayActivityEntry(item)?.subagentRunId));
   const mainThoughts = thoughts.filter((t) => !t?.subagentRunId);
-  const activityHtml = mainActivities.length ? renderActivityMarkup(mainActivities) : '';
+  const activityHtml = mainActivities.length ? renderActivityMarkup(mainActivities, promotedBoundaryEntry) : '';
   const thoughtsHtml = mainThoughts.length ? renderThoughtsMarkup(mainThoughts) : '';
   const subagentHtml = renderSubagentRunsMarkup(subagentRuns, activities, thoughts);
   // Finished background workflows persisted with this assistant message
@@ -846,7 +914,9 @@ function createMessageNode(msg, msgId = null, force = false) {
   return div;
 }
 
-function insertMessageNode(node, scroll = true, insertAfterId = null) {
+// Never scrolls: the caller scrolls after the separator pass (see
+// appendMessage).
+function insertMessageNode(node, insertAfterId = null) {
   if (!node) return null;
   if (node.parentNode) return node;
   const el = getMessagesElement();
@@ -860,7 +930,6 @@ function insertMessageNode(node, scroll = true, insertAfterId = null) {
   } else {
     el.appendChild(node);
   }
-  if (scroll) scrollBottom();
   return node;
 }
 
@@ -880,7 +949,7 @@ function prependMessageNodes(msgs) {
     inserted += 1;
   }
   if (!inserted) return { inserted: 0, firstMessageId: '' };
-  const marker = el.querySelector('.msg');
+  const marker = el.querySelector(FIRST_TRANSCRIPT_ROW_SELECTOR);
   if (marker && marker.parentNode === el) {
     el.insertBefore(fragment, marker);
   } else {
@@ -999,9 +1068,20 @@ function renderThoughtBody(body, text) {
   }
 }
 
-export function renderActivityMarkup(activities) {
-  const progress = activities.filter((item) => relayActivityEntryText(item).startsWith('● '));
-  const tools = activities.filter((item) => !relayActivityEntryText(item).startsWith('● '));
+export function renderActivityMarkup(activities, promotedBoundaryEntry = undefined) {
+  // The compaction boundary that got promoted to a transcript break row must
+  // not be repeated inside the collapsed tool-activity details. A turn that
+  // compacted more than once only promotes its LAST boundary, so the earlier
+  // ones stay visible here as prose rather than disappearing from the
+  // transcript altogether (one break row per message is all the separator
+  // planner can place).
+  const list = Array.isArray(activities) ? activities : [];
+  const promoted = promotedBoundaryEntry === undefined
+    ? promotedCompactBoundaryEntry(list)
+    : promotedBoundaryEntry;
+  const visible = list.filter((item) => item !== promoted);
+  const progress = visible.filter((item) => relayActivityEntryText(item).startsWith('● '));
+  const tools = visible.filter((item) => !relayActivityEntryText(item).startsWith('● '));
   const progressHtml = progress.length
     ? `<div class="msg-activity-list">${progress.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(relayActivityEntryText(item)))}</div>`).join('')}</div>`
     : '';
@@ -1252,6 +1332,10 @@ export function renderThinkingActivities() {
   for (const item of items) {
     const entry = normalizeRelayActivityEntry(item);
     if (!entry) continue;
+    // The persisted message promotes a compaction boundary to a full-width
+    // break row, so the live bubble must not show it as a prose line — it
+    // would otherwise flip presentation the moment the turn lands.
+    if (isCompactBoundaryActivityEntry(entry)) continue;
     const decorated = decorateActivityText(entry.text);
     if (entry.subagentRunId) {
       const list = bySubagentRun.get(entry.subagentRunId) || [];
@@ -1355,9 +1439,18 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
   }
 }
 
-export function appendThinkingActivity(text, subagentRunId = null, autoScroll = true) {
-  if (!text) return;
-  const decorated = decorateActivityText(text);
+// `item` is either the plain activity text or a full activity entry
+// ({ text, subagentRunId, metadata }); the entry form is what lets the live
+// bubble recognise a compaction boundary.
+export function appendThinkingActivity(item, subagentRunId = null, autoScroll = true) {
+  const entry = normalizeRelayActivityEntry(
+    item && typeof item === 'object' ? item : { text: item, subagentRunId },
+  );
+  if (!entry) return;
+  // Same rule as renderThinkingActivities: a boundary becomes a break row on
+  // the persisted message, so it never shows as live prose.
+  if (isCompactBoundaryActivityEntry(entry)) return;
+  const decorated = decorateActivityText(entry.text);
 
   if (subagentRunId) {
     const subagentBubble = ensureSubagentBubble(subagentRunId);
@@ -2144,7 +2237,12 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
   if (empty) empty.remove();
   const node = createMessageNode(msg, msgId, force);
   const isNewNode = !!node && !node.parentNode;
-  const insertedNode = insertMessageNode(node, scroll, insertAfterId);
+  // Insert without scrolling: the separator pass below can add a row above
+  // this message, and scrolling before it runs leaves the viewport a
+  // separator-height short of the bottom (which then reads as "not at
+  // bottom" and suppresses auto-scroll for the next message too).
+  // renderMessages orders it the same way.
+  const insertedNode = insertMessageNode(node, insertAfterId);
   if (trackHistory && isNewNode && insertedNode) {
     const messageId = String(msgId || msg?.id || '').trim();
     const messageTimestamp = String(msg?.timestamp || '').trim();
@@ -2163,6 +2261,10 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
         },
       });
     }
+  }
+  if (isNewNode && insertedNode) {
+    syncSeparatorsNow();
+    if (scroll) scrollBottom();
   }
   return insertedNode;
 }
@@ -2203,6 +2305,13 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
       mode: String(item?.mode || '').trim(),
       attachments: Array.isArray(item?.attachments) ? item.attachments.length : 0,
       hiddenFromShares: item?.hiddenFromShares === true,
+      // Without this, a payload that differs from the last render only by a
+      // newly linked compaction activity short-circuits below and the break
+      // row never appears until some unrelated field changes.
+      compactBoundary: (() => {
+        const boundary = compactBoundaryFromActivities(item?.activities);
+        return boundary ? `${boundary.preTokens ?? ''}|${boundary.postTokens ?? ''}` : '';
+      })(),
       thoughts: (Array.isArray(item?.thoughts) ? item.thoughts : []).map((thought) => ({
         reasoningId: String(thought?.reasoningId || '').trim(),
         seq: Number.isFinite(Number(thought?.seq)) ? Number(thought.seq) : null,
@@ -2313,7 +2422,10 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
       afterTimestamp: newestMessageTimestamp || null,
     }) : null,
   });
-  for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
+  withSuspendedSeparatorSync(() => {
+    for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
+  });
+  syncSeparatorsNow();
   renderRelayQuestions();
   renderRelayBoards();
   lastRenderedMessageSnapshotKey = snapshotKey;

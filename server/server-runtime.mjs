@@ -52,6 +52,7 @@ import {
 } from './services/drives-path-helpers.mjs';
 import { DEFAULT_CLAUDE_REASONING_EFFORTS, withClaudeUltracodeTier } from './services/provider-reasoning-effort.mjs';
 import { createPlanUsageService } from './services/plan-usage-service.mjs';
+import { splitFreeAndBufferTokens } from './services/context-usage-view.mjs';
 import { normalizeCursorAllowanceSettings } from './services/plan-usage-cursor.mjs';
 import { normalizeGrokAllowanceSettings } from './services/plan-usage-grok.mjs';
 import { createGrokBillingUsageFetcher } from './services/grok-billing-usage.mjs';
@@ -95,12 +96,14 @@ import {
   readTurnCeilingSetting,
   turnCeilingMinutesToMs,
 } from '../shared/turn-ceiling.mjs';
+import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
 import {
   parseBackgroundTaskTimeoutUpdate,
   readBackgroundTaskTimeoutSetting,
   backgroundTaskTimeoutMinutesToMs,
 } from '../shared/background-task-timeout.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
+import { capRelayActivityEntries } from './public/app/activity-replay-state.mjs';
 import {
   canonicalizeModelId,
   filterValidModelIds,
@@ -3807,8 +3810,9 @@ function buildContextUsageBlock(snapshot, runtimeSession, extraEntries = []) {
   const usedPct = toNullablePercent(snapshot?.used_percent);
   const systemTools = toNullableInt(snapshot?.system_tools_tokens);
   const messages = toNullableInt(snapshot?.messages_tokens);
-  const freeTokens = toNullableInt(snapshot?.free_tokens);
-  const bufferTokens = toNullableInt(snapshot?.buffer_tokens);
+  // Disjoint slices: the snapshot's free space still contains the buffer, and
+  // the grid below lays all four out as if they partition the window.
+  const { freeTokens, bufferTokens } = splitFreeAndBufferTokens(snapshot);
   const cacheRead = toNullableInt(snapshot?.cache_read_tokens);
   const cacheWrite = toNullableInt(snapshot?.cache_write_tokens);
 
@@ -5248,26 +5252,43 @@ function mapRelayActivityRow(row) {
   const text = sanitizeActivityText(row?.text);
   if (!text) return null;
   const subagentRunId = row?.subagent_run_id ? String(row.subagent_run_id).trim() : null;
+  // Structured rows (compaction boundaries) carry their payload alongside the
+  // prose so the transcript can promote them to a break row; junk JSON is
+  // simply dropped back to a prose-only entry.
+  let metadata = null;
+  if (row?.metadata_json) {
+    try {
+      const parsed = JSON.parse(String(row.metadata_json));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed;
+    } catch { metadata = null; }
+  }
   return {
     text,
     subagentRunId: subagentRunId || null,
+    ...(metadata ? { metadata } : {}),
   };
 }
 
+const RELAY_ACTIVITY_ROW_LIMIT = 48;
+
 function relayActivityForResponse(responseMessageId) {
-  return stmts.listActivityByResponse
-    .all(responseMessageId)
-    .map(mapRelayActivityRow)
-    .filter(Boolean)
-    .slice(0, 48);
+  return capRelayActivityEntries(
+    stmts.listActivityByResponse
+      .all(responseMessageId)
+      .map(mapRelayActivityRow)
+      .filter(Boolean),
+    RELAY_ACTIVITY_ROW_LIMIT,
+  );
 }
 
 function relayActivityForQueueMessage(queueMessageId) {
-  return stmts.listActivityByQueueMessage
-    .all(queueMessageId)
-    .map(mapRelayActivityRow)
-    .filter(Boolean)
-    .slice(0, 48);
+  return capRelayActivityEntries(
+    stmts.listActivityByQueueMessage
+      .all(queueMessageId)
+      .map(mapRelayActivityRow)
+      .filter(Boolean),
+    RELAY_ACTIVITY_ROW_LIMIT,
+  );
 }
 
 function relayStreamEventsForQueueMessage(queueMessageId) {
@@ -6123,6 +6144,12 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       // watchdogs (Grok's prompt ceiling) must honor it rather than imposing
       // their own cap on a turn the user asked to leave unbounded.
       turnCeilingMs: turnCeilingMinutesToMs(getTurnCeilingMinutes()),
+      // Per-conversation, unlike the two above: delivery is already scoped to
+      // one conversation, so the worker picks the window up on its next turn
+      // without a new queue column or push channel. null = Auto.
+      autoCompactWindow: parseAutoCompactWindow(out.conversationId
+        ? stmts.getConvAnyStatus.get(out.conversationId)?.auto_compact_window
+        : null),
     },
     routing: {
       enabled: true,

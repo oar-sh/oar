@@ -5,6 +5,13 @@
  * Kept DOM-free and dependency-light so it can be unit tested directly.
  */
 
+import {
+  AUTO_COMPACT_WINDOW_STOPS,
+  autoCompactWindowToIndex,
+  formatAutoCompactWindowLabel,
+  parseAutoCompactWindow,
+} from './auto-compact-window-options.mjs';
+
 // The SDK labels categories with names, not CSS. Anything unmapped falls back
 // to a neutral swatch rather than rendering an invalid color.
 const CATEGORY_COLORS = Object.freeze({
@@ -110,6 +117,89 @@ function renderRow({ name, tokens, percent, color, muted = false }) {
   `;
 }
 
+// How the CLI describes where the effective threshold came from. Unknown
+// sources are rendered verbatim rather than dropped, so a new CLI vocabulary
+// still tells the user something.
+const AUTOCOMPACT_SOURCE_LABELS = Object.freeze({
+  auto: 'auto (model-tuned)',
+  'model-default': 'model default',
+  settings: 'from settings',
+  env: 'from CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  clientdata: 'from client data',
+});
+
+function autocompactSourceLabel(source) {
+  const key = String(source || '').trim();
+  if (!key) return '';
+  return AUTOCOMPACT_SOURCE_LABELS[key.toLowerCase()] || key;
+}
+
+/**
+ * The Claude-only auto-compact window control: a snap-stop slider over
+ * AUTO_COMPACT_WINDOW_STOPS plus the measured effective threshold.
+ *
+ * No stop is annotated as out of the model's reach: the payload carries no
+ * trustworthy model-limit field. `rawMaxTokens` tracks the ACTIVE setting, not
+ * the model's own window (probed on claude-opus-5[1m]: no setting → 1000000,
+ * setting 100000 → 100000), so annotating from it told a user who had just
+ * pinned 100k that every larger stop was pointless. Applied on the next
+ * message delivery, which is why there is no live preview of the effect.
+ *
+ * `isAutoCompactEnabled` is tri-state on purpose: `null`/`undefined` means the
+ * runtime has not reported yet (no context-usage snapshot exists before the
+ * first turn) and must not be read as "disabled" — auto-compact is on by
+ * default, so claiming otherwise next to an unknown threshold is a lie.
+ *
+ * @returns {string} HTML, or '' when there is nothing to control
+ */
+export function renderAutoCompactControlHtml({
+  autoCompactWindow = null,
+  autoCompactThreshold = null,
+  autocompactSource = null,
+  isAutoCompactEnabled = null,
+  maxTokens = null,
+} = {}) {
+  const window = parseAutoCompactWindow(autoCompactWindow);
+  const index = autoCompactWindowToIndex(window);
+
+  const threshold = toNullableNumber(autoCompactThreshold);
+  const sourceLabel = autocompactSourceLabel(autocompactSource);
+  const effective = threshold === null
+    ? '<span class="ctx-autocompact-muted">— (known after the first turn)</span>'
+    : `compacts at ${escapeHtml(formatCompactTokens(threshold))}${toNullableNumber(maxTokens) === null
+      ? ''
+      : ` of ${escapeHtml(formatCompactTokens(maxTokens))}`} tokens${sourceLabel ? ` · ${escapeHtml(sourceLabel)}` : ''}`;
+
+  // No toggle by design: the window is the only thing this control owns. Only
+  // an explicit `false` from a real snapshot renders the note — unknown stays
+  // silent rather than contradicting the "known after the first turn" line.
+  const disabledNote = isAutoCompactEnabled === false
+    ? '<div class="ctx-autocompact-note">Auto-compact is disabled for this session.</div>'
+    : '';
+
+  return `
+    <div class="ctx-autocompact">
+      <div class="ctx-autocompact-row">
+        <label for="ctx-autocompact-slider">Auto-compact window:</label>
+        <b id="ctx-autocompact-value">${escapeHtml(formatAutoCompactWindowLabel(window))}</b>
+      </div>
+      <input
+        id="ctx-autocompact-slider"
+        class="ctx-autocompact-slider"
+        type="range"
+        min="0"
+        max="${AUTO_COMPACT_WINDOW_STOPS.length - 1}"
+        step="1"
+        value="${index}"
+        aria-label="Auto-compact window"
+      >
+      <div class="ctx-autocompact-effective">Effective: ${effective}</div>
+      ${disabledNote}
+      <div class="ctx-autocompact-note">Applied on the next message in this conversation.</div>
+    </div>
+  `;
+}
+
 /**
  * @param {object|null} usage the `contextUsage` field of an /api/context response
  * @returns {string} modal body HTML, or '' when there is nothing to render
@@ -135,6 +225,25 @@ export function renderContextUsageHtml(usage) {
       muted: true,
     })
     : '';
+  // Unused window the conversation may not occupy: without its own row the
+  // reserve would just be missing from the table, since free space has it
+  // subtracted out.
+  const bufferRow = toNullableNumber(usage.bufferTokens) !== null && Number(usage.bufferTokens) > 0
+    ? renderRow({
+      name: 'Auto-compact reserve',
+      tokens: usage.bufferTokens,
+      percent: usage.bufferPercent,
+      color: null,
+      muted: true,
+    })
+    : '';
+
+  // Deferred tool definitions are listed by the SDK but left out of
+  // totalTokens, so the category rows legitimately sum higher than the
+  // headline. Without this the table reads as an arithmetic error.
+  const deferredNote = categories.some((category) => category.isDeferred === true)
+    ? '<div class="ctx-usage-note">Deferred tools are listed but not loaded, so they are not counted in the total.</div>'
+    : '';
 
   const estimateNote = usage.isEstimate
     ? `<div class="ctx-usage-note">${escapeHtml(estimateNoteText(usage.estimateKind))}</div>`
@@ -149,12 +258,13 @@ export function renderContextUsageHtml(usage) {
       ${headline ? `<div class="ctx-usage-headline">${escapeHtml(headline)}</div>` : ''}
       <div class="ctx-usage-bar">${renderBarSegments(categories, usage.maxTokens)}</div>
       ${estimateNote}
+      ${deferredNote}
       ${capturedNote}
       <table class="ctx-usage-table">
         <thead>
           <tr><th>Category</th><th class="ctx-usage-num">Tokens</th><th class="ctx-usage-num">Usage</th></tr>
         </thead>
-        <tbody>${rows}${freeRow}</tbody>
+        <tbody>${rows}${freeRow}${bufferRow}</tbody>
       </table>
     </div>
   `;

@@ -39,8 +39,8 @@ function makeStmts(db) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     insertActivity: db.prepare(`
-      INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `),
     insertThought: db.prepare(`
       INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id)

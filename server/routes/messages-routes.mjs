@@ -142,6 +142,28 @@ function normalizeSessionWorkerId(value) {
   return text || null;
 }
 
+const MAX_ACTIVITY_METADATA_BYTES = 2048;
+
+// Structured sidecar for an activity row. Only plain objects with a `kind`
+// survive, and only up to a small size cap — the column exists so the
+// transcript can promote a row (today: the Claude compaction boundary) to a
+// break row, not as a general blob store. Junk degrades to null, which leaves
+// the row as ordinary prose activity.
+export function sanitizeActivityMetadata(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const kind = String(value.kind || '').trim();
+  if (!kind) return null;
+  const normalized = { ...value, kind };
+  let serialized = '';
+  try {
+    serialized = JSON.stringify(normalized);
+  } catch {
+    return null;
+  }
+  if (!serialized || Buffer.byteLength(serialized, 'utf8') > MAX_ACTIVITY_METADATA_BYTES) return null;
+  return normalized;
+}
+
 function normalizeDuplicateMessageText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
@@ -6537,7 +6559,7 @@ export function registerMessagesRoutes(app, deps) {
   // POST /api/activity — relay sends in-flight activity updates (tool/search sections)
   app.post('/api/activity', auth, (req, res) => {
     touchCli();
-    const { messageId, conversationId, text, mode, subagentRunId } = req.body || {};
+    const { messageId, conversationId, text, mode, subagentRunId, metadata } = req.body || {};
     const activityText = sanitizeActivityText(text);
     if (!messageId || !conversationId || !activityText) {
       return res.status(400).json({ error: 'Missing activity payload' });
@@ -6546,6 +6568,7 @@ export function registerMessagesRoutes(app, deps) {
     const q = stmts.findQById.get(messageId);
     const responseMessageId = q?.response_message_id || null;
     const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
+    const normalizedMetadata = sanitizeActivityMetadata(metadata);
     stmts.insertActivity.run(
       messageId,
       responseMessageId,
@@ -6554,6 +6577,7 @@ export function registerMessagesRoutes(app, deps) {
       activityText,
       new Date().toISOString(),
       normalizedSubagentRunId,
+      normalizedMetadata ? JSON.stringify(normalizedMetadata) : null,
     );
 
     io.emit('relay_activity', {
@@ -6563,6 +6587,7 @@ export function registerMessagesRoutes(app, deps) {
       text: activityText,
       timestamp: new Date().toISOString(),
       subagentRunId: normalizedSubagentRunId || undefined,
+      ...(normalizedMetadata ? { metadata: normalizedMetadata } : {}),
     });
     res.json({ ok: true });
   });

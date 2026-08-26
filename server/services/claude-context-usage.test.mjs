@@ -107,11 +107,51 @@ test('resolveModelUsageEntry matches by id, else the lone entry', () => {
   assert.equal(resolveModelUsageEntry(null, 'x'), null);
 });
 
+// autoCompactThreshold is a TOKEN COUNT, verified against live
+// runtime_sessions.context_usage_json rows (claude-opus-5: max 1000000 /
+// threshold 967000; claude-haiku-4-5: 200000 / 167000). This test previously
+// passed 92 and expected 80000, i.e. it encoded a percent reading; the old
+// formula turned real payloads hugely negative and clamped every Claude
+// session's buffer to 0.
 test('auto-compact threshold becomes the buffer', () => {
   const snapshot = buildClaudeContextSnapshot({
-    contextUsage: sdkResponse({ isAutoCompactEnabled: true, autoCompactThreshold: 92 }),
+    contextUsage: sdkResponse({ isAutoCompactEnabled: true, autoCompactThreshold: 967000 }),
   });
-  assert.equal(snapshot.buffer_tokens, 80000);
+  assert.equal(snapshot.buffer_tokens, 33000);
+
+  const haiku = buildClaudeContextSnapshot({
+    contextUsage: sdkResponse({
+      maxTokens: 200000,
+      rawMaxTokens: 200000,
+      isAutoCompactEnabled: true,
+      autoCompactThreshold: 167000,
+    }),
+  });
+  assert.equal(haiku.buffer_tokens, 33000);
+});
+
+test('the threshold and its source survive normalization as measured', () => {
+  const usage = normalizeClaudeContextUsage(sdkResponse({
+    maxTokens: 967000,
+    rawMaxTokens: 967000,
+    autoCompactThreshold: 934000,
+    autocompactSource: 'model-default',
+    isAutoCompactEnabled: true,
+  }));
+  assert.equal(usage.autoCompactThreshold, 934000, 'a token count, not a percent');
+  assert.equal(usage.rawMaxTokens, 967000);
+  assert.equal(usage.autocompactSource, 'model-default');
+  assert.equal(usage.isAutoCompactEnabled, true);
+});
+
+test('a payload without auto-compact fields reports them as absent', () => {
+  const usage = normalizeClaudeContextUsage(sdkResponse());
+  assert.equal(usage.autoCompactThreshold, null);
+  assert.equal(usage.autocompactSource, null);
+  assert.equal(
+    buildClaudeContextSnapshot({ contextUsage: sdkResponse() }).buffer_tokens,
+    null,
+  );
 });
 
 test('readStoredClaudeContextUsage parses the persisted row', () => {

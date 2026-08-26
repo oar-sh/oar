@@ -38,7 +38,7 @@ export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}
  * (delivered or background-continuation) through one publisher.
  */
 export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRuns = null } = {}) {
-  async function postActivity(message, text, subagentRunId = null) {
+  async function postActivity(message, text, subagentRunId = null, metadata = null) {
     if (!text) return;
     await api('POST', '/api/activity', {
       messageId: message.id,
@@ -46,6 +46,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
       mode: message.relayMode || 'agent',
       text,
       ...(subagentRunId ? { subagentRunId } : {}),
+      ...(metadata && typeof metadata === 'object' ? { metadata } : {}),
     }).catch(() => {});
   }
 
@@ -84,7 +85,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
       return;
     }
     if (channel === 'activity') {
-      await postActivity(message, payload.text, payload.subagentRunId);
+      await postActivity(message, payload.text, payload.subagentRunId, payload.metadata || null);
       return;
     }
     if (channel === 'subagent') {

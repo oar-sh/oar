@@ -26,6 +26,7 @@ export const SCHEMA_SQL = `
     preferred_relay_mode TEXT,
     preferred_model TEXT,
     preferred_reasoning_effort TEXT,
+    auto_compact_window INTEGER,
     configured_workspace_root_path TEXT,
     runtime_workspace_root_path TEXT,
     archived   INTEGER NOT NULL DEFAULT 0,
@@ -324,6 +325,7 @@ export const SCHEMA_SQL = `
     relay_mode          TEXT NOT NULL DEFAULT 'agent',
     text                TEXT NOT NULL,
     created_at          TEXT NOT NULL,
+    metadata_json       TEXT,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
   );
 
@@ -723,6 +725,11 @@ if (!conversationColumns.includes('preferred_reasoning_effort')) {
     }
   }
 }
+if (!conversationColumns.includes('auto_compact_window')) {
+  // Token count (not a percent); NULL = "Auto", i.e. the model-tuned default
+  // the Claude CLI picks on its own. See shared/auto-compact-window.mjs.
+  db.exec(`ALTER TABLE conversations ADD COLUMN auto_compact_window INTEGER`);
+}
 if (!conversationColumns.includes('configured_workspace_root_path')) {
   db.exec(`ALTER TABLE conversations ADD COLUMN configured_workspace_root_path TEXT`);
 }
@@ -824,6 +831,13 @@ db.exec(`
 const relayActivityColumns = db.prepare(`PRAGMA table_info(relay_activity)`).all().map((c) => c.name);
 if (relayActivityColumns.length && !relayActivityColumns.includes('subagent_run_id')) {
   db.exec(`ALTER TABLE relay_activity ADD COLUMN subagent_run_id TEXT`);
+}
+// Structured payload for activity rows that the transcript renders as more
+// than prose — today only the Claude compaction boundary
+// ({kind:'compact_boundary', preTokens, postTokens}), which becomes a
+// full-width break row instead of a line inside the tool-activity details.
+if (relayActivityColumns.length && !relayActivityColumns.includes('metadata_json')) {
+  db.exec(`ALTER TABLE relay_activity ADD COLUMN metadata_json TEXT`);
 }
 const relayThoughtColumns = db.prepare(`PRAGMA table_info(relay_thought)`).all().map((c) => c.name);
 if (relayThoughtColumns.length && !relayThoughtColumns.includes('subagent_run_id')) {

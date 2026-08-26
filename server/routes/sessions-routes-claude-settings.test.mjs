@@ -113,6 +113,21 @@ test('claude catalog folds [1m] variants into the base model as a long_context t
   assert.equal(result.modelMetadataByModel['claude-sonnet-5'].longContextLimitTokens, undefined);
 });
 
+test('claude catalog reports the context tiers the enabled ids actually provide', () => {
+  const base = { models: [], providersByModel: {}, reasoningByModel: {}, modelMetadataByModel: {} };
+  const result = buildModelCatalogWithClaudeProvider(base, {
+    enabled: true,
+    model: 'claude-sonnet-5',
+    models: ['claude-sonnet-5', 'claude-opus-5[1m]', 'claude-fable-5', 'claude-fable-5[1m]'],
+  });
+  const tierValues = (modelId) => (result.claudeContextTiersByModel[modelId] || []).map((tier) => tier.value);
+  assert.deepEqual(tierValues('claude-sonnet-5'), ['default']);
+  // No plain "claude-opus-5" in the catalog, so the SDK cannot run it at the
+  // default window even though Copilot serves that id with two tiers.
+  assert.deepEqual(tierValues('claude-opus-5'), ['long_context']);
+  assert.deepEqual(tierValues('claude-fable-5'), ['default', 'long_context']);
+});
+
 test('claude catalog surfaces the base model when only the [1m] variant is enabled', () => {
   const base = { models: [], providersByModel: {}, reasoningByModel: {}, modelMetadataByModel: {} };
   const result = buildModelCatalogWithClaudeProvider(base, {

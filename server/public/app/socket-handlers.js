@@ -448,11 +448,12 @@ export async function connectSocket(overrideDeps) {
   socket.on('background_tasks', ({ conversationId, tasks }) => {
     setConversationBackgroundTasks(conversationId, tasks);
   });
-  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId }) => {
+  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId, metadata }) => {
     if (!messageId || !text) return;
     const entry = {
       text: String(text || '').trim(),
       subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
+      metadata: (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) ? metadata : null,
     };
     if (!entry.text) return;
     const items = relayActivities.get(messageId) || [];
@@ -468,7 +469,7 @@ export async function connectSocket(overrideDeps) {
     }
     if (conversationId === currentConvId) {
       const autoScroll = isMessagesAtBottom();
-      appendThinkingActivity(entry.text, entry.subagentRunId, autoScroll);
+      appendThinkingActivity(entry, entry.subagentRunId, autoScroll);
     }
   });
   socket.on('relay_stream', ({ conversationId, messageId, text, done, seq, subagentRunId }) => {
@@ -534,7 +535,7 @@ export async function connectSocket(overrideDeps) {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, senderClientId }) => {
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, autoCompactWindow, senderClientId }) => {
     if (senderClientId && senderClientId === CLIENT_ID) return;
     const id = String(conversationId || '').trim();
     if (!id || !conversations[id]) return;
@@ -543,6 +544,11 @@ export async function connectSocket(overrideDeps) {
       preferredRelayMode: preferredRelayMode || conversations[id].preferredRelayMode || FALLBACK_MODE,
       preferredModel: preferredModel || conversations[id].preferredModel || '',
       preferredReasoningEffort: preferredReasoningEffort || conversations[id].preferredReasoningEffort || '',
+      // null is a real value here (Auto), so only an omitted field keeps the
+      // previously known one.
+      autoCompactWindow: autoCompactWindow === undefined
+        ? (conversations[id].autoCompactWindow ?? null)
+        : (autoCompactWindow ?? null),
     };
     if (String(currentConvId || '').trim() === id) {
       applyConversationPreferencesForConversation(id, {

@@ -2,110 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
+import { applySchema } from '../db-schema.mjs';
 import { createQuestionRepository } from './question-repository.mjs';
 
 function makeDb() {
+  // Production schema, not a hand-rolled copy: the local DDL this replaced had
+  // already drifted twice (subagent_run_id, then metadata_json).
   const db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE relay_questions (
-      id TEXT PRIMARY KEY,
-      queue_id TEXT,
-      conversation_id TEXT,
-      message_id TEXT,
-      relay_mode TEXT,
-      prompt TEXT,
-      choices TEXT,
-      request TEXT,
-      request_schema TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      answer TEXT,
-      structured_answer TEXT,
-      sdk_session_id TEXT,
-      owner_worker_id TEXT,
-      continuation_id TEXT,
-      continuation_question_id TEXT,
-      created_at TEXT,
-      answered_at TEXT,
-      expires_at TEXT
-    );
-    CREATE TABLE relay_activity (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      queue_message_id TEXT,
-      response_message_id TEXT,
-      conversation_id TEXT,
-      relay_mode TEXT,
-      text TEXT,
-      created_at TEXT,
-      subagent_run_id TEXT
-    );
-    CREATE TABLE relay_stream_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      queue_message_id TEXT,
-      response_message_id TEXT,
-      conversation_id TEXT,
-      relay_mode TEXT,
-      seq INTEGER,
-      text TEXT,
-      done INTEGER,
-      created_at TEXT,
-      subagent_run_id TEXT
-    );
-    CREATE TABLE relay_thought (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      queue_message_id TEXT,
-      response_message_id TEXT,
-      conversation_id TEXT,
-      relay_mode TEXT,
-      reasoning_id TEXT,
-      seq INTEGER,
-      text TEXT,
-      done INTEGER,
-      created_at TEXT,
-      subagent_run_id TEXT
-    );
-    CREATE TABLE subagent_runs (
-      id TEXT PRIMARY KEY,
-      queue_message_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      parent_subagent_id TEXT,
-      display_name TEXT,
-      status TEXT NOT NULL DEFAULT 'running',
-      started_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      completed_at TEXT
-    );
-    CREATE TABLE workflow_runs (
-      id TEXT PRIMARY KEY,
-      response_message_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      run_index INTEGER NOT NULL DEFAULT 0,
-      digest_json TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE queue (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT,
-      response_message_id TEXT
-    );
-    CREATE TABLE relay_boards (
-      id TEXT PRIMARY KEY,
-      queue_id TEXT,
-      conversation_id TEXT,
-      message_id TEXT,
-      board_type TEXT,
-      relay_mode TEXT,
-      title TEXT,
-      body TEXT,
-      actions_json TEXT,
-      recommended_action TEXT,
-      context_json TEXT,
-      status TEXT,
-      selected_action TEXT,
-      acted_at TEXT,
-      created_at TEXT,
-      updated_at TEXT
-    );
-  `);
+  applySchema(db);
+  // relay_* tables carry a foreign key to conversations in the real schema,
+  // which the hand-rolled DDL did not, so the fixture parent row is required.
+  db.prepare(`INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('conv-1', 'Conversation conv-1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run();
+  const queueRow = db.prepare(`INSERT INTO queue (id, conversation_id, text, status, timestamp) VALUES (?, 'conv-1', 'seed', 'done', '2026-01-01T00:00:00Z')`);
+  for (const id of ['queue-1', 'queue-2', 'queue-3', 'queue-4']) queueRow.run(id);
   return db;
 }
 

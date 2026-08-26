@@ -19,6 +19,10 @@ import {
   phantomResultMessage,
   backgroundTasksMessage,
   taskNotificationMessage,
+  compactBoundaryMessage,
+  compactingStatusMessage,
+  compactSummaryReplay,
+  taskNotificationReplay,
   userReplay,
   assistantText,
   baseMessage,
@@ -238,6 +242,57 @@ test('mid-session effort changes toggle the ultracode flags, idempotently', asyn
   turn.emit(resultMessage('back to high', 'native-1'));
   assert.equal(await fourth, true);
   assert.deepEqual(flagCalls[1], { ultracode: null, enableWorkflows: null, effortLevel: 'high' });
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the auto-compact window reaches the spawn and reconciles drift live', async () => {
+  const stub = makeApiStub();
+  const capturedSpawns = [];
+  const turn = scriptedTurn({ echoPushes: true });
+  const flagCalls = [];
+  turn.applyFlagSettings = async (settings) => { flagCalls.push(settings); };
+  // The window arrives piggybacked on each delivery, so the runner reads it
+  // through a getter rather than off the message.
+  let deliveredWindow = 150000;
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      capturedSpawns.push(params);
+      return turn;
+    },
+    getAutoCompactWindow: () => deliveredWindow,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(capturedSpawns[0].autoCompactWindow, 150000, 'spawn carries the window');
+  assert.deepEqual(flagCalls, [], 'a spawn-time window needs no flag-settings call');
+
+  // Unchanged window: no redundant control request.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('second', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(flagCalls.length, 0);
+
+  deliveredWindow = 500000;
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  turn.emit(resultMessage('third', 'native-1'));
+  assert.equal(await third, true);
+  assert.deepEqual(flagCalls, [{ autoCompactWindow: 500000 }]);
+
+  // Back to Auto: the flag layer must be cleared, or the setting is one-way.
+  deliveredWindow = null;
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4' } });
+  await waitFor(() => turn.pushed.length === 4, { label: 'fourth push' });
+  turn.emit(resultMessage('fourth', 'native-1'));
+  assert.equal(await fourth, true);
+  assert.deepEqual(flagCalls[1], { autoCompactWindow: null });
 
   turn.endInput();
   await settled(runner);
@@ -772,6 +827,1869 @@ test('the watchdog fails over a delivered entry the CLI never opens a turn for',
   assert.ok(response?.body?.terminalError, 'terminal error published');
   assert.match(String(response.body.text || ''), /watchdog/);
   assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+// ---------------------------------------------------------------------------
+// Compaction (conv 563e252e, 2026-08-20: a 614k-token session resumed against a
+// freshly lowered 100k window compacted for 133s at resume)
+
+function compactionActivities(stub) {
+  return stub.calls.filter(
+    (call) => call.routePath === '/api/activity' && call.body?.metadata?.kind === 'compact_boundary',
+  );
+}
+
+test('a compaction with no turn open publishes onto the next turn, exactly once', async () => {
+  // Compaction at resume arrives before anything attaches, so the per-turn
+  // normalizer never sees it — the boundary was dropped on the floor and no
+  // conversation had ever recorded one.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  await tick(20);
+  assert.equal(compactionActivities(stub).length, 0, 'nothing to publish onto yet');
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+
+  const boundaries = compactionActivities(stub);
+  assert.equal(boundaries.length, 1);
+  assert.equal(boundaries[0].body.messageId, 'q-1');
+  // post_tokens is genuinely absent from real auto-compact payloads: the row
+  // degrades to a pre-only label instead of losing its metadata.
+  assert.deepEqual(boundaries[0].body.metadata, {
+    kind: 'compact_boundary',
+    preTokens: 614117,
+    postTokens: null,
+  });
+  assert.equal(boundaries[0].body.text, 'Context compacted (was 614.1k tokens)');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a compaction during a turn publishes exactly once, on that turn', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(compactBoundaryMessage({ preTokens: 120000, postTokens: 40000 }));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+
+  // The buffer is what a second publish would come out of, and it only drains
+  // when another context activates — so the next turn is where a duplicate
+  // would show up, not this one.
+  assert.deepEqual(runner._getProcess().pendingActivities, [], 'nothing left to re-publish');
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'again' } });
+  turn.emit(userReplay('again'));
+  turn.emit(resultMessage('done again', 'native-1'));
+  assert.equal(await second, true);
+
+  const boundaries = compactionActivities(stub);
+  assert.equal(boundaries.length, 1, 'the process-level observer must not double-publish');
+  assert.equal(boundaries[0].body.messageId, 'q-1');
+  assert.equal(boundaries[0].body.text, 'Context compacted (120k → 40k tokens)');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the watchdog leaves a delivered entry alone while the CLI is compacting', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 60,
+    lifecyclePollMs: 10,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  // Compaction is minutes of completely silent work: no active turn, no live
+  // task, no control round-trip. Counting it as idleness failed the row over
+  // on a turn the CLI went on to answer.
+  // Announced once and then silence — the CLI's periodic re-emit is
+  // remote-control-only, so the hold has to survive on this single signal.
+  turn.emit(compactingStatusMessage());
+  await tick(200);
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'not reaped mid-compaction');
+
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(resultMessage('answered after compacting', 'native-1'));
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'answered after compacting');
+  assert.ok(!response.body.terminalError);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the turn the CLI re-opens after compacting belongs to the delivered message', { timeout: 15_000 }, async () => {
+  // The CLI answers the delivered message AFTER the boundary, re-opening the
+  // turn with its own compaction summary — text that matches no pending entry.
+  // Read as a self-opened turn, the answer published on a synthetic
+  // continuation row and the real one orphaned until the watchdog failed it.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(assistantText('here is the answer'));
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    undefined,
+    'the delivered row owns the turn — no synthetic one may be registered',
+  );
+  assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('after a settled task, a compaction replay and a notification each get the right turn', { timeout: 15_000 }, async () => {
+  // Both halves at once, in a session that has had a background task settle —
+  // the case every bookkeeping design got wrong in one direction or the other.
+  // The compaction's own replay belongs to the delivered message; the task's
+  // notification replay belongs to a continuation of its own. They are told
+  // apart by the CLI's `<task-notification>` tag, not by what the runner
+  // believes it is owed.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  // A message is pushed, then the CLI compacts for longer than any
+  // continuation grace window before dequeuing anything.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(80);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  // The compaction re-opens the delivered turn with its own summary: q-2's.
+  turn.emit(compactSummaryReplay());
+  turn.emit(resultMessage('answered after compacting', 'native-1'));
+  assert.equal(await second, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-2',
+  );
+  assert.equal(response.body.text, 'answered after compacting');
+  assert.ok(!response.body.terminalError, 'the delivered row must not be failed over');
+
+  // The task's notification is still owed a turn, and opens its own.
+  turn.emit(userReplay('<task-notification>agent-1 completed</task-notification>'));
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.equal(continuation.body.text, 'the agent finished');
+  turn.endInput();
+  await settled(runner);
+});
+
+// Both orders in which a compaction can land inside a turn the CLI opened for
+// a settled task. The untagged summary row follows ANY compaction, so "is this
+// message a notification" cannot answer "is this turn the delivered message's"
+// on its own — the turn-level signal has to carry it.
+test('a compaction inside a task continuation does not take the queued message', { timeout: 15_000 }, async () => {
+  // The notification replays FIRST, so the turn is already the task's when the
+  // compaction fires. Adoption here posted the agent's report as the answer to
+  // the user's queued message.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  // The CLI opens the task's continuation, then compacts inside it.
+  turn.emit(taskNotificationReplay());
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the task report gets its own row' },
+  );
+  assert.equal(continuation.body.text, 'the agent finished');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+    'the queued message must not be closed by the task report',
+  );
+
+  // The delivered message is still owed its turn, and gets it.
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-2',
+  );
+  assert.equal(response.body.text, 'your answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an adopted turn is handed back when the notification replays after the summary', { timeout: 15_000 }, async () => {
+  // The reverse order: the summary row arrives first and adoption takes the
+  // queued row, then the notification replays into the SAME turn — proving the
+  // turn was the task's all along. Nothing has published yet, so the adoption
+  // unwinds instead of stealing the answer.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'adopted, provisionally');
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'handed back to the queue head');
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the task report gets its own row' },
+  );
+  assert.equal(continuation.body.text, 'the agent finished');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+    'the queued message must not be closed by the task report',
+  );
+
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-2',
+  );
+  assert.equal(response.body.text, 'your answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a streaming adopted turn is not unwound by a late notification', { timeout: 15_000 }, async () => {
+  // The hand-back must be strictly between the summary row and the turn's
+  // first output: once the adopted turn has streamed, unwinding it would drop
+  // published text on the floor.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(assistantText('working on it'));
+  await tick(20);
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'the adoption is committed');
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+// A helper for the several orders below that need a settled background task
+// before the compaction: runs one delivered turn that dispatches `agent-1`,
+// then settles it. Leaves the process idle with nothing queued.
+async function settleOneBackgroundTask(runner, turn, stub) {
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  return stub;
+}
+
+test('a system frame between the summary and the notification does not commit the adoption', { timeout: 15_000 }, async () => {
+  // The provisional flag may only be spent by real OUTPUT. The compaction's
+  // own terminator status lands between the summary row and the notification
+  // replay in the most ordinary order there is; committing on it would make
+  // the hand-back unreachable exactly where it is needed.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
+  await settleOneBackgroundTask(runner, turn, stub);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_result: 'success' });
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'handed back despite the status frame');
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the task report gets its own row' },
+  );
+  assert.equal(continuation.body.text, 'the agent finished');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+  );
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a self-opened turn with any stamped origin is not the compaction replay', { timeout: 15_000 }, async () => {
+  // SDKMessageOrigin is a nine-member union and the compact summary carries
+  // NO origin at all, so the test has to be positive: a cross-session `peer`
+  // message read as the compaction's summary would steal the row for good
+  // (the hand-back only recognizes task notifications).
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit({
+    type: 'user',
+    parent_tool_use_id: null,
+    origin: { kind: 'peer', from: 'other-session' },
+    message: { role: 'user', content: 'please review PR 42' },
+  });
+  turn.emit(resultMessage('reviewed PR 42 for you', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    { label: 'the peer turn registers its own row' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1'),
+    undefined,
+    'a peer message must not close the queued row',
+  );
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a compaction inside a bare-init continuation does not take the queued message', { timeout: 15_000 }, async () => {
+  // The live-verified continuation shape has NO user replay at all — just a
+  // bare init. With a message queued behind it, that init is the only signal
+  // that the turn is the CLI's own, and nothing later can correct a wrong
+  // adoption.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 5_000 });
+  await settleOneBackgroundTask(runner, turn, stub);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(assistantText('the agent finished'));
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the bare-init continuation gets its own row' },
+  );
+  assert.equal(continuation.body.text, 'the agent finished');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+  );
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a provisional adoption absorbed as steering gives the row back instead of merging it', { timeout: 15_000 }, async () => {
+  // The absorbed-steering branch settles the outgoing turn with "merged into
+  // the next message" and never requeues it — correct for a row the CLI has
+  // consumed, catastrophic for one it has not: a provisionally adopted row was
+  // never replayed, so it is still owed a turn.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await tick(20);
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } });
+  await tick(20);
+  turn.emit(userReplay('and another'));
+  turn.emit(resultMessage('answering the third', 'native-1'));
+  assert.equal(await third, true);
+
+  const answerFor = (id) => stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === id,
+  )?.body.text;
+  assert.equal(answerFor('q-3'), 'answering the third');
+  assert.equal(answerFor('q-2'), undefined, 'q-2 must not be settled as merged');
+
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('answering the second', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(answerFor('q-2'), 'answering the second');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a phantom result on an adopted turn gives the row back instead of wedging', { timeout: 15_000 }, async () => {
+  // A phantom closes the turn with nothing published and is skipped by the
+  // normalizer, so a committed adoption would leave the context active with
+  // no result ever coming — the queue entry gone from the watchdog's reach and
+  // handlePendingPayload never resolving.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(phantomResultMessage('native-1'));
+  await tick(30);
+  const proc = runner._getProcess();
+  assert.equal(proc.activeCtx, null, 'the phantom released the context');
+  assert.equal(proc.pendingDelivered.length, 1, 'the row is back under the watchdog');
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'the real answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a handed-back row goes to the head of the queue, and only once', { timeout: 15_000 }, async () => {
+  // Ordering and idempotence of the restore: the handed-back entry is still
+  // the next thing the CLI owes, anything queued behind it stays behind it,
+  // and the restored context must lose its provisional flag so a LATER
+  // notification cannot unwind it a second time.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
+  await settleOneBackgroundTask(runner, turn, stub);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await tick(20);
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } });
+  await tick(20);
+  // Stamped as if the watchdog had already started counting this entry as
+  // unattached; the restore has to clear it or the CLI's own compaction time
+  // is charged against the row it is about to replay.
+  runner._getProcess().activeCtx.deliveredEntry.unattachedSince = 1;
+  // Likewise the provisional quiet clock: it is per-adoption, and carried into
+  // a later one the row would be reaped on the first poll of a turn that was
+  // about to answer it.
+  runner._getProcess().activeCtx.provisionalSince = 1;
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  const proc = runner._getProcess();
+  assert.deepEqual(
+    proc.pendingDelivered.map((entry) => entry.ctx.message.id),
+    ['q-2', 'q-3'],
+    'restored to the head, not appended behind q-3',
+  );
+  assert.equal(proc.pendingDelivered[0].ctx.adoptedFromCompaction, false, 'no longer provisional');
+  assert.equal(proc.pendingDelivered[0].unattachedSince, 0, 'the unattached clock restarts');
+  assert.equal(proc.pendingDelivered[0].ctx.provisionalSince, 0, 'the provisional clock restarts');
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the task report gets its own row' },
+  );
+
+  // Attached for real now: a notification arriving mid-turn must NOT unwind it.
+  turn.emit(userReplay('quick question'));
+  await tick(20);
+  turn.emit(taskNotificationReplay());
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  const answerFor = (id) => stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === id,
+  )?.body.text;
+  assert.equal(answerFor('q-2'), 'your answer');
+  turn.emit(userReplay('and another'));
+  turn.emit(resultMessage('the third answer', 'native-1'));
+  assert.equal(await third, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the delivered message replaying its own text after the summary keeps the turn', { timeout: 15_000 }, async () => {
+  // The hand-back triggers on a task notification specifically. The CLI also
+  // replays the delivered message's own text after a compaction, and that
+  // replay is the confirmation the adoption was RIGHT — unwinding on it would
+  // hand the row's own turn to a synthetic continuation.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    undefined,
+    'no synthetic row — the turn was the delivered message’s all along',
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a handed-back adoption leaves no control poller running', { timeout: 15_000 }, async () => {
+  // activateContext starts a poller per attach, and the restored entry gets
+  // another one when it attaches for real; the provisional one has to be
+  // stopped or the abort control for a dead context outlives it.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const started = [];
+  const stopped = [];
+  const controlPoller = {
+    start: ({ queueMessageId }) => {
+      const state = { queueMessageId };
+      started.push(state);
+      return state;
+    },
+    stop: (state) => { if (state) stopped.push(state); },
+  };
+  const runner = makeRunner({ stub, startImpl: () => turn, controlPoller, notificationGraceMs: 30 });
+  await settleOneBackgroundTask(runner, turn, stub);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await tick(20);
+  const provisional = started.at(-1);
+  assert.equal(provisional.queueMessageId, 'q-2', 'the adoption started a poller for q-2');
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  assert.ok(stopped.includes(provisional), 'the provisional poller is stopped on hand-back');
+
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the task report gets its own row' },
+  );
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+  assert.equal(started.length, stopped.length, 'every poller started was stopped');
+});
+
+test('a restored row does not inherit the turn that displaced it', { timeout: 15_000 }, async () => {
+  // Normalizer inheritance is for a genuine hand-off, where the outgoing
+  // context is settled and never used again. A RESTORED one runs its own turn
+  // later, and a shared normalizer publishes the displacing turn's streamed
+  // text as the restored row's answer — its stream text survives a result.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await tick(20);
+  runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } }).catch(() => {});
+  await tick(20);
+  turn.emit(userReplay('and another'));
+  turn.emit({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'the third answer only' } },
+  });
+  turn.emit(resultMessage('the third answer only', 'native-1'));
+  await tick(30);
+  // The stream ends with q-2 still queued: it must be requeued, never answered
+  // with text that belongs to q-3.
+  turn.endInput();
+  await settled(runner);
+
+  const answerFor = (id) => stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === id,
+  )?.body.text;
+  assert.equal(answerFor('q-3'), 'the third answer only');
+  assert.notEqual(answerFor('q-2'), 'the third answer only', 'q-2 must not inherit q-3’s text');
+  await second.catch(() => {});
+});
+
+test('a settled task does not divert a delivered turn that has no replay', { timeout: 15_000 }, async () => {
+  // Suppressing adoption after a task settles must not also divert assistant
+  // traffic: a delivered turn whose replay never precedes its output attaches
+  // on that output, and marking the turn self-opened would fail the row over
+  // while publishing its answer on a synthetic continuation.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    notificationGraceMs: 5_000,
+    pendingDeliveredTimeoutMs: 300,
+    lifecyclePollMs: 10,
+  });
+  await settleOneBackgroundTask(runner, turn, stub);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('your answer'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+
+  assert.equal(await second, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-2',
+  );
+  assert.equal(response.body.text, 'your answer');
+  assert.ok(!response.body.terminalError, 'the row must not be failed over');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    undefined,
+    'no synthetic row — this turn was the delivered message’s',
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a provisional adoption that produces nothing gives the row back to the watchdog', { timeout: 15_000 }, async () => {
+  // Adoption takes the entry out of pendingDelivered on an inference. If the
+  // turn then goes silent, nothing can fail the row over and the process is
+  // pinned forever by its own guess — worse than the orphan it replaced.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 100,
+    idleShutdownMs: 5_000,
+    lifecyclePollMs: 10,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'adopted');
+
+  // Total silence from here: the row comes back and the watchdog fails it
+  // over, instead of the process sitting pinned on its own guess forever.
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.match(response.body.terminalError.message, /never opened a turn for this message/);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a compaction inside a discarded continuation still reaches the next turn', { timeout: 15_000 }, async () => {
+  // A continuation whose registration fails every attempt is `discarded` but
+  // still the active context, and dispatchToContext drops everything handed to
+  // it. Read as "a context is active", the boundary would be published into
+  // that void and the break row would vanish.
+  const stub = makeApiStub({ failRoutes: new Set(['/api/continuation-turn']) });
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-0', text: 'first' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('first'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(userReplay('a turn the CLI opened by itself'));
+  turn.emit(assistantText('working'));
+  await waitFor(
+    () => runner._getProcess()?.activeCtx?.discarded,
+    { label: 'the continuation gave up registering' },
+  );
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(resultMessage('done', 'native-1'));
+  await tick(30);
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  const boundaries = compactionActivities(stub);
+  assert.equal(boundaries.length, 1, 'buffered past the discarded context, published once');
+  assert.equal(boundaries[0].body.messageId, 'q-1');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an adoption committed by stream deltas alone is not unwound', { timeout: 15_000 }, async () => {
+  // A turn can publish through stream_event deltas without ever emitting a
+  // complete assistant frame. Committing only on `assistant` would let a later
+  // notification hand back a row whose answer is already on the wire.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'here is the answer' } },
+  });
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/stream' && call.body.messageId === 'q-1'),
+    { label: 'the adopted turn is already publishing' },
+  );
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'committed — no hand-back');
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a live subagent’s chatter does not commit a provisional adoption', { timeout: 15_000 }, async () => {
+  // A background task's stream arrives at top level carrying
+  // parent_tool_use_id. It is not the adopted turn's output, and a task
+  // running while the user's message is queued is the ordinary state of the
+  // conversation this whole fix came from — committing on it would disarm the
+  // hand-back in exactly the window it exists for.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 5_000 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([
+    { task_id: 'agent-1', task_type: 'local_agent', description: 'job' },
+    { task_id: 'agent-2', task_type: 'local_agent', description: 'other job' },
+  ]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  // agent-1 settles; agent-2 keeps streaming.
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-2', task_type: 'local_agent', description: 'other job' }]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await tick(20);
+  turn.emit({
+    type: 'assistant',
+    parent_tool_use_id: 'tool-2',
+    message: { content: [{ type: 'text', text: 'agent-2 thinking out loud' }] },
+  });
+  turn.emit({
+    type: 'stream_event',
+    parent_tool_use_id: 'tool-2',
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'more chatter' } },
+  });
+  await tick(20);
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'still provisional — handed back');
+  turn.emit(resultMessage('the agent finished its job', 'native-1'));
+
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the task report gets its own row' },
+  );
+  assert.equal(continuation.body.text, 'the agent finished its job');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+  );
+
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your real answer', 'native-1'));
+  assert.equal(await second, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-2',
+  );
+  assert.equal(response.body.text, 'your real answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a permission-mode change during a compaction does not release the hold', { timeout: 15_000 }, async () => {
+  // `{status:null, permissionMode}` is a mode-change notice and says nothing
+  // about compaction — and the user can change the relay mode while a 133 s
+  // compaction runs. Read as a terminator it would drop the hold that keeps
+  // the watchdog, idle shutdown and the mode-change recycle off the CLI's back.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    idleShutdownMs: 40,
+    lifecyclePollMs: 10,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(compactingStatusMessage());
+  await tick(20);
+  turn.emit({ type: 'system', subtype: 'status', status: null, permissionMode: 'acceptEdits' });
+  await tick(30);
+  assert.ok(runner._getProcess()?.compactingSince, 'the hold survives a mode notice');
+  await tick(150);
+  assert.ok(runner._getProcess(), 'and still guards the process against idling out');
+
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_result: 'success' });
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a self-opened turn whose first block is not text is not the compaction replay', { timeout: 15_000 }, async () => {
+  // The origin test cannot see a message with no readable leading text, so an
+  // image- or document-led turn opener would fall through to "not a task
+  // notification" and be adopted. Unreadable means not adopted.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit({
+    type: 'user',
+    parent_tool_use_id: null,
+    message: {
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBOR' } },
+        { type: 'text', text: 'what is in this screenshot?' },
+      ],
+    },
+  });
+  turn.emit(resultMessage('a screenshot of a terminal', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    { label: 'the unreadable turn registers its own row' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1'),
+    undefined,
+    'an unreadable opener must not close the queued row',
+  );
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a row restored by the reaper can be adopted again by a later compaction', { timeout: 15_000 }, async () => {
+  // The quiet clock is per-adoption. Carried over from a previous one, the
+  // second adoption is reaped on the first lifecycle poll and the row is
+  // failed over on a turn that was about to answer it.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 200,
+    idleShutdownMs: 10_000,
+    lifecyclePollMs: 10,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await waitFor(
+    () => runner._getProcess()?.pendingDelivered.length === 1,
+    { label: 'the silent adoption is reaped back onto the queue' },
+  );
+
+  // A second compaction, and this time the turn answers.
+  turn.emit(compactBoundaryMessage({ preTokens: 400000 }));
+  turn.emit(compactSummaryReplay());
+  await tick(60);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'adopted again');
+  assert.ok(runner._getProcess().activeCtx?.adoptedFromCompaction, 'and still provisional');
+  turn.emit(assistantText('here is the answer'));
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  assert.ok(!response.body.terminalError, 'the second adoption must not inherit the first’s clock');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stale settle clock cannot re-open adoption on a bare-init continuation', { timeout: 15_000 }, async () => {
+  // The same steal as the bare-init case, but with the settle clock long
+  // erased: a turn attached in between (activateContext zeroes the settle
+  // timestamps) and the compaction outlives any grace anyway. Suppression has
+  // to come from the init itself, not from how recently a task settled.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
+  await settleOneBackgroundTask(runner, turn, stub);
+
+  // An ordinary turn in between wipes notificationPendingAt / taskSettledAt.
+  const middle = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and this' } });
+  await tick(20);
+  turn.emit(userReplay('and this'));
+  turn.emit(resultMessage('answered the middle one', 'native-1'));
+  assert.equal(await middle, true);
+  await tick(60);
+
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'quick question' } });
+  await tick(20);
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(assistantText('the background agent finished'));
+  turn.emit(resultMessage('the background agent finished', 'native-1'));
+
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the report gets its own row' },
+  );
+  assert.equal(continuation.body.text, 'the background agent finished');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-3'),
+    undefined,
+    'the queued row must not take the report',
+  );
+
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('here is the real answer', 'native-1'));
+  assert.equal(await third, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-3',
+  );
+  assert.equal(response.body.text, 'here is the real answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a compaction on the spawn’s own init still adopts', { timeout: 15_000 }, async () => {
+  // The counterweight to the rule above: compaction AT RESUME — the incident
+  // this whole fix exists for — happens right after the spawn's first init,
+  // and must still be adopted rather than suppressed along with everything
+  // else.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(assistantText('here is the answer'));
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    undefined,
+    'the delivered row owns the resume-time compaction’s turn',
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('init-time suppression lasts one turn, not the whole process', { timeout: 15_000 }, async () => {
+  // The suppression flag says "the turn THIS init opened is the CLI's own". If
+  // it never cleared it would latch for the process's life and adoption would
+  // be dead for every later compaction — the original orphan bug, silently
+  // back.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await first, true);
+
+  // A bare init with a message queued: suppression on.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(initMessage('native-1'));
+  await tick(20);
+  assert.equal(runner._getProcess().continuationInitPending, true);
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(runner._getProcess().continuationInitPending, false, 'cleared by the turn that opened');
+
+  // A later compaction re-opens a third message's turn: adoption must work.
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } });
+  await tick(20);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(assistantText('the third answer'));
+  turn.emit(resultMessage('the third answer', 'native-1'));
+  assert.equal(await third, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-3',
+  );
+  assert.equal(response.body.text, 'the third answer');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    undefined,
+    'adoption is alive again — no synthetic row',
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a Stop taken during a provisional adoption does not silence the real turn', { timeout: 15_000 }, async () => {
+  // activateContext keys a control poller on the adopted row, so the
+  // provisional window is the one moment a still-QUEUED message is Stoppable.
+  // That abort belongs to the turn that was running; carried on the restored
+  // context it would make finalizeContext take its interrupted branch and
+  // publish no response when the row finally runs for real.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  let capturedAbort = null;
+  const controlPoller = {
+    start: ({ queueMessageId, onAbortTurn }) => {
+      if (queueMessageId === 'q-1') capturedAbort = onAbortTurn;
+      return { queueMessageId };
+    },
+    stop: () => {},
+  };
+  const runner = makeRunner({ stub, startImpl: () => turn, controlPoller });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await waitFor(() => capturedAbort, { label: 'the adopted row is Stoppable' });
+  await capturedAbort();
+  turn.emit(taskNotificationReplay());
+  await tick(20);
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'handed back');
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the continuation settles' },
+  );
+
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('here is your answer'));
+  turn.emit(resultMessage('here is your answer', 'native-1'));
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.ok(response, 'the row must still get a response');
+  assert.equal(response.body.text, 'here is your answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the reaper cannot put a settling turn back on the queue', { timeout: 15_000 }, async () => {
+  // An adopted turn silent past the provisional timeout whose first output is
+  // its own `result`: the lifecycle poll can land inside finalizeContext's
+  // awaited publishes. Restoring there puts a FINALIZED context on the queue,
+  // and the next turn to attach it wedges the process for good — finalize
+  // returns early, so the context is never closed and never released.
+  const stub = makeApiStub();
+  const slow = {
+    calls: stub.calls,
+    api: async (method, routePath, body) => {
+      const result = await stub.api(method, routePath, body);
+      if (routePath === '/api/response') await new Promise((resolve) => setTimeout(resolve, 120));
+      return result;
+    },
+  };
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub: slow,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 100,
+    idleShutdownMs: 10_000,
+    lifecyclePollMs: 10,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await first, true);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_result: 'success' });
+  // Late enough that the provisional clock expires DURING finalizeContext's
+  // awaited publishes, which is the only window the race has.
+  await tick(80);
+  turn.emit(resultMessage('the answer', 'native-1'));
+  await tick(20);
+  assert.equal(
+    runner._getProcess().activeCtx?.adoptedFromCompaction,
+    false,
+    'the result commits the adoption before finalize starts awaiting',
+  );
+  assert.equal(await second, true);
+  await tick(60);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'an answered row is not owed again');
+
+  // The process must still be able to run a turn.
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } });
+  await tick(20);
+  turn.emit(assistantText('third answer'));
+  turn.emit(resultMessage('third answer', 'native-1'));
+  assert.equal(await third, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-3',
+  );
+  assert.equal(response.body.text, 'third answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a boundary restarts the unattached clock of an entry near the deadline', { timeout: 15_000 }, async () => {
+  // The watchdog resets pending clocks only WHILE compacting; an entry that
+  // was already close to the deadline when the boundary lands would otherwise
+  // be failed over during the post-boundary replay gap — on a turn the CLI is
+  // about to open for it.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 120,
+    idleShutdownMs: 10_000,
+    lifecyclePollMs: 10,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await first, true);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(100);
+  // Not compacting, so the clock has been running the whole time.
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  await tick(60);
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'not reaped across the boundary');
+
+  turn.emit(compactSummaryReplay());
+  turn.emit(assistantText('your answer'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-2',
+  );
+  assert.equal(response.body.text, 'your answer');
+  assert.ok(!response.body.terminalError);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the adopted message’s own replay makes the adoption final', { timeout: 15_000 }, async () => {
+  // Every unwind rests on "the CLI never consumed this prompt". Once the row's
+  // own text replays, that is false: handing the turn back would fail the row
+  // over for a message the CLI has already taken, and the answer would land on
+  // a synthetic continuation — the exact incident this fix exists to prevent.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(userReplay('hello'));
+  await tick(20);
+  assert.equal(
+    runner._getProcess().activeCtx?.adoptedFromCompaction,
+    false,
+    'confirmed by the replay, no longer provisional',
+  );
+  // A notification arriving now must not unwind it.
+  turn.emit(taskNotificationReplay());
+  turn.emit(assistantText('here is the answer'));
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  assert.ok(!response.body.terminalError, 'the row must not be failed over');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    undefined,
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a mid-turn absorption picks the message it matches, not the queue head', { timeout: 15_000 }, async () => {
+  // The 2026-08-18 steering fix matched only the head. With two messages
+  // queued the CLI can absorb the second, and head-only matching then lets the
+  // running turn keep an answer that belongs to it while BOTH queued rows die
+  // to the watchdog.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, pendingDeliveredTimeoutMs: 0 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await tick(20);
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second' } });
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'third' } });
+  await tick(20);
+  // The CLI absorbs the THIRD message into the running turn.
+  turn.emit(userReplay('third'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await third, true);
+
+  const answerFor = (id) => stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === id,
+  )?.body.text;
+  assert.match(answerFor('q-1'), /merged into the next message/);
+  assert.equal(answerFor('q-3'), 'done');
+
+  turn.emit(userReplay('second'));
+  turn.emit(resultMessage('the second answer', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(answerFor('q-2'), 'the second answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a compaction summary delivered as plain string content is still adopted', { timeout: 15_000 }, async () => {
+  // `content` is a plain string on real rows as often as a block array. Read
+  // only as an array, the summary is "unreadable" and falls through to
+  // non-adoption — the orphan bug, back for the common wire shape.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit({
+    type: 'user',
+    parent_tool_use_id: null,
+    message: { role: 'user', content: 'This session is being continued from a previous conversation…' },
+  });
+  turn.emit(assistantText('here is the answer'));
+  turn.emit(resultMessage('here is the answer', 'native-1'));
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'here is the answer');
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    undefined,
+    'the delivered row owns the turn',
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a legacy notification replay with string content and no origin still opens its own turn', { timeout: 15_000 }, async () => {
+  // Real notification rows carry `content` as a plain string, not a block
+  // array. An emitter predating `origin` leaves only the `<task-notification>`
+  // tag to go on, and the tag can only be read if string content is read.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit({
+    type: 'user',
+    parent_tool_use_id: null,
+    message: { role: 'user', content: '<task-notification id="agent-1">agent-1 completed</task-notification>' },
+  });
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    { label: 'the legacy notification registers its own row' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1'),
+    undefined,
+    'the queued row must not take the task report',
+  );
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a compaction alone keeps the process alive past the idle timeout', { timeout: 15_000 }, async () => {
+  // A compaction produces no stream traffic for minutes and nothing else is
+  // "live" while it runs; an idle shutdown under it kills the CLI mid-flight.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, idleShutdownMs: 40, lifecyclePollMs: 10 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await first, true);
+  turn.emit(compactingStatusMessage());
+  await tick(200);
+  assert.ok(runner._getProcess(), 'the process must survive the compaction');
+
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_result: 'success' });
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a boundary with nothing queued cannot adopt a message delivered after it', { timeout: 15_000 }, async () => {
+  // The window is armed for the entries waiting on the compaction. Arming it
+  // with an empty queue would leave it open for whatever is pushed next, and
+  // the CLI's own next turn would take that row.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await first, true);
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  await tick(20);
+  assert.equal(runner._getProcess().compactReplayUntil, 0, 'nothing was waiting on this compaction');
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(compactSummaryReplay());
+  turn.emit(resultMessage('some other turn', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    { label: 'the CLI turn registers its own row' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+    'a boundary that predates the message must not adopt it',
+  );
+
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('two queued messages replayed out of order each get their own answer', { timeout: 15_000 }, async () => {
+  // Pairing by queue position alone answers each message with the other's
+  // turn; the replay's text is what identifies which entry it opens.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  turn.emit(initMessage('native-1'));
+  await tick(20);
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('the second answer', 'native-1'));
+  assert.equal(await second, true);
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  const answerFor = (id) => stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === id,
+  )?.body.text;
+  assert.equal(answerFor('q-2'), 'the second answer');
+  assert.equal(answerFor('q-1'), 'the first answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a task notification for an unknown task leaves a pending delivered row alone', { timeout: 15_000 }, async () => {
+  // A notification whose task was never in a live set (a stale worker, a
+  // resumed session) must neither adopt the pending row nor make the CLI's own
+  // turn look like the compaction's.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(taskNotificationMessage('never-seen-agent'));
+  await tick(20);
+  turn.emit(userReplay('<task-notification>never-seen-agent completed</task-notification>'));
+  turn.emit(resultMessage('stale task report', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation for the unknown task' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1'),
+    undefined,
+    'the pending row must not be closed by a stale task report',
+  );
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.equal(response.body.text, 'the real answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the adoption window expires instead of waiting for a turn that never comes', { timeout: 15_000 }, async () => {
+  // Safety property: an armed window that is never spent must not sit open,
+  // or an unrelated self-opened turn minutes later would adopt the row.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, compactReplayAdoptionMs: 30 });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  await tick(80);
+  // Past the window: an untagged self-opened turn is no longer the
+  // compaction's replay and must not take the delivered row.
+  turn.emit(compactSummaryReplay());
+  turn.emit(resultMessage('some other turn', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    { label: 'continuation registered after the window expired' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1'),
+    undefined,
+  );
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('one boundary can adopt one turn, not every turn after it', { timeout: 15_000 }, async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  turn.emit(resultMessage('answered after compacting', 'native-1'));
+  assert.equal(await first, true);
+
+  // The window was spent by that turn. A second self-opened turn — no new
+  // boundary — is the CLI's own and must register a continuation.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(20);
+  turn.emit(userReplay('some other self-opened turn'));
+  turn.emit(resultMessage('not your answer', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    { label: 'second turn registers its own row' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+    'the window is one-shot',
+  );
+
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('your answer', 'native-1'));
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a failed compaction disarms the window it opened', { timeout: 15_000 }, async () => {
+  // No boundary and no replay follow a failed compaction — the turn carries on
+  // uncompacted — so the window must not stay open for a later turn to take.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_result: 'failed' });
+  await tick(20);
+  assert.equal(runner._getProcess().compactReplayUntil, 0, 'window disarmed');
+  assert.equal(runner._getProcess().compactingSince, 0, 'hold released');
+
+  turn.emit(userReplay('a turn of the CLI\'s own'));
+  turn.emit(resultMessage('not your answer', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/continuation-turn'),
+    { label: 'continuation after a failed compaction' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1'),
+    undefined,
+  );
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+// Bounded: this turn can only end through the watchdog, so a regression
+// that keeps the hold standing would otherwise hang rather than fail.
+test('a compact_error disarms the window just like compact_result failed', { timeout: 15_000 }, async () => {
+  // Both spellings are optional in the SDK type and both mean the compaction
+  // produced nothing: no boundary, no replay, the turn carries on uncompacted.
+  // A window left armed would only widen the chance of a later self-opened
+  // turn taking the row.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_error: 'out of memory' });
+  await tick(20);
+  assert.equal(runner._getProcess().compactReplayUntil, 0, 'window disarmed');
+  assert.equal(runner._getProcess().compactingSince, 0, 'hold released');
+
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the real answer', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1'),
+    { label: 'the turn carries on uncompacted' },
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an early compact start that compacts nothing releases the hold', { timeout: 5_000 }, async () => {
+  // The CLI announces 'compacting', then reports a BARE null status — no
+  // compact_result, no boundary. Read as "still compacting", the hold would
+  // stand until the staleness cap, delaying the watchdog by minutes.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 60,
+    lifecyclePollMs: 10,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(compactingStatusMessage());
+  turn.emit({ type: 'system', subtype: 'status', status: null });
+  // A permission-mode notice shares the shape but says nothing about
+  // compaction, so it must not be mistaken for either edge.
+  turn.emit({ type: 'system', subtype: 'status', status: null, permissionMode: 'plan' });
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.ok(response?.body?.terminalError, 'the watchdog is no longer held off');
+  turn.endInput();
+  await settled(runner);
+});
+
+// Bounded: this turn can only end through the watchdog, so a regression
+// that keeps the hold standing would otherwise hang rather than fail.
+test('a compaction hold that is never released expires on its own', { timeout: 5_000 }, async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    pendingDeliveredTimeoutMs: 60,
+    lifecyclePollMs: 10,
+    compactionStaleMs: 50,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  // Announced and then nothing at all: no boundary, no terminating status.
+  turn.emit(compactingStatusMessage());
+
+  assert.equal(await pending, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-1',
+  );
+  assert.ok(response?.body?.terminalError, 'the hold cannot outlive the staleness cap');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a buffered boundary survives a flood of between-turn notices', async () => {
+  // The buffer is capped, and it used to drop from the front — so a boundary
+  // buffered between turns lost its break row to ordinary chatter. Structured
+  // entries carry transcript geometry no later line restores.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  for (let index = 0; index < 60; index += 1) {
+    turn.emit(taskNotificationMessage('agent-1', `settled ${index}`));
+  }
+  await tick(20);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'again' } });
+  turn.emit(userReplay('again'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await second, true);
+
+  const boundaries = compactionActivities(stub);
+  assert.equal(boundaries.length, 1, 'the boundary outlived the chatter');
+  assert.equal(boundaries[0].body.messageId, 'q-2');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an api_retry between turns tolerates a buffered boundary ahead of it', async () => {
+  // The collapse-consecutive-retries peek reads the tail of a buffer that now
+  // holds prepared actions as well as prose; treating one as a string throws
+  // inside the stream consumer and takes the process down.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+
+  // Between turns, with no delivered row to post onto: both entries buffer.
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 10, error_status: 500, session_id: 'native-1' });
+  await tick(20);
+  assert.ok(runner._getProcess(), 'the stream consumer must still be alive');
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'again' } });
+  turn.emit(userReplay('again'));
+  turn.emit(resultMessage('done again', 'native-1'));
+  assert.equal(await second, true);
+
+  assert.equal(compactionActivities(stub).length, 1);
+  assert.ok(
+    stub.calls.find((call) => call.routePath === '/api/activity'
+      && call.body.messageId === 'q-2'
+      && /500/.test(call.body.text || '')),
+    'the retry notice rides along with it',
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a second notification replay after a compaction still opens its own turn', async () => {
+  // Two tasks settle with a continuation in between, so the runner has already
+  // seen one of the CLI's own turns before the compaction. Every bookkeeping
+  // design mis-accounted here — a boolean latch was cleared by the first
+  // continuation, a per-task ledger was drained by a turn that opened for an
+  // unrelated reason — and the second notification replay then closed the
+  // user's queued row with the background task's report. Reading the tag off
+  // the message has no state to get wrong.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([
+    { task_id: 'agent-1', task_type: 'local_agent', description: 'job one' },
+    { task_id: 'agent-2', task_type: 'local_agent', description: 'job two' },
+  ]));
+  turn.emit(resultMessage('dispatched both', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  turn.emit(taskNotificationMessage('agent-2'));
+  // Continuation #1 runs and settles exactly one of the two debts.
+  turn.emit(userReplay('<task-notification>agent-1 completed</task-notification>'));
+  turn.emit(resultMessage('agent-1 finished', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'first continuation response' },
+  );
+
+  // The user sends a message, and a compaction lands before the CLI dequeues
+  // anything — well past any continuation grace window.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  await tick(80);
+  turn.emit(compactingStatusMessage());
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  await tick(20);
+  // Continuation #2 — still owed — must open its own turn.
+  turn.emit(userReplay('<task-notification>agent-2 completed</task-notification>'));
+  turn.emit(resultMessage('agent-2 finished', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-2'),
+    { label: 'second continuation response' },
+  );
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2'),
+    undefined,
+    'the queued user row must not be closed by the second background task report',
+  );
+
+  turn.emit(userReplay('quick question'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await second, true);
+  const response = stub.calls.find(
+    (call) => call.routePath === '/api/response' && call.body.messageId === 'q-2',
+  );
+  assert.equal(response.body.text, 'answered');
   turn.endInput();
   await settled(runner);
 });

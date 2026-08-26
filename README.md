@@ -67,7 +67,8 @@ Copilot Remote is still under active development, so expect occasional rough edg
 - Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
 - Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
 - Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
-- **Context usage** modal with a per-category token breakdown of the model's context window
+- **Context usage** modal with a per-category token breakdown of the model's context window, plus a per-conversation **auto-compact window** slider for Claude sessions
+- **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context, and matching dots beside the scrollbar
 - **Plan usage** modal with subscription credits, rate-limit windows and reset countdowns for Copilot, Claude, Cursor, and Grok
 - **Image conversations** (OpenAI BYOK): generate images in chat and iterate on a generated image with *Edit this image*
 - **Share** a conversation by link, with per-message *Hide from shares* control
@@ -247,6 +248,8 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
   - **Grok** — per-turn tokens and estimated cost from the agent prompt result (no live plan-quota API over ACP). Optional monthly USD allowance in Settings for an estimated remaining meter; card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
 - Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
 - Use the **Context** button for a per-category breakdown of the conversation's context window: a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets.
+- Claude conversations additionally get an **auto-compact window** slider in that modal. Claude Code compacts a session once it approaches a model-tuned window (around 967k tokens on Opus 5), which is why long conversations rarely compact at all; setting a smaller window makes it happen sooner and keeps turns cheaper. *Auto* hands the choice back to the CLI. The smallest window is 100k, because the CLI silently ignores anything below that and falls back to its own default. The line beneath the slider reports the window actually in force and where it came from — your setting, the model default, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment override — and fills in once the conversation's first turn completes. The change reaches a running session on its next message.
+- The transcript marks day boundaries, and marks the point where a Claude session compacted its context with the tokens before and after. Both appear as dots beside the scrollbar for the messages currently loaded.
 - Use **Share** in the conversation menu to publish a read-only link. Hover any message and choose **Hide from shares** to keep it out of the shared view without deleting it; hidden messages stay fully visible to you and are marked as hidden.
 - External links in chat open in a new tab with `noopener`/`noreferrer`; workspace file mentions stay in the in-app preview.
 - Workspace browsing follows the selected CLI session's effective CWD. Running sessions keep their learned runtime CWD, menu changes update the next-launch CWD, and chat `cd ...` commands do not retarget the browser.
