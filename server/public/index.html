@@ -1211,6 +1211,26 @@
     display: block;
     white-space: inherit;
   }
+  /* Copy button injected into every rendered code block (code-copy.mjs).
+     The anchor class comes from JS rather than :has() so positioning works
+     everywhere the transcript renders. */
+  pre.has-code-copy { position: relative; }
+  .code-copy-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    font-size: 0.72rem;
+    line-height: 1;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg2);
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0.75;
+  }
+  .code-copy-btn:hover, .code-copy-btn:focus-visible { opacity: 1; color: var(--text); }
+  .code-copy-btn.is-copied { color: var(--accent); border-color: var(--accent); opacity: 1; }
   .katex-display {
     max-width: 100%;
     margin: 0.65em 0;
@@ -1714,6 +1734,44 @@
   }
   .ctx-autocompact-muted { color: var(--muted); }
   .ctx-autocompact-note {
+    font-size: 0.76rem;
+    color: var(--muted);
+  }
+  /* Claude-only thinking control (on/off + text visibility), under the
+     auto-compact slider. */
+  .ctx-thinking {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .ctx-thinking-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 0.85rem;
+  }
+  .ctx-thinking-group { display: inline-flex; gap: 0; }
+  .ctx-thinking-btn {
+    font-size: 0.78rem;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .ctx-thinking-btn:first-child { border-radius: 6px 0 0 6px; }
+  .ctx-thinking-btn:last-child { border-radius: 0 6px 6px 0; }
+  .ctx-thinking-btn + .ctx-thinking-btn { border-left: none; }
+  .ctx-thinking-btn.is-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .ctx-thinking-note {
     font-size: 0.76rem;
     color: var(--muted);
   }

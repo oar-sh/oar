@@ -9,6 +9,7 @@ import {
   submitRelayBoardAction as submitRelayBoardActionApi,
 } from './api-client.js';
 import { renderMarkdownPreview } from './router.js';
+import { attachCodeCopyButtons } from './code-copy.mjs';
 
 let relayBoardRenderHash = '';
 
@@ -84,6 +85,7 @@ export function renderRelayBoards() {
         ${actionHtml}
       </div>`;
     wrapper.querySelectorAll('pre code').forEach((node) => hljs.highlightElement(node));
+    attachCodeCopyButtons(wrapper);
     el.appendChild(wrapper);
   }
   window.scrollBottom?.();

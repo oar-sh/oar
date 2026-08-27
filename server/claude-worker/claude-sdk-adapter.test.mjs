@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 
 import {
   CLAUDE_ULTRACODE_EFFORT,
+  applyThinkingDisplay,
   claudeAutoCompactFlagSettings,
   claudeSpawnSettings,
+  claudeThinkingFlagSettings,
   claudeUltracodeFlagSettings,
   createCanUseTool,
   normalizeClaudeEffort,
@@ -266,4 +268,90 @@ test('canUseTool tells the model to restate the plan when no board was surfaced'
   const result = await canUseTool('ExitPlanMode', { plan: '' }, {});
   assert.equal(result.behavior, 'deny');
   assert.match(result.message, /Restate the complete plan/);
+});
+
+test('spawn settings encode thinking explicitly; only an absent value omits the key', () => {
+  assert.deepEqual(
+    claudeSpawnSettings({ thinkingEnabled: true }),
+    { alwaysThinkingEnabled: true },
+  );
+  assert.deepEqual(
+    claudeSpawnSettings({ thinkingEnabled: false }),
+    { alwaysThinkingEnabled: false },
+  );
+  // The adapter applies NO relay default: null/absent means "say nothing", so
+  // the key is omitted. The relay resolves its own default (on) before this.
+  assert.equal(claudeSpawnSettings({ thinkingEnabled: null }), null);
+  assert.equal(claudeSpawnSettings({ thinkingEnabled: 'junk' }), null);
+  assert.equal(claudeSpawnSettings({ thinkingEnabled: undefined }), null);
+  // ...and it merges with the other settings-layer values, one object.
+  assert.deepEqual(
+    claudeSpawnSettings({ ultracode: true, autoCompactWindow: 200000, thinkingEnabled: false }),
+    { ultracode: true, enableWorkflows: true, autoCompactWindow: 200000, alwaysThinkingEnabled: false },
+  );
+});
+
+test('claudeThinkingFlagSettings carries the explicit value, applying no default', () => {
+  assert.deepEqual(claudeThinkingFlagSettings(true), { alwaysThinkingEnabled: true });
+  assert.deepEqual(claudeThinkingFlagSettings(false), { alwaysThinkingEnabled: false });
+  assert.deepEqual(claudeThinkingFlagSettings(null), { alwaysThinkingEnabled: null });
+  assert.deepEqual(claudeThinkingFlagSettings('junk'), { alwaysThinkingEnabled: null });
+});
+
+test('startClaudeSession requests the delivered display mode after spawn', async () => {
+  const displayCalls = [];
+  const queryImpl = () => ({
+    async* [Symbol.asyncIterator]() {},
+    async setMaxThinkingTokens(budget, display) { displayCalls.push([budget, display]); },
+  });
+  startClaudeSession({ cwd: '/tmp', thinkingDisplay: 'omitted', queryImpl });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(displayCalls, [[null, 'omitted']]);
+});
+
+test('startClaudeSession defaults the display to summarized (previous behavior)', async () => {
+  const displayCalls = [];
+  const queryImpl = () => ({
+    async* [Symbol.asyncIterator]() {},
+    async setMaxThinkingTokens(budget, display) { displayCalls.push([budget, display]); },
+  });
+  startClaudeSession({ cwd: '/tmp', queryImpl });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(displayCalls, [[null, 'summarized']]);
+});
+
+test('applyThinkingDisplay resolves a legacy/unknown mode to the default, never to hidden', async () => {
+  // 'host' was a third state before the relay took a position on thinking.
+  // A row still carrying it (or any junk) must land on 'summarized' — the one
+  // outcome that keeps thoughts visible — rather than being forwarded raw.
+  const displayCalls = [];
+  const turn = {
+    async setMaxThinkingTokens(budget, display) { displayCalls.push([budget, display]); },
+  };
+  await applyThinkingDisplay(turn, 'host');
+  await applyThinkingDisplay(turn, 'nonsense');
+  assert.deepEqual(displayCalls, [[null, 'summarized'], [null, 'summarized']]);
+});
+
+test('applyThinkingDisplay re-sends the tracked budget rather than nulling it', async () => {
+  // The first argument is positional: a hardcoded null while a budget pin
+  // existed would silently clear the pin on every display change.
+  const displayCalls = [];
+  const turn = {
+    async setMaxThinkingTokens(budget, display) { displayCalls.push([budget, display]); },
+  };
+  await applyThinkingDisplay(turn, 'summarized', { budget: 12000 });
+  assert.deepEqual(displayCalls, [[12000, 'summarized']]);
+});
+
+test('applyThinkingDisplay tolerates old CLIs and failures', async () => {
+  await applyThinkingDisplay({}, 'summarized'); // no method: silent no-op
+  const failures = [];
+  await applyThinkingDisplay(
+    { async setMaxThinkingTokens() { throw new Error('nope'); } },
+    'summarized',
+    { dbg: (...args) => failures.push(args.join(' ')) },
+  );
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /nope/);
 });

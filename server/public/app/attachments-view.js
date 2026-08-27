@@ -48,6 +48,7 @@ import {
 } from './router.js';
 import { markdownHeadingId, resolveFilePreviewLink } from './file-preview-navigation.mjs';
 import { openExternalNavigation } from './external-link-policy.mjs';
+import { attachCodeCopyButtons } from './code-copy.mjs';
 import {
   deepestExistingAncestor,
   planRepoRehydration,
@@ -1075,6 +1076,7 @@ export function renderFilePreview() {
     });
     assignMarkdownHeadingIds(article);
     bodyEl.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+    attachCodeCopyButtons(bodyEl);
     const fragment = String(filePreviewState.viewerOptions?.fragment || '');
     if (fragment) requestAnimationFrame(() => scrollMarkdownPreviewToFragment(fragment));
     return;
@@ -1083,6 +1085,7 @@ export function renderFilePreview() {
   const languageClass = payload.language ? `language-${escHtml(payload.language)}` : '';
   bodyEl.innerHTML = `<div class="file-preview-code"><pre><code class="${languageClass}">${escHtml(rawText)}</code></pre></div>`;
   bodyEl.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+  attachCodeCopyButtons(bodyEl);
 }
 
 export async function openWorkspaceFilePreview(rawPath, options = {}) {

@@ -97,6 +97,7 @@ import {
   turnCeilingMinutesToMs,
 } from '../shared/turn-ceiling.mjs';
 import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
+import { parseThinkingDisplay, parseThinkingEnabled } from '../shared/claude-thinking.mjs';
 import {
   parseBackgroundTaskTimeoutUpdate,
   readBackgroundTaskTimeoutSetting,
@@ -6147,9 +6148,18 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       // Per-conversation, unlike the two above: delivery is already scoped to
       // one conversation, so the worker picks the window up on its next turn
       // without a new queue column or push channel. null = Auto.
-      autoCompactWindow: parseAutoCompactWindow(out.conversationId
-        ? stmts.getConvAnyStatus.get(out.conversationId)?.auto_compact_window
-        : null),
+      ...((() => {
+        const conv = out.conversationId ? stmts.getConvAnyStatus.get(out.conversationId) : null;
+        return {
+          autoCompactWindow: parseAutoCompactWindow(conv?.auto_compact_window),
+          // Per-conversation thinking control, same delivery scoping. An
+          // explicit null on thinkingEnabled means Host default — the worker
+          // distinguishes it from an absent key (an older relay), so both
+          // keys are always present here.
+          thinkingEnabled: parseThinkingEnabled(conv?.thinking_enabled),
+          thinkingDisplay: parseThinkingDisplay(conv?.thinking_display),
+        };
+      })()),
     },
     routing: {
       enabled: true,

@@ -1,5 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
+import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
+
 const MODE_SYSTEM_PROMPT_APPEND = {
   ask: 'Prioritize clarification questions (AskUserQuestion) before implementation work; do not make broad assumptions when a question would materially change the result.',
   autopilot: 'Keep moving unless user input is truly blocking; avoid unnecessary questions.',
@@ -47,6 +49,37 @@ export function claudeAutoCompactFlagSettings(autoCompactWindow) {
   return { autoCompactWindow: window };
 }
 
+/**
+ * The flag-settings payload that pins (or clears) `alwaysThinkingEnabled` on a
+ * live session.
+ *
+ * Probed 2026-08-26 (CLI 2.1.226): the CLI honors this key at SPAWN in both
+ * directions, and mid-session only in the ENABLING direction — a mid-session
+ * `false` is accepted and **silently ignored**; thinking keeps running and
+ * stays visible. `adaptProcess` therefore only calls this for `true`, and
+ * leaves a disable for the next spawn to apply. Do not "fix" that guard:
+ * calling this with `false` doesn't fail, it lies.
+ */
+export function claudeThinkingFlagSettings(thinkingEnabled) {
+  return { alwaysThinkingEnabled: strictThinkingEnabled(thinkingEnabled) };
+}
+
+/**
+ * true / false / null(=say nothing), with NO relay default applied.
+ *
+ * The adapter stays mechanical on purpose: the "unset means on" policy lives
+ * in `shared/claude-thinking.mjs` and is resolved by the relay before the
+ * value ever gets here. If this used `parseThinkingEnabled` instead, its
+ * default would fire for a caller that passed nothing and pin
+ * `alwaysThinkingEnabled` on every spawn — including the ones that mean to
+ * leave the key out entirely.
+ */
+function strictThinkingEnabled(value) {
+  if (value === true) return true;
+  if (value === false) return false;
+  return null;
+}
+
 /** A token count, or null for Auto. Junk is Auto, never a pinned window. */
 export function normalizeAutoCompactWindow(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -61,11 +94,17 @@ export function normalizeAutoCompactWindow(value) {
  * spreads of `settings` in the options literal would silently clobber each
  * other. Returns null when nothing needs to be set.
  */
-export function claudeSpawnSettings({ ultracode = false, autoCompactWindow = null } = {}) {
+export function claudeSpawnSettings({ ultracode = false, autoCompactWindow = null, thinkingEnabled = null } = {}) {
   const window = normalizeAutoCompactWindow(autoCompactWindow);
+  const thinking = strictThinkingEnabled(thinkingEnabled);
   const settings = {
     ...(ultracode ? { ultracode: true, enableWorkflows: true } : {}),
     ...(window !== null ? { autoCompactWindow: window } : {}),
+    // null means OMIT the key. The relay always resolves to true/false
+    // before spawning (its default is on), so in practice the key is always
+    // present; the omit path exists for direct callers that mean to say
+    // nothing.
+    ...(thinking !== null ? { alwaysThinkingEnabled: thinking } : {}),
   };
   return Object.keys(settings).length ? settings : null;
 }
@@ -143,6 +182,8 @@ export function startClaudeSession({
   relayMode = 'agent',
   reasoningEffort = '',
   autoCompactWindow = null,
+  thinkingEnabled = null,
+  thinkingDisplay = '',
   abortController,
   canUseTool,
   pathToClaudeCodeExecutable = '',
@@ -154,9 +195,10 @@ export function startClaudeSession({
   const ultracode = effort === CLAUDE_ULTRACODE_EFFORT;
   const effortOption = ultracode ? 'xhigh' : effort;
   // Spawn-time twin of the flag-settings helpers: the settings layer is the
-  // only way to hand a fresh CLI the session-scoped ultracode flag and the
-  // auto-compact window, and both share one `settings` object.
-  const spawnSettings = claudeSpawnSettings({ ultracode, autoCompactWindow });
+  // only way to hand a fresh CLI the session-scoped ultracode flag, the
+  // auto-compact window and the thinking pin, and all three share one
+  // `settings` object.
+  const spawnSettings = claudeSpawnSettings({ ultracode, autoCompactWindow, thinkingEnabled });
   const options = {
     cwd,
     permissionMode: permissionModeForRelayMode(relayMode),
@@ -175,7 +217,7 @@ export function startClaudeSession({
   };
   const { stream, push, end } = createPushableUserMessageStream();
   const turn = queryImpl({ prompt: stream, options });
-  requestSummarizedThinkingDisplay(turn, dbg);
+  applyThinkingDisplay(turn, thinkingDisplay, { dbg });
   turn.pushUserMessage = push;
   // The session process MUST call this on every teardown path or the CLI
   // process lingers waiting for more input.
@@ -185,25 +227,38 @@ export function startClaudeSession({
 }
 
 /**
- * Make whatever thinking the session already produces visible to the relay,
- * without changing how much Claude thinks.
+ * Set the session's thinking display mode, without changing how much Claude
+ * thinks.
  *
- * No `thinking` option is passed to `query()` on purpose: every variant of that
- * option forces a `type`, which would override the host's configuration and
- * could switch thinking on for a session that has it off. `setMaxThinkingTokens`
- * with a null budget resets to the session default — it neither enables thinking
- * on a disabled session nor changes any budget — while the second argument sets
- * the display mode, which is the part that decides whether thinking blocks reach
- * the SDK consumer at all.
+ * No `thinking` option is passed to `query()` on purpose: every variant of
+ * that option forces a `type`, which would override the host's configuration
+ * — the on/off axis goes through `Settings.alwaysThinkingEnabled` instead
+ * (spawn settings / `claudeThinkingFlagSettings`). `setMaxThinkingTokens` is
+ * deprecated on its FIRST argument only; the second (`thinkingDisplay`) has
+ * no replacement on a live session and is the sole live lever for display.
+ * Measured 2026-08-26: without this call the API default hides thinking text
+ * (blocks arrive with empty `thinking`), so the spawn-time call is
+ * load-bearing — it is what makes thought bubbles exist at all.
  *
- * Best-effort: the method is deprecated and the control request can fail on
- * older CLIs. When it does, complete assistant messages still carry whatever
- * thinking the host's own settings allow.
+ * `display` is a relay state ('summarized' | 'omitted' | 'host'); 'host'
+ * maps to the wire's `null`, an ACTIVE instruction that clears the session
+ * display mode back to the API default — not a skip.
+ *
+ * The budget argument is positional and re-sent on every call: hardcoding
+ * `null` while a budget pin existed would silently clear it, so the caller's
+ * tracked budget (always null today — the relay pins none) is threaded
+ * through rather than assumed.
+ *
+ * Best-effort: the method can be missing on older CLIs. When the call fails,
+ * complete assistant messages still carry whatever thinking the session's
+ * settings allow.
  */
-function requestSummarizedThinkingDisplay(turn, dbg = () => {}) {
-  if (typeof turn?.setMaxThinkingTokens !== 'function') return;
-  Promise.resolve()
-    .then(() => turn.setMaxThinkingTokens(null, 'summarized'))
+export function applyThinkingDisplay(turn, display, { budget = null, dbg = () => {} } = {}) {
+  if (typeof turn?.setMaxThinkingTokens !== 'function') return Promise.resolve();
+  const mode = parseThinkingDisplay(display);
+  const wireDisplay = mode === 'host' ? null : mode;
+  return Promise.resolve()
+    .then(() => turn.setMaxThinkingTokens(budget ?? null, wireDisplay))
     .catch((error) => {
       dbg('thinking display request failed', error?.message || String(error));
     });
@@ -217,7 +272,7 @@ function requestSummarizedThinkingDisplay(turn, dbg = () => {}) {
  * down once the async iterator returns. In practice that means calling this
  * from inside the `for await` loop, when the `result` message arrives.
  *
- * Best-effort like `requestSummarizedThinkingDisplay`: the control request is
+ * Best-effort like `applyThinkingDisplay`: the control request is
  * unavailable on older CLIs, and losing a context snapshot must never fail the
  * turn that produced it.
  */

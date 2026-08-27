@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +30,39 @@ function collectTestFiles(dir, out = []) {
   return out;
 }
 
+// Everything git actually publishes, so the sweep matches what a clone would
+// receive: gitignored working files (server/config.json, docs/plans/, logs)
+// are excluded for free, and nothing untracked can trip a guard the pusher
+// never sees. Binary blobs are skipped — a regex cannot read a screenshot,
+// which is a real blind spot worth naming rather than papering over: images
+// have to be reviewed by eye before they are committed.
+const TEXT_FILE_RE = /\.(mjs|js|cjs|ts|json|md|html|css|svg|yml|yaml|sh|ps1|webmanifest)$/i;
+
+// Returns null — not an empty list — when git cannot answer (no git on PATH,
+// a source export with no .git, a sandbox that blocks subprocesses). The
+// caller skips in that case instead of failing: an empty list would otherwise
+// read as "the walk is broken" on a machine that is merely missing git. There
+// is deliberately no filesystem-walk fallback — the ignore list is exactly
+// what keeps the local `server/config.json` (which holds a real relay token)
+// out of this scan, so a walk that ignored it would fail on every dev machine.
+function collectTrackedTextFiles() {
+  let listed = '';
+  try {
+    listed = execFileSync('git', ['ls-files', '-z'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+  return listed.split('\0')
+    .filter((rel) => rel && TEXT_FILE_RE.test(rel) && rel !== 'package-lock.json')
+    .map((rel) => path.join(repoRoot, rel))
+    .filter((full) => path.resolve(full) !== SELF && fs.existsSync(full));
+}
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -48,31 +82,65 @@ function isGenericIdentity(value) {
   return GENERIC_IDENTITIES.has(String(value || '').trim().toLowerCase());
 }
 
-function buildFingerprintPatterns() {
-  const patterns = [];
+// Private/LAN suffixes: a host under one of these is somebody's machine, never
+// a public documentation domain, so the hostname may be the LEADING label
+// there. Under a public TLD it must be the whole authority or a dotted suffix.
+const PRIVATE_TLDS = String.raw`(?:local|lan|home|internal|localdomain|localhost)`;
+
+// The identity is a parameter, defaulted to the running host, so the patterns
+// can be exercised against synthetic identities in a test rather than only
+// against whatever machine happens to run the suite.
+function readHostIdentity() {
   let username = '';
   try { username = String(os.userInfo().username || '').trim(); } catch {}
+  return {
+    username,
+    homedir: String(os.homedir() || '').trim(),
+    hostname: String(os.hostname() || '').trim(),
+  };
+}
+
+function buildFingerprintPatterns(identity = readHostIdentity()) {
+  const patterns = [];
+  const username = String(identity.username || '').trim();
   if (username.length >= 5 && !isGenericIdentity(username)) {
     patterns.push({
       label: `local username in a home path (${username})`,
       re: new RegExp(String.raw`[\\/]+(?:Users|home)[\\/]+` + escapeRegExp(username) + String.raw`\b`, 'i'),
     });
   }
-  const homedir = String(os.homedir() || '').trim();
+  const homedir = String(identity.homedir || '').trim();
   // `/home/dev` is 9 chars and would otherwise flag the documented fixture.
   const homedirLeaf = homedir.split(/[\\/]+/).filter(Boolean).pop() || '';
   if (homedir.length >= 8 && !isGenericIdentity(homedirLeaf)) {
     const flexibleSlashes = escapeRegExp(homedir).replace(/\\\\/g, String.raw`[\\/]+`);
     patterns.push({ label: 'local home directory path', re: new RegExp(flexibleSlashes, 'i') });
   }
-  const hostname = String(os.hostname() || '').trim();
+  const hostname = String(identity.hostname || '').trim();
   if (hostname.length >= 6 && !isGenericIdentity(hostname)) {
-    // Anchored to a host position (URL authority, email domain, explicit host=/host:)
-    // rather than a bare word match, which would hit the hostname inside ordinary prose.
+    // The hostname must be the WHOLE authority, or a whole dotted suffix of it
+    // ("relay.<hostname>"), never a bare substring. The looser form matched any
+    // domain that merely contained the hostname as a label, so a contributor
+    // whose machine is named `claude` or `github` failed this guard on
+    // `https://code.claude.com` / `https://github.com/...` — an ordinary
+    // documentation URL flagged purely because of what their laptop is called.
+    // Positions: URL authority, email domain, and explicit host=/host: config.
+    const host = escapeRegExp(hostname);
+    const labels = String.raw`(?:[A-Za-z0-9_-]+\.)*`;
+    // Anything that can legally terminate a host: port, path, query, quote,
+    // whitespace, or end of line. The mail form excludes '/' so an npm scope
+    // (`@cursor/sdk`) is not read as an address at `cursor`.
+    const hostEnd = String.raw`(?=[:/?#\s"'\`,)\]]|$)`;
+    const mailEnd = String.raw`(?=[:\s"'\`,)\]>]|$)`;
+    const self = String.raw`(?:${labels}${host}|${host}\.${PRIVATE_TLDS})`;
     patterns.push({
       label: `local hostname (${hostname})`,
-      re: new RegExp(String.raw`(?:https?://|ssh://|@|\bhosts?\s*[=:]\s*['"\`]?)[A-Za-z0-9.-]*\b`
-        + escapeRegExp(hostname) + String.raw`\b`, 'i'),
+      re: new RegExp(
+        String.raw`(?:(?:https?|ssh)://(?:[^/\s@]*@)?${self}${hostEnd}`
+        + String.raw`|@${self}${mailEnd}`
+        + String.raw`|\bhosts?\s*[=:]\s*['"\`]?${self}${hostEnd})`,
+        'i',
+      ),
     });
   }
   return patterns;
@@ -269,4 +337,105 @@ test('tests asserting a joined POSIX path declare how they handle the platform',
     + 'Inject the path module into the code under test (`pathImpl: path.posix`, the preferred form — '
     + 'see claude-session-root-service), build the expectation with the same host `path` API, or annotate '
     + `with a \`platform-agnostic:\` note if the value never reaches path semantics. Violations:\n${violations.join('\n')}`);
+});
+
+// Guard: the companion to the first test, widened from test files to
+// EVERYTHING GIT PUBLISHES. The original guard only covered `*.test.mjs`, on
+// the reasoning that fixtures are where fake data belongs — but a credential
+// or a home path does not care which file it lands in, and `docs/`,
+// `server/public/`, and the worker sources were all unscanned.
+//
+// Only machine fingerprints and secrets are checked here, NOT emails: the
+// author's name in LICENSE and the project's own GitHub URL in README are
+// deliberate publication, not leakage, and a repo-wide email rule would have
+// to allowlist them one by one until it meant nothing.
+//
+// A home path stays a violation in source even when the account name is
+// itself harmless (this project's author uses a pseudonym): the value being
+// kept out is the machine layout plus whoever's account name the next
+// contributor happens to have. Screenshots are a separate matter — they are
+// content, reviewed by eye, and not scanned here.
+test('tracked files contain no machine fingerprints or secrets', (t) => {
+  const files = collectTrackedTextFiles();
+  if (files === null) {
+    // No git here (source export, no git on PATH, subprocesses blocked). Report
+    // it as skipped rather than failed: this guard protects what git publishes,
+    // and where git cannot answer there is nothing to publish.
+    t.skip('git ls-files unavailable — cannot determine the published file set');
+    return;
+  }
+  assert.ok(files.length > 100, `Expected to scan the tracked tree, found ${files.length} — git ls-files walk is broken`);
+
+  const fingerprintPatterns = buildFingerprintPatterns();
+  const violations = [];
+
+  for (const file of files) {
+    const relPath = path.relative(repoRoot, file);
+    let lines = [];
+    try { lines = fs.readFileSync(file, 'utf8').split(/\r?\n/); } catch { continue; }
+    lines.forEach((line, idx) => {
+      for (const { label, re } of [...fingerprintPatterns, ...SECRET_PATTERNS]) {
+        if (re.test(line)) violations.push(`${relPath}:${idx + 1} — ${label}`);
+      }
+    });
+  }
+
+  assert.deepEqual(violations, [],
+    'Committed files must not carry the author\'s machine identity or any credential. '
+    + `Use the documented fixtures (C:\\Users\\dev, /home/dev, fake tokens). Violations:\n${violations.join('\n')}`);
+});
+
+// Guard for the guards above: the fingerprint patterns are derived from
+// whoever's machine runs the suite, so their correctness cannot be judged from
+// a single host. These cases feed SYNTHETIC identities through the same
+// builder, pinning both halves of the contract on every machine:
+//   - real machine identity is still caught, and
+//   - ordinary content is never flagged just because of what a laptop is named.
+// The second half is the one that broke: the first version of the widened scan
+// matched the hostname as a bare substring, so a contributor whose machine was
+// called `claude` or `github` failed on this project's own doc URLs.
+const FINGERPRINT_CASES = [
+  // [identity, line, shouldFlag, why]
+  [{ hostname: 'claude' }, 'see https://code.claude.com/docs', false, 'public doc URL vs a machine named claude'],
+  [{ hostname: 'github' }, 'git clone https://github.com/owner/repo', false, 'repo URL vs a machine named github'],
+  [{ hostname: 'cursor' }, 'import x from "@cursor/sdk"', false, 'npm scope is not an email host'],
+  [{ hostname: 'anthropic' }, 'https://api.anthropic.com/v1', false, 'api domain vs a machine named anthropic'],
+  [{ hostname: 'bigbox9' }, 'the bigbox9 machine is fast', false, 'bare prose mention'],
+  [{ hostname: 'bigbox9' }, 'https://bigbox9.local:3333/api', true, 'LAN FQDN of the running host'],
+  [{ hostname: 'bigbox9' }, 'mail me at ops@bigbox9.local', true, 'email at the running host'],
+  [{ hostname: 'bigbox9' }, 'host: bigbox9', true, 'explicit host assignment'],
+  [{ hostname: 'relay.example9' }, 'ssh://deploy@edge.relay.example9:22/srv', true, 'ssh authority under the host domain'],
+  // Generic identities are skipped entirely, or the documented fixtures would
+  // flag on any throwaway container.
+  [{ hostname: 'localhost' }, 'http://localhost:3333/api', false, 'generic hostname is not a fingerprint'],
+  [{ username: 'dev', homedir: '/home/dev' }, 'const cwd = "/home/dev/project";', false, 'documented fixture user'],
+  [{ username: 'ubuntu', homedir: '/home/ubuntu' }, '/home/ubuntu/app', false, 'generic cloud-image user'],
+  // A real account name, in the shapes that actually leak.
+  [{ username: 'jklassen', homedir: '/home/jklassen' }, 'path: /home/jklassen/notes', true, 'POSIX home path'],
+  [{ username: 'jklassen', homedir: 'C:\\Users\\jklassen' }, 'C:/Users/jklassen/repo', true, 'Windows home path, either slash'],
+  [{ username: 'jklassen' }, 'jklassen reviewed the change', false, 'a name outside a home path is not a machine fingerprint'],
+];
+
+test('fingerprint patterns behave the same on any user or machine', () => {
+  const failures = [];
+  for (const [identity, line, shouldFlag, why] of FINGERPRINT_CASES) {
+    const patterns = buildFingerprintPatterns({ username: '', homedir: '', hostname: '', ...identity });
+    const flagged = patterns.some(({ re }) => re.test(line));
+    if (flagged !== shouldFlag) {
+      failures.push(`${JSON.stringify(identity)} + ${JSON.stringify(line)} -> ${flagged}, expected ${shouldFlag} (${why})`);
+    }
+  }
+  assert.deepEqual(failures, [],
+    `The fingerprint patterns must not depend on who runs the suite:\n${failures.join('\n')}`);
+});
+
+// Known, accepted gap, pinned so it is a decision rather than a surprise: when
+// the hostname is the leading label of a PUBLIC domain, it is indistinguishable
+// from `github.com` on a laptop named `github`, so it is not flagged. The cases
+// that actually identify a machine — whole authority, dotted suffix, LAN FQDN —
+// are covered above.
+test('a public domain sharing the hostname label is deliberately not flagged', () => {
+  const patterns = buildFingerprintPatterns({ username: '', homedir: '', hostname: 'bigbox9' });
+  assert.equal(patterns.some(({ re }) => re.test('https://bigbox9.com/blog')), false);
+  assert.equal(patterns.some(({ re }) => re.test('https://bigbox9')), true, 'the bare authority still flags');
 });

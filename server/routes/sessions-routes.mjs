@@ -11,6 +11,7 @@ import { applySafeServedContentHeaders } from '../services/safe-served-content.m
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
+import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
 import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 import {
   DEFAULT_CLAUDE_REASONING_EFFORTS,
@@ -2883,6 +2884,8 @@ export function registerSessionsRoutes(app, deps) {
       // reported separately.
       resolvedConversationId: conversationRow?.id || null,
       autoCompactWindow: parseAutoCompactWindow(conversationRow?.auto_compact_window),
+      thinkingEnabled: parseThinkingEnabled(conversationRow?.thinking_enabled),
+      thinkingDisplay: parseThinkingDisplay(conversationRow?.thinking_display),
       runtimeSessionId: runtimeSession?.id || null,
       copilotSessionId,
       providerType: usesStoredContextUsage ? providerType : 'github',
@@ -3640,8 +3643,11 @@ export function registerSessionsRoutes(app, deps) {
       mentions('preferredReasoningEffort') ? req.body?.preferredReasoningEffort : existing?.preferred_reasoning_effort,
     );
     // Only an explicit mention rewrites the window (null = Auto is a real
-    // value, so a plain falsy check would not do).
+    // value, so a plain falsy check would not do). Same for the thinking
+    // control, where null = Host default.
     const mentionsAutoCompactWindow = mentions('autoCompactWindow');
+    const mentionsThinkingEnabled = mentions('thinkingEnabled');
+    const mentionsThinkingDisplay = mentions('thinkingDisplay');
     const persisted = persistConversationPreferences({
       db,
       stmts,
@@ -3651,6 +3657,12 @@ export function registerSessionsRoutes(app, deps) {
       preferredReasoningEffort,
       ...(mentionsAutoCompactWindow
         ? { autoCompactWindow: parseAutoCompactWindow(req.body?.autoCompactWindow) }
+        : {}),
+      ...(mentionsThinkingEnabled
+        ? { thinkingEnabled: parseThinkingEnabled(req.body?.thinkingEnabled) }
+        : {}),
+      ...(mentionsThinkingDisplay
+        ? { thinkingDisplay: parseThinkingDisplay(req.body?.thinkingDisplay) }
         : {}),
       updatedAt: now,
       createIfMissing: !existing,
@@ -3663,6 +3675,8 @@ export function registerSessionsRoutes(app, deps) {
       preferredModel: persisted.preferredModel,
       preferredReasoningEffort: persisted.preferredReasoningEffort,
       autoCompactWindow: persisted.autoCompactWindow ?? null,
+      thinkingEnabled: persisted.thinkingEnabled ?? null,
+      thinkingDisplay: persisted.thinkingDisplay ?? null,
       updatedAt: persisted.updatedAt,
       senderClientId,
     });
@@ -3674,6 +3688,8 @@ export function registerSessionsRoutes(app, deps) {
       preferredModel: persisted.preferredModel,
       preferredReasoningEffort: persisted.preferredReasoningEffort,
       autoCompactWindow: persisted.autoCompactWindow ?? null,
+      thinkingEnabled: persisted.thinkingEnabled ?? null,
+      thinkingDisplay: persisted.thinkingDisplay ?? null,
       updatedAt: persisted.updatedAt,
       created: persisted.created,
       senderClientId,

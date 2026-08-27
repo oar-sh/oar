@@ -196,3 +196,91 @@ test('the broadcast carries the merged state, not just the mentioned keys', asyn
   assert.equal(update[1].preferredReasoningEffort, 'high');
   assert.equal(update[1].senderClientId, 'client-a');
 });
+
+test('a thinking-only PATCH stores both axes and leaves every other preference alone', async () => {
+  const { patch, row } = setup();
+
+  const response = await patch({ clientId: 'client-a', thinkingEnabled: false, thinkingDisplay: 'omitted' });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.thinkingEnabled, false);
+  assert.equal(response.body.thinkingDisplay, 'omitted');
+  assert.equal(response.body.preferredModel, 'claude-opus-5');
+  assert.equal(response.body.preferredRelayMode, 'plan');
+
+  const stored = row();
+  assert.equal(stored.thinking_enabled, 0, 'off stores as 0, not NULL');
+  assert.equal(stored.thinking_display, 'omitted');
+  assert.equal(stored.preferred_model, 'claude-opus-5', 'the composer model survives a thinking write');
+});
+
+test('an unset conversation reads back as the relay default (thinking on, summarized)', async () => {
+  const { patch, row } = setup();
+
+  // Nothing written yet: both columns are NULL, and NULL means "never set".
+  assert.equal(row().thinking_enabled, null);
+  assert.equal(row().thinking_display, null);
+
+  const response = await patch({ clientId: 'client-a', preferredRelayMode: 'agent' });
+  assert.equal(response.body.thinkingEnabled, true, 'copilot-remote thinks by default');
+  assert.equal(response.body.thinkingDisplay, 'summarized', 'thoughts are visible by default');
+});
+
+test('a null/junk thinkingEnabled resolves to the default rather than disabling thinking', async () => {
+  const { patch, row } = setup();
+
+  await patch({ clientId: 'client-a', thinkingEnabled: false });
+  assert.equal(row().thinking_enabled, 0);
+
+  // An older client (or a bad payload) must never silently leave thinking off
+  // — the parser's fallback is the relay default.
+  const response = await patch({ clientId: 'client-a', thinkingEnabled: null });
+  assert.equal(response.body.thinkingEnabled, true);
+  assert.equal(row().thinking_enabled, 1);
+});
+
+test('both axes store the resolved value, never NULL-as-default', async () => {
+  // NULL means "never set". Canonicalizing a default choice back to NULL would
+  // re-point those rows if the relay default ever changed, so an explicit
+  // choice is always written out.
+  const { patch, row } = setup();
+
+  await patch({ clientId: 'client-a', thinkingDisplay: 'omitted' });
+  assert.equal(row().thinking_display, 'omitted');
+
+  const response = await patch({ clientId: 'client-a', thinkingDisplay: 'summarized' });
+  assert.equal(response.body.thinkingDisplay, 'summarized');
+  assert.equal(row().thinking_display, 'summarized', 'the default is stored explicitly');
+
+  await patch({ clientId: 'client-a', thinkingEnabled: true });
+  assert.equal(row().thinking_enabled, 1);
+});
+
+test('a composer write that mentions no thinking key must not reset either axis', async () => {
+  const { patch, row } = setup();
+
+  await patch({ clientId: 'client-a', thinkingEnabled: false, thinkingDisplay: 'omitted' });
+
+  const response = await patch({
+    clientId: 'client-b',
+    preferredRelayMode: 'agent',
+    preferredModel: '',
+    preferredReasoningEffort: '',
+  });
+  assert.equal(response.body.thinkingEnabled, false, 'echoed from storage even when unmentioned');
+  assert.equal(response.body.thinkingDisplay, 'omitted');
+
+  const stored = row();
+  assert.equal(stored.thinking_enabled, 0, 'a composer write must not re-enable thinking');
+  assert.equal(stored.thinking_display, 'omitted');
+});
+
+test('the broadcast carries the merged thinking state', async () => {
+  const { patch, emitted } = setup();
+
+  await patch({ clientId: 'client-a', thinkingEnabled: false });
+  const update = emitted.find(([event]) => event === 'conversation_preferences_updated');
+  assert.ok(update);
+  assert.equal(update[1].thinkingEnabled, false);
+  assert.equal(update[1].thinkingDisplay, 'summarized');
+  assert.equal(update[1].preferredModel, 'claude-opus-5');
+});

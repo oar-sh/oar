@@ -18,9 +18,12 @@ import {
   normalizeClaudeEffort,
   claudeUltracodeFlagSettings,
   claudeAutoCompactFlagSettings,
+  claudeThinkingFlagSettings,
+  applyThinkingDisplay,
   normalizeAutoCompactWindow,
   permissionModeForRelayMode,
 } from './claude-sdk-adapter.mjs';
+import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
 import { createClaudeTurnPublisher } from './claude-turn-publisher.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
@@ -387,6 +390,10 @@ export function createClaudeSessionRunner({
   // per turn rather than captured, so a slider change picked up on the next
   // delivery reaches a process that is already running.
   getAutoCompactWindow = () => null,
+  // The per-conversation thinking state ({enabled, display}); read per turn
+  // like the window, so a settings change reaches a running process on its
+  // next delivery.
+  getThinking = () => ({ enabled: null, display: '' }),
   lifecyclePollMs = 5_000,
   // A settled task's continuation normally begins within ~1s; when nothing
   // arrives inside this window the notification was silent (skip_transcript)
@@ -1984,6 +1991,9 @@ export function createClaudeSessionRunner({
     const model = resolvePerTurnModel(message);
     const effort = normalizeClaudeEffort(message.reasoningEffort);
     const autoCompactWindow = normalizeAutoCompactWindow(getAutoCompactWindow());
+    const thinkingState = getThinking() || {};
+    const thinkingEnabled = parseThinkingEnabled(thinkingState.enabled);
+    const thinkingDisplay = parseThinkingDisplay(thinkingState.display);
     const abortController = new AbortController();
     const processRef = {
       turn: null,
@@ -1992,6 +2002,16 @@ export function createClaudeSessionRunner({
       relayMode,
       effort,
       autoCompactWindow,
+      // Seeded from what the process is SPAWNED with, so the adapt diff is
+      // against reality rather than against a delivered setting the CLI may
+      // never have honored.
+      thinkingEnabled,
+      thinkingDisplay,
+      // No budget pin exists today, but `setMaxThinkingTokens`' first
+      // argument is positional and re-sent on every display change — thread
+      // the tracked value so a future budget feature cannot be silently
+      // cleared by a display toggle.
+      thinkingBudget: null,
       appendClass: modeAppendClass(relayMode),
       permissionMode: permissionModeForRelayMode(relayMode),
       liveTasks: new Map(),
@@ -2107,6 +2127,8 @@ export function createClaudeSessionRunner({
       relayMode,
       reasoningEffort: effort,
       autoCompactWindow,
+      thinkingEnabled,
+      thinkingDisplay,
       abortController,
       canUseTool,
       pathToClaudeCodeExecutable,
@@ -2201,6 +2223,38 @@ export function createClaudeSessionRunner({
         dbg('applyFlagSettings autoCompactWindow failed', error?.message || String(error));
       });
       proc.autoCompactWindow = autoCompactWindow;
+    }
+    // Thinking is NOT a symmetric copy of the window block: the probe
+    // (2026-08-26, docs/plans/claude-thinking-control.md) showed the two
+    // directions of the on/off axis are not equally reachable mid-session.
+    const thinkingState = getThinking() || {};
+    const thinkingEnabled = parseThinkingEnabled(thinkingState.enabled);
+    const thinkingDisplay = parseThinkingDisplay(thinkingState.display);
+    let reassertDisplay = false;
+    if (thinkingEnabled !== proc.thinkingEnabled) {
+      if (thinkingEnabled === true) {
+        // Enabling applies live. The display MUST be re-sent afterwards, in
+        // this order: a session spawned with thinking off carries no display
+        // mode, so enabling without it yields visible-but-empty thinking.
+        await Promise.resolve(proc.turn.applyFlagSettings?.(claudeThinkingFlagSettings(true))).catch((error) => {
+          dbg('applyFlagSettings thinkingEnabled failed', error?.message || String(error));
+        });
+        proc.thinkingEnabled = true;
+        reassertDisplay = true;
+      } else {
+        // Disabling: the CLI accepts the flag
+        // call and silently ignores it (probe 2026-08-26), so both sending it
+        // and recording it as applied would be lies — the second would desync
+        // `proc.thinkingEnabled` from reality and make the next enable a
+        // no-op diff. Nothing needs to be remembered here: the request is not
+        // lost, because `spawnProcess` re-reads `getThinking()` and the next
+        // process is born with it. Deliberately no bookkeeping field — an
+        // earlier revision carried one that nothing ever read.
+      }
+    }
+    if (thinkingDisplay !== proc.thinkingDisplay || reassertDisplay) {
+      await applyThinkingDisplay(proc.turn, thinkingDisplay, { budget: proc.thinkingBudget, dbg });
+      proc.thinkingDisplay = thinkingDisplay;
     }
     proc.relayMode = relayMode;
     return proc;

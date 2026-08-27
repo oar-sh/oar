@@ -200,6 +200,73 @@ export function renderAutoCompactControlHtml({
   `;
 }
 
+// Wire value ↔ segmented-button value. Two states per axis: the relay's
+// defaults are On + Summarized, and an unset conversation reads back as those,
+// so a third "host default" button could not be stored distinctly from unset.
+const THINKING_ENABLED_CHOICES = Object.freeze([
+  { key: 'on', label: 'On' },
+  { key: 'off', label: 'Off' },
+]);
+const THINKING_DISPLAY_CHOICES = Object.freeze([
+  { key: 'summarized', label: 'Summarized' },
+  { key: 'omitted', label: 'Hidden' },
+]);
+
+/** Anything but an explicit off is on — the relay default. */
+export function thinkingEnabledToKey(enabled) {
+  return enabled === false ? 'off' : 'on';
+}
+
+export function thinkingEnabledFromKey(key) {
+  return key !== 'off';
+}
+
+function renderThinkingButtons(axis, choices, activeKey) {
+  return choices.map(({ key, label }) => `
+        <button
+          type="button"
+          class="ctx-thinking-btn${key === activeKey ? ' is-active' : ''}"
+          data-thinking-axis="${axis}"
+          data-thinking-value="${key}"
+          aria-pressed="${key === activeKey ? 'true' : 'false'}"
+        >${escapeHtml(label)}</button>`).join('');
+}
+
+/**
+ * Claude-only thinking control, rendered under the auto-compact slider.
+ *
+ * Two axes with different application semantics (probed 2026-08-26, see
+ * docs/plans/claude-thinking-control.md): display changes and turning
+ * thinking ON apply on the next message; turning it OFF only applies when the
+ * CLI process next starts — the CLI silently ignores mid-session disabling —
+ * so the note states both rather than pretending one uniform rule.
+ *
+ * @returns {string} HTML
+ */
+export function renderThinkingControlHtml({ thinkingEnabled = true, thinkingDisplay = null } = {}) {
+  const enabledKey = thinkingEnabledToKey(thinkingEnabled);
+  const displayKey = String(thinkingDisplay || '').trim().toLowerCase() === 'omitted'
+    ? 'omitted'
+    : 'summarized';
+  return `
+    <div class="ctx-thinking">
+      <div class="ctx-thinking-row">
+        <span class="ctx-thinking-label">Thinking:</span>
+        <div class="ctx-thinking-group" role="group" aria-label="Thinking">
+${renderThinkingButtons('enabled', THINKING_ENABLED_CHOICES, enabledKey)}
+        </div>
+      </div>
+      <div class="ctx-thinking-row">
+        <span class="ctx-thinking-label">Thinking text:</span>
+        <div class="ctx-thinking-group" role="group" aria-label="Thinking text">
+${renderThinkingButtons('display', THINKING_DISPLAY_CHOICES, displayKey)}
+        </div>
+      </div>
+      <div class="ctx-thinking-note">Defaults are On and Summarized. Text changes and turning thinking on apply on the next message; turning it off applies to the next CLI session. Hiding the text does not reduce thinking or cost — it only keeps it out of the transcript.</div>
+    </div>
+  `;
+}
+
 /**
  * @param {object|null} usage the `contextUsage` field of an /api/context response
  * @returns {string} modal body HTML, or '' when there is nothing to render

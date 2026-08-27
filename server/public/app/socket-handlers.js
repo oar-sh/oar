@@ -535,7 +535,7 @@ export async function connectSocket(overrideDeps) {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, autoCompactWindow, senderClientId }) => {
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, autoCompactWindow, thinkingEnabled, thinkingDisplay, senderClientId }) => {
     if (senderClientId && senderClientId === CLIENT_ID) return;
     const id = String(conversationId || '').trim();
     if (!id || !conversations[id]) return;
@@ -549,6 +549,14 @@ export async function connectSocket(overrideDeps) {
       autoCompactWindow: autoCompactWindow === undefined
         ? (conversations[id].autoCompactWindow ?? null)
         : (autoCompactWindow ?? null),
+      // Same semantics: null = Host default for enabled, and the display is
+      // an explicit mode string; only an omitted field keeps the known value.
+      thinkingEnabled: thinkingEnabled === undefined
+        ? (conversations[id].thinkingEnabled ?? null)
+        : (thinkingEnabled ?? null),
+      thinkingDisplay: thinkingDisplay === undefined
+        ? (conversations[id].thinkingDisplay ?? null)
+        : (thinkingDisplay ?? null),
     };
     if (String(currentConvId || '').trim() === id) {
       applyConversationPreferencesForConversation(id, {

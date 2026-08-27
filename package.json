@@ -30,7 +30,8 @@
     "tty-console": "^1.0.4"
   },
   "devDependencies": {
-    "@playwright/test": "^1.60.0"
+    "@playwright/test": "^1.60.0",
+    "jsdom": "^30.0.1"
   },
   "overrides": {
     "undici": "6.28.0"
