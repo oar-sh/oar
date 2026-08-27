@@ -15,6 +15,7 @@ import { createWorkerWebSocketLink } from '../../.github/extensions/web-relay/ru
 import { createHeartbeatController } from '../../.github/extensions/web-relay/polling/heartbeat.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { resolveDeliveredAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
+import { resolveDeliveredThinking } from '../../shared/claude-thinking.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 
@@ -55,6 +56,10 @@ async function main() {
   // Per-conversation auto-compact window (token count, null = Auto); arrives
   // piggybacked on each queue delivery, like the timeouts above.
   let autoCompactWindow = null;
+  // Per-conversation thinking control ({enabled: bool|null, display}); same
+  // piggyback. enabled null = host default; display defaults to 'summarized'
+  // (today's behavior — visible thought bubbles).
+  let thinking = resolveDeliveredThinking(null, null);
 
   const api = createApiClient({
     serverUrl,
@@ -96,6 +101,7 @@ async function main() {
     })(),
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     getAutoCompactWindow: () => autoCompactWindow,
+    getThinking: () => thinking,
     dbg,
   });
 
@@ -126,6 +132,10 @@ async function main() {
       // Absent (an older relay) leaves the last known value alone; an explicit
       // null is the user choosing Auto and must clear the pin.
       autoCompactWindow = resolveDeliveredAutoCompactWindow(autoCompactWindow, pending?.settings);
+      // Same presence semantics as the window: absent keys (an older relay)
+      // keep the last known state; an explicit null on thinkingEnabled is the
+      // user choosing Host default.
+      thinking = resolveDeliveredThinking(thinking, pending?.settings);
       try {
         return await turnRunner.handlePendingPayload(pending);
       } catch (error) {

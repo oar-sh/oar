@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 
 import {
   renderAutoCompactControlHtml,
+  renderThinkingControlHtml,
+  thinkingEnabledFromKey,
+  thinkingEnabledToKey,
   renderContextUsageHtml,
   formatCompactTokens,
   formatUsagePercent,
@@ -231,4 +234,39 @@ test('an unknown source string is rendered escaped, not dropped', () => {
   });
   assert.ok(!html.includes('<img'));
   assert.match(html, /&lt;img src=x&gt;/);
+});
+
+test('the thinking control renders both axes with the stored state active', () => {
+  const html = renderThinkingControlHtml({ thinkingEnabled: false, thinkingDisplay: 'omitted' });
+  assert.match(html, /data-thinking-axis="enabled"[^>]*data-thinking-value="off"[^>]*aria-pressed="true"/s);
+  assert.match(html, /data-thinking-axis="display"[^>]*data-thinking-value="omitted"[^>]*aria-pressed="true"/s);
+  // Exactly one active button per axis.
+  assert.equal((html.match(/is-active/g) || []).length, 2);
+});
+
+test('the thinking control defaults to On + Summarized', () => {
+  const html = renderThinkingControlHtml({});
+  assert.match(html, /data-thinking-axis="enabled"[^>]*data-thinking-value="on"[^>]*aria-pressed="true"/s);
+  assert.match(html, /data-thinking-value="summarized"[^>]*aria-pressed="true"/s);
+  // Two states per axis — no "host default" button to pick that could not be
+  // stored distinctly from "never set".
+  assert.equal((html.match(/data-thinking-axis="enabled"/g) || []).length, 2);
+  assert.equal((html.match(/data-thinking-axis="display"/g) || []).length, 2);
+  assert.doesNotMatch(html, /Host default/);
+});
+
+test('the thinking note states the asymmetric semantics and that hiding is not a cost control', () => {
+  const html = renderThinkingControlHtml({});
+  assert.match(html, /next message/);
+  assert.match(html, /next CLI session/);
+  assert.match(html, /does not reduce thinking or cost/);
+});
+
+test('thinking enabled key mapping round-trips, and anything but off is on', () => {
+  assert.equal(thinkingEnabledFromKey(thinkingEnabledToKey(true)), true);
+  assert.equal(thinkingEnabledFromKey(thinkingEnabledToKey(false)), false);
+  // A legacy null (the old "host default") maps onto the relay default.
+  assert.equal(thinkingEnabledToKey(null), 'on');
+  assert.equal(thinkingEnabledFromKey('on'), true);
+  assert.equal(thinkingEnabledFromKey('off'), false);
 });

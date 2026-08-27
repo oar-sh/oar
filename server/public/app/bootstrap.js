@@ -167,7 +167,13 @@ import {
   registerPwaShell,
   updatePwaAppName,
 } from './pwa-install.js';
-import { renderAutoCompactControlHtml, renderContextUsageHtml } from './context-usage-view.mjs';
+import {
+  renderAutoCompactControlHtml,
+  renderContextUsageHtml,
+  renderThinkingControlHtml,
+  thinkingEnabledFromKey,
+  thinkingEnabledToKey,
+} from './context-usage-view.mjs';
 import {
   autoCompactWindowFromIndex,
   autoCompactWindowToIndex,
@@ -2767,6 +2773,79 @@ function initAutoCompactWindowControl() {
   });
 }
 
+// Same lifecycle as the auto-compact control: the modal body is re-rendered
+// from scratch, so state lives here. Written on every context render.
+let thinkingControlStored = { enabled: true, display: 'summarized' };
+let thinkingControlUpdateInFlight = false;
+
+function setThinkingControlValue({ enabled, display }) {
+  const activeKeys = {
+    enabled: thinkingEnabledToKey(enabled),
+    display: String(display || 'summarized'),
+  };
+  for (const btn of document.querySelectorAll('.ctx-thinking-btn')) {
+    const axis = btn.dataset.thinkingAxis;
+    const active = btn.dataset.thinkingValue === activeKeys[axis];
+    btn.classList.toggle('is-active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
+
+function initThinkingControl() {
+  const body = document.getElementById('summary-modal-body');
+  if (!body || body.dataset.thinkingBound === '1') return;
+  body.dataset.thinkingBound = '1';
+  body.addEventListener('click', (event) => {
+    const btn = event.target?.closest?.('.ctx-thinking-btn');
+    if (!btn || !body.contains(btn)) return;
+    void applyThinkingSelection(btn.dataset.thinkingAxis, btn.dataset.thinkingValue);
+  });
+}
+
+async function applyThinkingSelection(axis, key) {
+  // The control shares the auto-compact control's conversation binding: both
+  // render only for Claude conversations from the same payload.
+  const convId = String(autoCompactControlConversationId || '').trim();
+  if (!convId || thinkingControlUpdateInFlight) {
+    setThinkingControlValue(thinkingControlStored);
+    return;
+  }
+  // Only the touched axis is sent: the route keeps every unmentioned key as
+  // stored, so an enabled click can never clobber the display (or the
+  // composer's model/effort).
+  const patch = axis === 'enabled'
+    ? { thinkingEnabled: thinkingEnabledFromKey(key) }
+    : { thinkingDisplay: key === 'omitted' ? 'omitted' : 'summarized' };
+  thinkingControlUpdateInFlight = true;
+  try {
+    const response = await updateConversationPreferences(convId, {
+      clientId: CLIENT_ID,
+      ...patch,
+    });
+    if (!response) throw new Error('Failed to update the thinking setting');
+    thinkingControlStored = {
+      enabled: response.thinkingEnabled !== false,
+      display: response.thinkingDisplay || 'summarized',
+    };
+    setThinkingControlValue(thinkingControlStored);
+    // Per-transition truth (probed): enabling and display changes are live on
+    // the next message; disabling/reverting only reaches the CLI at its next
+    // process start.
+    showTransientRelayNotice(axis === 'enabled'
+      ? (thinkingControlStored.enabled
+        ? 'Thinking on; applies to the next message.'
+        : 'Thinking off; applies when the CLI session next restarts.')
+      : (thinkingControlStored.display === 'summarized'
+        ? 'Thinking text visible (summarized); applies to the next message.'
+        : 'Thinking text hidden; applies to the next message.'));
+  } catch (error) {
+    setThinkingControlValue(thinkingControlStored);
+    alert(error?.message || 'Failed to update the thinking setting.');
+  } finally {
+    thinkingControlUpdateInFlight = false;
+  }
+}
+
 async function applyAutoCompactWindowSelection(autoCompactWindow) {
   const convId = String(autoCompactControlConversationId || '').trim();
   const slider = document.getElementById('ctx-autocompact-slider');
@@ -2838,6 +2917,12 @@ async function loadContextSummaryAndRender(convId) {
       maxTokens: payload.contextUsage?.maxTokens ?? null,
     })
     : '';
+  const thinkingHtml = payload.providerType === 'claude'
+    ? renderThinkingControlHtml({
+      thinkingEnabled: payload.thinkingEnabled !== false,
+      thinkingDisplay: payload.thinkingDisplay ?? null,
+    })
+    : '';
   // The slider's writes need the conversation id even when the modal was
   // opened through an sdk_session_id.
   autoCompactControlConversationId = String(
@@ -2846,14 +2931,18 @@ async function loadContextSummaryAndRender(convId) {
   // Baseline for the failure path below: what the server says is stored right
   // now, refreshed every time the control is re-rendered.
   autoCompactControlStoredWindow = payload.autoCompactWindow ?? null;
+  thinkingControlStored = {
+    enabled: payload.thinkingEnabled !== false,
+    display: payload.thinkingDisplay || 'summarized',
+  };
   const detailText = String(payload.text || '').trim();
   // The structured breakdown is the answer; the runtime's own text dump stays
   // available underneath for the details it carries that categories don't.
   const bodyHtml = usageHtml
-    ? `${usageHtml}${autoCompactHtml}${detailText
+    ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${detailText
       ? `<details class="ctx-usage-raw"><summary>Raw details</summary><pre>${escHtml(detailText)}</pre></details>`
       : ''}`
-    : `${autoCompactHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
+    : `${autoCompactHtml}${thinkingHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
 
   renderSummaryModalContent({
     title: 'Context usage',
@@ -3888,6 +3977,7 @@ async function initApp() {
     return;
   }
   initAutoCompactWindowControl();
+  initThinkingControl();
   initModeSelector();
   initModelSelector();
   initReasoningSelector();

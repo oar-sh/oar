@@ -3811,3 +3811,179 @@ test('the CLI-reported model backs the response when the composer says auto', as
   turn.endInput();
   await settled(runner);
 });
+
+test('thinking reaches the spawn and reconciles asymmetrically live', async () => {
+  // Probe 2026-08-26 (docs/plans/claude-thinking-control.md): enabling
+  // applies live (and must re-send the display, in that order — a session
+  // spawned off has no display mode); disabling/reverting is silently
+  // ignored by the CLI mid-session, so the runner must NOT pretend it
+  // worked — no flag call, state untouched, next spawn honors it.
+  const stub = makeApiStub();
+  const capturedSpawns = [];
+  const turn = scriptedTurn({ echoPushes: true });
+  const calls = [];
+  turn.applyFlagSettings = async (settings) => { calls.push(['flags', settings]); };
+  turn.setMaxThinkingTokens = async (budget, display) => { calls.push(['display', budget, display]); };
+  let delivered = { enabled: false, display: 'omitted' };
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      capturedSpawns.push(params);
+      return turn;
+    },
+    getThinking: () => delivered,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(capturedSpawns[0].thinkingEnabled, false, 'spawn carries the pin');
+  assert.equal(capturedSpawns[0].thinkingDisplay, 'omitted', 'spawn carries the display');
+  assert.deepEqual(calls, [], 'spawn-time state needs no reconcile call');
+
+  // Unchanged: no redundant control requests.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('second', 'native-1'));
+  assert.equal(await second, true);
+  assert.deepEqual(calls, []);
+
+  // Enabling applies live: settings first, then the display re-sent even
+  // though the delivered display did not change.
+  delivered = { enabled: true, display: 'omitted' };
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  turn.emit(resultMessage('third', 'native-1'));
+  assert.equal(await third, true);
+  assert.deepEqual(calls, [
+    ['flags', { alwaysThinkingEnabled: true }],
+    ['display', null, 'omitted'],
+  ]);
+
+  // A display change alone applies live, both directions.
+  delivered = { enabled: true, display: 'summarized' };
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4' } });
+  await waitFor(() => turn.pushed.length === 4, { label: 'fourth push' });
+  turn.emit(resultMessage('fourth', 'native-1'));
+  assert.equal(await fourth, true);
+  assert.deepEqual(calls[2], ['display', null, 'summarized']);
+  assert.equal(calls.length, 3);
+
+  // Disabling mid-session: the CLI would silently ignore it, so the runner
+  // must not call the flag layer or update its own state...
+  delivered = { enabled: false, display: 'summarized' };
+  const fifth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-5' } });
+  await waitFor(() => turn.pushed.length === 5, { label: 'fifth push' });
+  turn.emit(resultMessage('fifth', 'native-1'));
+  assert.equal(await fifth, true);
+  assert.equal(calls.length, 3, 'disabling must not produce a control request');
+  assert.equal(runner._getProcess().thinkingEnabled, true, 'state must reflect the CLI, not the request');
+
+  // ...so a later re-enable is a live no-op (the CLI never left the state).
+  delivered = { enabled: true, display: 'summarized' };
+  const sixth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-6' } });
+  await waitFor(() => turn.pushed.length === 6, { label: 'sixth push' });
+  turn.emit(resultMessage('sixth', 'native-1'));
+  assert.equal(await sixth, true);
+  assert.equal(calls.length, 3, 'the CLI is already thinking; nothing to send');
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a legacy null thinking setting reads as the relay default, never as a disable', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const calls = [];
+  turn.applyFlagSettings = async (settings) => { calls.push(settings); };
+  turn.setMaxThinkingTokens = async () => {};
+  let delivered = { enabled: true, display: 'summarized' };
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    getThinking: () => delivered,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+
+  // A row written before the relay took a position carries NULL, which the
+  // shared parser resolves to the default (on) — it must NOT be read as a
+  // disable, which would silently switch thinking off for old conversations.
+  delivered = { enabled: null, display: 'summarized' };
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('second', 'native-1'));
+  assert.equal(await second, true);
+  assert.deepEqual(calls, [], 'already on: nothing to reconcile');
+  assert.equal(runner._getProcess().thinkingEnabled, true, 'a legacy null stays on');
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a disable the CLI ignored is honored by the next spawn, not lost', async () => {
+  // The guarantee behind "applies when the CLI session next restarts": the
+  // mid-session disable is deliberately never sent (the CLI would ignore it),
+  // so the ONLY thing that makes the user's choice real is the next spawn
+  // re-reading the delivered setting. Nothing tested that, which is what let
+  // a bookkeeping field that no production code read look load-bearing.
+  const stub = makeApiStub();
+  const capturedSpawns = [];
+  let turn = scriptedTurn({ echoPushes: true });
+  const flagCalls = [];
+  const wire = (t) => {
+    t.applyFlagSettings = async (settings) => { flagCalls.push(settings); };
+    t.setMaxThinkingTokens = async () => {};
+    return t;
+  };
+  wire(turn);
+  let delivered = { enabled: true, display: 'summarized' };
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      capturedSpawns.push(params);
+      return turn;
+    },
+    getThinking: () => delivered,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(capturedSpawns[0].thinkingEnabled, true);
+
+  // The user turns thinking off mid-session: silently ignored by the CLI, so
+  // the runner sends nothing and keeps believing thinking is on.
+  delivered = { enabled: false, display: 'summarized' };
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('second', 'native-1'));
+  assert.equal(await second, true);
+  assert.deepEqual(flagCalls, [], 'nothing is sent for a disable');
+  assert.equal(runner._getProcess().thinkingEnabled, true);
+
+  // Now force a respawn (a relay-mode change whose system-prompt append class
+  // differs recycles the process when nothing lives in it). The replacement
+  // must be born with the user's choice.
+  const previousTurn = turn;
+  turn = wire(scriptedTurn({ echoPushes: true }));
+  const third = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-3', relayMode: 'ask' },
+  });
+  await waitFor(() => capturedSpawns.length === 2, { label: 'respawn' });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('third', 'native-1'));
+  assert.equal(await third, true);
+  assert.equal(capturedSpawns[1].thinkingEnabled, false,
+    'the ignored disable must reach the CLI at the next spawn');
+  assert.equal(capturedSpawns[1].thinkingDisplay, 'summarized');
+
+  previousTurn.endInput();
+  turn.endInput();
+  await settled(runner);
+});

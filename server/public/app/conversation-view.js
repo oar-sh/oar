@@ -49,6 +49,7 @@ import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { buildWorkflowRunCard } from './background-tasks-view.mjs';
+import { attachCodeCopyButtons } from './code-copy.mjs';
 import {
   serializeDraftAttachments,
   hydrateDraftAttachments,
@@ -911,6 +912,7 @@ function createMessageNode(msg, msgId = null, force = false) {
     }
   }
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
+  attachCodeCopyButtons(div);
   return div;
 }
 
@@ -1027,6 +1029,7 @@ function enhanceThoughtMarkup(root) {
   root.querySelectorAll('pre code').forEach((block) => {
     if (globalThis.hljs?.highlightElement) globalThis.hljs.highlightElement(block);
   });
+  attachCodeCopyButtons(root);
 }
 
 // Streamed markdown grows at the tail, so only nodes from the first divergent
