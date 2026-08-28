@@ -5,6 +5,11 @@
 // `backgroundTasks` on reload; hidden whenever the set is empty.
 
 import { apiFetch } from './api-client.js';
+import {
+  getPreviewsForConversation,
+  renderPreviewRowsInto,
+  subscribePreviews,
+} from './preview-cards.mjs';
 
 const tasksByConversation = new Map();
 const stopsInFlight = new Set();
@@ -400,12 +405,24 @@ function renderTaskRow(conversationId, task) {
     </div>${treeHolder}`;
 }
 
+// "2 background tasks running", "1 preview", or both — the panel is shared, so
+// the summary has to name whatever is actually in it.
+function panelSummaryText(taskCount, previewCount) {
+  const parts = [];
+  if (taskCount) parts.push(`${taskCount} background task${taskCount === 1 ? '' : 's'} running`);
+  if (previewCount) parts.push(`${previewCount} preview${previewCount === 1 ? '' : 's'}`);
+  return parts.join(' · ');
+}
+
 export function renderBackgroundTasksPanel() {
   const panel = document.getElementById('background-tasks-panel');
   if (!panel) return;
   const conversationId = currentConversationId;
   const tasks = conversationId ? (tasksByConversation.get(conversationId) || []) : [];
-  if (!tasks.length) {
+  const previews = conversationId ? getPreviewsForConversation(conversationId) : [];
+  // Previews outlive the task that started the dev server, so the panel stays
+  // up for them even once every background task has finished.
+  if (!tasks.length && !previews.length) {
     panel.hidden = true;
     panel.removeAttribute('open');
     stopElapsedTimer();
@@ -415,7 +432,14 @@ export function renderBackgroundTasksPanel() {
   panel.hidden = false;
   const summary = panel.querySelector('#background-tasks-summary');
   if (summary) {
-    summary.innerHTML = `<span class="bg-task-spinner"></span> ${tasks.length} background task${tasks.length === 1 ? '' : 's'} running`;
+    const spinner = tasks.length ? '<span class="bg-task-spinner"></span> ' : '';
+    summary.innerHTML = `${spinner}${escHtml(panelSummaryText(tasks.length, previews.length))}`;
+  }
+  const previewList = panel.querySelector('#background-previews-list');
+  if (previewList) {
+    // Previews sit above the task list: the link is the thing you came to the
+    // panel for, and it should not drift down as tasks come and go.
+    renderPreviewRowsInto(previewList, previews);
   }
   const list = panel.querySelector('#background-tasks-list');
   if (list) {
@@ -442,8 +466,13 @@ export function renderBackgroundTasksPanel() {
     }
   }
   if (wasOpen) panel.setAttribute('open', '');
-  startElapsedTimer();
+  if (tasks.length) startElapsedTimer();
+  else stopElapsedTimer();
 }
+
+// A preview created, closed, or flipping online/offline re-renders the panel;
+// the registry is relay-owned, so the store cannot notify through the task path.
+subscribePreviews(() => renderBackgroundTasksPanel());
 
 function startElapsedTimer() {
   if (elapsedTimer) return;

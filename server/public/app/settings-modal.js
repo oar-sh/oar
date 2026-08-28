@@ -5,6 +5,7 @@ import {
   showTransientRelayNotice,
 } from './store.js';
 import {
+  apiFetch,
   loadClaudeSettings,
   loadCursorSettings,
   loadCursorAllowanceSettings,
@@ -31,6 +32,12 @@ import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
 import { refreshPushSettingsSection } from './push-settings.js';
+import {
+  getPreviews,
+  renderPreviewRowsInto,
+  setPreviews,
+  subscribePreviews,
+} from './preview-cards.mjs';
 
 const THEME_STORAGE_KEY = 'copilot_theme';
 const SHOW_SUSPEND_HOST_STORAGE_KEY = 'copilot_show_suspend_host';
@@ -1289,6 +1296,38 @@ export async function updateDefaultSessionWorkspaceRootSetting(rawValue) {
   }
 }
 
+// "Live previews": every preview across every session, not just this
+// conversation's. Previews never expire, so this list is the one place that can
+// close a link left behind in a conversation you have moved on from.
+export function renderPreviewsSection() {
+  const list = document.getElementById('settings-previews-list');
+  const empty = document.getElementById('settings-previews-empty');
+  if (!list) return;
+  const previews = getPreviews();
+  renderPreviewRowsInto(list, previews, { withConversation: true });
+  if (empty) {
+    empty.hidden = previews.length > 0;
+    empty.textContent = 'No previews are published right now.';
+  }
+}
+
+export async function refreshPreviewsSection() {
+  try {
+    // The socket keeps the store live, but a modal opened right after a reload
+    // may not have seen an event yet.
+    const response = await apiFetch('/api/previews');
+    setPreviews(response?.previews || []);
+  } catch {
+    renderPreviewsSection();
+  }
+}
+
+subscribePreviews(() => {
+  const modal = document.getElementById('settings-modal');
+  if (!modal?.classList.contains('visible')) return;
+  renderPreviewsSection();
+});
+
 export function openSettingsModal() {
   closeChatActionsMenu();
   const modal = document.getElementById('settings-modal');
@@ -1322,6 +1361,7 @@ export function openSettingsModal() {
   syncBackgroundTaskTimeoutSlider();
   void refreshBackgroundTaskTimeoutSetting();
   void refreshPushSettingsSection();
+  void refreshPreviewsSection();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }

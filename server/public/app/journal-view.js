@@ -38,6 +38,7 @@ import {
 } from './api-client.js';
 import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
 import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
+import { mergeConversationPreviews } from './preview-cards.mjs';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRepoBrowserLaunchCwdPath } from './attachments-view.js';
@@ -399,6 +400,8 @@ export function applyLoadedConversationState(id, response, {
   restoreInFlightThinking(response.inFlight || null, followLiveUpdates);
   setBackgroundTasksConversation(id);
   setConversationBackgroundTasks(id, response.backgroundTasks || []);
+  // Merge, not replace: this payload only carries one conversation's previews.
+  mergeConversationPreviews(id, response.previews || []);
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
   if (!restoreScroll || !didRenderMessages) return;
