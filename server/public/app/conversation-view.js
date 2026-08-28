@@ -49,6 +49,10 @@ import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo } from './attachments-view.js';
 import { buildWorkflowRunCard } from './background-tasks-view.mjs';
+import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
+import { buildTranscriptPreviewCard } from './preview-cards.mjs';
+import { closeSlashAutocomplete, handleSlashAutocompleteKey, updateSlashAutocomplete } from './slash-autocomplete.mjs';
+import { evaluateUnknownCommandGuard } from './slash-commands.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
 import {
   serializeDraftAttachments,
@@ -865,6 +869,10 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? msg.workflowRuns.filter((run) => run && typeof run === 'object').slice(0, 5)
     : [];
   const workflowRunsHtml = workflowRuns.length ? '<div class="msg-workflow-runs"></div>' : '';
+  const previewCards = (msg.role === 'assistant' && Array.isArray(msg.previewCards))
+    ? msg.previewCards.filter((card) => card && typeof card === 'object').slice(0, 5)
+    : [];
+  const previewCardsHtml = previewCards.length ? '<div class="msg-preview-cards"></div>' : '';
   const hasVisibleText = Boolean(String(msg.text || '').trim());
   const bubbleClass = (!hasVisibleText && attachments.length && !activities.length)
     ? 'msg-bubble msg-bubble-media-only'
@@ -889,7 +897,7 @@ function createMessageNode(msg, msgId = null, force = false) {
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${userBubbleActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -908,6 +916,17 @@ function createMessageNode(msg, msgId = null, force = false) {
       for (const run of workflowRuns) {
         const card = buildWorkflowRunCard(run);
         if (card) runsHolder.appendChild(card);
+      }
+    }
+  }
+  // Persisted preview snapshots render as link cards; live/closed state is
+  // overlaid from the current registry inside the builder.
+  if (previewCards.length) {
+    const cardsHolder = div.querySelector('.msg-preview-cards');
+    if (cardsHolder) {
+      for (const snapshot of previewCards) {
+        const card = buildTranscriptPreviewCard(snapshot);
+        if (card) cardsHolder.appendChild(card);
       }
     }
   }
@@ -2492,6 +2511,10 @@ export function compactCurrentConversation() {
   }
 }
 
+// Warn-once slot for the unknown-command guard; keyed by exact text so any
+// edit re-arms the warning.
+let unknownCommandWarned = null;
+
 export async function sendMessage() {
   const input = document.getElementById('msg-input');
   const originalComposerText = String(input?.value || '');
@@ -2504,6 +2527,19 @@ export async function sendMessage() {
     return;
   }
   if (!hasDraft) return;
+  closeSlashAutocomplete();
+
+  // Warn-once typo guard: a message that looks like a command but matches none
+  // would otherwise burn an agent turn as plain text.
+  const guard = evaluateUnknownCommandGuard(text, {
+    slot: unknownCommandWarned,
+    hasAttachments: selectedAttachments.length > 0,
+  });
+  unknownCommandWarned = guard.slot;
+  if (guard.warn) {
+    showTransientRelayNotice(guard.notice);
+    return;
+  }
 
   if (text.toLowerCase() === '/compact' && selectedAttachments.length === 0) {
     input.value = '';
@@ -2511,6 +2547,16 @@ export async function sendMessage() {
     releaseComposerFocusAfterSend(input);
     compactCurrentConversation();
     scrollBottomAfterSend();
+    return;
+  }
+
+  const previewCommand = selectedAttachments.length === 0 ? parsePreviewCommand(text) : null;
+  if (previewCommand) {
+    input.value = '';
+    autoResize(input);
+    releaseComposerFocusAfterSend(input);
+    const result = await runPreviewCommand(previewCommand, { conversationId: currentConvId });
+    showTransientRelayNotice(result.notice);
     return;
   }
 
@@ -2757,7 +2803,16 @@ export async function sendMessage() {
   }
 }
 
+// Textarea input hook (inline oninput beside autoResize): keeps the slash
+// menu in sync with the caret. Cheap no-op for non-slash text.
+export function updateComposerSlashMenu(input) {
+  updateSlashAutocomplete(input, { conversationId: currentConvId });
+}
+
 export function handleKey(e) {
+  // The open menu owns navigation keys; Ctrl/Cmd+Enter still falls through to
+  // send because the menu never consumes it.
+  if (handleSlashAutocompleteKey(e, e.target)) return;
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
     sendMessage();

@@ -93,6 +93,7 @@ import {
   compactCurrentConversation,
   sendMessage,
   handleKey,
+  updateComposerSlashMenu,
   getConversationLoadedMessageCount,
   loadOlderConversationMessages,
   syncComposerControlState,
@@ -110,6 +111,7 @@ import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } fro
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
 import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
+import { initSlashAutocomplete } from './slash-autocomplete.mjs';
 import { dataTransferHasFiles } from './composer-paste.mjs';
 import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
 import {
@@ -4002,6 +4004,7 @@ async function initApp() {
   syncRefreshHistoryMenuState();
   initChatTitleCopy();
   initEmojiPicker();
+  initSlashAutocomplete();
   initConversationListLazyLoading();
   initConversationHistoryLazyLoading();
   initBubbleActionHandlers();
@@ -4190,6 +4193,7 @@ window.setImageEditTarget = setImageEditTarget;
 window.clearImageEditTarget = clearImageEditTarget;
 window.jumpToImageParent = jumpToImageParent;
 window.autoResize = autoResize;
+window.updateComposerSlashMenu = updateComposerSlashMenu;
 window.closeSummaryModal = closeSummaryModal;
 window.refreshSummaryModal = refreshSummaryModal;
 window.renderSummaryModalContent = renderSummaryModalContent;
