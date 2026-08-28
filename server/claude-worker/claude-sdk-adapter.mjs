@@ -1,6 +1,11 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { createSdkMcpServer, query } from '@anthropic-ai/claude-agent-sdk';
 
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
+import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
+
+// The name the in-process MCP server is registered under; it prefixes every
+// tool it carries on the wire (`mcp__relay__preview`).
+export const RELAY_MCP_SERVER_NAME = 'relay';
 
 const MODE_SYSTEM_PROMPT_APPEND = {
   ask: 'Prioritize clarification questions (AskUserQuestion) before implementation work; do not make broad assumptions when a question would materially change the result.',
@@ -126,6 +131,22 @@ export function systemPromptForRelayMode(relayMode) {
 }
 
 /**
+ * The in-process MCP server carrying the relay's own tools, running inside the
+ * worker rather than as a child process. It is registered on every session:
+ * the worker cannot see whether the relay's preview lane is enabled, and a
+ * disabled lane answers the tool call with a refusal the model can relay,
+ * which beats inventing a capability flag to plumb through the delivery
+ * payload. `getConversationId` is called per tool call because a process
+ * outlives the turn it was spawned for.
+ */
+export function createRelayMcpServer({ api, getConversationId, dbg } = {}) {
+  return createSdkMcpServer({
+    name: RELAY_MCP_SERVER_NAME,
+    tools: [createPreviewToolDefinition({ api, getConversationId, dbg })],
+  });
+}
+
+/**
  * A user-message stream the session process feeds for the whole life of the
  * CLI process: each `push(content)` becomes one user turn, and the stream
  * only ends on `end()` — which is what lets the CLI exit. The CLI begins
@@ -187,6 +208,8 @@ export function startClaudeSession({
   abortController,
   canUseTool,
   pathToClaudeCodeExecutable = '',
+  api = null,
+  getConversationId = () => '',
   queryImpl = query,
   dbg = () => {},
 } = {}) {
@@ -199,6 +222,11 @@ export function startClaudeSession({
   // auto-compact window and the thinking pin, and all three share one
   // `settings` object.
   const spawnSettings = claudeSpawnSettings({ ultracode, autoCompactWindow, thinkingEnabled });
+  // Relay tools need the worker's authenticated API helper; a caller that
+  // passes none (tests, probes) gets a session without them.
+  const relayMcpServer = typeof api === 'function'
+    ? createRelayMcpServer({ api, getConversationId, dbg })
+    : null;
   const options = {
     cwd,
     permissionMode: permissionModeForRelayMode(relayMode),
@@ -211,6 +239,7 @@ export function startClaudeSession({
     ...(String(resume || '').trim() ? { resume: String(resume).trim() } : {}),
     ...(abortController ? { abortController } : {}),
     ...(typeof canUseTool === 'function' ? { canUseTool } : {}),
+    ...(relayMcpServer ? { mcpServers: { [RELAY_MCP_SERVER_NAME]: relayMcpServer } } : {}),
     ...(String(pathToClaudeCodeExecutable || '').trim()
       ? { pathToClaudeCodeExecutable: String(pathToClaudeCodeExecutable).trim() }
       : {}),

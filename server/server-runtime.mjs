@@ -36,6 +36,7 @@ import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { registerGitRoutes } from './routes/git-routes.mjs';
+import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
@@ -77,6 +78,12 @@ import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs
 import { applyClaudeProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
+import {
+  createPreviewRegistry,
+  normalizePreviewsConfig,
+} from './services/preview-registry-service.mjs';
+import { createPreviewProxyServer } from './services/preview-proxy-server.mjs';
+import { createPreviewHealthProbe } from './services/preview-health-probe.mjs';
 import { createTunnelWorkerPathGuard } from './services/tunnel-worker-path-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
@@ -5371,6 +5378,24 @@ function workflowRunsForResponse(responseMessageId) {
     .slice(0, 5);
 }
 
+// Snapshots of previews published during this response's turn. Snapshot, not a
+// registry lookup: the card must render after the preview closes or the relay
+// restarts. The renderer overlays live/closed state from the current registry.
+function previewCardsForResponse(responseMessageId) {
+  const rows = stmts.listPreviewCardsByResponse?.all(responseMessageId) || [];
+  return rows
+    .map((row) => {
+      try {
+        const snapshot = JSON.parse(String(row?.preview_json || ''));
+        return snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) ? snapshot : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .slice(0, 5);
+}
+
 // Live background-task sets per conversation, published by Claude session
 // workers (REPLACE semantics, mirroring the SDK's background_tasks_changed
 // signal). In-memory only: the worker republishes on every change and clears
@@ -6566,9 +6591,13 @@ const sharedRouteDeps = {
   relayThoughtsForQueueMessage,
   subagentRunsForResponse,
   workflowRunsForResponse,
+  previewCardsForResponse,
   sanitizeActivityText,
   inFlightStateForConversation,
   backgroundTaskStore,
+  // A closure, not the registry itself: this deps object is built before the
+  // preview lane is constructed further down the file.
+  listConversationPreviews: (conversationId) => previewRegistry.listForConversation(conversationId),
   sendWorkerControl: (sessionId, control) => sessionWorkerWebSocketService.sendControlToSession(sessionId, control),
   emitToClientsExceptSessionId,
   relayBridgeOwnerService,
@@ -7042,6 +7071,83 @@ const cloudflaredTunnelManager = createCloudflaredTunnelManager({
 });
 runtimeState.cloudflaredTunnelState = cloudflaredTunnelManager.state;
 
+// ─── Preview Lane ─────────────────────────────────────────────────────────────
+// A second http.Server on its own loopback port, published on its own hostname.
+// The relay's express app is deliberately NOT mounted on it: preview traffic
+// cannot reach /api, socket.io, the SPA or session-worker paths because none of
+// them exist on that port. The only way in or out of the registry is the
+// authenticated /api/previews routes below, on the relay port.
+const previewsConfig = normalizePreviewsConfig(config.previews || {}, {
+  env: process.env,
+  relayPort: config.port,
+  // Hostname comparison, not origin: cookies ignore the port, so a preview on
+  // the relay's hostname would share the relay's auth cookie no matter the port.
+  relayHostnames: [
+    ...(Array.isArray(config.publicHostnames) ? config.publicHostnames : []),
+    'localhost',
+    '127.0.0.1',
+  ],
+  reservedPorts: [config.cliPort],
+});
+for (const previewConfigError of previewsConfig.errors) {
+  console.warn(`${runtimeLogPrefix()}PREVIEW LANE disabled: ${previewConfigError}`);
+}
+const previewRegistry = createPreviewRegistry({
+  config: previewsConfig,
+  onChange: ({ previews }) => {
+    try { io.emit('previews', { previews }); } catch {}
+  },
+});
+const previewProxyServer = createPreviewProxyServer({
+  registry: previewRegistry,
+  logger: console,
+  // Withheld from forwarded requests so a previewed app never sees the relay
+  // token, even if a hand-crafted request carries it.
+  relayBearerTokens: [config.authToken],
+});
+const previewHealthProbe = createPreviewHealthProbe({ registry: previewRegistry });
+runtimeState.previewLane = {
+  get enabled() { return previewsConfig.enabled; },
+  get listening() { return previewProxyServer.listening; },
+  get publicBaseUrl() { return previewsConfig.publicBaseUrl; },
+  get count() { return previewRegistry.size; },
+  get errors() { return previewsConfig.errors; },
+};
+// Registered here rather than with the other route modules above: the registry
+// is constructed at this point in the file, and a route module referencing it
+// earlier would hit the temporal dead zone.
+registerPreviewRoutes(app, {
+  auth,
+  previewRegistry,
+  previewHealthProbe,
+  // Static previews are jailed to the conversation's workspace root; a preview
+  // registered without a conversation falls back to the server-wide root.
+  resolvePreviewWorkspaceRoot: (conversationId) => {
+    if (String(conversationId || '').trim()) {
+      const state = resolveConversationWorkspaceState({ conversationId });
+      const rootPath = String(state?.currentWorkspaceRootPath || '').trim();
+      if (rootPath) return rootPath;
+    }
+    return currentWorkspaceRootPath();
+  },
+  // A preview published while a turn is processing gets pinned to that turn's
+  // transcript (snapshot, keyed on the queue id and linked to the response at
+  // finalize — the relay_activity two-step). No in-flight turn → no card.
+  recordPreviewCard: (conversationId, preview) => {
+    const id = String(conversationId || '').trim();
+    if (!id || !preview?.token) return;
+    const queueRow = stmts.getLatestProcessingQueueByConversation?.get?.(id);
+    if (!queueRow?.id) return;
+    stmts.insertPreviewCard?.run(
+      `pvc_${uuidv4()}`,
+      queueRow.id,
+      id,
+      JSON.stringify(preview),
+      new Date().toISOString(),
+    );
+  },
+});
+
 function clearRuntimeTimers() {
   for (const timer of Object.values(runtimeTimers)) {
     if (!timer) continue;
@@ -7076,6 +7182,11 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();
   cloudflaredTunnelManager.stop();
+  previewHealthProbe.stop();
+  // Previews are in-memory by design: a restart is the only implicit cleanup,
+  // so every public link dies with the process.
+  previewRegistry.clear();
+  void previewProxyServer.stop().catch(() => {});
   try { relaySingletonGuard.release(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Failed to release singleton lock: ${error?.message || error}`);
   }
@@ -7199,6 +7310,15 @@ httpServer.listen(config.port, listenHost, () => {
   // Start SSH tunnel after server is listening
   sshTunnelManager.start();
   cloudflaredTunnelManager.start();
+  // A preview-lane failure must never take the relay with it: the listener is
+  // optional infrastructure, so a bind error is logged and the relay carries on
+  // without previews.
+  previewProxyServer.start().then((address) => {
+    if (!address) return;
+    previewHealthProbe.start();
+  }).catch((error) => {
+    console.warn(`${runtimeLogPrefix()}PREVIEW LANE failed to bind :${previewsConfig.port} — ${error?.message || error}`);
+  });
   void sdkSessionImportService.runStartupImport().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session import startup failed: ${error?.message || error}`);
   });

@@ -23,7 +23,8 @@
     "socket.io": "^4.7.5",
     "uuid": "^14.0.0",
     "web-push": "^3.6.7",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "zod": "^4.4.3"
   },
   "optionalDependencies": {
     "cloudflared": "^0.7.1",

@@ -92,3 +92,28 @@ test('updateThoughtByQueueAndReasoning updates snapshot without changing seq', (
     subagent_run_id: 'sub-1',
   });
 });
+
+test('preview cards: insert with queue id, link at finalize, list by response', () => {
+  const db = makeDb();
+  const repo = createQuestionRepository(db);
+
+  const snapshot = { token: 'a'.repeat(32), label: 'app', url: 'https://p/x/' };
+  repo.insertPreviewCard.run('pvc-1', 'queue-1', 'conv-1', JSON.stringify(snapshot), '2026-01-01T00:00:00Z');
+
+  // Mid-turn: not yet visible under any response.
+  assert.deepEqual(repo.listPreviewCardsByResponse.all('resp-1'), []);
+
+  repo.linkPreviewCardsToResponse.run('resp-1', 'queue-1');
+  const rows = repo.listPreviewCardsByResponse.all('resp-1');
+  assert.equal(rows.length, 1);
+  assert.deepEqual(JSON.parse(rows[0].preview_json), snapshot);
+
+  // Linking is one-shot: a second finalize for the same queue id (retry path)
+  // must not re-point already-linked cards.
+  repo.linkPreviewCardsToResponse.run('resp-2', 'queue-1');
+  assert.equal(repo.listPreviewCardsByResponse.all('resp-1').length, 1);
+  assert.deepEqual(repo.listPreviewCardsByResponse.all('resp-2'), []);
+
+  repo.deleteConvPreviewCards.run('conv-1');
+  assert.deepEqual(repo.listPreviewCardsByResponse.all('resp-1'), []);
+});

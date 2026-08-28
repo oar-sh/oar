@@ -236,6 +236,7 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
 - Start a chat with **New Chat**, which asks for the **working directory**, **provider**, **model**, and **reasoning effort** (or **quality** and **size**, for image chats) before the conversation exists. The working directory picker lists the known CWDs (current session, relay workspace, browser folder, recent roots) plus a **Custom path…** entry, defaults to the last directory you picked, and the chosen directory is applied before the session worker first launches. With Copilot as the only provider the provider row is hidden.
 - Choose **mode** and **model** per message in the composer.
 - Use **Compact** to branch to a fresh conversation seeded with summary context.
+- Type **`/preview`** to publish a local dev server or directory on the public preview host without involving the agent: `/preview 5173 [label]`, `/preview ./dist [label]`, `/preview list`, `/preview close`. Agents can do the same via the `preview` tool (Claude/Cursor) or the documented API (see `docs/preview-servers.md`).
 - Use **Browse files** to inspect workspace/drives and open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.
 - Click file/folder copy controls to insert `@file:...` / `@folder:...` tokens.
 - Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes only** and **Full file** modes; closing it returns to the still-open list.
@@ -388,6 +389,13 @@ When either trips, the turn is returned to the queue rather than lost.
 | `cloudflaredTunnel.binary` | *(auto)*             | `cloudflared` path; defaults to the npm package, then `PATH`              |
 | `cloudflaredTunnel.extraArgs` | `[]`              | Extra arguments appended to `cloudflared tunnel run`                      |
 | `tunnelMarkerHeaders`      | `[]`                 | Extra edge-injected headers that mark tunnel traffic (see worker-path guard) |
+| `publicHostnames`          | `[]`                 | Hostnames the relay itself answers on; the preview lane refuses to share one |
+| `previews.enabled`         | `false`              | Publish local dev servers on a separate listener (see `docs/preview-servers.md`) |
+| `previews.port`            | `port + 1`           | Loopback port for the preview listener; `0` picks an ephemeral port        |
+| `previews.bindHost`        | `127.0.0.1`          | Bind address; non-loopback needs `previews.allowPublicBind`                |
+| `previews.publicBaseUrl`   | —                    | Public base URL on a hostname **different** from the relay's               |
+| `previews.allowedTargetHosts` | `[]`              | Upstreams allowed beyond loopback (container/VM IPs)                       |
+| `previews.maxLive`         | `8`                  | Maximum simultaneously published previews                                  |
 
 
 > Session mismatch recovery is restart-driven: the relay restart orchestrator parks queue work, restarts/rebinds the CLI runtime, and resumes dequeueing after rebind confirmation. The extension no longer attempts in-process session switch APIs from the dequeue/send path.
@@ -516,6 +524,7 @@ Common routes:
 - Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
 - Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`
+- Previews: `/api/previews`, `/api/previews/:token` (publish a local dev server; see `docs/preview-servers.md`)
 - Uploads: `/api/upload`, `/api/upload/:sha256/content`
 
 All authenticated routes accept either:

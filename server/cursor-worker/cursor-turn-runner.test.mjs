@@ -127,6 +127,26 @@ test('first turn creates the agent, persists its id, and later turns reuse the l
   );
 });
 
+test('the preview tool is registered beside ask_user and runs on the active conversation', async () => {
+  const stub = makeApiStub();
+  const createCalls = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('ok.'), evFinished()]]),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+  const preview = createCalls[0].customTools?.preview;
+  assert.ok(preview?.execute, 'preview must be registered at creation');
+  assert.equal(preview.inputSchema.properties.action.enum.join(','), 'create,list,close');
+  assert.ok(createCalls[0].customTools?.ask_user?.execute, 'ask_user must still be registered');
+
+  const result = await preview.execute({ action: 'list' });
+  const listCall = stub.calls.find((call) => call.routePath.startsWith('/api/previews'));
+  assert.equal(listCall.method, 'GET');
+  assert.equal(result.structuredContent.ok, true);
+});
+
 test('the payload roster becomes model-pinned subagents on the created handle', async () => {
   const stub = makeApiStub();
   const createCalls = [];

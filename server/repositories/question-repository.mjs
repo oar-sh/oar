@@ -128,6 +128,24 @@ export function createQuestionRepository(db) {
         `),
         deleteConvWorkflowRuns: db.prepare(`DELETE FROM workflow_runs WHERE conversation_id = ?`),
 
+        // preview cards — snapshots of previews published mid-turn, written
+        // with the queue id and linked to the response at finalize (the same
+        // two-step relay_activity uses, because the response id does not exist
+        // while the turn is still running).
+        insertPreviewCard: db.prepare(`
+          INSERT INTO preview_cards (
+            id, queue_message_id, response_message_id, conversation_id, preview_json, created_at
+          ) VALUES (?, ?, NULL, ?, ?, ?)
+        `),
+        linkPreviewCardsToResponse: db.prepare(`UPDATE preview_cards SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
+        listPreviewCardsByResponse: db.prepare(`
+          SELECT id, preview_json, created_at
+          FROM preview_cards
+          WHERE response_message_id = ?
+          ORDER BY created_at ASC, id ASC
+        `),
+        deleteConvPreviewCards: db.prepare(`DELETE FROM preview_cards WHERE conversation_id = ?`),
+
         // relay boards
         insertBoard: db.prepare(`INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`),
         getBoard: db.prepare(`SELECT * FROM relay_boards WHERE id = ?`),

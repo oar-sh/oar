@@ -29,7 +29,7 @@ import {
   extractQuestionPrompt,
   serializeRequest,
 } from "./skills/tool-activity.mjs";
-import { buildPromptWithMode } from "./skills/prompt-context.mjs";
+import { createPreviewInstructionsProvider, createRelayPromptBuilder } from "./skills/prompt-context.mjs";
 import { createQuestionBridge } from "./skills/question-bridge.mjs";
 import { createQuestionRoutingHooks } from "./skills/question-routing-hooks.mjs";
 import { createReasoningStreamHandlers } from "./skills/reasoning-stream.mjs";
@@ -95,24 +95,10 @@ const bannerStateStore = createBannerStateStore({
   cooldownMs: BANNER_DEDUPE_COOLDOWN_MS,
 });
 
-function normalizeRelayMode(value) {
-  const mode = String(value || "agent").trim().toLowerCase();
-  if (mode === "plan" || mode === "ask" || mode === "autopilot" || mode === "agent") return mode;
-  return "agent";
-}
-
-let lastPromptedRelayMode = null;
-const buildPromptWithRelayContext = (message) => {
-  const relayMode = normalizeRelayMode(message?.relayMode);
-  const includeInstructions = lastPromptedRelayMode !== relayMode;
-  const prompt = buildPromptWithMode(
-    { ...message, relayMode },
-    RELAY_TOOL_INSTRUCTIONS,
-    { includeInstructions },
-  );
-  lastPromptedRelayMode = relayMode;
-  return prompt;
-};
+const buildPromptWithRelayContext = createRelayPromptBuilder({
+  toolInstructions: RELAY_TOOL_INSTRUCTIONS,
+  getPreviewInstructions: createPreviewInstructionsProvider({ api }),
+});
 
 const managedServerLifecycle = createManagedServerLifecycle({
   api,
