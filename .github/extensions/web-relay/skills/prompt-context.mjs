@@ -1,3 +1,10 @@
+import {
+  applyPreviewInstructions,
+  createPreviewInstructionsProvider,
+} from "../../../../shared/preview-instructions.mjs";
+
+export { createPreviewInstructionsProvider };
+
 export function buildPrompt(message) {
   const text = String(message?.text || "").trim();
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
@@ -73,6 +80,33 @@ export function buildPromptWithMode(message, toolInstructions = "", options = {}
   const modePrompt = buildModePrompt(message?.relayMode, toolInstructions, options);
   const body = buildPrompt(message);
   return [modePrompt, body].filter(Boolean).join(" ");
+}
+
+/**
+ * The relay's prompt prefix builder: tool guidance rides along only when the
+ * relay mode changed, so repeat turns in one mode stay cheap.
+ */
+export function createRelayPromptBuilder({
+  toolInstructions = "",
+  getPreviewInstructions = null,
+} = {}) {
+  let lastPromptedRelayMode = null;
+  return async function buildPromptWithRelayContext(message) {
+    const relayMode = normalizeRelayMode(message?.relayMode);
+    const includeInstructions = lastPromptedRelayMode !== relayMode;
+    let instructions = "";
+    if (includeInstructions) {
+      // Guidance is advisory: a preview lookup that fails must cost the block,
+      // never the turn.
+      const previewBlock = typeof getPreviewInstructions === "function"
+        ? await Promise.resolve().then(getPreviewInstructions).catch(() => "")
+        : "";
+      instructions = applyPreviewInstructions(toolInstructions, previewBlock);
+    }
+    const prompt = buildPromptWithMode({ ...message, relayMode }, instructions, { includeInstructions });
+    lastPromptedRelayMode = relayMode;
+    return prompt;
+  };
 }
 
 export function stripPromptPrefix(text, promptPrefix = "") {

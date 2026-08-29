@@ -2132,6 +2132,16 @@ export function createClaudeSessionRunner({
       abortController,
       canUseTool,
       pathToClaudeCodeExecutable,
+      api,
+      // Resolved per tool call: one CLI process serves many turns, and a
+      // continuation's row can land on a different conversation than the
+      // worker's session id.
+      getConversationId: () => String(
+        processRef.activeCtx?.message?.conversationId
+        || processRef.pendingDelivered[0]?.ctx.message?.conversationId
+        || sdkSessionId
+        || '',
+      ),
       dbg,
     });
     processRef.lifecycleTimer = setInterval(() => evaluateLifecycle(), lifecyclePollMs);

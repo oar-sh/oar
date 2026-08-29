@@ -1683,6 +1683,7 @@ export function buildConversationMessages({
   relayThoughtsByMessageId = new Map(),
   subagentRunsByMessageId = new Map(),
   workflowRunsByMessageId = new Map(),
+  previewCardsByMessageId = new Map(),
   responseMessageToSourceId = new Map(),
   queueRows = [],
   usageByResponseMessageId = new Map(),
@@ -1708,6 +1709,7 @@ export function buildConversationMessages({
           thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
           subagentRuns: message?.role === 'assistant' ? (subagentRunsByMessageId.get(id) || []) : [],
           workflowRuns: message?.role === 'assistant' ? (workflowRunsByMessageId.get(id) || []) : [],
+          previewCards: message?.role === 'assistant' ? (previewCardsByMessageId.get(id) || []) : [],
           id,
           role: message?.role,
           text: stripRelayPromptContext(message?.text, message?.mode),
@@ -1751,6 +1753,9 @@ export function buildConversationMessages({
       workflowRuns: (Array.isArray(message?.workflowRuns) && message.workflowRuns.length)
         ? message.workflowRuns
         : (id ? (workflowRunsByMessageId.get(id) || []) : []),
+      previewCards: (Array.isArray(message?.previewCards) && message.previewCards.length)
+        ? message.previewCards
+        : (id ? (previewCardsByMessageId.get(id) || []) : []),
       text: stripRelayPromptContext(message?.text, message?.mode),
       sourceMessageId,
       modelOrigin: message?.modelOrigin
@@ -1895,10 +1900,12 @@ export function registerSessionsRoutes(app, deps) {
     relayThoughtsForResponse,
     subagentRunsForResponse,
     workflowRunsForResponse,
+    previewCardsForResponse,
     buildContextResponseText,
     readContextFromSessionEvents,
     inFlightStateForConversation,
     backgroundTaskStore,
+    listConversationPreviews,
     createCompactedConversation,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
@@ -2087,6 +2094,11 @@ export function registerSessionsRoutes(app, deps) {
       stmts.deleteConvThoughts.run(conversationId);
     } else {
       db.prepare(`DELETE FROM relay_thought WHERE conversation_id = ?`).run(conversationId);
+    }
+    if (typeof stmts.deleteConvPreviewCards?.run === 'function') {
+      stmts.deleteConvPreviewCards.run(conversationId);
+    } else {
+      db.prepare(`DELETE FROM preview_cards WHERE conversation_id = ?`).run(conversationId);
     }
     db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
@@ -2367,6 +2379,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
     );
+    const previewCardsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, previewCardsForResponse ? previewCardsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -2385,6 +2402,7 @@ export function registerSessionsRoutes(app, deps) {
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
       workflowRunsByMessageId,
+      previewCardsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -3076,6 +3094,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
     );
+    const previewCardsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, previewCardsForResponse ? previewCardsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conversationId) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -3091,6 +3114,7 @@ export function registerSessionsRoutes(app, deps) {
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
       workflowRunsByMessageId,
+      previewCardsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -3472,6 +3496,11 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
     );
+    const previewCardsByMessageId = new Map(
+      dbMessages
+        .filter((m) => m.role === 'assistant')
+        .map((m) => [m.id, previewCardsForResponse ? previewCardsForResponse(m.id) : []]),
+    );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
@@ -3487,6 +3516,7 @@ export function registerSessionsRoutes(app, deps) {
       relayThoughtsByMessageId,
       subagentRunsByMessageId,
       workflowRunsByMessageId,
+      previewCardsByMessageId,
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
@@ -3535,6 +3565,7 @@ export function registerSessionsRoutes(app, deps) {
       sessionUsageSummary,
       inFlight,
       backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
+      previews: listConversationPreviews?.(resolvedConversationId) || [],
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,

@@ -78,6 +78,15 @@ export function compactBoundaryActivityAction(sdkMessage) {
   };
 }
 
+// MCP tools reach the transcript namespaced as `mcp__<server>__<tool>`; which
+// server carries a tool is relay plumbing, so the chip shows the bare name.
+const MCP_TOOL_NAME = /^mcp__(?:.+?)__(.+)$/;
+
+export function displayToolName(name) {
+  const value = String(name || '').trim();
+  return MCP_TOOL_NAME.exec(value)?.[1] || value;
+}
+
 export function isSubagentToolName(name) {
   return SUBAGENT_TOOL_NAMES.has(String(name || '').trim().toLowerCase());
 }
@@ -243,7 +252,7 @@ export function createSdkMessageNormalizer() {
 
   function actionsForToolUseBlock(block, parentToolUseId) {
     const actions = [];
-    const toolName = String(block?.name || '').trim() || 'unknown';
+    const toolName = displayToolName(block?.name) || 'unknown';
     const toolUseId = String(block?.id || '').trim();
     const input = block?.input && typeof block.input === 'object' ? block.input : {};
     if (isSubagentToolName(toolName) && toolUseId) {

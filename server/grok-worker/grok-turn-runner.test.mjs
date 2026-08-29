@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
 import { classifyGrokError } from './grok-sdk-adapter.mjs';
+import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
+import { PREVIEW_TOOL_DESCRIPTION } from '../../shared/preview-tool-core.mjs';
 
 function createMockApi() {
   const calls = [];
@@ -368,5 +370,111 @@ test('the composer reasoning effort is forwarded to the turn starter', async () 
     message: { id: 'msg-f', conversationId: 'conv-effort', text: 'x', relayMode: 'agent', reasoningEffort: 'high' },
   });
   assert.equal(seenEffort, 'high');
+  await runner.dispose();
+});
+
+function createPreviewApi(lane) {
+  const calls = [];
+  const api = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (method === 'GET' && path === '/api/previews') return lane;
+    return { ok: true };
+  };
+  api.calls = calls;
+  return api;
+}
+
+function createPromptCapturingRunner({ api, sdkSessionId }) {
+  const prompts = [];
+  async function* quickTurn() {
+    yield {
+      channel: 'result',
+      payload: { text: 'ok', isError: false, errorMessage: '', stopReason: 'end_turn', model: 'grok-4.5' },
+    };
+  }
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId,
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    createAgentHandleImpl: async () => makeHandle(),
+    startGrokTurnImpl: (opts) => {
+      prompts.push(opts.text);
+      return quickTurn();
+    },
+    getPreviewInstructions: createPreviewInstructionsProvider({ api }),
+  });
+  return { runner, prompts };
+}
+
+test('an enabled preview lane prefixes the first Grok prompt with the instruction block', async () => {
+  const api = createPreviewApi({ enabled: true, publicBaseUrl: 'https://previews.example.test', previews: [] });
+  const { runner, prompts } = createPromptCapturingRunner({ api, sdkSessionId: 'conv-preview-on' });
+
+  await runner.handlePendingPayload({
+    message: { id: 'msg-p1', conversationId: 'conv-preview-on', text: 'show me the app', relayMode: 'agent' },
+  });
+  assert.ok(prompts[0].includes(PREVIEW_TOOL_DESCRIPTION));
+  assert.ok(prompts[0].includes('https://previews.example.test'));
+  assert.ok(prompts[0].endsWith('show me the app'));
+  await runner.dispose();
+});
+
+test('a disabled preview lane leaves the Grok prompt untouched', async () => {
+  const api = createPreviewApi({ enabled: false, publicBaseUrl: '', previews: [] });
+  const { runner, prompts } = createPromptCapturingRunner({ api, sdkSessionId: 'conv-preview-off' });
+
+  await runner.handlePendingPayload({
+    message: { id: 'msg-p2', conversationId: 'conv-preview-off', text: 'show me the app', relayMode: 'agent' },
+  });
+  assert.equal(prompts[0], 'show me the app');
+  await runner.dispose();
+});
+
+test('the Grok preview block is sent once per worker and looked up once', async () => {
+  const api = createPreviewApi({ enabled: true, publicBaseUrl: 'https://previews.example.test', previews: [] });
+  const { runner, prompts } = createPromptCapturingRunner({ api, sdkSessionId: 'conv-preview-once' });
+
+  await runner.handlePendingPayload({
+    message: { id: 'msg-p3', conversationId: 'conv-preview-once', text: 'first', relayMode: 'agent' },
+  });
+  await runner.handlePendingPayload({
+    message: { id: 'msg-p4', conversationId: 'conv-preview-once', text: 'second', relayMode: 'agent' },
+  });
+
+  assert.ok(prompts[0].includes(PREVIEW_TOOL_DESCRIPTION));
+  assert.equal(prompts[1], 'second');
+  const previewLookups = api.calls.filter((c) => c.method === 'GET' && c.path === '/api/previews');
+  assert.equal(previewLookups.length, 1);
+  await runner.dispose();
+});
+
+test('a preview lookup failure does not fail the Grok turn', async () => {
+  const api = createMockApi();
+  const prompts = [];
+  async function* quickTurn() {
+    yield {
+      channel: 'result',
+      payload: { text: 'ok', isError: false, errorMessage: '', stopReason: 'end_turn', model: 'grok-4.5' },
+    };
+  }
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-preview-fail',
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    createAgentHandleImpl: async () => makeHandle(),
+    startGrokTurnImpl: (opts) => {
+      prompts.push(opts.text);
+      return quickTurn();
+    },
+    getPreviewInstructions: async () => { throw new Error('HTTP 500 /api/previews'); },
+  });
+
+  const ok = await runner.handlePendingPayload({
+    message: { id: 'msg-p5', conversationId: 'conv-preview-fail', text: 'still works', relayMode: 'agent' },
+  });
+  assert.equal(ok, true);
+  assert.equal(prompts[0], 'still works');
   await runner.dispose();
 });

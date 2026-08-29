@@ -414,6 +414,26 @@ export const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
     ON workflow_runs(conversation_id);
 
+  -- Previews published mid-turn, pinned to the transcript. Snapshot JSON, not a
+  -- registry reference: the registry is in-memory and the card must still
+  -- render after the preview closes or the relay restarts. Written with the
+  -- queue id (the response id does not exist yet mid-turn) and linked to the
+  -- response at finalize, exactly like relay_activity.
+  CREATE TABLE IF NOT EXISTS preview_cards (
+    id                  TEXT PRIMARY KEY,
+    queue_message_id    TEXT NOT NULL,
+    response_message_id TEXT,
+    conversation_id     TEXT NOT NULL,
+    preview_json        TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_preview_cards_response
+    ON preview_cards(response_message_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_preview_cards_queue
+    ON preview_cards(queue_message_id);
+
   CREATE TABLE IF NOT EXISTS uploaded_files (
     sha256        TEXT PRIMARY KEY,
     original_name TEXT,
@@ -839,6 +859,24 @@ db.exec(`
     ON workflow_runs(response_message_id, run_index);
   CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
     ON workflow_runs(conversation_id);
+`);
+
+// Existing databases pick up preview_cards here; fresh ones get it from the
+// main schema block above (same dual-declaration pattern as workflow_runs).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS preview_cards (
+    id                  TEXT PRIMARY KEY,
+    queue_message_id    TEXT NOT NULL,
+    response_message_id TEXT,
+    conversation_id     TEXT NOT NULL,
+    preview_json        TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_preview_cards_response
+    ON preview_cards(response_message_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_preview_cards_queue
+    ON preview_cards(queue_message_id);
 `);
 
 const relayActivityColumns = db.prepare(`PRAGMA table_info(relay_activity)`).all().map((c) => c.name);

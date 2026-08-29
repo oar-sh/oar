@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   CLAUDE_ULTRACODE_EFFORT,
+  RELAY_MCP_SERVER_NAME,
   applyThinkingDisplay,
   claudeAutoCompactFlagSettings,
   claudeSpawnSettings,
@@ -75,6 +76,44 @@ test('startClaudeSession builds streaming-input query options', async () => {
   assert.deepEqual(messages[0].message.content, [{ type: 'text', text: 'hi' }]);
   assert.deepEqual(messages[1].message.content, [{ type: 'text', text: 'follow-up' }]);
   assert.throws(() => turn.pushUserMessage([{ type: 'text', text: 'late' }]), /ended/);
+});
+
+test('an injected api registers the relay MCP server carrying the preview tool', async () => {
+  const calls = [];
+  let captured = null;
+  startClaudeSession({
+    content: null,
+    cwd: '/workspace',
+    api: async (method, routePath, body) => {
+      calls.push({ method, routePath, body });
+      return { previews: [], enabled: true };
+    },
+    getConversationId: () => 'conv-7',
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.equal(RELAY_MCP_SERVER_NAME, 'relay');
+  const server = captured.options.mcpServers?.[RELAY_MCP_SERVER_NAME];
+  assert.ok(server, 'the relay server must be registered');
+  assert.equal(server.type, 'sdk', 'it runs in-process, not as a child MCP process');
+  assert.equal(server.name, 'relay');
+
+  // The server owns the only reference to the tool, so the round-trip is
+  // exercised through its registration.
+  const registered = server.instance._registeredTools;
+  assert.deepEqual(Object.keys(registered), ['preview']);
+  const result = await registered.preview.handler({ action: 'list' }, {});
+  assert.deepEqual(calls, [{ method: 'GET', routePath: '/api/previews', body: undefined }]);
+  assert.deepEqual(JSON.parse(result.content[0].text), { ok: true, enabled: true, previews: [] });
+});
+
+test('a session without an api helper registers no MCP servers', () => {
+  let captured = null;
+  startClaudeSession({
+    content: null,
+    cwd: '/workspace',
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.equal('mcpServers' in captured.options, false);
 });
 
 test('startClaudeSession omits model for auto and resume when empty', () => {

@@ -2008,6 +2008,9 @@ export function registerMessagesRoutes(app, deps) {
       // A failed turn keeps its reasoning: without this link the thoughts
       // stayed response_message_id NULL and vanished from the transcript.
       stmts.linkThoughtsToResponse?.run(responseId, messageId);
+      // A preview published before the turn failed is still live and public;
+      // its card must not vanish with the error.
+      stmts.linkPreviewCardsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, conversationId);
       stmts.pruneQueue?.run();
       return true;
@@ -6235,6 +6238,7 @@ export function registerMessagesRoutes(app, deps) {
       stmts.linkActivityToResponse.run(responseId, messageId);
       stmts.linkStreamEventsToResponse?.run(responseId, messageId);
       stmts.linkThoughtsToResponse?.run(responseId, messageId);
+      stmts.linkPreviewCardsToResponse?.run(responseId, messageId);
       stmts.updateConvTime.run(now, targetConversationId);
       if (imageOperation && generatedImageAttachments.length) {
         const previousAttempt = stmts.getLatestAttempt?.get(imageOperation.id) || null;

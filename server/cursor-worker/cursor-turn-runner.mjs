@@ -11,6 +11,7 @@ import {
   resolveCursorReasoningParams,
 } from './cursor-sdk-adapter.mjs';
 import { createAskUserTool } from './cursor-ask-user-tool.mjs';
+import { createPreviewTool } from './cursor-preview-tool.mjs';
 import {
   buildCursorSubagentAgents,
   cursorSubagentRosterFingerprint,
@@ -144,6 +145,14 @@ export function createCursorTurnRunner({
     getAbortSignal: () => currentAbortController?.signal || null,
     dbg,
   });
+  // Registered even when the relay's preview lane is disabled: the worker
+  // cannot see that configuration, and the API answers a disabled lane with a
+  // plain refusal the model can relay instead of a failed turn.
+  const previewTool = createPreviewTool({
+    api,
+    getConversationId: () => activeMessage?.conversationId || '',
+    dbg,
+  });
   const customTools = {
     ask_user: {
       description: askUserTool.description,
@@ -156,6 +165,11 @@ export function createCursorTurnRunner({
           pendingAskUserCalls -= 1;
         }
       },
+    },
+    [previewTool.name]: {
+      description: previewTool.description,
+      inputSchema: previewTool.inputSchema,
+      execute: previewTool.execute,
     },
   };
 

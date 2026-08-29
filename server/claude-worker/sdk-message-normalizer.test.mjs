@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   createSdkMessageNormalizer,
+  displayToolName,
   formatToolActivityText,
   shouldEmitStreamUpdate,
   summarizeToolInput,
@@ -90,6 +91,31 @@ test('assistant tool_use blocks emit truncated activity lines', () => {
   assert.equal(actions[0].channel, 'activity');
   assert.equal(actions[0].payload.text, 'Tool (Bash): npm test');
   assert.equal(actions[0].payload.subagentRunId, null);
+});
+
+test('MCP tool names lose their server prefix in the chip', () => {
+  assert.equal(displayToolName('mcp__relay__preview'), 'preview');
+  assert.equal(displayToolName('mcp__some-server__do_thing'), 'do_thing');
+  assert.equal(displayToolName('Bash'), 'Bash');
+  assert.equal(displayToolName('mcp__weird'), 'mcp__weird');
+  assert.equal(displayToolName(''), '');
+
+  const normalizer = createSdkMessageNormalizer();
+  const actions = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_preview_1',
+          name: 'mcp__relay__preview',
+          input: { action: 'create', port: 5173 },
+        },
+      ],
+    },
+  });
+  assert.equal(actions[0].payload.text, 'Tool (preview): {"action":"create","port":5173}');
 });
 
 test('activity text is capped at 140 characters', () => {

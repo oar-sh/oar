@@ -5,6 +5,7 @@ import {
 } from './grok-sdk-adapter.mjs';
 import { buildGrokContextUsage, resolveGrokContextWindow } from './grok-context-usage.mjs';
 import { extractGrokUsageFromPromptResult, normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
+import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 
@@ -96,6 +97,7 @@ export function createGrokTurnRunner({
   createAgentHandleImpl = createGrokAgentHandle,
   startGrokTurnImpl = startGrokTurn,
   classifyErrorImpl = classifyGrokError,
+  getPreviewInstructions = createPreviewInstructionsProvider({ api }),
   dbg = () => {},
 } = {}) {
   let agentHandle = null;
@@ -104,6 +106,10 @@ export function createGrokTurnRunner({
   let waitingForTurn = false;
   let currentAbortController = null;
   let lastNudgedRelayMode = '';
+  // ACP has no system-prompt seam, so capability guidance rides the prompt
+  // prefix like the mode nudge — once per worker, since the Grok session keeps
+  // the history it was told in.
+  let previewInstructionsSent = false;
   // The user's max-turn-duration ceiling (0 = no limit), piggybacked on queue
   // deliveries; null means no delivery has told us yet and the ACP defaults
   // apply.
@@ -327,7 +333,13 @@ export function createGrokTurnRunner({
 
     const modeNudge = grokModeNudge(message.relayMode, lastNudgedRelayMode);
     const userText = buildGrokUserText(message);
-    const promptText = [modeNudge, userText].filter(Boolean).join('\n\n');
+    // Advisory: a preview lookup that fails costs the guidance, never the turn.
+    const previewBlock = previewInstructionsSent
+      ? ''
+      : await Promise.resolve()
+        .then(() => getPreviewInstructions?.())
+        .catch(() => '');
+    const promptText = [previewBlock, modeNudge, userText].filter(Boolean).join('\n\n');
     const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
 
     let turn = null;
@@ -365,6 +377,7 @@ export function createGrokTurnRunner({
             await dispatchAction(message, action, state);
           }
           lastNudgedRelayMode = pendingNudgedRelayMode;
+          if (previewBlock) previewInstructionsSent = true;
           break;
         } catch (error) {
           // A stale agent whose previous prompt never settled reports busy;

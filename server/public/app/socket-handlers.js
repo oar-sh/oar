@@ -39,6 +39,7 @@ import {
 } from './ask-user-view.js';
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
 import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
+import { setPreviews } from './preview-cards.mjs';
 import {
   showThinking,
   removeThinking,
@@ -447,6 +448,11 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('background_tasks', ({ conversationId, tasks }) => {
     setConversationBackgroundTasks(conversationId, tasks);
+  });
+  // REPLACE semantics for the whole set: the preview registry is relay-owned
+  // and global, so every change ships the full list.
+  socket.on('previews', ({ previews }) => {
+    setPreviews(previews);
   });
   socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId, metadata }) => {
     if (!messageId || !text) return;
