@@ -24,10 +24,10 @@ Copilot Remote is built to feel at home on both desktop and mobile. Your convers
 <div align="center"><small>Mobile session view with the composer and a PWA-style fullscreen layout.</small></div>
 </td>
 <td width="60%" align="right" valign="top">
-<a href="docs/screenshots/desktop_pwa_chrome.png" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/desktop_pwa_chrome.png" alt="Desktop PWA chat view">
+<a href="docs/screenshots/desktop_pwa_background_agents.png" target="_blank" rel="noopener noreferrer">
+<img src="docs/screenshots/desktop_pwa_background_agents.png" alt="Desktop PWA chat view with background agents">
 </a>
-<div align="center"><small>Desktop PWA App (Chrome), chat view with session list.</small></div>
+<div align="center"><small>Desktop PWA App (Chrome), chat view with background agents running in parallel.</small></div>
 </td>
 </tr>
 <tr>
