@@ -59,6 +59,14 @@ function looksLikeCopilotWorkerProcess(proc) {
   const cmd = String(proc?.commandLine || '').trim().toLowerCase();
   if (!name && !cmd) return false;
   if (cmd.includes('\\server\\server.js') || cmd.includes('/server/server.js')) return false;
+  // A tmux process is never a worker. The shared tmux server keeps the argv of
+  // whichever `tmux new-session -d -s <session-id> ...` first started it, so a
+  // session-id scan would otherwise match the server itself — and killing it
+  // tears down every tmux-hosted worker on the socket, not just the target
+  // session. (The server's comm is "tmux: server", which the ps parser splits
+  // into name "tmux:" with the command line shifted to start with "server".)
+  if (name === 'tmux' || name.startsWith('tmux:')) return false;
+  if (/^(?:server\s+)?tmux(?:\s|$)/.test(cmd)) return false;
   if (name === 'copilot.exe') return true;
   if (name === 'gh.exe' && cmd.includes('gh') && cmd.includes('copilot')) return true;
   if (cmd.includes('gh copilot')) return true;

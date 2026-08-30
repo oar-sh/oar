@@ -24,6 +24,7 @@ import { readStoredClaudeContextUsage } from '../services/claude-context-usage.m
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
+import { createClaudeAuthService } from '../services/claude-auth-service.mjs';
 import {
   isWithinAllowedPrefix,
   readWorkspaceRootPathFromBody,
@@ -68,6 +69,9 @@ export { mapUsageSnapshotRow };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
+// Registry statuses that mean "this worker is currently running" (same triple
+// as countActiveCliWorkers in server-runtime.mjs).
+const SESSION_WORKER_ACTIVE_STATUSES = Object.freeze(['starting', 'ready', 'processing']);
 
 function normalizeWorkerStatusText(value, fallback = null) {
   const text = String(value || '').trim();
@@ -689,7 +693,7 @@ export async function launchWorkspaceRootSession(
   if (!sid) {
     return { ok: false, statusCode: 400, error: 'Missing session id' };
   }
-  const activeStatuses = ['starting', 'ready', 'processing'];
+  const activeStatuses = SESSION_WORKER_ACTIVE_STATUSES;
   const selectedWorkerState = typeof sessionWorkerSupervisor?.getWorkerState === 'function'
     ? sessionWorkerSupervisor.getWorkerState(sid)
     : null;
@@ -1136,7 +1140,7 @@ export function buildSessionWorkerStatusPayload({
     ? supervisorSnapshot
     : {};
   const workers = Array.isArray(snapshot.workers) ? snapshot.workers : [];
-  const onlineWorkerStatuses = new Set(['starting', 'ready', 'processing']);
+  const onlineWorkerStatuses = new Set(SESSION_WORKER_ACTIVE_STATUSES);
   const onlineCount = workers.reduce((count, worker) => {
     const status = normalizeWorkerStatusText(worker?.status, 'new');
     return count + (onlineWorkerStatuses.has(status) ? 1 : 0);
@@ -1927,6 +1931,10 @@ export function registerSessionsRoutes(app, deps) {
     getClaudeProviderSettings = () => ({ configured: false, enabled: false, model: 'claude-sonnet-5', models: [] }),
     setClaudeProviderSettings = () => ({ ok: false, error: 'Claude settings are unavailable' }),
     refreshClaudeProviderModels = async () => ({ ok: false, models: [], error: 'Claude model discovery is unavailable' }),
+    // Owns the relay-wide single-flight Claude login state machine. Created here
+    // (rather than as a module singleton) so each route registration in tests
+    // gets its own instance; production registers these routes once.
+    claudeAuthService = null,
     getCursorProviderSettings = () => ({ configured: false, enabled: false, model: 'composer-2.5', models: [] }),
     setCursorProviderSettings = () => ({ ok: false, error: 'Cursor settings are unavailable' }),
     refreshCursorProviderModels = async () => ({ ok: false, models: [], error: 'Cursor model discovery is unavailable' }),
@@ -4911,6 +4919,174 @@ export function registerSessionsRoutes(app, deps) {
       warning: reconciliationFailures.length
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'Claude model discovery failed')),
+    });
+  });
+
+  // --- Claude account (CLI OAuth) -----------------------------------------
+  // Drives `claude auth login/logout` on the host so an account switch does not
+  // need shell access. No Claude secret passes through the relay: the CLI writes
+  // its own credentials file, which the workers already read.
+  // Owned by server-runtime (so dispose() reaches it on shutdown); the local
+  // construction is the test-harness fallback.
+  const claudeAuth = claudeAuthService || createClaudeAuthService();
+
+  // Stand-in for the window before the first `claude auth status` read lands:
+  // the payload shape is fixed, so a broadcast carries a neutral status rather
+  // than dropping the field.
+  const CLAUDE_AUTH_UNKNOWN_STATUS = Object.freeze({
+    ok: false,
+    loggedIn: false,
+    authMethod: null,
+    apiProvider: null,
+    email: null,
+    orgId: null,
+    orgName: null,
+    subscriptionType: null,
+    error: null,
+    checkedAt: null,
+  });
+
+  /**
+   * Claude workers that are actually running right now. The worker registry
+   * carries no provider field, so each active entry is resolved back to its
+   * runtime_sessions row (provider_type). Feeds the logout confirmation dialog.
+   */
+  function countRunningClaudeWorkers() {
+    const workers = typeof sessionWorkerRegistry?.listWorkers === 'function'
+      ? sessionWorkerRegistry.listWorkers()
+      : [];
+    let count = 0;
+    for (const worker of (Array.isArray(workers) ? workers : [])) {
+      const workerStatus = String(worker?.status || '').trim().toLowerCase();
+      if (!SESSION_WORKER_ACTIVE_STATUSES.includes(workerStatus)) continue;
+      // A registry entry survives a crash and an entry can predate its process,
+      // so only a recorded *and* live pid counts as running.
+      const pid = Number(worker?.pid);
+      if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) continue;
+      const sid = String(worker?.sdkSessionId || '').trim();
+      if (!sid) continue;
+      let runtimeSessionRow = null;
+      try {
+        runtimeSessionRow = stmts.getRuntimeSessionBySdkSessionId?.get?.(sid) || null;
+      } catch {
+        runtimeSessionRow = null;
+      }
+      if (String(runtimeSessionRow?.provider_type || '').trim().toLowerCase() === 'claude') count += 1;
+    }
+    return count;
+  }
+
+  // Each count walks the registry and reads one runtime_sessions row per worker,
+  // so it is recomputed only where the number is consumed (the status read and
+  // the logout confirmation) and reused for the login-transition broadcasts.
+  let lastRunningClaudeWorkers = 0;
+  function refreshRunningClaudeWorkers() {
+    lastRunningClaudeWorkers = countRunningClaudeWorkers();
+    return lastRunningClaudeWorkers;
+  }
+
+  function claudeAuthPayload({ status = null, login = null, runningClaudeWorkers = lastRunningClaudeWorkers } = {}) {
+    return {
+      status: status || CLAUDE_AUTH_UNKNOWN_STATUS,
+      login: login || claudeAuth.getLoginState(),
+      runningClaudeWorkers,
+    };
+  }
+
+  async function buildClaudeAuthPayload({
+    login = null,
+    forceStatus = false,
+    status = null,
+    countWorkers = false,
+  } = {}) {
+    // getStatus() never rejects: a failed probe resolves as `ok:false` with the
+    // reason in `error`.
+    const resolved = status || await claudeAuth.getStatus({ force: forceStatus });
+    return claudeAuthPayload({
+      status: resolved,
+      login,
+      runningClaudeWorkers: countWorkers ? refreshRunningClaudeWorkers() : lastRunningClaudeWorkers,
+    });
+  }
+
+  // Login transitions broadcast synchronously off the last known status: the
+  // awaiting_code emit carries the authorize URL, and building it around a
+  // status read would park it behind a CLI spawn (up to 20s on a cold cache).
+  // The service re-emits the same state once a fresh status lands.
+  claudeAuth.subscribe((login) => {
+    io.emit('claude_auth_state', claudeAuthPayload({ status: claudeAuth.getCachedStatus(), login }));
+  });
+
+  // A fresh login usually unblocks model discovery (it fails opaquely while
+  // logged out), so the catalog is repopulated without a relay restart.
+  // Running workers are deliberately left alone: they keep the previous
+  // account's token until they exit.
+  claudeAuth.onLoginSuccess(async () => {
+    try {
+      await refreshClaudeProviderModels();
+    } catch (error) {
+      console.log(`[claude-auth] model refresh after login failed: ${error?.message || error}`);
+    }
+    const settings = getClaudeProviderSettings();
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('claude_settings_updated', {
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
+      models: Array.isArray(settings?.models) ? settings.models : [],
+      availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+    });
+  });
+
+  app.get('/api/claude/auth/status', auth, async (_req, res) => {
+    return res.json(await buildClaudeAuthPayload({ countWorkers: true }));
+  });
+
+  app.post('/api/claude/auth/login/start', auth, async (req, res) => {
+    const result = claudeAuth.startLogin();
+    if (!result?.ok) {
+      return res.status(500).json({
+        error: result?.error || 'Failed to start Claude login',
+        ...(await buildClaudeAuthPayload()),
+      });
+    }
+    return res.json({
+      ok: true,
+      reused: result.reused === true,
+      ...(await buildClaudeAuthPayload({ login: result.login })),
+    });
+  });
+
+  app.post('/api/claude/auth/login/code', auth, async (req, res) => {
+    // The code itself is never logged, echoed back, or broadcast.
+    const result = claudeAuth.submitCode(req.body?.code);
+    if (!result?.ok) {
+      return res.status(Number(result?.statusCode) || 400).json({
+        error: result?.error || 'Failed to submit the Claude login code',
+        ...(await buildClaudeAuthPayload()),
+      });
+    }
+    return res.json({ ok: true, ...(await buildClaudeAuthPayload({ login: result.login })) });
+  });
+
+  app.post('/api/claude/auth/login/cancel', auth, async (_req, res) => {
+    const result = claudeAuth.cancel();
+    return res.json({ ok: true, ...(await buildClaudeAuthPayload({ login: result.login })) });
+  });
+
+  app.post('/api/claude/auth/logout', auth, async (_req, res) => {
+    const result = await claudeAuth.logout();
+    if (!result?.ok) {
+      return res.status(Number(result?.statusCode) || 500).json({
+        error: result?.error || 'Failed to log out of Claude',
+        ...(await buildClaudeAuthPayload({ status: result?.status || null, countWorkers: true })),
+      });
+    }
+    // logout() already force-refreshed the status and its idle transition
+    // already broadcast it, so neither the spawn nor the emit is repeated.
+    return res.json({
+      ok: true,
+      ...(await buildClaudeAuthPayload({ status: result.status, countWorkers: true })),
     });
   });
 

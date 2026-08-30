@@ -253,6 +253,55 @@ export async function updateClaudeSettings({
   }
 }
 
+// Claude account auth (Relogin / Logout). The relay answers failures with a
+// useful `error` string (e.g. logout refused with 409 while a login is in
+// flight), so these POSTs use the explicit fetch shape and surface that message
+// instead of apiFetch's null-on-error.
+async function claudeAuthRequest(path, body = null) {
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}${path}`, {
+      signal: requestTimeoutSignal(),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(String(result?.error || `Claude auth request failed (${response.status})`).trim());
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure(path, error);
+    throw error;
+  }
+}
+
+export async function getClaudeAuthStatus() {
+  return apiFetch('/api/claude/auth/status');
+}
+
+export async function startClaudeLogin() {
+  return claudeAuthRequest('/api/claude/auth/login/start');
+}
+
+// The pasted code is sent once and never stored, logged, or echoed back.
+export async function submitClaudeLoginCode(code) {
+  return claudeAuthRequest('/api/claude/auth/login/code', { code: String(code || '') });
+}
+
+export async function cancelClaudeLogin() {
+  return claudeAuthRequest('/api/claude/auth/login/cancel');
+}
+
+export async function claudeLogout() {
+  return claudeAuthRequest('/api/claude/auth/logout');
+}
+
 export async function loadGrokSettings() {
   return apiFetch('/api/settings/grok');
 }

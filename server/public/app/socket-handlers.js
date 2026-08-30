@@ -40,6 +40,7 @@ import {
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
 import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
+import { applyClaudeAuthState } from './claude-auth-ui.js';
 import {
   showThinking,
   removeThinking,
@@ -350,6 +351,11 @@ export async function connectSocket(overrideDeps) {
         .then(() => deps?.refreshCurrentView?.())
         .catch(() => {});
     }
+  });
+  // Login/logout transitions on the relay host. Broadcast to every client so a
+  // login started on the desktop can be finished on a phone (and vice versa).
+  socket.on('claude_auth_state', (payload) => {
+    applyClaudeAuthState(payload || null);
   });
   socket.on('grok_settings_updated', (payload) => {
     deps?.applyGrokSettingsState?.(payload || {});

@@ -61,6 +61,30 @@ test('process inspector ignores relay server process on linux path form', () => 
   assert.deepEqual(matches.map((proc) => proc.processId), [202]);
 });
 
+test('process inspector never matches the shared tmux server for a session id', () => {
+  // The tmux server adopts the argv of the first `tmux new-session` that
+  // started it, so its command line carries that session's id and worker
+  // script path forever. Killing it would destroy every tmux-hosted worker.
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'linux',
+    execFileSyncImpl(command, args) {
+      assert.equal(command, 'ps');
+      assert.deepEqual(args, ['-eo', 'pid=,ppid=,comm=,args=', '-ww']);
+      return Buffer.from([
+        // comm "tmux: server" splits into name "tmux:" + cmd "server tmux ..."
+        `301 1 tmux: server tmux new-session -d -s sess-1 sh -lc export FOO='bar'; exec 'node' '/x/server/claude-worker/claude-session-worker.mjs' --session-id 'sess-1'`,
+        // A plain tmux client invocation carrying the same session id.
+        `302 1 tmux tmux new-session -d -s sess-1 sh -lc exec 'node' '/x/server/claude-worker/claude-session-worker.mjs' --session-id 'sess-1'`,
+        // The actual worker for the session — the only legitimate match.
+        `303 301 node node /x/server/claude-worker/claude-session-worker.mjs --session-id sess-1`,
+      ].join('\n'));
+    },
+  });
+
+  const matches = inspector.findProcessesForSession('sess-1');
+  assert.deepEqual(matches.map((proc) => proc.processId), [303]);
+});
+
 test('process inspector ignores relay server process on windows path form', () => {
   const inspector = createSessionWorkerProcessInspector({
     platform: 'win32',

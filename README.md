@@ -94,7 +94,7 @@ Only Node.js and the runtime you actually intend to use are required.
 | GitHub Copilot CLI extension | Copilot provider              | `gh extension install github/gh-copilot`  |
 | Copilot subscription         | Copilot provider              | Individual, Business, or Enterprise       |
 | OpenAI API key               | OpenAI + OpenAI Image chats   | Entered in **⚙️ Settings**, stored locally |
-| Claude Code CLI, logged in   | Claude chats                  | Run `claude` once on the relay host; no API key is stored by the relay |
+| Claude Code CLI, logged in   | Claude chats                  | Log in from **⚙️ Settings → Providers → Claude → Relogin**, or run `claude` once on the relay host; no API key is stored by the relay |
 
 
 ## Quick start
@@ -242,7 +242,7 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
 - Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes only** and **Full file** modes; closing it returns to the still-open list.
 - Answer clarification prompts in relay question cards (from `ask_user`, or Claude's `AskUserQuestion`).
 - Watch the reply arrive: assistant text streams into the pending bubble as it is generated, and any subagent the turn spawns gets its own nested bubble with its own thoughts, activity, and text.
-- Use **Check Usage** (`📊`) in the conversation menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Sources differ per provider:
+- Use **Check Usage** (`📊`) in the conversation menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Each provider gets its own tab, opening on the conversation's own provider, and the card names the signed-in account (email and plan) beneath its title. Sources differ per provider:
   - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing.
   - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn.
   - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools. Cursor exposes no account API for included pools, so these figures are estimates and the Spending dashboard remains authoritative.
@@ -265,14 +265,21 @@ Turning a provider **off** (or removing the OpenAI key) rebinds conversations th
 | Provider              | Enable via                              | Auth                                  | Notes                                                                 |
 | --------------------- | --------------------------------------- | ------------------------------------- | --------------------------------------------------------------------- |
 | **Copilot** (default) | always available                        | your `gh` / Copilot CLI login         | Full relay feature set; the only provider that reports Copilot usage   |
-| **OpenAI (BYOK)**     | ⚙️ Settings → OpenAI API key            | your API key, stored in the relay DB  | Runs the Copilot CLI in BYOK mode against an OpenAI-compatible endpoint |
-| **OpenAI Image (BYOK)** | ⚙️ Settings → OpenAI API key           | same key                              | Calls the OpenAI Images API directly; a chat whose replies are images  |
-| **Claude (Agent SDK)** | ⚙️ Settings → Claude SDK                | the relay host's logged-in Claude CLI | No API key is stored; runs a dedicated Node worker per conversation    |
-| **Cursor (Agent SDK)** | ⚙️ Settings → Cursor SDK                | your Cursor API key, stored in the relay DB | Runs a dedicated Node worker per conversation through the Cursor Agent SDK |
+| **OpenAI (BYOK)**     | ⚙️ Settings → Providers → OpenAI        | your API key, stored in the relay DB  | Runs the Copilot CLI in BYOK mode against an OpenAI-compatible endpoint |
+| **OpenAI Image (BYOK)** | ⚙️ Settings → Providers → OpenAI      | same key                              | Calls the OpenAI Images API directly; a chat whose replies are images  |
+| **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude        | the relay host's logged-in Claude CLI | No API key is stored; runs a dedicated Node worker per conversation    |
+| **Cursor (Agent SDK)** | ⚙️ Settings → Providers → Cursor        | your Cursor API key, stored in the relay DB | Runs a dedicated Node worker per conversation through the Cursor Agent SDK |
 
 ### Claude (Agent SDK)
 
-Turn on **⚙️ Settings → Claude SDK → Enable Claude for New Chat model selection**. The relay authenticates through the Claude credentials already present on the host machine (`~/.claude`), so there is no key to enter — run `claude` once on the relay host and log in first.
+Turn on **⚙️ Settings → Providers → Claude → Enable Claude for New Chat model selection**. The relay authenticates through the Claude credentials present on the host machine (`~/.claude`), so there is no key to enter.
+
+The same panel manages the account itself. The row at the top names the signed-in account and plan, and:
+
+- **Relogin** runs the Claude CLI's login on the relay host and brings the flow to the browser: the authorize link appears inline with a **Copy link** button — open it on any device, authorize on claude.ai, then paste the returned code back into the field. The relay holds no Claude secret; the CLI rewrites the host credentials, and a fresh model discovery runs straight after, so switching accounts needs no relay restart. The flow is pushed over the socket, so you can start it on one device and finish it on another, and closing the modal does not lose it.
+- **Logout** asks for confirmation first and tells you how many Claude workers are running. Running Claude sessions keep the previous account's token until their worker exits; new sessions use the new account.
+
+If Claude has never been logged in on the host, running `claude` there once still works as before.
 
 Enabling it also runs model discovery against the Agent SDK and adds the discovered `claude-*` model IDs to the pickers. Use **Select Models → Claude SDK** to choose which of them appear in the composer; the configured default model always stays enabled.
 
@@ -295,7 +302,7 @@ Differences from Copilot conversations:
 
 ### Cursor (Agent SDK)
 
-Turn on **⚙️ Settings → Cursor SDK**, paste your Cursor API key, and enable it for New Chat model selection. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model always stays enabled).
+Turn on **⚙️ Settings → Providers → Cursor**, paste your Cursor API key, and enable it for New Chat model selection. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model always stays enabled).
 
 What Cursor conversations support:
 
@@ -305,7 +312,7 @@ What Cursor conversations support:
 - The browsable **Session** root points at the worker's per-session agent store, created on the session's first turn
 - Expired cached agent handles are recreated and retried automatically once — a second auth failure means the API key itself is invalid
 
-Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under Settings → Cursor monthly plan allowance.
+Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under Settings → Providers → Cursor → Cursor monthly plan allowance.
 
 ## Relay modes
 
@@ -333,12 +340,13 @@ Selection is persisted in browser storage and attached per message.
 
 ## Settings (⚙️ in the web UI)
 
-These live in the relay database rather than `server/config.json`, and apply to every browser that connects:
+The modal is organised into four tabs — **General**, **Providers** (with an OpenAI / Claude / Grok / Cursor sub-tab each), **Previews**, and **Notifications** — and reopens on the tab you used last. Most of these settings live in the relay database rather than `server/config.json`, and apply to every browser that connects:
 
 | Setting                    | Default    | What it does                                                                    |
 | -------------------------- | ---------- | ------------------------------------------------------------------------------- |
 | OpenAI API key / model / base URL | —   | Enables the OpenAI and OpenAI Image providers                                    |
 | Claude (Agent SDK)         | disabled   | Enables Claude as a New Chat provider and runs model discovery                    |
+| Claude account (Relogin / Logout) | host login | Switches the Claude account the relay host's CLI uses, from the browser (see [Claude (Agent SDK)](#claude-agent-sdk)) |
 | Max turn duration          | `60 min`   | Hard cap on how long one turn may run before the relay requeues it (see below)    |
 | Default session workspace root | —      | CWD used by sessions that have no configured root                                |
 | Install app name           | —          | Label used for future PWA installs (per browser)                                 |
@@ -518,6 +526,7 @@ Common routes:
 - Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
 - Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
+- Claude account auth: `/api/claude/auth/status`, `/api/claude/auth/login/start`, `/api/claude/auth/login/code`, `/api/claude/auth/login/cancel`, `/api/claude/auth/logout`
 - Cursor worker: `/api/cursor-agent-id`, `/api/cursor-context-usage`, `/api/cursor-plan-usage`
 - Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
@@ -544,8 +553,8 @@ For deeper implementation/API details, see `[server/README.md](server/README.md)
 | Wrong/old model shown              | Check `/api/models` and extension logs for model snapshot updates                |
 | Clarification card not progressing | Answer via the web card; relay resumes after question status becomes `answered`  |
 | File links fail                    | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
-| Claude missing from New Chat       | Enable it in **⚙️ Settings → Claude SDK**; the toggle is off by default           |
-| Claude reply says it cannot authenticate | Run `claude` on the relay host and log in, then retry the turn             |
+| Claude missing from New Chat       | Enable it in **⚙️ Settings → Providers → Claude**; the toggle is off by default   |
+| Claude reply says it cannot authenticate | Press **Relogin** in **⚙️ Settings → Providers → Claude** (or run `claude` on the relay host), then retry the turn |
 | Claude model list empty or stale   | Re-save the Claude settings, or use **Select Models → Refresh** to rerun discovery |
 | Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
 | No usage line under a reply        | Expected for OpenAI, Claude, and Cursor turns; only Copilot turns record plan usage |

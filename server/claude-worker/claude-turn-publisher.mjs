@@ -262,7 +262,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     const isAuthError = /authentication|logged in|login|credential|api key/i.test(errorText);
     await publishResponse(message, {
       text: isAuthError
-        ? `System note: the Claude runtime could not authenticate (${errorText}). Log in with the Claude CLI on the relay host (run \`claude\`), then retry.`
+        ? `System note: the Claude runtime could not authenticate (${errorText}). Log in again from Settings → Providers → Claude → Relogin (or run \`claude\` on the relay host), then retry.`
         : `System note: the Claude turn failed (${errorText}). Retry or send a new message.`,
       model: null,
       terminalError: {

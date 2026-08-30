@@ -32,6 +32,8 @@ import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
 import { refreshPushSettingsSection } from './push-settings.js';
+import { selectSettingsTab } from './settings-tabs.js';
+import { refreshClaudeAuthSection } from './claude-auth-ui.js';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -1328,9 +1330,12 @@ subscribePreviews(() => {
   renderPreviewsSection();
 });
 
-export function openSettingsModal() {
+// `tab` / `providerTab` are optional deep links (e.g. openSettingsModal('providers', 'claude'));
+// omitting them restores the last tab the user was on.
+export function openSettingsModal(tab, providerTab) {
   closeChatActionsMenu();
   const modal = document.getElementById('settings-modal');
+  selectSettingsTab(tab, providerTab);
   const themeSelect = document.getElementById('theme-select');
   if (themeSelect) {
     themeSelect.value = readLocalStorage(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
@@ -1345,6 +1350,7 @@ export function openSettingsModal() {
   claudeSettingsInputsDirty = false;
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();
+  void refreshClaudeAuthSection();
   grokSettingsInputsDirty = false;
   ensureGrokSettingsInputTracking();
   void syncGrokSettingsInputs();

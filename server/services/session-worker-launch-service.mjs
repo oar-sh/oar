@@ -372,6 +372,10 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     'COPILOT_PROVIDER_WIRE_API',
     'COPILOT_MODEL',
     'COPILOT_WEB_RELAY_WORKER_KIND',
+    // Without this the tmux path would fall back to ~/.claude while the relay
+    // (and the detached spawn path, which inherits the full environment) uses
+    // the override — worker and relay would read different config roots.
+    'CLAUDE_CONFIG_DIR',
     'CLAUDE_RELAY_MODEL',
     'CURSOR_RELAY_MODEL',
     'CURSOR_AGENT_STORE_DIR',

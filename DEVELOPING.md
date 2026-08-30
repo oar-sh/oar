@@ -118,7 +118,7 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **1608 pass / 0 fail / 4 skip on Windows**, **1612 pass / 0 fail / 0 skip on Linux**.
+Expected: **2033 pass / 0 fail / 4 skip on Windows**, **2037 pass / 0 fail / 0 skip on Linux**.
 The 4 Windows skips are host-gated (0600 file modes, symlinks) and run on Linux.
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
@@ -145,10 +145,14 @@ npm run test:e2e
 
 The e2e runner spawns its own `server.js` on a free port with an isolated state directory
 (`COPILOT_WEB_RELAY_DATA_DIR` + `COPILOT_WEB_RELAY_CONFIG` pointed at a temp dir), so it can
-run alongside a live relay without touching its database, singleton lock, or config. The test
-server also runs with `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1`, so it never launches real
-Copilot CLI clients or Claude workers; set `RELAY_E2E_ALLOW_CLI=1` explicitly (with user
-permission) if a run genuinely needs live turns.
+run alongside a live relay without touching its database, singleton lock, or config. `HOME`,
+`USERPROFILE`, `COPILOT_SESSION_STATE_DIR` and `CLAUDE_CONFIG_DIR` are redirected into the
+same temp root, so no host provider state (Copilot sessions, Claude credentials) is visible
+to it. The test server also runs with `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1`, so it never
+launches real Copilot CLI clients, Claude workers, or `claude auth login/logout/status` —
+every one of those spawn paths refuses outright; set `RELAY_E2E_ALLOW_CLI=1` explicitly (with
+user permission) if a run genuinely needs live turns (even then the auth subcommands are
+pointed at `server/services/fixtures/claude-auth-stub.sh`, never the real CLI).
 
 Extra arguments are forwarded to Playwright, so a single spec can be run in isolation:
 

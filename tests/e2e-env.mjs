@@ -28,6 +28,12 @@ export function relayDataDir() {
   return requireEnv("RELAY_TEST_DATA_DIR");
 }
 
+// Fake credentials file the Claude auth stub CLI treats as "logged in".
+// Lives under the test server's isolated CLAUDE_CONFIG_DIR, never the host's.
+export function relayClaudeCredFile() {
+  return requireEnv("RELAY_TEST_CLAUDE_CRED_FILE");
+}
+
 export function relayDbPath() {
   return path.join(relayDataDir(), "copilot.db");
 }

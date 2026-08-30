@@ -86,6 +86,11 @@ async function main() {
   // live relay running out of the same checkout.
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-remote-e2e-"));
   const dataDir = path.join(stateRoot, "data");
+  const claudeConfigDir = path.join(stateRoot, "claude-config");
+  fs.mkdirSync(claudeConfigDir, { recursive: true });
+  // "Logged in" for the stub CLI means this file exists; specs seed and read it
+  // to control the starting account state (tests/claude-auth.spec.mjs).
+  const claudeCredFile = path.join(claudeConfigDir, "credentials.json");
 
   // The test server must never spawn real Copilot CLI clients or Claude workers.
   // Set RELAY_E2E_ALLOW_CLI=1 explicitly (with user permission) to test live turns.
@@ -122,6 +127,19 @@ async function main() {
         COPILOT_SESSION_STATE_DIR: path.join(stateRoot, "session-state"),
         HOME: stateRoot,
         USERPROFILE: stateRoot,
+        // The Claude CLI reads CLAUDE_CONFIG_DIR ahead of HOME, and the relay
+        // now passes it straight through to `claude auth …`; without an
+        // override the "isolated" server would address the developer's real
+        // Claude credentials.
+        CLAUDE_CONFIG_DIR: claudeConfigDir,
+        // Second belt: even with RELAY_E2E_ALLOW_CLI=1 the auth subcommands hit
+        // a stub that only touches the temp state root, never the real CLI.
+        COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN: path.join(repoRoot, "server", "services", "fixtures", "claude-auth-stub.sh"),
+        CLAUDE_AUTH_STUB_CRED_FILE: claudeCredFile,
+        // The CLI kill switch below would otherwise refuse the auth spawns too.
+        // This opt-in is only honoured together with the stub path above, so the
+        // real `claude` still can never run here — see claude-auth-service.mjs.
+        COPILOT_WEB_RELAY_CLAUDE_AUTH_ALLOW_STUB_SPAWN: "1",
         ...(disableCliSpawn ? { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: disableCliSpawn } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -178,6 +196,7 @@ async function main() {
         PLAYWRIGHT_BASE_URL: baseUrl,
         RELAY_TEST_TOKEN: token,
         RELAY_TEST_DATA_DIR: dataDir,
+        RELAY_TEST_CLAUDE_CRED_FILE: claudeCredFile,
       },
       stdio: "inherit",
       windowsHide: false,

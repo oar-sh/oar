@@ -39,6 +39,7 @@ import { registerGitRoutes } from './routes/git-routes.mjs';
 import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
+import { createClaudeAuthService } from './services/claude-auth-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
 import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
@@ -2981,6 +2982,10 @@ const stmts = {
   ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+// Owns the `claude auth …` child processes, so the runtime (not the route
+// module) constructs it: shutdownRuntime() has to be able to dispose a login
+// PTY that is still holding a process group.
+const claudeAuthService = createClaudeAuthService();
 
 // ─── Web Push ─────────────────────────────────────────────────────────────────
 // VAPID keys are generated once and persisted in app_settings; regenerating
@@ -6663,6 +6668,7 @@ const sharedRouteDeps = {
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
+  claudeAuthService,
   imageOperationService,
   windowsAutostartService,
   pushDispatchService,
@@ -7177,6 +7183,9 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   void sdkSessionImportService.dispose().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session importer shutdown failed: ${error?.message || error}`);
   });
+  try { claudeAuthService.dispose(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}Claude auth service shutdown failed: ${error?.message || error}`);
+  }
   sessionWorkerWebSocketService.stop();
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();

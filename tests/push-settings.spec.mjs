@@ -53,7 +53,7 @@ function authHeaders() {
 // wait for the settings modal entry point before poking it.
 async function openSettings(page) {
   await page.waitForFunction(() => typeof window.openSettingsModal === "function");
-  await page.evaluate(() => window.openSettingsModal());
+  await page.evaluate(() => window.openSettingsModal("notifications"));
 }
 
 test.describe.serial("push notification settings", () => {
