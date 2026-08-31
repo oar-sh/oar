@@ -151,7 +151,7 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **2281 pass / 0 fail / 4 skip on Windows**, **2285 pass / 0 fail / 0 skip on Linux**.
+Expected: **2286 pass / 0 fail / 4 skip on Windows**, **2290 pass / 0 fail / 0 skip on Linux**.
 The 4 Windows skips are host-gated (0600 file modes, symlinks) and run on Linux.
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,

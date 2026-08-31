@@ -358,6 +358,20 @@ export function createCopilotEventNormalizer() {
     return actions;
   }
 
+  // The agent's explicit closing message, delivered via session.task_complete.
+  // In autopilot agent mode the model can finish with BOTH durable
+  // assistant.messages empty — the whole answer lives in the task summary
+  // (live burn-in, 2026-08-31: "echo CWD" produced 145 output tokens and an
+  // empty reply). The extension already treats task_complete({ summary }) as
+  // "the agent's explicit closing message — highest priority"
+  // (runtime/session-io.mjs); the same precedence applies here.
+  let taskCompleteSummary = '';
+
+  /** What the user should read: the task summary outranks composed text. */
+  function finalText() {
+    return taskCompleteSummary || composeText();
+  }
+
   function composeText() {
     if (!messageOrder.length) return '';
     if (cachedPrefix === null) {
@@ -427,10 +441,16 @@ export function createCopilotEventNormalizer() {
     return [...strays, {
       channel: 'result',
       payload: {
-        text: composeText(),
+        text: finalText(),
         // Per-prompt texts, so an interaction that absorbed a steered message
-        // can answer each queue row with the reply that belongs to it.
-        segmentTexts: segments.map((_, index) => segmentText(index)),
+        // can answer each queue row with the reply that belongs to it. The
+        // task summary closes the LAST prompt — earlier segments keep their
+        // own streamed replies.
+        segmentTexts: segments.map((_, index) => (
+          taskCompleteSummary && index === segments.length - 1
+            ? taskCompleteSummary
+            : segmentText(index)
+        )),
         promptCount: segments.length,
         isError,
         aborted,
@@ -721,6 +741,21 @@ export function createCopilotEventNormalizer() {
           errorData: data,
         });
       }
+      // ---- explicit closing message ----------------------------------------
+      case 'session.task_complete': {
+        // Root-agent only by construction: an agentId-tagged task_complete
+        // (a subagent finishing its own autopilot loop) was already consumed
+        // by the subagent block above and never reaches this switch.
+        const summary = String(data.summary || '').trim();
+        if (!summary) return [];
+        taskCompleteSummary = summary;
+        // Stream it so the reply is visible before the terminal result lands —
+        // in the empty-assistant-text case nothing has streamed yet.
+        const text = finalText();
+        if (!shouldEmitStreamUpdate(text, lastEmittedStreamText)) return [];
+        lastEmittedStreamText = text;
+        return [{ channel: 'stream', payload: { text, done: false, subagentRunId: null } }];
+      }
       // ---- the one true terminator -----------------------------------------
       case 'session.idle': {
         if (data.aborted === true) aborted = true;
@@ -748,7 +783,7 @@ export function createCopilotEventNormalizer() {
 
   return {
     normalize,
-    finalStreamText: composeText,
+    finalStreamText: finalText,
     segmentText,
     promptCount: () => segments.length,
     /**

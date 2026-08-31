@@ -238,6 +238,85 @@ test('a subagent inner tool call cannot hijack the run id of a nested subagent',
   ]);
 });
 
+// Live burn-in regression (session 3173ef84, 2026-08-31): in autopilot agent
+// mode the model can end with BOTH durable assistant.messages empty and the
+// whole answer inside session.task_complete({ summary }) — the turn published
+// "completed without a text reply" while 145 output tokens sat in the summary.
+test('task_complete summary becomes the reply when assistant text is empty', () => {
+  const { actions } = run([
+    { type: 'session.start', data: { sessionId: 's-1', selectedModel: 'gpt-5.6-luna' } },
+    { type: 'user.message', data: {} },
+    { type: 'assistant.turn_start', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: '', model: 'gpt-5.6-luna' } },
+    { type: 'tool.execution_start', data: { toolName: 'bash', arguments: { command: 'pwd' } } },
+    { type: 'tool.execution_complete', data: { success: true } },
+    { type: 'assistant.turn_end', data: {} },
+    { type: 'assistant.turn_start', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-2', content: '', model: 'gpt-5.6-luna' } },
+    { type: 'tool.execution_start', data: { toolName: 'task_complete', arguments: {} } },
+    { type: 'tool.execution_complete', data: { success: true } },
+    { type: 'assistant.turn_end', data: {} },
+    { type: 'session.task_complete', data: { summary: 'Current working directory: `/home/dev/playground`', success: true } },
+    { type: 'session.idle', data: {} },
+  ]);
+
+  const result = terminal(actions);
+  assert.equal(result.text, 'Current working directory: `/home/dev/playground`');
+  assert.deepEqual(result.segmentTexts, ['Current working directory: `/home/dev/playground`']);
+  assert.equal(result.isError, false);
+  // The summary streams before the terminal result so the UI shows it live.
+  const streams = only(actions, 'stream');
+  assert.ok(streams.length >= 1);
+  assert.equal(streams[streams.length - 1].payload.text, 'Current working directory: `/home/dev/playground`');
+});
+
+test('task_complete summary outranks streamed text, mirroring the extension', () => {
+  // runtime/session-io.mjs: task_complete({ summary }) is "the agent's
+  // explicit closing message — highest priority".
+  const { actions, normalizer } = run([
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: 'working on it…' } },
+    { type: 'session.task_complete', data: { summary: 'All done: 3 files changed.' } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(terminal(actions).text, 'All done: 3 files changed.');
+  assert.equal(normalizer.finalStreamText(), 'All done: 3 files changed.');
+});
+
+test('task_complete with a blank summary changes nothing', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: 'the real reply' } },
+    { type: 'session.task_complete', data: { summary: '   ', success: true } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(terminal(actions).text, 'the real reply');
+});
+
+test('a subagent task_complete never becomes the main reply', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    { type: 'subagent.started', agentId: 'agent-9', data: { toolCallId: 'call-9', name: 'researcher' } },
+    { type: 'session.task_complete', agentId: 'agent-9', data: { summary: 'subagent private summary' } },
+    { type: 'subagent.completed', agentId: 'agent-9', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: 'main reply' } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(terminal(actions).text, 'main reply');
+});
+
+test('with steering, the task summary answers only the last prompt segment', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: 'first answer' } },
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-2', content: '' } },
+    { type: 'session.task_complete', data: { summary: 'second answer via summary' } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.deepEqual(terminal(actions).segmentTexts, ['first answer', 'second answer via summary']);
+});
+
 test('prompt segments split the interaction on user.message boundaries', () => {
   // A steered prompt is answered inside the SAME interaction, so the only way
   // to give its queue row its own reply is to split on the boundaries the
