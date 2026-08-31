@@ -1,0 +1,625 @@
+[
+  {
+    "type": "session.start",
+    "data": {
+      "sessionId": "da6fa1f7-7da7-4488-878a-cb26ec271730",
+      "version": 1,
+      "producer": "copilot-agent",
+      "copilotVersion": "0.0.0",
+      "startTime": "2026-08-31T09:24:28.571Z",
+      "selectedModel": "gpt-5-mini",
+      "contextTier": null,
+      "context": {
+        "cwd": "/tmp/relay-fixture-workspace"
+      },
+      "remoteSteerable": false,
+      "alreadyInUse": false
+    },
+    "id": "e59d8907-154e-455a-b935-40f18a42e09f",
+    "timestamp": "2026-08-31T09:24:28.581Z",
+    "parentId": null
+  },
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "ffd90d92-ff5b-472e-97eb-a12e2b8c8fdc",
+    "timestamp": "2026-08-31T09:24:28.615Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "82830da1-74af-4be9-859d-72a4a157882d",
+    "timestamp": "2026-08-31T09:24:28.618Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "session.title_changed",
+    "data": {
+      "title": "Think then answer"
+    },
+    "ephemeral": true,
+    "id": "c507da45-480f-4477-9359-8bce29a38145",
+    "timestamp": "2026-08-31T09:24:28.620Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "session.mcp_server_status_changed",
+    "data": {
+      "serverName": "github-mcp-server",
+      "status": "pending"
+    },
+    "ephemeral": true,
+    "id": "488bc711-447d-45ab-8a1a-a374346ff26a",
+    "timestamp": "2026-08-31T09:24:28.631Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "session.mcp_server_status_changed",
+    "data": {
+      "serverName": "github-mcp-server",
+      "status": "connected"
+    },
+    "ephemeral": true,
+    "id": "fa8ba7fc-050c-4e1c-812b-cfd11bbf3f76",
+    "timestamp": "2026-08-31T09:24:28.977Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "session.mcp_servers_loaded",
+    "data": {
+      "servers": [
+        {
+          "name": "github-mcp-server",
+          "status": "connected",
+          "source": "builtin"
+        }
+      ]
+    },
+    "ephemeral": true,
+    "id": "4b019d79-ed2a-4b61-b039-92370910ad54",
+    "timestamp": "2026-08-31T09:24:28.977Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "session.tools_updated",
+    "data": {
+      "model": "spike-model"
+    },
+    "ephemeral": true,
+    "id": "313dcd44-7779-4c39-a2ed-50d9cf6f15a3",
+    "timestamp": "2026-08-31T09:24:29.249Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "user.message",
+    "data": {
+      "content": "Think then answer",
+      "transformedContent": "<current_datetime>2026-08-31T09:24:29.249+00:00</current_datetime>\n\nThink then answer",
+      "supportedNativeDocumentMimeTypes": [],
+      "delivery": "idle",
+      "interactionId": "d822b1ed-317c-48fb-9238-bb06bc96b6b9",
+      "turnId": "0",
+      "parentAgentTaskId": "4c14985f-5665-41eb-a513-8abf05569efb"
+    },
+    "id": "aba0e0f1-144c-407d-8dd1-ceed2df50b87",
+    "timestamp": "2026-08-31T09:24:29.249Z",
+    "parentId": "e59d8907-154e-455a-b935-40f18a42e09f"
+  },
+  {
+    "type": "model.turn_started",
+    "data": {
+      "kind": "turn_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168269254
+    },
+    "ephemeral": true,
+    "id": "999a0a08-6ae7-4208-af15-388b0a4f5965",
+    "timestamp": "2026-08-31T09:24:29.254Z",
+    "parentId": "1481878b-b9e6-4935-9893-27d0f51c97a8"
+  },
+  {
+    "type": "assistant.turn_start",
+    "data": {
+      "turnId": "0",
+      "interactionId": "d822b1ed-317c-48fb-9238-bb06bc96b6b9"
+    },
+    "id": "99ddf37a-85ac-4789-a2eb-1f827ade32ca",
+    "timestamp": "2026-08-31T09:24:29.255Z",
+    "parentId": "1481878b-b9e6-4935-9893-27d0f51c97a8"
+  },
+  {
+    "type": "session.usage_info",
+    "ephemeral": true,
+    "data": {
+      "tokenLimit": 128000,
+      "currentTokens": 13226,
+      "messagesLength": 2,
+      "systemTokens": 6142,
+      "conversationTokens": 33,
+      "toolDefinitionsTokens": 7051,
+      "isInitial": true
+    },
+    "id": "33e65cf0-e8a9-494c-9e58-49aafbcd7ae6",
+    "timestamp": "2026-08-31T09:24:29.274Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "model.log",
+    "data": {
+      "kind": "log",
+      "level": "debug",
+      "message": "Model does not support vision, skipping image processing"
+    },
+    "ephemeral": true,
+    "id": "c7f8e734-40c8-4c9d-af95-7a22dc29a8f8",
+    "timestamp": "2026-08-31T09:24:29.275Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "model.call_start",
+    "data": {
+      "turnId": "0",
+      "model": "spike-model"
+    },
+    "ephemeral": true,
+    "id": "65b6159a-ac95-4ced-8106-e5e9e0dad0ee",
+    "timestamp": "2026-08-31T09:24:29.276Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "model.model_call_started",
+    "data": {
+      "kind": "model_call_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168269276
+    },
+    "ephemeral": true,
+    "id": "a4c037ee-0bea-40a0-9c5b-a8e5ea08fefc",
+    "timestamp": "2026-08-31T09:24:29.276Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 12
+    },
+    "ephemeral": true,
+    "id": "91294966-a652-4485-aca1-2d017846ad23",
+    "timestamp": "2026-08-31T09:24:29.283Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.reasoning_delta",
+    "data": {
+      "reasoningId": "6af51cff-da01-474c-aca0-04f9cffd8bd1",
+      "deltaContent": "Let me think"
+    },
+    "ephemeral": true,
+    "id": "639c5433-eb9d-4c87-aa44-5bdc0d5a9f59",
+    "timestamp": "2026-08-31T09:24:29.283Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 23
+    },
+    "ephemeral": true,
+    "id": "da9c525a-d5e6-439d-a3ac-e680f547eabf",
+    "timestamp": "2026-08-31T09:24:29.343Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.reasoning_delta",
+    "data": {
+      "reasoningId": "6af51cff-da01-474c-aca0-04f9cffd8bd1",
+      "deltaContent": " about this"
+    },
+    "ephemeral": true,
+    "id": "2f079082-cc4c-4cd3-a888-82a98804dd99",
+    "timestamp": "2026-08-31T09:24:29.343Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 34
+    },
+    "ephemeral": true,
+    "id": "846265b4-0073-4de9-a95a-e3e01b8ad33d",
+    "timestamp": "2026-08-31T09:24:29.403Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.reasoning_delta",
+    "data": {
+      "reasoningId": "6af51cff-da01-474c-aca0-04f9cffd8bd1",
+      "deltaContent": " carefully."
+    },
+    "ephemeral": true,
+    "id": "d38b8326-0a02-48b1-94fb-c8c78bf3c3ed",
+    "timestamp": "2026-08-31T09:24:29.403Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 37
+    },
+    "ephemeral": true,
+    "id": "1e672dae-3c07-4224-a283-c85eb6dff2ad",
+    "timestamp": "2026-08-31T09:24:29.463Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.message_start",
+    "data": {
+      "messageId": "b0fbaa4e-b81b-44c9-ba27-0f22ad7369ea"
+    },
+    "ephemeral": true,
+    "id": "f8625a26-29ee-497a-b710-914575c1cfac",
+    "timestamp": "2026-08-31T09:24:29.463Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "b0fbaa4e-b81b-44c9-ba27-0f22ad7369ea",
+      "deltaContent": "SPI"
+    },
+    "ephemeral": true,
+    "id": "d7472fa0-18d0-45bf-8c3d-8dddafef024d",
+    "timestamp": "2026-08-31T09:24:29.463Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 39
+    },
+    "ephemeral": true,
+    "id": "12785015-4acc-4ac9-b9b0-f6d2d98c155e",
+    "timestamp": "2026-08-31T09:24:29.524Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "b0fbaa4e-b81b-44c9-ba27-0f22ad7369ea",
+      "deltaContent": "KE"
+    },
+    "ephemeral": true,
+    "id": "50b57168-d160-4f43-8df8-da6709c44c5b",
+    "timestamp": "2026-08-31T09:24:29.524Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 42
+    },
+    "ephemeral": true,
+    "id": "a57f068a-68ed-4e07-a001-d59c0375fe46",
+    "timestamp": "2026-08-31T09:24:29.585Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "b0fbaa4e-b81b-44c9-ba27-0f22ad7369ea",
+      "deltaContent": "_OK"
+    },
+    "ephemeral": true,
+    "id": "6655a8b5-7cac-495d-9afe-56b264d10636",
+    "timestamp": "2026-08-31T09:24:29.585Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.usage",
+    "data": {
+      "model": "spike-model",
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "reasoningTokens": 0,
+      "cost": 0,
+      "duration": 372,
+      "timeToFirstTokenMs": 6.664305,
+      "outputTtftMs": 6.707647,
+      "interTokenLatencyMs": 51.882867142857144,
+      "initiator": "user",
+      "interactionType": "conversation-agent",
+      "isByok": true,
+      "isAuto": false,
+      "maxPromptTokens": 128000,
+      "transport": "http",
+      "apiCallId": "chatcmpl-spike-1",
+      "rte": false,
+      "apiEndpoint": "/chat/completions",
+      "quotaSnapshots": {},
+      "reasoningEffort": "medium",
+      "availableToolCount": 23,
+      "toolTokenCount": 7051,
+      "frontierSource": "estimated",
+      "cacheDetailsReported": false,
+      "numToolCalls": 0,
+      "toolCounts": {},
+      "finishReason": "stop",
+      "contentFilterTriggered": false
+    },
+    "ephemeral": true,
+    "id": "fb9929f6-eedb-45ab-b3b3-4610886f4fa0",
+    "timestamp": "2026-08-31T09:24:29.649Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "model.model_call_success",
+    "data": {
+      "kind": "model_call_success",
+      "turn": 0,
+      "modelCallDurationMs": 372,
+      "ttftMs": 6.664305,
+      "outputTtftMs": 6.707647,
+      "interTokenLatencyMs": 51.882867142857144,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-1",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "user",
+        "transport": "http"
+      },
+      "responseChunk": {
+        "object": "chat.completion.chunk",
+        "id": "chatcmpl-spike-1",
+        "choices": [
+          {
+            "delta": {
+              "responses_message_status": "completed",
+              "role": "assistant",
+              "content": "SPIKE_OK",
+              "refusal": null,
+              "reasoning_text": "Let me think about this carefully."
+            },
+            "finish_reason": "stop",
+            "index": 0
+          }
+        ],
+        "created": 1788168269,
+        "model": "spike-model"
+      },
+      "quotaSnapshots": {},
+      "rte": false,
+      "reasoningEffort": "medium",
+      "maxPromptTokens": 128000,
+      "toolCount": 23,
+      "toolTokenCount": 7051
+    },
+    "ephemeral": true,
+    "id": "5bd94e39-4a1f-45e1-9d85-4b602246f23e",
+    "timestamp": "2026-08-31T09:24:29.650Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "model.call_finished",
+    "data": {
+      "turnId": "0",
+      "dispatchDurationMs": 372,
+      "outcome": "success",
+      "editClassifierVersion": 1,
+      "interactionId": "d822b1ed-317c-48fb-9238-bb06bc96b6b9",
+      "containsBuiltInFileEditRequest": false
+    },
+    "ephemeral": true,
+    "id": "8c66b35f-5c1c-4cf9-adc3-f7812ca641a6",
+    "timestamp": "2026-08-31T09:24:29.650Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "model.message",
+    "data": {
+      "kind": "message",
+      "turn": 0,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-1",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "user",
+        "transport": "http"
+      },
+      "reasoningWireField": "reasoning_content",
+      "message": {
+        "reasoning_text": "Let me think about this carefully.",
+        "content": "SPIKE_OK",
+        "role": "assistant",
+        "refusal": null,
+        "apiCallId": "chatcmpl-spike-1"
+      }
+    },
+    "ephemeral": true,
+    "id": "78f3e0c4-55c1-4a43-a88f-21db2310677d",
+    "timestamp": "2026-08-31T09:24:29.650Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.message",
+    "data": {
+      "messageId": "b0fbaa4e-b81b-44c9-ba27-0f22ad7369ea",
+      "model": "spike-model",
+      "content": "SPIKE_OK",
+      "toolRequests": [],
+      "interactionId": "d822b1ed-317c-48fb-9238-bb06bc96b6b9",
+      "turnId": "0",
+      "reasoningText": "Let me think about this carefully.",
+      "rte": false,
+      "apiCallId": "chatcmpl-spike-1"
+    },
+    "id": "648f77e3-f7fc-453d-b479-9b3fa2379db9",
+    "timestamp": "2026-08-31T09:24:29.651Z",
+    "parentId": "99ddf37a-85ac-4789-a2eb-1f827ade32ca"
+  },
+  {
+    "type": "assistant.reasoning",
+    "data": {
+      "reasoningId": "6af51cff-da01-474c-aca0-04f9cffd8bd1",
+      "content": "Let me think about this carefully.",
+      "rte": false
+    },
+    "ephemeral": true,
+    "id": "e3610900-c1fc-4188-b840-4dc7bd5690e9",
+    "timestamp": "2026-08-31T09:24:29.652Z",
+    "parentId": "648f77e3-f7fc-453d-b479-9b3fa2379db9"
+  },
+  {
+    "type": "model.response",
+    "data": {
+      "kind": "response",
+      "turn": 0,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-1"
+      },
+      "response": {
+        "reasoning_text": "Let me think about this carefully.",
+        "content": "SPIKE_OK",
+        "role": "assistant",
+        "refusal": null
+      }
+    },
+    "ephemeral": true,
+    "id": "81ea01da-5641-4ed4-9fd4-c13b2ebf7c3d",
+    "timestamp": "2026-08-31T09:24:29.653Z",
+    "parentId": "648f77e3-f7fc-453d-b479-9b3fa2379db9"
+  },
+  {
+    "type": "model.turn_ended",
+    "data": {
+      "kind": "turn_ended",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168269653
+    },
+    "ephemeral": true,
+    "id": "4ef485d8-11e4-4449-bff3-56de2211de0d",
+    "timestamp": "2026-08-31T09:24:29.653Z",
+    "parentId": "648f77e3-f7fc-453d-b479-9b3fa2379db9"
+  },
+  {
+    "type": "assistant.turn_end",
+    "data": {
+      "turnId": "0"
+    },
+    "id": "876bffd8-eda2-4a99-a188-dbd98237443b",
+    "timestamp": "2026-08-31T09:24:29.654Z",
+    "parentId": "648f77e3-f7fc-453d-b479-9b3fa2379db9"
+  },
+  {
+    "type": "assistant.idle",
+    "data": {},
+    "ephemeral": true,
+    "id": "ee953adc-b721-44b3-9aaf-70b263c86451",
+    "timestamp": "2026-08-31T09:24:29.658Z",
+    "parentId": "876bffd8-eda2-4a99-a188-dbd98237443b"
+  },
+  {
+    "type": "session.idle",
+    "data": {
+      "mode": "interactive"
+    },
+    "ephemeral": true,
+    "id": "440c9d94-ea53-4938-b987-27da9d482262",
+    "timestamp": "2026-08-31T09:24:29.658Z",
+    "parentId": "876bffd8-eda2-4a99-a188-dbd98237443b"
+  }
+]

@@ -2,19 +2,16 @@
  * Map ACP session/update payloads onto the six relay channels used by
  * Claude/Cursor workers: init, stream, thought, activity, subagent, result.
  */
+import { capThought } from '../../shared/thought-cap.mjs';
+import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
+
 const MAX_TOOL_DETAIL_LENGTH = 140;
-const MAX_THOUGHT_CHARS = 16 * 1024;
 const SUBAGENT_TOOL_NAMES = new Set(['task', 'agent', 'subagent']);
 
 function truncate(text, maxLength = MAX_TOOL_DETAIL_LENGTH) {
   const value = String(text || '').trim();
   if (value.length <= maxLength) return value;
   return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
-}
-
-function capThought(text) {
-  const value = String(text || '');
-  return value.length <= MAX_THOUGHT_CHARS ? value : value.slice(0, MAX_THOUGHT_CHARS);
 }
 
 export function extractTextContent(content) {
@@ -29,18 +26,9 @@ export function extractTextContent(content) {
   return '';
 }
 
-export function shouldEmitStreamUpdate(nextText, previousText) {
-  const next = String(nextText || '');
-  const prev = String(previousText || '');
-  if (!next) return false;
-  if (!prev) return true;
-  if (next === prev) return false;
-  const delta = next.length - prev.length;
-  if (delta >= 24) return true;
-  if (delta > 0 && /[\n.!?:)]$/.test(next)) return true;
-  if (delta <= 0) return true;
-  return false;
-}
+// Re-exported (rather than defined here) so existing importers of this
+// normalizer keep working; the rule itself lives in shared/.
+export { shouldEmitStreamUpdate };
 
 export function summarizeToolInput(input) {
   if (!input || typeof input !== 'object') {

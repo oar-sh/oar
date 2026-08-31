@@ -1,6 +1,7 @@
+import { capThought } from '../../shared/thought-cap.mjs';
+import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
+
 const MAX_TOOL_DETAIL_LENGTH = 140;
-// Matches the Copilot reasoning-stream bridge's per-thought cap.
-const MAX_THOUGHT_CHARS = 16 * 1024;
 const REDACTED_THINKING_PLACEHOLDER = '[Reasoning redacted by the model provider]';
 const SUBAGENT_TOOL_NAMES = new Set(['task', 'agent']);
 
@@ -15,11 +16,6 @@ function formatCompactTokens(value) {
   if (!Number.isFinite(n)) return '';
   if (Math.abs(n) < 1000) return String(Math.round(n));
   return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
-}
-
-function capThought(text) {
-  const value = String(text || '');
-  return value.length <= MAX_THOUGHT_CHARS ? value : value.slice(0, MAX_THOUGHT_CHARS);
 }
 
 /**
@@ -120,20 +116,9 @@ export function formatToolActivityText(toolName, input) {
   return truncate(summary ? `Tool (${toolName}): ${summary}` : `Tool (${toolName})`);
 }
 
-// Mirrors the emit gating used by the Copilot extension's stream publisher so
-// relay_stream traffic stays comparable across providers.
-export function shouldEmitStreamUpdate(nextText, previousText) {
-  const next = String(nextText || '');
-  const prev = String(previousText || '');
-  if (!next) return false;
-  if (!prev) return true;
-  if (next === prev) return false;
-  const delta = next.length - prev.length;
-  if (delta >= 24) return true;
-  if (delta > 0 && /[\n.!?:)]$/.test(next)) return true;
-  if (delta <= 0) return true;
-  return false;
-}
+// Re-exported (rather than defined here) so existing importers of this
+// normalizer keep working; the rule itself lives in shared/.
+export { shouldEmitStreamUpdate };
 
 /**
  * Stateful normalizer mapping Claude Agent SDK messages onto relay channel

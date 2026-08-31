@@ -1,0 +1,700 @@
+[
+  {
+    "type": "session.shutdown",
+    "data": {
+      "shutdownType": "routine",
+      "totalPremiumRequests": 0,
+      "totalNanoAiu": 0,
+      "totalApiDurationMs": 669,
+      "sessionStartTime": 1788168209277,
+      "eventsFileSizeBytes": 33889,
+      "codeChanges": {
+        "linesAdded": 0,
+        "linesRemoved": 0,
+        "filesModified": []
+      },
+      "modelMetrics": {
+        "spike-model": {
+          "requests": {
+            "count": 3,
+            "cost": 0
+          },
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0
+          },
+          "totalNanoAiu": 0
+        }
+      },
+      "agentMetrics": {
+        "main": {
+          "totalApiDurationMs": 669,
+          "totalNanoAiu": 0,
+          "modelMetrics": {
+            "spike-model": {
+              "requests": {
+                "count": 3,
+                "cost": 0
+              },
+              "usage": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "cacheReadTokens": 0,
+                "cacheWriteTokens": 0,
+                "reasoningTokens": 0
+              },
+              "totalNanoAiu": 0
+            }
+          }
+        }
+      },
+      "currentModel": "spike-model",
+      "currentTokens": 12710,
+      "systemTokens": 5597,
+      "conversationTokens": 178,
+      "toolDefinitionsTokens": 6932
+    },
+    "id": "0e7fcd07-c65c-4295-9fe1-74c861a2298c",
+    "timestamp": "2026-08-31T09:23:38.375Z",
+    "parentId": "5204ee12-f5c1-44f6-af16-6565d6f7e322"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "90c7de3c-0127-4241-9840-c0159df56f10",
+    "timestamp": "2026-08-31T09:23:38.386Z",
+    "parentId": "0e7fcd07-c65c-4295-9fe1-74c861a2298c"
+  },
+  {
+    "type": "session.resume",
+    "data": {
+      "resumeTime": "2026-08-31T09:23:40.594Z",
+      "selectedModel": "gpt-5-mini",
+      "contextTier": null,
+      "sessionLimits": null,
+      "context": {
+        "cwd": "/tmp/relay-fixture-workspace"
+      },
+      "remoteSteerable": false,
+      "eventsFileSizeBytes": 34850,
+      "eventCount": 22,
+      "alreadyInUse": false,
+      "sessionWasActive": false
+    },
+    "id": "51cd9b71-1708-4819-b147-f17306d53cc7",
+    "timestamp": "2026-08-31T09:23:40.771Z",
+    "parentId": "0e7fcd07-c65c-4295-9fe1-74c861a2298c"
+  },
+  {
+    "type": "capabilities.changed",
+    "data": {
+      "ui": {
+        "elicitation": true
+      }
+    },
+    "ephemeral": true,
+    "id": "9be3ad04-8408-4157-9b7f-77db1f20be25",
+    "timestamp": "2026-08-31T09:23:40.772Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "1beba7a5-48c6-48ee-9f58-28b528cfbc3d",
+    "timestamp": "2026-08-31T09:23:40.776Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "16bc37c4-f8da-4823-9aa8-dbff0defff30",
+    "timestamp": "2026-08-31T09:23:40.777Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "session.mcp_server_status_changed",
+    "data": {
+      "serverName": "github-mcp-server",
+      "status": "pending"
+    },
+    "ephemeral": true,
+    "id": "edc590a2-8fb1-4dce-b9f4-4dedae8b1a69",
+    "timestamp": "2026-08-31T09:23:40.788Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "session.mcp_server_status_changed",
+    "data": {
+      "serverName": "github-mcp-server",
+      "status": "connected"
+    },
+    "ephemeral": true,
+    "id": "d634aa55-433f-4215-a757-f2fb41ae800c",
+    "timestamp": "2026-08-31T09:23:41.127Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "session.mcp_servers_loaded",
+    "data": {
+      "servers": [
+        {
+          "name": "github-mcp-server",
+          "status": "connected",
+          "source": "builtin"
+        }
+      ]
+    },
+    "ephemeral": true,
+    "id": "1fc98480-acc8-461c-a9df-a1419672ab5b",
+    "timestamp": "2026-08-31T09:23:41.127Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "session.tools_updated",
+    "data": {
+      "model": "spike-model"
+    },
+    "ephemeral": true,
+    "id": "eedf4241-b891-4e08-8969-d97f7b4c4f0b",
+    "timestamp": "2026-08-31T09:23:41.391Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "user.message",
+    "data": {
+      "content": "SPIKE_TEXT again after resume",
+      "transformedContent": "<current_datetime>2026-08-31T09:23:41.392+00:00</current_datetime>\n\nSPIKE_TEXT again after resume",
+      "supportedNativeDocumentMimeTypes": [],
+      "delivery": "idle",
+      "interactionId": "33aeef76-65f1-42d6-b6a1-7523eb823c9e",
+      "turnId": "0",
+      "parentAgentTaskId": "80649214-25f7-465d-bf77-b2b42113c7c9"
+    },
+    "id": "1e24ae96-4089-4d95-95f4-adbe07ea8378",
+    "timestamp": "2026-08-31T09:23:41.392Z",
+    "parentId": "51cd9b71-1708-4819-b147-f17306d53cc7"
+  },
+  {
+    "type": "model.turn_started",
+    "data": {
+      "kind": "turn_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168221396
+    },
+    "ephemeral": true,
+    "id": "e72171d2-a533-4912-9ee1-b1762ab512cc",
+    "timestamp": "2026-08-31T09:23:41.396Z",
+    "parentId": "9a24ae41-5c22-4e1f-b3fa-07d9a42cc2be"
+  },
+  {
+    "type": "assistant.turn_start",
+    "data": {
+      "turnId": "0",
+      "interactionId": "33aeef76-65f1-42d6-b6a1-7523eb823c9e"
+    },
+    "id": "7da09772-c6cd-4ca8-8f3f-64c14428acc2",
+    "timestamp": "2026-08-31T09:23:41.397Z",
+    "parentId": "9a24ae41-5c22-4e1f-b3fa-07d9a42cc2be"
+  },
+  {
+    "type": "session.usage_info",
+    "ephemeral": true,
+    "data": {
+      "tokenLimit": 128000,
+      "currentTokens": 12698,
+      "messagesLength": 9,
+      "systemTokens": 5597,
+      "conversationTokens": 214,
+      "toolDefinitionsTokens": 6887,
+      "isInitial": true
+    },
+    "id": "3798efe2-dd4d-4bc7-9edb-a8f1f9d1d416",
+    "timestamp": "2026-08-31T09:23:41.416Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "model.log",
+    "data": {
+      "kind": "log",
+      "level": "debug",
+      "message": "Model does not support vision, skipping image processing"
+    },
+    "ephemeral": true,
+    "id": "90cd0d60-a592-4f46-a694-81083ad5ff40",
+    "timestamp": "2026-08-31T09:23:41.417Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "model.call_start",
+    "data": {
+      "turnId": "0",
+      "model": "spike-model"
+    },
+    "ephemeral": true,
+    "id": "41825170-3234-40b1-b4a9-423a55c9cb30",
+    "timestamp": "2026-08-31T09:23:41.418Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "model.model_call_started",
+    "data": {
+      "kind": "model_call_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168221418
+    },
+    "ephemeral": true,
+    "id": "091f6068-1a14-4327-ae10-eaae204b4a39",
+    "timestamp": "2026-08-31T09:23:41.418Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 3
+    },
+    "ephemeral": true,
+    "id": "ca71ea51-5da4-43d8-b960-739196b25a65",
+    "timestamp": "2026-08-31T09:23:41.421Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.message_start",
+    "data": {
+      "messageId": "13c522ae-30b2-4b5b-ac5c-1ea642e40966"
+    },
+    "ephemeral": true,
+    "id": "87255682-c5e1-4fc9-bdc8-9c25b4f05291",
+    "timestamp": "2026-08-31T09:23:41.421Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "13c522ae-30b2-4b5b-ac5c-1ea642e40966",
+      "deltaContent": "SPI"
+    },
+    "ephemeral": true,
+    "id": "fb1473bb-b6d6-4a2f-9781-0cb560b47cc4",
+    "timestamp": "2026-08-31T09:23:41.421Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 5
+    },
+    "ephemeral": true,
+    "id": "c7d5bcff-6387-4991-8606-a84cb1043597",
+    "timestamp": "2026-08-31T09:23:41.502Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "13c522ae-30b2-4b5b-ac5c-1ea642e40966",
+      "deltaContent": "KE"
+    },
+    "ephemeral": true,
+    "id": "3a5a42e1-fc79-4bcb-88ad-fc2014eeb71b",
+    "timestamp": "2026-08-31T09:23:41.502Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 6
+    },
+    "ephemeral": true,
+    "id": "fd1b6ee2-6356-4ecd-b194-6434afe10e5c",
+    "timestamp": "2026-08-31T09:23:41.583Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "13c522ae-30b2-4b5b-ac5c-1ea642e40966",
+      "deltaContent": "_"
+    },
+    "ephemeral": true,
+    "id": "24f7fd39-4d89-4f39-95d9-b229f03d2b59",
+    "timestamp": "2026-08-31T09:23:41.583Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 8
+    },
+    "ephemeral": true,
+    "id": "151c7a39-4f1d-4440-9344-334790b6a9e1",
+    "timestamp": "2026-08-31T09:23:41.664Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "13c522ae-30b2-4b5b-ac5c-1ea642e40966",
+      "deltaContent": "OK"
+    },
+    "ephemeral": true,
+    "id": "4e18eff2-c227-4a7c-b878-dde35754a569",
+    "timestamp": "2026-08-31T09:23:41.664Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.usage",
+    "data": {
+      "model": "spike-model",
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "reasoningTokens": 0,
+      "cost": 0,
+      "duration": 329,
+      "timeToFirstTokenMs": 1.912998,
+      "outputTtftMs": 1.942764,
+      "interTokenLatencyMs": 64.7428166,
+      "initiator": "user",
+      "interactionType": "conversation-agent",
+      "isByok": true,
+      "isAuto": false,
+      "maxPromptTokens": 128000,
+      "transport": "http",
+      "apiCallId": "chatcmpl-spike-5",
+      "rte": false,
+      "apiEndpoint": "/chat/completions",
+      "quotaSnapshots": {},
+      "reasoningEffort": "medium",
+      "availableToolCount": 22,
+      "toolTokenCount": 6887,
+      "frontierSource": "estimated",
+      "cacheDetailsReported": false,
+      "numToolCalls": 0,
+      "toolCounts": {},
+      "finishReason": "stop",
+      "contentFilterTriggered": false
+    },
+    "ephemeral": true,
+    "id": "18f2dbbb-4d89-44e2-ab1e-188f35c194d7",
+    "timestamp": "2026-08-31T09:23:41.748Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "model.model_call_success",
+    "data": {
+      "kind": "model_call_success",
+      "turn": 0,
+      "modelCallDurationMs": 329,
+      "ttftMs": 1.912998,
+      "outputTtftMs": 1.942764,
+      "interTokenLatencyMs": 64.7428166,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-5",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "user",
+        "transport": "http"
+      },
+      "responseChunk": {
+        "object": "chat.completion.chunk",
+        "id": "chatcmpl-spike-5",
+        "choices": [
+          {
+            "delta": {
+              "responses_message_status": "completed",
+              "role": "assistant",
+              "content": "SPIKE_OK",
+              "refusal": null
+            },
+            "finish_reason": "stop",
+            "index": 0
+          }
+        ],
+        "created": 1788168221,
+        "model": "spike-model"
+      },
+      "quotaSnapshots": {},
+      "rte": false,
+      "reasoningEffort": "medium",
+      "maxPromptTokens": 128000,
+      "toolCount": 22,
+      "toolTokenCount": 6887
+    },
+    "ephemeral": true,
+    "id": "22165e22-830b-40cb-ab04-a75d4bad9ca3",
+    "timestamp": "2026-08-31T09:23:41.750Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "model.call_finished",
+    "data": {
+      "turnId": "0",
+      "dispatchDurationMs": 329,
+      "outcome": "success",
+      "editClassifierVersion": 1,
+      "interactionId": "33aeef76-65f1-42d6-b6a1-7523eb823c9e",
+      "containsBuiltInFileEditRequest": false
+    },
+    "ephemeral": true,
+    "id": "fa0c8bc2-8ab6-4c4d-9f6c-37f9d84538fc",
+    "timestamp": "2026-08-31T09:23:41.750Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "model.message",
+    "data": {
+      "kind": "message",
+      "turn": 0,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-5",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "user",
+        "transport": "http"
+      },
+      "message": {
+        "content": "SPIKE_OK",
+        "role": "assistant",
+        "refusal": null,
+        "apiCallId": "chatcmpl-spike-5"
+      }
+    },
+    "ephemeral": true,
+    "id": "e10b13f2-6af9-4c42-883b-5dfab2141a7b",
+    "timestamp": "2026-08-31T09:23:41.750Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "assistant.message",
+    "data": {
+      "messageId": "13c522ae-30b2-4b5b-ac5c-1ea642e40966",
+      "model": "spike-model",
+      "content": "SPIKE_OK",
+      "toolRequests": [],
+      "interactionId": "33aeef76-65f1-42d6-b6a1-7523eb823c9e",
+      "turnId": "0",
+      "rte": false,
+      "apiCallId": "chatcmpl-spike-5"
+    },
+    "id": "f77ae312-b772-4c8d-aa29-558b137edbbc",
+    "timestamp": "2026-08-31T09:23:41.750Z",
+    "parentId": "7da09772-c6cd-4ca8-8f3f-64c14428acc2"
+  },
+  {
+    "type": "model.response",
+    "data": {
+      "kind": "response",
+      "turn": 0,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-5"
+      },
+      "response": {
+        "content": "SPIKE_OK",
+        "role": "assistant",
+        "refusal": null
+      }
+    },
+    "ephemeral": true,
+    "id": "22145ccf-1118-4ca3-bf90-d210431d9974",
+    "timestamp": "2026-08-31T09:23:41.751Z",
+    "parentId": "f77ae312-b772-4c8d-aa29-558b137edbbc"
+  },
+  {
+    "type": "model.turn_ended",
+    "data": {
+      "kind": "turn_ended",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168221751
+    },
+    "ephemeral": true,
+    "id": "439f9439-7251-4f9b-bce7-1c947abf1688",
+    "timestamp": "2026-08-31T09:23:41.751Z",
+    "parentId": "f77ae312-b772-4c8d-aa29-558b137edbbc"
+  },
+  {
+    "type": "assistant.turn_end",
+    "data": {
+      "turnId": "0"
+    },
+    "id": "f2f41194-06ac-4124-9e52-9679734fdc45",
+    "timestamp": "2026-08-31T09:23:41.752Z",
+    "parentId": "f77ae312-b772-4c8d-aa29-558b137edbbc"
+  },
+  {
+    "type": "assistant.idle",
+    "data": {},
+    "ephemeral": true,
+    "id": "ae2e0cb0-ffbc-4a5e-994c-88882bca1ed0",
+    "timestamp": "2026-08-31T09:23:41.756Z",
+    "parentId": "f2f41194-06ac-4124-9e52-9679734fdc45"
+  },
+  {
+    "type": "session.idle",
+    "data": {
+      "mode": "interactive"
+    },
+    "ephemeral": true,
+    "id": "f34e3426-cee8-4a1d-81cb-df9412e9abde",
+    "timestamp": "2026-08-31T09:23:41.757Z",
+    "parentId": "f2f41194-06ac-4124-9e52-9679734fdc45"
+  },
+  {
+    "type": "session.shutdown",
+    "data": {
+      "shutdownType": "routine",
+      "totalPremiumRequests": 0,
+      "totalNanoAiu": 0,
+      "totalApiDurationMs": 998,
+      "sessionStartTime": 1788168209277,
+      "eventsFileSizeBytes": 36622,
+      "codeChanges": {
+        "linesAdded": 0,
+        "linesRemoved": 0,
+        "filesModified": []
+      },
+      "modelMetrics": {
+        "spike-model": {
+          "requests": {
+            "count": 4,
+            "cost": 0
+          },
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0
+          },
+          "totalNanoAiu": 0
+        }
+      },
+      "agentMetrics": {
+        "main": {
+          "totalApiDurationMs": 998,
+          "totalNanoAiu": 0,
+          "modelMetrics": {
+            "spike-model": {
+              "requests": {
+                "count": 4,
+                "cost": 0
+              },
+              "usage": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "cacheReadTokens": 0,
+                "cacheWriteTokens": 0,
+                "reasoningTokens": 0
+              },
+              "totalNanoAiu": 0
+            }
+          }
+        }
+      },
+      "currentModel": "spike-model",
+      "currentTokens": 12753,
+      "systemTokens": 5597,
+      "conversationTokens": 221,
+      "toolDefinitionsTokens": 6932
+    },
+    "id": "2c95b501-7f6a-4598-b32d-f923b92e2d15",
+    "timestamp": "2026-08-31T09:23:41.772Z",
+    "parentId": "f2f41194-06ac-4124-9e52-9679734fdc45"
+  }
+]
