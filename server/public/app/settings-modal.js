@@ -36,6 +36,8 @@ import { normalizeKnownCwdPath } from './cwd-picker.js';
 import { refreshPushSettingsSection } from './push-settings.js';
 import { selectSettingsTab } from './settings-tabs.js';
 import { refreshClaudeAuthSection } from './claude-auth-ui.js';
+import { refreshGrokAuthSection } from './grok-auth-ui.js';
+import { refreshCliInstallSections } from './cli-install-ui.js';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -1449,6 +1451,11 @@ export function openSettingsModal(tab, providerTab) {
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();
   void refreshClaudeAuthSection();
+  void refreshGrokAuthSection();
+  // Forced: the cached rows can be 30s stale, and a CLI installed from a shell
+  // in the meantime should show up the moment the panel opens. Sockets keep it
+  // current from here on.
+  void refreshCliInstallSections({ force: true });
   grokSettingsInputsDirty = false;
   ensureGrokSettingsInputTracking();
   void syncGrokSettingsInputs();

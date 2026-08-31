@@ -41,6 +41,8 @@ import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-bo
 import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
 import { applyClaudeAuthState } from './claude-auth-ui.js';
+import { applyGrokAuthState } from './grok-auth-ui.js';
+import { applyCliInstallState } from './cli-install-ui.js';
 import {
   showThinking,
   removeThinking,
@@ -361,6 +363,18 @@ export async function connectSocket(overrideDeps) {
   // login started on the desktop can be finished on a phone (and vice versa).
   socket.on('claude_auth_state', (payload) => {
     applyClaudeAuthState(payload || null);
+  });
+  // Same contract for Grok, one state shorter (no code to paste back). Success
+  // arrives twice — once off the cached status, once when the confirming read
+  // lands — so the renderer is idempotent rather than transition-driven.
+  socket.on('grok_auth_state', (payload) => {
+    applyGrokAuthState(payload || null);
+  });
+  // CLI install transitions AND log chunks. The payload always carries the whole
+  // retained buffer plus a monotonic logSeq, so a client that connects
+  // mid-install renders the full log instead of a suffix.
+  socket.on('cli_install_state', (payload) => {
+    applyCliInstallState(payload || null);
   });
   socket.on('grok_settings_updated', (payload) => {
     deps?.applyGrokSettingsState?.(payload || {});

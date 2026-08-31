@@ -46,6 +46,11 @@ async function main() {
         RELAY_TEST_TOKEN: token,
         RELAY_TEST_DATA_DIR: relay.dataDir,
         RELAY_TEST_CLAUDE_CRED_FILE: relay.claudeCredFile,
+        // The CLI-install specs boot their own relay (an install rewrites config
+        // and rebinds env), so only the Grok-account paths are published here.
+        RELAY_TEST_GROK_AUTH_FILE: relay.grokAuthFile,
+        RELAY_TEST_GROK_LOGIN_AUTHORIZED_FILE: relay.grokLoginAuthorizedFile,
+        RELAY_TEST_GROK_LOGIN_DENIED_FILE: relay.grokLoginDeniedFile,
       },
       stdio: "inherit",
       windowsHide: false,

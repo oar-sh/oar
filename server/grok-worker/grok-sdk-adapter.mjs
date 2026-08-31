@@ -22,7 +22,11 @@ export function classifyGrokError(error) {
   ) {
     return {
       code: 'grok.authentication_failed',
-      message: 'Grok authentication failed. Run `grok login` on the relay host, or set XAI_API_KEY.',
+      // Points at the relay's own UI, which renders a Sign in button for this
+      // stable code (relay-error-ctas.mjs); the host-shell advice stays as the
+      // fallback for anyone reading this outside a browser.
+      message: 'Grok authentication failed. Sign in from Settings → Providers → Grok, '
+        + 'or run `grok login` on the relay host / set XAI_API_KEY.',
       isAuth: true,
       isBusy: false,
     };
@@ -48,7 +52,10 @@ export function classifyGrokError(error) {
   if (lower.includes('enoent') || lower.includes('not found') || lower.includes('spawn')) {
     return {
       code: 'grok.cli_missing',
-      message: 'Grok CLI was not found on PATH. Install Grok Build / Grok CLI on the relay host.',
+      // The dead end this plan exists for: the only fix used to be a shell on
+      // the host. The relay now installs it, and this stable code renders an
+      // Install button (relay-error-ctas.mjs).
+      message: 'Grok CLI was not found on PATH. Install it from Settings → Providers → Grok.',
       isAuth: false,
       isBusy: false,
     };

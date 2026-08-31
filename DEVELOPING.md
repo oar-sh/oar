@@ -162,7 +162,7 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **2329 pass / 0 fail / 4 skip on Windows**, **2333 pass / 0 fail / 0 skip on Linux**.
+Expected: **2466 pass / 0 fail / 4 skip on Windows**, **2470 pass / 0 fail / 0 skip on Linux**.
 The 4 Windows skips are host-gated (0600 file modes, symlinks) and run on Linux.
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
@@ -187,6 +187,12 @@ node --test server/services/context-usage-view.test.mjs
 npm run test:e2e
 ```
 
+Expected on Linux: **110 passed / 0 failed / 3 skipped** (the 3 are host-gated). Two question-card
+tests in `relay-question-ui.spec.mjs` (`:82` and `:386`) are **known flaky** and usually pass on
+Playwright's single retry; across five full runs they failed 0–2 times each with no relation to what
+else was in the suite. Treat a failure there as flake only after re-running — anything else failing
+is a regression.
+
 The e2e runner spawns its own `server.js` on a free port with an isolated state directory
 (`COPILOT_WEB_RELAY_DATA_DIR` + `COPILOT_WEB_RELAY_CONFIG` pointed at a temp dir), so it can
 run alongside a live relay without touching its database, singleton lock, or config. `HOME`,
@@ -197,6 +203,21 @@ launches real Copilot CLI clients, Claude workers, or `claude auth login/logout/
 every one of those spawn paths refuses outright; set `RELAY_E2E_ALLOW_CLI=1` explicitly (with
 user permission) if a run genuinely needs live turns (even then the auth subcommands are
 pointed at `server/services/fixtures/claude-auth-stub.sh`, never the real CLI).
+
+Three provider-CLI surfaces are stubbed the same way, each behind a **pair** of variables so the
+kill switch can never be bypassed into running a real binary: `claude auth *`
+(`COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN` + `…_CLAUDE_AUTH_ALLOW_STUB_SPAWN`), the CLI installers
+(`COPILOT_WEB_RELAY_CLI_INSTALL_COMMAND` + `…_CLI_INSTALL_ALLOW_STUB_SPAWN`, pointed at
+`cli-install-stub.sh`), and `grok login/logout` (`GROK_CLI_COMMAND` +
+`…_GROK_AUTH_ALLOW_STUB_SPAWN`, pointed at `grok-stub.sh`).
+
+**`COPILOT_WEB_RELAY_CLI_BIN_DIR` is the one that matters most.** Provider-CLI *detection* walks
+`PATH`, and an isolated relay still inherits the host's `PATH` — it has to, it runs `node` — so
+without this pin `/api/cli/status` reports the developer's own `grok`/`claude`/`copilot`, and with
+the install stub enabled it would run them. The variable **replaces** `PATH` and the descriptors'
+own bin directories rather than being preferred over them, and every test relay gets it pointed at
+an empty directory inside its temp state root. Specs seed a fake binary there to mean "already
+installed"; a spec must never see, run, or modify a host install.
 
 Extra arguments are forwarded to Playwright, so a single spec can be run in isolation:
 
@@ -214,7 +235,10 @@ That isolation env lives in `tests/relay-server-harness.mjs` (`startRelayServer`
 `COPILOT_SDK_PATH` at a stub directory, so a relay's answer never depends on what the host has
 installed. A spec that needs a *differently configured* relay boots its own throwaway one from the
 same helper rather than copying the env block — `tests/copilot-engine.spec.mjs` does this to test
-the Copilot SDK engine's accept path, which the shared server's routing pin makes unreachable.
+the Copilot SDK engine's accept path, which the shared server's routing pin makes unreachable, and
+`tests/cli-install.spec.mjs` because a successful install rewrites that relay's `config.json`, binds
+`GROK_CLI_COMMAND` into its process env and hoists its `PATH` — none of which the shared server's
+other specs should inherit.
 Keep that rare: it costs a server boot per relay.
 
 ### Live smoke tests

@@ -489,6 +489,14 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     // (and the detached spawn path, which inherits the full environment) uses
     // the override — worker and relay would read different config roots.
     'CLAUDE_CONFIG_DIR',
+    // Same divergence, one variable over: the relay binds a resolved `claude`
+    // binary onto its own environment (cli-install-service.mjs §4.3), and the
+    // detached path inherits it for free. Without it here a bound binary would
+    // be silently dropped on the tmux path and the worker would fall back to
+    // whatever `claude` PATH happens to resolve — exactly the failure mode
+    // CLAUDE_CONFIG_DIR above was added for. GROK_CLI_COMMAND, its Grok
+    // counterpart, has always been on this list.
+    'CLAUDE_CODE_EXECUTABLE',
     'CLAUDE_RELAY_MODEL',
     'CURSOR_RELAY_MODEL',
     'CURSOR_AGENT_STORE_DIR',

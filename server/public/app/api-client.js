@@ -306,6 +306,51 @@ export async function claudeLogout() {
   return claudeAuthRequest('/api/claude/auth/logout');
 }
 
+// Provider CLI install / update. The body only ever carries a descriptor id and
+// an action name — the commands themselves are frozen literals in server code —
+// so there is nothing here for a caller to interpolate into a shell.
+export async function getCliStatus({ force = false } = {}) {
+  // Each probe spawns short-lived CLI processes on the host, so a refresh is
+  // opt-in: the settings panel asks for one when it opens, sockets do the rest.
+  return apiFetch(`/api/cli/status${force ? '?force=1' : ''}`);
+}
+
+export async function startCliInstall(provider, action) {
+  return settingsRequest(
+    '/api/cli/install',
+    { provider: String(provider || ''), action: String(action || '') },
+    'Failed to start the CLI install',
+  );
+}
+
+// Kills a running install, and doubles as the dismiss path for a settled one.
+export async function cancelCliInstall() {
+  return settingsRequest('/api/cli/install/cancel', null, 'Failed to cancel the CLI install');
+}
+
+// Grok account auth (Sign in / Sign out). One route shorter than Claude's: the
+// device code rides in the authorize URL and the CLI polls x.ai itself, so
+// nothing is ever pasted back through the relay.
+function grokAuthRequest(path, body = null) {
+  return settingsRequest(path, body, 'Grok auth request failed');
+}
+
+export async function getGrokAuthStatus() {
+  return apiFetch('/api/grok/auth/status');
+}
+
+export async function startGrokLogin() {
+  return grokAuthRequest('/api/grok/auth/login/start');
+}
+
+export async function cancelGrokLogin() {
+  return grokAuthRequest('/api/grok/auth/login/cancel');
+}
+
+export async function grokLogout() {
+  return grokAuthRequest('/api/grok/auth/logout');
+}
+
 export async function loadGrokSettings() {
   return apiFetch('/api/settings/grok');
 }

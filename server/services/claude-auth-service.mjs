@@ -1,6 +1,29 @@
 'use strict';
 import { spawn } from 'child_process';
 
+// The mechanical half of this module now lives in cli-process-runner.mjs, so
+// the CLI install service and the Grok auth service share one implementation
+// of it rather than each growing its own. The four names this module has
+// always exported are re-exported below: every importer and test of this path
+// keeps working, and the state machine underneath is unchanged.
+import {
+  CLI_SPAWN_DISABLED_ERROR,
+  MAX_CAPTURED_OUTPUT_CHARS,
+  joinWrappedLines,
+  killTree as killProcessTree,
+  runToCompletion as runProcessToCompletion,
+  scrubSecrets,
+  stripTerminalEscapes,
+  tailOf,
+} from './cli-process-runner.mjs';
+
+export {
+  CLI_SPAWN_DISABLED_ERROR,
+  joinWrappedLines,
+  scrubSecrets,
+  stripTerminalEscapes,
+};
+
 /**
  * Claude CLI auth (status / login / logout) driven from the relay.
  *
@@ -27,12 +50,7 @@ export const CLAUDE_AUTH_STATUS_TTL_MS = 5_000;
 const CLAUDE_AUTH_STATUS_TIMEOUT_MS = 20_000;
 const CLAUDE_AUTH_LOGOUT_TIMEOUT_MS = 60_000;
 const KILL_ESCALATION_MS = 2_000;
-const MAX_CAPTURED_OUTPUT_CHARS = 16_000;
-const MAX_ERROR_TAIL_CHARS = 600;
 const MAX_CODE_LENGTH = 4_096;
-
-/** Refusal used by every spawn path when the relay runs with CLI spawns off. */
-export const CLI_SPAWN_DISABLED_ERROR = 'cli spawns disabled';
 
 // The authorize URL has moved hosts across CLI releases (claude.com today,
 // claude.ai and console.anthropic.com in older/enterprise builds), so the host
@@ -40,22 +58,7 @@ export const CLI_SPAWN_DISABLED_ERROR = 'cli spawns disabled';
 const AUTH_URL_PATTERN = /https:\/\/(?:[A-Za-z0-9-]+\.)*(?:claude\.(?:com|ai)|anthropic\.com)\/\S*/;
 // OSC-8 hyperlink: ESC ] 8 ; ; <target> (BEL | ESC \)
 const OSC8_PATTERN = /\x1b\]8;;(.*?)(?:\x07|\x1b\\)/g;
-// Any OSC sequence (hyperlinks, window-title sets, clipboard writes): ESC ]
-// <payload> (BEL | ST). Stripped whole so no `0;title` residue reaches the
-// prompt/JSON/error parsers.
-const OSC_PATTERN = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
-// Any CSI sequence (SGR colours, cursor moves, erases).
-const CSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
-// Remaining single-character / other escape sequences.
-const OTHER_ESCAPE_PATTERN = /\x1b[@-Z\\-_]/g;
 const PROMPT_SENTINEL = 'Paste code here';
-// `script` gives the CLI an 80-column PTY, and the CLI hard-wraps its own
-// output at that width. Only a line that is *exactly* that wide is treated as
-// continued: a line that merely ends in a long token ended because the CLI
-// printed a newline, and gluing the next line onto it would corrupt the match.
-// On a differently-sized terminal this degrades to the pre-wrap behaviour (and
-// the OSC-8 href, which never wraps, is preferred anyway).
-const PTY_WRAP_COLUMNS = 80;
 
 const LOGIN_STATES = Object.freeze({
   IDLE: 'idle',
@@ -70,39 +73,6 @@ export const CLAUDE_AUTH_LOGIN_STATES = LOGIN_STATES;
 
 function normalizeText(value) {
   return String(value == null ? '' : value).trim();
-}
-
-/**
- * Removes OSC sequences (including OSC-8 hyperlink wrappers), ANSI CSI
- * sequences and the CR the PTY adds to every line, leaving the human-visible
- * text.
- */
-export function stripTerminalEscapes(value) {
-  return String(value == null ? '' : value)
-    .replace(OSC_PATTERN, '')
-    .replace(CSI_PATTERN, '')
-    .replace(OTHER_ESCAPE_PATTERN, '')
-    .replace(/\r/g, '');
-}
-
-/**
- * Rejoins lines the PTY hard-wrapped mid-token: a wrap fills the terminal width
- * and leaves no trailing space, so a full-width line is stitched onto the line
- * that follows it (repeatedly, for a URL spanning three or more rows).
- */
-export function joinWrappedLines(value) {
-  const lines = String(value == null ? '' : value).split('\n');
-  const joined = [];
-  let previousWrapped = false;
-  for (const line of lines) {
-    if (previousWrapped && joined.length && /^\S/.test(line)) {
-      joined[joined.length - 1] = `${joined[joined.length - 1]}${line}`;
-    } else {
-      joined.push(line);
-    }
-    previousWrapped = line.length === PTY_WRAP_COLUMNS && /\S$/.test(line);
-  }
-  return joined.join('\n');
 }
 
 /**
@@ -134,34 +104,8 @@ export function hasCodePrompt(rawOutput) {
   return stripTerminalEscapes(rawOutput).includes(PROMPT_SENTINEL);
 }
 
-/**
- * Redacts anything token-shaped plus the exact code the user pasted, so an
- * error tail can be surfaced to the UI without leaking a credential. The
- * authorize URL's long PKCE segments get caught by the generic rule too, which
- * is fine: the URL is already carried in the login payload.
- */
-export function scrubSecrets(text, submittedCode = '') {
-  let output = String(text == null ? '' : text);
-  const code = normalizeText(submittedCode);
-  if (code.length >= 4) {
-    output = output.split(code).join('[redacted]');
-  }
-  return output
-    .replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]')
-    .replace(/[A-Za-z0-9_-]{32,}/g, '[redacted]');
-}
-
 function shellQuote(value) {
   return `'${String(value == null ? '' : value).replace(/'/g, `'\\''`)}'`;
-}
-
-function tailOf(text, limit = MAX_ERROR_TAIL_CHARS) {
-  const lines = String(text || '')
-    .split('\n')
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim());
-  const joined = lines.join(' · ');
-  return joined.length > limit ? `…${joined.slice(-limit)}` : joined;
 }
 
 function parseAuthStatusJson(stdout) {
@@ -312,52 +256,20 @@ export function createClaudeAuthService({
   }
 
   function killTree(child, signal) {
-    if (!child || child.exitCode !== null) return;
-    const pid = Number(child.pid);
-    if (platform !== 'win32' && Number.isInteger(pid) && pid > 0) {
-      try {
-        processKillImpl(-pid, signal);
-        return;
-      } catch {}
-    }
-    try { child.kill(signal); } catch {}
+    killProcessTree(child, signal, { platform, processKillImpl });
   }
 
   function runToCompletion(args, { timeoutMs, usePty = true } = {}) {
-    return new Promise((resolve) => {
-      let child = null;
-      try {
-        child = spawnAuthProcess(args, { pty: usePty, stdin: usePty ? 'pipe' : 'ignore' });
-      } catch (error) {
-        resolve({ ok: false, code: null, output: '', error: error?.message || String(error) });
-        return;
-      }
-      let output = '';
-      let settled = false;
-      const append = (chunk) => {
-        output = `${output}${chunk.toString()}`.slice(-MAX_CAPTURED_OUTPUT_CHARS);
-      };
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeoutImpl(timer);
-        resolve(result);
-      };
-      const timer = setTimeoutImpl(() => {
-        killTree(child, 'SIGTERM');
-        finish({ ok: false, code: null, output, error: `timed out after ${timeoutMs}ms` });
-      }, timeoutMs);
-      timer?.unref?.();
-      child.stdout?.on?.('data', append);
-      child.stderr?.on?.('data', append);
-      child.stdin?.end?.();
-      child.on('error', (error) => finish({
-        ok: false, code: null, output, error: error?.message || String(error),
-      }));
-      child.on('close', (code) => finish({
-        ok: code === 0, code, output, error: null,
-      }));
-    });
+    return runProcessToCompletion(
+      () => spawnAuthProcess(args, { pty: usePty, stdin: usePty ? 'pipe' : 'ignore' }),
+      {
+        timeoutMs,
+        setTimeoutImpl,
+        clearTimeoutImpl,
+        killChild: killTree,
+        maxOutputChars: MAX_CAPTURED_OUTPUT_CHARS,
+      },
+    );
   }
 
   async function fetchStatus() {

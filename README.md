@@ -267,8 +267,41 @@ Turning a provider **off** (or removing the OpenAI key) rebinds conversations th
 | **Copilot** (default) | always available                        | your `gh` / Copilot CLI login         | Full relay feature set; the only provider that reports Copilot usage. Two engines: the CLI extension (default) or an experimental headless SDK worker |
 | **OpenAI (BYOK)**     | ⚙️ Settings → Providers → OpenAI        | your API key, stored in the relay DB  | Runs the Copilot CLI in BYOK mode against an OpenAI-compatible endpoint |
 | **OpenAI Image (BYOK)** | ⚙️ Settings → Providers → OpenAI      | same key                              | Calls the OpenAI Images API directly; a chat whose replies are images  |
-| **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude        | the relay host's logged-in Claude CLI | No API key is stored; runs a dedicated Node worker per conversation    |
+| **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude        | the relay host's logged-in Claude CLI — **switchable from the panel** | No API key is stored; runs a dedicated Node worker per conversation. The CLI itself can be installed/updated from the panel |
 | **Cursor (Agent SDK)** | ⚙️ Settings → Providers → Cursor        | your Cursor API key, stored in the relay DB | Runs a dedicated Node worker per conversation through the Cursor Agent SDK |
+| **Grok (CLI ACP)**    | ⚙️ Settings → Providers → Grok          | the relay host's Grok CLI login — **sign in / out from the panel** | No API key is stored; drives `grok agent stdio` over ACP. The CLI itself can be installed/updated from the panel |
+
+### Installing a provider CLI from the relay
+
+Grok and Claude both run as CLIs on the relay host, and the failure mode used to be a dead end: a
+turn fails with *"Grok CLI was not found on PATH"* and the only fix is a shell on the host — the one
+thing the relay exists to avoid. Each provider sub-tab now carries a CLI row at the top:
+
+```
+Grok CLI    not installed                                    [ Install ]
+Grok CLI    1.0.13 · ~/.grok/bin/grok · native · up to date  [ Update  ]
+```
+
+- **Install** asks for confirmation first, naming the exact command and the directory it writes into.
+  The commands are the vendors' own one-liners (`curl -fsSL https://x.ai/cli/install.sh | bash`,
+  `curl -fsSL https://claude.ai/install.sh | bash`, or their PowerShell equivalents on Windows) and
+  they are hardcoded in the relay — nothing you type reaches a shell. They run as the relay user,
+  into your home directory, never under sudo.
+- The output streams into the panel live, and the log survives closing the modal or watching from
+  another device. One install at a time, relay-wide.
+- When it finishes, the relay resolves the binary, wires it into the environment it launches workers
+  with, and remembers it across restarts — **no relay restart is needed**. Sessions already running
+  keep the binary they started with.
+- **Update** runs the CLI's own updater (`grok update`, `claude update`), not the install script again.
+- If your Claude was installed with npm into a folder the relay user cannot write, `claude doctor`
+  says so and the button becomes **Switch to native installer** — Anthropic's own recommended fix.
+  The npm copy stays where it is; the native build takes precedence on PATH.
+- The **Copilot** row is read-only: that CLI is managed with npm on this host, so there is nothing
+  the relay could usefully run.
+
+When a turn fails because a CLI is missing or signed out, the failed reply itself carries the fix as
+a button — **Install Grok CLI**, **Sign in to Grok**, **Claude settings** — which opens the right
+panel and, for an install, the same confirmation sheet.
 
 ### GitHub Copilot — engine choice
 
@@ -331,6 +364,34 @@ What Cursor conversations support:
 - Expired cached agent handles are recreated and retried automatically once — a second auth failure means the API key itself is invalid
 
 Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under Settings → Providers → Cursor → Cursor monthly plan allowance.
+
+### Grok (CLI ACP)
+
+Turn on **⚙️ Settings → Providers → Grok**. There is no key to enter: the relay drives the Grok CLI
+on the host and uses whatever account that CLI is signed in to (or `XAI_API_KEY` in the host
+environment).
+
+The same panel manages both the CLI and the account:
+
+- The **Grok CLI** row installs or updates the CLI itself — see
+  [Installing a provider CLI from the relay](#installing-a-provider-cli-from-the-relay).
+- **Sign in** starts the CLI's device-code login on the relay host and brings it to the browser: the
+  x.ai authorization link appears inline with a **Copy link** button, and the `XXXX-XXXX` code is
+  shown next to it so you can check it against what the browser displays. Open the link on any
+  device, confirm, and the panel flips to signed-in **by itself** — nothing is pasted back through
+  the relay, because the CLI polls x.ai and finishes on its own. Model discovery re-runs straight
+  after, so switching accounts needs no relay restart. The flow is pushed over the socket: start it
+  on one device, finish it on another, and closing the modal does not lose it.
+- **Sign out** asks for confirmation first and tells you how many Grok workers are running. Running
+  sessions keep the previous token until their worker exits.
+
+The relay holds no Grok secret: the device code is public by design, and the token is written by the
+CLI straight into `~/.grok/auth.json`. Running `grok login` on the host still works as before.
+
+Grok conversations support live reply streaming, thoughts, plan boards, subagent lifecycle chips,
+**Stop**, session resume across worker restarts, per-turn context metrics, and the live weekly quota
+bar in **Check Usage**. The model is fixed per conversation (ACP has no mid-session switch), and
+question cards are not available — the protocol has no ask-user surface.
 
 ## Relay modes
 
@@ -540,11 +601,13 @@ If the same extension is available both project-local (`.github/extensions/web-r
 Common routes:
 
 - Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`, `/api/context/:conversationId`
-- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/cursor`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
+- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
 - Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
 - Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
 - Claude account auth: `/api/claude/auth/status`, `/api/claude/auth/login/start`, `/api/claude/auth/login/code`, `/api/claude/auth/login/cancel`, `/api/claude/auth/logout`
+- Grok account auth: `/api/grok/auth/status`, `/api/grok/auth/login/start`, `/api/grok/auth/login/cancel`, `/api/grok/auth/logout`
+- Provider CLI install: `/api/cli/status`, `/api/cli/install`, `/api/cli/install/cancel`
 - Cursor worker: `/api/cursor-agent-id`, `/api/cursor-context-usage`, `/api/cursor-plan-usage`
 - Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
@@ -572,7 +635,9 @@ For deeper implementation/API details, see `[server/README.md](server/README.md)
 | Clarification card not progressing | Answer via the web card; relay resumes after question status becomes `answered`  |
 | File links fail                    | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
 | Claude missing from New Chat       | Enable it in **⚙️ Settings → Providers → Claude**; the toggle is off by default   |
-| Claude reply says it cannot authenticate | Press **Relogin** in **⚙️ Settings → Providers → Claude** (or run `claude` on the relay host), then retry the turn |
+| Claude reply says it cannot authenticate | Press **Claude settings** on the failed reply, then **Relogin** (or run `claude` on the relay host), and retry the turn |
+| Grok reply says the CLI was not found | Press **Install Grok CLI** on the failed reply, or install it from **⚙️ Settings → Providers → Grok**; no relay restart is needed afterwards |
+| Grok reply says authentication failed | Press **Sign in to Grok** on the failed reply and confirm the device code in a browser |
 | Claude model list empty or stale   | Re-save the Claude settings, or use **Select Models → Refresh** to rerun discovery |
 | Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
 | No usage line under a reply        | Expected for OpenAI, Claude, and Cursor turns; only Copilot turns record plan usage |

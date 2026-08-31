@@ -299,6 +299,18 @@ import {
   openClaudeLogoutConfirmation,
   confirmClaudeLogout,
 } from './claude-auth-ui.js';
+import {
+  startGrokSignIn,
+  cancelGrokSignIn,
+  copyGrokLoginUrl,
+  openGrokLogoutConfirmation,
+  confirmGrokLogout,
+} from './grok-auth-ui.js';
+import {
+  confirmCliInstall,
+  runCliInstall,
+  cancelCliInstallRun,
+} from './cli-install-ui.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 // The New Chat modal used to keep its own model key, so a selection made there
@@ -4199,6 +4211,14 @@ window.cancelClaudeRelogin = cancelClaudeRelogin;
 window.copyClaudeLoginUrl = copyClaudeLoginUrl;
 window.openClaudeLogoutConfirmation = openClaudeLogoutConfirmation;
 window.confirmClaudeLogout = confirmClaudeLogout;
+window.startGrokSignIn = startGrokSignIn;
+window.cancelGrokSignIn = cancelGrokSignIn;
+window.copyGrokLoginUrl = copyGrokLoginUrl;
+window.openGrokLogoutConfirmation = openGrokLogoutConfirmation;
+window.confirmGrokLogout = confirmGrokLogout;
+window.confirmCliInstall = confirmCliInstall;
+window.runCliInstall = runCliInstall;
+window.cancelCliInstallRun = cancelCliInstallRun;
 window.saveGrokSettings = saveGrokSettings;
 window.toggleGrokProvider = toggleGrokProvider;
 window.saveCursorSettings = saveCursorSettings;

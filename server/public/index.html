@@ -958,6 +958,42 @@
   .settings-provider-status[data-state="active"] { color: #3fb950; }
   .settings-provider-status[data-state="saved"] { color: var(--accent); }
   .settings-provider-status[data-state="error"] { color: #f85149; }
+  /* Author `display: flex` on these rows outranks the UA [hidden] rule, exactly
+     like .settings-row above, so hiding them from script needs this. */
+  #claude-auth-url-row[hidden],
+  #claude-auth-code-row[hidden],
+  #grok-auth-url-row[hidden],
+  #grok-auth-code-row[hidden],
+  #grok-auth-actions-row[hidden] {
+    display: none;
+  }
+  /* Provider CLI install rows (cli-install-ui.js). */
+  .cli-install-label { font-weight: 600; flex: 0 0 auto; }
+  .cli-install-log { width: 100%; margin-top: 8px; }
+  .cli-install-log > summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    word-break: break-all;
+  }
+  /* Capped: an installer can print thousands of lines and the settings modal
+     must not grow a second scrollbar the length of the page. */
+  .cli-install-log pre,
+  .cli-install-command {
+    max-height: 220px;
+    overflow: auto;
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-sm);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
   /* Settings modal tabs: same visual language as .summary-btn.model-provider-tab. */
   .settings-tab-strip {
     display: flex;
@@ -1399,6 +1435,15 @@
     border-top: 1px dashed var(--border);
   }
   .msg-bubble-actions:empty { display: none; }
+  /* Fix-it buttons on a terminal turn failure (relay-error-ctas.mjs). */
+  .msg-error-cta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .msg-error-cta:empty { display: none; }
   .msg.user .bubble-action-btn {
     color: var(--user-bubble-fg);
     border-color: var(--user-bubble-border);
@@ -5061,6 +5106,27 @@
           aria-labelledby="settings-provider-tab-copilot"
           data-settings-provider-panel="copilot"
         >
+          <!-- Provider CLI status row; cli-install-ui.js drives the state. Copilot
+               is detect-only (npm-global on this host), so its payload carries no
+               commands and every action button stays hidden. -->
+          <div id="cli-copilot-section" style="margin-top: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <span id="cli-copilot-label" class="cli-install-label">GitHub Copilot CLI</span>
+              <div id="cli-copilot-status" class="settings-help settings-provider-status" style="flex: 1 1 auto;">Checking…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="cli-copilot-install-btn" type="button" class="summary-btn" onclick="confirmCliInstall('copilot', 'install')" hidden>Install</button>
+                <button id="cli-copilot-update-btn" type="button" class="summary-btn" onclick="confirmCliInstall('copilot', 'update')" hidden>Update</button>
+                <button id="cli-copilot-migrate-btn" type="button" class="summary-btn" onclick="confirmCliInstall('copilot', 'migrate')" hidden>Switch to native installer</button>
+                <button id="cli-copilot-cancel-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Cancel</button>
+                <button id="cli-copilot-dismiss-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Dismiss</button>
+              </div>
+            </div>
+            <div id="cli-copilot-note" class="settings-help settings-provider-status" style="margin-top: 6px;" hidden></div>
+            <details id="cli-copilot-log-details" class="cli-install-log" hidden>
+              <summary id="cli-copilot-log-summary">Install log</summary>
+              <pre id="cli-copilot-log"></pre>
+            </details>
+          </div>
           <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
             <label for="copilot-engine-select">Copilot engine</label>
             <select id="copilot-engine-select" aria-label="Copilot engine">
@@ -5128,6 +5194,25 @@
           data-settings-provider-panel="claude"
           hidden
         >
+          <!-- Provider CLI install / update row; cli-install-ui.js drives the state. -->
+          <div id="cli-claude-section" style="margin-bottom: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <span id="cli-claude-label" class="cli-install-label">Claude Code CLI</span>
+              <div id="cli-claude-status" class="settings-help settings-provider-status" style="flex: 1 1 auto;">Checking…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="cli-claude-install-btn" type="button" class="summary-btn" onclick="confirmCliInstall('claude', 'install')" hidden>Install</button>
+                <button id="cli-claude-update-btn" type="button" class="summary-btn" onclick="confirmCliInstall('claude', 'update')" hidden>Update</button>
+                <button id="cli-claude-migrate-btn" type="button" class="summary-btn" onclick="confirmCliInstall('claude', 'migrate')" hidden>Switch to native installer</button>
+                <button id="cli-claude-cancel-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Cancel</button>
+                <button id="cli-claude-dismiss-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Dismiss</button>
+              </div>
+            </div>
+            <div id="cli-claude-note" class="settings-help settings-provider-status" style="margin-top: 6px;" hidden></div>
+            <details id="cli-claude-log-details" class="cli-install-log" hidden>
+              <summary id="cli-claude-log-summary">Install log</summary>
+              <pre id="cli-claude-log"></pre>
+            </details>
+          </div>
           <!-- Claude account auth UI (Relogin / Logout); claude-auth-ui.js drives the state. -->
           <div id="claude-auth-section">
             <div class="settings-row" style="margin-bottom: 0;">
@@ -5196,6 +5281,59 @@
           data-settings-provider-panel="grok"
           hidden
         >
+          <!-- Provider CLI install / update row; cli-install-ui.js drives the state. -->
+          <div id="cli-grok-section" style="margin-top: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <span id="cli-grok-label" class="cli-install-label">Grok CLI</span>
+              <div id="cli-grok-status" class="settings-help settings-provider-status" style="flex: 1 1 auto;">Checking…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="cli-grok-install-btn" type="button" class="summary-btn" onclick="confirmCliInstall('grok', 'install')" hidden>Install</button>
+                <button id="cli-grok-update-btn" type="button" class="summary-btn" onclick="confirmCliInstall('grok', 'update')" hidden>Update</button>
+                <button id="cli-grok-migrate-btn" type="button" class="summary-btn" onclick="confirmCliInstall('grok', 'migrate')" hidden>Switch to native installer</button>
+                <button id="cli-grok-cancel-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Cancel</button>
+                <button id="cli-grok-dismiss-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Dismiss</button>
+              </div>
+            </div>
+            <div id="cli-grok-note" class="settings-help settings-provider-status" style="margin-top: 6px;" hidden></div>
+            <details id="cli-grok-log-details" class="cli-install-log" hidden>
+              <summary id="cli-grok-log-summary">Install log</summary>
+              <pre id="cli-grok-log"></pre>
+            </details>
+          </div>
+          <!-- Grok account auth UI (device-code Sign in / Sign out); grok-auth-ui.js
+               drives the state. No code input: the device code rides in the URL. -->
+          <div id="grok-auth-section" style="margin-top: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <div id="grok-auth-account" class="settings-help settings-provider-status">Loading Grok account…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="grok-auth-signin-btn" type="button" class="summary-btn" onclick="startGrokSignIn()">Sign in</button>
+                <button id="grok-auth-logout-btn" type="button" class="summary-btn" onclick="openGrokLogoutConfirmation()">Sign out</button>
+              </div>
+            </div>
+            <div id="grok-auth-login-area" class="settings-row settings-row-column" style="margin-top: 10px; margin-bottom: 0;" hidden>
+              <div id="grok-auth-login-status" class="settings-help settings-provider-status">Starting sign-in…</div>
+              <div id="grok-auth-url-row" style="display: flex; gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+                <a
+                  id="grok-auth-url-link"
+                  href="#"
+                  target="_blank"
+                  rel="noopener"
+                  style="flex: 1 1 auto; word-break: break-all; font-size: var(--fs-meta-sm);"
+                >Open the Grok sign-in page</a>
+                <button id="grok-auth-copy-btn" type="button" class="summary-btn" style="flex: 0 0 auto;" onclick="copyGrokLoginUrl()">Copy link</button>
+              </div>
+              <div id="grok-auth-code-row" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 8px;" hidden>
+                <span class="settings-help">Confirm this code in the browser:</span>
+                <code id="grok-auth-user-code" style="font-size: var(--fs-meta-md); letter-spacing: 0.08em;"></code>
+              </div>
+              <!-- Its own row, not the code row: a scrape that never found the
+                   code must still leave the session cancellable. -->
+              <div id="grok-auth-actions-row" style="display: flex; gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+                <button id="grok-auth-cancel-btn" type="button" class="summary-btn" onclick="cancelGrokSignIn()">Cancel</button>
+              </div>
+            </div>
+            <div class="settings-help" style="margin-top: 8px;">Sign in runs <code>grok login --device-auth</code> on the relay host and finishes by itself once you authorise the code — the link opens on any device. Running Grok sessions continue on the previous account until their workers restart.</div>
+          </div>
           <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
             <label for="grok-model-input">Grok</label>
             <div class="settings-row" style="width: 100%; margin-bottom: 8px;">

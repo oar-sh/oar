@@ -110,7 +110,35 @@ export function createStateRoot() {
   const sdkStubDir = path.join(stateRoot, "copilot-sdk-stub");
   fs.mkdirSync(sdkStubDir, { recursive: true });
   fs.writeFileSync(path.join(sdkStubDir, "extension.js"), "// e2e stub — never imported\n");
-  return { stateRoot, dataDir, claudeConfigDir, claudeCredFile, sdkStubDir };
+  // The only directory the CLI install service is allowed to resolve provider
+  // binaries from (COPILOT_WEB_RELAY_CLI_BIN_DIR below). Starts empty, so every
+  // provider row reads "not installed" until a spec installs into it — see the
+  // env block for why merely *preferring* it would not be enough.
+  const cliBinDir = path.join(stateRoot, "cli-bin");
+  fs.mkdirSync(cliBinDir, { recursive: true });
+  // "Signed in to Grok" means `$HOME/.grok/auth.json` exists — that is what
+  // readGrokCliAuthKey() (grok-billing-usage.mjs) reads and therefore what the
+  // account row reports. HOME is this state root, so seeding or deleting this
+  // file is how a spec sets the starting account state, exactly as
+  // claudeCredFile is for Claude.
+  const grokHomeDir = path.join(stateRoot, ".grok");
+  fs.mkdirSync(grokHomeDir, { recursive: true });
+  const grokAuthFile = path.join(grokHomeDir, "auth.json");
+  // The stub's stand-in for the browser: `grok login --device-auth` polls until
+  // one of these appears, then exits 0 (writing grokAuthFile) or non-zero.
+  const grokLoginAuthorizedFile = path.join(stateRoot, "grok-login-authorized");
+  const grokLoginDeniedFile = path.join(stateRoot, "grok-login-denied");
+  return {
+    stateRoot,
+    dataDir,
+    claudeConfigDir,
+    claudeCredFile,
+    sdkStubDir,
+    cliBinDir,
+    grokAuthFile,
+    grokLoginAuthorizedFile,
+    grokLoginDeniedFile,
+  };
 }
 
 export function removeStateRoot(stateRoot) {
@@ -127,9 +155,14 @@ export function buildRelayServerEnv({
   claudeConfigDir,
   claudeCredFile,
   sdkStubDir,
+  cliBinDir,
+  grokAuthFile,
+  grokLoginAuthorizedFile,
+  grokLoginDeniedFile,
   allowCli = false,
   overrides = {},
 } = {}) {
+  const fixtures = path.join(repoRoot, "server", "services", "fixtures");
   // The test server must never spawn real Copilot CLI clients or Claude workers.
   // Set RELAY_E2E_ALLOW_CLI=1 explicitly (with user permission) to test live turns.
   const disableCliSpawn = allowCli ? "" : "1";
@@ -170,12 +203,44 @@ export function buildRelayServerEnv({
     CLAUDE_CONFIG_DIR: claudeConfigDir,
     // Second belt: even with RELAY_E2E_ALLOW_CLI=1 the auth subcommands hit
     // a stub that only touches the temp state root, never the real CLI.
-    COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN: path.join(repoRoot, "server", "services", "fixtures", "claude-auth-stub.sh"),
+    COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN: path.join(fixtures, "claude-auth-stub.sh"),
     CLAUDE_AUTH_STUB_CRED_FILE: claudeCredFile,
     // The CLI kill switch below would otherwise refuse the auth spawns too.
     // This opt-in is only honoured together with the stub path above, so the
     // real `claude` still can never run here — see claude-auth-service.mjs.
     COPILOT_WEB_RELAY_CLAUDE_AUTH_ALLOW_STUB_SPAWN: "1",
+
+    // --- Provider CLI install / update ------------------------------------
+    // THE isolation lever for the CLI rows, and the reason this block is not
+    // optional. An isolated relay still inherits the host's PATH — it has to,
+    // it runs `node` — so `resolveCliBinary()` would otherwise find the
+    // developer's own ~/.grok/bin/grok, ~/.local/bin/claude and npm-global
+    // `copilot`, report them in /api/cli/status, and (once the stub pair below
+    // re-enables spawning) actually execute them to read `--version` and run
+    // `claude doctor`. This var *replaces* PATH and the descriptors' own bin
+    // dirs rather than being preferred over them, so the host's installs are
+    // not merely outranked — they are invisible.
+    COPILOT_WEB_RELAY_CLI_BIN_DIR: cliBinDir,
+    // Same paired-flag shape as the Claude auth stub above: the opt-in is only
+    // honoured together with an explicit command override, so a relay with the
+    // kill switch on can never end up running a real `curl … | bash`.
+    COPILOT_WEB_RELAY_CLI_INSTALL_COMMAND: path.join(fixtures, "cli-install-stub.sh"),
+    COPILOT_WEB_RELAY_CLI_INSTALL_ALLOW_STUB_SPAWN: "1",
+    // Where the stub's fake binary lands: the one directory above, so the
+    // install really is followed by a resolve → bind → broadcast.
+    CLI_INSTALL_STUB_BIN_DIR: cliBinDir,
+
+    // --- Grok account (device-code login) ---------------------------------
+    // Second belt again: the auth spawns are pointed at the stub, so the host's
+    // real `grok` is never asked to log in — or, far worse, to log *out*.
+    GROK_CLI_COMMAND: path.join(fixtures, "grok-stub.sh"),
+    COPILOT_WEB_RELAY_GROK_AUTH_ALLOW_STUB_SPAWN: "1",
+    // The fake auth store, inside the temp HOME the relay already reads
+    // ~/.grok/auth.json from, so the stub and readGrokCliAuthKey() agree.
+    GROK_STUB_AUTH_FILE: grokAuthFile,
+    GROK_STUB_SUCCESS_SENTINEL: grokLoginAuthorizedFile,
+    GROK_STUB_FAILURE_SENTINEL: grokLoginDeniedFile,
+
     ...(disableCliSpawn ? { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: disableCliSpawn } : {}),
     ...overrides,
   };

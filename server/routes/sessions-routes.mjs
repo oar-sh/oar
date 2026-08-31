@@ -25,6 +25,8 @@ import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
 import { createClaudeAuthService } from '../services/claude-auth-service.mjs';
+import { createCliInstallService } from '../services/cli-install-service.mjs';
+import { createGrokAuthService } from '../services/grok-auth-service.mjs';
 import {
   isWithinAllowedPrefix,
   readWorkspaceRootPathFromBody,
@@ -1976,12 +1978,18 @@ export function registerSessionsRoutes(app, deps) {
     // (rather than as a module singleton) so each route registration in tests
     // gets its own instance; production registers these routes once.
     claudeAuthService = null,
+    // Owns the relay-wide single-flight CLI install/update, the descriptor
+    // table and the binary bindings, on the same terms as claudeAuthService.
+    cliInstallService = null,
     getCursorProviderSettings = () => ({ configured: false, enabled: false, model: 'composer-2.5', models: [] }),
     setCursorProviderSettings = () => ({ ok: false, error: 'Cursor settings are unavailable' }),
     refreshCursorProviderModels = async () => ({ ok: false, models: [], error: 'Cursor model discovery is unavailable' }),
     getGrokProviderSettings = () => ({ configured: false, enabled: false, model: 'grok-4.5', models: [] }),
     setGrokProviderSettings = () => ({ ok: false, error: 'Grok settings are unavailable' }),
     refreshGrokProviderModels = async () => ({ ok: false, models: [], error: 'Grok model discovery is unavailable' }),
+    // Owns the relay-wide single-flight Grok device-code login, on the same
+    // terms as claudeAuthService above.
+    grokAuthService = null,
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -5018,11 +5026,13 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   /**
-   * Claude workers that are actually running right now. The worker registry
-   * carries no provider field, so each active entry is resolved back to its
-   * runtime_sessions row (provider_type). Feeds the logout confirmation dialog.
+   * Workers of one provider that are actually running right now. The worker
+   * registry carries no provider field, so each active entry is resolved back to
+   * its runtime_sessions row (provider_type). Feeds the logout confirmation
+   * dialogs (Claude and Grok both name the count before signing out).
    */
-  function countRunningClaudeWorkers() {
+  function countRunningWorkersForProvider(providerType) {
+    const wantedProvider = String(providerType || '').trim().toLowerCase();
     const workers = typeof sessionWorkerRegistry?.listWorkers === 'function'
       ? sessionWorkerRegistry.listWorkers()
       : [];
@@ -5042,7 +5052,7 @@ export function registerSessionsRoutes(app, deps) {
       } catch {
         runtimeSessionRow = null;
       }
-      if (String(runtimeSessionRow?.provider_type || '').trim().toLowerCase() === 'claude') count += 1;
+      if (String(runtimeSessionRow?.provider_type || '').trim().toLowerCase() === wantedProvider) count += 1;
     }
     return count;
   }
@@ -5052,7 +5062,7 @@ export function registerSessionsRoutes(app, deps) {
   // the logout confirmation) and reused for the login-transition broadcasts.
   let lastRunningClaudeWorkers = 0;
   function refreshRunningClaudeWorkers() {
-    lastRunningClaudeWorkers = countRunningClaudeWorkers();
+    lastRunningClaudeWorkers = countRunningWorkersForProvider('claude');
     return lastRunningClaudeWorkers;
   }
 
@@ -5158,6 +5168,221 @@ export function registerSessionsRoutes(app, deps) {
     return res.json({
       ok: true,
       ...(await buildClaudeAuthPayload({ status: result.status, countWorkers: true })),
+    });
+  });
+
+  // --- Provider CLI install / update --------------------------------------
+  // Runs the vendors' own install one-liners on the relay host so a missing
+  // `grok` (relay.grok-cli-missing) can be fixed from the phone instead of from
+  // a shell. Every command is a frozen literal in cli-install-service.mjs; a
+  // request body only ever carries a descriptor id and an action name, and an
+  // unknown id is a 400 before any spawn is considered.
+  // Owned by server-runtime (so dispose() reaches a running installer on
+  // shutdown); the local construction is the test-harness fallback.
+  const cliInstall = cliInstallService || createCliInstallService();
+
+  // Install transitions broadcast off the last known probe rather than a fresh
+  // one: each log chunk emits, and re-probing three CLIs per chunk would spawn
+  // more processes than the install itself. The service re-probes (and
+  // re-emits) once the install closes.
+  cliInstall.subscribe(() => {
+    io.emit('cli_install_state', cliInstall.getCachedStatusSnapshot());
+  });
+
+  // A freshly installed CLI usually unblocks that provider's model discovery
+  // (it fails opaquely with no binary), so the catalog is repopulated without a
+  // relay restart. Running workers are deliberately left alone: they keep the
+  // binary they launched with.
+  cliInstall.onInstallSuccess(async ({ providerId } = {}) => {
+    if (providerId === 'grok') {
+      try {
+        await refreshGrokProviderModels();
+      } catch (error) {
+        console.log(`[cli-install] Grok model refresh after install failed: ${error?.message || error}`);
+      }
+      const settings = getGrokProviderSettings();
+      io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+      io.emit('grok_settings_updated', {
+        configured: settings?.configured === true,
+        enabled: settings?.enabled === true,
+        model: String(settings?.model || 'grok-4.5').trim() || 'grok-4.5',
+        models: Array.isArray(settings?.models) ? settings.models : [],
+        availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+      });
+      return;
+    }
+    if (providerId === 'claude') {
+      try {
+        await refreshClaudeProviderModels();
+      } catch (error) {
+        console.log(`[cli-install] Claude model refresh after install failed: ${error?.message || error}`);
+      }
+      const settings = getClaudeProviderSettings();
+      io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+      io.emit('claude_settings_updated', {
+        configured: settings?.configured === true,
+        enabled: settings?.enabled === true,
+        model: String(settings?.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
+        models: Array.isArray(settings?.models) ? settings.models : [],
+        availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+      });
+    }
+  });
+
+  app.get('/api/cli/status', auth, async (req, res) => {
+    // Each probe spawns up to three short-lived CLI processes, so the 30s cache
+    // is the default and a refresh is opt-in (the settings panel asks for one
+    // when it opens).
+    const force = ['1', 'true', 'yes'].includes(String(req.query?.force || '').trim().toLowerCase());
+    return res.json(await cliInstall.getStatusSnapshot({ force }));
+  });
+
+  app.post('/api/cli/install', auth, async (req, res) => {
+    const result = cliInstall.runInstall(req.body?.provider, { action: req.body?.action });
+    if (!result?.ok) {
+      return res.status(Number(result?.statusCode) || 400).json({
+        error: result?.error || 'Failed to start the CLI install',
+        ...cliInstall.getCachedStatusSnapshot(),
+      });
+    }
+    // The cached provider rows ride along so the caller renders the panel
+    // without a second round trip; the install itself finishes over the socket.
+    return res.json({
+      ok: true,
+      reused: result.reused === true,
+      ...cliInstall.getCachedStatusSnapshot(),
+      install: result.install,
+    });
+  });
+
+  app.post('/api/cli/install/cancel', auth, async (_req, res) => {
+    const result = cliInstall.cancel();
+    return res.json({
+      ok: true,
+      ...cliInstall.getCachedStatusSnapshot(),
+      install: result.install,
+    });
+  });
+
+  // --- Grok account (CLI device-code OAuth) -------------------------------
+  // Same shape as the Claude block above, one state shorter: `grok login
+  // --device-auth` prints a URL carrying the device code, then polls x.ai and
+  // exits on its own, so nothing is ever pasted back through the relay and there
+  // is no `/login/code` route. Owned by server-runtime (so dispose() reaches it
+  // on shutdown); the local construction is the test-harness fallback.
+  const grokAuth = grokAuthService || createGrokAuthService();
+
+  // Stand-in for the window before the first auth-store read lands: the payload
+  // shape is fixed, so a broadcast carries a neutral status rather than dropping
+  // the field.
+  const GROK_AUTH_UNKNOWN_STATUS = Object.freeze({
+    ok: false,
+    loggedIn: false,
+    expiresAt: null,
+    expired: false,
+    plan: null,
+    usagePercent: null,
+    periodType: null,
+    periodEnd: null,
+    error: null,
+    checkedAt: null,
+  });
+
+  let lastRunningGrokWorkers = 0;
+  function refreshRunningGrokWorkers() {
+    lastRunningGrokWorkers = countRunningWorkersForProvider('grok');
+    return lastRunningGrokWorkers;
+  }
+
+  function grokAuthPayload({ status = null, login = null, runningGrokWorkers = lastRunningGrokWorkers } = {}) {
+    return {
+      status: status || GROK_AUTH_UNKNOWN_STATUS,
+      login: login || grokAuth.getLoginState(),
+      runningGrokWorkers,
+    };
+  }
+
+  async function buildGrokAuthPayload({
+    login = null,
+    forceStatus = false,
+    status = null,
+    countWorkers = false,
+  } = {}) {
+    // getStatus() never rejects: a failed read resolves as a logged-out payload.
+    const resolved = status || await grokAuth.getStatus({ force: forceStatus });
+    return grokAuthPayload({
+      status: resolved,
+      login,
+      runningGrokWorkers: countWorkers ? refreshRunningGrokWorkers() : lastRunningGrokWorkers,
+    });
+  }
+
+  // Login transitions broadcast synchronously off the last known status: the
+  // awaiting_authorization emit carries the device URL and code, and building it
+  // around a status read would park it behind the billing proxy fetch. The
+  // service re-emits the same state once a fresh status lands.
+  grokAuth.subscribe((login) => {
+    io.emit('grok_auth_state', grokAuthPayload({ status: grokAuth.getCachedStatus(), login }));
+  });
+
+  // A fresh login unblocks model discovery (the ACP initialize probe fails while
+  // logged out), so the catalog is repopulated without a relay restart. Running
+  // workers are deliberately left alone: they keep the previous account's token
+  // until they exit.
+  grokAuth.onLoginSuccess(async () => {
+    try {
+      await refreshGrokProviderModels();
+    } catch (error) {
+      console.log(`[grok-auth] model refresh after login failed: ${error?.message || error}`);
+    }
+    const settings = getGrokProviderSettings();
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('grok_settings_updated', {
+      configured: settings?.configured === true,
+      enabled: settings?.enabled === true,
+      model: String(settings?.model || 'grok-4.5').trim() || 'grok-4.5',
+      models: Array.isArray(settings?.models) ? settings.models : [],
+      availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+    });
+  });
+
+  app.get('/api/grok/auth/status', auth, async (_req, res) => {
+    return res.json(await buildGrokAuthPayload({ countWorkers: true }));
+  });
+
+  app.post('/api/grok/auth/login/start', auth, async (_req, res) => {
+    const result = grokAuth.startLogin();
+    if (!result?.ok) {
+      return res.status(500).json({
+        error: result?.error || 'Failed to start Grok login',
+        ...(await buildGrokAuthPayload()),
+      });
+    }
+    return res.json({
+      ok: true,
+      reused: result.reused === true,
+      ...(await buildGrokAuthPayload({ login: result.login })),
+    });
+  });
+
+  app.post('/api/grok/auth/login/cancel', auth, async (_req, res) => {
+    const result = grokAuth.cancel();
+    return res.json({ ok: true, ...(await buildGrokAuthPayload({ login: result.login })) });
+  });
+
+  app.post('/api/grok/auth/logout', auth, async (_req, res) => {
+    const result = await grokAuth.logout();
+    if (!result?.ok) {
+      return res.status(Number(result?.statusCode) || 500).json({
+        error: result?.error || 'Failed to log out of Grok',
+        ...(await buildGrokAuthPayload({ status: result?.status || null, countWorkers: true })),
+      });
+    }
+    // logout() already force-refreshed the status and its idle transition
+    // already broadcast it, so neither the read nor the emit is repeated.
+    return res.json({
+      ok: true,
+      ...(await buildGrokAuthPayload({ status: result.status, countWorkers: true })),
     });
   });
 

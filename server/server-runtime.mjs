@@ -40,6 +40,8 @@ import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
 import { createClaudeAuthService } from './services/claude-auth-service.mjs';
+import { createCliInstallService, writeCliBinariesToConfigFile } from './services/cli-install-service.mjs';
+import { createGrokAuthService } from './services/grok-auth-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
 import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
@@ -3032,6 +3034,54 @@ const statusEventService = createStatusEventService(db);
 // module) constructs it: shutdownRuntime() has to be able to dispose a login
 // PTY that is still holding a process group.
 const claudeAuthService = createClaudeAuthService();
+// Same ownership reason for `grok login --device-auth`: it polls x.ai for up to
+// ten minutes, so a shutdown mid-login has to be able to signal its process
+// group.
+const grokAuthService = createGrokAuthService();
+
+// ─── Provider CLI install / binary binding ────────────────────────────────────
+// A resolved CLI path is host state, not conversation state, so it lives beside
+// the port and the token in config.json rather than in the app_settings table
+// (a relay moved to another machine must not carry the old machine's paths in
+// its database).
+function readCliBinariesFromConfig() {
+  const stored = config?.cliBinaries;
+  return stored && typeof stored === 'object' && !Array.isArray(stored) ? { ...stored } : {};
+}
+
+// Read-modify-write against the file, never a dump of the in-memory `config`:
+// that object carries values deliberately kept off disk (a `--token` override,
+// the generated fallback token), and writing it back wholesale would persist
+// them. The merge, the refusal to write over a config that could not be read,
+// and the tmp-file+rename all live in the service so they can be tested — see
+// writeCliBinariesToConfigFile() for why each of those is load-bearing.
+// Throwing is the contract: bindResolvedBinary() keeps the in-process binding
+// and logs the reason.
+function writeCliBinariesToConfig(binaries) {
+  writeCliBinariesToConfigFile(CONFIG_PATH, binaries);
+  config.cliBinaries = { ...binaries };
+}
+
+// Owned here for the same reason as the auth services: shutdownRuntime() has to
+// be able to signal an installer that is still holding a process group.
+const cliInstallService = createCliInstallService({
+  readBoundBinaries: readCliBinariesFromConfig,
+  writeBoundBinaries: writeCliBinariesToConfig,
+});
+// Re-apply what a previous install resolved before anything can spawn a worker,
+// so a restarted relay finds the same binaries it found before — including on a
+// host where the vendor installer could not symlink into a directory that is
+// already on PATH (each bound binary's own directory is hoisted onto PATH).
+// A relay with nothing bound is left with the PATH the host gave it.
+try {
+  const boundCliBinaries = cliInstallService.applyPersistedBindings();
+  const boundIds = Object.keys(boundCliBinaries);
+  if (boundIds.length) {
+    console.log(`[cli-install] bound provider CLI binaries: ${boundIds.join(', ')}`);
+  }
+} catch (error) {
+  console.warn(`[cli-install] failed to apply persisted CLI bindings: ${error?.message || error}`);
+}
 
 // ─── Web Push ─────────────────────────────────────────────────────────────────
 // VAPID keys are generated once and persisted in app_settings; regenerating
@@ -6738,6 +6788,8 @@ const sharedRouteDeps = {
   getSharedWatcherCount,
   statusEventService,
   claudeAuthService,
+  cliInstallService,
+  grokAuthService,
   imageOperationService,
   windowsAutostartService,
   pushDispatchService,
@@ -7254,6 +7306,12 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   });
   try { claudeAuthService.dispose(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Claude auth service shutdown failed: ${error?.message || error}`);
+  }
+  try { cliInstallService.dispose(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}CLI install service shutdown failed: ${error?.message || error}`);
+  }
+  try { grokAuthService.dispose(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}Grok auth service shutdown failed: ${error?.message || error}`);
   }
   sessionWorkerWebSocketService.stop();
   tmuxInspectorSocketService.stop();
