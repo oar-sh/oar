@@ -1,0 +1,445 @@
+[
+ {
+  "type": "system.notification",
+  "data": {
+   "content": "<system_notification>\nDetached shell \"Wait one minute for the requested timer\" (shellId: 1) has completed. Use read_bash with shellId \"1\" to retrieve its output and exit code.\n</system_notification>",
+   "kind": {
+    "type": "shell_detached_completed",
+    "shellId": "1",
+    "description": "Wait one minute for the requested timer"
+   }
+  },
+  "id": "9718510f-f3dd-4a09-be19-8b466e7528cb",
+  "timestamp": "2026-08-31T14:24:20.843Z",
+  "parentId": "3c68df7e-54eb-4cf9-a3a4-0b2db5cebd2d"
+ },
+ {
+  "type": "system.message",
+  "data": {
+   "role": "system",
+   "content": "<system prompt elided>",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60"
+  },
+  "id": "8d3a34d1-7f87-44e5-8b46-97ad9844cf30",
+  "timestamp": "2026-08-31T14:24:20.844Z",
+  "parentId": "9718510f-f3dd-4a09-be19-8b466e7528cb"
+ },
+ {
+  "type": "assistant.turn_start",
+  "data": {
+   "turnId": "0",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60"
+  },
+  "id": "6ddc442a-a525-4702-bb8e-9a9a6e01ba5e",
+  "timestamp": "2026-08-31T14:24:20.846Z",
+  "parentId": "8d3a34d1-7f87-44e5-8b46-97ad9844cf30"
+ },
+ {
+  "type": "assistant.message",
+  "data": {
+   "messageId": "bc093279-9c5b-4ff8-82ab-0a0a200367eb",
+   "model": "gpt-5.6-luna",
+   "content": "",
+   "toolRequests": [
+    {
+     "toolCallId": "call_Hh2pB3NjFaXzsTqHTRbs28Sr",
+     "name": "read_bash",
+     "arguments": {
+      "shellId": "1",
+      "delay": 1
+     },
+     "type": "function",
+     "intentionSummary": "Waiting up to 1 second for command output",
+     "toolTitle": "Read shell output"
+    }
+   ],
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60",
+   "turnId": "0",
+   "rte": true,
+   "apiCallId": "C2c1KiMJOacgll8Wa91HeAEsW2aJBfJuJ2np91aeALpTLWA03oU6eC/fL+6MhlCA8wHpBty7PRv55pq5t788S3qkBIooxXkLN8L2M3Qr4HA43JhtmIllA15h0cAMNkZ+HTyaUpvQVb1oLw5V8eIJePUaLLg4dI7foUlzNs/2Svqb6sTkSWH4nyVM2LYxIA6kdbGZC2x0YJp5DdD8ZvLauLm7O2HE7ZTKITv81G+zAJfLBopUBr9ap3xfKcLJ4lM+8UJe0kG2jZssiFLFHNNA04RG6okIt2vd2cJD3/Y8jXbgXR8eugVkeaU45fLbQuX5b5rcN8b7Hyel0lK7JzSpWa7JGqKCV5jyboGp7ZCOldLufcRRP/rjeA+n0XQh4PNbY+Oz7sJoZbfr/eRfwd8Ysc798iZD1Bu6Z+naf4wX933s4szucW6QxxOc2cRllr9qquEdn/E8cKsfFzsB0oKakrx2TD2OYqOlBiaA7SInkQ=="
+  },
+  "id": "a4c433ab-05c1-4f6a-95e0-39942cf0f88d",
+  "timestamp": "2026-08-31T14:24:23.114Z",
+  "parentId": "6ddc442a-a525-4702-bb8e-9a9a6e01ba5e"
+ },
+ {
+  "type": "tool.execution_start",
+  "data": {
+   "toolCallId": "call_Hh2pB3NjFaXzsTqHTRbs28Sr",
+   "toolName": "read_bash",
+   "arguments": {
+    "shellId": "1",
+    "delay": 1
+   },
+   "turnId": "0",
+   "model": "gpt-5.6-luna",
+   "toolTitle": "Read shell output"
+  },
+  "id": "6f8c9443-8629-4092-a665-d9ef013637ac",
+  "timestamp": "2026-08-31T14:24:23.116Z",
+  "parentId": "a4c433ab-05c1-4f6a-95e0-39942cf0f88d"
+ },
+ {
+  "type": "tool.execution_complete",
+  "data": {
+   "toolCallId": "call_Hh2pB3NjFaXzsTqHTRbs28Sr",
+   "model": "gpt-5.6-luna",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60",
+   "turnId": "0",
+   "rte": true,
+   "success": true,
+   "result": {
+    "content": "Output:\nTimer fired after 1 minute.\n<detached command with shellId: 1 completed with exit code 0>",
+    "detailedContent": "Output:\nTimer fired after 1 minute.\n<detached command with shellId: 1 completed with exit code 0>"
+   },
+   "toolTelemetry": {
+    "properties": {
+     "read_target_state": "active",
+     "read_target_original_mode": "async"
+    },
+    "restrictedProperties": {}
+   }
+  },
+  "id": "13dcde40-ab42-49c3-be0b-19cc2d7ec4c8",
+  "timestamp": "2026-08-31T14:24:23.119Z",
+  "parentId": "6f8c9443-8629-4092-a665-d9ef013637ac"
+ },
+ {
+  "type": "assistant.turn_end",
+  "data": {
+   "turnId": "0"
+  },
+  "id": "20b90e67-9725-458b-9773-67557d084b40",
+  "timestamp": "2026-08-31T14:24:23.122Z",
+  "parentId": "13dcde40-ab42-49c3-be0b-19cc2d7ec4c8"
+ },
+ {
+  "type": "assistant.turn_start",
+  "data": {
+   "turnId": "1",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60"
+  },
+  "id": "527ac096-a704-4c25-a434-8c42b69a5391",
+  "timestamp": "2026-08-31T14:24:23.122Z",
+  "parentId": "20b90e67-9725-458b-9773-67557d084b40"
+ },
+ {
+  "type": "assistant.message",
+  "data": {
+   "messageId": "11076e47-37ed-4d57-a7bd-326c34321993",
+   "model": "gpt-5.6-luna",
+   "content": "⏰ The 1-minute timer fired.",
+   "toolRequests": [],
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60",
+   "turnId": "1",
+   "phase": "final_answer",
+   "rte": true,
+   "apiCallId": "0JECOlpIuTgGOy6s6zrLVL9CcTknzPc8UY2wNRhNgivB6OcGT13yiAE8opiQwdiP950wWc0dgDBT1XZbd2/JONLg9OheINjBm38S+8fmKLCNZ9P7E2o35GyCMOHLvhR+G9Fo43hqxjrpijL5qFphMT8g0YOAs1hQF/2kuCFwFnJJVTYPFvOWti2AZ6bRel4sp/5RNrpbfxdh/fe2dwduFdrLt/um2WpGEf+kL5pl87UpvGzJ31bUvcCT3rg/pxGs6Erg0izl/4fpuMxmMcjkNPNolHssUnG82iShvLeE5WnrSmvaSIftyebKjJlMqnI8cxgUoswSNnX/LGhZuMKDbMjAlJqOAccLcgOCi4oICtRl9OtVexJumdiXQ7CA/wqM7tdoLv++PJkmkxon6yuyGZNIfACS65blPdSXPoTIV+nUHrI2kJ3PvgNOFZZMDvEbMYQx36xRKpi6QOu3CHQ+nroIwpK23lBAMD6Zgs1yag==",
+   "serverTools": {
+    "provider": "openai-responses"
+   }
+  },
+  "id": "53fed53c-189c-4723-a7b1-1e50cde947f7",
+  "timestamp": "2026-08-31T14:24:24.160Z",
+  "parentId": "527ac096-a704-4c25-a434-8c42b69a5391"
+ },
+ {
+  "type": "assistant.turn_end",
+  "data": {
+   "turnId": "1"
+  },
+  "id": "39a52877-6e2e-4cce-8af9-5f26452af553",
+  "timestamp": "2026-08-31T14:24:24.162Z",
+  "parentId": "53fed53c-189c-4723-a7b1-1e50cde947f7"
+ },
+ {
+  "type": "session.usage_checkpoint",
+  "data": {
+   "totalNanoAiu": 971665000,
+   "totalPremiumRequests": 2,
+   "modelCacheState": [
+    {
+     "modelId": "gpt-5.6-luna",
+     "cacheExpiresAt": "2026-08-31T14:54:23.158Z",
+     "cacheTtlSeconds": 1800
+    }
+   ],
+   "promptCacheBreakState": [
+    {
+     "conversation": "main",
+     "models": {
+      "gpt-5.6-luna": {
+       "model": "gpt-5.6-luna",
+       "vendor": "openai",
+       "model_call_id": "0JECOlpIuTgGOy6s6zrLVL9CcTknzPc8UY2wNRhNgivB6OcGT13yiAE8opiQwdiP950wWc0dgDBT1XZbd2/JONLg9OheINjBm38S+8fmKLCNZ9P7E2o35GyCMOHLvhR+G9Fo43hqxjrpijL5qFphMT8g0YOAs1hQF/2kuCFwFnJJVTYPFvOWti2AZ6bRel4sp/5RNrpbfxdh/fe2dwduFdrLt/um2WpGEf+kL5pl87UpvGzJ31bUvcCT3rg/pxGs6Erg0izl/4fpuMxmMcjkNPNolHssUnG82iShvLeE5WnrSmvaSIftyebKjJlMqnI8cxgUoswSNnX/LGhZuMKDbMjAlJqOAccLcgOCi4oICtRl9OtVexJumdiXQ7CA/wqM7tdoLv++PJkmkxon6yuyGZNIfACS65blPdSXPoTIV+nUHrI2kJ3PvgNOFZZMDvEbMYQx36xRKpi6QOu3CHQ+nroIwpK23lBAMD6Zgs1yag==",
+       "request_id": "00000-5c71bcdf-3e4e-42c4-8c17-cb4bfb065f4a",
+       "github_request_id": "196adc63-c9f4-4154-868b-f2c2cd6d4daa",
+       "api_endpoint": "ws:/responses",
+       "transport": "websocket",
+       "session_mode": "interactive",
+       "reasoning_effort": "medium",
+       "initiator": "agent",
+       "tool_count": 22,
+       "tool_tokens": 7964,
+       "tools": [
+        {
+         "name": "bash",
+         "schema_hash": "8071f13f1f8b",
+         "safe": true
+        },
+        {
+         "name": "read_bash",
+         "schema_hash": "78bdc74b3707",
+         "safe": true
+        },
+        {
+         "name": "stop_bash",
+         "schema_hash": "dd8c0c97e7c9",
+         "safe": true
+        },
+        {
+         "name": "list_bash",
+         "schema_hash": "3209638ac5d6",
+         "safe": true
+        },
+        {
+         "name": "apply_patch",
+         "schema_hash": "82b4475374ff",
+         "safe": true
+        },
+        {
+         "name": "view",
+         "schema_hash": "bce2bfaab6ba",
+         "safe": true
+        },
+        {
+         "name": "web_fetch",
+         "schema_hash": "a0829f05c5fd",
+         "safe": true
+        },
+        {
+         "name": "skill",
+         "schema_hash": "970ef5551151",
+         "safe": true
+        },
+        {
+         "name": "ask_user",
+         "schema_hash": "c45aacfa3e3d",
+         "safe": true
+        },
+        {
+         "name": "sql",
+         "schema_hash": "c2a06c9d4c62",
+         "safe": true
+        },
+        {
+         "name": "read_agent",
+         "schema_hash": "0cc5a3205bfc",
+         "safe": true
+        },
+        {
+         "name": "list_agents",
+         "schema_hash": "e83edd8ed50f",
+         "safe": true
+        },
+        {
+         "name": "write_agent",
+         "schema_hash": "1db3ce5292e0",
+         "safe": true
+        },
+        {
+         "name": "rg",
+         "schema_hash": "32552e28c37f",
+         "safe": true
+        },
+        {
+         "name": "glob",
+         "schema_hash": "0b44fa8a5cf4",
+         "safe": true
+        },
+        {
+         "name": "task",
+         "schema_hash": "b7751998643e",
+         "safe": false
+        },
+        {
+         "name": "github-mcp-server-get_copilot_space",
+         "schema_hash": "c8adccdafb84",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-get_file_contents",
+         "schema_hash": "6cf17f9abfd4",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-list_copilot_spaces",
+         "schema_hash": "32e5d3fd470f",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-search_code",
+         "schema_hash": "679d4765fec5",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-search_users",
+         "schema_hash": "da0cf089bedb",
+         "safe": true
+        },
+        {
+         "name": "web_search",
+         "schema_hash": "cb18d98a639a",
+         "safe": true
+        }
+       ],
+       "tools_truncated": 0,
+       "system_segments": [
+        {
+         "segment": "identity",
+         "hash": "fe1711f6f31c",
+         "tokens": 754
+        },
+        {
+         "segment": "version_information",
+         "hash": "13746b2fa56e",
+         "tokens": 9
+        },
+        {
+         "segment": "model_information",
+         "hash": "4dfb83d40484",
+         "tokens": 83
+        },
+        {
+         "segment": "environment_context",
+         "hash": "1d572ecf0169",
+         "tokens": 60
+        },
+        {
+         "segment": "code_change_instructions",
+         "hash": "8882f6eb1325",
+         "tokens": 667
+        },
+        {
+         "segment": "dynamic_guidelines",
+         "hash": "47926a65fcda",
+         "tokens": 78
+        },
+        {
+         "segment": "environment_limitations",
+         "hash": "9d9ae1650158",
+         "tokens": 235
+        },
+        {
+         "segment": "tool_intro",
+         "hash": "2c07d9f78963",
+         "tokens": 20
+        },
+        {
+         "segment": "tool_instructions",
+         "hash": "c46fe9f18b7d",
+         "tokens": 3808
+        },
+        {
+         "segment": "custom_instructions",
+         "hash": "01ba4719c80b",
+         "tokens": 1
+        },
+        {
+         "segment": "additional_instructions",
+         "hash": "d2172871b2d3",
+         "tokens": 1521
+        },
+        {
+         "segment": "final_instructions",
+         "hash": "42885e06aebe",
+         "tokens": 223
+        }
+       ],
+       "conversation": {
+        "message_count": 11,
+        "points": [
+         {
+          "index": 0,
+          "hash": "b7418648e048"
+         },
+         {
+          "index": 1,
+          "hash": "906e64ad2fb2"
+         },
+         {
+          "index": 2,
+          "hash": "fa56b0c92c8c"
+         },
+         {
+          "index": 3,
+          "hash": "5689fc5ca33e"
+         },
+         {
+          "index": 4,
+          "hash": "7d018ae09713"
+         },
+         {
+          "index": 5,
+          "hash": "fc75a9a38800"
+         },
+         {
+          "index": 6,
+          "hash": "7fc43fa73e94"
+         },
+         {
+          "index": 7,
+          "hash": "cb7cffaf96f0"
+         },
+         {
+          "index": 8,
+          "hash": "e66aee3cca50"
+         },
+         {
+          "index": 9,
+          "hash": "a481de3dc0a3"
+         },
+         {
+          "index": 10,
+          "hash": "44646d1cb325"
+         }
+        ]
+       },
+       "cache_config": {
+        "arm": "control",
+        "marks_system_prompt": false,
+        "marks_conversation": false,
+        "advisor_tool": false,
+        "incremental_input": true
+       },
+       "prompt_tokens": 15763,
+       "cache_read": 15686,
+       "cache_write": 74,
+       "cache_details_reported": true,
+       "frontier_tokens": 15760,
+       "frontier_source": "reported_writes",
+       "ttl_seconds": 1800,
+       "cache_expires_at": "2026-08-31T14:54:23.158Z",
+       "completed_at": "2026-08-31T14:24:24.157Z"
+      }
+     },
+     "lastActiveModel": "gpt-5.6-luna",
+     "pendingRewriteSources": []
+    }
+   ]
+  },
+  "id": "c2791aef-b2d0-4d6a-b4cb-bb409475d7b7",
+  "timestamp": "2026-08-31T14:24:24.166Z",
+  "parentId": "39a52877-6e2e-4cce-8af9-5f26452af553"
+ },
+ {
+  "type": "session.idle",
+  "data": {
+   "aborted": false
+  },
+  "id": "idle-continuation",
+  "timestamp": "2026-08-31T14:24:24.300Z",
+  "parentId": null,
+  "ephemeral": true
+ }
+]

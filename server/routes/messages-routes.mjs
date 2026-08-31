@@ -6511,6 +6511,11 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true });
   });
 
+  // Providers whose workers turn runtime-initiated activity into continuation
+  // rows: the Claude worker (background tasks/agents) and the Copilot SDK
+  // worker (detached background shells) serving both Copilot-CLI providers.
+  const CONTINUATION_PROVIDER_TYPES = new Set(['claude', 'github', 'openai']);
+
   // POST /api/continuation-turn — a session worker's CLI started a turn on its
   // own (a background task's notification). The synthetic queue row gives that
   // turn the full relay surface — stream, thoughts, activity, questions, and a
@@ -6523,9 +6528,19 @@ export function registerMessagesRoutes(app, deps) {
     const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
     if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
     const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
-    const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
-    if (providerType !== 'claude') {
-      return res.status(409).json({ error: 'Background continuations are only supported for Claude conversations' });
+    // Fail closed on an unbound conversation: without a runtime-session row the
+    // provider is unknowable, and defaulting it would let a stale worker mint
+    // rows for a conversation it no longer owns (same hardening as the
+    // copilot-plan-usage ingest).
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'No runtime session for conversation' });
+    }
+    const providerType = String(runtimeSession.provider_type || '').trim().toLowerCase();
+    // Claude and both Copilot-CLI providers (github hosted, openai BYOK) run
+    // workers that continue runtime-initiated turns; refuse the rest rather
+    // than minting a row no worker will ever answer.
+    if (!CONTINUATION_PROVIDER_TYPES.has(providerType)) {
+      return res.status(409).json({ error: `Background continuations are not supported for ${providerType || 'unbound'} conversations` });
     }
     const requester = readBridgeIdentity(req);
     const ownerSessionId = normalizeSessionWorkerId(requester?.sessionId)

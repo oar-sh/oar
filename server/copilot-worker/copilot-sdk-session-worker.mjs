@@ -79,6 +79,18 @@ async function main() {
     controlPoller,
     idleShutdownMs: readOptionalMs('COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS'),
     turnStallTimeoutMs: readOptionalMs('COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS'),
+    // How long live detached shells alone may hold the runtime open (0 = no
+    // limit). Deliberately NOT the relay's `background_task_timeout_minutes`
+    // slider that rides every delivery payload: that slider defaults to
+    // 0/unlimited and governs Claude's background tasks, which the composer
+    // lists and can stop. A Copilot detached shell has neither, so consuming it
+    // would make "a forgotten shell pins a runtime forever" the default with
+    // nothing in the UI to reveal it. The runner's own 30-minute cap applies
+    // unless this says otherwise.
+    ...(() => {
+      const override = readOptionalMs('COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS');
+      return override === undefined ? {} : { getBackgroundTaskTimeoutMs: () => override };
+    })(),
     dbg,
   });
 

@@ -9,7 +9,10 @@ drives the CLI's **bundled SDK** (`COPILOT_SDK_PATH`) as a headless JSON-RPC run
 shape as the Claude, Cursor and Grok workers. The extension engine ([copilot-sdk.md](copilot-sdk.md))
 remains the default and is untouched; this file tracks the SDK engine only.
 
-**Status:** implemented (phases 0–4), **burn-in pending**. Default engine is still Extension.
+**Status:** implemented (phases 0–4), **burn-in in progress**. Default engine is still Extension.
+Burn-in finding #2 (self-initiated turns were dropped; live session `10a1a9ad`, 2026-08-31) is fixed
+worker-side — but its relay route still refuses Copilot, so it cannot be exercised live yet. See
+[Self-initiated turns](#self-initiated-continuation-turns).
 
 ## Engine selection
 
@@ -28,9 +31,10 @@ remains the default and is untouched; this file tracks the SDK engine only.
 | Module | Purpose | Key exports |
 | ------ | ------- | ----------- |
 | `copilot-sdk-session-worker.mjs` | Process entry point. Config → api client → control poller → turn runner → heartbeat → worker WebSocket, plus signal handling and the crash guard. | *(side-effecting `main()`)* |
-| `copilot-sdk-session-process.mjs` | Owns the `CopilotClient`/`CopilotSession` for one conversation and runs turns as a state machine over the session event callback. | `createCopilotSdkSessionRunner`, `RUNTIME_INTERRUPTED_NOTE`, `STEERED_ROW_MERGED_NOTE`, `DEFAULT_INFINITE_SESSION_CONFIG` |
+| `copilot-sdk-session-process.mjs` | Owns the `CopilotClient`/`CopilotSession` for one conversation and runs turns as a state machine over the session event callback — both `delivered` turns and the `continuation` turns the runtime starts by itself. | `createCopilotSdkSessionRunner`, `RUNTIME_INTERRUPTED_NOTE`, `STEERED_ROW_MERGED_NOTE`, `CONTINUATION_TRIGGER`, `DEFAULT_INFINITE_SESSION_CONFIG` |
 | `copilot-sdk-adapter.mjs` | The only module that touches the real SDK: path/version resolution, client start, runtime-exit observation, permission policy, error classification. | `resolveCopilotSdkPaths`, `startCopilotClient`, `observeRuntimeExit`, `describeVersionSkew`, `createCopilotPermissionHandler`, `copilotPermissionDecision`, `isReadOnlyPermissionRequest`, `copilotAgentModeForRelayMode`, `classifyCopilotSessionError`, `classifyCopilotTurnException`, `isCopilotQuotaError`, `isCopilotAuthError`, `isSessionNotFoundError` |
 | `copilot-sdk-event-normalizer.mjs` | Pure `SessionEvent` → relay channel/action mapping. No I/O, no SDK import; one instance per turn. | `createCopilotEventNormalizer`, `isSubagentEvent`, `subagentDisplayName`, `formatToolActivityText`, `summarizeToolInput`, `formatSubagentStats` |
+| `copilot-continuation-signals.mjs` | Pure signal extraction for self-initiated turns: detached-shell liveness, resume-replay discrimination, and which events mean "the runtime started work". No I/O, no SDK import. | `createBackgroundShellTracker`, `createReplayGate`, `isContinuationOpeningEvent`, `describeSettledShell`, `CONTINUATION_OPENING_EVENT_TYPES`, `SHELL_SETTLED_NOTIFICATION_KINDS` |
 | `copilot-question-bridge.mjs` | The runtime's two blocking human surfaces (`ask_user`, ask-mode tool approval) → relay question cards, over `shared/ask-user-bridge.mjs`. | `createCopilotQuestionBridge`, `normalizeUserInputChoices`, `deriveWasFreeform`, `PERMISSION_APPROVE_CHOICE`, `PERMISSION_DENY_CHOICE` |
 | `copilot-plan-board.mjs` | `plan_ready` board payload, when the text-shape fallback may post one, and the exit-plan feedback strings. | `buildCopilotPlanReadyBoardPayload`, `shouldPostPlanBoard`, `planTextFromExitRequest`, `PLAN_BOARD_ACTIONS`, `PLAN_LINE_THRESHOLD` |
 | `copilot-prompt-context.mjs` | Per-turn relay prompt prefix: mode marker, mode instructions (only on change), `server/relay-tools.md` guidance, live preview block. | `createCopilotPromptContextBuilder`, `withRelayContext`, `loadDefaultRelayToolInstructions` |
@@ -54,8 +58,9 @@ Shared modules it reuses rather than reimplements: `shared/worker-bootstrap.mjs`
 | Resume across worker restart | Implemented | The relay's SDK session id **is** the runtime's session id: `buildSessionConfig` sets `SessionConfig.sessionId`, so the runtime's own state under `~/.copilot/session-state/<id>` is the store and there is no side table. `ensureSession` always tries `client.resumeSession()` first and only falls back to `createSession()` on `isSessionNotFoundError`; any other error fails the turn retryably. |
 | Steering mid-turn | Implemented | `steerIntoActiveTurn` sends with `mode: 'enqueue'` (live-probed: `immediate` does **not** preempt an in-flight model call, and the whole interaction closes with a single `session.idle`), adopts the row onto the running turn so the lease is renewed and the crash guard requeues both, and answers each row from its own prompt segment indexed by **send order** (`settleSteeredRows`; a row that never got a segment gets `STEERED_ROW_MERGED_NOTE` rather than a requeue that would run it twice). |
 | Abort / Stop | Implemented | `controlPoller.start({ queueMessageId, onAbortTurn })` → `session.abort()`; the runtime's `agent.interrupted` → `session.idle{aborted:true}` settles through the normal terminator. An abort landing before `send()` settles locally; a runtime-initiated abort publishes `RUNTIME_INTERRUPTED_NOTE`. |
-| Idle shutdown | Implemented | `evaluateLifecycle` closes only the runtime (`stopRuntime('idle')`), never the process, after `DEFAULT_IDLE_SHUTDOWN_MS` (10 min, `COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS`); suppressed while a turn is active or a question card is open. Stall watchdog `DEFAULT_TURN_STALL_TIMEOUT_MS` (120 s, `COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS`, `0` disables). |
-| Background-task gating | Not applicable | `session.background_tasks_changed` carries an empty payload (~23 per bash call) — no task id to stop, nothing to gate on. Dropped in the normalizer; worker controls are logged and ignored. Copilot has no background-task surface equivalent to Claude's. |
+| Idle shutdown | Implemented | `evaluateLifecycle` closes only the runtime (`stopRuntime('idle')`), never the process, after `DEFAULT_IDLE_SHUTDOWN_MS` (10 min, `COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS`); suppressed while a turn of **either kind** is active, a question card is open, a detached shell is live, or a settled shell's continuation is still due. Stall watchdog `DEFAULT_TURN_STALL_TIMEOUT_MS` (120 s, `COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS`, `0` disables). |
+| Self-initiated (continuation) turns | Implemented | See [the section below](#self-initiated-continuation-turns). **Blocked live**: the relay route refuses non-Claude conversations. |
+| Background-task gating | Implemented (shells, not "tasks") | `session.background_tasks_changed` is still useless — empty payload, ~23 per bash call, no id or state — so gating keys on **detached shells** tracked from tool events and `system.notification`'s typed `shell_detached_completed` / `shell_completed` kinds instead (`copilot-continuation-signals.mjs`). Capped by `getBackgroundTaskTimeoutMs()` (`COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS`, 30 min, `0` = unlimited). Worker `stop_background_task` controls are still logged and ignored: the runtime exposes no host-side stop RPC. |
 | Runtime death detection | Partial (version-fragile) | The SDK exposes no public exit signal, so `observeRuntimeExit` attaches to `client.processExitPromise` — TS-private but present at runtime — degrading to no detection if a future bundle drops it (fallback would be polling `client.ping()` during a turn). `session.shutdown` is deliberately **not** treated as death: the resume fixture shows it arriving from a graceful disconnect right before a healthy turn. |
 | Version skew reporting | Implemented | `describeVersionSkew` / `readRuntimeVersion` (`copilot-sdk-adapter.mjs`) — the SDK is per-CLI-version and never vendored. |
 
@@ -75,6 +80,27 @@ Shared modules it reuses rather than reimplements: `shared/worker-bootstrap.mjs`
 | Usage | `assistant.usage` (also `agentId`-tagged for subagent calls — counted toward spend but never allowed to set the turn's model), `session.usage_info` → context usage, `model.call_failure` → `quotaSnapshots` |
 | `result` | `session.idle` (`completed` / `aborted`) and `session.error`, guarded so only one terminal fires. `assistant.turn_end` is inert (one per model call) |
 | Dropped | `session.background_tasks_changed`, `pending_messages.modified`, `assistant.streaming_delta`, `model.*`, `session.shutdown` |
+
+Two event classes are consumed **outside** the normalizer, in `copilot-continuation-signals.mjs`,
+because they are about the session rather than the turn: `system.notification` (a settled shell) and
+`session.resume`'s `resumeTime`/`eventCount` (the replay window).
+
+## Self-initiated (continuation) turns
+
+The runtime starts turns nobody asked for. A detached shell (`bash{mode:"async", detach:true}`)
+settles on its own clock and the runtime re-invokes the model with no prompt behind it. Live burn-in
+(session `10a1a9ad`, 2026-08-31, "set a timer to 1 minute") caught the whole of that second turn
+being dropped — `routeEvent` returned early with no active turn — so the user never saw the reply.
+
+| Question | Answer / evidence |
+| -------- | ----------------- |
+| What opens a continuation? | A live (non-replayed) event in `CONTINUATION_OPENING_EVENT_TYPES` arriving with no active turn. An **allowlist**: a missing opener costs one dropped continuation, a spurious one puts an empty synthetic turn in the transcript. Terminators (`session.idle`/`error`) and connection bookkeeping are excluded by construction. |
+| What row does it publish into? | `POST /api/continuation-turn` (`trigger: 'background_task'`, matching the Claude worker so the relay's `CONTINUATION …` log line reads the same for both engines). The turn buffers its actions until the row has an id, then flushes them in arrival order; 3 attempts, then the output is **discarded** — the turn still lands in the runtime's own transcript, and the worker stays healthy. |
+| How does it end? | Exactly like a delivered turn: `session.idle` / `session.error`, the same stall watchdog, the same abort control (started once the row has an id), the same `finishTurn` publish path, and the same fire-and-forget usage ingest. A continuation spends real quota — the live capture burned a premium request on it. |
+| How is replay kept out? | `createReplayGate`: after `session.resume`, suppress events whose own `timestamp` predates `resumeTime`, at most `eventCount` of them, disarming at the first event that is not older. Both halves are needed — see [the plan's §4e](../plans/copilot-sdk-worker.md) for what each one alone gets wrong. There is no SDK replay flag (`ephemeral` marks transience, not replay). |
+| Steering during one | A delivered row steers into the running continuation like any other interaction. The continuation owns the normalizer's **implicit segment 0** (it sent no prompt), so the first steered prompt opens segment **1** — tracked by `turn.nextSegmentIndex` / `turn.firstSentSegment` rather than derived, because the two turn kinds differ. Getting it wrong cross-publishes the continuation's reply into the user's row. |
+| Relay mode | Inherited from the last delivered turn (`lastRelayMode`): a self-initiated turn has no delivery to read a mode off, and it is a continuation *of* that work. |
+| **Live status** | **Blocked.** `POST /api/continuation-turn` answers **409** unless the runtime session's `provider_type` is `claude`; Copilot binds to `github`/`openai`. The worker degrades correctly (retry, then discard) but no continuation can reach a live relay until that gate is widened — a one-line relay change outside this lane. |
 
 **Do not set `includeSubAgentStreamingEvents: false`.** It defaults to true, and turning it off also
 collapses the *parent's* tool-call argument streaming (live-reproduced twice each way).
@@ -148,12 +174,22 @@ on its own, and after a switch back to the extension engine nothing would ever r
 Turn-level behaviour is covered by unit tests driving the runner against a **fake SDK client**
 (`copilot-sdk-test-harness.mjs`) over checked-in event fixtures captured from the real runtime
 (`server/copilot-worker/fixtures/`: `happy-turn`, `abort-turn`, `ask-user-turn`, `quota-turn`,
-`reasoning-turn`, `resume-turn`, `subagent-turn`, `tool-permission-turn`). No e2e stub of the
+`reasoning-turn`, `resume-turn`, `subagent-turn`, `tool-permission-turn`,
+`background-timer-turn` + `background-timer-continuation` — the two halves of the burn-in timer
+incident, cut from the real `~/.copilot/session-state/<id>/events.jsonl` and scrubbed). No e2e stub of the
 JSON-RPC protocol exists, and none is planned — see [the plan's §4c](../plans/copilot-sdk-worker.md).
 
 | Suite | Tests | Covers |
 | ----- | ----- | ------ |
 | `server/copilot-worker/copilot-sdk-session-process.test.mjs` | 74 | turn state machine, resume, steering, abort, idle/stall, plan boards, usage capture |
+| `server/copilot-worker/copilot-sdk-continuation-turn.test.mjs` | 22 | self-initiated turns end to end over the live timer capture: row registration, reply attribution, streams/activity, usage, heartbeat ownership, replay suppression, lifecycle pinning + cap expiry, steering during a continuation, degraded relay |
+| `server/copilot-worker/copilot-continuation-signals.test.mjs` | 19 | shell open/settle/close signals, replay-window arithmetic, opener allowlist |
+<!-- The continuation suite's fake client replays its fixture on the FIRST send only, so a
+     steered second prompt does not re-answer with the first turn's transcript. A test that
+     delivers a genuinely separate second turn must pass `replayEverySend: true` — otherwise that
+     turn never sees a terminator and sits out the whole 120 s stall watchdog before passing, which
+     reads as a hung suite rather than a slow one. -->
+
 | `server/copilot-worker/copilot-sdk-event-normalizer.test.mjs` | 33 | event → channel mapping, subagent lane, terminal guards |
 | `server/copilot-worker/copilot-sdk-adapter.test.mjs` | 28 | path/version resolution, permission policy, error classification |
 | `server/copilot-worker/copilot-byok-provider.test.mjs` | 14 | provider config, ceilings, override validation |
@@ -186,7 +222,18 @@ sustained period. Extension removal is a separate future decision.
 - [ ] Usage/billing card unchanged, plus the new last-turn section
 - [ ] Resume across worker restart
 - [ ] Relay restart survival
-- [ ] Background-task gating (n/a — confirm nothing regresses)
+- [ ] **Self-initiated turns** — ask for a timer longer than a minute; the "it fired" reply must
+      arrive as its own transcript entry (relay log: `CONTINUATION … trigger=background_task`).
+      **Gated on the relay's `/api/continuation-turn` provider check being widened past `claude`;**
+      until then the expected observation is three refused registrations in the worker log and no
+      relay output.
+- [ ] **Background shell outliving the idle window** — start a shell that takes >10 min; the runtime
+      must still be up when it settles (it is the shell's parent), and the reply must arrive.
+- [ ] **The cap** — a shell that never finishes must stop pinning after 30 min
+      (`COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS`), and the runtime must then idle out.
+- [ ] **Resume replay** — restart the worker mid-conversation; the resume must produce **no**
+      continuation rows and no duplicated replies.
+- [ ] Background-task gating (shells, not Claude-style tasks — see the section above)
 - [ ] Idle shutdown
 - [ ] Windows spawn
 - [ ] Previews lane

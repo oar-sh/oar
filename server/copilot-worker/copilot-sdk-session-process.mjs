@@ -10,6 +10,40 @@
 // callback. `sendAndWait()` is deliberately unused: it has a hard 60s internal
 // timeout after which it merely stops waiting, which would silently strand
 // every long turn.
+//
+// ## Self-initiated turns
+//
+// The runtime does not only answer prompts. A detached background shell
+// (`bash{mode:"async", detach:true}`) settles on its own clock, and the runtime
+// then re-invokes the model with NO prompt behind it — a `system.notification`
+// followed by a fresh `assistant.turn_start`, tool calls and a durable
+// `assistant.message`. Live burn-in (session `10a1a9ad`, 2026-08-31: "set a
+// timer to 1 minute") caught the whole of that second turn being dropped
+// because no relay row was open to publish it into, and the user never saw the
+// answer they had been promised.
+//
+// So a turn here is one of two kinds:
+//
+//  - `delivered`     — a queue row arrived, `runTurn` sends its prompt;
+//  - `continuation`  — the runtime started work by itself. The worker mints a
+//    synthetic queue row (`POST /api/continuation-turn`) and runs the SAME
+//    state machine over the events, so the turn gets the full relay surface:
+//    stream, thoughts, activity, questions, usage and a response of its own.
+//    Actions produced before the row exists are buffered and flushed in order.
+//
+// Three rules keep that safe, and each is enforced in `routeEvent`:
+//
+//  1. **Replay is not new work.** `session.resume` can replay persisted history
+//     through the same callback; `createReplayGate` drops it (see that module
+//     for why `resumeTime` and `eventCount` are used together).
+//  2. **Liveness pins the runtime.** Idle shutdown must not stop a runtime that
+//     has a detached shell running or a settled shell's continuation still due
+//     — stopping it kills the shell. `createBackgroundShellTracker` supplies
+//     the set; `backgroundTaskTimeoutMs` caps how long it may pin.
+//  3. **A continuation is a turn like any other.** It ends on `session.idle`,
+//     its usage is captured and posted, and a user message delivered while it
+//     runs is steered into it (answered from its own prompt segment) rather
+//     than cross-published into the continuation's row.
 import {
   USER_INPUT_UNSUPPORTED_ANSWER,
   classifyCopilotSessionError,
@@ -24,6 +58,12 @@ import {
 } from './copilot-sdk-adapter.mjs';
 import { buildCopilotMessageOptions } from './copilot-attachments.mjs';
 import { resolveCopilotProviderConfig } from './copilot-byok-provider.mjs';
+import {
+  createBackgroundShellTracker,
+  createReplayGate,
+  describeSettledShell,
+  isContinuationOpeningEvent,
+} from './copilot-continuation-signals.mjs';
 import { createCopilotEventNormalizer } from './copilot-sdk-event-normalizer.mjs';
 import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 import {
@@ -53,6 +93,36 @@ const DEFAULT_LIFECYCLE_POLL_MS = 5_000;
 // (messages-routes.mjs), so without a stall ceiling a turn whose runtime went
 // quiet holds its queue row open indefinitely and no watchdog can free it.
 const DEFAULT_TURN_STALL_TIMEOUT_MS = 120_000;
+/**
+ * How long live background shells ALONE may keep the runtime up (0 = no limit).
+ *
+ * Deliberately not the relay's `background_task_timeout_minutes` slider, whose
+ * default is 0/unlimited: that slider governs Claude's background tasks, which
+ * have ids, a composer panel and a stop button, so "no limit" there is a choice
+ * the user can see and undo. A Copilot detached shell has none of that — the
+ * runtime exposes no RPC to stop one and the relay has no surface listing them
+ * — so an unlimited default would let a single forgotten `sleep 99999` pin a
+ * runtime subprocess for the life of the relay with nothing to point at. 30
+ * minutes is well past any timer a user would sit and wait for, and the cap
+ * only ever costs the shell, never a turn.
+ */
+const DEFAULT_BACKGROUND_TASK_TIMEOUT_MS = 30 * 60_000;
+/**
+ * How long after a shell settles the runtime is held up waiting for the
+ * continuation it should trigger.
+ *
+ * The live capture had 3ms between the `system.notification` and the
+ * `assistant.turn_start`. This window only has to survive a runtime that
+ * notifies and then decides there is nothing to say — mirrors the Claude
+ * worker's `notificationGraceMs`, same value.
+ */
+const DEFAULT_CONTINUATION_GRACE_MS = 60_000;
+/** Retry spacing for the synthetic-row registration (3 attempts). */
+const DEFAULT_CONTINUATION_RETRY_DELAY_MS = 500;
+/** How long a continuation's actions may buffer before its row is abandoned. */
+const CONTINUATION_REGISTRATION_TIMEOUT_MS = 10_000;
+/** Cap on activity lines carried between turns, so a chatty runtime cannot grow them. */
+const MAX_PENDING_ACTIVITIES = 20;
 
 /**
  * Appended to the partial answer when the RUNTIME interrupted the turn on its
@@ -74,6 +144,13 @@ export const RUNTIME_INTERRUPTED_NOTE =
 export const STEERED_ROW_MERGED_NOTE =
   '_(This message was delivered while the previous turn was still running; the reply continues in '
   + 'the next turn.)_';
+
+/**
+ * The `trigger` reported to `POST /api/continuation-turn`, matching the value
+ * the Claude worker sends so the relay's `CONTINUATION … trigger=` log line and
+ * any future per-trigger handling read the same for both engines.
+ */
+export const CONTINUATION_TRIGGER = 'background_task';
 
 /**
  * Compaction / infinite-session policy.
@@ -142,6 +219,16 @@ export function createCopilotSdkSessionRunner({
   // fails terminally instead of holding the queue row until the relay's own
   // delivery watchdog gives up.
   turnStallTimeoutMs = DEFAULT_TURN_STALL_TIMEOUT_MS,
+  // How long live detached shells alone may keep the runtime up (0 = no
+  // limit). Read through a getter, like the Claude worker's
+  // `getBackgroundTaskTimeoutMs`, so a future settings push can move it without
+  // a worker restart.
+  getBackgroundTaskTimeoutMs = () => DEFAULT_BACKGROUND_TASK_TIMEOUT_MS,
+  continuationGraceMs = DEFAULT_CONTINUATION_GRACE_MS,
+  continuationRetryDelayMs = DEFAULT_CONTINUATION_RETRY_DELAY_MS,
+  // How long a settled continuation waits for its row before giving up on it.
+  // Must outlast the registration's own retries; a test shortens it.
+  continuationRegistrationTimeoutMs = CONTINUATION_REGISTRATION_TIMEOUT_MS,
   dbg = () => {},
 } = {}) {
   let client = null;
@@ -183,6 +270,27 @@ export function createCopilotSdkSessionRunner({
   // ceilings are model-specific and the session is rebuilt when the model
   // changes.
   let byokProvider = null;
+  // Drops the history a `session.resume` replays through the live callback, so
+  // a two-day-old `assistant.message` can never mint a continuation row.
+  const replayGate = createReplayGate();
+  // The detached shells this session has running. The lifecycle's pin, and the
+  // reason a settled one is worth waiting for.
+  const backgroundShells = createBackgroundShellTracker();
+  // When a shell settled and the continuation it should trigger has not opened
+  // yet. Holds the runtime for `continuationGraceMs`; cleared by the
+  // continuation opening, or by the grace expiring on a runtime that decided it
+  // had nothing to say.
+  let continuationDueSince = 0;
+  // Transcript lines produced between turns (a settled shell's notification).
+  // They belong to the turn they trigger, so they are carried into it rather
+  // than dropped — the same trade the Claude worker's `pendingActivities`
+  // makes.
+  let pendingActivities = [];
+  // The relay mode of the last delivered turn. A self-initiated turn has no
+  // delivery to read a mode off, and it is a continuation OF that turn's work,
+  // so it inherits it — which is what keeps the permission handler and the
+  // plan-board gating behaving the same either side of a background wait.
+  let lastRelayMode = 'agent';
 
   async function whileAwaitingHuman(run) {
     pendingHumanRequests += 1;
@@ -202,7 +310,10 @@ export function createCopilotSdkSessionRunner({
   const questionBridge = createQuestionBridgeImpl({
     api,
     sdkSessionId,
-    getActiveMessage: () => activeTurn?.message || null,
+    // A continuation's message has no `id` until its synthetic row is
+    // registered; posting a card against a null id would 409. Reporting "no
+    // active message" instead lets the bridge take its own degraded path.
+    getActiveMessage: () => (activeTurn?.message?.id ? activeTurn.message : null),
     ...(questionPollMs === undefined ? {} : { questionPollMs }),
     ...(questionTimeoutMs === undefined ? {} : { questionTimeoutMs }),
     dbg,
@@ -303,7 +414,7 @@ export function createCopilotSdkSessionRunner({
   async function closeStraySubagentRuns(turn) {
     const runs = turn?.normalizer?.activeSubagentRuns?.() || [];
     for (const run of runs) {
-      await dispatchAction(turn.message, {
+      await emitAction(turn, {
         channel: 'subagent',
         payload: {
           subagentRunId: run.subagentRunId,
@@ -311,8 +422,24 @@ export function createCopilotSdkSessionRunner({
           displayName: run.displayName,
           status: 'failed',
         },
-      }, turn.state);
+      });
     }
+  }
+
+  /**
+   * Publish an action, or hold it if the turn has no queue row yet.
+   *
+   * The single gate every producer goes through. A continuation's row is
+   * created asynchronously, and a POST carrying `messageId: null` is not merely
+   * useless — the relay's activity/stream routes key on it, so it would be
+   * attributed to nothing at all.
+   */
+  async function emitAction(turn, action) {
+    if (!turn.registered) {
+      turn.bufferedActions.push(action);
+      return;
+    }
+    await dispatchAction(turn.message, action, turn.state);
   }
 
   async function publishFinalStream(message, text) {
@@ -422,12 +549,72 @@ export function createCopilotSdkSessionRunner({
   // ---------------------------------------------------------------- session --
 
   function routeEvent(event) {
+    // A replayed event is history the relay already has. It must not touch the
+    // idle clock, the shell set, an active turn's normalizer, or — the reason
+    // this gate exists at all — open a continuation row for work that finished
+    // days ago.
+    if (replayGate.isReplay(event)) {
+      dbg('dropping a replayed event', String(event?.type || ''), String(event?.timestamp || ''));
+      return;
+    }
     touch();
-    const turn = activeTurn;
-    if (!turn) return;
+    observeBackgroundShells(event);
+    let turn = activeTurn;
+    if (!turn) {
+      // The runtime started work with no row open. Anything that is not the
+      // START of work (terminators, connection bookkeeping) stays a no-op:
+      // opening a row for one would leave a synthetic turn in the transcript
+      // that only the stall watchdog could close.
+      if (!isContinuationOpeningEvent(event)) return;
+      turn = openContinuationTurn();
+    }
+    // `activeTurn` is deliberately still set (and still settled) while a turn
+    // publishes its response, so a continuation cannot open inside that window
+    // and clobber the row being written. Events landing there are dropped by
+    // `handleTurnEvent`'s settled guard — and cost nothing, because the opener
+    // allowlist spans the whole of a turn: the next `assistant.message` or
+    // `tool.execution_start` opens the continuation once the row is closed,
+    // with the normalizer still capturing the reply text.
     dispatchChain = dispatchChain
       .then(() => handleTurnEvent(turn, event))
       .catch((error) => { dbg('event dispatch failed', error?.message || String(error)); });
+  }
+
+  /**
+   * Keep the detached-shell set current and note when one settles.
+   *
+   * Runs for every live event, in or out of a turn: shells are OPENED inside a
+   * delivered turn (that is where the model calls `bash`) and SETTLE outside
+   * one, which is the whole asymmetry this fix exists for.
+   */
+  function observeBackgroundShells(event) {
+    let changed;
+    try {
+      changed = backgroundShells.observe(event);
+    } catch (error) {
+      dbg('background shell tracking failed', String(event?.type || ''), error?.message || String(error));
+      return;
+    }
+    for (const shell of changed.opened) {
+      dbg('detached shell started', shell.shellId, shell.description || '(no description)');
+    }
+    for (const shell of changed.settled) {
+      dbg('detached shell settled', shell.shellId);
+      const note = describeSettledShell(shell);
+      // Only carried when there is no turn to publish into: inside a turn the
+      // normalizer already narrates the `read_bash` that reads the output.
+      if (note && !activeTurn && pendingActivities.length < MAX_PENDING_ACTIVITIES) {
+        pendingActivities.push(note);
+      }
+    }
+    // Only the runtime's own `system.notification` heralds a continuation. A
+    // `read_bash` that reports an exit code closes the same shell, but it
+    // happens inside a turn that already knows — pinning on it would hold the
+    // runtime for the grace window after every ordinary background command.
+    //
+    // Set even when a turn is active: the gap that matters is the one AFTER
+    // that turn closes.
+    if (changed.heralded) continuationDueSince = Date.now();
   }
 
   async function handleTurnEvent(turn, event) {
@@ -446,7 +633,21 @@ export function createCopilotSdkSessionRunner({
         turn.settle();
         return;
       }
-      await dispatchAction(turn.message, action, turn.state);
+      // A continuation's actions buffer until its synthetic row exists; the
+      // registration drains them in arrival order and only then flips
+      // `registered`, so a later action can never overtake an earlier one.
+      // Delivered turns are registered from birth and take the direct path.
+      await emitAction(turn, action);
+    }
+  }
+
+  /** Publish everything a not-yet-registered turn buffered, in order. */
+  async function flushBufferedActions(turn) {
+    while (turn.bufferedActions.length) {
+      const batch = turn.bufferedActions.splice(0);
+      for (const action of batch) {
+        await dispatchAction(turn.message, action, turn.state).catch(() => {});
+      }
     }
   }
 
@@ -724,6 +925,14 @@ export function createCopilotSdkSessionRunner({
     session = null;
     client = null;
     appliedModel = '';
+    // Detached shells are children of the runtime process, so stopping it ends
+    // them: the tracked set is state about a process that no longer exists and
+    // must not pin the next one. The replay gate is reset for the same reason —
+    // the next connection resumes and arms its own window.
+    backgroundShells.reset();
+    replayGate.reset();
+    continuationDueSince = 0;
+    pendingActivities = [];
     if (!closingSession && !closingClient) return;
     dbg(`stopping the copilot runtime (${reason})`);
     try { await closingSession?.disconnect?.(); } catch (error) {
@@ -736,11 +945,56 @@ export function createCopilotSdkSessionRunner({
 
   // -------------------------------------------------------------- lifecycle --
 
+  /**
+   * Whether background work is holding the runtime open.
+   *
+   * `stopRuntime` ends the CLI runtime process, and a detached shell is a child
+   * of it — so stopping while one is live does not merely postpone the
+   * continuation, it KILLS the command. The live capture's 1-minute timer
+   * survived only because it was shorter than the 10-minute idle window; a
+   * 15-minute one would have been silently destroyed.
+   *
+   * Two holds, both bounded:
+   *
+   *  - a settled shell whose continuation has not opened yet
+   *    (`continuationGraceMs`), because the runtime is about to re-invoke the
+   *    model and closing it in that gap loses the reply;
+   *  - live shells, until `getBackgroundTaskTimeoutMs()` (0 = no limit). On
+   *    expiry the shells are FORGOTTEN rather than stopped: unlike the Claude
+   *    SDK, runtime 1.0.82 exposes no way to stop a shell from the host side
+   *    (`stop_bash` is a tool the *model* calls), so the honest choice is to
+   *    stop pretending they will report back and let the runtime — and with it
+   *    the shells — go. Logged, because it means a command was cut short.
+   */
+  function backgroundWorkHoldsRuntime() {
+    const now = Date.now();
+    if (continuationDueSince) {
+      if (now - continuationDueSince < continuationGraceMs) return true;
+      // The runtime notified and then decided it had nothing to say. Stop
+      // pinning; this is the Claude worker's `notificationGraceMs` backstop.
+      dbg('continuation grace expired with no continuation turn');
+      continuationDueSince = 0;
+    }
+    if (!backgroundShells.size()) return false;
+    const capMs = Number(getBackgroundTaskTimeoutMs()) || 0;
+    for (const shell of backgroundShells.expireOlderThan(capMs)) {
+      dbg(
+        'background shell cap reached; it no longer holds the runtime open',
+        shell.shellId,
+        shell.description || '(no description)',
+      );
+    }
+    return backgroundShells.size() > 0;
+  }
+
   function evaluateLifecycle() {
     // A pending question card means a human is mid-answer; tearing the runtime
     // down under them would discard the session the answer belongs to.
     if (disposed || activeTurn || pendingHumanRequests > 0 || !client) return;
     if (!(idleShutdownMs > 0)) return;
+    // Evaluated before the idle clock so the caps still expire on a runtime
+    // that has been quiet far longer than the idle window.
+    if (backgroundWorkHoldsRuntime()) return;
     if (Date.now() - lastActivityAt < idleShutdownMs) return;
     void stopRuntime('idle').catch(() => {});
   }
@@ -765,8 +1019,12 @@ export function createCopilotSdkSessionRunner({
     return String(message?.providerModel || '').trim() || defaultModel;
   }
 
-  function createTurn(message) {
+  function createTurn(message, { kind = 'delivered' } = {}) {
+    const continuation = kind === 'continuation';
     const turn = {
+      // 'delivered' (a queue row arrived) | 'continuation' (the runtime started
+      // work by itself and this worker minted a synthetic row for it).
+      kind,
       message,
       normalizer: createNormalizerImpl(),
       state: { lastStreamedText: '' },
@@ -777,6 +1035,16 @@ export function createCopilotSdkSessionRunner({
       planBoardPosted: false,
       // Set when a mutating tool was actually approved and run this turn.
       acted: false,
+      // A delivered row exists before the turn does, so its actions publish
+      // straight away. A continuation's row is created asynchronously, so its
+      // actions buffer here until it has an id.
+      registered: !continuation,
+      bufferedActions: [],
+      // Set when the synthetic row could not be created; the turn's relay
+      // output is dropped (it still lands in the runtime's own transcript)
+      // rather than failing the worker.
+      discarded: false,
+      controlState: null,
       // How many prompts have been SENT into this interaction. The runtime
       // consumes queued prompts in order, and opens one `user.message` segment
       // per prompt as it picks each up, so send order IS segment order.
@@ -788,12 +1056,26 @@ export function createCopilotSdkSessionRunner({
       //
       // Starts at 1, not 0: this turn's own prompt is always its first, and
       // counting it here rather than after `send()` resolves closes the race
-      // where a steering delivery lands between the two.
-      promptsSent: 1,
-      // The segment this turn's OWN prompt will be answered in. Non-zero when a
-      // previous interaction left prompts queued inside the runtime: those are
-      // consumed first and open the earlier segments.
-      baseSegment: carriedPrompts,
+      // where a steering delivery lands between the two. A continuation sent no
+      // prompt at all, so it starts at 0.
+      promptsSent: continuation ? 0 : 1,
+      // The segment this turn's OWN reply lands in. For a delivered turn that
+      // is where its prompt is picked up — non-zero when a previous interaction
+      // left prompts queued inside the runtime, which are consumed first. A
+      // continuation has no `user.message` of its own, so the normalizer's
+      // implicit first segment is its own.
+      baseSegment: continuation ? 0 : carriedPrompts,
+      // The segment the NEXT prompt steered into this interaction will be
+      // answered in. Tracked explicitly rather than derived, because the two
+      // kinds differ: a delivered turn's own prompt occupies `baseSegment`, so
+      // the next is `baseSegment + 1`; a continuation occupies segment 0
+      // without having sent anything, so the first steered prompt opens
+      // segment 1. Getting this wrong cross-publishes the continuation's reply
+      // into the user's row.
+      nextSegmentIndex: continuation ? 1 : carriedPrompts + 1,
+      // The lowest segment index any prompt SENT by this turn can occupy — the
+      // floor for the carried-prompt arithmetic when the interaction ends.
+      firstSentSegment: continuation ? 1 : carriedPrompts,
       // Cancels any relay question card this turn is blocked on, so an aborted
       // turn does not leave a human answering into the void.
       abortController: new AbortController(),
@@ -853,6 +1135,7 @@ export function createCopilotSdkSessionRunner({
   async function runTurn(message) {
     const model = resolvePerTurnModel(message);
     const relayMode = message?.relayMode || 'agent';
+    lastRelayMode = relayMode;
     const turn = createTurn(message);
     // Set before the session is touched: the heartbeat's owner-recovery guard
     // reads the active ids, so a cold-start delivery must already own its row.
@@ -908,19 +1191,42 @@ export function createCopilotSdkSessionRunner({
       }
     } finally {
       controlPoller?.stop?.(controlState);
-      turn.disarmStall();
-      // Release anything blocked on a question card before the turn's state is
-      // read: the card's answer can no longer reach the runtime.
-      turn.abortController.abort();
-      // Drain in-flight dispatches before the turn's state is read, so a
-      // stream POST cannot land after the response.
-      await dispatchChain.catch(() => {});
-      // Any subagent still open at this point never will be. The normalizer
-      // closes strays when it produces a terminal result; these are the paths
-      // that never produced one.
-      await closeStraySubagentRuns(turn).catch(() => {});
+      await quiesceTurn(turn);
     }
 
+    return finishTurn(turn, model);
+  }
+
+  /**
+   * Everything that must happen between "the turn stopped producing events" and
+   * "its state may be read": stop the watchdog, release anything blocked on a
+   * question card, drain in-flight relay POSTs, and close subagent runs the
+   * normalizer never got to close.
+   */
+  async function quiesceTurn(turn) {
+    turn.disarmStall();
+    // The card's answer can no longer reach the runtime.
+    turn.abortController.abort();
+    // Drain in-flight dispatches before the turn's state is read, so a stream
+    // POST cannot land after the response.
+    await dispatchChain.catch(() => {});
+    // Any subagent still open at this point never will be. The normalizer
+    // closes strays when it produces a terminal result; these are the paths
+    // that never produced one.
+    await closeStraySubagentRuns(turn).catch(() => {});
+  }
+
+  /**
+   * Publish a finished turn's outcome onto its queue row (and every row steered
+   * into it).
+   *
+   * Shared by both turn kinds. A continuation reaches it through
+   * `driveContinuation` instead of `runTurn`, but the outcomes are identical:
+   * the runtime does not distinguish a turn it started from one it was asked
+   * for, so neither does the reporting.
+   */
+  async function finishTurn(turn, model) {
+    const { message } = turn;
     const result = turn.result;
     const responseModel = result?.model || turn.normalizer.model || model || null;
     // Capture only. The POST fires from `handlePendingPayload`'s `finally`,
@@ -928,9 +1234,17 @@ export function createCopilotSdkSessionRunner({
     captureTurnUsage(message, result);
 
     // Whatever this interaction did not get to stays queued in the runtime and
-    // shifts the NEXT interaction's segments.
+    // shifts the NEXT interaction's segments: the prompts this turn sent occupy
+    // `[firstSentSegment, nextSegmentIndex)`, and the ones the runtime never
+    // opened a segment for are still in its pending queue.
+    //
+    // The `max` against `firstSentSegment` is what makes this correct for a
+    // continuation, which occupies segment 0 without having sent anything: a
+    // continuation that opened no segment at all (an empty self-initiated turn)
+    // would otherwise report one carried prompt and shift the next real turn's
+    // answer by one.
     const segmentsOpened = turn.normalizer.promptCount();
-    carriedPrompts = Math.max(0, (turn.baseSegment + turn.promptsSent) - segmentsOpened);
+    carriedPrompts = Math.max(0, turn.nextSegmentIndex - Math.max(turn.firstSentSegment, segmentsOpened));
 
     // This row's own reply. Falls back to the whole composed text when the
     // runtime opened no segment at all (an empty or immediately-failed turn),
@@ -1007,6 +1321,187 @@ export function createCopilotSdkSessionRunner({
     return true;
   }
 
+  // ----------------------------------------------------------- continuation --
+
+  /**
+   * The runtime started a turn nobody asked for. Give it a relay row.
+   *
+   * Called synchronously from `routeEvent`, so `activeTurn` is set before the
+   * triggering event is dispatched — which is what stops a second opener in the
+   * same batch from minting a second row for the same turn, and what makes idle
+   * shutdown and the heartbeat see the work immediately.
+   *
+   * The row itself is created asynchronously (`POST /api/continuation-turn`);
+   * everything the turn produces meanwhile buffers on the turn and flushes in
+   * order once the row has an id.
+   */
+  function openContinuationTurn() {
+    const turn = createTurn({
+      id: null,
+      conversationId: sdkSessionId,
+      // A self-initiated turn has no delivery to read a mode off, so it runs in
+      // the mode the conversation was last driven in — the permission handler
+      // and the plan-board gating both read the live turn's mode.
+      relayMode: lastRelayMode,
+      model: '',
+    }, { kind: 'continuation' });
+    activeTurn = turn;
+    // The gap this pin covers has closed.
+    continuationDueSince = 0;
+    turn.armStall();
+    // Lines produced between turns (a settled shell's notification) belong to
+    // the turn they triggered.
+    if (pendingActivities.length) {
+      for (const text of pendingActivities.splice(0)) {
+        turn.bufferedActions.push({ channel: 'activity', payload: { text, subagentRunId: null } });
+      }
+    }
+    dbg('opening a continuation turn for runtime-initiated work');
+    // Both are fire-and-forget by design (the SDK's event callback is
+    // synchronous and cannot await a turn), so both must swallow: an unhandled
+    // rejection here would reach the worker crash guard and take the whole
+    // process down over one lost continuation.
+    registerContinuationRow(turn).catch((error) => {
+      dbg('continuation registration threw', error?.message || String(error));
+      if (turn.message.id) {
+        // The row was created and only the bookkeeping after it failed. Release
+        // the buffer to the drive path rather than throwing away a turn that
+        // has somewhere to go.
+        turn.registered = true;
+        return;
+      }
+      turn.discarded = true;
+      turn.bufferedActions = [];
+    });
+    driveContinuation(turn).catch((error) => {
+      dbg('continuation driver threw', error?.message || String(error));
+    });
+    return turn;
+  }
+
+  /**
+   * Create the synthetic queue row and release the turn's buffered output.
+   *
+   * Retries on any response that produced no message id — a truthy but empty
+   * body must not end the loop early. Giving up discards the turn's relay
+   * output (it still lands in the runtime's own transcript) rather than failing
+   * the worker: a continuation nobody can see is a lost message, not a broken
+   * session.
+   */
+  async function registerContinuationRow(turn) {
+    let response = null;
+    for (let attempt = 0; attempt < 3 && !response?.messageId; attempt += 1) {
+      if (turn.discarded) return;
+      response = await api('POST', '/api/continuation-turn', {
+        conversationId: sdkSessionId,
+        sdkSessionId,
+        relayMode: turn.message.relayMode,
+        trigger: CONTINUATION_TRIGGER,
+      }).catch((error) => {
+        dbg('continuation turn registration failed', error?.message || String(error));
+        return null;
+      });
+      if (!response?.messageId) {
+        await new Promise((resolve) => { setTimeout(resolve, continuationRetryDelayMs); });
+      }
+    }
+    if (!response?.messageId) {
+      turn.discarded = true;
+      turn.bufferedActions = [];
+      dbg('continuation turn discarded (no relay message id)');
+      return;
+    }
+    turn.message.id = String(response.messageId);
+    // The route reports which conversation the synthetic row landed on;
+    // trusting it beats assuming worker session id === conversation id.
+    const conversationId = String(response.conversationId || '').trim();
+    if (conversationId) turn.message.conversationId = conversationId;
+    // Only now is there a row to abort, so this is where the control poller can
+    // start.
+    turn.controlState = controlPoller?.start?.({
+      queueMessageId: turn.message.id,
+      onAbortTurn: async () => {
+        turn.aborted = true;
+        if (!session) return;
+        await session.abort?.();
+      },
+    }) || null;
+    await flushBufferedActions(turn);
+    turn.registered = true;
+  }
+
+  /** Resolve once the continuation's row exists, or its registration gave up. */
+  async function awaitContinuationRow(turn, timeoutMs = continuationRegistrationTimeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (!turn.registered && !turn.discarded && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 25); });
+    }
+  }
+
+  /**
+   * Run a continuation to its terminator and publish it, mirroring
+   * `handlePendingPayload`'s outer shape.
+   *
+   * `activeTurn` is cleared only after every publish has landed, exactly as for
+   * a delivered turn: a heartbeat firing inside the publish window with no
+   * active ids would tell the relay this worker owns nothing, and the
+   * still-`processing` synthetic row would be recovered underneath it.
+   */
+  async function driveContinuation(turn) {
+    let failure = null;
+    try {
+      await turn.done;
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      await quiesceTurn(turn);
+      // Nothing can be published before the row exists. The buffer is drained
+      // by the registration itself; this only covers actions that arrived
+      // during the drain.
+      await awaitContinuationRow(turn);
+      // The invariant is the id, not the flag: registration can also give up by
+      // throwing, or by taking longer than `awaitContinuationRow` waits, and
+      // publishing against `messageId: null` would attribute the whole turn to
+      // nothing at all.
+      if (!turn.message.id) {
+        turn.discarded = true;
+        turn.bufferedActions = [];
+        dbg('continuation output dropped (no relay row)');
+        // The steering path is still waiting on any row it handed us, and it
+        // has no row of its own to fall back to.
+        await settleSteeredRows(turn, null, null, classifyCopilotTurnException(
+          failure || new Error('the relay refused a continuation row for this turn'),
+        )).catch(() => {});
+        return;
+      }
+      await flushBufferedActions(turn);
+      if (failure) {
+        const classified = classifyCopilotTurnException(failure);
+        dbg('continuation turn failed', turn.message.id, classified.detail);
+        await publishResponse(turn.message, {
+          text: classified.text,
+          model: null,
+          terminalError: terminalErrorRecord(turn.message, classified),
+        });
+        await settleSteeredRows(turn, null, null, classified).catch(() => {});
+        return;
+      }
+      await finishTurn(turn, '');
+    } catch (error) {
+      dbg('continuation publish failed', error?.message || String(error));
+    } finally {
+      controlPoller?.stop?.(turn.controlState);
+      turn.controlState = null;
+      if (activeTurn === turn) activeTurn = null;
+      touch();
+      // A continuation spends real quota (the live capture burned a premium
+      // request on `read_bash` + the reply), so its numbers ride the same
+      // fire-and-forget ingest as a delivered turn's.
+      postTurnUsage();
+    }
+  }
+
   /**
    * Settle every queue row that was steered into this interaction.
    *
@@ -1074,9 +1569,10 @@ export function createCopilotSdkSessionRunner({
     }
     // Prompts are consumed in the order they were sent, and each opens its own
     // `user.message` segment as it is picked up, so this prompt's send position
-    // (after any prompts carried over from a previous interaction) is its
-    // segment index.
-    const segmentIndex = turn.baseSegment + turn.promptsSent;
+    // (after any prompts carried over from a previous interaction, and after
+    // whatever the interaction itself occupies) is its segment index.
+    const segmentIndex = turn.nextSegmentIndex;
+    turn.nextSegmentIndex += 1;
     turn.promptsSent += 1;
     const steered = { message, segmentIndex };
     steered.done = new Promise((resolve) => { steered.settle = resolve; });
@@ -1222,6 +1718,11 @@ export function createCopilotSdkSessionRunner({
       hasSession: !!session,
       appliedModel,
       lastActivityAt,
+      // 'delivered' | 'continuation' | '' — which kind of turn, if any, owns
+      // the worker right now.
+      activeTurnKind: activeTurn?.kind || '',
+      backgroundShells: backgroundShells.live(),
+      continuationDueSince,
     }),
     _evaluateLifecycle: evaluateLifecycle,
   };

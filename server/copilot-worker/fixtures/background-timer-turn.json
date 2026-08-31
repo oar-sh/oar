@@ -1,0 +1,497 @@
+[
+ {
+  "type": "user.message",
+  "data": {
+   "content": "[Relay mode: autopilot] please set a timer to 1 minute and let me know when the timer fired",
+   "transformedContent": "<transformed prompt elided>",
+   "supportedNativeDocumentMimeTypes": [],
+   "agentMode": "autopilot",
+   "delivery": "idle",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60",
+   "turnId": "0",
+   "parentAgentTaskId": "422a9ce4-b9fe-4b74-84b4-ea32e7988817"
+  },
+  "id": "f2049d1c-fa04-4c53-96d1-8b5e641157bb",
+  "timestamp": "2026-08-31T14:23:18.153Z",
+  "parentId": "23c3c7dc-fc6b-4b61-9285-3078fb43eaa6"
+ },
+ {
+  "type": "assistant.turn_start",
+  "data": {
+   "turnId": "0",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60"
+  },
+  "id": "d56f77e5-b85d-41c4-9380-3b99fda792ca",
+  "timestamp": "2026-08-31T14:23:18.158Z",
+  "parentId": "f2049d1c-fa04-4c53-96d1-8b5e641157bb"
+ },
+ {
+  "type": "assistant.message",
+  "data": {
+   "messageId": "d388aaa9-95f1-425d-8bbe-90bc7000d082",
+   "model": "gpt-5.6-luna",
+   "content": "",
+   "toolRequests": [
+    {
+     "toolCallId": "call_56Cu4P65FGEWyyHkjP6p1zPL",
+     "name": "bash",
+     "arguments": {
+      "command": "sleep 60 && printf '%s\\n' 'Timer fired after 1 minute.'",
+      "description": "Wait one minute for the requested timer",
+      "mode": "async",
+      "detach": true,
+      "initial_wait": 30
+     },
+     "type": "function",
+     "intentionSummary": "Wait one minute for the requested timer"
+    }
+   ],
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60",
+   "turnId": "0",
+   "rte": true,
+   "apiCallId": "phvhyxj5k26LCP8FmKTJMNZ4s0Ls2/yQYqA2/mIW+MqnkG1MmPkVSPiCYOeEgCJjnPfWrdU53pzPWhJ9n/qOyv3R6lFRfIJt5XdPVyt/ZQSRTO903QULONke5gqmYHrHlMogHYyVPkvIGyTiHsd1j6y1BKrGj51rUvUpUVKAvpFKOHL3ai/+y8p8IV3u7riwFusXWl50xTBYWogd7f0DmzVjzD0a928nFbjVxc19FuJCh/dBVE4g6AgZrW6hbKHsSxE6cQdy2cEEBlSow/FOiXteeVXPcXjYIzy5UbdK2jMn9fPxaW1X0r04AHPCQ/GDe8QSgG3iJ9lMEtLyGVHwNg6vdZF933gk8Iivd1Y2WS7o7JVdEhPkRFVly1fntP7PzrEKRbBViQOwOQyh5Rd8SaZKBCYCgbBI/7WC2bAv8I2PpHn9UgFmKq09c0Hw9Ye1bZ/LEOLNZ81vT8ENGAQX+FdY71Mqhx1e0BRf3aBQPA=="
+  },
+  "id": "62c63988-a56b-445a-be3c-bc5e16fd76c3",
+  "timestamp": "2026-08-31T14:23:20.246Z",
+  "parentId": "d56f77e5-b85d-41c4-9380-3b99fda792ca"
+ },
+ {
+  "type": "tool.execution_start",
+  "data": {
+   "toolCallId": "call_56Cu4P65FGEWyyHkjP6p1zPL",
+   "toolName": "bash",
+   "arguments": {
+    "command": "sleep 60 && printf '%s\\n' 'Timer fired after 1 minute.'",
+    "description": "Wait one minute for the requested timer",
+    "mode": "async",
+    "detach": true,
+    "initial_wait": 30
+   },
+   "turnId": "0",
+   "model": "gpt-5.6-luna",
+   "shellToolInfo": {
+    "possiblePaths": [
+     "Timer fired after 1 minute."
+    ],
+    "hasWriteFileRedirection": false
+   }
+  },
+  "id": "5a636c8c-de4f-4f1b-9ff3-0d60191bf501",
+  "timestamp": "2026-08-31T14:23:20.249Z",
+  "parentId": "62c63988-a56b-445a-be3c-bc5e16fd76c3"
+ },
+ {
+  "type": "permission.requested",
+  "data": {
+   "requestId": "3ac174e1-fee5-479c-b7f5-a7a9c25ec927",
+   "permissionRequest": {
+    "kind": "shell",
+    "toolCallId": "call_56Cu4P65FGEWyyHkjP6p1zPL",
+    "fullCommandText": "sleep 60 && printf '%s\\n' 'Timer fired after 1 minute.'",
+    "intention": "Wait one minute for the requested timer",
+    "commands": [
+     {
+      "identifier": "sleep 60 && printf '%s\\n' 'Timer fired after 1 minute.'",
+      "readOnly": false
+     }
+    ],
+    "commandSegments": [
+     {
+      "identifier": "sleep",
+      "fullCommandText": "sleep 60"
+     },
+     {
+      "identifier": "printf",
+      "fullCommandText": "printf '%s\\n' 'Timer fired after 1 minute.'"
+     }
+    ],
+    "possiblePaths": [],
+    "possibleUrls": [],
+    "hasWriteFileRedirection": false,
+    "canOfferSessionApproval": false
+   },
+   "promptRequest": {
+    "kind": "commands",
+    "fullCommandText": "sleep 60 && printf '%s\\n' 'Timer fired after 1 minute.'",
+    "intention": "Wait one minute for the requested timer",
+    "commandIdentifiers": [
+     "sleep 60 && printf '%s\\n' 'Timer fired after 1 minute.'"
+    ],
+    "canOfferSessionApproval": false,
+    "toolCallId": "call_56Cu4P65FGEWyyHkjP6p1zPL"
+   }
+  },
+  "id": "7bfac980-f451-442a-8b43-cad920d603a7",
+  "timestamp": "2026-08-31T14:23:20.251Z",
+  "parentId": "5a636c8c-de4f-4f1b-9ff3-0d60191bf501"
+ },
+ {
+  "type": "permission.completed",
+  "data": {
+   "requestId": "3ac174e1-fee5-479c-b7f5-a7a9c25ec927",
+   "toolCallId": "call_56Cu4P65FGEWyyHkjP6p1zPL",
+   "result": {
+    "kind": "approved"
+   }
+  },
+  "id": "9c91f061-f0da-4bd1-9d01-8ade4d63ca1e",
+  "timestamp": "2026-08-31T14:23:20.253Z",
+  "parentId": "7bfac980-f451-442a-8b43-cad920d603a7"
+ },
+ {
+  "type": "tool.execution_complete",
+  "data": {
+   "toolCallId": "call_56Cu4P65FGEWyyHkjP6p1zPL",
+   "model": "gpt-5.6-luna",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60",
+   "turnId": "0",
+   "rte": true,
+   "success": true,
+   "result": {
+    "content": "<command started in detached background with shellId: 1>",
+    "detailedContent": "<command started in detached background with shellId: 1>"
+   },
+   "toolTelemetry": {
+    "properties": {
+     "customTimeout": "true",
+     "executionMode": "async",
+     "detached": "true",
+     "sandboxApplied": "false",
+     "sandboxOptOutRequested": "false"
+    },
+    "metrics": {}
+   }
+  },
+  "id": "8b2b6fc8-8539-47e7-be97-128a309d98f5",
+  "timestamp": "2026-08-31T14:23:20.274Z",
+  "parentId": "9c91f061-f0da-4bd1-9d01-8ade4d63ca1e"
+ },
+ {
+  "type": "assistant.turn_end",
+  "data": {
+   "turnId": "0"
+  },
+  "id": "a3dee46c-c0d2-4c53-9bd1-1b73aa098b94",
+  "timestamp": "2026-08-31T14:23:20.279Z",
+  "parentId": "8b2b6fc8-8539-47e7-be97-128a309d98f5"
+ },
+ {
+  "type": "assistant.turn_start",
+  "data": {
+   "turnId": "1",
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60"
+  },
+  "id": "c517f385-ba7a-4558-8d6c-5bdbc3e69c1b",
+  "timestamp": "2026-08-31T14:23:20.280Z",
+  "parentId": "a3dee46c-c0d2-4c53-9bd1-1b73aa098b94"
+ },
+ {
+  "type": "assistant.message",
+  "data": {
+   "messageId": "aa91cae4-dcc5-4842-9d79-9af86723175a",
+   "model": "gpt-5.6-luna",
+   "content": "Timer set for 1 minute. I’ll let you know when it fires.",
+   "toolRequests": [],
+   "interactionId": "ef0f9e8d-5f19-45a2-9c79-045785470c60",
+   "turnId": "1",
+   "reasoningText": "",
+   "phase": "final_answer",
+   "rte": true,
+   "apiCallId": "+mZnRceX/xfuoLcsEVfcQGaZU88GR/1YzxbBe7HWniTwK4pgfYmjbPDKvpQQNOEg/lotbFQBhtUqh/3dNRHhZOuDOcuZ367HcC05YK32/FUF2291vigdGy3/FmvemjZjjKsUxfSkNtv5NI1V3fyeiammkw9GK8UCoTvDgAwwXUjg/8X3rcalWZpBD5B0OgjN2IPcHp8bQKcjzp3buJOhnGvilzcI3pvFk8mImjnYAiIDffWXjdNH7j3bonsIZsN4yeaorQczkODhPvfgX9/6UBWnAF3LKrm0sweU0yoUzGEnOtuLSjF848EAv6Pin114bcBTpxmb+CyXUEN+aNwFstZ2e7J8NovUz5KVq/jfPZ+549QyOnsECO1ZyJs25Go/AKpX+lBumsrFvyQiF8PdB27LSO53qCLw2Z96gFzQ0HcXiiss6H3nIpnv4VlRMjACKsurXp/nlNGUaebBY5WiCFjRz8qBUZBXr1iLzSPlAA==",
+   "serverTools": {
+    "provider": "openai-responses"
+   }
+  },
+  "id": "a650195a-f9ab-45fe-a899-7b8480066199",
+  "timestamp": "2026-08-31T14:23:21.743Z",
+  "parentId": "c517f385-ba7a-4558-8d6c-5bdbc3e69c1b"
+ },
+ {
+  "type": "assistant.turn_end",
+  "data": {
+   "turnId": "1"
+  },
+  "id": "5f840bf3-f625-4d0b-ab34-10d425ebdff4",
+  "timestamp": "2026-08-31T14:23:21.747Z",
+  "parentId": "a650195a-f9ab-45fe-a899-7b8480066199"
+ },
+ {
+  "type": "session.usage_checkpoint",
+  "data": {
+   "totalNanoAiu": 540173000,
+   "totalPremiumRequests": 2,
+   "modelCacheState": [
+    {
+     "modelId": "gpt-5.6-luna",
+     "cacheExpiresAt": "2026-08-31T14:53:20.314Z",
+     "cacheTtlSeconds": 1800
+    }
+   ],
+   "promptCacheBreakState": [
+    {
+     "conversation": "main",
+     "models": {
+      "gpt-5.6-luna": {
+       "model": "gpt-5.6-luna",
+       "vendor": "openai",
+       "model_call_id": "+mZnRceX/xfuoLcsEVfcQGaZU88GR/1YzxbBe7HWniTwK4pgfYmjbPDKvpQQNOEg/lotbFQBhtUqh/3dNRHhZOuDOcuZ367HcC05YK32/FUF2291vigdGy3/FmvemjZjjKsUxfSkNtv5NI1V3fyeiammkw9GK8UCoTvDgAwwXUjg/8X3rcalWZpBD5B0OgjN2IPcHp8bQKcjzp3buJOhnGvilzcI3pvFk8mImjnYAiIDffWXjdNH7j3bonsIZsN4yeaorQczkODhPvfgX9/6UBWnAF3LKrm0sweU0yoUzGEnOtuLSjF848EAv6Pin114bcBTpxmb+CyXUEN+aNwFstZ2e7J8NovUz5KVq/jfPZ+549QyOnsECO1ZyJs25Go/AKpX+lBumsrFvyQiF8PdB27LSO53qCLw2Z96gFzQ0HcXiiss6H3nIpnv4VlRMjACKsurXp/nlNGUaebBY5WiCFjRz8qBUZBXr1iLzSPlAA==",
+       "request_id": "00000-6f3ad63a-79d7-442f-822f-22786dcf5ae6",
+       "github_request_id": "2a5f5687-d4dd-482d-a12e-64c2884d56db",
+       "api_endpoint": "ws:/responses",
+       "transport": "websocket",
+       "session_mode": "autopilot",
+       "reasoning_effort": "medium",
+       "initiator": "agent",
+       "tool_count": 23,
+       "tool_tokens": 8088,
+       "tools": [
+        {
+         "name": "bash",
+         "schema_hash": "8071f13f1f8b",
+         "safe": true
+        },
+        {
+         "name": "read_bash",
+         "schema_hash": "78bdc74b3707",
+         "safe": true
+        },
+        {
+         "name": "stop_bash",
+         "schema_hash": "dd8c0c97e7c9",
+         "safe": true
+        },
+        {
+         "name": "list_bash",
+         "schema_hash": "3209638ac5d6",
+         "safe": true
+        },
+        {
+         "name": "apply_patch",
+         "schema_hash": "82b4475374ff",
+         "safe": true
+        },
+        {
+         "name": "view",
+         "schema_hash": "bce2bfaab6ba",
+         "safe": true
+        },
+        {
+         "name": "web_fetch",
+         "schema_hash": "a0829f05c5fd",
+         "safe": true
+        },
+        {
+         "name": "skill",
+         "schema_hash": "970ef5551151",
+         "safe": true
+        },
+        {
+         "name": "ask_user",
+         "schema_hash": "c45aacfa3e3d",
+         "safe": true
+        },
+        {
+         "name": "sql",
+         "schema_hash": "c2a06c9d4c62",
+         "safe": true
+        },
+        {
+         "name": "task_complete",
+         "schema_hash": "497193e478f3",
+         "safe": true
+        },
+        {
+         "name": "read_agent",
+         "schema_hash": "0cc5a3205bfc",
+         "safe": true
+        },
+        {
+         "name": "list_agents",
+         "schema_hash": "e83edd8ed50f",
+         "safe": true
+        },
+        {
+         "name": "write_agent",
+         "schema_hash": "1db3ce5292e0",
+         "safe": true
+        },
+        {
+         "name": "rg",
+         "schema_hash": "32552e28c37f",
+         "safe": true
+        },
+        {
+         "name": "glob",
+         "schema_hash": "0b44fa8a5cf4",
+         "safe": true
+        },
+        {
+         "name": "task",
+         "schema_hash": "b7751998643e",
+         "safe": false
+        },
+        {
+         "name": "github-mcp-server-get_copilot_space",
+         "schema_hash": "c8adccdafb84",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-get_file_contents",
+         "schema_hash": "6cf17f9abfd4",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-list_copilot_spaces",
+         "schema_hash": "32e5d3fd470f",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-search_code",
+         "schema_hash": "679d4765fec5",
+         "safe": true
+        },
+        {
+         "name": "github-mcp-server-search_users",
+         "schema_hash": "da0cf089bedb",
+         "safe": true
+        },
+        {
+         "name": "web_search",
+         "schema_hash": "cb18d98a639a",
+         "safe": true
+        }
+       ],
+       "tools_truncated": 0,
+       "system_segments": [
+        {
+         "segment": "identity",
+         "hash": "fe1711f6f31c",
+         "tokens": 754
+        },
+        {
+         "segment": "version_information",
+         "hash": "13746b2fa56e",
+         "tokens": 9
+        },
+        {
+         "segment": "model_information",
+         "hash": "4dfb83d40484",
+         "tokens": 83
+        },
+        {
+         "segment": "environment_context",
+         "hash": "1d572ecf0169",
+         "tokens": 60
+        },
+        {
+         "segment": "code_change_instructions",
+         "hash": "8882f6eb1325",
+         "tokens": 667
+        },
+        {
+         "segment": "dynamic_guidelines",
+         "hash": "47926a65fcda",
+         "tokens": 78
+        },
+        {
+         "segment": "environment_limitations",
+         "hash": "9d9ae1650158",
+         "tokens": 235
+        },
+        {
+         "segment": "tool_intro",
+         "hash": "2c07d9f78963",
+         "tokens": 20
+        },
+        {
+         "segment": "tool_instructions",
+         "hash": "f34c72761c4e",
+         "tokens": 4099
+        },
+        {
+         "segment": "custom_instructions",
+         "hash": "01ba4719c80b",
+         "tokens": 1
+        },
+        {
+         "segment": "additional_instructions",
+         "hash": "24516e4217f9",
+         "tokens": 1991
+        },
+        {
+         "segment": "final_instructions",
+         "hash": "42885e06aebe",
+         "tokens": 223
+        }
+       ],
+       "conversation": {
+        "message_count": 7,
+        "points": [
+         {
+          "index": 0,
+          "hash": "b7418648e048"
+         },
+         {
+          "index": 1,
+          "hash": "906e64ad2fb2"
+         },
+         {
+          "index": 2,
+          "hash": "fa56b0c92c8c"
+         },
+         {
+          "index": 3,
+          "hash": "5689fc5ca33e"
+         },
+         {
+          "index": 4,
+          "hash": "7d018ae09713"
+         },
+         {
+          "index": 5,
+          "hash": "fc75a9a38800"
+         },
+         {
+          "index": 6,
+          "hash": "7fc43fa73e94"
+         }
+        ]
+       },
+       "cache_config": {
+        "arm": "control",
+        "marks_system_prompt": false,
+        "marks_conversation": false,
+        "advisor_tool": false,
+        "incremental_input": true
+       },
+       "prompt_tokens": 16428,
+       "cache_read": 16292,
+       "cache_write": 133,
+       "cache_details_reported": true,
+       "frontier_tokens": 16425,
+       "frontier_source": "reported_writes",
+       "ttl_seconds": 1800,
+       "cache_expires_at": "2026-08-31T14:53:20.314Z",
+       "completed_at": "2026-08-31T14:23:21.739Z"
+      }
+     },
+     "lastActiveModel": "gpt-5.6-luna",
+     "pendingRewriteSources": []
+    }
+   ]
+  },
+  "id": "3c68df7e-54eb-4cf9-a3a4-0b2db5cebd2d",
+  "timestamp": "2026-08-31T14:23:21.750Z",
+  "parentId": "5f840bf3-f625-4d0b-ab34-10d425ebdff4"
+ },
+ {
+  "type": "session.idle",
+  "data": {
+   "aborted": false
+  },
+  "id": "idle-delivered",
+  "timestamp": "2026-08-31T14:23:21.900Z",
+  "parentId": null,
+  "ephemeral": true
+ }
+]

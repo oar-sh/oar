@@ -30,18 +30,56 @@ export async function waitFor(predicate, { timeoutMs = 3000, label = 'condition'
   throw new Error(`waitFor timed out: ${label}`);
 }
 
-/** Records every relay call; `failRoutes` makes a route throw, like a 500. */
-export function makeApiStub({ failRoutes = new Set() } = {}) {
+/**
+ * Records every relay call; `failRoutes` makes a route throw, like a 500.
+ *
+ * `routeResponses` maps a route to its response body, or to a function of
+ * `(body, callIndexForThatRoute)` — which is how a test drives a route that
+ * answers differently per attempt (`/api/continuation-turn`'s retry loop).
+ * Unlisted routes answer `{}`, as before.
+ */
+export function makeApiStub({ failRoutes = new Set(), routeResponses = {} } = {}) {
   const calls = [];
+  const routeCounts = new Map();
   async function api(method, routePath, body) {
     calls.push({ method, routePath, body });
     const route = String(routePath).split('?')[0];
     if (failRoutes.has(route)) throw new Error(`stub route failure: ${route}`);
-    return {};
+    const attempt = routeCounts.get(route) || 0;
+    routeCounts.set(route, attempt + 1);
+    const canned = routeResponses[route];
+    if (typeof canned === 'function') return canned(body, attempt);
+    return canned === undefined ? {} : canned;
   }
   api.calls = calls;
   api.bodiesFor = (routePath) => calls.filter((c) => c.routePath === routePath).map((c) => c.body);
   return api;
+}
+
+/**
+ * An api stub that mints synthetic queue rows, so a test can exercise the
+ * continuation path end to end. `POST /api/continuation-turn` answers with a
+ * fresh `messageId`, exactly as the relay route does.
+ */
+export function makeContinuationApiStub({
+  conversationId = 'conv-1',
+  messageIds = ['cont-1', 'cont-2', 'cont-3'],
+  ...options
+} = {}) {
+  const minted = [];
+  const stub = makeApiStub({
+    ...options,
+    routeResponses: {
+      '/api/continuation-turn': (body, attempt) => {
+        const messageId = messageIds[Math.min(attempt, messageIds.length - 1)];
+        minted.push({ messageId, body });
+        return { ok: true, messageId, conversationId };
+      },
+      ...(options.routeResponses || {}),
+    },
+  });
+  stub.mintedContinuations = minted;
+  return stub;
 }
 
 /**
