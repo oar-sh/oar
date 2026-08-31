@@ -9,6 +9,7 @@ that live in the relay itself (and apply to every provider) are tracked here.
 | Provider | Runtime | Tracker |
 | -------- | ------- | ------- |
 | **Copilot** | `@github/copilot-sdk`, driven by the CLI extension (foreground) or the standalone relay client | [copilot-sdk.md](copilot-sdk.md) |
+| **Copilot (SDK engine)** | The same SDK driven headlessly by a per-conversation Node worker in `server/copilot-worker/` — *implemented, experimental, burn-in pending; opt in per relay* | [copilot-sdk-worker.md](copilot-sdk-worker.md) |
 | **OpenAI (BYOK)** | Rides the Copilot worker via `COPILOT_PROVIDER_*` env vars; image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md) + the core rows below |
 | **Claude** | `@anthropic-ai/claude-agent-sdk` in `server/claude-worker/` | [claude-sdk.md](claude-sdk.md) |
 | **Cursor** | `@cursor/sdk` in `server/cursor-worker/` — *implemented, pending live validation* | [cursor-sdk.md](cursor-sdk.md) |
@@ -62,6 +63,23 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-08-31: Added a second **engine** for Copilot conversations — a headless SDK worker
+  (`server/copilot-worker/`, tracked in [copilot-sdk-worker.md](copilot-sdk-worker.md)) that drives
+  the CLI's bundled SDK over JSON-RPC instead of the `copilot` TUI plus the web-relay extension. One
+  plain Node process per conversation, like Claude/Cursor/Grok: no PTY, no extension bootstrap, and a
+  first run that needs only a logged-in Copilot CLI. Chosen per relay in Settings → Providers →
+  Copilot; **Extension stays the default** until burn-in passes, and the toggle refuses (409, with
+  the reason rendered in the panel) when `COPILOT_SDK_PATH` did not resolve at boot or session-worker
+  routing is off. The engine picks a worker *kind*, not a provider type, so `shared/provider-routing.mjs`,
+  model catalogs and usage cards are untouched. New per-turn billing ingest
+  (`POST /api/copilot-plan-usage` → snapshot key `copilot-sdk`) surfaces real spend (`totalNanoAiu`)
+  and overage (`quotaSnapshots.cfi_overage`) — neither is visible relay-side — as an additive
+  **Last SDK worker turn** section on the Copilot card, withheld after 7 days. Accepted losses for
+  the SDK engine: no tmux inspector, no thinking stream on hosted models (reasoning is encrypted),
+  structured elicitation declined. Live probes settled three things worth remembering: subagent
+  `agentId` lives on the event *envelope* and is not `toolCallId`; `includeSubAgentStreamingEvents:
+  false` also guts the parent's tool-call streaming; and `mode: 'immediate'` does not preempt an
+  in-flight model call, with the whole steered interaction closing on a single `session.idle`.
 - 2026-08-17: Claude background tasks stopped being opaque rows. `local_workflow` tasks now carry a
   live progress digest the worker reads off the CLI's on-disk workflow state (journal while running,
   run record once it lands — the record is written only at completion), clamped in the worker and

@@ -84,6 +84,39 @@ Useful overrides: `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary),
 `COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH` (worker script location),
 `COPILOT_WEB_RELAY_CONFIG` (relay config used to resolve the server URL and auth token).
 
+### Copilot SDK workers
+
+With **Settings → Providers → Copilot → Copilot engine** set to *SDK*, Copilot conversations run
+`server/copilot-worker/copilot-sdk-session-worker.mjs` as a plain Node process instead of a Copilot
+CLI session — same shape as the Claude worker, and with the same `[copilot-sdk-worker …]` log lines
+under `tmux attach`. There is **no TUI to inspect**: the worker drives the CLI's bundled SDK runtime
+headlessly, so the tmux inspector shows the worker's own log, not a Copilot session. The default
+engine (*Extension*) is unaffected.
+
+Prerequisite: `COPILOT_SDK_PATH` must point at the `copilot-sdk` directory inside an installed
+Copilot CLI bundle. The relay derives it once at boot from the extension bootstrap path, which is
+why installing the CLI while the relay is running does not help until it restarts — the same fact
+the settings panel reports when it refuses the engine.
+
+Run the worker manually against a live relay:
+
+```bash
+COPILOT_WEB_RELAY_WORKER_KIND=copilot-sdk \
+COPILOT_SDK_PATH=~/.cache/copilot/pkg/linux-x64/<version>/copilot-sdk \
+COPILOT_WORKSPACE_ROOT=/path/to/workspace \
+COPILOT_RELAY_MODEL=gpt-5.4-mini \
+node server/copilot-worker/copilot-sdk-session-worker.mjs --session-id <sdk-session-id>
+```
+
+Useful overrides: `COPILOT_WEB_RELAY_CLI_EXECUTABLE` (explicit `copilot` binary for the runtime
+spawn), `COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH` (worker script location),
+`COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS` (runtime idle close, default 10 min),
+`COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS` (stall watchdog, default 120 s, `0` disables).
+
+Live testing spends real Copilot quota: **`gpt-5.4-mini` is the only sanctioned model for live
+relay tests**, per the standing live-testing policy, and only with the user's explicit go-ahead.
+Everything else belongs in the unit suites, which drive the worker against a fake SDK client.
+
 ## Tests
 
 ### Node version
@@ -164,6 +197,14 @@ Specs must resolve the relay URL, auth token, and database exclusively through
 `tests/e2e-env.mjs` (fed by `run-e2e.mjs` via `PLAYWRIGHT_BASE_URL`, `RELAY_TEST_TOKEN`,
 `RELAY_TEST_DATA_DIR`). Never read `server/config.json`, open `server/data/copilot.db`, or
 target `http://127.0.0.1:3333` from a spec — those belong to the live relay.
+
+That isolation env lives in `tests/relay-server-harness.mjs` (`startRelayServer`), which
+`run-e2e.mjs` calls for the server every spec shares. It also pins session-worker routing off and
+`COPILOT_SDK_PATH` at a stub directory, so a relay's answer never depends on what the host has
+installed. A spec that needs a *differently configured* relay boots its own throwaway one from the
+same helper rather than copying the env block — `tests/copilot-engine.spec.mjs` does this to test
+the Copilot SDK engine's accept path, which the shared server's routing pin makes unreachable.
+Keep that rare: it costs a server boot per relay.
 
 ### Live smoke tests
 

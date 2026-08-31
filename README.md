@@ -243,7 +243,7 @@ On startup, the relay imports locally persisted Copilot sessions through the ins
 - Answer clarification prompts in relay question cards (from `ask_user`, or Claude's `AskUserQuestion`).
 - Watch the reply arrive: assistant text streams into the pending bubble as it is generated, and any subagent the turn spawns gets its own nested bubble with its own thoughts, activity, and text.
 - Use **Check Usage** (`📊`) in the conversation menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Each provider gets its own tab, opening on the conversation's own provider, and the card names the signed-in account (email and plan) beneath its title. Sources differ per provider:
-  - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing.
+  - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing. Conversations running on the experimental SDK engine add a **Last SDK worker turn** section (AI credits actually spent, tokens, model calls, overage) with the model and how long ago it was captured; it is one turn's numbers rather than a running total, and it stops being shown once it is more than seven days old.
   - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn.
   - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools. Cursor exposes no account API for included pools, so these figures are estimates and the Spending dashboard remains authoritative.
   - **Grok** — per-turn tokens and estimated cost from the agent prompt result (no live plan-quota API over ACP). Optional monthly USD allowance in Settings for an estimated remaining meter; card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
@@ -264,11 +264,29 @@ Turning a provider **off** (or removing the OpenAI key) rebinds conversations th
 
 | Provider              | Enable via                              | Auth                                  | Notes                                                                 |
 | --------------------- | --------------------------------------- | ------------------------------------- | --------------------------------------------------------------------- |
-| **Copilot** (default) | always available                        | your `gh` / Copilot CLI login         | Full relay feature set; the only provider that reports Copilot usage   |
+| **Copilot** (default) | always available                        | your `gh` / Copilot CLI login         | Full relay feature set; the only provider that reports Copilot usage. Two engines: the CLI extension (default) or an experimental headless SDK worker |
 | **OpenAI (BYOK)**     | ⚙️ Settings → Providers → OpenAI        | your API key, stored in the relay DB  | Runs the Copilot CLI in BYOK mode against an OpenAI-compatible endpoint |
 | **OpenAI Image (BYOK)** | ⚙️ Settings → Providers → OpenAI      | same key                              | Calls the OpenAI Images API directly; a chat whose replies are images  |
 | **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude        | the relay host's logged-in Claude CLI | No API key is stored; runs a dedicated Node worker per conversation    |
 | **Cursor (Agent SDK)** | ⚙️ Settings → Providers → Cursor        | your Cursor API key, stored in the relay DB | Runs a dedicated Node worker per conversation through the Cursor Agent SDK |
+
+### GitHub Copilot — engine choice
+
+Copilot conversations can run on either of two engines, chosen in **⚙️ Settings → Providers → Copilot → Copilot engine**. The setting is per relay and applies to newly started conversations; sessions already running keep the engine they started on until their worker restarts.
+
+| Engine | What runs | Trade-offs |
+| ------ | --------- | ---------- |
+| **Extension** (default) | The Copilot CLI in a terminal session with the web-relay extension loaded | The engine everything has shipped on. Attach to a live session with the tmux inspector (`tmux attach -t <sdk-session-id>`) |
+| **SDK** (experimental) | A headless Node worker per conversation, driving the CLI's bundled SDK runtime over JSON-RPC | No CLI extension to install or keep in sync — first run needs only a Copilot CLI that is installed and logged in. **No tmux inspector** for those sessions: there is no TUI to attach to |
+
+Switching to **SDK** can be refused, and the panel says why in place of the engine description:
+
+- *"The Copilot SDK was not found when the relay started (COPILOT_SDK_PATH did not resolve)…"* — no Copilot CLI bundle with an SDK was found. Install or upgrade the GitHub Copilot CLI **and restart the relay**: the launch environment is snapshotted at startup, so a CLI installed since then is not visible yet.
+- *"The SDK engine requires session worker routing, which is disabled on this relay (SESSION_WORKER_ROUTING_ENABLED)…"* — with routing off no SDK worker is ever spawned, so the setting would have no effect.
+
+A refusal never changes the stored engine; the select snaps back to the engine the relay actually runs.
+
+SDK-engine turns report their own per-turn billing to the relay, which appears as the **Last SDK worker turn** section on the Copilot card in **Check Usage** (see above). The card's meters come from the account-level quota API and are correct for both engines.
 
 ### Claude (Agent SDK)
 
