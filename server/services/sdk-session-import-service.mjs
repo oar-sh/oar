@@ -162,6 +162,20 @@ export function createSdkSessionImportService({
     if (relayLink && text(relayLink.conversation_id) && text(relayLink.conversation_id) !== sdkSessionId) {
       return { sdkSessionId, status: 'skipped', category: 'relay-owned', reason: 'relay-execution-session' };
     }
+    // The SDK-engine workers (Copilot SDK, Claude, Cursor, Grok) run a
+    // conversation's turns in a CLI session that shares the conversation's OWN
+    // id — the exact equality the guard above reads as "external". A runtime
+    // binding for that conversation means the relay executes it and already
+    // owns its history: importing would overwrite relay messages with the raw
+    // runtime transcript, instruction preambles included (burn-in incident
+    // 2026-08-31: "[Relay mode: autopilot] …" surfaced as user bubbles and
+    // conversation titles after a restart). This also protects an imported
+    // conversation the user later CONTINUED in the relay — from that moment
+    // the relay's history is authoritative, not the CLI transcript.
+    const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(sdkSessionId) || null;
+    if (runtimeSession) {
+      return { sdkSessionId, status: 'skipped', category: 'relay-owned', reason: 'relay-execution-session' };
+    }
     // Same protection when a live conversation already claims this session id
     // as its transcript binding under a different conversation id.
     const owningConversation = stmts.getConvBySdkSessionId?.get?.(sdkSessionId) || null;
