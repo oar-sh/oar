@@ -958,8 +958,20 @@
   .settings-provider-status[data-state="active"] { color: #3fb950; }
   .settings-provider-status[data-state="saved"] { color: var(--accent); }
   .settings-provider-status[data-state="error"] { color: #f85149; }
-  /* Author `display: flex` on these rows outranks the UA [hidden] rule, exactly
-     like .settings-row above, so hiding them from script needs this. */
+  /* These rows are laid out as flex and hidden from script via `.hidden = true`.
+     Their `display: flex` lives HERE rather than in a style="" attribute on
+     purpose: an inline declaration outranks every selector-based rule (short of
+     !important), so an inline flex would beat both the UA [hidden] rule and the
+     one below, and the row would stay on screen while script believed it hidden.
+     Declared as author CSS, the [hidden] rule wins on specificity (id+attribute
+     over id) and hiding works — the same shape as .settings-row above. */
+  #claude-auth-url-row,
+  #claude-auth-code-row,
+  #grok-auth-url-row,
+  #grok-auth-code-row,
+  #grok-auth-actions-row {
+    display: flex;
+  }
   #claude-auth-url-row[hidden],
   #claude-auth-code-row[hidden],
   #grok-auth-url-row[hidden],
@@ -5224,7 +5236,7 @@
             </div>
             <div id="claude-auth-login-area" class="settings-row settings-row-column" style="margin-top: 10px; margin-bottom: 0;" hidden>
               <div id="claude-auth-login-status" class="settings-help settings-provider-status">Starting login…</div>
-              <div id="claude-auth-url-row" style="display: flex; gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+              <div id="claude-auth-url-row" style="gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
                 <a
                   id="claude-auth-url-link"
                   href="#"
@@ -5234,7 +5246,7 @@
                 >Open the Claude login page</a>
                 <button id="claude-auth-copy-btn" type="button" class="summary-btn" style="flex: 0 0 auto;" onclick="copyClaudeLoginUrl()">Copy link</button>
               </div>
-              <div id="claude-auth-code-row" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 8px;" hidden>
+              <div id="claude-auth-code-row" style="gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 8px;" hidden>
                 <input
                   id="claude-auth-code-input"
                   type="text"
@@ -5312,7 +5324,7 @@
             </div>
             <div id="grok-auth-login-area" class="settings-row settings-row-column" style="margin-top: 10px; margin-bottom: 0;" hidden>
               <div id="grok-auth-login-status" class="settings-help settings-provider-status">Starting sign-in…</div>
-              <div id="grok-auth-url-row" style="display: flex; gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+              <div id="grok-auth-url-row" style="gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
                 <a
                   id="grok-auth-url-link"
                   href="#"
@@ -5322,13 +5334,13 @@
                 >Open the Grok sign-in page</a>
                 <button id="grok-auth-copy-btn" type="button" class="summary-btn" style="flex: 0 0 auto;" onclick="copyGrokLoginUrl()">Copy link</button>
               </div>
-              <div id="grok-auth-code-row" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 8px;" hidden>
+              <div id="grok-auth-code-row" style="gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 8px;" hidden>
                 <span class="settings-help">Confirm this code in the browser:</span>
                 <code id="grok-auth-user-code" style="font-size: var(--fs-meta-md); letter-spacing: 0.08em;"></code>
               </div>
               <!-- Its own row, not the code row: a scrape that never found the
                    code must still leave the session cancellable. -->
-              <div id="grok-auth-actions-row" style="display: flex; gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+              <div id="grok-auth-actions-row" style="gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
                 <button id="grok-auth-cancel-btn" type="button" class="summary-btn" onclick="cancelGrokSignIn()">Cancel</button>
               </div>
             </div>

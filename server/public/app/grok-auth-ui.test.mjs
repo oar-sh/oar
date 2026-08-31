@@ -260,3 +260,29 @@ test('an unknown login state degrades to idle instead of throwing', () => {
   applyGrokAuthState(null);
   assert.equal(el('grok-auth-login-area').hidden, true);
 });
+
+// Regression guard for a bug that shipped and was invisible to every test we
+// had: these rows carried `display: flex` in a style="" attribute, and an
+// inline declaration outranks every selector-based rule short of !important —
+// including the UA [hidden] rule and index.html's own [hidden] override. So
+// `element.hidden = true` set the attribute, assertions on `.hidden` passed,
+// and the row stayed on screen anyway (the one-shot OAuth URL lingered through
+// `exchanging`). JSDOM does not do the full cascade, so asserting computed
+// style here would prove nothing; the durable check is that the layout
+// declaration never moves back into the attribute where it cannot be overridden.
+test('rows hidden from script never declare display inline, so [hidden] can win', () => {
+  for (const id of [
+    'claude-auth-url-row',
+    'claude-auth-code-row',
+    'grok-auth-url-row',
+    'grok-auth-code-row',
+    'grok-auth-actions-row',
+  ]) {
+    const node = el(id);
+    assert.ok(node, `${id} is missing from index.html`);
+    assert.ok(
+      !/(^|;)\s*display\s*:/i.test(node.getAttribute('style') || ''),
+      `${id} declares display inline; [hidden] cannot override it, so hiding it from script silently fails`,
+    );
+  }
+});
