@@ -23,6 +23,7 @@ import {
   startCopilotClient,
 } from './copilot-sdk-adapter.mjs';
 import { buildCopilotMessageOptions } from './copilot-attachments.mjs';
+import { resolveCopilotProviderConfig } from './copilot-byok-provider.mjs';
 import { createCopilotEventNormalizer } from './copilot-sdk-event-normalizer.mjs';
 import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 import {
@@ -110,6 +111,10 @@ export function createCopilotSdkSessionRunner({
   startClientImpl = startCopilotClient,
   createNormalizerImpl = createCopilotEventNormalizer,
   buildMessageOptionsImpl = buildCopilotMessageOptions,
+  // BYOK: `COPILOT_PROVIDER_*` in this worker's env become
+  // `SessionConfig.provider`. Injected so tests can drive the branch without
+  // mutating process.env.
+  resolveProviderConfigImpl = resolveCopilotProviderConfig,
   // Threading seam for `MessageOptions.mode` ("enqueue" | "immediate").
   //
   // A BYOK probe against runtime 1.0.82 ran a mid-turn send three ways —
@@ -147,6 +152,14 @@ export function createCopilotSdkSessionRunner({
   let lifecycleTimer = null;
   let lastActivityAt = Date.now();
   let lastTurnUsage = null;
+  // The snapshot object already handed to the ingest. Identity, not a flag, so
+  // a turn that captured nothing new cannot re-post the previous turn's numbers
+  // (every settle path runs `postTurnUsage`, including the ones that publish no
+  // fresh usage at all).
+  let postedTurnUsage = null;
+  // The in-flight ingest POST, exposed only as a test seam. Never awaited by
+  // the turn path — that is the entire point of it.
+  let usagePostChain = Promise.resolve();
   let starting = null;
   let disposed = false;
   let detachRuntimeExit = () => {};
@@ -163,6 +176,13 @@ export function createCopilotSdkSessionRunner({
   // the human's eventual answer to a runtime whose row is already settled.
   // Same guard the Cursor worker's `hasPendingClientWork` provides.
   let pendingHumanRequests = 0;
+  // The `SessionConfig.provider` block this session was BUILT with, or null for
+  // a hosted (`github`) session. Set by `buildSessionConfig` rather than by a
+  // second throwaway resolve here, so "is this BYOK?" and "what did the runtime
+  // actually get?" can never disagree — which matters because the block's token
+  // ceilings are model-specific and the session is rebuilt when the model
+  // changes.
+  let byokProvider = null;
 
   async function whileAwaitingHuman(run) {
     pendingHumanRequests += 1;
@@ -331,12 +351,10 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * Per-turn usage capture. There is no worker-side Copilot usage ingest route
-   * today — the Copilot plan card is built relay-side from quota snapshots the
-   * relay fetches itself (`services/plan-usage-copilot.mjs`), and no
-   * `/api/copilot-plan-usage` endpoint exists to post to. So this records the
-   * turn's tokens/cost/TTFT (and any quota snapshot the failure path saw) on
-   * the runner and logs it; wiring an ingest endpoint is phase 2's job.
+   * Per-turn usage capture, recorded on the runner.
+   *
+   * Synchronous and side-effect-only: it decides WHAT to report, never when.
+   * The POST is `postTurnUsage`'s job and runs after the row is published.
    */
   function captureTurnUsage(message, result) {
     const usage = result?.usage || null;
@@ -368,6 +386,37 @@ export function createCopilotSdkSessionRunner({
       hasQuotaSnapshots: !!usage?.quotaSnapshots,
       cfiOverage: usage?.quotaSnapshots?.cfi_overage ?? null,
     }));
+  }
+
+  /**
+   * Report the captured turn usage to the relay's `/api/copilot-plan-usage`
+   * ingest. Fire-and-forget, deliberately, and always AFTER the row has been
+   * published.
+   *
+   * The plan card's meters come from the account-level quota API the relay
+   * fetches itself, and those already cover SDK sessions. What only the worker
+   * can see is the per-turn detail: `totalNanoAiu` (real spend — the event's
+   * `cost` is the premium multiplier, not money) and
+   * `quotaSnapshots.cfi_overage` (overage, invisible to `account.getQuota()`'s
+   * cached read). None of that is worth one millisecond of a finished reply.
+   *
+   * Awaiting it was actively dangerous: by this point the stall watchdog is
+   * disarmed and the relay client has no request timeout, so an unresponsive
+   * relay could hold a COMPLETED turn — its text already generated, its queue
+   * row still open — for as long as the socket stayed up. The result is unused
+   * and the failure is already swallowed, so there was nothing to wait for.
+   *
+   * BYOK sessions do not post at all: they spend the user's own OpenAI key
+   * rather than Copilot quota, and their usage events report `cost: 0`, so
+   * their numbers would only mislead on a card about the Copilot plan.
+   */
+  function postTurnUsage() {
+    if (byokProvider || !lastTurnUsage || lastTurnUsage === postedTurnUsage) return;
+    postedTurnUsage = lastTurnUsage;
+    // Held so a test (and only a test) can await the settle; nothing in the
+    // turn path ever reads it.
+    usagePostChain = api('POST', '/api/copilot-plan-usage', lastTurnUsage)
+      .catch((error) => { dbg('usage ingest failed', error?.message || String(error)); });
   }
 
   // ---------------------------------------------------------------- session --
@@ -419,12 +468,23 @@ export function createCopilotSdkSessionRunner({
       getSignal: () => activeTurn?.abortController?.signal || null,
       dbg,
     });
+    // BYOK sessions must carry their provider IN the session config: the
+    // runtime's `COPILOT_PROVIDER_*` startup layer does not run for
+    // SDK-created sessions, so without this an OpenAI-provider conversation
+    // would silently run on hosted Copilot models instead. Null for every
+    // hosted (`github`) session, which is the common case.
+    //
+    // The resolved block is remembered: its token ceilings describe THIS model,
+    // and `session.setModel()` cannot update them (see `applyModel`).
+    const provider = resolveProviderConfigImpl({ env, model: model || defaultModel, dbg });
+    byokProvider = provider;
     return {
       // The relay session id IS the SDK session id, so the runtime's own state
       // under ~/.copilot/session-state/<id> is addressable by conversation and
       // survives worker restarts without a side table.
       sessionId: sdkSessionId,
       ...(model ? { model } : {}),
+      ...(provider ? { provider } : {}),
       // Not a default: without this the SDK emits no deltas at all and the
       // transcript only updates when the whole message lands.
       streaming: true,
@@ -556,6 +616,9 @@ export function createCopilotSdkSessionRunner({
   /**
    * Best-effort model switch: a rejected switch must not fail the turn, it
    * just runs on the session's current model (and says so in the log).
+   *
+   * This is the HOSTED path only. A BYOK session cannot switch this way — see
+   * `switchModel`.
    */
   async function applyModel(model) {
     if (!model || typeof session?.setModel !== 'function') return;
@@ -565,6 +628,45 @@ export function createCopilotSdkSessionRunner({
     } catch (error) {
       dbg('copilot setModel failed', model, error?.message || String(error));
     }
+  }
+
+  /**
+   * Switch a live session onto a different model.
+   *
+   * Hosted sessions just call `setModel()`. BYOK sessions cannot: their token
+   * ceilings live in `SessionConfig.provider`, which is fixed at session
+   * creation. Runtime 1.0.82 exposes **no** way to update it — `setModel()`
+   * takes reasoning/context options but no provider, there is no
+   * `setProvider`, and the one runtime registry-add RPC belongs to the
+   * experimental named-`providers`/`models` surface, which the runtime
+   * explicitly REJECTS when combined with the singular whole-session
+   * `provider` this worker uses.
+   *
+   * So a bare `setModel()` on a BYOK session leaves the previous model's
+   * ceilings in place, and both directions of that are harmful: ceilings too
+   * high turn compaction into hard API rejections, ceilings too low compact a
+   * conversation that had plenty of room left.
+   *
+   * The session is therefore disposed and rebuilt with freshly resolved
+   * ceilings. Nothing is lost: the relay session id IS the SDK session id, the
+   * runtime's state persists under it, and the rebuild takes the ordinary
+   * resume path — the same one every worker restart already uses.
+   */
+  async function switchModel(model, relayMode) {
+    if (!byokProvider) {
+      await applyModel(model);
+      return session;
+    }
+    dbg('rebuilding the copilot session for a BYOK model switch', model);
+    const closing = session;
+    session = null;
+    appliedModel = '';
+    // Disconnect first so the runtime is not holding two handles on one
+    // session id while the resume runs.
+    try { await closing?.disconnect?.(); } catch (error) {
+      dbg('session disconnect before model switch failed', error?.message || String(error));
+    }
+    return ensureSession(model, relayMode);
   }
 
   async function ensureSession(model, relayMode) {
@@ -609,7 +711,7 @@ export function createCopilotSdkSessionRunner({
       }
       return session;
     }
-    if (model && model !== appliedModel) await applyModel(model);
+    if (model && model !== appliedModel) return switchModel(model, relayMode);
     return session;
   }
 
@@ -821,6 +923,8 @@ export function createCopilotSdkSessionRunner({
 
     const result = turn.result;
     const responseModel = result?.model || turn.normalizer.model || model || null;
+    // Capture only. The POST fires from `handlePendingPayload`'s `finally`,
+    // after this row has been published.
     captureTurnUsage(message, result);
 
     // Whatever this interaction did not get to stays queued in the runtime and
@@ -1057,6 +1161,11 @@ export function createCopilotSdkSessionRunner({
       // execution racing the response that was already on its way.
       activeTurn = null;
       touch();
+      // Every path through the turn — published, failed, aborted, threw — has
+      // finished by here, which is the only safe place for the ingest: it is
+      // advisory, it is not awaited, and it must never be able to delay a reply
+      // that is already written.
+      postTurnUsage();
     }
   }
 
@@ -1101,8 +1210,12 @@ export function createCopilotSdkSessionRunner({
     getActiveQueueMessageIds,
     isTurnActive: () => !!activeTurn,
     dispose,
-    // The turn's tokens/cost/TTFT, held for the ingest wiring phase 2 adds.
+    // The turn's tokens/cost/TTFT, as posted to `/api/copilot-plan-usage`.
     getLastTurnUsage: () => lastTurnUsage,
+    // The in-flight usage ingest. A test seam ONLY: the turn path deliberately
+    // never awaits this, which is what keeps a slow relay from holding a
+    // finished reply.
+    whenUsagePosted: () => usagePostChain,
     // Test seams / observability.
     _getState: () => ({
       hasClient: !!client,

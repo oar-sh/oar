@@ -86,7 +86,9 @@ const LEGACY_SETTINGS_IDS = [
 ];
 
 const TABS = ["general", "providers", "previews", "notifications"];
-const PROVIDER_TABS = ["openai", "claude", "grok", "cursor"];
+// Copilot leads, matching the DOM order in index.html: it is the default
+// provider, so its panel is the one a first-time visitor lands on.
+const PROVIDER_TABS = ["copilot", "openai", "claude", "grok", "cursor"];
 
 async function loadApp(page) {
   await page.goto(`/?token=${encodeURIComponent(relayToken())}`);

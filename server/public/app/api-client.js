@@ -216,48 +216,19 @@ export async function loadOpenAISettings() {
   return apiFetch('/api/settings/openai');
 }
 
-export async function loadClaudeSettings() {
-  return apiFetch('/api/settings/claude');
-}
-
-export async function updateClaudeSettings({
-  enabled = undefined,
-  model = undefined,
-  enabledModels = undefined,
-} = {}) {
-  const payload = {};
-  if (typeof enabled === 'boolean') payload.enabled = enabled;
-  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
-  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
-  if (!networkRequestsEnabled) return null;
-  try {
-    const response = await fetch(`${BASE}/api/settings/claude`, {
-      signal: requestTimeoutSignal(),
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders(),
-      },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = String(result?.error || `Failed to update Claude settings (${response.status})`).trim();
-      throw new Error(message);
-    }
-    noteFetchSuccess();
-    return result;
-  } catch (error) {
-    noteFetchFailure('/api/settings/claude', error);
-    throw error;
-  }
-}
-
-// Claude account auth (Relogin / Logout). The relay answers failures with a
-// useful `error` string (e.g. logout refused with 409 while a login is in
-// flight), so these POSTs use the explicit fetch shape and surface that message
-// instead of apiFetch's null-on-error.
-async function claudeAuthRequest(path, body = null) {
+/**
+ * A settings POST that surfaces the relay's own error string.
+ *
+ * `apiFetch` answers a non-2xx with null, which is the right default for reads
+ * but throws away the one thing these endpoints exist to tell you: WHY the save
+ * was refused ("the SDK engine requires session worker routing…", "logout
+ * refused while a login is in flight"). Every settings mutation wants the same
+ * explicit shape, so it lives here once instead of being re-typed per provider.
+ *
+ * Throws on failure — callers render `error.message` — and returns null only
+ * when network requests are disabled outright.
+ */
+async function settingsRequest(path, body = null, fallbackError = 'Request failed') {
   if (!networkRequestsEnabled) return null;
   try {
     const response = await fetch(`${BASE}${path}`, {
@@ -271,7 +242,7 @@ async function claudeAuthRequest(path, body = null) {
     });
     const result = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(String(result?.error || `Claude auth request failed (${response.status})`).trim());
+      throw new Error(String(result?.error || `${fallbackError} (${response.status})`).trim());
     }
     noteFetchSuccess();
     return result;
@@ -279,6 +250,39 @@ async function claudeAuthRequest(path, body = null) {
     noteFetchFailure(path, error);
     throw error;
   }
+}
+
+export async function loadCopilotSettings() {
+  return apiFetch('/api/settings/copilot');
+}
+
+export async function updateCopilotSettings({ engine = undefined } = {}) {
+  const payload = {};
+  if (typeof engine === 'string' && engine.trim()) payload.engine = engine.trim();
+  return settingsRequest('/api/settings/copilot', payload, 'Failed to update Copilot settings');
+}
+
+export async function loadClaudeSettings() {
+  return apiFetch('/api/settings/claude');
+}
+
+export async function updateClaudeSettings({
+  enabled = undefined,
+  model = undefined,
+  enabledModels = undefined,
+} = {}) {
+  const payload = {};
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  return settingsRequest('/api/settings/claude', payload, 'Failed to update Claude settings');
+}
+
+// Claude account auth (Relogin / Logout). The relay answers failures with a
+// useful `error` string (e.g. logout refused with 409 while a login is in
+// flight), which is exactly what `settingsRequest` preserves.
+function claudeAuthRequest(path, body = null) {
+  return settingsRequest(path, body, 'Claude auth request failed');
 }
 
 export async function getClaudeAuthStatus() {
@@ -315,28 +319,7 @@ export async function updateGrokSettings({
   if (typeof enabled === 'boolean') payload.enabled = enabled;
   if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
-  if (!networkRequestsEnabled) return null;
-  try {
-    const response = await fetch(`${BASE}/api/settings/grok`, {
-      signal: requestTimeoutSignal(),
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders(),
-      },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = String(result?.error || `Failed to update Grok settings (${response.status})`).trim();
-      throw new Error(message);
-    }
-    noteFetchSuccess();
-    return result;
-  } catch (error) {
-    noteFetchFailure('/api/settings/grok', error);
-    throw error;
-  }
+  return settingsRequest('/api/settings/grok', payload, 'Failed to update Grok settings');
 }
 
 export async function updateOpenAISettings({
@@ -353,28 +336,7 @@ export async function updateOpenAISettings({
   };
   if (typeof baseUrl === 'string') payload.baseUrl = String(baseUrl).trim();
   if (typeof enabled === 'boolean') payload.enabled = enabled;
-  if (!networkRequestsEnabled) return null;
-  try {
-    const response = await fetch(`${BASE}/api/settings/openai`, {
-      signal: requestTimeoutSignal(),
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders(),
-      },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = String(result?.error || `Failed to update OpenAI settings (${response.status})`).trim();
-      throw new Error(message);
-    }
-    noteFetchSuccess();
-    return result;
-  } catch (error) {
-    noteFetchFailure('/api/settings/openai', error);
-    throw error;
-  }
+  return settingsRequest('/api/settings/openai', payload, 'Failed to update OpenAI settings');
 }
 
 export async function loadCursorSettings() {
@@ -397,28 +359,7 @@ export async function updateCursorSettings({
   if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (typeof enabled === 'boolean') payload.enabled = enabled;
   if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
-  if (!networkRequestsEnabled) return null;
-  try {
-    const response = await fetch(`${BASE}/api/settings/cursor`, {
-      signal: requestTimeoutSignal(),
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders(),
-      },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = String(result?.error || `Failed to update Cursor settings (${response.status})`).trim();
-      throw new Error(message);
-    }
-    noteFetchSuccess();
-    return result;
-  } catch (error) {
-    noteFetchFailure('/api/settings/cursor', error);
-    throw error;
-  }
+  return settingsRequest('/api/settings/cursor', payload, 'Failed to update Cursor settings');
 }
 
 export async function loadWindowsAutostartSetting() {

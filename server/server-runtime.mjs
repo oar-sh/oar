@@ -76,7 +76,7 @@ import { createSessionWorkerRegistry } from './services/session-worker-registry-
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
-import { applyClaudeProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
 import {
@@ -1213,6 +1213,14 @@ const OPENAI_MODEL_SETTING_KEY = 'openai_model';
 const OPENAI_MODELS_SETTING_KEY = 'openai_models';
 const OPENAI_BASE_URL_SETTING_KEY = 'openai_base_url';
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+// Which engine runs a Copilot (github / openai-provider) conversation: the
+// `copilot` CLI under a PTY with the web-relay extension injected, or the
+// headless SDK worker. The provider SET is unchanged by this — `github` and
+// `openai` stay the provider types, and this only selects the worker kind they
+// spawn, so model catalogs, usage cards and routing all stay put.
+const COPILOT_ENGINE_SETTING_KEY = 'copilot_engine';
+const COPILOT_ENGINES = ['extension', 'sdk'];
+const DEFAULT_COPILOT_ENGINE = 'extension';
 const CLAUDE_ENABLED_SETTING_KEY = 'claude_enabled';
 const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
@@ -1797,6 +1805,44 @@ function readAppSettingValue(key) {
   const normalizedKey = String(key || '').trim();
   if (!normalizedKey || typeof stmts?.getAppSetting?.get !== 'function') return '';
   return String(stmts.getAppSetting.get(normalizedKey)?.value || '').trim();
+}
+
+/**
+ * The Copilot engine setting, normalised. An unset or unrecognised stored value
+ * reads as the default (`extension`) rather than throwing: this value picks a
+ * worker kind at spawn time, and a relay that cannot decide must still be able
+ * to start a conversation on the engine that has been shipping.
+ */
+function getCopilotEngine() {
+  const stored = readAppSettingValue(COPILOT_ENGINE_SETTING_KEY).toLowerCase();
+  return COPILOT_ENGINES.includes(stored) ? stored : DEFAULT_COPILOT_ENGINE;
+}
+
+function getCopilotProviderSettings() {
+  return { engine: getCopilotEngine(), engines: [...COPILOT_ENGINES] };
+}
+
+function setCopilotProviderSettings({ engine } = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Copilot settings are unavailable' };
+  }
+  const normalized = String(engine || '').trim().toLowerCase();
+  if (!COPILOT_ENGINES.includes(normalized)) return { ok: false, error: 'Invalid Copilot engine' };
+  if (normalized === 'sdk') {
+    // Refuse rather than persist a setting that cannot take effect. Both
+    // preconditions are boot-time facts this module owns: the launch
+    // environment is snapshotted once at startup, and the routing flag decides
+    // whether any node worker is ever spawned at all.
+    const unavailable = copilotSdkEngineUnavailableReason({
+      env: sessionWorkerLaunchEnv,
+      routingEnabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
+    });
+    // 409, not 400: the request is well-formed, the relay is not in a state to
+    // honour it.
+    if (unavailable) return { ok: false, status: 409, error: unavailable };
+  }
+  stmts.upsertAppSetting.run(COPILOT_ENGINE_SETTING_KEY, normalized, new Date().toISOString());
+  return { ok: true, ...getCopilotProviderSettings() };
 }
 
 function getTurnCeilingMinutes() {
@@ -3297,7 +3343,7 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
   // Clear every provider's variables first (the appliers' kind-guarded deletes
   // keep the chained clears order-independent), then apply only the bound one.
-  const cleared = applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv))));
+  const cleared = applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv)))));
   if (providerType === 'claude') {
     const claudeSettings = getClaudeProviderSettings();
     const claudeModel = String(runtimeSession?.provider_model || runtimeSession?.model || claudeSettings.model).trim();
@@ -3327,17 +3373,38 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
       command: String(process.env.GROK_CLI_COMMAND || process.env.GROK_COMMAND || '').trim(),
     });
   }
+  // Only the two providers the Copilot CLI serves get this far, so the setting
+  // is read here rather than at the top of the function: claude/cursor/grok
+  // spawns would otherwise pay a DB read whose answer they always discard.
+  //
+  // The toggle picks the WORKER KIND, not the provider type — routing, model
+  // catalogs and usage cards are unaffected. Read per spawn, so flipping the
+  // setting takes effect on the next worker without disturbing running ones.
+  const copilotSdkEngine = getCopilotEngine() === 'sdk';
   if (providerType !== 'openai') {
-    return cleared;
+    // github (and any unknown provider, which binds to github): the extension
+    // engine is the absence of a worker kind, the SDK engine names one.
+    if (!copilotSdkEngine) return cleared;
+    return applyCopilotSdkProviderEnvironment(cleared, {
+      enabled: true,
+      model: String(runtimeSession?.provider_model || runtimeSession?.model || '').trim(),
+    });
   }
   const settings = getOpenAIProviderSettings();
   const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
-  return applyOpenAIProviderEnvironment(cleared, {
+  // BYOK first, engine second: the OpenAI applier owns the COPILOT_PROVIDER_*
+  // family on both engines (the extension's CLI startup layer reads it, and the
+  // SDK worker re-expresses it as SessionConfig.provider because the runtime
+  // ignores it for SDK-created sessions), and the engine applier only adds the
+  // worker kind on top.
+  const openAiEnv = applyOpenAIProviderEnvironment(cleared, {
     enabled: true,
     apiKey: settings.apiKey,
     model,
     baseUrl: settings.baseUrl,
   });
+  if (!copilotSdkEngine) return openAiEnv;
+  return applyCopilotSdkProviderEnvironment(openAiEnv, { enabled: true, model });
 }
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
@@ -6544,6 +6611,8 @@ const sharedRouteDeps = {
   getOpenAIProviderSettings,
   setOpenAIProviderSettings,
   refreshOpenAIProviderModels,
+  getCopilotProviderSettings,
+  setCopilotProviderSettings,
   getClaudeProviderSettings,
   setClaudeProviderSettings,
   refreshClaudeProviderModels,

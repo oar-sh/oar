@@ -21,6 +21,7 @@ import {
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
 import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services/plan-usage-claude.mjs';
+import { normalizeCopilotWorkerUsage } from '../services/plan-usage-copilot.mjs';
 import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning-effort.mjs';
@@ -4921,6 +4922,45 @@ export function registerMessagesRoutes(app, deps) {
       });
     if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
     planUsageService.saveSnapshot('claude', usage, {
+      source: 'worker',
+      error: String(req.body?.error || '').trim() || null,
+    });
+    res.json({ ok: true });
+  });
+
+  // POST /api/copilot-plan-usage — the Copilot SDK worker reports the turn's
+  // billing/token detail.
+  //
+  // The Copilot card's meters are fetched relay-side from the account-level
+  // quota API and already cover SDK sessions, so this is strictly additive: it
+  // carries the two things no relay-side source can see — `totalNanoAiu` (real
+  // spend; the event's `cost` is the premium multiplier, not money) and
+  // `quotaSnapshots.cfi_overage` (overage, which `account.getQuota()`'s cached
+  // read never shows).
+  app.post('/api/copilot-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService) return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    // Stricter than the Claude route's binding check on purpose, and it has to
+    // be. `github` is the DEFAULT provider binding, so a row-shaped fallback
+    // ("no runtime session? assume github") would accept ANY fabricated
+    // conversationId from any authenticated poster and let it overwrite a
+    // snapshot the whole relay reads. The session must exist AND be bound —
+    // the same order the Grok route uses. (A BYOK `openai` conversation spends
+    // the user's own key rather than Copilot quota, so its numbers do not
+    // belong on the Copilot plan card either; the worker declines to post them,
+    // and the binding check is the backstop.)
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'github') {
+      return res.status(409).json({ error: 'Conversation is not bound to the Copilot provider' });
+    }
+    const usage = normalizeCopilotWorkerUsage(req.body);
+    if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
+    planUsageService.saveSnapshot('copilot-sdk', usage, {
       source: 'worker',
       error: String(req.body?.error || '').trim() || null,
     });

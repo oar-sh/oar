@@ -5003,13 +5003,23 @@
       >
         <div class="settings-tab-strip settings-subtab-strip" role="tablist" aria-label="Provider settings">
           <button
-            id="settings-provider-tab-openai"
+            id="settings-provider-tab-copilot"
             class="settings-tab settings-subtab active"
             type="button"
             role="tab"
             aria-selected="true"
-            aria-controls="settings-provider-panel-openai"
+            aria-controls="settings-provider-panel-copilot"
             tabindex="0"
+            data-settings-provider-tab="copilot"
+          >Copilot</button>
+          <button
+            id="settings-provider-tab-openai"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-openai"
+            tabindex="-1"
             data-settings-provider-tab="openai"
           >OpenAI</button>
           <button
@@ -5044,12 +5054,34 @@
           >Cursor</button>
         </div>
         <div
-          id="settings-provider-panel-openai"
+          id="settings-provider-panel-copilot"
           class="settings-panel active"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-copilot"
+          data-settings-provider-panel="copilot"
+        >
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="copilot-engine-select">Copilot engine</label>
+            <select id="copilot-engine-select" aria-label="Copilot engine">
+              <option value="extension">Extension — current</option>
+              <option value="sdk">SDK — experimental</option>
+            </select>
+            <div id="copilot-settings-status" class="settings-help settings-provider-status">Loading Copilot settings…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="copilot-save-btn" type="button" class="summary-btn" onclick="saveCopilotSettings()">Save Copilot settings</button>
+            </div>
+            <div class="settings-help">Chooses how GitHub Copilot conversations run. <strong>Extension</strong> is the current default: the Copilot CLI in a terminal session, which you can attach to with the tmux inspector. <strong>SDK</strong> is experimental and headless — no CLI extension to install, but no tmux inspector for those sessions. Applies to newly started conversations; sessions already running keep their engine until their worker restarts.</div>
+          </div>
+        </div>
+        <div
+          id="settings-provider-panel-openai"
+          class="settings-panel"
           role="tabpanel"
           tabindex="0"
           aria-labelledby="settings-provider-tab-openai"
           data-settings-provider-panel="openai"
+          hidden
         >
           <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
             <label for="openai-api-key-input">OpenAI API key</label>

@@ -248,6 +248,8 @@ import {
   toggleClaudeProvider,
   applyClaudeSettingsState,
   refreshClaudeSettingsState,
+  saveCopilotSettings,
+  applyCopilotSettingsState,
   saveGrokSettings,
   toggleGrokProvider,
   applyGrokSettingsState,
@@ -3803,6 +3805,7 @@ initSocketHandlers({
   applyConversationPreferencesForConversation,
   applyOpenAISettingsState,
   applyClaudeSettingsState,
+  applyCopilotSettingsState,
   applyGrokSettingsState,
   applyCursorSettingsState,
 });
@@ -4187,6 +4190,7 @@ window.saveOpenAISettings = saveOpenAISettings;
 window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.saveClaudeSettings = saveClaudeSettings;
+window.saveCopilotSettings = saveCopilotSettings;
 window.toggleClaudeProvider = toggleClaudeProvider;
 window.startClaudeRelogin = startClaudeRelogin;
 window.submitClaudeLoginCodeFromInput = submitClaudeLoginCodeFromInput;

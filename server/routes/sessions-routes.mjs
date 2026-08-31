@@ -258,6 +258,45 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
   };
 }
 
+/**
+ * The Copilot provider settings update. Only one field today — which engine
+ * runs Copilot conversations — and it is validated against the enum here so
+ * the route can 400 a typo rather than persisting a value that would silently
+ * read back as the default forever.
+ */
+export function parseCopilotSettingsUpdateRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const hasEngine = Object.prototype.hasOwnProperty.call(payload, 'engine');
+  if (!hasEngine) return { ok: false, error: 'No Copilot settings update provided' };
+  const engine = String(payload.engine || '').trim().toLowerCase();
+  if (engine !== 'extension' && engine !== 'sdk') {
+    return { ok: false, error: 'Invalid Copilot engine' };
+  }
+  return { ok: true, engine };
+}
+
+export const COPILOT_ENGINES = Object.freeze(['extension', 'sdk']);
+
+/**
+ * The wire shape of the Copilot provider settings, from whatever the runtime
+ * handed back. One builder for the GET, the POST and the socket broadcast, so
+ * the three cannot describe the relay differently.
+ *
+ * `extension` is the fallback for anything unrecognised because it is the
+ * engine that has been shipping: a relay that cannot say which engine it is on
+ * must not claim to be on the experimental one.
+ */
+export function buildCopilotSettingsPayload(settings = {}) {
+  const engine = String(settings?.engine || '').trim().toLowerCase();
+  const engines = Array.isArray(settings?.engines) && settings.engines.length
+    ? settings.engines
+    : [...COPILOT_ENGINES];
+  return {
+    engine: COPILOT_ENGINES.includes(engine) ? engine : 'extension',
+    engines,
+  };
+}
+
 export function parseCursorSettingsUpdateRequest(body = {}) {
   const payload = body && typeof body === 'object' ? body : {};
   const remove = payload.remove === true;
@@ -1928,6 +1967,8 @@ export function registerSessionsRoutes(app, deps) {
     getOpenAIProviderSettings = () => ({ configured: false, enabled: false, model: 'gpt-4o' }),
     setOpenAIProviderSettings = () => ({ ok: false, error: 'OpenAI settings are unavailable' }),
     refreshOpenAIProviderModels = async () => ({ ok: false, models: [], error: 'OpenAI model discovery is unavailable' }),
+    getCopilotProviderSettings = () => ({ engine: 'extension', engines: ['extension', 'sdk'] }),
+    setCopilotProviderSettings = () => ({ ok: false, error: 'Copilot settings are unavailable' }),
     getClaudeProviderSettings = () => ({ configured: false, enabled: false, model: 'claude-sonnet-5', models: [] }),
     setClaudeProviderSettings = () => ({ ok: false, error: 'Claude settings are unavailable' }),
     refreshClaudeProviderModels = async () => ({ ok: false, models: [], error: 'Claude model discovery is unavailable' }),
@@ -4847,6 +4888,36 @@ export function registerSessionsRoutes(app, deps) {
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed')),
     });
+  });
+
+  // Copilot has no credentials or model list of its own in settings (it
+  // authenticates through the host's `copilot` login and its catalog comes from
+  // the CLI), so this pair carries exactly one thing: which engine runs it.
+  //
+  // The GET response, the POST response and the socket broadcast are the same
+  // three consumers of one shape, so it is built once here — three hand-rolled
+  // copies is how a field ends up present on two of them.
+  app.get('/api/settings/copilot', auth, (_req, res) => {
+    return res.json(buildCopilotSettingsPayload(getCopilotProviderSettings()));
+  });
+
+  app.post('/api/settings/copilot', auth, (req, res) => {
+    const parsed = parseCopilotSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setCopilotProviderSettings(parsed);
+    if (!result?.ok) {
+      // The setter distinguishes "malformed" (400) from "this relay cannot run
+      // that engine" (409), and the reason string is written to be read by a
+      // human in the settings panel — pass it through verbatim.
+      return res.status(Number(result?.status) || 400)
+        .json({ error: result?.error || 'Failed to update Copilot settings' });
+    }
+    const settingsPayload = buildCopilotSettingsPayload(result);
+    // No model catalog is emitted with this: the engine switch does not change
+    // which models exist, only which process runs them. Running workers are
+    // deliberately left alone — the new engine applies to the next spawn.
+    io.emit('copilot_settings_updated', settingsPayload);
+    return res.json({ ok: true, ...settingsPayload });
   });
 
   app.get('/api/settings/claude', auth, (_req, res) => {

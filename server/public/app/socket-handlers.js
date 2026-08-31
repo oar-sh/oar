@@ -344,6 +344,11 @@ export async function connectSocket(overrideDeps) {
         .catch(() => {});
     }
   });
+  // No view refresh here: the engine switch rebinds nothing — it only changes
+  // which worker the NEXT Copilot conversation spawns.
+  socket.on('copilot_settings_updated', (payload) => {
+    deps?.applyCopilotSettingsState?.(payload || {});
+  });
   socket.on('claude_settings_updated', (payload) => {
     deps?.applyClaudeSettingsState?.(payload || {});
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {

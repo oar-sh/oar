@@ -1060,6 +1060,158 @@ test('compaction is configured explicitly rather than left to the runtime defaul
   });
 });
 
+test('a hosted turn posts its usage to the copilot ingest', async () => {
+  const { stub, runner } = setup({ env: {} });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  const posts = stub.bodiesFor('/api/copilot-plan-usage');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].conversationId, 'conv-1');
+  assert.equal(posts[0].messageId, 'q-1');
+  // The relay normalises; the worker posts the captured shape as-is, so the
+  // fields only it can see have to survive the trip.
+  assert.ok(posts[0].usage);
+});
+
+test('a BYOK turn posts no copilot usage', async () => {
+  // BYOK spends the user's own key, not Copilot quota, and its usage events
+  // report cost 0 — those numbers do not belong on the Copilot plan card.
+  const { stub, runner } = setup({
+    env: {
+      COPILOT_PROVIDER_TYPE: 'openai',
+      COPILOT_PROVIDER_API_KEY: 'sk-test',
+      COPILOT_MODEL: 'gpt-5.4-mini',
+    },
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  assert.equal(stub.bodiesFor('/api/copilot-plan-usage').length, 0);
+});
+
+test('a hosted session carries no BYOK provider block', async () => {
+  const { client, runner } = setup({ env: {} });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  assert.equal('provider' in client.createAttempts[0], false);
+});
+
+test('an openai-provider session carries its BYOK provider into the session config', async () => {
+  // The runtime ignores COPILOT_PROVIDER_* for SDK-created sessions, so the
+  // same relay configuration the extension path reads from the environment has
+  // to be re-expressed here or the conversation silently runs on hosted models.
+  const { client, runner } = setup({
+    env: {
+      COPILOT_PROVIDER_TYPE: 'openai',
+      COPILOT_PROVIDER_BASE_URL: 'https://example.test/v1',
+      COPILOT_PROVIDER_API_KEY: 'sk-test',
+      COPILOT_PROVIDER_WIRE_API: 'responses',
+      COPILOT_MODEL: 'gpt-5.4-mini',
+    },
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  const { provider } = client.createAttempts[0];
+  assert.deepEqual(provider, {
+    type: 'openai',
+    baseUrl: 'https://example.test/v1',
+    apiKey: 'sk-test',
+    wireApi: 'responses',
+    // gpt-5.4-mini's 256k window, minus the completion that has to fit in it.
+    maxPromptTokens: 128_000,
+    maxOutputTokens: 128_000,
+  });
+  // Leaving modelId unset is what keeps setModel authoritative for the session.
+  assert.equal('modelId' in provider, false);
+});
+
+test('a hosted model switch uses setModel and keeps the one session', async () => {
+  const { client, runner } = setup({ env: {} });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4' } });
+
+  assert.deepEqual(client.session.setModelCalls, ['gpt-5.4']);
+  // One session for the whole conversation: nothing was torn down.
+  assert.equal(client.sessions.length, 1);
+  assert.equal(client.session.disconnected, false);
+});
+
+test('a BYOK model switch rebuilds the session so the ceilings follow the model', async () => {
+  // `SessionConfig.provider` carries the model's token ceilings and runtime
+  // 1.0.82 has no way to update it mid-session — setModel takes no provider,
+  // there is no setProvider, and the registry-add RPC belongs to the named
+  // multi-provider surface, which the runtime rejects alongside the singular
+  // `provider` this worker uses. A bare setModel would therefore leave gpt-4o's
+  // ceilings describing a gpt-4.1 session.
+  const { client, runner } = setup({
+    env: {
+      COPILOT_PROVIDER_TYPE: 'openai',
+      COPILOT_PROVIDER_API_KEY: 'sk-test',
+      COPILOT_MODEL: 'gpt-4o',
+    },
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, model: 'gpt-4o' } });
+  assert.equal(client.createAttempts[0].provider.maxPromptTokens, 111_616);
+  const firstSession = client.session;
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-4.1' } });
+
+  // The old session was disposed and a NEW one built for the new model...
+  assert.equal(firstSession.disconnected, true);
+  assert.equal(client.sessions.length, 2);
+  assert.notEqual(client.session, firstSession);
+  // ...with ceilings that describe gpt-4.1 rather than gpt-4o.
+  const rebuilt = client.resumeAttempts[client.resumeAttempts.length - 1].config;
+  assert.equal(rebuilt.provider.maxPromptTokens, 1_014_808);
+  assert.equal(rebuilt.provider.maxOutputTokens, 32_768);
+  // History is preserved: the rebuild RESUMES the same session id rather than
+  // creating a blank second one.
+  assert.equal(rebuilt.sessionId, 'conv-1');
+  assert.equal(client.createAttempts.length, 1);
+  // Both turns still published their reply.
+  assert.equal(client.sessions[1].sends.length, 1);
+});
+
+test('the usage ingest never delays a finished reply', async () => {
+  // The POST runs after the stall watchdog is disarmed on a client with no
+  // request timeout, so awaiting it would let an unresponsive relay hold a
+  // COMPLETED turn and its still-open queue row.
+  let releaseIngest = () => {};
+  const gate = new Promise((resolve) => { releaseIngest = resolve; });
+  const stub = makeApiStub();
+  const calls = [];
+  const gatedApi = async (method, routePath, body) => {
+    calls.push(routePath);
+    if (routePath === '/api/copilot-plan-usage') await gate;
+    return stub(method, routePath, body);
+  };
+  gatedApi.bodiesFor = stub.bodiesFor;
+
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  const { runner } = makeRunner({ stub: gatedApi, client });
+
+  // Resolves while the ingest POST is still hanging.
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(stub.bodiesFor('/api/response').length, 1);
+  // The POST was issued (ordering is deterministic), just not waited on.
+  assert.equal(calls.includes('/api/copilot-plan-usage'), true);
+  assert.equal(calls.indexOf('/api/response') < calls.indexOf('/api/copilot-plan-usage'), true);
+
+  releaseIngest();
+  await runner.whenUsagePosted();
+});
+
+test('a rejected usage ingest is swallowed rather than failing the turn', async () => {
+  const { stub, runner } = setup({
+    env: {},
+    apiStubOptions: { failRoutes: new Set(['/api/copilot-plan-usage']) },
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  await runner.whenUsagePosted();
+  assert.equal(stub.bodiesFor('/api/response').length, 1);
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+});
+
 test('shutdown closes any question card still waiting for a human', async () => {
   const { runner, questionBridge } = setup();
   await runner.handlePendingPayload({ message: baseMessage });

@@ -70,8 +70,19 @@ function looksLikeCopilotWorkerProcess(proc) {
   if (name === 'copilot.exe') return true;
   if (name === 'gh.exe' && cmd.includes('gh') && cmd.includes('copilot')) return true;
   if (cmd.includes('gh copilot')) return true;
-  if (cmd.includes('claude-session-worker')) return true;
-  if (cmd.includes('cursor-session-worker')) return true;
+  // Every node worker's entry script is named `<kind>-session-worker.mjs` and
+  // is invoked as `node <script> --session-id <id>` — none of the CLI markers
+  // below (no `--allow-all`, no `@github/copilot` path) appear on their command
+  // lines, so a worker missing from this check is invisible to discovery: the
+  // kill route no-ops and process reuse spawns a duplicate every turn. That is
+  // exactly what happened to `grok-session-worker`, which the per-worker list
+  // this replaces never named.
+  //
+  // Matching the naming convention instead of four literals means a new node
+  // worker is discoverable the moment it exists. The tmux exclusions above
+  // still run first, so the shared tmux server cannot be adopted through this
+  // arm by carrying a worker's argv.
+  if (cmd.includes('-session-worker')) return true;
   return cmd.includes('copilot.cmd')
     || cmd.includes('copilot-win32')
     || cmd.includes('@github\\copilot')

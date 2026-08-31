@@ -28,6 +28,8 @@ import {
   buildMeter,
   buildProviderCard,
   buildUnavailableCard,
+  pickNonNegative,
+  pickNumber,
   roundCurrency,
   toFiniteNumber,
   toIsoTimestamp,
@@ -96,22 +98,6 @@ export function resolveGrokBillingCycle(options = {}) {
     resetDay: options.resetDay ?? DEFAULT_GROK_RESET_DAY,
     now: options.now,
   });
-}
-
-function pickNumber(...candidates) {
-  for (const candidate of candidates) {
-    const value = toFiniteNumber(candidate);
-    if (value !== null) return value;
-  }
-  return null;
-}
-
-// Negative token counts, costs, or durations are nonsense — treat them as
-// "not reported" rather than booking them (they would otherwise decrement
-// the cycle spend ledger). Mirrors normalizeCursorUsageReport.
-function pickNonNegative(...candidates) {
-  const value = pickNumber(...candidates);
-  return value === null || value < 0 ? null : value;
 }
 
 /**

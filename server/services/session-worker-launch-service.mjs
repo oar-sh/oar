@@ -78,10 +78,19 @@ export function applyOpenAIProviderEnvironment(env = {}, {
   return next;
 }
 
+/**
+ * The worker kind an environment names, or `copilot` (the extension engine,
+ * which is the absence of a kind) for anything unrecognised.
+ *
+ * Validated against `NODE_WORKER_DESCRIPTORS` rather than a parallel list of
+ * kind names: a new node worker is then one descriptor entry, and there is no
+ * second place that can be forgotten and silently route the new kind back to
+ * the Copilot CLI. Referenced lazily — this is only ever called at request
+ * time, long after the descriptor table is initialised.
+ */
 export function resolveWorkerKind(env = {}) {
   const kind = String(env?.COPILOT_WEB_RELAY_WORKER_KIND || '').trim().toLowerCase();
-  if (kind === 'claude' || kind === 'cursor' || kind === 'grok') return kind;
-  return 'copilot';
+  return Object.hasOwn(NODE_WORKER_DESCRIPTORS, kind) ? kind : 'copilot';
 }
 
 export function applyClaudeProviderEnvironment(env = {}, {
@@ -140,6 +149,79 @@ export function applyGrokProviderEnvironment(env = {}, {
   return next;
 }
 
+/**
+ * The Copilot SDK engine: the same `github`/`openai` providers the extension
+ * serves, run as a plain Node worker against the CLI's headless runtime.
+ *
+ * Unlike the other appliers this one configures no credentials of its own. The
+ * SDK worker authenticates exactly like the TUI does (the host's `copilot`
+ * login), and the one path it needs — `COPILOT_SDK_PATH` — is already resolved
+ * once into the base launch environment for every session, extension or SDK.
+ * (It needs no CLI executable: the runtime entry point is derived from the SDK
+ * bundle's own version directory, so the two can never drift apart.) This
+ * applier's whole job is selecting the worker kind and handing over the model.
+ *
+ * BYOK is deliberately NOT re-implemented here: an `openai` session is composed
+ * as `applyCopilotSdkProviderEnvironment(applyOpenAIProviderEnvironment(...))`,
+ * so one OpenAI configuration drives both engines and the secret-env-file
+ * plumbing for `COPILOT_PROVIDER_API_KEY` is untouched. The SDK worker reads
+ * that family in-process (`copilot-byok-provider.mjs`) because the runtime
+ * ignores it for SDK-created sessions.
+ *
+ * `COPILOT_SDK_PATH` is required rather than optional: it is resolved from the
+ * installed CLI's own bundle, so its absence means there is no CLI to run and
+ * failing here names the problem instead of spawning a worker that dies on its
+ * first import.
+ */
+export function applyCopilotSdkProviderEnvironment(env = {}, {
+  enabled = false,
+  model = '',
+} = {}) {
+  const next = { ...env };
+  // Only clear the worker kind this provider owns so clear chains stay
+  // order-independent when multiple provider appliers run back to back.
+  if (resolveWorkerKind(next) === 'copilot-sdk') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
+  delete next.COPILOT_RELAY_MODEL;
+  if (!enabled) return next;
+  if (!normalizeText(next.COPILOT_SDK_PATH)) throw new Error('copilot-sdk-path-not-resolved');
+  next.COPILOT_WEB_RELAY_WORKER_KIND = 'copilot-sdk';
+  const normalizedModel = normalizeText(model);
+  if (normalizedModel) next.COPILOT_RELAY_MODEL = normalizedModel;
+  return next;
+}
+
+/**
+ * Why the Copilot SDK engine cannot be selected right now, or null when it can.
+ *
+ * The engine toggle is a promise the UI makes on the relay's behalf ("new
+ * Copilot conversations run headless"), and there are two ways to save it and
+ * have precisely nothing happen — both invisible from the settings panel, and
+ * both indistinguishable from the feature simply not working:
+ *
+ *  - `COPILOT_SDK_PATH` never resolved. The worker's very first act is to
+ *    import the SDK from it, so every conversation would die on spawn.
+ *  - Session-worker routing is off. No worker of any node kind is ever spawned,
+ *    so the setting is a no-op while the panel asserts the opposite.
+ *
+ * Refusing the save with the reason is strictly better than accepting it: the
+ * user finds out at the moment they can still act on it.
+ */
+export function copilotSdkEngineUnavailableReason({ env = {}, routingEnabled = false } = {}) {
+  if (!normalizeText(env?.COPILOT_SDK_PATH)) {
+    // Worth spelling out: the launch environment is built ONCE at boot, so
+    // installing the CLI now and re-saving without a restart fails identically.
+    return 'The Copilot SDK was not found when the relay started (COPILOT_SDK_PATH did not resolve). '
+      + 'Install or upgrade the GitHub Copilot CLI, then restart the relay — the launch environment is '
+      + 'snapshotted at startup, so a CLI installed since then is not visible yet.';
+  }
+  if (routingEnabled !== true) {
+    return 'The SDK engine requires session worker routing, which is disabled on this relay '
+      + '(SESSION_WORKER_ROUTING_ENABLED). With routing off no SDK worker is ever spawned, so the engine '
+      + 'setting would have no effect.';
+  }
+  return null;
+}
+
 export function isClaudeWorkerEnvironment(env = {}) {
   return String(env?.COPILOT_WEB_RELAY_WORKER_KIND || '').trim().toLowerCase() === 'claude';
 }
@@ -150,6 +232,10 @@ export function isCursorWorkerEnvironment(env = {}) {
 
 export function isGrokWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'grok';
+}
+
+export function isCopilotSdkWorkerEnvironment(env = {}) {
+  return resolveWorkerKind(env) === 'copilot-sdk';
 }
 
 export function resolveClaudeWorkerScriptPath(env = {}) {
@@ -182,12 +268,29 @@ export function resolveGrokWorkerScriptPath(env = {}) {
   return path.join(process.cwd(), 'server', 'grok-worker', 'grok-session-worker.mjs');
 }
 
-// Workers that run as plain Node processes (no CLI, no pseudo-TTY). Copilot is
-// intentionally absent: its launch path must stay exactly as-is.
+export function resolveCopilotSdkWorkerScriptPath(env = {}) {
+  const explicit = normalizeText(env?.COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH);
+  if (explicit) return explicit;
+  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
+  if (repoRoot) return path.join(repoRoot, 'server', 'copilot-worker', 'copilot-sdk-session-worker.mjs');
+  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
+  if (serverDir) return path.join(serverDir, 'copilot-worker', 'copilot-sdk-session-worker.mjs');
+  return path.join(process.cwd(), 'server', 'copilot-worker', 'copilot-sdk-session-worker.mjs');
+}
+
+// Workers that run as plain Node processes (no CLI, no pseudo-TTY). The
+// `copilot` kind is intentionally absent: that is the extension engine, whose
+// launch path (the real TUI under a `script` pseudo-TTY) must stay exactly
+// as-is. `copilot-sdk` is the SAME provider on the headless SDK engine, and it
+// belongs here with Claude/Cursor/Grok.
 const NODE_WORKER_DESCRIPTORS = Object.freeze({
   claude: Object.freeze({ resolveScriptPath: resolveClaudeWorkerScriptPath, windowsTitle: 'Claude Worker' }),
   cursor: Object.freeze({ resolveScriptPath: resolveCursorWorkerScriptPath, windowsTitle: 'Cursor Worker' }),
   grok: Object.freeze({ resolveScriptPath: resolveGrokWorkerScriptPath, windowsTitle: 'Grok Worker' }),
+  'copilot-sdk': Object.freeze({
+    resolveScriptPath: resolveCopilotSdkWorkerScriptPath,
+    windowsTitle: 'Copilot SDK Worker',
+  }),
 });
 
 function resolveNodeWorkerDescriptor(env = {}) {
@@ -372,6 +475,16 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     'COPILOT_PROVIDER_WIRE_API',
     'COPILOT_MODEL',
     'COPILOT_WEB_RELAY_WORKER_KIND',
+    // The SDK worker's own model and BYOK context overrides. `COPILOT_MODEL`
+    // above is the extension engine's model variable and is read by the CLI's
+    // startup layer; the SDK worker takes its default model from
+    // `COPILOT_RELAY_MODEL`, matching every other Node worker's
+    // `*_RELAY_MODEL`. Without it here the model would silently drop to the
+    // runtime default on the tmux path while working on the detached path,
+    // which inherits the whole environment.
+    'COPILOT_RELAY_MODEL',
+    'COPILOT_PROVIDER_MAX_PROMPT_TOKENS',
+    'COPILOT_PROVIDER_MAX_OUTPUT_TOKENS',
     // Without this the tmux path would fall back to ~/.claude while the relay
     // (and the detached spawn path, which inherits the full environment) uses
     // the override — worker and relay would read different config roots.
