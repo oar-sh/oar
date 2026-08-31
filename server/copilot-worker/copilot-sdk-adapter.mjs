@@ -255,6 +255,71 @@ export function copilotPermissionDecision(relayMode, request) {
 }
 
 /**
+ * Does this relay mode ask the human before a mutating tool runs, rather than
+ * deciding locally? Only `ask` does: `plan` is a "describe, do not act" mode
+ * where a prompt on every tool would be noise, and agent/autopilot run
+ * unattended by definition.
+ */
+export function relayModeAsksBeforeActing(relayMode) {
+  return String(relayMode || '').trim().toLowerCase() === 'ask';
+}
+
+/**
+ * Build the runtime's `onPermissionRequest` handler.
+ *
+ * Modes split three ways:
+ *
+ *  - agent / autopilot / anything unrecognised — auto-approve, unchanged.
+ *  - plan — deny non-read tools with feedback, unchanged from phase 1. A card
+ *    per tool call would be noise in a mode whose whole point is not acting.
+ *  - ask — route the decision to the human through a relay question card.
+ *
+ * Read-only requests short-circuit to `approve-once` in every mode: prompting
+ * to read a file the model is already allowed to read is pure friction.
+ *
+ * The returned decision `kind`s stay inside the runtime's verified vocabulary
+ * (`approve-once` / `reject` / `user-not-available`). `{kind:"allow"}` does not
+ * exist and is rejected with "unknown variant `allow`".
+ */
+export function createCopilotPermissionHandler({
+  bridge = null,
+  getRelayMode = () => 'agent',
+  getSignal = () => null,
+  dbg = () => {},
+} = {}) {
+  return async function onPermissionRequest(request) {
+    const relayMode = getRelayMode();
+    if (!relayModeAsksBeforeActing(relayMode) || !bridge) {
+      return copilotPermissionDecision(relayMode, request);
+    }
+    if (isReadOnlyPermissionRequest(request)) return { kind: 'approve-once' };
+    try {
+      const { approved, feedback, timedOut, description } = await bridge.askToolApproval(request, {
+        signal: getSignal(),
+      });
+      if (timedOut) {
+        // The runtime's own "nobody answered" verdict. Deliberately not a
+        // `reject`: a rejection reads to the model as a considered refusal it
+        // should work around, while this reads as an absent human.
+        dbg('permission question timed out', description);
+        return { kind: 'user-not-available' };
+      }
+      if (approved) return { kind: 'approve-once' };
+      // The bridge composes the note (a freeform denial carries the human's own
+      // reason; a plain "Deny" click gets a generic one), so the choice labels
+      // stay in one module.
+      return { kind: 'reject', feedback: feedback || 'The user declined this action.' };
+    } catch (error) {
+      // The relay is unreachable or the card could not be created. Falling
+      // back to the local policy keeps the turn moving; throwing would be
+      // auto-answered `user-not-available` by the SDK with no explanation.
+      dbg('permission question failed, falling back to the local policy', error?.message || String(error));
+      return copilotPermissionDecision(relayMode, request);
+    }
+  };
+}
+
+/**
  * The relay mode expressed in the runtime's own `MessageOptions.agentMode`
  * vocabulary, so the runtime's built-in mode behaviour lines up with the
  * permission policy above instead of fighting it. Unknown relay modes fall

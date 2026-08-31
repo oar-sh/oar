@@ -171,21 +171,100 @@ export const baseMessage = Object.freeze({
   model: 'gpt-5-mini',
 });
 
+/**
+ * A stand-in for the relay question bridge.
+ *
+ * `answers` maps a matcher to a canned reply, so a test can drive `ask_user`
+ * and ask-mode tool approvals without a relay. Every call is recorded.
+ */
+export function makeFakeQuestionBridge({
+  userInputAnswer = 'the human answer',
+  userInputTimedOut = false,
+  approve = true,
+  approvalTimedOut = false,
+  approvalFeedback = 'The user declined this action.',
+  onAsk = null,
+} = {}) {
+  const bridge = {
+    userInputCalls: [],
+    approvalCalls: [],
+    cancelledCount: 0,
+    async askUserInput(request, options) {
+      bridge.userInputCalls.push({ request, options });
+      if (onAsk) await onAsk(request, options);
+      const choices = Array.isArray(request?.choices) ? request.choices : [];
+      const answer = typeof userInputAnswer === 'function' ? userInputAnswer(request) : userInputAnswer;
+      return {
+        answer,
+        wasFreeform: userInputTimedOut ? true : !choices.includes(answer),
+        timedOut: userInputTimedOut,
+      };
+    },
+    async askToolApproval(request, options) {
+      bridge.approvalCalls.push({ request, options });
+      if (onAsk) await onAsk(request, options);
+      return {
+        approved: approvalTimedOut ? false : approve,
+        answer: approve ? 'Approve' : 'Deny',
+        feedback: approvalFeedback,
+        timedOut: approvalTimedOut,
+        description: 'a tool',
+      };
+    },
+    async cancelPendingQuestions() {
+      bridge.cancelledCount += 1;
+      return 0;
+    },
+    pendingQuestionCount: () => 0,
+  };
+  return bridge;
+}
+
+/**
+ * The relay-context prefix the runner prepends to every prompt, for tests that
+ * assert on the prompt. `relayToolInstructions` defaults to '' in the harness,
+ * so only the mode marker and the mode's standing instructions appear, and the
+ * instructions only on the FIRST turn of a given relay mode.
+ */
+export function expectedPromptPrefix(mode = 'agent', { includeInstructions = true } = {}) {
+  const marker = `[Relay mode: ${mode}]`;
+  if (!includeInstructions) return marker;
+  const instructions = {
+    agent: 'Proceed as an interactive coding agent and use tools as needed. If you need clarification, pause and ask through the web relay instead of stalling silently. These instructions remain in effect until relay mode changes.',
+    plan: 'Draft a concise plan only. Use read-only inspection tools (glob, rg, view) only when they materially improve plan quality; otherwise draft from provided context. Do not edit repository files or run mutating commands unless the user explicitly asks for implementation. If clarification is required, pause and ask through the web relay. These instructions remain in effect until relay mode changes.',
+    ask: 'Prioritize clarification questions before doing any implementation work. If the request is ambiguous or underspecified, pause and ask through the web relay before making assumptions. Do not make broad assumptions when a question would materially change the result. These instructions remain in effect until relay mode changes.',
+    autopilot: 'Act directly on the request and use tools when needed. Keep moving unless user input is truly blocking. These instructions remain in effect until relay mode changes.',
+  }[mode];
+  return `${marker} ${instructions}`;
+}
+
+/** The message body with the relay-context prefix in front, as sent. */
+export function promptWithPrefix(body, mode = 'agent', options = {}) {
+  return `${expectedPromptPrefix(mode, options)} ${body}`;
+}
+
 export function makeRunner({
   stub,
   client,
   startWarning = null,
   runtimeVersion = '1.0.82',
+  questionBridge = makeFakeQuestionBridge(),
   ...overrides
 } = {}) {
   const started = [];
   return {
     started,
+    questionBridge,
     runner: createCopilotSdkSessionRunner({
       api: stub,
       sdkSessionId: 'conv-1',
       cwd: '/tmp/relay-fixture-workspace',
       resolvePathsImpl: () => FAKE_SDK_PATHS,
+      // Spawn-free and relay-free by default: no test reads the real
+      // relay-tools.md off disk or asks a relay whether previews are on.
+      relayToolInstructions: '',
+      getPreviewInstructionsImpl: () => '',
+      createQuestionBridgeImpl: () => questionBridge,
       startClientImpl: async (options) => {
         started.push(options);
         return {

@@ -91,17 +91,51 @@ export function formatToolActivityText(toolName, input) {
  * from the root/main agent and session-level events." Note it is on the
  * envelope, NOT on `data`.
  *
- * Phase 1 uses this only to keep subagent prose out of the main reply and the
- * main reasoning bubble — the runtime forwards subagent streaming by default
+ * The runtime forwards subagent streaming by default
  * (`includeSubAgentStreamingEvents`, default true), and turning that flag off
  * is not an option: a live probe against runtime 1.0.82 showed it also
  * collapses the PARENT's tool-call argument streaming (`streaming_delta`
  * 33→2, `tool_call_delta` 32→1), gutting main-transcript streaming. So the
- * filter lives here instead. Phase 2 gives subagents their own lane and starts
- * publishing this text under a `subagentRunId`.
+ * routing lives here instead: phase 1 dropped these events, phase 2 routes
+ * them to the subagent lane keyed on `agentId`.
  */
 export function isSubagentEvent(event) {
   return !!String(event?.agentId || '').trim();
+}
+
+/**
+ * The run id for a subagent event.
+ *
+ * Lifecycle events (`subagent.started` / `completed` / `failed`) carry
+ * `data.toolCallId` — the spawning tool call — while the tagged
+ * `assistant.message` that holds the subagent's actual reply carries only the
+ * envelope `agentId`. Whichever of the two is present is registered as an
+ * ALIAS of one canonical run id (see `resolveSubagentRun`), so the lane still
+ * assembles if a runtime version populates only one of them.
+ */
+export function subagentEventKeys(event) {
+  const data = event?.data && typeof event.data === 'object' ? event.data : {};
+  return {
+    agentId: sanitizeSubagentRunId(event?.agentId),
+    toolCallId: sanitizeSubagentRunId(data.toolCallId),
+  };
+}
+
+/** A short, human-readable label for a subagent, for the lane header. */
+export function subagentDisplayName(data) {
+  return String(data?.agentDisplayName || data?.agentName || '').trim() || 'Subagent';
+}
+
+/** "12.3k tokens · 4 tool calls · 8.1s" — whichever parts the runtime reported. */
+export function formatSubagentStats(data) {
+  const parts = [];
+  const tokens = Number(data?.totalTokens);
+  if (Number.isFinite(tokens) && tokens > 0) parts.push(`${tokens} tokens`);
+  const toolCalls = Number(data?.totalToolCalls);
+  if (Number.isFinite(toolCalls) && toolCalls > 0) parts.push(`${toolCalls} tool calls`);
+  const durationMs = Number(data?.durationMs);
+  if (Number.isFinite(durationMs) && durationMs > 0) parts.push(`${(durationMs / 1000).toFixed(1)}s`);
+  return parts.join(' · ');
 }
 
 /**
@@ -117,26 +151,37 @@ function createUsageAccumulator() {
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     reasoningTokens: 0,
+    // `cost` is the PREMIUM MULTIPLIER, not money — the field name is
+    // misleading and there is no `premiumRequests` field at all. Real spend is
+    // `copilotUsage.totalNanoAiu`, summed separately below, which is what a
+    // usage card must report.
     cost: 0,
+    totalNanoAiu: 0,
     modelCalls: 0,
+    subagentModelCalls: 0,
     durationMs: 0,
     timeToFirstTokenMs: null,
     model: '',
     isByok: null,
     quotaSnapshots: null,
   };
-  function add(data) {
+  function add(data, { allowModel = true } = {}) {
     if (!data || typeof data !== 'object') return;
     totals.modelCalls += 1;
+    if (!allowModel) totals.subagentModelCalls += 1;
     for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'cost']) {
       const value = Number(data[key]);
       if (Number.isFinite(value)) totals[key] += value;
     }
+    const nanoAiu = Number(data.copilotUsage?.totalNanoAiu);
+    if (Number.isFinite(nanoAiu)) totals.totalNanoAiu += nanoAiu;
     const duration = Number(data.duration);
     if (Number.isFinite(duration)) totals.durationMs += duration;
     const ttft = Number(data.timeToFirstTokenMs);
     if (totals.timeToFirstTokenMs === null && Number.isFinite(ttft)) totals.timeToFirstTokenMs = ttft;
-    const model = String(data.model || '').trim();
+    // A subagent's usage counts toward spend but must not rename the turn's
+    // model: `task` can override the model per subagent.
+    const model = allowModel ? String(data.model || '').trim() : '';
     if (model) totals.model = model;
     if (typeof data.isByok === 'boolean') totals.isByok = data.isByok;
     // Usually `{}` on a healthy call; a populated snapshot (the quota path)
@@ -191,16 +236,126 @@ export function createCopilotEventNormalizer() {
   const toolNames = new Map(); // toolCallId -> toolName
   const permissionRequests = new Map(); // requestId -> summary
 
+  // ---- prompt segments (steering attribution) -------------------------------
+  //
+  // One interaction can answer SEVERAL prompts: a message sent mid-turn is
+  // queued by the runtime and picked up at the next model-call boundary, and
+  // the whole thing closes with a single `session.idle` (live-verified, see
+  // §4b/§5 of the plan). Each prompt the runtime actually starts work on opens
+  // with its own `user.message` event, so those events are the prompt
+  // boundaries — and they are what lets a steered queue row be answered with
+  // ITS OWN text instead of the whole interaction's transcript.
+  const segments = []; // array of arrays of messageIds, one per user.message
+
+  function currentSegment() {
+    if (!segments.length) segments.push([]);
+    return segments[segments.length - 1];
+  }
+
   function noteMessage(messageId) {
     const id = String(messageId || '').trim();
     if (!id) return '';
     if (!messageTexts.has(id)) {
       messageTexts.set(id, '');
       messageOrder.push(id);
+      currentSegment().push(id);
       // The message that was newest is now part of the prefix.
       cachedPrefix = null;
     }
     return id;
+  }
+
+  /** The reply text for prompt `index` (0 = the prompt the turn opened with). */
+  function segmentText(index) {
+    const ids = segments[index];
+    if (!Array.isArray(ids) || !ids.length) return '';
+    const parts = [];
+    for (const id of ids) {
+      const text = String(messageTexts.get(id) || '');
+      if (text.trim()) parts.push(text);
+    }
+    return parts.join('\n\n');
+  }
+
+  // ---- subagent lane --------------------------------------------------------
+  //
+  // Keyed on the envelope `agentId`, which a live BYOK probe confirmed is
+  // present on the lifecycle events AND on the tagged `assistant.message`
+  // carrying the reply (and is NOT equal to `data.toolCallId`). `toolCallId` is
+  // registered as an alias anyway so the lane still assembles if a future
+  // runtime tags only one of them.
+  const subagentRuns = new Map(); // runId -> { displayName, status, opened }
+  const subagentAliases = new Map(); // agentId|toolCallId -> runId
+
+  /**
+   * `useToolCallId` is true only for `subagent.*` lifecycle events, where
+   * `data.toolCallId` names the tool call that SPAWNED this subagent.
+   *
+   * On any other event `toolCallId` names a tool call the subagent is MAKING,
+   * which is a different thing entirely — aliasing it would mean that if a
+   * subagent ever spawned a nested one, the child's `subagent.started` (whose
+   * `toolCallId` is that same inner call) would resolve to the PARENT's run:
+   * the child's text would merge into the parent's lane and the child's
+   * `completed` would close the parent's bubble while it was still running.
+   */
+  function resolveSubagentRun(event, { useToolCallId = false } = {}) {
+    const { agentId, toolCallId } = subagentEventKeys(event);
+    const alias = useToolCallId ? toolCallId : null;
+    const runId = (agentId && subagentAliases.get(agentId))
+      || (alias && subagentAliases.get(alias))
+      || agentId
+      || alias
+      || null;
+    if (!runId) return null;
+    if (agentId) subagentAliases.set(agentId, runId);
+    if (alias) subagentAliases.set(alias, runId);
+    return runId;
+  }
+
+  /**
+   * Open a lane the moment anything references the run, even if
+   * `subagent.started` was missed or arrives out of order — a lane that only
+   * ever appears on a perfectly ordered event stream is a lane that silently
+   * vanishes on the day the stream is not perfectly ordered.
+   */
+  function ensureSubagentRun(runId, displayName) {
+    let run = subagentRuns.get(runId);
+    if (!run) {
+      run = { displayName: displayName || 'Subagent', status: 'running', opened: false };
+      subagentRuns.set(runId, run);
+    } else if (displayName && run.displayName === 'Subagent') {
+      run.displayName = displayName;
+    }
+    if (run.opened) return [];
+    run.opened = true;
+    return [{
+      channel: 'subagent',
+      payload: {
+        subagentRunId: runId,
+        // Copilot reports one flat level: `subagent.started` names the parent
+        // TOOL CALL, not a parent agent, so there is no id to nest under. Same
+        // choice the Cursor worker makes.
+        parentSubagentId: null,
+        displayName: run.displayName,
+        status: 'running',
+      },
+    }];
+  }
+
+  function closeSubagentRun(runId, status, displayName) {
+    const actions = ensureSubagentRun(runId, displayName);
+    const run = subagentRuns.get(runId);
+    if (run) run.status = status;
+    actions.push({
+      channel: 'subagent',
+      payload: {
+        subagentRunId: runId,
+        parentSubagentId: null,
+        displayName: run?.displayName || displayName || 'Subagent',
+        status,
+      },
+    });
+    return actions;
   }
 
   function composeText() {
@@ -239,8 +394,8 @@ export function createCopilotEventNormalizer() {
     };
   }
 
-  function activityAction(text) {
-    return { channel: 'activity', payload: { text, subagentRunId: null } };
+  function activityAction(text, subagentRunId = null) {
+    return { channel: 'activity', payload: { text, subagentRunId } };
   }
 
   /**
@@ -251,10 +406,32 @@ export function createCopilotEventNormalizer() {
   function terminalAction({ isError = false, subtype = 'completed', errorMessage = null, errorData = null } = {}) {
     if (terminalEmitted) return [];
     terminalEmitted = true;
-    return [{
+    // A subagent still marked running when the interaction ends would render as
+    // a bubble spinning forever: the relay only reconciles open runs when the
+    // queue row FAILS, so a successful turn has to close its own. Cursor learnt
+    // the same lesson (`activeSubagentRuns` on handle recreation).
+    const strays = [];
+    for (const [runId, run] of subagentRuns) {
+      if (run.status !== 'running') continue;
+      run.status = 'failed';
+      strays.push({
+        channel: 'subagent',
+        payload: {
+          subagentRunId: runId,
+          parentSubagentId: null,
+          displayName: run.displayName,
+          status: 'failed',
+        },
+      });
+    }
+    return [...strays, {
       channel: 'result',
       payload: {
         text: composeText(),
+        // Per-prompt texts, so an interaction that absorbed a steered message
+        // can answer each queue row with the reply that belongs to it.
+        segmentTexts: segments.map((_, index) => segmentText(index)),
+        promptCount: segments.length,
         isError,
         aborted,
         subtype,
@@ -276,15 +453,105 @@ export function createCopilotEventNormalizer() {
     const type = String(event.type || '');
     const data = event.data && typeof event.data === 'object' ? event.data : {};
 
-    // Belt and braces against subagent prose merging into the main reply or
-    // the main thinking bubble. The runtime forwards subagent streaming by
-    // default and the flag that suppresses it also breaks parent streaming
-    // (see `isSubagentEvent`), so the assistant/reasoning channels drop
-    // agentId-tagged events outright. Everything else — tools, permissions,
-    // usage, terminators — is session-scoped and stays.
-    if (isSubagentEvent(event) && type.startsWith('assistant.')) return [];
+    // ---- subagent lifecycle (session-scoped, tagged with the subagent's id) --
+    switch (type) {
+      case 'subagent.started': {
+        const runId = resolveSubagentRun(event, { useToolCallId: true });
+        if (!runId) return [];
+        return ensureSubagentRun(runId, subagentDisplayName(data));
+      }
+      case 'subagent.configured':
+      case 'subagent.selected': {
+        // `subagent.configured` is UNDOCUMENTED — it appears in no published
+        // schema and a live probe found it between started and completed,
+        // carrying `agentId` but neither `toolCallId` nor a display name. It is
+        // handled rather than ignored so the lane still opens if it ever
+        // arrives first, and it must never clobber the roster's display name
+        // with its own absent one (hence the `||` in ensureSubagentRun).
+        const runId = resolveSubagentRun(event, { useToolCallId: true });
+        if (!runId) return [];
+        return ensureSubagentRun(runId, subagentDisplayName(data));
+      }
+      case 'subagent.completed': {
+        const runId = resolveSubagentRun(event, { useToolCallId: true });
+        if (!runId) return [];
+        const actions = closeSubagentRun(runId, 'completed', subagentDisplayName(data));
+        const stats = formatSubagentStats(data);
+        if (stats) actions.push(activityAction(truncate(`Finished · ${stats}`), runId));
+        return actions;
+      }
+      case 'subagent.failed': {
+        const runId = resolveSubagentRun(event, { useToolCallId: true });
+        if (!runId) return [];
+        const name = subagentDisplayName(data);
+        const reason = String(data.error || '').trim() || 'unknown error';
+        const actions = closeSubagentRun(runId, 'failed', name);
+        actions.push(activityAction(truncate(`Subagent failed: ${reason}`), runId));
+        // ALSO on the main thread. The parent agent recovers from a failed
+        // subagent silently — it just carries on — so a failure reported only
+        // inside a collapsed lane bubble is a failure the user never learns
+        // about. This is the line that makes it visible.
+        actions.push(activityAction(truncate(`Subagent failed (${name}): ${reason}`)));
+        return actions;
+      }
+      case 'subagent.deselected':
+        return [];
+      default:
+        break;
+    }
+
+    // ---- subagent-tagged events → the lane -----------------------------------
+    //
+    // The runtime forwards subagent streaming by default and the flag that
+    // suppresses it also breaks PARENT streaming (see `isSubagentEvent`), so
+    // these are routed here rather than suppressed at the source. Hosted
+    // subagents emit no deltas at all: the whole reply arrives as one tagged
+    // `assistant.message` (live-verified), which is why this publishes it as a
+    // completed stream rather than accumulating.
+    if (isSubagentEvent(event)) {
+      const runId = resolveSubagentRun(event);
+      if (!runId) return [];
+      if (type === 'assistant.message') {
+        const content = String(data.content || '');
+        if (!content.trim()) return [];
+        const actions = ensureSubagentRun(runId);
+        actions.push({
+          channel: 'stream',
+          payload: { text: content, done: true, subagentRunId: runId },
+        });
+        return actions;
+      }
+      if (type === 'tool.execution_start') {
+        const toolName = String(data.toolName || '').trim() || 'tool';
+        const actions = ensureSubagentRun(runId);
+        actions.push(activityAction(formatToolActivityText(toolName, data.arguments), runId));
+        return actions;
+      }
+      if (type === 'assistant.usage') {
+        // Counted toward the turn's spend — a subagent's model call costs real
+        // money — but it must not set the turn's REPORTED model, which is the
+        // main thread's. Subagents can run a different model entirely
+        // (`task`'s `model` override).
+        usage.add(data, { allowModel: false });
+        return [];
+      }
+      // Everything else the subagent emits (deltas, turn_start/end, reasoning,
+      // its own user/system messages) is deliberately dropped: it would
+      // otherwise merge into the main reply or the main thinking bubble.
+      return [];
+    }
 
     switch (type) {
+      // ---- prompt boundary --------------------------------------------------
+      case 'user.message': {
+        // The runtime has started work on a prompt. Opens a new segment so a
+        // message that was steered into this interaction gets its own reply
+        // text. Deliberately NOT gated on segment emptiness: two prompts in a
+        // row with no assistant output between them are still two prompts.
+        segments.push([]);
+        cachedPrefix = null;
+        return [];
+      }
       // ---- session identity -------------------------------------------------
       case 'session.start':
       case 'session.resume': {
@@ -426,12 +693,12 @@ export function createCopilotEventNormalizer() {
           : `Permission ${kind}`))];
       }
       case 'user_input.requested': {
-        // Phase 1 answers these in-band with a "not supported" note (see
-        // copilot-sdk-adapter.mjs); the activity row makes that visible in the
-        // transcript instead of the model silently reporting it was blocked.
+        // The question is forwarded to the relay as a question card; this row
+        // records it in the transcript so the conversation still reads as a
+        // conversation once the card has been answered and dismissed.
         const question = String(data.question || '').trim();
         return [activityAction(truncate(
-          `Copilot asked a question the SDK worker cannot forward yet: ${question || '(no question text)'}`,
+          `Copilot asked: ${question || '(no question text)'}`,
         ))];
       }
 
@@ -482,12 +749,17 @@ export function createCopilotEventNormalizer() {
   return {
     normalize,
     finalStreamText: composeText,
-    // Copilot's subagent lane is visible (`agentId` on the event envelope,
-    // plus `subagent.started` / `subagent.configured` / `subagent.completed`
-    // lifecycle events), but phase 1 only FILTERS it — see `isSubagentEvent`.
-    // Publishing it under real run ids is phase 2's job, and this stays empty
-    // until then rather than reporting runs the relay was never told about.
-    activeSubagentRuns: () => [],
+    segmentText,
+    promptCount: () => segments.length,
+    /**
+     * Runs still marked `running`. The turn runner force-closes these when a
+     * turn dies without reaching its terminator (abort, runtime exit, thrown
+     * exception) — those paths never build a `result`, so the stray-closing in
+     * `terminalAction` cannot run and the bubbles would spin forever.
+     */
+    activeSubagentRuns: () => [...subagentRuns.entries()]
+      .filter(([, run]) => run.status === 'running')
+      .map(([subagentRunId, run]) => ({ subagentRunId, displayName: run.displayName })),
     get model() { return sessionModel; },
   };
 }

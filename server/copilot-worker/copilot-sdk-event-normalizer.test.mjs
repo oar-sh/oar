@@ -180,22 +180,81 @@ test('resume turn: the init action reports the resumed session and its event cou
   assert.equal(result.subtype, 'completed');
 });
 
-test('ask_user turn: the unforwardable question is surfaced as an activity row', () => {
+test('ask_user turn: the question is recorded in the transcript', () => {
+  // The question itself goes to the relay as a question card; this row keeps
+  // the transcript readable once that card has been answered and dismissed.
   const { actions } = run(loadFixture('ask-user-turn'));
   const activities = only(actions, 'activity').map((a) => a.payload.text);
   assert.ok(
-    activities.some((text) => text.startsWith('Copilot asked a question the SDK worker cannot forward yet:')),
+    activities.some((text) => text.startsWith('Copilot asked: ')),
     activities.join(' | '),
   );
   assert.ok(activities.some((text) => text.startsWith('Tool (ask_user):')), activities.join(' | '));
 });
 
-test('no fixture produces a subagent action (the SDK has no attribution yet)', () => {
+test('a turn without subagents produces no subagent actions at all', () => {
   for (const name of ['happy-turn', 'tool-permission-turn', 'ask-user-turn', 'reasoning-turn']) {
     const { actions, normalizer } = run(loadFixture(name));
     assert.equal(only(actions, 'subagent').length, 0, name);
     assert.deepEqual(normalizer.activeSubagentRuns(), []);
   }
+});
+
+test('a subagent inner tool call cannot hijack the run id of a nested subagent', () => {
+  // On a lifecycle event `data.toolCallId` names the call that SPAWNED the
+  // subagent; on any other event it names a call the subagent is MAKING.
+  // Aliasing the latter would make a nested subagent's `started` resolve to its
+  // parent's run — merging its text into the parent lane and closing the
+  // parent's bubble when the child finished.
+  const normalizer = createCopilotEventNormalizer();
+  normalizer.normalize({
+    type: 'subagent.started',
+    agentId: 'parent-agent',
+    data: { agentDisplayName: 'Parent', toolCallId: 'spawn_parent' },
+  });
+  // The parent subagent makes a tool call whose id later spawns a child.
+  normalizer.normalize({
+    type: 'tool.execution_start',
+    agentId: 'parent-agent',
+    data: { toolCallId: 'call_nested', toolName: 'task' },
+  });
+  const childStart = normalizer.normalize({
+    type: 'subagent.started',
+    agentId: 'child-agent',
+    data: { agentDisplayName: 'Child', toolCallId: 'call_nested' },
+  });
+
+  assert.equal(childStart[0].payload.subagentRunId, 'child-agent');
+  assert.equal(childStart[0].payload.displayName, 'Child');
+
+  // Closing the child must leave the parent running.
+  normalizer.normalize({
+    type: 'subagent.completed',
+    agentId: 'child-agent',
+    data: { agentDisplayName: 'Child', toolCallId: 'call_nested' },
+  });
+  assert.deepEqual(normalizer.activeSubagentRuns(), [
+    { subagentRunId: 'parent-agent', displayName: 'Parent' },
+  ]);
+});
+
+test('prompt segments split the interaction on user.message boundaries', () => {
+  // A steered prompt is answered inside the SAME interaction, so the only way
+  // to give its queue row its own reply is to split on the boundaries the
+  // runtime marks as it picks each prompt up.
+  const normalizer = createCopilotEventNormalizer();
+  normalizer.normalize({ type: 'user.message', data: {} });
+  normalizer.normalize({ type: 'assistant.message', data: { messageId: 'm1', content: 'first' } });
+  normalizer.normalize({ type: 'user.message', data: {} });
+  normalizer.normalize({ type: 'assistant.message', data: { messageId: 'm2', content: 'second' } });
+
+  assert.equal(normalizer.promptCount(), 2);
+  assert.equal(normalizer.segmentText(0), 'first');
+  assert.equal(normalizer.segmentText(1), 'second');
+  // A segment the runtime never opened is empty, not a throw.
+  assert.equal(normalizer.segmentText(2), '');
+  // The composed reply is still the whole interaction.
+  assert.equal(normalizer.finalStreamText(), 'first\n\nsecond');
 });
 
 test('a failed tool execution publishes a failure activity naming the tool', () => {
@@ -303,11 +362,11 @@ test('formatToolActivityText degrades without arguments', () => {
   assert.equal(formatToolActivityText('bash', { command: 'x'.repeat(300) }).length, 140);
 });
 
-test('subagent-tagged assistant and reasoning events never reach the main channels', () => {
+test('subagent text goes to the lane and never into the main reply', () => {
   // `agentId` sits on the event ENVELOPE and is absent for the root agent.
   // The runtime forwards subagent streaming by default and the flag that
   // suppresses it also collapses the PARENT's tool-call streaming (verified
-  // against runtime 1.0.82), so the filter has to live here.
+  // against runtime 1.0.82), so the routing has to live here.
   assert.equal(isSubagentEvent({ agentId: 'agent-7' }), true);
   assert.equal(isSubagentEvent({ agentId: '' }), false);
   assert.equal(isSubagentEvent({}), false);
@@ -318,27 +377,108 @@ test('subagent-tagged assistant and reasoning events never reach the main channe
 
   // A subagent's whole inner turn — hosted subagents emit no deltas at all,
   // their text arrives as one agentId-tagged assistant.message.
-  assert.deepEqual(normalizer.normalize({
+  const actions = normalizer.normalize({
     type: 'assistant.message',
     agentId: 'agent-7',
     data: { messageId: 'sub-1', content: 'the subagent private notes' },
-  }), []);
+  });
+  const stream = actions.find((action) => action.channel === 'stream');
+  assert.equal(stream.payload.subagentRunId, 'agent-7');
+  assert.equal(stream.payload.text, 'the subagent private notes');
+
+  // Reasoning stays dropped: it would otherwise merge into the main thinking
+  // bubble, and the lane has no reasoning surface of its own.
   assert.deepEqual(normalizer.normalize({
     type: 'assistant.reasoning_delta',
     agentId: 'agent-7',
     data: { reasoningId: 'sub-r1', deltaContent: 'subagent thinking' },
   }), []);
 
+  // The decisive assertion: none of it reached the reply.
   assert.equal(normalizer.finalStreamText(), 'main answer');
 });
 
-test('subagent lifecycle events — documented or not — are inert, never noisy', () => {
+test('subagent lifecycle drives the lane, and the undocumented event is tolerated', () => {
   const normalizer = createCopilotEventNormalizer();
-  for (const type of ['subagent.started', 'subagent.configured', 'subagent.completed', 'subagent.failed']) {
-    // `subagent.configured` is undocumented (in no published schema) and was
-    // only found by a live probe: an unknown event type must be ordinary.
-    assert.deepEqual(normalizer.normalize({ type, agentId: 'agent-7', data: { agentName: 'explorer' } }), [], type);
-  }
+  const started = normalizer.normalize({
+    type: 'subagent.started',
+    agentId: 'agent-7',
+    data: { agentDisplayName: 'Explorer', agentName: 'explore', toolCallId: 'call_1' },
+  });
+  assert.deepEqual(started, [{
+    channel: 'subagent',
+    payload: {
+      subagentRunId: 'agent-7', parentSubagentId: null, displayName: 'Explorer', status: 'running',
+    },
+  }]);
+
+  // `subagent.configured` is undocumented (in no published schema) and was only
+  // found by a live probe. It carries `agentId` but no display name, and must
+  // neither open a duplicate lane nor blank the name the roster already has.
+  assert.deepEqual(normalizer.normalize({ type: 'subagent.configured', agentId: 'agent-7', data: {} }), []);
+
+  const completed = normalizer.normalize({
+    type: 'subagent.completed',
+    agentId: 'agent-7',
+    data: { agentDisplayName: 'Explorer', toolCallId: 'call_1', totalTokens: 1200, totalToolCalls: 3, durationMs: 8100 },
+  });
+  assert.equal(completed[0].payload.status, 'completed');
+  assert.equal(completed[0].payload.displayName, 'Explorer');
+  // Stats ride an activity row inside the lane.
+  assert.equal(completed[1].payload.subagentRunId, 'agent-7');
+  assert.match(completed[1].payload.text, /1200 tokens · 3 tool calls · 8\.1s/);
+
+  assert.deepEqual(normalizer.activeSubagentRuns(), []);
+});
+
+test('a failed subagent is reported on the main thread, not just inside its lane', () => {
+  // The parent agent recovers from a failed subagent silently — it just carries
+  // on — so a failure visible ONLY in a collapsed lane bubble is a failure the
+  // user never learns about.
+  const normalizer = createCopilotEventNormalizer();
+  normalizer.normalize({
+    type: 'subagent.started',
+    agentId: 'agent-9',
+    data: { agentDisplayName: 'Researcher', toolCallId: 'call_2' },
+  });
+  const failed = normalizer.normalize({
+    type: 'subagent.failed',
+    agentId: 'agent-9',
+    data: { agentDisplayName: 'Researcher', toolCallId: 'call_2', error: 'tool budget exhausted' },
+  });
+
+  assert.equal(failed[0].payload.status, 'failed');
+  const laneNote = failed.find((a) => a.channel === 'activity' && a.payload.subagentRunId === 'agent-9');
+  assert.match(laneNote.payload.text, /tool budget exhausted/);
+  const mainNote = failed.find((a) => a.channel === 'activity' && a.payload.subagentRunId === null);
+  assert.match(mainNote.payload.text, /Subagent failed \(Researcher\): tool budget exhausted/);
+});
+
+test('a subagent still running when the turn ends is closed, not left spinning', () => {
+  // The relay only reconciles open runs when the queue row FAILS, so a
+  // successful turn has to close its own or the bubble spins forever.
+  const normalizer = createCopilotEventNormalizer();
+  normalizer.normalize({ type: 'subagent.started', agentId: 'agent-3', data: { agentDisplayName: 'Stray' } });
+  assert.deepEqual(normalizer.activeSubagentRuns(), [{ subagentRunId: 'agent-3', displayName: 'Stray' }]);
+
+  const actions = normalizer.normalize({ type: 'session.idle', data: {} });
+  const closed = actions.find((a) => a.channel === 'subagent');
+  assert.equal(closed.payload.subagentRunId, 'agent-3');
+  assert.equal(closed.payload.status, 'failed');
+  assert.equal(actions.at(-1).channel, 'result');
+});
+
+test('a subagent tool call is attributed to the lane, not the main activity feed', () => {
+  const normalizer = createCopilotEventNormalizer();
+  normalizer.normalize({ type: 'subagent.started', agentId: 'agent-4', data: { agentDisplayName: 'Helper' } });
+  const actions = normalizer.normalize({
+    type: 'tool.execution_start',
+    agentId: 'agent-4',
+    data: { toolCallId: 'c9', toolName: 'grep', arguments: { pattern: 'needle' } },
+  });
+  const activity = actions.find((a) => a.channel === 'activity');
+  assert.equal(activity.payload.subagentRunId, 'agent-4');
+  assert.equal(activity.payload.text, 'Tool (grep): needle');
 });
 
 test('an empty authoritative assistant.message does not wipe the accumulated deltas', () => {

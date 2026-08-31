@@ -15,7 +15,8 @@ import {
   classifyCopilotSessionError,
   classifyCopilotTurnException,
   copilotAgentModeForRelayMode,
-  copilotPermissionDecision,
+  createCopilotPermissionHandler,
+  isReadOnlyPermissionRequest,
   isSessionNotFoundError,
   observeRuntimeExit,
   resolveCopilotSdkPaths,
@@ -23,6 +24,20 @@ import {
 } from './copilot-sdk-adapter.mjs';
 import { buildCopilotMessageOptions } from './copilot-attachments.mjs';
 import { createCopilotEventNormalizer } from './copilot-sdk-event-normalizer.mjs';
+import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
+import {
+  EXIT_PLAN_BOARD_POSTED_FEEDBACK,
+  EXIT_PLAN_NO_BOARD_FEEDBACK,
+  buildCopilotPlanReadyBoardPayload,
+  planTextFromExitRequest,
+  shouldPostPlanBoard,
+} from './copilot-plan-board.mjs';
+import {
+  createCopilotPromptContextBuilder,
+  createPreviewInstructionsProvider,
+  loadDefaultRelayToolInstructions,
+  withRelayContext,
+} from './copilot-prompt-context.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 
 // How long the runtime may sit with no session activity before the worker
@@ -48,6 +63,38 @@ export const RUNTIME_INTERRUPTED_NOTE =
   'System note: the Copilot runtime interrupted this turn before it finished. '
   + 'Resend the message to continue.';
 
+/**
+ * Published to a steered queue row whose prompt the runtime accepted but never
+ * opened work on before the interaction ended. The prompt is still queued
+ * INSIDE the runtime, so it will be answered at the start of the next turn —
+ * requeuing the row would run it twice. Mirrors the Claude worker's
+ * handed-off-context note, which exists for the same reason.
+ */
+export const STEERED_ROW_MERGED_NOTE =
+  '_(This message was delivered while the previous turn was still running; the reply continues in '
+  + 'the next turn.)_';
+
+/**
+ * Compaction / infinite-session policy.
+ *
+ * These are the runtime's OWN documented defaults for `InfiniteSessionConfig`
+ * (enabled, background compaction at 0.80 of the context window, blocking
+ * compaction at 0.95) — they are set explicitly rather than left unset so a
+ * future change to the runtime's defaults cannot silently move the point at
+ * which a long relay conversation starts compacting. Compaction is what makes
+ * a resumable, long-lived relay conversation possible at all: the alternative
+ * is a turn that fails on context overflow with the whole history intact and
+ * no way forward.
+ */
+export const DEFAULT_INFINITE_SESSION_CONFIG = Object.freeze({
+  enabled: true,
+  backgroundCompactionThreshold: 0.8,
+  bufferExhaustionThreshold: 0.95,
+});
+
+/** `steerIntoActiveTurn` could not adopt the row; run it as a normal turn. */
+const NOT_STEERED = Symbol('not-steered');
+
 export function createCopilotSdkSessionRunner({
   api,
   sdkSessionId,
@@ -63,10 +110,26 @@ export function createCopilotSdkSessionRunner({
   startClientImpl = startCopilotClient,
   createNormalizerImpl = createCopilotEventNormalizer,
   buildMessageOptionsImpl = buildCopilotMessageOptions,
-  // Threading seam for `MessageOptions.mode` ("enqueue" | "immediate"). Phase 1
-  // sends without a mode (the runtime default); phase 2 probes steering and
-  // returns a mode from here without touching the send path.
-  resolveSendModeImpl = () => '',
+  // Threading seam for `MessageOptions.mode` ("enqueue" | "immediate").
+  //
+  // A BYOK probe against runtime 1.0.82 ran a mid-turn send three ways —
+  // "enqueue", "immediate" and unset — and all three behaved IDENTICALLY: the
+  // send resolves in ~2ms with a message id, the prompt is queued
+  // (`pending_messages.modified`), the in-flight model call runs to completion
+  // untouched, and the prompt is picked up at the NEXT model-call boundary with
+  // its own `user.message`. Neither mode interrupts anything. "enqueue" is the
+  // documented default and preserves FIFO order, which is what the relay queue
+  // contract wants, so it is what this sends. See §5 of the plan doc.
+  resolveSendModeImpl = () => 'enqueue',
+  // Interactive surfaces. Tests inject a fake bridge; nothing here reaches the
+  // relay without one.
+  createQuestionBridgeImpl = createCopilotQuestionBridge,
+  questionPollMs = undefined,
+  questionTimeoutMs = undefined,
+  // Preview-lane guidance. Advisory — a failure costs the block, not the turn.
+  relayToolInstructions = undefined,
+  getPreviewInstructionsImpl = undefined,
+  infiniteSessionConfig = DEFAULT_INFINITE_SESSION_CONFIG,
   idleShutdownMs = DEFAULT_IDLE_SHUTDOWN_MS,
   lifecyclePollMs = DEFAULT_LIFECYCLE_POLL_MS,
   // 0 disables (matching the background-task timeout's 0 = no-limit
@@ -87,6 +150,52 @@ export function createCopilotSdkSessionRunner({
   let starting = null;
   let disposed = false;
   let detachRuntimeExit = () => {};
+  // Prompts this worker sent that the runtime accepted but had not started work
+  // on when the interaction ended. They stay in the runtime's pending queue and
+  // are picked up FIRST in the next interaction, ahead of that turn's own
+  // prompt — so the next turn's segments are shifted by this many, and without
+  // it the primary row would be answered with a leftover prompt's reply.
+  let carriedPrompts = 0;
+  // Blocking handlers currently waiting on a human (`ask_user`, an ask-mode
+  // tool approval). The runtime emits NO events while blocked in one, and the
+  // question timeout is 8 hours against a 120s stall ceiling — so without this
+  // every unanswered card would fail its row after two minutes and then hand
+  // the human's eventual answer to a runtime whose row is already settled.
+  // Same guard the Cursor worker's `hasPendingClientWork` provides.
+  let pendingHumanRequests = 0;
+
+  async function whileAwaitingHuman(run) {
+    pendingHumanRequests += 1;
+    try {
+      return await run();
+    } finally {
+      pendingHumanRequests -= 1;
+      // The clock restarts from the answer, not from before the wait.
+      touch();
+      activeTurn?.armStall?.();
+    }
+  }
+
+  // The relay question bridge serves `ask_user` and (in ask mode) tool
+  // approvals. `getActiveMessage` must resolve to the row that is CURRENTLY
+  // `processing`, because `/api/relay-question` 409s otherwise.
+  const questionBridge = createQuestionBridgeImpl({
+    api,
+    sdkSessionId,
+    getActiveMessage: () => activeTurn?.message || null,
+    ...(questionPollMs === undefined ? {} : { questionPollMs }),
+    ...(questionTimeoutMs === undefined ? {} : { questionTimeoutMs }),
+    dbg,
+  });
+
+  const buildRelayContextPrefix = createCopilotPromptContextBuilder({
+    toolInstructions: relayToolInstructions === undefined
+      ? loadDefaultRelayToolInstructions({ env })
+      : relayToolInstructions,
+    getPreviewInstructions: getPreviewInstructionsImpl === undefined
+      ? createPreviewInstructionsProvider({ api })
+      : getPreviewInstructionsImpl,
+  });
   // Every event is handled on one chain so the relay POSTs for a turn land in
   // the order the runtime produced them; the SDK's callback is synchronous and
   // would otherwise interleave awaits.
@@ -144,10 +253,46 @@ export function createCopilotSdkSessionRunner({
     }
     if (channel === 'activity') {
       await postActivity(message, payload.text, payload.subagentRunId);
+      return;
     }
-    // The `subagent` channel has no producer in phase 1 — the normalizer
-    // filters the subagent lane rather than publishing it. Phase 2 adds the
-    // publisher and the channel together.
+    if (channel === 'subagent') {
+      // Same body as every sibling worker's, so the lane bubbles, the
+      // `subagent_status` broadcast and the UI's grouping behave identically
+      // whichever provider produced the run.
+      await api('POST', '/api/subagent-run', {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        subagentRunId: payload.subagentRunId,
+        ...(payload.parentSubagentId ? { parentSubagentId: payload.parentSubagentId } : {}),
+        ...(payload.displayName ? { displayName: payload.displayName } : {}),
+        status: payload.status,
+      }).catch(() => {});
+    }
+  }
+
+  /**
+   * Force-close any subagent still marked running.
+   *
+   * The normalizer closes strays when it builds a terminal `result`, but the
+   * paths that kill a turn WITHOUT one — a user abort, the runtime exiting, a
+   * thrown exception — never get there. The relay only reconciles open runs
+   * when the queue row is FAILED, so on the abort path (where the row is
+   * settled server-side) an un-closed run would render as a bubble spinning
+   * forever.
+   */
+  async function closeStraySubagentRuns(turn) {
+    const runs = turn?.normalizer?.activeSubagentRuns?.() || [];
+    for (const run of runs) {
+      await dispatchAction(turn.message, {
+        channel: 'subagent',
+        payload: {
+          subagentRunId: run.subagentRunId,
+          parentSubagentId: null,
+          displayName: run.displayName,
+          status: 'failed',
+        },
+      }, turn.state);
+    }
   }
 
   async function publishFinalStream(message, text) {
@@ -210,11 +355,18 @@ export function createCopilotSdkSessionRunner({
       model: lastTurnUsage.model,
       inputTokens: usage?.inputTokens ?? null,
       outputTokens: usage?.outputTokens ?? null,
+      // The premium MULTIPLIER, not money.
       cost: usage?.cost ?? null,
+      // Real spend, and the field a usage card should show.
+      totalNanoAiu: usage?.totalNanoAiu ?? null,
       modelCalls: usage?.modelCalls ?? null,
+      subagentModelCalls: usage?.subagentModelCalls ?? null,
       timeToFirstTokenMs: usage?.timeToFirstTokenMs ?? null,
       contextTokens: contextUsage?.currentTokens ?? null,
+      // Overage lives at `quotaSnapshots.cfi_overage`; `account.getQuota()`
+      // reads a stale cache and will not show it.
       hasQuotaSnapshots: !!usage?.quotaSnapshots,
+      cfiOverage: usage?.quotaSnapshots?.cfi_overage ?? null,
     }));
   }
 
@@ -250,6 +402,23 @@ export function createCopilotSdkSessionRunner({
   }
 
   function buildSessionConfig(model, relayMode) {
+    // Built once per session, not per request. Reads the mode off the LIVE turn
+    // rather than closing over the one the session was built with, because one
+    // session serves every turn and the user can switch modes between them.
+    const decidePermission = createCopilotPermissionHandler({
+      // Only the ask-mode branch actually blocks on a human; wrapping it keeps
+      // the stall watchdog off a turn where someone is deciding.
+      bridge: {
+        askToolApproval: (permissionRequest, options) => whileAwaitingHuman(
+          () => questionBridge.askToolApproval(permissionRequest, options),
+        ),
+      },
+      getRelayMode: () => activeTurn?.message?.relayMode || relayMode,
+      // An aborted turn must not leave the human staring at a card whose answer
+      // nothing will read; the bridge times the card out instead.
+      getSignal: () => activeTurn?.abortController?.signal || null,
+      dbg,
+    });
     return {
       // The relay session id IS the SDK session id, so the runtime's own state
       // under ~/.copilot/session-state/<id> is addressable by conversation and
@@ -261,24 +430,82 @@ export function createCopilotSdkSessionRunner({
       streaming: true,
       workingDirectory: cwd,
       clientName,
+      // The runtime's own defaults, pinned. See DEFAULT_INFINITE_SESSION_CONFIG.
+      ...(infiniteSessionConfig ? { infiniteSessions: { ...infiniteSessionConfig } } : {}),
       onEvent: routeEvent,
-      // Permission policy follows the conversation's relay mode, mirroring
-      // what `permissionModeForRelayMode` enforces in the Claude worker: plan
-      // and ask modes may read but must not act. The handler reads the mode
-      // from the LIVE turn rather than closing over the mode the session was
-      // built with, because one session serves every turn of a conversation
+      // Permission policy follows the conversation's relay mode: agent and
+      // autopilot auto-approve, plan denies non-read tools with feedback, and
+      // ask asks the human through a relay question card. The handler reads the
+      // mode from the LIVE turn rather than closing over the mode the session
+      // was built with, because one session serves every turn of a conversation
       // and the user can switch modes between them.
-      onPermissionRequest: (request) => copilotPermissionDecision(
-        activeTurn?.message?.relayMode || relayMode,
-        request,
-      ),
-      // Stubs that settle rather than hang: the runtime blocks the turn on
-      // these handlers, so a missing implementation has to answer, not throw.
-      // `wasFreeform` is required by `UserInputResponse` and the runtime's
-      // deserializer is strict — omitting it fails the tool call silently.
-      onUserInputRequest: async () => ({ answer: USER_INPUT_UNSUPPORTED_ANSWER, wasFreeform: true }),
+      onPermissionRequest: async (request) => {
+        const decision = await decidePermission(request);
+        // Remember that this turn actually changed something: it is what tells
+        // a described plan apart from work already done, which is the
+        // difference between a useful handoff board and a nonsensical one.
+        if (decision?.kind === 'approve-once' && !isReadOnlyPermissionRequest(request) && activeTurn) {
+          activeTurn.acted = true;
+        }
+        return decision;
+      },
+      // `ask_user` → a relay question card. The runtime BLOCKS the turn on this
+      // handler, so it must always settle: a throw would fail the tool call
+      // silently, and a hang would hold the queue row until the delivery
+      // watchdog gives up. `wasFreeform` is required by `UserInputResponse` and
+      // the deserializer is strict, so it is always a real boolean.
+      onUserInputRequest: async (request) => {
+        try {
+          const { answer, wasFreeform } = await whileAwaitingHuman(() => questionBridge.askUserInput(request, {
+            signal: activeTurn?.abortController?.signal || null,
+          }));
+          return { answer, wasFreeform };
+        } catch (error) {
+          dbg('user input question failed', error?.message || String(error));
+          return { answer: USER_INPUT_UNSUPPORTED_ANSWER, wasFreeform: true };
+        }
+      },
+      // The agent finished planning. Post the board and REFUSE the exit:
+      // approving it tells the runtime the plan was accepted and the same turn
+      // rolls straight into implementing while the board sits unanswered.
+      onExitPlanModeRequest: async (request) => {
+        const posted = await publishPlanBoard(activeTurn, planTextFromExitRequest(request), 'exit_plan_mode');
+        return {
+          approved: false,
+          feedback: posted ? EXIT_PLAN_BOARD_POSTED_FEEDBACK : EXIT_PLAN_NO_BOARD_FEEDBACK,
+        };
+      },
+      // Structured elicitation has no relay card type of its own; declining is
+      // in-band and lets the model continue, which a hang would not.
       onElicitationRequest: () => ({ action: 'decline' }),
     };
+  }
+
+  /**
+   * Post the `plan_ready` board for a turn. Returns whether a board went out,
+   * which the exit-plan handler turns into the feedback the agent sees.
+   *
+   * Marks the turn so the completion path's text-shape fallback does not post a
+   * second board — the relay would dedupe it (`UNIQUE(message_id, board_type)`)
+   * but only after a pointless round trip.
+   */
+  async function publishPlanBoard(turn, planText, source) {
+    if (!turn?.message?.id) return false;
+    const payload = buildCopilotPlanReadyBoardPayload({ message: turn.message, planText, source });
+    if (!payload) return false;
+    // The failure is swallowed (a relay that refused the board must not fail a
+    // turn that otherwise succeeded) but it is REPORTED: telling the agent the
+    // plan is "shown to the user for review" when it is not would end the turn
+    // with the plan visible nowhere, and would also latch off the text-shape
+    // fallback that could still have posted it.
+    try {
+      await api('POST', '/api/relay-board', payload);
+    } catch (error) {
+      dbg('plan board publish failed', error?.message || String(error));
+      return false;
+    }
+    turn.planBoardPosted = true;
+    return true;
   }
 
   /**
@@ -408,7 +635,9 @@ export function createCopilotSdkSessionRunner({
   // -------------------------------------------------------------- lifecycle --
 
   function evaluateLifecycle() {
-    if (disposed || activeTurn || !client) return;
+    // A pending question card means a human is mid-answer; tearing the runtime
+    // down under them would discard the session the answer belongs to.
+    if (disposed || activeTurn || pendingHumanRequests > 0 || !client) return;
     if (!(idleShutdownMs > 0)) return;
     if (Date.now() - lastActivityAt < idleShutdownMs) return;
     void stopRuntime('idle').catch(() => {});
@@ -443,6 +672,33 @@ export function createCopilotSdkSessionRunner({
       settled: false,
       aborted: false,
       stallTimer: null,
+      planBoardPosted: false,
+      // Set when a mutating tool was actually approved and run this turn.
+      acted: false,
+      // How many prompts have been SENT into this interaction. The runtime
+      // consumes queued prompts in order, and opens one `user.message` segment
+      // per prompt as it picks each up, so send order IS segment order.
+      //
+      // Deliberately not derived from the normalizer's live segment count: at
+      // the moment a steering send happens the runtime may not have opened the
+      // previous prompt's segment yet, and the steered row would then be
+      // attributed the PREVIOUS prompt's answer.
+      //
+      // Starts at 1, not 0: this turn's own prompt is always its first, and
+      // counting it here rather than after `send()` resolves closes the race
+      // where a steering delivery lands between the two.
+      promptsSent: 1,
+      // The segment this turn's OWN prompt will be answered in. Non-zero when a
+      // previous interaction left prompts queued inside the runtime: those are
+      // consumed first and open the earlier segments.
+      baseSegment: carriedPrompts,
+      // Cancels any relay question card this turn is blocked on, so an aborted
+      // turn does not leave a human answering into the void.
+      abortController: new AbortController(),
+      // Queue rows delivered mid-turn and steered into this interaction. Each
+      // one is owed a response by THIS turn — the runtime answers them all
+      // under a single `session.idle`, so nothing else will settle them.
+      steeredRows: [],
     };
     turn.done = new Promise((resolve, reject) => {
       turn.resolveDone = resolve;
@@ -475,6 +731,13 @@ export function createCopilotSdkSessionRunner({
       if (!(turnStallTimeoutMs > 0) || turn.settled) return;
       turn.disarmStall();
       turn.stallTimer = setTimeout(() => {
+        // A human staring at a question card is not a stalled runtime. Re-arm
+        // rather than fail: the card has its own (much longer) timeout, and
+        // failing the row here would settle it while the answer is still coming.
+        if (pendingHumanRequests > 0) {
+          turn.armStall();
+          return;
+        }
         turn.fail(new Error(
           `copilot worker watchdog: the runtime produced no events for ${Math.round(turnStallTimeoutMs / 1000)}s; `
           + 'the row is failed — resend the message to retry',
@@ -523,7 +786,11 @@ export function createCopilotSdkSessionRunner({
       } else {
         turn.armStall();
         const sendMode = String(resolveSendModeImpl(message) || '').trim();
-        const { prompt, attachments } = buildMessageOptionsImpl(message);
+        const { prompt: body, attachments } = buildMessageOptionsImpl(message);
+        // Relay mode marker + (on a mode change) the standing mode instructions,
+        // the relay tool guidance and the live preview-lane block.
+        const prefix = await buildRelayContextPrefix(message).catch(() => '');
+        const prompt = withRelayContext(prefix, body);
         // `mode` and `attachments` are FIELDS of the single MessageOptions
         // argument — `send()` takes no second parameter, so passing options
         // positionally drops them silently.
@@ -540,14 +807,33 @@ export function createCopilotSdkSessionRunner({
     } finally {
       controlPoller?.stop?.(controlState);
       turn.disarmStall();
+      // Release anything blocked on a question card before the turn's state is
+      // read: the card's answer can no longer reach the runtime.
+      turn.abortController.abort();
       // Drain in-flight dispatches before the turn's state is read, so a
       // stream POST cannot land after the response.
       await dispatchChain.catch(() => {});
+      // Any subagent still open at this point never will be. The normalizer
+      // closes strays when it produces a terminal result; these are the paths
+      // that never produced one.
+      await closeStraySubagentRuns(turn).catch(() => {});
     }
 
     const result = turn.result;
     const responseModel = result?.model || turn.normalizer.model || model || null;
     captureTurnUsage(message, result);
+
+    // Whatever this interaction did not get to stays queued in the runtime and
+    // shifts the NEXT interaction's segments.
+    const segmentsOpened = turn.normalizer.promptCount();
+    carriedPrompts = Math.max(0, (turn.baseSegment + turn.promptsSent) - segmentsOpened);
+
+    // This row's own reply. Falls back to the whole composed text when the
+    // runtime opened no segment at all (an empty or immediately-failed turn),
+    // which is strictly better than publishing nothing.
+    const ownText = String(
+      turn.normalizer.segmentText(turn.baseSegment) || result?.text || turn.state.lastStreamedText || '',
+    ).trim();
 
     // A user-initiated abort publishes the partial text and nothing else: the
     // queue row's fate belongs to the server-side abort control, exactly as in
@@ -555,7 +841,13 @@ export function createCopilotSdkSessionRunner({
     // double-settle the row.
     if (turn.aborted) {
       dbg('turn aborted', message.id);
-      await publishFinalStream(message, result?.text || turn.state.lastStreamedText);
+      // This row's segment only: the steered rows publish their own, and
+      // publishing the composed text here would show their replies twice.
+      await publishFinalStream(message, ownText);
+      // A steered row is NOT covered by the abort control (which knows only
+      // about the row the user aborted), so it still has to be settled here or
+      // it holds `processing` forever behind a renewing lease.
+      await settleSteeredRows(turn, result, responseModel);
       return true;
     }
 
@@ -566,10 +858,10 @@ export function createCopilotSdkSessionRunner({
     // settled with a record that says what actually happened.
     if (result?.aborted) {
       dbg('turn interrupted by the runtime', message.id);
-      const partial = String(result?.text || turn.state.lastStreamedText || '').trim();
-      const text = partial ? `${partial}\n\n${RUNTIME_INTERRUPTED_NOTE}` : RUNTIME_INTERRUPTED_NOTE;
+      const text = ownText ? `${ownText}\n\n${RUNTIME_INTERRUPTED_NOTE}` : RUNTIME_INTERRUPTED_NOTE;
       await publishFinalStream(message, text);
       await publishResponse(message, { text, model: responseModel });
+      await settleSteeredRows(turn, result, responseModel);
       return true;
     }
 
@@ -582,22 +874,158 @@ export function createCopilotSdkSessionRunner({
         model: responseModel,
         terminalError: terminalErrorRecord(message, classified),
       });
+      // The steered rows failed with it — they were being answered by the same
+      // interaction. They get the same terminal record so each row says why.
+      await settleSteeredRows(turn, result, responseModel, classified);
       return true;
+    }
+
+    // The turn produced a plan but never called exit-plan-mode (or the runtime
+    // build has no such hook). Same text-shape fallback the siblings use, and
+    // it must go out BEFORE the response: `/api/relay-board` 409s once the
+    // queue row leaves `processing`.
+    if (shouldPostPlanBoard({
+      relayMode: message.relayMode,
+      finalText: ownText,
+      alreadyPosted: turn.planBoardPosted,
+      acted: turn.acted === true,
+    })) {
+      await publishPlanBoard(turn, ownText, 'plan-mode-fallback');
     }
 
     // A terminal, non-error turn with no prose is COMPLETE, not a failed
     // delivery — requeuing re-runs deterministically empty work until the
     // retry cap fails the row with a misleading "Relay timeout".
-    const finalText = String(result?.text || turn.state.lastStreamedText || '').trim();
-    const publishedText = finalText || EMPTY_TURN_COMPLETION_NOTE;
+    const publishedText = ownText || EMPTY_TURN_COMPLETION_NOTE;
     await publishFinalStream(message, publishedText);
     await publishResponse(message, { text: publishedText, model: responseModel });
+    await settleSteeredRows(turn, result, responseModel);
+    return true;
+  }
+
+  /**
+   * Settle every queue row that was steered into this interaction.
+   *
+   * The runtime answers the original prompt AND every prompt queued behind it
+   * under ONE `session.idle` (live-verified — see the plan doc §5), so no
+   * second turn will ever settle these rows. Each one is answered with the text
+   * of ITS OWN prompt segment, which the normalizer separates using the
+   * `user.message` events that mark where the runtime picked each prompt up.
+   *
+   * A row whose prompt the runtime accepted but never started work on has no
+   * segment. It is NOT requeued: the prompt is still sitting in the runtime's
+   * pending queue and will be answered at the start of the next turn, so
+   * redelivering it would run the same prompt twice. It gets a note instead —
+   * the same trade the Claude worker makes for a handed-off context.
+   */
+  async function settleSteeredRows(turn, result, responseModel, classified = null) {
+    if (!turn.steeredRows.length) return;
+    for (const steered of turn.steeredRows) {
+      const { message: steeredMessage, segmentIndex } = steered;
+      let text = String(turn.normalizer.segmentText(segmentIndex) || '').trim();
+      if (classified) {
+        text = classified.text;
+      } else if (!text) {
+        text = STEERED_ROW_MERGED_NOTE;
+      }
+      await publishFinalStream(steeredMessage, text);
+      await publishResponse(steeredMessage, {
+        text,
+        model: responseModel,
+        ...(classified ? { terminalError: terminalErrorRecord(steeredMessage, classified) } : {}),
+      });
+      steered.settle?.();
+    }
+    turn.steeredRows.length = 0;
+  }
+
+  /**
+   * A delivery arrived while a turn was already running.
+   *
+   * The relay's worker socket is single-flight — it will not deliver a second
+   * row until `onDeliver` resolves — so this is not the normal path. It is
+   * reachable on a socket reconnect that redelivers, and it is the path a
+   * future relay change would take, so it steers rather than corrupting the
+   * turn: the prompt is queued into the SAME interaction (which is all
+   * `mode: "enqueue"` can do — it cannot interrupt an in-flight model call),
+   * and the row is adopted so the interaction's terminator settles it too.
+   *
+   * The row is registered BEFORE the send so a failure between the two cannot
+   * leave a row nobody owns.
+   */
+  async function steerIntoActiveTurn(turn, message) {
+    const { prompt: body, attachments } = buildMessageOptionsImpl(message);
+    // A real relay round trip on the first turn of a mode — long enough for the
+    // turn to finish underneath us.
+    const prefix = await buildRelayContextPrefix(message).catch(() => '');
+    const prompt = withRelayContext(prefix, body);
+    // Re-checked AFTER the awaits and before anything is sent or registered.
+    // `settleSteeredRows` has already run if the turn settled during them, so a
+    // row pushed now would never be settled and its caller would wait forever —
+    // wedging the single-flight delivery socket. Nothing has been sent yet, so
+    // handing the row back to the normal path is free.
+    if (turn.settled) {
+      dbg('turn settled while steering was preparing; running it as a fresh turn', message.id);
+      return NOT_STEERED;
+    }
+    // Prompts are consumed in the order they were sent, and each opens its own
+    // `user.message` segment as it is picked up, so this prompt's send position
+    // (after any prompts carried over from a previous interaction) is its
+    // segment index.
+    const segmentIndex = turn.baseSegment + turn.promptsSent;
+    turn.promptsSent += 1;
+    const steered = { message, segmentIndex };
+    steered.done = new Promise((resolve) => { steered.settle = resolve; });
+    turn.steeredRows.push(steered);
+    dbg('steering a mid-turn delivery into the running turn', message.id, `segment=${segmentIndex}`);
+    try {
+      await session.send({
+        prompt,
+        ...(attachments?.length ? { attachments } : {}),
+        mode: 'enqueue',
+        agentMode: copilotAgentModeForRelayMode(message?.relayMode || 'agent'),
+      });
+    } catch (error) {
+      // The prompt never reached the runtime, so nothing will answer it and the
+      // row is safe to requeue — unlike an accepted one.
+      turn.steeredRows = turn.steeredRows.filter((entry) => entry !== steered);
+      dbg('steering send failed, requeuing the row', message.id, error?.message || String(error));
+      await api('POST', '/api/requeue', { messageId: message.id }).catch(() => {});
+      return true;
+    }
+    // Resolves when the interaction settles this row in `settleSteeredRows`.
+    await steered.done;
     return true;
   }
 
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
+    // A delivery that lands while a turn is running is steered into it rather
+    // than starting a second one: the runtime has a single conversation and a
+    // concurrent `send` would interleave into the same interaction anyway —
+    // this way the row is owned and settled instead of orphaned.
+    //
+    // Deliberately OUTSIDE the try/finally below: that `finally` clears
+    // `activeTurn`, and a steered call returns while the turn it was steered
+    // into is still publishing. Clearing there would tell the heartbeat this
+    // worker owns nothing and the relay would recover the live row.
+    if (activeTurn && !activeTurn.settled && session) {
+      const turn = activeTurn;
+      try {
+        const outcome = await steerIntoActiveTurn(turn, message);
+        if (outcome !== NOT_STEERED) return outcome;
+      } catch (error) {
+        dbg('steering failed', message.id, error?.message || String(error));
+        const classified = classifyCopilotTurnException(error);
+        await publishResponse(message, {
+          text: classified.text,
+          model: null,
+          terminalError: terminalErrorRecord(message, classified),
+        });
+        return true;
+      }
+    }
     try {
       return await runTurn(message);
     } catch (error) {
@@ -612,6 +1040,14 @@ export function createCopilotSdkSessionRunner({
         model: null,
         terminalError: terminalErrorRecord(message, classified),
       });
+      // Rows steered into the turn that just threw are owed a response too —
+      // and, more urgently, `steerIntoActiveTurn` is still awaiting their
+      // settle. Skipping this would wedge that caller (and its queue row)
+      // forever behind a heartbeat that keeps renewing the lease.
+      if (activeTurn) {
+        await settleSteeredRows(activeTurn, null, null, classified).catch(() => {});
+        await closeStraySubagentRuns(activeTurn).catch(() => {});
+      }
       return true;
     } finally {
       // Cleared only once every publish for this row has landed. A heartbeat
@@ -630,14 +1066,32 @@ export function createCopilotSdkSessionRunner({
     return activeTurn ? String(activeTurn.message?.id || '') : '';
   }
 
+  /**
+   * Every row this worker owns — the turn's own, plus any steered into it.
+   *
+   * Both the heartbeat (lease renewal) and the crash guard (requeue-on-exit)
+   * read this. A steered row missing from it would be recovered mid-flight as
+   * `owner-heartbeat-mismatch` and re-delivered while the runtime was still
+   * answering it.
+   */
   function getActiveQueueMessageIds() {
-    const id = getActiveQueueMessageId();
-    return id ? [id] : [];
+    if (!activeTurn) return [];
+    const ids = [];
+    const primary = String(activeTurn.message?.id || '');
+    if (primary) ids.push(primary);
+    for (const steered of activeTurn.steeredRows || []) {
+      const id = String(steered.message?.id || '');
+      if (id && !ids.includes(id)) ids.push(id);
+    }
+    return ids;
   }
 
   async function dispose() {
     disposed = true;
     stopLifecycleTimer();
+    // A question card left `pending` would sit in the UI inviting an answer
+    // that nothing is left to read. Time them out before the socket goes.
+    await questionBridge.cancelPendingQuestions?.().catch?.(() => {});
     await stopRuntime('worker-shutdown');
   }
 

@@ -6,9 +6,12 @@ import {
   baseMessage,
   createFakeCopilotClient,
   eventsThrough,
+  expectedPromptPrefix,
   loadFixture,
   makeApiStub,
+  makeFakeQuestionBridge,
   makeRunner,
+  promptWithPrefix,
   waitFor,
 } from './copilot-sdk-test-harness.mjs';
 import { USER_INPUT_UNSUPPORTED_ANSWER } from './copilot-sdk-adapter.mjs';
@@ -25,8 +28,8 @@ function setup({ events = loadFixture('happy-turn'), clientOptions = {}, ...over
     onSend: (session) => session.replay(events),
     ...clientOptions,
   });
-  const { runner, started } = makeRunner({ stub, client, ...overrides });
-  return { stub, client, runner, started };
+  const { runner, started, questionBridge } = makeRunner({ stub, client, ...overrides });
+  return { stub, client, runner, started, questionBridge };
 }
 
 test('a happy turn publishes streamed text and a completed response', async () => {
@@ -71,7 +74,13 @@ test('send takes ONE MessageOptions object, prompt and agentMode included', asyn
   // `send(options)` has no second parameter: anything passed positionally is
   // dropped on the floor by the real SDK.
   assert.equal(client.session.sends.length, 1);
-  assert.deepEqual(client.session.sends[0], { prompt: 'hello', agentMode: 'interactive' });
+  assert.deepEqual(client.session.sends[0], {
+    prompt: promptWithPrefix('hello'),
+    // "enqueue" is the runtime default and the only ordering-preserving mode;
+    // a BYOK probe showed "immediate" does not preempt a running call either.
+    mode: 'enqueue',
+    agentMode: 'interactive',
+  });
 });
 
 test('the turn does not settle on assistant.turn_end, only on session.idle', async () => {
@@ -374,33 +383,93 @@ test('agent and autopilot turns auto-approve every permission request', async ()
   const { onPermissionRequest } = client.createAttempts[0];
   // `{kind:"allow"}` is rejected by the runtime ("unknown variant `allow`")
   // and silently fails the tool call, so only `approve-once` is ever emitted.
-  assert.deepEqual(onPermissionRequest({ kind: 'write', fileName: 'a.txt' }), { kind: 'approve-once' });
+  assert.deepEqual(await onPermissionRequest({ kind: 'write', fileName: 'a.txt' }), { kind: 'approve-once' });
 
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'autopilot' } });
-  assert.deepEqual(onPermissionRequest({ kind: 'shell', fullCommandText: 'rm -rf x' }), { kind: 'approve-once' });
+  assert.deepEqual(await onPermissionRequest({ kind: 'shell', fullCommandText: 'rm -rf x' }), { kind: 'approve-once' });
 });
 
-test('plan and ask turns deny anything that is not read-only', async () => {
-  const { client, runner } = setup();
+test('plan mode denies non-read tools locally, without asking the user', async () => {
+  const { client, runner, questionBridge } = setup();
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
   const { onPermissionRequest } = client.createAttempts[0];
 
   // The handler reads the mode off the LIVE turn: one session serves every
   // turn of a conversation and the user can switch modes between them.
-  const denied = onPermissionRequest({ kind: 'write', fileName: 'src/app.js', intention: 'rewrite it' });
+  const denied = await onPermissionRequest({ kind: 'write', fileName: 'src/app.js', intention: 'rewrite it' });
   assert.equal(denied.kind, 'reject');
   assert.match(denied.feedback, /plan mode/);
   assert.match(denied.feedback, /src\/app\.js/);
 
   // Reading is still allowed, so a plan turn can actually research.
   assert.deepEqual(
-    onPermissionRequest({ kind: 'read', path: 'src/app.js', intention: 'read it' }),
+    await onPermissionRequest({ kind: 'read', path: 'src/app.js', intention: 'read it' }),
     { kind: 'approve-once' },
   );
   assert.deepEqual(
-    onPermissionRequest({ kind: 'shell', fullCommandText: 'ls', commands: [{ identifier: 'ls', readOnly: true }] }),
+    await onPermissionRequest({ kind: 'shell', fullCommandText: 'ls', commands: [{ identifier: 'ls', readOnly: true }] }),
     { kind: 'approve-once' },
   );
+
+  // Plan mode is a "describe, do not act" mode: a card per tool call would be
+  // noise, so nothing was asked.
+  assert.equal(questionBridge.approvalCalls.length, 0);
+});
+
+test('ask mode routes a mutating tool to the user and honours the answer', async () => {
+  const approving = makeFakeQuestionBridge({ approve: true });
+  const { client, runner } = setup({ questionBridge: approving });
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+  const { onPermissionRequest } = client.createAttempts[0];
+
+  assert.deepEqual(
+    await onPermissionRequest({ kind: 'write', fileName: 'src/app.js' }),
+    { kind: 'approve-once' },
+  );
+  assert.equal(approving.approvalCalls.length, 1);
+
+  // Reads short-circuit: prompting to read a file the model may already read
+  // is pure friction.
+  assert.deepEqual(await onPermissionRequest({ kind: 'read', path: 'a.js' }), { kind: 'approve-once' });
+  assert.equal(approving.approvalCalls.length, 1);
+});
+
+test('a denied ask-mode approval carries the human reason back as feedback', async () => {
+  const denying = makeFakeQuestionBridge({ approve: false, approvalFeedback: 'not on the prod config' });
+  const { client, runner } = setup({ questionBridge: denying });
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+  const { onPermissionRequest } = client.createAttempts[0];
+
+  const decision = await onPermissionRequest({ kind: 'write', fileName: 'prod.json' });
+  assert.deepEqual(decision, { kind: 'reject', feedback: 'not on the prod config' });
+});
+
+test('an unanswered ask-mode card is user-not-available, never a reject', async () => {
+  // A rejection reads to the model as a considered refusal to work around; an
+  // absent human is a different fact and has its own decision kind.
+  const silent = makeFakeQuestionBridge({ approvalTimedOut: true });
+  const { client, runner } = setup({ questionBridge: silent });
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+  const { onPermissionRequest } = client.createAttempts[0];
+
+  assert.deepEqual(
+    await onPermissionRequest({ kind: 'write', fileName: 'a.js' }),
+    { kind: 'user-not-available' },
+  );
+});
+
+test('a question bridge failure falls back to the local policy instead of throwing', async () => {
+  // A handler that throws is auto-answered `user-not-available` by the SDK with
+  // no explanation; the local policy at least tells the model why.
+  const broken = makeFakeQuestionBridge();
+  broken.askToolApproval = async () => { throw new Error('relay unreachable'); };
+  const { client, runner } = setup({ questionBridge: broken });
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+  const { onPermissionRequest } = client.createAttempts[0];
+
+  const decision = await onPermissionRequest({ kind: 'write', fileName: 'a.js' });
+  assert.equal(decision.kind, 'reject');
+  assert.match(decision.feedback, /ask mode/);
 });
 
 test('the relay mode is threaded to the runtime as agentMode', async () => {
@@ -413,18 +482,34 @@ test('the relay mode is threaded to the runtime as agentMode', async () => {
   assert.equal(client.session.sends[1].agentMode, 'interactive');
 });
 
-test('the interactive handlers answer instead of hanging the turn', async () => {
-  const { client, runner } = setup();
+test('ask_user reaches the human and the answer goes back to the runtime', async () => {
+  const bridge = makeFakeQuestionBridge({ userInputAnswer: 'staging' });
+  const { client, runner } = setup({ questionBridge: bridge });
   await runner.handlePendingPayload({ message: baseMessage });
 
   const config = client.createAttempts[0];
   // `wasFreeform` is REQUIRED by UserInputResponse and the runtime's
   // deserializer is strict — omitting it fails the tool call silently.
-  assert.deepEqual(await config.onUserInputRequest({ requestId: 'r1', question: 'which env?' }, {}), {
+  assert.deepEqual(
+    await config.onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] }),
+    { answer: 'staging', wasFreeform: false },
+  );
+  assert.equal(bridge.userInputCalls[0].request.question, 'which env?');
+});
+
+test('a question bridge failure answers in-band rather than failing the tool call', async () => {
+  // The runtime BLOCKS the turn on this handler: a throw fails the tool call
+  // silently and a hang holds the queue row until the delivery watchdog fires.
+  const broken = makeFakeQuestionBridge();
+  broken.askUserInput = async () => { throw new Error('relay unreachable'); };
+  const { client, runner } = setup({ questionBridge: broken });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  const config = client.createAttempts[0];
+  assert.deepEqual(await config.onUserInputRequest({ requestId: 'r1', question: 'which env?' }), {
     answer: USER_INPUT_UNSUPPORTED_ANSWER,
     wasFreeform: true,
   });
-  assert.match(USER_INPUT_UNSUPPORTED_ANSWER, /not yet supported by the SDK worker/);
   assert.deepEqual(config.onElicitationRequest({}), { action: 'decline' });
 });
 
@@ -442,7 +527,7 @@ test('attachments travel as MessageOptions.attachments, with paths in the prompt
   });
 
   const sent = client.session.sends[0];
-  assert.match(sent.prompt, /^review this\n\n/);
+  assert.ok(sent.prompt.startsWith(`${expectedPromptPrefix('agent')} review this\n\n`), sent.prompt.slice(0, 200));
   assert.match(sent.prompt, /<system_reminder>Attached files: notes\.md<\/system_reminder>$/);
 });
 
@@ -560,10 +645,21 @@ test('the send mode seam threads MessageOptions.mode through to send', async () 
   assert.equal(client.session.sends[0].mode, 'enqueue');
 });
 
-test('no mode field is sent when no mode is resolved', async () => {
-  const { client, runner } = setup();
+test('no mode field is sent when the seam resolves an empty mode', async () => {
+  const { client, runner } = setup({ resolveSendModeImpl: () => '' });
   await runner.handlePendingPayload({ message: baseMessage });
   assert.equal('mode' in client.session.sends[0], false);
+});
+
+test('the default send mode is enqueue', async () => {
+  // A BYOK probe against runtime 1.0.82 ran a mid-turn send as "enqueue",
+  // "immediate" and unset: all three behaved identically (queued, picked up at
+  // the next model-call boundary, no interruption). "enqueue" is the documented
+  // default and the only one that guarantees FIFO order, which is what the
+  // relay queue contract wants.
+  const { client, runner } = setup();
+  await runner.handlePendingPayload({ message: baseMessage });
+  assert.equal(client.session.sends[0].mode, 'enqueue');
 });
 
 test('the stall watchdog fails a silent turn terminally', async () => {
@@ -684,4 +780,448 @@ test('dispose is safe before anything started', async () => {
   await runner.dispose();
   assert.equal(started.length, 0);
   assert.equal(client.stopped, 0);
+});
+
+// ---------------------------------------------------------------- subagents --
+
+test('a subagent run reaches the relay lane, and its prose stays out of the reply', async () => {
+  // Replayed from a live BYOK capture of a real `task` call, so the event
+  // shapes (envelope agentId, the undocumented subagent.configured, a reply
+  // that arrives as ONE tagged assistant.message with no deltas) are the
+  // runtime's, not a hand-written guess.
+  const { stub, runner } = setup({ events: loadFixture('subagent-turn') });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  const runs = stub.bodiesFor('/api/subagent-run');
+  assert.equal(runs.length, 2);
+  assert.equal(runs[0].status, 'running');
+  assert.equal(runs[0].displayName, 'Probe Helper');
+  assert.equal(runs[0].messageId, 'q-1');
+  assert.equal(runs[0].conversationId, 'conv-1');
+  assert.equal(runs[1].status, 'completed');
+  assert.equal(runs[1].subagentRunId, runs[0].subagentRunId);
+
+  // The subagent's reply went to the lane...
+  const laneStream = stub.bodiesFor('/api/stream').find((b) => b.subagentRunId);
+  assert.equal(laneStream.text, 'SUBAGENT_REPLY');
+  assert.equal(laneStream.subagentRunId, runs[0].subagentRunId);
+
+  // ...and emphatically not into the turn's answer.
+  const response = lastBodyOf(stub, '/api/response');
+  assert.equal(response.text, 'PARENT_DONE');
+});
+
+test('a subagent left running when the turn dies is closed, not left spinning', async () => {
+  // The relay only reconciles open runs when the row FAILS; an aborted turn is
+  // settled server-side, so the worker has to close its own or the bubble spins
+  // forever.
+  const events = [
+    { type: 'subagent.started', agentId: 'agent-x', data: { agentDisplayName: 'Stray', toolCallId: 'c1' } },
+  ];
+  const { stub, client, runner } = setup({ events });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => stub.bodiesFor('/api/subagent-run').length > 0, { label: 'run opened' });
+  client.session.emit({ type: 'abort', data: {} });
+  client.session.emit({ type: 'session.idle', data: { aborted: true } });
+  await pending;
+
+  const runs = stub.bodiesFor('/api/subagent-run');
+  assert.equal(runs.at(-1).status, 'failed');
+  assert.equal(runs.at(-1).subagentRunId, 'agent-x');
+});
+
+// --------------------------------------------------------------- plan board --
+
+test('an exit-plan request posts the board and refuses to exit plan mode', async () => {
+  const { stub, client, runner } = setup();
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
+
+  const { onExitPlanModeRequest } = client.createAttempts[0];
+  // A turn has to be active for the board to bind to a queue row.
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'plan' } });
+  await waitFor(() => runner.isTurnActive(), { label: 'turn active' });
+  const result = await onExitPlanModeRequest({ summary: 'short', planContent: '- a\n- b' });
+  await pending;
+
+  const board = bodyOf(stub, '/api/relay-board');
+  assert.equal(board.boardType, 'plan_ready');
+  assert.equal(board.body, '- a\n- b');
+  assert.equal(board.context.source, 'exit_plan_mode');
+
+  // Approving would tell the runtime the plan was accepted and the SAME turn
+  // would roll straight into implementing while the board sits unanswered.
+  assert.equal(result.approved, false);
+  assert.match(result.feedback, /shown to the user in the relay for review/);
+});
+
+test('a plan-shaped answer with no exit-plan hook still posts a board', async () => {
+  const events = [
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm1', content: '- research the schema\n- write the migration' } },
+    { type: 'session.idle', data: {} },
+  ];
+  const { stub, runner } = setup({ events });
+
+  await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
+
+  const board = bodyOf(stub, '/api/relay-board');
+  assert.equal(board.context.source, 'plan-mode-fallback');
+  assert.match(board.body, /research the schema/);
+
+  // The board must go out BEFORE the response: /api/relay-board 409s once the
+  // queue row leaves `processing`.
+  const routes = stub.calls.map((c) => c.routePath);
+  assert.ok(routes.indexOf('/api/relay-board') < routes.indexOf('/api/response'), routes.join(' | '));
+});
+
+test('an agent-mode turn never posts a plan board, however list-shaped', async () => {
+  const events = [
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm1', content: '- did this\n- did that' } },
+    { type: 'session.idle', data: {} },
+  ];
+  const { stub, runner } = setup({ events });
+  await runner.handlePendingPayload({ message: baseMessage });
+  assert.equal(stub.bodiesFor('/api/relay-board').length, 0);
+});
+
+// ----------------------------------------------------------------- steering --
+
+/** A client whose Nth send replays a different slice of the interaction. */
+function steeringClient(perSend) {
+  let sendIndex = 0;
+  return createFakeCopilotClient({
+    onSend: (session) => {
+      const events = perSend[sendIndex] || [];
+      sendIndex += 1;
+      session.replay(events);
+    },
+  });
+}
+
+test('a delivery mid-turn is steered in, and BOTH rows get their own answer', async () => {
+  // Live-verified against runtime 1.0.82: an enqueued prompt is picked up at
+  // the next model-call boundary and the whole interaction closes with ONE
+  // session.idle. So nothing but this turn will ever settle the steered row.
+  const client = steeringClient([
+    [
+      { type: 'user.message', data: {} },
+      { type: 'assistant.message', data: { messageId: 'm1', content: 'first answer' } },
+    ],
+    [
+      { type: 'user.message', data: {} },
+      { type: 'assistant.message', data: { messageId: 'm2', content: 'second answer' } },
+      { type: 'session.idle', data: {} },
+    ],
+  ]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+
+  const steered = { ...baseMessage, id: 'q-2', text: 'actually, do it this way' };
+  const second = runner.handlePendingPayload({ message: steered });
+
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  // Steered into the SAME session, never a second turn.
+  assert.equal(client.sessions.length, 1);
+  assert.equal(client.session.sends.length, 2);
+  assert.equal(client.session.sends[1].mode, 'enqueue');
+  assert.match(client.session.sends[1].prompt, /actually, do it this way/);
+
+  // Each row is answered with the text of ITS OWN prompt segment.
+  const responses = stub.bodiesFor('/api/response');
+  assert.equal(responses.length, 2);
+  assert.equal(responses.find((r) => r.messageId === 'q-1').text, 'first answer');
+  assert.equal(responses.find((r) => r.messageId === 'q-2').text, 'second answer');
+  // A steered row is never requeued: the runtime already consumed the prompt.
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+});
+
+test('the heartbeat claims the steered row too, or the relay recovers it mid-flight', async () => {
+  // Neither send settles the interaction, so both rows are genuinely in flight
+  // at the same time — which is the only moment this can be observed.
+  const client = steeringClient([[], []]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => runner.getActiveQueueMessageIds().length === 2, { label: 'both rows owned' });
+
+  // A row missing from this list is recovered as `owner-heartbeat-mismatch` and
+  // re-delivered while the runtime is still answering it.
+  assert.deepEqual(runner.getActiveQueueMessageIds(), ['q-1', 'q-2']);
+
+  client.session.emit({ type: 'session.idle', data: {} });
+  await first;
+  await second;
+  assert.deepEqual(runner.getActiveQueueMessageIds(), []);
+});
+
+test('a steered prompt the runtime never started is noted, not requeued', async () => {
+  // The prompt is still queued INSIDE the runtime and will be answered at the
+  // start of the next turn; redelivering the row would run it twice.
+  //
+  // Events are emitted by hand rather than replayed from a send, so the
+  // interaction provably ends with only ONE prompt segment open — replaying on
+  // send would race the steer and make the outcome depend on timing.
+  const client = steeringClient([[], []]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => runner.getActiveQueueMessageIds().length === 2, { label: 'row steered in' });
+
+  // The runtime answers the first prompt and goes idle without ever opening a
+  // segment for the steered one.
+  client.session.emit({ type: 'user.message', data: {} });
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm1', content: 'only answer' } });
+  client.session.emit({ type: 'session.idle', data: {} });
+
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  const responses = stub.bodiesFor('/api/response');
+  assert.equal(responses.find((r) => r.messageId === 'q-1').text, 'only answer');
+  const steeredResponse = responses.find((r) => r.messageId === 'q-2');
+  assert.match(steeredResponse.text, /reply continues in the next turn/);
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+});
+
+test('a steering send that never reached the runtime requeues its row', async () => {
+  // Nothing consumed the prompt, so redelivery is safe — and is the only way
+  // the row gets answered at all.
+  const client = steeringClient([[], [{ type: 'session.idle', data: {} }]]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  client.session.send = async () => { throw new Error('connection lost'); };
+
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } }), true);
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), [{ messageId: 'q-2' }]);
+
+  client.session.emit({ type: 'session.idle', data: {} });
+  await first;
+});
+
+test('a turn that throws still settles the rows steered into it', async () => {
+  // Otherwise `steerIntoActiveTurn` waits forever on a settle that never comes,
+  // holding its queue row behind a heartbeat that keeps renewing the lease.
+  const client = steeringClient([[], []]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 40 });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  const steeredResponse = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
+  assert.ok(steeredResponse, 'the steered row must be settled');
+  assert.equal(steeredResponse.terminalError.stableCode, 'copilot.turn-error');
+});
+
+// ------------------------------------------------------- previews / config --
+
+test('the preview-lane block is injected into the first prompt of a mode', async () => {
+  const { client, runner } = setup({
+    relayToolInstructions: '# Tools\n\n## Preview servers\n\nplaceholder',
+    getPreviewInstructionsImpl: () => '## Preview servers\n\nPOST /api/previews to publish',
+  });
+
+  await runner.handlePendingPayload({ message: baseMessage });
+  assert.match(client.session.sends[0].prompt, /POST \/api\/previews to publish/);
+  assert.doesNotMatch(client.session.sends[0].prompt, /placeholder/);
+});
+
+test('compaction is configured explicitly rather than left to the runtime default', async () => {
+  // Pinned to the runtime's own documented defaults so a future change to them
+  // cannot silently move where a long relay conversation starts compacting.
+  const { client, runner } = setup();
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  assert.deepEqual(client.createAttempts[0].infiniteSessions, {
+    enabled: true,
+    backgroundCompactionThreshold: 0.8,
+    bufferExhaustionThreshold: 0.95,
+  });
+});
+
+test('shutdown closes any question card still waiting for a human', async () => {
+  const { runner, questionBridge } = setup();
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.dispose();
+  assert.equal(questionBridge.cancelledCount, 1);
+});
+
+test('the captured usage carries real spend, not just the premium multiplier', async () => {
+  // `cost` is the multiplier and there is no `premiumRequests` field at all;
+  // `copilotUsage.totalNanoAiu` is the number a usage card must show. Phase 3
+  // only adds the transport, so the shape has to be right now.
+  const events = [
+    { type: 'user.message', data: {} },
+    {
+      type: 'assistant.usage',
+      data: {
+        model: 'gpt-5.4-mini',
+        inputTokens: 100,
+        outputTokens: 20,
+        cost: 0.33,
+        copilotUsage: { totalNanoAiu: 4200 },
+      },
+    },
+    { type: 'model.call_failure', data: { quotaSnapshots: { cfi_overage: { used: 3 } } } },
+    { type: 'assistant.message', data: { messageId: 'm1', content: 'done' } },
+    { type: 'session.idle', data: {} },
+  ];
+  const { runner } = setup({ events });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  const captured = runner.getLastTurnUsage();
+  assert.equal(captured.usage.totalNanoAiu, 4200);
+  assert.equal(captured.usage.cost, 0.33);
+  assert.deepEqual(captured.usage.quotaSnapshots.cfi_overage, { used: 3 });
+  // The model that actually billed, taken off the usage event rather than the
+  // requested one.
+  assert.equal(captured.usage.model, 'gpt-5.4-mini');
+});
+
+// ------------------------------------------------- review regression guards --
+
+test('a prompt left queued in the runtime does not steal the next turn answer', async () => {
+  // A steered prompt the runtime never started stays in its pending queue and
+  // is picked up FIRST next time — opening segment 0 — so the next delivery's
+  // own reply is segment 1. Indexing that row at 0 would publish the previous
+  // message's answer to it and drop its own entirely.
+  const client = steeringClient([[], [], []]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+
+  // Turn 1: q-2 is steered in but the runtime goes idle without starting it.
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => runner.getActiveQueueMessageIds().length === 2, { label: 'steered in' });
+  client.session.emit({ type: 'user.message', data: {} });
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm1', content: 'answer to q-1' } });
+  client.session.emit({ type: 'session.idle', data: {} });
+  await first;
+  await second;
+
+  // Turn 2: the runtime works through the leftover q-2 prompt first, then q-3.
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3' } });
+  await waitFor(() => client.session.sends.length === 3, { label: 'third send' });
+  client.session.emit({ type: 'user.message', data: {} });
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm2', content: 'leftover q-2 answer' } });
+  client.session.emit({ type: 'user.message', data: {} });
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm3', content: 'answer to q-3' } });
+  client.session.emit({ type: 'session.idle', data: {} });
+  assert.equal(await third, true);
+
+  const q3 = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-3');
+  assert.equal(q3.text, 'answer to q-3');
+});
+
+test('a turn settling mid-steer hands the row back instead of wedging the socket', async () => {
+  // `steerIntoActiveTurn` awaits the relay-context build before registering the
+  // row. If the turn settles during that await, `settleSteeredRows` has already
+  // run — a row pushed afterwards would never be settled and `onDeliver` would
+  // never resolve, wedging the single-flight delivery socket.
+  const client = steeringClient([[], [{ type: 'session.idle', data: {} }]]);
+  const stub = makeApiStub();
+  let releaseSteer = () => {};
+  const gate = new Promise((resolve) => { releaseSteer = resolve; });
+  let calls = 0;
+  const { runner } = makeRunner({
+    stub,
+    client,
+    getPreviewInstructionsImpl: async () => {
+      calls += 1;
+      // Block only the steering delivery's build, not the first turn's.
+      if (calls > 1) await gate;
+      return '';
+    },
+  });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+
+  // Start the steer, let it block, then settle the turn underneath it.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'plan' } });
+  await new Promise((resolve) => { setTimeout(resolve, 10); });
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm1', content: 'done' } });
+  client.session.emit({ type: 'session.idle', data: {} });
+  assert.equal(await first, true);
+  releaseSteer();
+
+  // The row must still be answered — as its own turn, since steering was
+  // abandoned before anything was sent.
+  assert.equal(await second, true);
+  const q2 = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
+  assert.ok(q2, 'the handed-back row must be settled');
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+});
+
+test('the stall watchdog waits for a human instead of failing the row under them', async () => {
+  // The runtime emits NO events while blocked in a question handler, and the
+  // card's own timeout is 8 hours against a 120s stall ceiling. Failing here
+  // would settle the row and then hand the human's answer to a dead turn.
+  const client = createFakeCopilotClient({ onSend: () => {} });
+  const stub = makeApiStub();
+  let asked = () => {};
+  const askedOnce = new Promise((resolve) => { asked = resolve; });
+  let release = () => {};
+  const humanThinking = new Promise((resolve) => { release = resolve; });
+  const slowHuman = makeFakeQuestionBridge({
+    userInputAnswer: 'staging',
+    onAsk: async () => { asked(); await humanThinking; },
+  });
+  const { runner } = makeRunner({ stub, client, questionBridge: slowHuman, turnStallTimeoutMs: 25 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => !!client.session, { label: 'session' });
+  const answer = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'which env?' });
+  await askedOnce;
+
+  // Well past the 25ms ceiling with the human still thinking.
+  await new Promise((resolve) => { setTimeout(resolve, 90); });
+  assert.equal(runner.isTurnActive(), true, 'the row must not be failed while a human is answering');
+  assert.equal(stub.bodiesFor('/api/response').length, 0);
+
+  release();
+  assert.deepEqual(await answer, { answer: 'staging', wasFreeform: true });
+
+  client.session.emit({ type: 'session.idle', data: {} });
+  assert.equal(await pending, true);
+});
+
+test('a plan board the relay refused is reported as not posted', async () => {
+  // Telling the agent the plan is "shown to the user for review" when the POST
+  // failed ends the turn with the plan visible nowhere — and latches off the
+  // text-shape fallback that could still have posted it.
+  const { client, runner } = setup({
+    events: [],
+    apiStubOptions: { failRoutes: new Set(['/api/relay-board']) },
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
+  await waitFor(() => client.createAttempts.length > 0, { label: 'session created' });
+  const result = await client.createAttempts[0].onExitPlanModeRequest({ summary: '- a\n- b' });
+  client.session.emit({ type: 'session.idle', data: {} });
+  await pending;
+
+  assert.equal(result.approved, false);
+  assert.match(result.feedback, /could not be shown for review/);
 });
