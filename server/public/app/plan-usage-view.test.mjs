@@ -97,6 +97,8 @@ test('overage clamps the bar at 100% and is worded as "over"', () => {
   );
   assert.match(html, /width:100%/);
   assert.match(html, /100 over/);
+  // The overage is a magnitude — a signed "-100 over" is the bug this guards.
+  assert.doesNotMatch(html, /-100 over/);
 });
 
 test('an unknown utilization renders a striped bar instead of a false zero', () => {

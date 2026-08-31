@@ -134,7 +134,11 @@ export function meterSummaryText(meter) {
   if (allowance !== null && used !== null) {
     const parts = [`${used} of ${allowance} used`];
     if (remaining !== null) {
-      parts.push(toNullableNumber(meter.remaining) < 0 ? `${remaining} over` : `${remaining} left`);
+      const remainingNumber = toNullableNumber(meter.remaining);
+      // Overage reads as a magnitude ("9989 over"), not a signed value.
+      parts.push(remainingNumber < 0
+        ? `${formatAmount(Math.abs(remainingNumber), unit)} over`
+        : `${remaining} left`);
     }
     return parts.join(' · ');
   }

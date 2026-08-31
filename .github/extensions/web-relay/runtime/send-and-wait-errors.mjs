@@ -40,6 +40,18 @@ function classifyTerminalError(text) {
       guidance: "Retry the message. If it repeats, restart the relay and include the error code.",
     };
   }
+  // Monthly/plan quota exhaustion is not transient: retrying before the
+  // billing window resets can never succeed. Distinct from "rate limit"
+  // (per-minute throttling), which stays retryable below.
+  if ((lower.includes("quota") && (lower.includes("exceeded") || lower.includes("exhaust")))
+    || lower.includes("out of ai credits")
+    || lower.includes("premium request allowance")) {
+    return {
+      code: "quota-exhausted",
+      message: "GitHub Copilot has no AI credits left for this billing window, so the request was rejected.",
+      guidance: "Open Check Usage for the reset time and retry after the reset, or switch this conversation to another provider.",
+    };
+  }
   if ((lower.includes("capierror") || lower.includes("http 400") || lower.includes("status 400") || /^400\b/.test(lower))
     && !lower.includes("timeout")
     && !lower.includes("temporar")
@@ -60,7 +72,8 @@ export function normalizeTerminalSendAndWaitError(error) {
   if (!base) return null;
   const functionCallId = extractFirstMatch(detail, /function call\s+([a-z0-9_-]+)/i)
     || extractFirstMatch(detail, /\b(call_[a-z0-9_-]+)/i);
-  const requestId = extractFirstMatch(detail, /\brequest(?:\s+id|_id)?[:=]\s*([a-z0-9_-]+)/i)
+  // GitHub request ids are colon-separated hex segments (AFAC:3C07CD:…).
+  const requestId = extractFirstMatch(detail, /\brequest(?:\s+id|_id)?[:=]\s*([a-z0-9_-]+(?::[a-z0-9_-]+)*)/i)
     || extractFirstMatch(detail, /\b(req_[a-z0-9_-]+)/i);
   return {
     terminal: true,
