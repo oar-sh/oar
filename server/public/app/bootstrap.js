@@ -110,7 +110,7 @@ import {
 } from './conversation-view.js';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
-import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import { initSlashAutocomplete } from './slash-autocomplete.mjs';
 import { dataTransferHasFiles } from './composer-paste.mjs';
@@ -4297,6 +4297,7 @@ window.toggleRepoBrowserHidden = toggleRepoBrowserHidden;
 window.toggleRepoBrowserHeavy = toggleRepoBrowserHeavy;
 window.focusRepoTree = focusRepoTree;
 window.setRepoCurrentPath = setRepoCurrentPath;
+window.confirmRepoBrowserCwdPick = confirmRepoBrowserCwdPick;
 window.toggleEmojiPicker = toggleEmojiPicker;
 window.submitRelayQuestionChoice = submitRelayQuestionChoice;
 window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;

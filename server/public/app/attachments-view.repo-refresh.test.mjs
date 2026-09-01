@@ -21,11 +21,65 @@ function functionBody(source, name) {
 }
 
 test('a refresh keeps the expansion sets so the open tree survives a filter toggle', () => {
-  const body = functionBody(readSource('./attachments-view.js'), 'refreshRepoBrowser');
+  const source = readSource('./attachments-view.js');
+  const body = functionBody(source, 'refreshRepoBrowser');
   assert.doesNotMatch(body, /expandedPaths:\s*new Set\(\)/);
   assert.doesNotMatch(body, /collapsedPaths:\s*new Set\(\)/);
-  assert.match(body, /pendingRepoBrowserRestore = \{/);
-  assert.match(body, /repoBrowserRefreshSeq \+= 1/);
+  assert.match(body, /parkRepoBrowserRestore\(\)/);
+  // The parking helper is what bumps the seq and stashes the path.
+  assert.match(source, /function parkRepoBrowserRestore\(\)[\s\S]*?repoBrowserRefreshSeq \+= 1[\s\S]*?\n\}/);
+});
+
+test('reopening the browser parks a restore so loaded branches rehydrate', () => {
+  // The screenshot bug: openRepoBrowser refetched the lazy workspace tree with
+  // the old expansion still in state but never rehydrated it, stranding the
+  // selection on "Expand to load entries…" until a manual Refresh.
+  const body = functionBody(readSource('./attachments-view.js'), 'openRepoBrowser');
+  const parkIndex = body.indexOf('parkRepoBrowserRestore()');
+  const loadIndex = body.indexOf('loadRepoBrowserTree()');
+  assert.notEqual(parkIndex, -1, 'openRepoBrowser must park a restore for the workspace reload');
+  assert.notEqual(loadIndex, -1);
+  assert.ok(parkIndex < loadIndex, 'the restore must be parked before the reload starts');
+  // Unlike Refresh, reopen must not wipe the visible tree while refetching.
+  assert.doesNotMatch(body, /tree:\s*null/);
+});
+
+test('clicking a lazy-unloaded current dir loads it instead of collapsing it', () => {
+  const source = readSource('./attachments-view.js');
+  assert.match(source, /const isLoadedDir = isDir && !\(node\.lazy && !node\.childrenLoaded\);/);
+  assert.match(source, /if \(isLoadedDir && isCurrent && !isCollapsed && targetPath\) \{/);
+});
+
+test('the folder pane self-heals a lazy-unloaded selection', () => {
+  const body = functionBody(readSource('./attachments-view.js'), 'renderRepoFolder');
+  assert.doesNotMatch(body, /Open this folder to load entries/);
+  assert.match(body, /if \(!node\.loadingChildren\) void ensureRepoChildrenLoaded\(/);
+});
+
+test('concurrent child loads for the same path share one fetch', () => {
+  const body = functionBody(readSource('./attachments-view.js'), 'ensureRepoChildrenLoaded');
+  assert.match(body, /repoChildrenLoadsInFlight\.get\(nodePath\)/);
+  assert.match(body, /repoChildrenLoadsInFlight\.set\(nodePath, load\)/);
+  assert.match(body, /repoChildrenLoadsInFlight\.delete\(nodePath\)/);
+});
+
+test('the launch CWD path join is the cross-platform pure helper', () => {
+  const source = readSource('./attachments-view.js');
+  assert.match(functionBody(source, 'getRepoBrowserLaunchCwdPath'), /joinLaunchCwdPath\(/);
+  assert.doesNotMatch(source, /joinWindowsPath/);
+});
+
+test('the CWD pick handler is captured before close clears it', () => {
+  const source = readSource('./attachments-view.js');
+  const confirmBody = functionBody(source, 'confirmRepoBrowserCwdPick');
+  const captureIndex = confirmBody.indexOf('const handler = repoBrowserCwdPickHandler');
+  const closeIndex = confirmBody.indexOf('closeRepoBrowser()');
+  assert.notEqual(captureIndex, -1);
+  assert.notEqual(closeIndex, -1);
+  assert.ok(captureIndex < closeIndex, 'closeRepoBrowser nulls the handler, so it must be captured first');
+  const closeBody = functionBody(source, 'closeRepoBrowser');
+  assert.match(closeBody, /repoBrowserCwdPickHandler = null/);
+  assert.match(closeBody, /classList\.remove\('cwd-pick-mode'\)/);
 });
 
 test('a genuine root switch still discards the expansion sets', () => {

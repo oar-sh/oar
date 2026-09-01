@@ -13,7 +13,7 @@ import {
   summaryModalState,
 } from './store.js';
 import { updateWorkspaceRoot, relaunchSessionWorkerWithWorkspaceRoot } from './api-client.js';
-import { getRepoBrowserLaunchCwdPath } from './attachments-view.js';
+import { getRepoBrowserLaunchCwdPath, openRepoBrowserForCwdPick } from './attachments-view.js';
 import {
   resolveActiveOptionIndex,
   resolveCwdMenuPlacement,
@@ -434,6 +434,19 @@ function bindChangeCwdPicker() {
     syncChangeCwdPickerView();
   });
 
+  document.getElementById('change-cwd-browse-btn')?.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (menuOpen) closeChangeCwdMenu();
+    // The picked path lands in the manual input, which already wins over the
+    // known-CWD selection in getEffectiveChangeCwdPath.
+    openRepoBrowserForCwdPick((pickedPath) => {
+      const { manualInput: manual } = getPickerEls();
+      if (manual) manual.value = pickedPath;
+      syncChangeCwdPickerView();
+    });
+  });
+
   syncChangeCwdPickerView();
 }
 
@@ -495,10 +508,13 @@ export function openChangeCwdModal() {
         <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
         <div><strong style="color:var(--text)">Next launch:</strong> ${escHtml(nextLaunchCwd || currentCwd || 'Unknown')}</div>
       </div>
-      <label class="change-cwd-picker" for="change-cwd-manual-path" style="margin-bottom:10px">
-        <span class="change-cwd-picker-label">Manual path</span>
-        <input id="change-cwd-manual-path" class="change-cwd-manual-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Manual path">
-      </label>
+      <div class="change-cwd-picker" style="margin-bottom:10px">
+        <label class="change-cwd-picker-label" for="change-cwd-manual-path">Manual path</label>
+        <div class="cwd-browse-row">
+          <input id="change-cwd-manual-path" class="change-cwd-manual-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Manual path">
+          <button id="change-cwd-browse-btn" class="cwd-browse-btn" type="button" title="Pick a folder with the file explorer" aria-label="Pick a folder with the file explorer">📁</button>
+        </div>
+      </div>
       <div id="change-cwd-picker" class="change-cwd-picker">
         <span id="change-cwd-picker-label" class="change-cwd-picker-label">Known CWDs</span>
         <input id="change-cwd-selected-path" type="hidden" value="${escHtml(defaultPath)}">

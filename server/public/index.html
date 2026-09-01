@@ -2790,6 +2790,32 @@
     color: var(--text);
   }
   #new-conversation-cwd-manual[hidden] { display: none; }
+  /* Shared row/button recipe for the file-explorer CWD browse buttons in the
+     New chat and Change CWD modals — one place to restyle both. */
+  .cwd-browse-row {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .cwd-browse-row > :first-child {
+    flex: 1;
+    min-width: 0;
+  }
+  .cwd-browse-btn {
+    flex: 0 0 auto;
+    min-height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg3);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .cwd-browse-btn:hover { border-color: var(--accent); }
+  #new-conversation-cwd-browse {
+    min-height: 42px;
+    margin-top: 8px;
+  }
   .tmux-inspector-dialog {
     width: min(1120px, 100%);
     height: min(80vh, 760px);
@@ -3630,6 +3656,27 @@
     padding: 14px;
   }
   #repo-browser-modal.visible { display: flex; }
+  /* CWD-pick mode is launched from the summary / new-chat modals (z 12050),
+     so the browser must stack above them; toasts stay on top at 12500. */
+  #repo-browser-modal.cwd-pick-mode { z-index: 12400; }
+  .repo-cwd-pick-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .repo-cwd-pick-bar[hidden] { display: none; }
+  .repo-cwd-pick-path {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--fs-meta-md);
+    color: var(--muted);
+    word-break: break-all;
+  }
+  #repo-cwd-pick-confirm { white-space: nowrap; }
+  #repo-cwd-pick-confirm:disabled { opacity: 0.55; cursor: default; }
   .repo-browser-dialog {
     width: min(1200px, 100%);
     height: min(92vh, 920px);
@@ -4863,6 +4910,10 @@
         <div id="repo-folder"></div>
       </section>
     </div>
+    <div id="repo-cwd-pick-bar" class="repo-cwd-pick-bar" hidden>
+      <span id="repo-cwd-pick-path" class="repo-cwd-pick-path"></span>
+      <button id="repo-cwd-pick-confirm" class="repo-browser-btn" type="button" onclick="confirmRepoBrowserCwdPick()">✅ Use this folder as CWD</button>
+    </div>
   </div>
 </div>
 
@@ -5583,9 +5634,12 @@
     </div>
     <div class="summary-body" style="padding: 16px;">
       <label for="new-conversation-cwd-select">Working directory</label>
-      <select id="new-conversation-cwd-select">
-        <option value="">Default</option>
-      </select>
+      <div class="cwd-browse-row">
+        <select id="new-conversation-cwd-select">
+          <option value="">Default</option>
+        </select>
+        <button id="new-conversation-cwd-browse" class="cwd-browse-btn" type="button" title="Pick a folder with the file explorer" aria-label="Pick a folder with the file explorer">📁</button>
+      </div>
       <input id="new-conversation-cwd-manual" type="text" hidden autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Full path of the launch directory">
       <div id="new-conversation-cwd-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);word-break:break-word;">New chats start in the relay default directory.</div>
       <div id="new-conversation-provider-row">
