@@ -119,6 +119,11 @@ test("renders and answers relay question card in the web UI", async ({ page, req
         prompt: questionPrompt,
         choices: ["Option A", "Option B", "Option C", "Option D"],
         allowFreeform: false,
+        // Pin the timeout so this spec cannot race the 10s expiry sweeper.
+        // The omitted-field default (8h, incl. null/junk fallbacks) is covered
+        // by shared/question-timeout.test.mjs; the route passes the raw body
+        // value straight into that helper.
+        timeout_ms: 120000,
         context: {
           source: "playwright-e2e",
           rationale: "Verifying relay question dialog rendering and answer flow.",
@@ -423,6 +428,7 @@ test("linkifies workspace file mentions in assistant messages and question cards
         prompt,
         choices: ["Done"],
         allowFreeform: false,
+        timeout_ms: 120000,
       },
     });
     expect(createdQuestion.ok()).toBeTruthy();

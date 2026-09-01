@@ -100,7 +100,7 @@ import {
 import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
-import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
+import { DEFAULT_QUESTION_TIMEOUT_MS, questionExpiresAt } from '../shared/question-timeout.mjs';
 import {
   parseTurnCeilingUpdate,
   readTurnCeilingSetting,
@@ -6870,10 +6870,19 @@ recoverStaleMessages(); // run immediately on startup
 
 function expirePendingQuestions() {
   const now = new Date().toISOString();
-  const result = stmts.expireQuestions.run(now);
-  if (result.changes > 0) {
-    console.log(`${runtimeLogPrefix()}Timed out ${result.changes} relay question(s)`);
-    io.emit('relay_question_changed', { expired: result.changes });
+  const expired = stmts.expireQuestions.all(now);
+  if (expired.length > 0) {
+    // Log id + age: a question timing out seconds after creation is a bug (a
+    // zero timeout), not a user walking away, and the age is what shows that.
+    const nowMs = Date.parse(now);
+    const detail = expired
+      .map((row) => {
+        const ageMs = nowMs - new Date(row.created_at || now).getTime();
+        return `${String(row.id || '').slice(0, 8)} age=${Math.max(0, Math.round(ageMs / 1000))}s`;
+      })
+      .join(', ');
+    console.log(`${runtimeLogPrefix()}Timed out ${expired.length} relay question(s): ${detail}`);
+    io.emit('relay_question_changed', { expired: expired.length });
   }
 }
 runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
@@ -7078,13 +7087,6 @@ if (typeof runtimeTimers.pendingWorkerPrime.unref === 'function') runtimeTimers.
 // POST /api/heartbeat — CLI sends a ping every poll interval
 
 // ─── Relay Question Routes ────────────────────────────────────────────────────
-
-function questionExpiresAt(createdAt, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS) {
-  const normalizedTimeoutMs = Number.isFinite(Number(timeoutMs))
-    ? Math.max(0, Math.trunc(Number(timeoutMs)))
-    : DEFAULT_QUESTION_TIMEOUT_MS;
-  return new Date(new Date(createdAt).getTime() + normalizedTimeoutMs).toISOString();
-}
 
 function sanitizeRelayQuestionPrompt(requestBody) {
   const prompt = String(
