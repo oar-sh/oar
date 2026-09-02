@@ -207,7 +207,7 @@ function showExternalLinkFallback(url) {
     title: 'Open external link',
     subtitle: 'Your browser blocked opening a separate tab',
     bodyHtml: `
-      <p>The Copilot Remote app remains open. Copy this link and open it in your system browser:</p>
+      <p>The OAR app remains open. Copy this link and open it in your system browser:</p>
       <pre><code>${escHtml(pendingExternalLinkUrl)}</code></pre>
       <div class="summary-actions">
         <button class="summary-btn" type="button" onclick="copyExternalLinkUrl()">Copy link</button>

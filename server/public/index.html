@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#161b22">
-<meta name="application-name" content="Copilot Remote">
-<meta name="apple-mobile-web-app-title" content="Copilot Remote">
+<meta name="application-name" content="OAR">
+<meta name="apple-mobile-web-app-title" content="OAR">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -24,7 +24,7 @@
     ? __APP_CONFIG.basePath.replace(/\/+$/, '')
     : __deriveBasePathFromLocation();
   const __IS_SHARED_ROUTE = typeof __APP_CONFIG?.sharedToken === 'string' && __APP_CONFIG.sharedToken.trim().length > 0;
-  const __PWA_VERSION = '0';
+  const __PWA_VERSION = '1';
   __APP_CONFIG.pwaVersion = __PWA_VERSION;
   window.__COPILOT_PWA_VERSION = __PWA_VERSION;
   window.addEventListener('DOMContentLoaded', () => {
@@ -171,7 +171,7 @@
   document.write(`<link rel="icon" type="image/svg+xml" href="${__APP_BASE}/app-icon.svg?${__PWA_BUST}">`);
   document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon-192.png?${__PWA_BUST}">`);
 </script>
-<title>Copilot Remote</title>
+<title>OAR — Open Agent Relay</title>
 <script>document.write('<scr'+'ipt src="'+__APP_BASE+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
@@ -4748,7 +4748,7 @@
 <!-- Auth Gate -->
 <div id="auth-gate">
   <div class="auth-box">
-    <h1>🤖 Copilot Remote</h1>
+    <h1>🛶 OAR</h1>
     <p>Enter your access token to connect</p>
     <input id="token-input" type="password" placeholder="Access token" autofocus onkeydown="if(event.key==='Enter')window.__copilotAuthConnect(event)">
     <button onclick="window.__copilotAuthConnect(event)">Connect</button>
@@ -4756,7 +4756,7 @@
   </div>
 </div>
 
-<div id="startup-loading" role="status" aria-live="polite">Connecting to Copilot Remote…</div>
+<div id="startup-loading" role="status" aria-live="polite">Connecting to OAR…</div>
 
 <!-- Sidebar overlay (mobile) -->
 <div id="sidebar-overlay" onclick="closeSidebar()"></div>
@@ -5082,7 +5082,7 @@
             id="pwa-app-name-input"
             type="text"
             maxlength="60"
-            placeholder="Copilot Remote"
+            placeholder="OAR"
             aria-label="Install app name"
             onchange="updatePwaAppName(this.value)"
           >

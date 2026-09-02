@@ -1,6 +1,12 @@
-# Copilot Remote
+# OAR — Open Agent Relay
 
 Drive your local coding agents from any browser (phone, tablet, or second computer) through a self-hosted web relay.
+
+```bash
+curl -fsSL oar.sh/install | sh
+```
+
+Landing page and installers: [oar.sh](https://oar.sh). From a git checkout, the Quick start below still applies unchanged.
 
 GitHub Copilot CLI is the default runtime, and two more can be enabled per conversation: **OpenAI (BYOK)** and **Claude (Agent SDK)**. All three share the same chat UI, queue, history, file browser, and question cards — you pick the runtime when you start a conversation.
 
@@ -12,7 +18,7 @@ GitHub Copilot CLI is the default runtime, and two more can be enabled per conve
 
 ## In action
 
-Copilot Remote is built to feel at home on both desktop and mobile. Your conversations can follow you from a browser tab to a PWA install, with file browsing and previews built in.
+OAR is built to feel at home on both desktop and mobile. Your conversations can follow you from a browser tab to a PWA install, with file browsing and previews built in.
 
 <div align="center">
 <table width="100%" cellspacing="0" cellpadding="0">
@@ -43,7 +49,7 @@ Copilot Remote is built to feel at home on both desktop and mobile. Your convers
 
 ## What this repository provides
 
-Copilot Remote is split into three pieces:
+OAR is split into three pieces:
 
 1. **Web relay server** (`server/`): queueing, persistence, auth, browser UI, file browser, uploads, and the OpenAI BYOK image path.
 2. **Copilot CLI extension** (`.github/extensions/web-relay/`): polls the relay, executes turns, streams activity, bridges `ask_user` questions into web question cards.
@@ -53,7 +59,7 @@ Copilot Remote is split into three pieces:
 
 ## Project Status
 
-Copilot Remote is still under active development, so expect occasional rough edges and some provider SDK features to be missing or incomplete for now.
+OAR is still under active development, so expect occasional rough edges and some provider SDK features to be missing or incomplete for now.
 
 
 ## Highlights
@@ -100,8 +106,8 @@ Only Node.js and the runtime you actually intend to use are required.
 ## Quick start
 
 ```bash
-git clone https://github.com/materia79/copilot-remote
-cd copilot-remote
+git clone https://github.com/oar-sh/oar
+cd oar
 npm install
 ```
 
@@ -150,15 +156,15 @@ For day-to-day development workflows, relay restart steps, and worker debugging 
 
 | Command                 | Purpose                                                                                                                                   |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `copilot-remote`        | Global npm command (after `npm link` or `npm install -g .`) that starts the web relay if needed, then runs `gh copilot` in the same shell |
-| `copilot-remote --install-extension` | Installs/updates a user-global `web-relay` wrapper entrypoint and exits                                                                |
+| `oar`                   | Global npm command (`npm i -g @oar-sh/oar`, or `npm link` from a checkout) that starts the web relay if needed, then runs `gh copilot` in the same shell |
+| `oar --install-extension` | Installs/updates a user-global `web-relay` wrapper entrypoint and exits                                                                |
 | `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and the relay worker link comes online                                      |
 | `node server/server.js` | The one way to start the relay server. `npm start` is an alias for exactly this command                                                    |
 
 ### The single server entry point
 
 `server/server.js` is the only entry point, in every mode — manual runs, the CLI
-extension, `copilot-remote`, Windows autostart, and the e2e runner all start it.
+extension, `oar`, Windows autostart, and the e2e runner all start it.
 Its role is chosen by argv, never by the environment:
 
 - `node server/server.js` — the process stays attached to your terminal as a
@@ -190,7 +196,7 @@ In extension-managed mode, the worker WebSocket begins after the CLI session bec
 The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
 When the CLI extension connects, it also prints the relay info window (local/network/remote/auth URLs) directly in the Copilot CLI client.
 
-On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry. It opens a visible terminal at sign-in and runs the installed `node server\server.js` path. This starts only the web relay server; a Copilot CLI session using the extension must attach separately before queued turns can be processed. Turning the setting off removes the copilot-remote Startup entry.
+On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry. It opens a visible terminal at sign-in and runs the installed `node server\server.js` path. This starts only the web relay server; a Copilot CLI session using the extension must attach separately before queued turns can be processed. Turning the setting off removes the OAR Startup entry.
 
 Do not restart the relay by killing processes; use `POST /api/relay/shutdown` instead.
 
@@ -207,7 +213,7 @@ Manual relay control details:
 
 ### Global npm command (Windows first)
 
-You can install the repo locally and get a global `copilot-remote` command without publishing:
+You can install the repo locally and get a global `oar` command without publishing:
 
 ```powershell
 npm link
@@ -217,7 +223,7 @@ npm install -g .
 
 Run it from any folder to start the web relay server for that folder's workspace root, then immediately hand the shell to `gh copilot` without a bootstrap prompt. If a relay is already active, the command reuses it and still opens Copilot in the same shell.
 
-Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` by default (or `COPILOT_WEB_RELAY_LOG_DIR` if you set it), so it stays out of the CLI terminal.
+Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` (git checkouts) or `%APPDATA%\oar\logs` (global installs) by default (or `COPILOT_WEB_RELAY_LOG_DIR` if you set it), so it stays out of the CLI terminal.
 
 If you want custom token/tunnel settings from a specific `server/config.json`, point `COPILOT_WEB_RELAY_CONFIG` at that file before launching. A plain `npm install -g .` does not bundle the repo-local gitignored config file.
 
@@ -226,7 +232,7 @@ Manual relay shutdowns are queued via `POST /api/relay/shutdown` and only take e
 Roadmap for later launcher modes:
 
 1. **Option 2**: launch/attach a Copilot CLI session directly.
-2. **Option 3**: support `copilot-remote -- [gh copilot args]` pass-through.
+2. **Option 3**: support `oar -- [gh copilot args]` pass-through.
 3. **Session resume**: add `--session-id=<...>` handoff once the session orchestration contract is defined.
 
 ## Using the web UI
@@ -576,7 +582,7 @@ Install a user-global extension entrypoint for use across repositories:
 Recommended command:
 
 ```bash
-copilot-remote --install-extension
+oar --install-extension
 ```
 
 This writes/updates `extension.mjs` in the user-global extension directory as a wrapper that imports the repository extension entrypoint directly.
@@ -654,7 +660,7 @@ For deeper implementation/API details, see `[server/README.md](server/README.md)
 ## Repository layout
 
 ```text
-copilot-remote/
+oar/
 ├── .github/extensions/web-relay/   # Copilot CLI extension (worker WebSocket, ask_user bridge, model snapshotting)
 ├── server/
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)

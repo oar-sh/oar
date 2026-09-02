@@ -2,6 +2,16 @@
 
 This document covers day-to-day development workflows for the web relay and Copilot CLI extension.
 
+## Naming: OAR vs "copilot"
+
+The product is **OAR — Open Agent Relay** (`@oar-sh/oar`, binary `oar`). Write it
+`OAR` in prose and `oar` in code. Many internals deliberately still say
+"copilot": the `COPILOT_WEB_RELAY_*` env vars, `.copilot/`-derived host paths,
+DB tables, cookies, and `server/data/copilot.db` either address the real GitHub
+Copilot CLI's contracts or are invisible identifiers whose rename would only buy
+a migration. Do not "fix" them in passing — the deferred rename list lives in
+`docs/plans/oar-rebrand-and-release.md` §11.
+
 ## Runtime ownership
 
 Everything starts the same way — `node server/server.js` (which is all `npm start` does).

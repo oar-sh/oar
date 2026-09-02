@@ -7,7 +7,7 @@ if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 for %%I in ("%SCRIPT_DIR%\..\..") do set "REPO_ROOT=%%~fI"
 
 if not exist "%REPO_ROOT%\package.json" (
-  echo [copilot-remote] Unable to locate the repository root from "%SCRIPT_DIR%".
+  echo [oar] Unable to locate the repository root from "%SCRIPT_DIR%".
   exit /b 1
 )
 
@@ -15,10 +15,10 @@ echo(;%PATH%; | findstr /I /C:";%SCRIPT_DIR%;" >nul
 if errorlevel 1 (
   call :AddToUserPath "%SCRIPT_DIR%"
   if errorlevel 1 (
-    echo [copilot-remote] Warning: could not update your user PATH.
+    echo [oar] Warning: could not update your user PATH.
   ) else (
-    echo [copilot-remote] Ensured "%SCRIPT_DIR%" is in your user PATH.
-    echo [copilot-remote] Open a new cmd.exe window to use copilot-remote by name.
+    echo [oar] Ensured "%SCRIPT_DIR%" is in your user PATH.
+    echo [oar] Open a new cmd.exe window to use oar by name.
     echo.
   )
 )
@@ -29,11 +29,11 @@ set "COPILOT_WEB_RELAY_SERVER_DIR=%REPO_ROOT%\server"
 
 pushd "%REPO_ROOT%" >nul
 if errorlevel 1 (
-  echo [copilot-remote] Failed to change to repo root: "%REPO_ROOT%".
+  echo [oar] Failed to change to repo root: "%REPO_ROOT%".
   exit /b 1
 )
 
-echo [copilot-remote] Starting Copilot from "%REPO_ROOT%"...
+echo [oar] Starting Copilot from "%REPO_ROOT%"...
 gh copilot -- --allow-all
 set "EXIT_CODE=%errorlevel%"
 popd >nul

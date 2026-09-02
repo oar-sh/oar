@@ -3,7 +3,7 @@ import { BASE, IS_SHARED_VIEW, showTransientRelayNotice } from './store.js';
 const THEME_COLOR_BASE = '#0d1117';
 const THEME_COLOR_IMMERSIVE = '#161b22';
 const PWA_APP_NAME_STORAGE_KEY = 'copilot_pwa_app_name';
-const PWA_APP_NAME_DEFAULT = 'Copilot Remote';
+const PWA_APP_NAME_DEFAULT = 'OAR';
 const PWA_APP_NAME_MAX_LENGTH = 60;
 const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
 
@@ -361,7 +361,7 @@ async function loadManifestTemplate(defaultHref) {
   const fallback = {
     name: PWA_APP_NAME_DEFAULT,
     short_name: derivePwaShortName(PWA_APP_NAME_DEFAULT),
-    description: 'Installable Copilot Remote web app with standalone launcher support.',
+    description: 'OAR — Open Agent Relay: drive your local coding agents from any browser.',
     id: './__copilot_remote_pwa__',
     start_url: './',
     scope: './',
