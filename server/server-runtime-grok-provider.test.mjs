@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveWorkerKind } from './services/session-worker-launch-service.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const runtimeSource = fs.readFileSync(path.join(__dirname, 'server-runtime.mjs'), 'utf8');
 const launchSource = fs.readFileSync(path.join(__dirname, 'services', 'session-worker-launch-service.mjs'), 'utf8');
@@ -14,7 +16,10 @@ const sessionsSource = fs.readFileSync(path.join(__dirname, 'routes', 'sessions-
 const messagesSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-routes.mjs'), 'utf8');
 
 test('launch service recognizes grok worker kind and script path', () => {
-  assert.match(launchSource, /kind === 'claude' \|\| kind === 'cursor' \|\| kind === 'grok'/);
+  // The kind list used to be spelled out inside resolveWorkerKind; it is now
+  // derived from the descriptor table asserted below, so this checks the
+  // BEHAVIOUR rather than a literal that no longer exists.
+  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'grok' }), 'grok');
   assert.match(launchSource, /export function applyGrokProviderEnvironment/);
   assert.match(launchSource, /grok: Object\.freeze\(\{ resolveScriptPath: resolveGrokWorkerScriptPath/);
   assert.match(launchSource, /GROK_RELAY_MODEL/);

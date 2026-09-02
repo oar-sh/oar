@@ -10,6 +10,8 @@ import {
 } from './plan-usage-contract.mjs';
 import {
   buildCopilotPlanCard,
+  buildCopilotWorkerUsageSection,
+  normalizeCopilotWorkerUsage,
   resolvePremiumBucketLabel,
   summarizeBillingUsageItems,
 } from './plan-usage-copilot.mjs';
@@ -142,6 +144,122 @@ test('a billing failure degrades to quota meters plus an explanatory message', (
   assert.equal(card.status, 'partial');
   assert.ok(card.meters.length >= 2);
   assert.match(card.message, /billing permissions/);
+});
+
+// The SDK engine's per-turn ingest. The card's meters come from the
+// account-level quota API and cover both engines, so everything below is
+// strictly additive detail.
+const workerUsagePost = {
+  conversationId: 'conv-1',
+  messageId: 'q-1',
+  model: 'gpt-5.4-mini',
+  capturedAt: '2026-08-31T00:00:00.000Z',
+  usage: {
+    // The premium MULTIPLIER, not money — it must never be read as spend.
+    cost: 1,
+    totalNanoAiu: 4_500_000,
+    inputTokens: 1200,
+    outputTokens: 340,
+    modelCalls: 3,
+    subagentModelCalls: 1,
+    quotaSnapshots: { cfi_overage: 2 },
+  },
+  contextUsage: { currentTokens: 18_000 },
+};
+
+test('normalizeCopilotWorkerUsage keeps the fields only the worker can see', () => {
+  const usage = normalizeCopilotWorkerUsage(workerUsagePost);
+  assert.equal(usage.totalNanoAiu, 4_500_000);
+  assert.equal(usage.cfiOverage, 2);
+  assert.equal(usage.contextTokens, 18_000);
+  assert.equal(usage.model, 'gpt-5.4-mini');
+  assert.equal(usage.conversationId, 'conv-1');
+  // `cost` is the premium multiplier, so it is deliberately not carried.
+  assert.equal('cost' in usage, false);
+});
+
+test('normalizeCopilotWorkerUsage rejects payloads with no numbers in them', () => {
+  assert.equal(normalizeCopilotWorkerUsage(null), null);
+  assert.equal(normalizeCopilotWorkerUsage({}), null);
+  assert.equal(normalizeCopilotWorkerUsage({ conversationId: 'conv-1', usage: {} }), null);
+});
+
+// Every assertion below pins its own clock: the section is aged against `now`,
+// so a wall-clock default would make these tests start failing a week after
+// `capturedAt` — with no code change.
+const CAPTURED_AT_MS = Date.parse(workerUsagePost.capturedAt);
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+test('the worker snapshot renders as an additive detail section', () => {
+  const section = buildCopilotWorkerUsageSection(
+    normalizeCopilotWorkerUsage(workerUsagePost),
+    { now: CAPTURED_AT_MS + 3 * HOUR_MS },
+  );
+  const rows = Object.fromEntries(section.rows.map((row) => [row.label, row.value]));
+  // A turn costs a fraction of a credit; 2-decimal rounding would report "0".
+  assert.equal(rows['AI credits'], '0.004500');
+  assert.equal(rows['Input tokens'], '1200');
+  assert.equal(rows.Overage, '2');
+  assert.match(section.note, /gpt-5\.4-mini/);
+});
+
+test('the worker section dates itself, because it is one turn and not a total', () => {
+  const usage = normalizeCopilotWorkerUsage(workerUsagePost);
+  const relative = (offsetMs) => buildCopilotWorkerUsageSection(usage, { now: CAPTURED_AT_MS + offsetMs }).note;
+
+  assert.match(relative(30_000), /as of just now$/);
+  assert.match(relative(5 * 60_000), /as of 5 minutes ago$/);
+  assert.match(relative(HOUR_MS), /as of 1 hour ago$/);
+  assert.match(relative(3 * DAY_MS), /as of 3 days ago$/);
+  // Model and age share one note, so neither costs the section a second row.
+  assert.equal(relative(HOUR_MS), 'Model gpt-5.4-mini · as of 1 hour ago');
+});
+
+test('a worker snapshot older than a week stops being rendered at all', () => {
+  // Nothing ever clears this row — switching back to the extension engine just
+  // stops writing it — so without a cutoff one turn's numbers would sit under
+  // live meters forever, reading as though they were live too.
+  const usage = normalizeCopilotWorkerUsage(workerUsagePost);
+  assert.ok(buildCopilotWorkerUsageSection(usage, { now: CAPTURED_AT_MS + 7 * DAY_MS - 1 }));
+  assert.equal(buildCopilotWorkerUsageSection(usage, { now: CAPTURED_AT_MS + 7 * DAY_MS + 1 }), null);
+
+  const card = buildCopilotPlanCard({
+    summary: copilotSummary,
+    workerUsage: usage,
+    now: CAPTURED_AT_MS + 8 * DAY_MS,
+  });
+  assert.equal(card.details.some((d) => d.id === 'copilot-sdk-last-turn'), false);
+});
+
+test('an undated worker snapshot still renders, without an age', () => {
+  // The numbers are real even when the timestamp is missing or unparseable;
+  // expiring them would discard good data on the strength of a bad field.
+  const undated = { ...normalizeCopilotWorkerUsage(workerUsagePost), capturedAt: null };
+  const section = buildCopilotWorkerUsageSection(undated, { now: CAPTURED_AT_MS + 90 * DAY_MS });
+  assert.equal(section.note, 'Model gpt-5.4-mini');
+
+  const unparseable = { ...undated, capturedAt: 'last tuesday' };
+  assert.equal(
+    buildCopilotWorkerUsageSection(unparseable, { now: CAPTURED_AT_MS }).note,
+    'Model gpt-5.4-mini · as of last tuesday',
+  );
+});
+
+test('the Copilot card gains the worker section only when a snapshot exists', () => {
+  const now = CAPTURED_AT_MS + HOUR_MS;
+  const withoutWorker = buildCopilotPlanCard({ summary: copilotSummary, now });
+  assert.equal((withoutWorker.details || []).some((d) => d.id === 'copilot-sdk-last-turn'), false);
+  assert.ok(withoutWorker.meters.length >= 2);
+
+  const withWorker = buildCopilotPlanCard({
+    summary: copilotSummary,
+    workerUsage: normalizeCopilotWorkerUsage(workerUsagePost),
+    now,
+  });
+  assert.ok(withWorker.details.some((d) => d.id === 'copilot-sdk-last-turn'));
+  // The meters are untouched by the addition.
+  assert.deepEqual(withWorker.meters, withoutWorker.meters);
 });
 
 test('a failed quota fetch produces an error card rather than throwing', () => {

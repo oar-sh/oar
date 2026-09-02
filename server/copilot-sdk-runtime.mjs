@@ -32,6 +32,20 @@ export function getCopilotBaseDirs({ env = process.env, platform = process.platf
   ]);
 }
 
+/**
+ * The runtime entry point inside a Copilot CLI version directory.
+ *
+ * It is `app.js` and never the sibling `index.js`: `index.js` is a
+ * self-updating launcher that resolves the newest version in the cache and
+ * `exec`s THAT version's `app.js`. Spawning it silently defeats pinning the
+ * runtime to the SDK bundle's own version, which matters because the event
+ * shapes the workers normalize are per-version. Exported so every caller pins
+ * the same file.
+ */
+export function copilotRuntimeEntry(versionDir) {
+  return path.join(versionDir, 'app.js');
+}
+
 export function resolveInstalledCopilotPaths({ config = {}, env = process.env, platform = process.platform, arch = process.arch } = {}) {
   if (config.sdkPath && config.cliPath) {
     return { sdkPath: path.resolve(config.sdkPath), cliPath: path.resolve(config.cliPath), version: 'configured' };
@@ -47,7 +61,7 @@ export function resolveInstalledCopilotPaths({ config = {}, env = process.env, p
         if (!/^\d+\.\d+\.\d+$/.test(version) || (requestedVersion && version !== requestedVersion)) continue;
         const versionDir = path.join(baseDir, subdir, version);
         const sdkPath = path.join(versionDir, 'copilot-sdk', 'index.js');
-        const cliPath = path.join(versionDir, 'app.js');
+        const cliPath = copilotRuntimeEntry(versionDir);
         if (fs.existsSync(sdkPath) && fs.existsSync(cliPath)) {
           candidates.push({ version, baseDirIdx, subdirIdx, sdkPath, cliPath });
         }

@@ -310,3 +310,40 @@ test('an absorbed steering turn settles the real queue rows through the real rou
   turn.endInput();
   await settled(runner);
 });
+
+test('the continuation gate admits copilot providers and fails closed otherwise', async () => {
+  const { db, api } = bootRelayRoutes();
+  const seed = (conv, provider) => {
+    db.prepare(`
+      INSERT INTO conversations (id, title, sdk_session_id, status, created_at, updated_at)
+      VALUES (?, ?, ?, 'active', ?, ?)
+    `).run(conv, `gate ${provider || 'unbound'}`, conv, NOW, NOW);
+    if (provider) {
+      db.prepare(`
+        INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, strategy, runtime_key, model, provider_type, provider_model, status, created_at, last_used_at)
+        VALUES (?, ?, ?, 'isolated', ?, ?, ?, ?, 'active', ?, ?)
+      `).run(`rs-${conv}`, conv, conv, `runtime-key-${conv}`, MODEL, provider, MODEL, NOW, NOW);
+    }
+  };
+
+  // Both Copilot-CLI providers pass — the SDK worker's detached-shell
+  // continuations depend on it (live burn-in session 10a1a9ad: the timer
+  // wake-up had nowhere to land while the gate was claude-only).
+  seed('conv-gate-github', 'github');
+  assert.equal((await api('POST', '/api/continuation-turn', { conversationId: 'conv-gate-github' })).ok, true);
+  seed('conv-gate-openai', 'openai');
+  assert.equal((await api('POST', '/api/continuation-turn', { conversationId: 'conv-gate-openai' })).ok, true);
+
+  // A provider with no continuation-capable worker is refused…
+  seed('conv-gate-cursor', 'cursor');
+  await assert.rejects(
+    () => api('POST', '/api/continuation-turn', { conversationId: 'conv-gate-cursor' }),
+    /not supported|409/i,
+  );
+  // …and an unbound conversation fails closed instead of defaulting to github.
+  seed('conv-gate-unbound', null);
+  await assert.rejects(
+    () => api('POST', '/api/continuation-turn', { conversationId: 'conv-gate-unbound' }),
+    /runtime session|404/i,
+  );
+});

@@ -7,6 +7,8 @@ import {
 import {
   apiFetch,
   loadClaudeSettings,
+  loadCopilotSettings,
+  updateCopilotSettings,
   loadCursorSettings,
   loadCursorAllowanceSettings,
   updateCursorAllowanceSettings,
@@ -32,6 +34,10 @@ import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
 import { refreshPushSettingsSection } from './push-settings.js';
+import { selectSettingsTab } from './settings-tabs.js';
+import { refreshClaudeAuthSection } from './claude-auth-ui.js';
+import { refreshGrokAuthSection } from './grok-auth-ui.js';
+import { refreshCliInstallSections } from './cli-install-ui.js';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -307,6 +313,101 @@ export async function refreshOpenAISettingsState() {
   const settings = await loadOpenAISettings();
   if (!settings) return null;
   return applyOpenAISettingsState(settings);
+}
+
+// Copilot has no key and no model list in settings — it authenticates through
+// the host's `copilot` login and its catalog comes from the CLI — so the only
+// thing this panel owns is which engine runs Copilot conversations.
+let copilotSettingsUpdateInFlight = false;
+let copilotSettingsState = { engine: 'extension' };
+// The reason the last save was refused, shown in place of the engine
+// description. Every apply sets it — so a later success, a refresh, or a
+// broadcast from another tab all clear it by simply not passing one.
+let copilotSettingsSaveError = '';
+
+function setCopilotSettingsControlsDisabled(disabled) {
+  for (const id of ['copilot-engine-select', 'copilot-save-btn']) {
+    const element = document.getElementById(id);
+    if (element) element.disabled = disabled;
+  }
+}
+
+export function applyCopilotSettingsState(settings = {}, { error = '' } = {}) {
+  copilotSettingsSaveError = String(error || '');
+  const engine = String(settings?.engine || copilotSettingsState.engine || 'extension').trim().toLowerCase();
+  copilotSettingsState = { engine: engine === 'sdk' ? 'sdk' : 'extension' };
+  const select = document.getElementById('copilot-engine-select');
+  const status = document.getElementById('copilot-settings-status');
+  // A select has no free text to lose, so unlike the Claude model input there
+  // is no dirty-tracking here: a socket refresh may always overwrite it — but
+  // never while the user's own save is still in flight.
+  if (select && !copilotSettingsUpdateInFlight) select.value = copilotSettingsState.engine;
+  if (status) {
+    if (copilotSettingsSaveError) {
+      status.textContent = copilotSettingsSaveError;
+      status.dataset.state = 'error';
+    } else {
+      status.textContent = copilotSettingsState.engine === 'sdk'
+        ? 'New Copilot conversations run on the experimental headless SDK worker. No tmux inspector for these sessions.'
+        : 'New Copilot conversations run on the Copilot CLI with the web-relay extension (current default).';
+      status.dataset.state = copilotSettingsState.engine === 'sdk' ? 'active' : 'unconfigured';
+    }
+  }
+  return copilotSettingsState;
+}
+
+export async function refreshCopilotSettingsState() {
+  const settings = await loadCopilotSettings();
+  if (!settings) return null;
+  return applyCopilotSettingsState(settings);
+}
+
+async function syncCopilotSettingsInputs() {
+  const status = document.getElementById('copilot-settings-status');
+  if (!status) return;
+  const settings = await refreshCopilotSettingsState();
+  if (!settings) {
+    status.textContent = 'Unable to load Copilot settings.';
+    status.dataset.state = 'error';
+  }
+}
+
+export async function saveCopilotSettings() {
+  if (copilotSettingsUpdateInFlight) return;
+  const select = document.getElementById('copilot-engine-select');
+  const engine = String(select?.value || '').trim().toLowerCase() || 'extension';
+  copilotSettingsUpdateInFlight = true;
+  setCopilotSettingsControlsDisabled(true);
+  // What to render once the save settles: the server's answer when it accepted,
+  // the last known state plus a reason when it did not. Assigned in the body,
+  // applied ONCE in the `finally` — clearing the in-flight flag early just to
+  // apply mid-try, then applying again on the way out, made the success path
+  // render twice and made the flag's meaning depend on which branch you were in.
+  let settled = copilotSettingsState;
+  let saveError = '';
+  try {
+    const result = await updateCopilotSettings({ engine });
+    if (!result) throw new Error('Failed to save Copilot settings.');
+    settled = result;
+    showTransientRelayNotice(
+      String(result.engine) === 'sdk'
+        ? 'Copilot engine set to SDK (experimental). New conversations use the headless worker; running sessions keep the extension until they restart.'
+        : 'Copilot engine set to Extension. New conversations use the Copilot CLI.',
+      6000,
+    );
+  } catch (error) {
+    // The relay refuses the SDK engine with a specific, actionable reason (no
+    // resolved SDK path; session-worker routing disabled). It goes in the
+    // status line as well as the alert, because the alert is gone the moment it
+    // is dismissed and the panel would otherwise show the old engine with no
+    // explanation of why the choice did not stick.
+    saveError = String(error?.message || 'Failed to save Copilot settings.');
+    alert(saveError);
+  } finally {
+    copilotSettingsUpdateInFlight = false;
+    setCopilotSettingsControlsDisabled(false);
+    applyCopilotSettingsState(settled, { error: saveError });
+  }
 }
 
 let claudeSettingsUpdateInFlight = false;
@@ -1328,9 +1429,12 @@ subscribePreviews(() => {
   renderPreviewsSection();
 });
 
-export function openSettingsModal() {
+// `tab` / `providerTab` are optional deep links (e.g. openSettingsModal('providers', 'claude'));
+// omitting them restores the last tab the user was on.
+export function openSettingsModal(tab, providerTab) {
   closeChatActionsMenu();
   const modal = document.getElementById('settings-modal');
+  selectSettingsTab(tab, providerTab);
   const themeSelect = document.getElementById('theme-select');
   if (themeSelect) {
     themeSelect.value = readLocalStorage(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
@@ -1339,12 +1443,19 @@ export function openSettingsModal() {
   syncFontScaleSelect();
   syncPwaAppNameInput();
   syncDefaultSessionWorkspaceRootInput();
+  void syncCopilotSettingsInputs();
   openAISettingsInputsDirty = false;
   ensureOpenAISettingsInputTracking();
   void syncOpenAISettingsInputs();
   claudeSettingsInputsDirty = false;
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();
+  void refreshClaudeAuthSection();
+  void refreshGrokAuthSection();
+  // Forced: the cached rows can be 30s stale, and a CLI installed from a shell
+  // in the meantime should show up the moment the panel opens. Sockets keep it
+  // current from here on.
+  void refreshCliInstallSections({ force: true });
   grokSettingsInputsDirty = false;
   ensureGrokSettingsInputTracking();
   void syncGrokSettingsInputs();

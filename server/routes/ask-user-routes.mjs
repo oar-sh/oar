@@ -15,13 +15,6 @@ function normalizeId(value) {
   return text || null;
 }
 
-function normalizeTimeoutMs(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return null;
-  const timeoutMs = Math.max(0, Math.trunc(numeric));
-  return timeoutMs;
-}
-
 function resolveNestedValue(source, keyPath) {
   let current = source;
   for (const key of keyPath) {
@@ -186,7 +179,9 @@ export function registerAskUserRoutes(app, deps) {
     const continuation = continuationRoutingEnabled
       ? extractContinuationOwnership(parsedQuestionRequest)
       : { continuationId: null, continuationQuestionId: null };
-    const expiresAt = questionExpiresAt(now, normalizeTimeoutMs(req.body.timeout_ms));
+    // questionExpiresAt normalizes: absent/junk falls back to the 8h default,
+    // explicit finite values (including 0) are honored.
+    const expiresAt = questionExpiresAt(now, req.body.timeout_ms);
 
     stmts.insertQuestion.run(
       questionId,

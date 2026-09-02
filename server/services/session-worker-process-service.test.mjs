@@ -36,12 +36,47 @@ test('process inspector recognizes node session worker processes by session id',
       return Buffer.from([
         `104 1 node node /x/server/claude-worker/claude-session-worker.mjs --session-id claude-1`,
         `105 1 node node /x/server/cursor-worker/cursor-session-worker.mjs --session-id abc`,
+        `107 1 node node /x/server/grok-worker/grok-session-worker.mjs --session-id grok-1`,
       ].join('\n'));
     },
   });
 
   assert.equal(inspector.findProcessForSession('claude-1')?.processId, 104);
   assert.equal(inspector.findProcessForSession('abc')?.processId, 105);
+  // grok-session-worker was missing from the marker list until 2026-08-31 —
+  // same class of miss as the tmux-server bug: kill no-ops, duplicate spawns.
+  assert.equal(inspector.findProcessForSession('grok-1')?.processId, 107);
+});
+
+test('process inspector recognizes the copilot SDK engine worker', () => {
+  // It carries none of the copilot CLI markers (no --allow-all, no
+  // @github/copilot path), so without its own arm the kill route no-ops and
+  // process reuse spawns a duplicate worker every turn.
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'linux',
+    execFileSyncImpl: () => Buffer.from([
+      `106 1 node node /x/server/copilot-worker/copilot-sdk-session-worker.mjs --session-id sdk-1`,
+    ].join('\n')),
+  });
+
+  assert.equal(inspector.findProcessForSession('sdk-1')?.processId, 106);
+});
+
+test('the tmux server is still excluded when it adopted an SDK worker argv', () => {
+  // The new arm must not reopen the tmux-server match: the server keeps the
+  // argv of whichever session started it, and killing it tears down every
+  // tmux-hosted worker on the socket.
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'linux',
+    execFileSyncImpl: () => Buffer.from([
+      `304 1 tmux: server tmux new-session -d -s sdk-2 sh -lc exec 'node' '/x/server/copilot-worker/copilot-sdk-session-worker.mjs' --session-id 'sdk-2'`,
+      `305 1 tmux tmux new-session -d -s sdk-2 sh -lc exec 'node' '/x/server/copilot-worker/copilot-sdk-session-worker.mjs' --session-id 'sdk-2'`,
+      `306 304 node node /x/server/copilot-worker/copilot-sdk-session-worker.mjs --session-id sdk-2`,
+    ].join('\n')),
+  });
+
+  const matches = inspector.findProcessesForSession('sdk-2');
+  assert.deepEqual(matches.map((proc) => proc.processId), [306]);
 });
 
 test('process inspector ignores relay server process on linux path form', () => {
@@ -59,6 +94,30 @@ test('process inspector ignores relay server process on linux path form', () => 
 
   const matches = inspector.findProcessesForSession('abc-123');
   assert.deepEqual(matches.map((proc) => proc.processId), [202]);
+});
+
+test('process inspector never matches the shared tmux server for a session id', () => {
+  // The tmux server adopts the argv of the first `tmux new-session` that
+  // started it, so its command line carries that session's id and worker
+  // script path forever. Killing it would destroy every tmux-hosted worker.
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'linux',
+    execFileSyncImpl(command, args) {
+      assert.equal(command, 'ps');
+      assert.deepEqual(args, ['-eo', 'pid=,ppid=,comm=,args=', '-ww']);
+      return Buffer.from([
+        // comm "tmux: server" splits into name "tmux:" + cmd "server tmux ..."
+        `301 1 tmux: server tmux new-session -d -s sess-1 sh -lc export FOO='bar'; exec 'node' '/x/server/claude-worker/claude-session-worker.mjs' --session-id 'sess-1'`,
+        // A plain tmux client invocation carrying the same session id.
+        `302 1 tmux tmux new-session -d -s sess-1 sh -lc exec 'node' '/x/server/claude-worker/claude-session-worker.mjs' --session-id 'sess-1'`,
+        // The actual worker for the session — the only legitimate match.
+        `303 301 node node /x/server/claude-worker/claude-session-worker.mjs --session-id sess-1`,
+      ].join('\n'));
+    },
+  });
+
+  const matches = inspector.findProcessesForSession('sess-1');
+  assert.deepEqual(matches.map((proc) => proc.processId), [303]);
 });
 
 test('process inspector ignores relay server process on windows path form', () => {

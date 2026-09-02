@@ -2,6 +2,16 @@
 
 This document covers day-to-day development workflows for the web relay and Copilot CLI extension.
 
+## Naming: OAR vs "copilot"
+
+The product is **OAR — Open Agent Relay** (`@oar-sh/oar`, binary `oar`). Write it
+`OAR` in prose and `oar` in code. Many internals deliberately still say
+"copilot": the `COPILOT_WEB_RELAY_*` env vars, `.copilot/`-derived host paths,
+DB tables, cookies, and `server/data/copilot.db` either address the real GitHub
+Copilot CLI's contracts or are invisible identifiers whose rename would only buy
+a migration. Do not "fix" them in passing — the deferred rename list lives in
+`docs/plans/oar-rebrand-and-release.md` §11.
+
 ## Runtime ownership
 
 Everything starts the same way — `node server/server.js` (which is all `npm start` does).
@@ -84,6 +94,50 @@ Useful overrides: `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary),
 `COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH` (worker script location),
 `COPILOT_WEB_RELAY_CONFIG` (relay config used to resolve the server URL and auth token).
 
+### Copilot SDK workers
+
+With **Settings → Providers → Copilot → Copilot engine** set to *SDK*, Copilot conversations run
+`server/copilot-worker/copilot-sdk-session-worker.mjs` as a plain Node process instead of a Copilot
+CLI session — same shape as the Claude worker, and with the same `[copilot-sdk-worker …]` log lines
+under `tmux attach`. There is **no TUI to inspect**: the worker drives the CLI's bundled SDK runtime
+headlessly, so the tmux inspector shows the worker's own log, not a Copilot session. The default
+engine (*Extension*) is unaffected.
+
+Prerequisite: `COPILOT_SDK_PATH` must point at the `copilot-sdk` directory inside an installed
+Copilot CLI bundle. The relay derives it once at boot from the extension bootstrap path, which is
+why installing the CLI while the relay is running does not help until it restarts — the same fact
+the settings panel reports when it refuses the engine.
+
+Run the worker manually against a live relay:
+
+```bash
+COPILOT_WEB_RELAY_WORKER_KIND=copilot-sdk \
+COPILOT_SDK_PATH=~/.cache/copilot/pkg/linux-x64/<version>/copilot-sdk \
+COPILOT_WORKSPACE_ROOT=/path/to/workspace \
+COPILOT_RELAY_MODEL=gpt-5.4-mini \
+node server/copilot-worker/copilot-sdk-session-worker.mjs --session-id <sdk-session-id>
+```
+
+Useful overrides: `COPILOT_WEB_RELAY_CLI_EXECUTABLE` (explicit `copilot` binary for the runtime
+spawn), `COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH` (worker script location),
+`COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS` (runtime idle close, default 10 min),
+`COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS` (stall watchdog, default 120 s, `0` disables),
+`COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS` (how long live detached shells alone may hold the
+runtime open, default 30 min, `0` = no limit).
+
+That last one is deliberately **not** the relay's *Background task timeout* slider, even though the
+slider's value already rides every delivery payload. The slider governs Claude's background tasks —
+which the composer lists and can stop — and defaults to `0`/unlimited. A Copilot detached shell
+(`bash{mode:"async", detach:true}`) has no relay-side listing and no host-side stop RPC, so consuming
+the slider would make "one forgotten `sleep 99999` pins a runtime subprocess forever" the default,
+with nothing in the UI to reveal it. Stopping the runtime kills its detached children, so the cap is
+a real trade: too low cuts a command short, too high leaks a process. 30 minutes is well past any
+timer a user sits and waits for.
+
+Live testing spends real Copilot quota: **`gpt-5.4-mini` is the only sanctioned model for live
+relay tests**, per the standing live-testing policy, and only with the user's explicit go-ahead.
+Everything else belongs in the unit suites, which drive the worker against a fake SDK client.
+
 ## Tests
 
 ### Node version
@@ -118,7 +172,7 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **1608 pass / 0 fail / 4 skip on Windows**, **1612 pass / 0 fail / 0 skip on Linux**.
+Expected: **2467 pass / 0 fail / 4 skip on Windows**, **2471 pass / 0 fail / 0 skip on Linux**.
 The 4 Windows skips are host-gated (0600 file modes, symlinks) and run on Linux.
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
@@ -143,12 +197,37 @@ node --test server/services/context-usage-view.test.mjs
 npm run test:e2e
 ```
 
+Expected on Linux: **110 passed / 0 failed / 3 skipped** (the 3 are host-gated). Two question-card
+tests in `relay-question-ui.spec.mjs` (`:82` and `:386`) are **known flaky** and usually pass on
+Playwright's single retry; across five full runs they failed 0–2 times each with no relation to what
+else was in the suite. Treat a failure there as flake only after re-running — anything else failing
+is a regression.
+
 The e2e runner spawns its own `server.js` on a free port with an isolated state directory
 (`COPILOT_WEB_RELAY_DATA_DIR` + `COPILOT_WEB_RELAY_CONFIG` pointed at a temp dir), so it can
-run alongside a live relay without touching its database, singleton lock, or config. The test
-server also runs with `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1`, so it never launches real
-Copilot CLI clients or Claude workers; set `RELAY_E2E_ALLOW_CLI=1` explicitly (with user
-permission) if a run genuinely needs live turns.
+run alongside a live relay without touching its database, singleton lock, or config. `HOME`,
+`USERPROFILE`, `COPILOT_SESSION_STATE_DIR` and `CLAUDE_CONFIG_DIR` are redirected into the
+same temp root, so no host provider state (Copilot sessions, Claude credentials) is visible
+to it. The test server also runs with `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1`, so it never
+launches real Copilot CLI clients, Claude workers, or `claude auth login/logout/status` —
+every one of those spawn paths refuses outright; set `RELAY_E2E_ALLOW_CLI=1` explicitly (with
+user permission) if a run genuinely needs live turns (even then the auth subcommands are
+pointed at `server/services/fixtures/claude-auth-stub.sh`, never the real CLI).
+
+Three provider-CLI surfaces are stubbed the same way, each behind a **pair** of variables so the
+kill switch can never be bypassed into running a real binary: `claude auth *`
+(`COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN` + `…_CLAUDE_AUTH_ALLOW_STUB_SPAWN`), the CLI installers
+(`COPILOT_WEB_RELAY_CLI_INSTALL_COMMAND` + `…_CLI_INSTALL_ALLOW_STUB_SPAWN`, pointed at
+`cli-install-stub.sh`), and `grok login/logout` (`GROK_CLI_COMMAND` +
+`…_GROK_AUTH_ALLOW_STUB_SPAWN`, pointed at `grok-stub.sh`).
+
+**`COPILOT_WEB_RELAY_CLI_BIN_DIR` is the one that matters most.** Provider-CLI *detection* walks
+`PATH`, and an isolated relay still inherits the host's `PATH` — it has to, it runs `node` — so
+without this pin `/api/cli/status` reports the developer's own `grok`/`claude`/`copilot`, and with
+the install stub enabled it would run them. The variable **replaces** `PATH` and the descriptors'
+own bin directories rather than being preferred over them, and every test relay gets it pointed at
+an empty directory inside its temp state root. Specs seed a fake binary there to mean "already
+installed"; a spec must never see, run, or modify a host install.
 
 Extra arguments are forwarded to Playwright, so a single spec can be run in isolation:
 
@@ -160,6 +239,17 @@ Specs must resolve the relay URL, auth token, and database exclusively through
 `tests/e2e-env.mjs` (fed by `run-e2e.mjs` via `PLAYWRIGHT_BASE_URL`, `RELAY_TEST_TOKEN`,
 `RELAY_TEST_DATA_DIR`). Never read `server/config.json`, open `server/data/copilot.db`, or
 target `http://127.0.0.1:3333` from a spec — those belong to the live relay.
+
+That isolation env lives in `tests/relay-server-harness.mjs` (`startRelayServer`), which
+`run-e2e.mjs` calls for the server every spec shares. It also pins session-worker routing off and
+`COPILOT_SDK_PATH` at a stub directory, so a relay's answer never depends on what the host has
+installed. A spec that needs a *differently configured* relay boots its own throwaway one from the
+same helper rather than copying the env block — `tests/copilot-engine.spec.mjs` does this to test
+the Copilot SDK engine's accept path, which the shared server's routing pin makes unreachable, and
+`tests/cli-install.spec.mjs` because a successful install rewrites that relay's `config.json`, binds
+`GROK_CLI_COMMAND` into its process env and hoists its `PATH` — none of which the shared server's
+other specs should inherit.
+Keep that rare: it costs a server boot per relay.
 
 ### Live smoke tests
 

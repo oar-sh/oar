@@ -40,6 +40,32 @@ export function toTrimmedString(value) {
   return text || null;
 }
 
+/** The first candidate that is a finite number, or null when none is. */
+export function pickNumber(...candidates) {
+  for (const candidate of candidates) {
+    const value = toFiniteNumber(candidate);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+/**
+ * Like `pickNumber`, but a negative result reads as "not reported".
+ *
+ * Token counts, costs, call counts and durations are all non-negative by
+ * definition, and every one of these numbers arrives from a WORKER over HTTP —
+ * so a negative is either a bug or a poster trying to decrement a ledger.
+ * Rejecting is strictly better than booking it.
+ *
+ * Note the ordering: the first FINITE candidate wins and is then checked, so a
+ * negative does not silently fall through to the next candidate — the payload
+ * said something about this field and what it said was nonsense.
+ */
+export function pickNonNegative(...candidates) {
+  const value = pickNumber(...candidates);
+  return value === null || value < 0 ? null : value;
+}
+
 /** ISO-8601 passthrough that rejects unparseable timestamps instead of rendering "Invalid Date". */
 export function toIsoTimestamp(value) {
   const text = toTrimmedString(value);

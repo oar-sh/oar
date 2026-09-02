@@ -1,0 +1,647 @@
+[
+  {
+    "type": "session.start",
+    "data": {
+      "sessionId": "cfbfe9c2-2bcc-4288-8732-1a7016230285",
+      "version": 1,
+      "producer": "copilot-agent",
+      "copilotVersion": "0.0.0",
+      "startTime": "2026-08-31T09:19:57.338Z",
+      "selectedModel": "gpt-5.4-mini",
+      "contextTier": null,
+      "context": {
+        "cwd": "/tmp/relay-fixture-workspace"
+      },
+      "remoteSteerable": false,
+      "alreadyInUse": false
+    },
+    "id": "292e9a9d-151e-4cba-af51-b9765007c9ca",
+    "timestamp": "2026-08-31T09:19:57.350Z",
+    "parentId": null
+  },
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "e943fc25-2e19-43ed-be74-1aab55306ba2",
+    "timestamp": "2026-08-31T09:19:57.924Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "af5716f4-4753-466e-b8e1-b85efb173a1c",
+    "timestamp": "2026-08-31T09:19:57.927Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "session.title_changed",
+    "data": {
+      "title": "Reply with exactly: SPIKE_OK"
+    },
+    "ephemeral": true,
+    "id": "e0c69cd4-4c51-46be-8b5a-1133e1765e3e",
+    "timestamp": "2026-08-31T09:19:57.929Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "session.mcp_server_status_changed",
+    "data": {
+      "serverName": "github-mcp-server",
+      "status": "pending"
+    },
+    "ephemeral": true,
+    "id": "a3409b34-2c8d-47db-953e-ceaa4b003dac",
+    "timestamp": "2026-08-31T09:19:57.950Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "session.mcp_server_status_changed",
+    "data": {
+      "serverName": "github-mcp-server",
+      "status": "connected"
+    },
+    "ephemeral": true,
+    "id": "5f6c4bcb-06a4-4ceb-976d-560776acad64",
+    "timestamp": "2026-08-31T09:19:58.282Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "session.mcp_servers_loaded",
+    "data": {
+      "servers": [
+        {
+          "name": "github-mcp-server",
+          "status": "connected",
+          "source": "builtin"
+        }
+      ]
+    },
+    "ephemeral": true,
+    "id": "382d5f71-ebec-4ebd-ae93-eb9d665cc817",
+    "timestamp": "2026-08-31T09:19:58.283Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "session.tools_updated",
+    "data": {
+      "model": "gpt-5.4-mini"
+    },
+    "ephemeral": true,
+    "id": "86d388e6-983e-4f5e-9533-ce85a79d3f35",
+    "timestamp": "2026-08-31T09:19:58.550Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "user.message",
+    "data": {
+      "content": "Reply with exactly: SPIKE_OK",
+      "transformedContent": "<current_datetime>2026-08-31T09:19:58.551+00:00</current_datetime>\n\nReply with exactly: SPIKE_OK",
+      "supportedNativeDocumentMimeTypes": [],
+      "delivery": "idle",
+      "interactionId": "60012371-4417-49c5-ba47-6acfdc1d7ef4",
+      "turnId": "0",
+      "parentAgentTaskId": "0b255c6c-fe4c-4f07-9125-b40d1113e50c"
+    },
+    "id": "e896df04-78f0-4925-8a20-9df1570217e7",
+    "timestamp": "2026-08-31T09:19:58.551Z",
+    "parentId": "292e9a9d-151e-4cba-af51-b9765007c9ca"
+  },
+  {
+    "type": "model.turn_started",
+    "data": {
+      "kind": "turn_started",
+      "model": "gpt-5.4-mini",
+      "modelInfo": {
+        "billing": {
+          "auto_discount": 0.3,
+          "restricted_to": [
+            "pro",
+            "pro_plus",
+            "individual_trial",
+            "edu",
+            "business",
+            "enterprise",
+            "max"
+          ],
+          "token_prices": {
+            "batch_size": 1000000,
+            "default": {
+              "cache_read_price": 7.5,
+              "cache_write_price": 0,
+              "input_price": 75,
+              "max_prompt_tokens": 272000,
+              "output_price": 450
+            }
+          }
+        },
+        "capabilities": {
+          "family": "gpt-5.4-mini",
+          "limits": {
+            "max_context_window_tokens": 400000,
+            "max_output_tokens": 128000,
+            "max_prompt_tokens": 272000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/gif",
+                "application/pdf"
+              ]
+            }
+          },
+          "object": "model_capabilities",
+          "supports": {
+            "parallel_tool_calls": true,
+            "reasoning_effort": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ],
+            "streaming": true,
+            "structured_outputs": true,
+            "tool_calls": true,
+            "vision": true,
+            "adaptive_thinking": "unsupported"
+          },
+          "tokenizer": "o200k_base",
+          "type": "chat"
+        },
+        "id": "gpt-5.4-mini",
+        "is_chat_default": false,
+        "is_chat_fallback": false,
+        "model_picker_category": "lightweight",
+        "model_picker_enabled": true,
+        "model_picker_price_category": "low",
+        "name": "GPT-5.4 mini",
+        "object": "model",
+        "policy": {
+          "state": "enabled",
+          "terms": "Enable access to the latest GPT-5.4 mini model from OpenAI. [Learn more about how GitHub Copilot serves GPT-5.4 mini](https://gh.io/copilot-openai)."
+        },
+        "preview": false,
+        "supported_endpoints": [
+          "/responses",
+          "ws:/responses"
+        ],
+        "vendor": "OpenAI",
+        "version": "gpt-5.4-mini",
+        "warning_messages": [
+          {
+            "code": "model_degraded_github",
+            "message": "GPT-5.4 mini is currently experiencing issues. We are actively working to resolve the issue. In the meantime, you might want to use a different model."
+          }
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788167998555
+    },
+    "ephemeral": true,
+    "id": "1745da3d-388f-4ad5-9614-7e668e9e7a66",
+    "timestamp": "2026-08-31T09:19:58.555Z",
+    "parentId": "b1c32be5-9368-423f-aec9-e896a1b3ef12"
+  },
+  {
+    "type": "assistant.turn_start",
+    "data": {
+      "turnId": "0",
+      "interactionId": "60012371-4417-49c5-ba47-6acfdc1d7ef4"
+    },
+    "id": "e5a21d39-3682-4d6f-af7f-355bd4f9e591",
+    "timestamp": "2026-08-31T09:19:58.555Z",
+    "parentId": "b1c32be5-9368-423f-aec9-e896a1b3ef12"
+  },
+  {
+    "type": "session.usage_info",
+    "ephemeral": true,
+    "data": {
+      "tokenLimit": 272000,
+      "currentTokens": 14698,
+      "messagesLength": 2,
+      "systemTokens": 6861,
+      "conversationTokens": 37,
+      "toolDefinitionsTokens": 7800,
+      "isInitial": true
+    },
+    "id": "6a6cf80d-1f4a-4b0f-8cde-c3cf42b6c1c2",
+    "timestamp": "2026-08-31T09:19:58.575Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "model.call_start",
+    "data": {
+      "turnId": "0",
+      "model": "gpt-5.4-mini"
+    },
+    "ephemeral": true,
+    "id": "ea58064b-d35a-4dae-9d1b-989290f6402e",
+    "timestamp": "2026-08-31T09:19:58.579Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "model.model_call_started",
+    "data": {
+      "kind": "model_call_started",
+      "model": "gpt-5.4-mini",
+      "modelInfo": {
+        "billing": {
+          "auto_discount": 0.3,
+          "restricted_to": [
+            "pro",
+            "pro_plus",
+            "individual_trial",
+            "edu",
+            "business",
+            "enterprise",
+            "max"
+          ],
+          "token_prices": {
+            "batch_size": 1000000,
+            "default": {
+              "cache_read_price": 7.5,
+              "cache_write_price": 0,
+              "input_price": 75,
+              "max_prompt_tokens": 272000,
+              "output_price": 450
+            }
+          }
+        },
+        "capabilities": {
+          "family": "gpt-5.4-mini",
+          "limits": {
+            "max_context_window_tokens": 400000,
+            "max_output_tokens": 128000,
+            "max_prompt_tokens": 272000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/gif",
+                "application/pdf"
+              ]
+            }
+          },
+          "object": "model_capabilities",
+          "supports": {
+            "parallel_tool_calls": true,
+            "reasoning_effort": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ],
+            "streaming": true,
+            "structured_outputs": true,
+            "tool_calls": true,
+            "vision": true,
+            "adaptive_thinking": "unsupported"
+          },
+          "tokenizer": "o200k_base",
+          "type": "chat"
+        },
+        "id": "gpt-5.4-mini",
+        "is_chat_default": false,
+        "is_chat_fallback": false,
+        "model_picker_category": "lightweight",
+        "model_picker_enabled": true,
+        "model_picker_price_category": "low",
+        "name": "GPT-5.4 mini",
+        "object": "model",
+        "policy": {
+          "state": "enabled",
+          "terms": "Enable access to the latest GPT-5.4 mini model from OpenAI. [Learn more about how GitHub Copilot serves GPT-5.4 mini](https://gh.io/copilot-openai)."
+        },
+        "preview": false,
+        "supported_endpoints": [
+          "/responses",
+          "ws:/responses"
+        ],
+        "vendor": "OpenAI",
+        "version": "gpt-5.4-mini",
+        "warning_messages": [
+          {
+            "code": "model_degraded_github",
+            "message": "GPT-5.4 mini is currently experiencing issues. We are actively working to resolve the issue. In the meantime, you might want to use a different model."
+          }
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788167998579
+    },
+    "ephemeral": true,
+    "id": "1fab6b71-4cf2-4dd9-b89b-11ef68e09606",
+    "timestamp": "2026-08-31T09:19:58.579Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "model.call_failure",
+    "data": {
+      "model": "gpt-5.4-mini",
+      "apiCallId": "00000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "providerCallId": "AAAA:BBBBBB:CCCCCCC:DDDDDDD:EEEEEEEE",
+      "serviceRequestId": "11111111-2222-3333-4444-555555555555",
+      "statusCode": 402,
+      "durationMs": 990,
+      "apiEndpoint": "/responses",
+      "transport": "http",
+      "failureKind": "api",
+      "maxPromptTokens": 272000,
+      "maxOutputTokens": 128000,
+      "isByok": false,
+      "isAuto": false,
+      "reasoningEffort": "medium",
+      "interactionType": "conversation-agent",
+      "rte": true,
+      "source": "top_level",
+      "errorMessage": "{\"message\":\"You have exceeded your monthly quota\",\"code\":\"quota_exceeded\"}",
+      "requestFingerprint": {
+        "messageCount": 2,
+        "toolResultMessageCount": 0,
+        "toolCallCount": 0,
+        "namelessToolCallCount": 0,
+        "imagePartCount": 0,
+        "imagePartsMissingMediaType": 0,
+        "lastMessageRole": "user"
+      },
+      "quotaSnapshots": {
+        "cfi_overage": {
+          "isUnlimitedEntitlement": false,
+          "entitlementRequests": 0,
+          "usedRequests": 0,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 10000,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 0,
+          "resetDate": "2026-09-01T00:00:00Z"
+        },
+        "premium_interactions": {
+          "isUnlimitedEntitlement": false,
+          "entitlementRequests": 20000,
+          "usedRequests": 20000,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 10000,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 0,
+          "overageEntitlement": 0,
+          "resetDate": "2026-09-01T00:00:00Z"
+        },
+        "chat": {
+          "isUnlimitedEntitlement": true,
+          "entitlementRequests": -1,
+          "usedRequests": 0,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 0,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 100,
+          "resetDate": "2026-09-01T00:00:00Z"
+        },
+        "completions": {
+          "isUnlimitedEntitlement": true,
+          "entitlementRequests": -1,
+          "usedRequests": 0,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 0,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 100,
+          "resetDate": "2026-09-01T00:00:00Z"
+        }
+      }
+    },
+    "ephemeral": true,
+    "id": "e547f25c-15aa-4123-9769-0dee7ea94ff3",
+    "timestamp": "2026-08-31T09:19:59.571Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "model.model_call_failure",
+    "data": {
+      "kind": "model_call_failure",
+      "turn": 0,
+      "modelCallDurationMs": 990,
+      "modelCall": {
+        "model": "gpt-5.4-mini",
+        "status": 402,
+        "error": "{\"message\":\"You have exceeded your monthly quota\",\"code\":\"quota_exceeded\"}",
+        "api_id": "00000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "request_id": "AAAA:BBBBBB:CCCCCCC:DDDDDDD:EEEEEEEE",
+        "api_endpoint": "/responses",
+        "transport": "http",
+        "failure_kind": "api",
+        "service_request_id": "11111111-2222-3333-4444-555555555555",
+        "rte": true
+      },
+      "rte": true,
+      "quotaSnapshots": {
+        "cfi_overage": {
+          "isUnlimitedEntitlement": false,
+          "entitlementRequests": 0,
+          "usedRequests": 0,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 10000,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 0,
+          "resetDate": "2026-09-01T00:00:00Z"
+        },
+        "premium_interactions": {
+          "isUnlimitedEntitlement": false,
+          "entitlementRequests": 20000,
+          "usedRequests": 20000,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 10000,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 0,
+          "resetDate": "2026-09-01T00:00:00Z",
+          "overageEntitlement": 0
+        },
+        "chat": {
+          "isUnlimitedEntitlement": true,
+          "entitlementRequests": -1,
+          "usedRequests": 0,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 0,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 100,
+          "resetDate": "2026-09-01T00:00:00Z"
+        },
+        "completions": {
+          "isUnlimitedEntitlement": true,
+          "entitlementRequests": -1,
+          "usedRequests": 0,
+          "usageAllowedWithExhaustedQuota": false,
+          "overage": 0,
+          "overageAllowedWithExhaustedQuota": false,
+          "remainingPercentage": 100,
+          "resetDate": "2026-09-01T00:00:00Z"
+        }
+      },
+      "reasoningEffort": "medium"
+    },
+    "ephemeral": true,
+    "id": "6ad70c7e-e933-4ab5-aa8b-8401d3b68f68",
+    "timestamp": "2026-08-31T09:19:59.573Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "model.call_finished",
+    "data": {
+      "turnId": "0",
+      "dispatchDurationMs": 990,
+      "outcome": "error",
+      "editClassifierVersion": 1,
+      "interactionId": "60012371-4417-49c5-ba47-6acfdc1d7ef4"
+    },
+    "ephemeral": true,
+    "id": "e09a9cbb-a8d5-4724-b85e-f78f705a7a37",
+    "timestamp": "2026-08-31T09:19:59.573Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "model.turn_failed",
+    "data": {
+      "kind": "turn_failed",
+      "model": "gpt-5.4-mini",
+      "modelInfo": {
+        "id": "gpt-5.4-mini"
+      },
+      "turn": 0,
+      "timestampMs": 1788167999574,
+      "error": "402 You have exceeded your monthly quota"
+    },
+    "ephemeral": true,
+    "id": "ea549f0c-1cbd-4d40-b5da-8ce3ca2e2c4b",
+    "timestamp": "2026-08-31T09:19:59.574Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "model.turn_ended",
+    "data": {
+      "kind": "turn_ended",
+      "model": "gpt-5.4-mini",
+      "modelInfo": {
+        "billing": {
+          "auto_discount": 0.3,
+          "restricted_to": [
+            "pro",
+            "pro_plus",
+            "individual_trial",
+            "edu",
+            "business",
+            "enterprise",
+            "max"
+          ],
+          "token_prices": {
+            "batch_size": 1000000,
+            "default": {
+              "cache_read_price": 7.5,
+              "cache_write_price": 0,
+              "input_price": 75,
+              "max_prompt_tokens": 272000,
+              "output_price": 450
+            }
+          }
+        },
+        "capabilities": {
+          "family": "gpt-5.4-mini",
+          "limits": {
+            "max_context_window_tokens": 400000,
+            "max_output_tokens": 128000,
+            "max_prompt_tokens": 272000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/gif",
+                "application/pdf"
+              ]
+            }
+          },
+          "object": "model_capabilities",
+          "supports": {
+            "parallel_tool_calls": true,
+            "reasoning_effort": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ],
+            "streaming": true,
+            "structured_outputs": true,
+            "tool_calls": true,
+            "vision": true,
+            "adaptive_thinking": "unsupported"
+          },
+          "tokenizer": "o200k_base",
+          "type": "chat"
+        },
+        "id": "gpt-5.4-mini",
+        "is_chat_default": false,
+        "is_chat_fallback": false,
+        "model_picker_category": "lightweight",
+        "model_picker_enabled": true,
+        "model_picker_price_category": "low",
+        "name": "GPT-5.4 mini",
+        "object": "model",
+        "policy": {
+          "state": "enabled",
+          "terms": "Enable access to the latest GPT-5.4 mini model from OpenAI. [Learn more about how GitHub Copilot serves GPT-5.4 mini](https://gh.io/copilot-openai)."
+        },
+        "preview": false,
+        "supported_endpoints": [
+          "/responses",
+          "ws:/responses"
+        ],
+        "vendor": "OpenAI",
+        "version": "gpt-5.4-mini",
+        "warning_messages": [
+          {
+            "code": "model_degraded_github",
+            "message": "GPT-5.4 mini is currently experiencing issues. We are actively working to resolve the issue. In the meantime, you might want to use a different model."
+          }
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788167999574
+    },
+    "ephemeral": true,
+    "id": "31a73ca6-8f9c-4f91-9264-fd5c46329b4f",
+    "timestamp": "2026-08-31T09:19:59.574Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "assistant.turn_end",
+    "data": {
+      "turnId": "0"
+    },
+    "id": "8d8df7f7-8ed4-423c-923d-533d60188007",
+    "timestamp": "2026-08-31T09:19:59.575Z",
+    "parentId": "e5a21d39-3682-4d6f-af7f-355bd4f9e591"
+  },
+  {
+    "type": "session.error",
+    "data": {
+      "errorType": "quota",
+      "message": "You have exceeded your monthly quota (Request ID: AAAA:BBBBBB:CCCCCCC:DDDDDDD:EEEEEEEE)",
+      "statusCode": 402,
+      "providerCallId": "AAAA:BBBBBB:CCCCCCC:DDDDDDD:EEEEEEEE",
+      "serviceRequestId": "11111111-2222-3333-4444-555555555555",
+      "errorCode": "quota_exceeded"
+    },
+    "id": "5be332ba-a0f1-4033-9c2f-fa59249d2a43",
+    "timestamp": "2026-08-31T09:19:59.576Z",
+    "parentId": "8d8df7f7-8ed4-423c-923d-533d60188007"
+  }
+]

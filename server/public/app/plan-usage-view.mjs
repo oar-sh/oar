@@ -28,6 +28,44 @@ const SOURCE_LABELS = Object.freeze(Object.assign(Object.create(null), {
   manual: 'Estimated',
 }));
 
+/** Short tab captions; the card keeps the long label ("GitHub Copilot"). */
+const TAB_LABELS = Object.freeze(Object.assign(Object.create(null), {
+  github: 'Copilot',
+  claude: 'Claude',
+  cursor: 'Cursor',
+  grok: 'Grok',
+}));
+
+// The composer speaks 'github'/'openai'/… while the usage report keys Copilot as
+// 'github'; fold the spellings that mean the same provider onto one id so a
+// session's provider can be matched against a card.
+const PROVIDER_ALIASES = Object.freeze(Object.assign(Object.create(null), {
+  copilot: 'github',
+  'github-copilot': 'github',
+  'copilot-github': 'github',
+}));
+
+/** @returns {string} the canonical usage-card id for a provider spelling. */
+export function normalizeUsageProvider(value) {
+  const key = String(value ?? '').trim().toLowerCase();
+  if (!key) return '';
+  return PROVIDER_ALIASES[key] || key;
+}
+
+/**
+ * Which tab opens selected: the requested provider when it has a card (so a
+ * Claude session lands on Claude), otherwise the first card — 'openai' sessions
+ * have no card of their own and must not open onto an empty modal.
+ */
+export function resolveActiveUsageProvider(providers, activeProvider = '') {
+  const ids = (Array.isArray(providers) ? providers : [])
+    .filter(Boolean)
+    .map((card) => normalizeUsageProvider(card.provider));
+  const wanted = normalizeUsageProvider(activeProvider);
+  if (wanted && ids.includes(wanted)) return wanted;
+  return ids[0] || '';
+}
+
 function toNullableNumber(value) {
   if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
@@ -96,7 +134,11 @@ export function meterSummaryText(meter) {
   if (allowance !== null && used !== null) {
     const parts = [`${used} of ${allowance} used`];
     if (remaining !== null) {
-      parts.push(toNullableNumber(meter.remaining) < 0 ? `${remaining} over` : `${remaining} left`);
+      const remainingNumber = toNullableNumber(meter.remaining);
+      // Overage reads as a magnitude ("9989 over"), not a signed value.
+      parts.push(remainingNumber < 0
+        ? `${formatAmount(Math.abs(remainingNumber), unit)} over`
+        : `${remaining} left`);
     }
     return parts.join(' · ');
   }
@@ -151,7 +193,29 @@ function renderDetailSection(section) {
   `;
 }
 
-function renderCard(card, now) {
+/**
+ * The signed-in account under the card title. Three distinct states, because
+ * "we could not ask" must not be drawn as "you are logged out": no `account`
+ * key renders nothing at all, `{loggedIn:false}` says so, anything else shows
+ * whatever identity we have.
+ */
+function renderAccountLine(account) {
+  if (!account || typeof account !== 'object') return '';
+  if (account.loggedIn === false) {
+    return '<span class="plan-usage-account plan-usage-account-signed-out">Not logged in</span>';
+  }
+  const parts = [account.email, account.plan]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean);
+  if (!parts.length) {
+    return account.loggedIn === true
+      ? '<span class="plan-usage-account">Logged in</span>'
+      : '';
+  }
+  return `<span class="plan-usage-account">${parts.map(escapeHtml).join(' · ')}</span>`;
+}
+
+function renderCard(card, now, { active = true } = {}) {
   const meters = Array.isArray(card.meters) ? card.meters : [];
   const details = Array.isArray(card.details) ? card.details : [];
   const links = Array.isArray(card.links) ? card.links : [];
@@ -179,10 +243,14 @@ function renderCard(card, now) {
     ? `Updated ${escapeHtml(String(card.capturedAt).replace('T', ' ').slice(0, 16))} UTC`
     : '';
 
+  const panelId = normalizeUsageProvider(card.provider);
   return `
-    <section class="plan-usage-card plan-usage-card-${escapeHtml(card.provider)}" data-provider="${escapeHtml(card.provider)}" data-status="${escapeHtml(card.status)}">
+    <section class="plan-usage-card plan-usage-card-${escapeHtml(card.provider)}" data-provider="${escapeHtml(card.provider)}" data-usage-panel="${escapeHtml(panelId)}" data-status="${escapeHtml(card.status)}" role="tabpanel" id="plan-usage-panel-${escapeHtml(panelId)}" aria-labelledby="plan-usage-tab-${escapeHtml(panelId)}" tabindex="0"${active ? '' : ' hidden'}>
       <header class="plan-usage-card-head">
-        <span class="plan-usage-card-title">${escapeHtml(card.label)}</span>
+        <span class="plan-usage-card-titles">
+          <span class="plan-usage-card-title">${escapeHtml(card.label)}</span>
+          ${renderAccountLine(card.account)}
+        </span>
         <span class="plan-usage-badges">${badges}</span>
       </header>
       ${card.message ? `<div class="plan-usage-message">${escapeHtml(card.message)}</div>` : ''}
@@ -196,16 +264,30 @@ function renderCard(card, now) {
   `;
 }
 
+function renderTab(card, activeProvider) {
+  const id = normalizeUsageProvider(card.provider);
+  const active = id === activeProvider;
+  const label = TAB_LABELS[id] || card.label || id;
+  return `<button type="button" class="plan-usage-tab${active ? ' active' : ''}" role="tab" id="plan-usage-tab-${escapeHtml(id)}" aria-controls="plan-usage-panel-${escapeHtml(id)}" aria-selected="${active ? 'true' : 'false'}" tabindex="${active ? '0' : '-1'}" data-usage-tab="${escapeHtml(id)}">${escapeHtml(label)}</button>`;
+}
+
 /**
  * @param {object|null} report the `/api/usage` payload
  * @param {object} [options]
  * @param {Date} [options.now] injectable clock so countdowns are testable
+ * @param {string} [options.activeProvider] the session's provider; selects its
+ *   tab when that provider has a card
  * @returns {string} modal body HTML, or '' when there is nothing to render
  */
-export function renderPlanUsageHtml(report, { now = new Date() } = {}) {
+export function renderPlanUsageHtml(report, { now = new Date(), activeProvider = '' } = {}) {
   const providers = Array.isArray(report?.providers) ? report.providers.filter(Boolean) : [];
   if (!providers.length) return '';
-  return `<div class="plan-usage">${providers.map((card) => renderCard(card, now)).join('')}</div>`;
+  const active = resolveActiveUsageProvider(providers, activeProvider);
+  const tabs = providers.map((card) => renderTab(card, active)).join('');
+  const cards = providers
+    .map((card) => renderCard(card, now, { active: normalizeUsageProvider(card.provider) === active }))
+    .join('');
+  return `<div class="plan-usage"><div class="plan-usage-tab-strip" role="tablist" aria-label="Usage providers">${tabs}</div>${cards}</div>`;
 }
 
 /** Subtitle for the modal header: the healthiest available "what matters now" line. */

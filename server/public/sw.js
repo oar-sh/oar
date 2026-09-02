@@ -126,7 +126,7 @@ async function handlePushEvent(event) {
     action: `choice-${index}`,
     title: String(choice).slice(0, 40),
   }));
-  await self.registration.showNotification(payload?.title || 'Copilot Remote', {
+  await self.registration.showNotification(payload?.title || 'OAR', {
     body: payload?.body || '',
     tag: payload?.tag || undefined,
     // Carried so a delivery delayed by doze is not misread as current.

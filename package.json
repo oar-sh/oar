@@ -1,12 +1,39 @@
 {
-  "name": "copilot-remote",
-  "version": "1.0.0",
+  "name": "@oar-sh/oar",
+  "version": "0.9.0",
   "type": "module",
-  "description": "Web proxy for GitHub Copilot CLI — relay messages between browser and CLI",
+  "description": "OAR — Open Agent Relay: drive your local coding agents from any browser",
+  "license": "MIT",
+  "homepage": "https://oar.sh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oar-sh/oar.git"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
   "main": "server/server.js",
   "bin": {
-    "copilot-remote": "./bin/copilot-remote.js"
+    "oar": "./bin/oar.js"
   },
+  "files": [
+    "bin/",
+    "server/",
+    "!server/**/*.test.mjs",
+    "!server/data/",
+    "!server/logs/",
+    "!server/config.json",
+    "!server/uploads/",
+    "server/uploads/README.md",
+    "server/uploads/image_input.md",
+    "shared/",
+    "!shared/**/*.test.mjs",
+    ".github/extensions/web-relay/",
+    "!.github/extensions/web-relay/**/*.test.mjs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node server/server.js",
     "copilot:relay": "gh copilot -- --allow-all",
@@ -20,6 +47,7 @@
     "@cursor/sdk": "^1.0.27",
     "better-sqlite3": "^12.10.0",
     "express": "^4.18.2",
+    "qrcode-terminal": "^0.12.0",
     "socket.io": "^4.7.5",
     "uuid": "^14.0.0",
     "web-push": "^3.6.7",

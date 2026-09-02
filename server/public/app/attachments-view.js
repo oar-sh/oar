@@ -58,6 +58,7 @@ import {
   writeRepoBrowserHeavyPreference,
   writeRepoBrowserHiddenPreference,
 } from './repo-browser-preferences.mjs';
+import { joinLaunchCwdPath } from './launch-cwd-path.mjs';
 
 function currentConversationId() {
   return String(currentConvId || '').trim();
@@ -111,6 +112,14 @@ function takePendingRepoBrowserRestore() {
   const restore = pendingRepoBrowserRestore;
   pendingRepoBrowserRestore = null;
   return restore;
+}
+
+// Bumping the seq also invalidates any restore already in flight.
+function parkRepoBrowserRestore() {
+  pendingRepoBrowserRestore = {
+    path: String(repoBrowserState.currentPath || ''),
+    seq: (repoBrowserRefreshSeq += 1),
+  };
 }
 
 /**
@@ -1215,20 +1224,12 @@ export function normalizeRepoPath(pathValue) {
   return normalizeWorkspaceMentionPath(pathValue);
 }
 
-function joinWindowsPath(basePath, relativePath) {
-  const root = String(basePath || '').trim().replace(/[\\/]+$/, '');
-  const rel = String(relativePath || '').trim().replace(/^[\\/]+/, '').replace(/\//g, '\\');
-  if (!root) return rel;
-  if (!rel) return root;
-  return `${root}\\${rel}`;
-}
-
 export function getRepoBrowserLaunchCwdPath() {
   const currentPath = String(repoBrowserState.currentPath || '').trim();
   const activeWorkspaceRoot = currentWorkspaceRootPathForSelection();
   if (!currentPath) return activeWorkspaceRoot;
   if (repoBrowserState.activeRoot === 'workspace') {
-    return joinWindowsPath(activeWorkspaceRoot, currentPath);
+    return joinLaunchCwdPath(activeWorkspaceRoot, currentPath);
   }
   return normalizeDriveBrowserPath(currentPath) || currentPath.replace(/\\/g, '/');
 }
@@ -1435,7 +1436,11 @@ export function renderRepoFolder() {
     return;
   }
   if (node.lazy && !node.childrenLoaded) {
-    folderHost.innerHTML = '<div class="repo-empty">Open this folder to load entries.</div>';
+    // Self-heal instead of dead-ending: kick off the load for the selected
+    // folder. Converges because ensureRepoChildrenLoaded sets loadingChildren
+    // synchronously and always ends with childrenLoaded, even on error.
+    folderHost.innerHTML = '<div class="repo-empty">Loading folder entries…</div>';
+    if (!node.loadingChildren) void ensureRepoChildrenLoaded(String(node.path || ''));
     return;
   }
   const children = Array.isArray(node.children)
@@ -1523,6 +1528,7 @@ export function renderRepoBrowser() {
   renderRepoBreadcrumb();
   renderRepoTree();
   renderRepoFolder();
+  updateRepoCwdPickBar();
 }
 
 export async function loadRepoBrowserTree() {
@@ -1592,6 +1598,8 @@ export async function loadRepoBrowserTree() {
   if (restoreNow) void applyRepoBrowserRestore(restoreNow);
 }
 
+const repoChildrenLoadsInFlight = new Map();
+
 export async function ensureRepoChildrenLoaded(pathValue) {
   if (pathValue === null || pathValue === undefined) return false;
   const normalizedPath = normalizeRepoPath(pathValue);
@@ -1601,21 +1609,43 @@ export async function ensureRepoChildrenLoaded(pathValue) {
   const node = repoBrowserState.nodeMap.get(nodePath);
   if (!node || node.type !== 'dir') return false;
   if (node.childrenLoaded) return true;
-  if (node.loadingChildren) return false;
+  // Concurrent callers (folder-pane self-heal racing the reopen restore walk)
+  // must share one fetch: returning false here would make the restore silently
+  // skip the branch and drop its descendants.
+  const inFlight = repoChildrenLoadsInFlight.get(nodePath);
+  if (inFlight) return inFlight;
 
+  const load = loadRepoChildrenIntoNode(nodePath, node);
+  repoChildrenLoadsInFlight.set(nodePath, load);
+  try {
+    return await load;
+  } finally {
+    repoChildrenLoadsInFlight.delete(nodePath);
+  }
+}
+
+async function loadRepoChildrenIntoNode(nodePath, node) {
   node.loadingChildren = true;
   repoBrowserState.loadingPath = nodePath;
   renderRepoBrowser();
   const treeAtRequest = repoBrowserState.tree;
 
-  const payload = repoBrowserState.activeRoot === 'workspace'
-    ? await loadRepoChildren(
-      nodePath,
-      repoBrowserState.workspaceIncludeHidden,
-      repoBrowserState.workspaceIncludeHeavy,
-      currentConversationId(),
-    )
-    : await loadDriveChildren(nodePath, repoBrowserState.drivesIncludeHidden);
+  // A rejection must not strand loadingChildren=true: the folder pane would
+  // show "Loading…" forever and the self-heal guard would never refire. Treat
+  // it exactly like an error payload (empty children, readError) below.
+  let payload = null;
+  try {
+    payload = repoBrowserState.activeRoot === 'workspace'
+      ? await loadRepoChildren(
+        nodePath,
+        repoBrowserState.workspaceIncludeHidden,
+        repoBrowserState.workspaceIncludeHeavy,
+        currentConversationId(),
+      )
+      : await loadDriveChildren(nodePath, repoBrowserState.drivesIncludeHidden);
+  } catch {
+    payload = null;
+  }
 
   node.loadingChildren = false;
   repoBrowserState.loadingPath = '';
@@ -1764,12 +1794,78 @@ export function setRepoBrowserSessionInfo(sessionRootPath, sessionRootName = '')
   }
 }
 
+// Non-null while the browser is acting as a CWD picker for the New chat /
+// Change CWD modals. Cleared on every close so a later plain open never
+// resurrects the pick bar.
+let repoBrowserCwdPickHandler = null;
+
+function repoBrowserCwdPickModeActive() {
+  return typeof repoBrowserCwdPickHandler === 'function';
+}
+
+/**
+ * The picked path, as opposed to the launch path: `getRepoBrowserLaunchCwdPath`
+ * falls back to the conversation's workspace root when nothing is selected,
+ * which is right for the known-CWD list but wrong for a picker — on the drives
+ * root it would offer (and enable confirming) a path from a different tree.
+ * Only the workspace root treats an empty selection as a pick, because there
+ * the visible tree root IS that path.
+ */
+function getRepoBrowserPickedCwdPath() {
+  const currentPath = String(repoBrowserState.currentPath || '').trim();
+  if (!currentPath && repoBrowserState.activeRoot !== 'workspace') return '';
+  return String(getRepoBrowserLaunchCwdPath() || '').trim();
+}
+
+function updateRepoCwdPickBar() {
+  const bar = document.getElementById('repo-cwd-pick-bar');
+  if (!bar) return;
+  const active = repoBrowserCwdPickModeActive();
+  bar.hidden = !active;
+  if (!active) return;
+  const pathEl = document.getElementById('repo-cwd-pick-path');
+  const confirmBtn = document.getElementById('repo-cwd-pick-confirm');
+  const pickedPath = getRepoBrowserPickedCwdPath();
+  if (pathEl) pathEl.textContent = pickedPath || 'Select a folder…';
+  if (confirmBtn) confirmBtn.disabled = !pickedPath;
+}
+
+/**
+ * Open the browser as a folder picker: the pick bar appears, the modal stacks
+ * above the summary/new-chat modals, and the global (drives) tree is the
+ * default root — the root tabs stay live, so workspace/session picks work too.
+ */
+export function openRepoBrowserForCwdPick(onPick) {
+  repoBrowserCwdPickHandler = typeof onPick === 'function' ? onPick : null;
+  const modal = document.getElementById('repo-browser-modal');
+  modal.classList.add('cwd-pick-mode');
+  if (repoBrowserState.activeRoot !== 'drives') setRepoBrowserRoot('drives');
+  openRepoBrowser();
+  updateRepoCwdPickBar();
+}
+
+export function confirmRepoBrowserCwdPick() {
+  const handler = repoBrowserCwdPickHandler;
+  if (!handler) return;
+  const pickedPath = getRepoBrowserPickedCwdPath();
+  if (!pickedPath) return;
+  closeRepoBrowser();
+  handler(pickedPath);
+}
+
 export function openRepoBrowser() {
   const modal = document.getElementById('repo-browser-modal');
   modal.classList.add('visible');
   modal.setAttribute('aria-hidden', 'false');
   repoBrowserState.open = true;
   if (repoBrowserState.activeRoot === 'workspace') {
+    // Reopening refetches the lazy workspace root, which would otherwise strand
+    // the surviving expansion/selection on unloaded placeholder nodes. Park a
+    // restore exactly like Refresh does — but keep the previous tree on screen
+    // while the refetch is in flight, so reopening never flashes a loader.
+    // An already-parked restore (an in-flight Refresh wiped currentPath to '')
+    // still holds the real selection; parking over it would lose the path.
+    if (!pendingRepoBrowserRestore) parkRepoBrowserRestore();
     void loadRepoBrowserTree();
   } else if (!repoBrowserState.tree) {
     void loadRepoBrowserTree();
@@ -1781,18 +1877,17 @@ export function openRepoBrowser() {
 export function closeRepoBrowser() {
   const modal = document.getElementById('repo-browser-modal');
   modal.classList.remove('visible');
+  modal.classList.remove('cwd-pick-mode');
   modal.setAttribute('aria-hidden', 'true');
   repoBrowserState.open = false;
+  repoBrowserCwdPickHandler = null;
 }
 
 export function refreshRepoBrowser() {
   // expandedPaths / collapsedPaths deliberately survive: a refresh refetches the
   // same root, so the user's expansion is still meaningful. applyRepoBrowserRestore
   // re-walks it once the new tree arrives.
-  pendingRepoBrowserRestore = {
-    path: String(repoBrowserState.currentPath || ''),
-    seq: (repoBrowserRefreshSeq += 1),
-  };
+  parkRepoBrowserRestore();
   setRepoBrowserState({
     tree: null,
     nodeMap: new Map(),
@@ -1882,6 +1977,7 @@ export async function setRepoCurrentPath(pathValue) {
   renderRepoFolder();
   updateRepoTreeSelection();
   syncRepoTreeToCurrentPath();
+  updateRepoCwdPickBar();
 }
 
 document.addEventListener('click', (event) => {
@@ -1933,7 +2029,12 @@ document.getElementById('repo-tree').addEventListener('click', (event) => {
   const fileButton = eventClosest(event, '[data-repo-open-file]');
   if (fileButton) {
     event.preventDefault();
-    void openWorkspaceFilePreviewFromRepo(fileButton.getAttribute('data-repo-open-file') || '');
+    // In pick mode the preview modal (z 11000) would open UNDER the raised
+    // browser (z 12400) — an invisible modal that then swallows Escape. A CWD
+    // picker is about folders; file clicks are inert there.
+    if (!repoBrowserCwdPickModeActive()) {
+      void openWorkspaceFilePreviewFromRepo(fileButton.getAttribute('data-repo-open-file') || '');
+    }
     return;
   }
   const dirSummary = eventClosest(event, '[data-repo-open-dir]');
@@ -1946,7 +2047,11 @@ document.getElementById('repo-tree').addEventListener('click', (event) => {
     const isDir = !!node && node.type === 'dir';
     const isCurrent = String(repoBrowserState.currentPath || '') === targetPath;
     const isCollapsed = repoBrowserState.collapsedPaths instanceof Set && repoBrowserState.collapsedPaths.has(targetPath);
-    if (isDir && isCurrent && !isCollapsed && targetPath) {
+    // A lazy dir whose children never loaded is showing a placeholder, and the
+    // click means "load it" — never "collapse it". Only a loaded current dir
+    // collapse-toggles.
+    const isLoadedDir = isDir && !(node.lazy && !node.childrenLoaded);
+    if (isLoadedDir && isCurrent && !isCollapsed && targetPath) {
       if (repoBrowserState.expandedPaths instanceof Set) {
         repoBrowserState.expandedPaths.delete(targetPath);
       }
@@ -1974,7 +2079,10 @@ document.getElementById('repo-folder').addEventListener('click', (event) => {
   const openFile = eventClosest(event, '[data-repo-open-file]');
   if (openFile) {
     event.preventDefault();
-    void openWorkspaceFilePreviewFromRepo(openFile.getAttribute('data-repo-open-file') || '');
+    // Same pick-mode guard as the tree pane: no invisible preview under the picker.
+    if (!repoBrowserCwdPickModeActive()) {
+      void openWorkspaceFilePreviewFromRepo(openFile.getAttribute('data-repo-open-file') || '');
+    }
   }
 });
 

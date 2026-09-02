@@ -5,8 +5,10 @@ import {
   formatAmount,
   formatResetCountdown,
   meterSummaryText,
+  normalizeUsageProvider,
   planUsageSubtitle,
   renderPlanUsageHtml,
+  resolveActiveUsageProvider,
   utilizationColor,
 } from './plan-usage-view.mjs';
 
@@ -51,6 +53,30 @@ function report(cardOverrides = {}) {
   };
 }
 
+function multiReport(...cardOverrides) {
+  const base = report().providers[0];
+  return {
+    version: 2,
+    generatedAt: NOW.toISOString(),
+    providers: cardOverrides.map((overrides) => ({ ...base, meters: [], ...overrides })),
+  };
+}
+
+const THREE_PROVIDERS = () => multiReport(
+  { provider: 'github', label: 'GitHub Copilot' },
+  { provider: 'claude', label: 'Claude' },
+  { provider: 'cursor', label: 'Cursor' },
+);
+
+/** The section for one provider, so per-panel assertions cannot read a sibling. */
+function panelHtml(html, provider) {
+  const start = html.indexOf(`data-usage-panel="${provider}"`);
+  assert.notEqual(start, -1, `no panel for ${provider}`);
+  const from = html.lastIndexOf('<section', start);
+  const end = html.indexOf('</section>', start);
+  return html.slice(from, end);
+}
+
 test('an empty or malformed report renders nothing', () => {
   assert.equal(renderPlanUsageHtml(null), '');
   assert.equal(renderPlanUsageHtml({ providers: [] }), '');
@@ -71,6 +97,8 @@ test('overage clamps the bar at 100% and is worded as "over"', () => {
   );
   assert.match(html, /width:100%/);
   assert.match(html, /100 over/);
+  // The overage is a magnitude — a signed "-100 over" is the bug this guards.
+  assert.doesNotMatch(html, /-100 over/);
 });
 
 test('an unknown utilization renders a striped bar instead of a false zero', () => {
@@ -191,6 +219,99 @@ test('a utilization-only meter summarises as a percentage', () => {
     meterSummaryText(meter({ used: null, allowance: null, remaining: null, utilization: 61.5 })),
     '61.5% used',
   );
+});
+
+test('provider spellings fold onto the card ids the report uses', () => {
+  assert.equal(normalizeUsageProvider('copilot'), 'github');
+  assert.equal(normalizeUsageProvider('GitHub-Copilot'), 'github');
+  assert.equal(normalizeUsageProvider(' Claude '), 'claude');
+  assert.equal(normalizeUsageProvider('openai'), 'openai');
+  assert.equal(normalizeUsageProvider(null), '');
+});
+
+test('the active tab is the requested provider when it has a card', () => {
+  const providers = THREE_PROVIDERS().providers;
+  assert.equal(resolveActiveUsageProvider(providers, 'claude'), 'claude');
+  assert.equal(resolveActiveUsageProvider(providers, 'copilot'), 'github');
+});
+
+test('a provider without a card falls back to the first card', () => {
+  const providers = THREE_PROVIDERS().providers;
+  // 'openai' sessions have no usage card of their own.
+  assert.equal(resolveActiveUsageProvider(providers, 'openai'), 'github');
+  assert.equal(resolveActiveUsageProvider(providers, 'grok'), 'github');
+  assert.equal(resolveActiveUsageProvider(providers, ''), 'github');
+  assert.equal(resolveActiveUsageProvider([], 'claude'), '');
+});
+
+test('one tab per provider, with the session provider selected', () => {
+  const html = renderPlanUsageHtml(THREE_PROVIDERS(), { now: NOW, activeProvider: 'claude' });
+  assert.match(html, /<div class="plan-usage-tab-strip" role="tablist"/);
+  assert.match(html, /data-usage-tab="github"[^>]*>Copilot</);
+  assert.match(html, /data-usage-tab="cursor"[^>]*>Cursor</);
+  assert.match(
+    html,
+    /class="plan-usage-tab active"[^>]*aria-selected="true"[^>]*aria-controls="plan-usage-panel-claude"|aria-controls="plan-usage-panel-claude"[^>]*aria-selected="true"/,
+  );
+  assert.equal((html.match(/aria-selected="true"/g) || []).length, 1);
+  assert.equal((html.match(/tabindex="-1"/g) || []).length, 2);
+});
+
+test('only the active provider card is visible', () => {
+  const html = renderPlanUsageHtml(THREE_PROVIDERS(), { now: NOW, activeProvider: 'cursor' });
+  assert.doesNotMatch(panelHtml(html, 'cursor'), /\shidden/);
+  assert.match(panelHtml(html, 'github'), /\shidden/);
+  assert.match(panelHtml(html, 'claude'), /\shidden/);
+  assert.match(panelHtml(html, 'cursor'), /role="tabpanel"[^>]*/);
+  assert.match(panelHtml(html, 'cursor'), /aria-labelledby="plan-usage-tab-cursor"/);
+});
+
+test('an unknown active provider still opens the first card', () => {
+  const html = renderPlanUsageHtml(THREE_PROVIDERS(), { now: NOW, activeProvider: 'openai' });
+  assert.doesNotMatch(panelHtml(html, 'github'), /\shidden/);
+  assert.match(panelHtml(html, 'claude'), /\shidden/);
+});
+
+test('the Claude account renders as email · plan under the card title', () => {
+  const html = renderPlanUsageHtml(
+    multiReport({ provider: 'claude', label: 'Claude', account: { loggedIn: true, email: 'someone@example.com', plan: 'max' } }),
+    { now: NOW },
+  );
+  assert.match(html, /class="plan-usage-account">someone@example\.com · max</);
+});
+
+test('a logged-out Claude account says so, and a missing one says nothing', () => {
+  const out = renderPlanUsageHtml(
+    multiReport({ provider: 'claude', label: 'Claude', account: { loggedIn: false } }),
+    { now: NOW },
+  );
+  assert.match(out, /plan-usage-account-signed-out">Not logged in</);
+  // No account key at all = the status probe failed; the card must not claim
+  // either state.
+  const unknown = renderPlanUsageHtml(multiReport({ provider: 'claude', label: 'Claude' }), { now: NOW });
+  assert.doesNotMatch(unknown, /plan-usage-account/);
+  assert.doesNotMatch(unknown, /Not logged in/);
+});
+
+test('a logged-in account with no details still reads as logged in', () => {
+  const html = renderPlanUsageHtml(
+    multiReport({ provider: 'claude', label: 'Claude', account: { loggedIn: true } }),
+    { now: NOW },
+  );
+  assert.match(html, /class="plan-usage-account">Logged in</);
+});
+
+test('the account line is HTML-escaped', () => {
+  const html = renderPlanUsageHtml(
+    multiReport({
+      provider: 'claude',
+      label: 'Claude',
+      account: { loggedIn: true, email: '<img src=x onerror=alert(1)>', plan: '"max"' },
+    }),
+    { now: NOW },
+  );
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(html, /&lt;img src=x/);
 });
 
 test('the subtitle counts reporting providers and the nearest reset', () => {

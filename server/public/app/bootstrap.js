@@ -54,6 +54,7 @@ import {
   verifyToken,
   refreshWorkspaceRootHints,
   loadUsageSummary,
+  getClaudeAuthStatus,
   loadContextSummary,
   loadModelCatalog,
   loadModelVariantCatalog,
@@ -109,7 +110,7 @@ import {
 } from './conversation-view.js';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
-import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath } from './attachments-view.js';
+import { handleAttachmentInput, retryAttachmentUpload, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import { initSlashAutocomplete } from './slash-autocomplete.mjs';
 import { dataTransferHasFiles } from './composer-paste.mjs';
@@ -181,7 +182,7 @@ import {
   autoCompactWindowToIndex,
   formatAutoCompactWindowLabel,
 } from './auto-compact-window-options.mjs';
-import { renderPlanUsageHtml, planUsageSubtitle } from './plan-usage-view.mjs';
+import { renderPlanUsageHtml, planUsageSubtitle, normalizeUsageProvider } from './plan-usage-view.mjs';
 import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
 import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
@@ -206,7 +207,7 @@ function showExternalLinkFallback(url) {
     title: 'Open external link',
     subtitle: 'Your browser blocked opening a separate tab',
     bodyHtml: `
-      <p>The Copilot Remote app remains open. Copy this link and open it in your system browser:</p>
+      <p>The OAR app remains open. Copy this link and open it in your system browser:</p>
       <pre><code>${escHtml(pendingExternalLinkUrl)}</code></pre>
       <div class="summary-actions">
         <button class="summary-btn" type="button" onclick="copyExternalLinkUrl()">Copy link</button>
@@ -247,6 +248,8 @@ import {
   toggleClaudeProvider,
   applyClaudeSettingsState,
   refreshClaudeSettingsState,
+  saveCopilotSettings,
+  applyCopilotSettingsState,
   saveGrokSettings,
   toggleGrokProvider,
   applyGrokSettingsState,
@@ -287,6 +290,27 @@ import {
   openSuspendHostConfirmation,
   confirmSuspendHost,
 } from './action-confirmations.js';
+import {
+  startClaudeRelogin,
+  submitClaudeLoginCodeFromInput,
+  handleClaudeLoginCodeKey,
+  cancelClaudeRelogin,
+  copyClaudeLoginUrl,
+  openClaudeLogoutConfirmation,
+  confirmClaudeLogout,
+} from './claude-auth-ui.js';
+import {
+  startGrokSignIn,
+  cancelGrokSignIn,
+  copyGrokLoginUrl,
+  openGrokLogoutConfirmation,
+  confirmGrokLogout,
+} from './grok-auth-ui.js';
+import {
+  confirmCliInstall,
+  runCliInstall,
+  cancelCliInstallRun,
+} from './cli-install-ui.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 // The New Chat modal used to keep its own model key, so a selection made there
@@ -2700,11 +2724,90 @@ async function saveSelectedModelsFromModal() {
   }
 }
 
+// Which usage tab is showing. Null means "follow the session's provider"; a
+// click pins a provider so the modal's Refresh re-renders onto the same tab
+// instead of snapping back. Reset on every fresh open of the modal.
+let usageTabProviderOverride = null;
+
+/**
+ * Delegated because #summary-modal-body's innerHTML is replaced on every render
+ * and refresh. Scoped to [data-usage-tab], which only the usage body emits, so
+ * the shared shell's context/git renders never reach it.
+ */
+function initUsageTabControl() {
+  const body = document.getElementById('summary-modal-body');
+  if (!body || body.dataset.usageTabsBound === '1') return;
+  body.dataset.usageTabsBound = '1';
+  body.addEventListener('click', (event) => {
+    const btn = event.target?.closest?.('[data-usage-tab]');
+    if (!btn || !body.contains(btn) || summaryModalState.kind !== 'usage') return;
+    selectUsageTab(body, btn.dataset.usageTab);
+  });
+}
+
+/** Pure DOM toggle: switching tabs never refetches `/api/usage`. */
+function selectUsageTab(root, provider) {
+  const target = String(provider || '').trim();
+  if (!target) return;
+  const tabs = Array.from(root.querySelectorAll('[data-usage-tab]'));
+  if (!tabs.some((tab) => tab.dataset.usageTab === target)) return;
+  for (const tab of tabs) {
+    const active = tab.dataset.usageTab === target;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    tab.tabIndex = active ? 0 : -1;
+  }
+  for (const panel of root.querySelectorAll('[data-usage-panel]')) {
+    panel.hidden = panel.dataset.usagePanel !== target;
+  }
+  usageTabProviderOverride = target;
+}
+
+/**
+ * `{loggedIn:false}` and "the status call failed" are different answers, so a
+ * failure returns null (the card then says nothing) rather than a logged-out
+ * claim we cannot back up.
+ */
+function claudeAccountFromAuthStatus(payload) {
+  const status = payload?.status;
+  if (!status || typeof status !== 'object') return null;
+  if (status.loggedIn !== true) return { loggedIn: false };
+  return {
+    loggedIn: true,
+    email: status.email || '',
+    plan: status.subscriptionType || '',
+  };
+}
+
+/** Joins the Claude account onto its usage card without mutating the payload. */
+function withClaudeAccount(report, account) {
+  if (!account || !Array.isArray(report?.providers)) return report;
+  return {
+    ...report,
+    providers: report.providers.map((card) => (
+      card && normalizeUsageProvider(card.provider) === 'claude' ? { ...card, account } : card
+    )),
+  };
+}
+
 async function loadUsageSummaryAndRender() {
-  const d = await loadUsageSummary();
+  // Usage is the point of the modal; the account line is a garnish, so the two
+  // are settled independently and a failing auth probe cannot blank the cards.
+  const [usageResult, authResult] = await Promise.allSettled([
+    loadUsageSummary(),
+    getClaudeAuthStatus(),
+  ]);
+  if (usageResult.status === 'rejected') throw usageResult.reason;
+  const d = usageResult.value;
   if (!d) throw new Error('Unable to load usage data');
-  const planHtml = renderPlanUsageHtml(d);
+  const account = authResult.status === 'fulfilled'
+    ? claudeAccountFromAuthStatus(authResult.value)
+    : null;
+  const activeProvider = usageTabProviderOverride
+    || normalizeUsageProvider(activeComposerProviderType());
+  const planHtml = renderPlanUsageHtml(withClaudeAccount(d, account), { activeProvider });
   if (planHtml) {
+    initUsageTabControl();
     renderSummaryModalContent({
       title: 'Plan usage',
       subtitle: planUsageSubtitle(d),
@@ -2956,6 +3059,9 @@ async function loadContextSummaryAndRender(convId) {
 }
 
 async function showUsage() {
+  // A fresh open follows the current session's provider again; only a click
+  // inside the modal pins a tab (for the Refresh button's sake).
+  usageTabProviderOverride = null;
   const btn = document.getElementById('chat-menu-usage') || document.getElementById('usage-btn');
   if (btn) {
     btn.textContent = '⏳';
@@ -3711,6 +3817,7 @@ initSocketHandlers({
   applyConversationPreferencesForConversation,
   applyOpenAISettingsState,
   applyClaudeSettingsState,
+  applyCopilotSettingsState,
   applyGrokSettingsState,
   applyCursorSettingsState,
 });
@@ -4095,7 +4202,23 @@ window.saveOpenAISettings = saveOpenAISettings;
 window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.saveClaudeSettings = saveClaudeSettings;
+window.saveCopilotSettings = saveCopilotSettings;
 window.toggleClaudeProvider = toggleClaudeProvider;
+window.startClaudeRelogin = startClaudeRelogin;
+window.submitClaudeLoginCodeFromInput = submitClaudeLoginCodeFromInput;
+window.handleClaudeLoginCodeKey = handleClaudeLoginCodeKey;
+window.cancelClaudeRelogin = cancelClaudeRelogin;
+window.copyClaudeLoginUrl = copyClaudeLoginUrl;
+window.openClaudeLogoutConfirmation = openClaudeLogoutConfirmation;
+window.confirmClaudeLogout = confirmClaudeLogout;
+window.startGrokSignIn = startGrokSignIn;
+window.cancelGrokSignIn = cancelGrokSignIn;
+window.copyGrokLoginUrl = copyGrokLoginUrl;
+window.openGrokLogoutConfirmation = openGrokLogoutConfirmation;
+window.confirmGrokLogout = confirmGrokLogout;
+window.confirmCliInstall = confirmCliInstall;
+window.runCliInstall = runCliInstall;
+window.cancelCliInstallRun = cancelCliInstallRun;
 window.saveGrokSettings = saveGrokSettings;
 window.toggleGrokProvider = toggleGrokProvider;
 window.saveCursorSettings = saveCursorSettings;
@@ -4174,6 +4297,7 @@ window.toggleRepoBrowserHidden = toggleRepoBrowserHidden;
 window.toggleRepoBrowserHeavy = toggleRepoBrowserHeavy;
 window.focusRepoTree = focusRepoTree;
 window.setRepoCurrentPath = setRepoCurrentPath;
+window.confirmRepoBrowserCwdPick = confirmRepoBrowserCwdPick;
 window.toggleEmojiPicker = toggleEmojiPicker;
 window.submitRelayQuestionChoice = submitRelayQuestionChoice;
 window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;

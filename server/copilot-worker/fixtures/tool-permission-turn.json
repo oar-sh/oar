@@ -1,0 +1,1293 @@
+[
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "07afb991-8692-431d-8ce2-332e5d113bfa",
+    "timestamp": "2026-08-31T09:23:30.351Z",
+    "parentId": "c9e5606d-6785-4203-93b4-da752f8a0acf"
+  },
+  {
+    "type": "pending_messages.modified",
+    "data": {},
+    "ephemeral": true,
+    "id": "4660c90c-dfec-4a23-9aa9-c88969c2766a",
+    "timestamp": "2026-08-31T09:23:30.352Z",
+    "parentId": "c9e5606d-6785-4203-93b4-da752f8a0acf"
+  },
+  {
+    "type": "session.mcp_servers_loaded",
+    "data": {
+      "servers": [
+        {
+          "name": "github-mcp-server",
+          "status": "connected",
+          "source": "builtin"
+        }
+      ]
+    },
+    "ephemeral": true,
+    "id": "1d5e7c3f-788b-445f-be29-687cab12ede1",
+    "timestamp": "2026-08-31T09:23:30.355Z",
+    "parentId": "c9e5606d-6785-4203-93b4-da752f8a0acf"
+  },
+  {
+    "type": "session.tools_updated",
+    "data": {
+      "model": "spike-model"
+    },
+    "ephemeral": true,
+    "id": "4e397996-c9fe-4cec-96bd-026e2dd5f379",
+    "timestamp": "2026-08-31T09:23:30.363Z",
+    "parentId": "c9e5606d-6785-4203-93b4-da752f8a0acf"
+  },
+  {
+    "type": "user.message",
+    "data": {
+      "content": "SPIKE_SHELL: run the echo command",
+      "transformedContent": "<current_datetime>2026-08-31T09:23:30.363+00:00</current_datetime>\n\nSPIKE_SHELL: run the echo command",
+      "supportedNativeDocumentMimeTypes": [],
+      "delivery": "idle",
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038",
+      "turnId": "0",
+      "parentAgentTaskId": "87cf283b-ed17-4d0c-b788-e819fafa021d"
+    },
+    "id": "1c5f2036-4560-4560-af0e-6d97158eee0b",
+    "timestamp": "2026-08-31T09:23:30.363Z",
+    "parentId": "c9e5606d-6785-4203-93b4-da752f8a0acf"
+  },
+  {
+    "type": "model.turn_started",
+    "data": {
+      "kind": "turn_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168210367
+    },
+    "ephemeral": true,
+    "id": "71859993-995c-46fb-a8b3-445e001d5f25",
+    "timestamp": "2026-08-31T09:23:30.367Z",
+    "parentId": "96d222dc-9f70-4a43-a790-86d0c1277eb9"
+  },
+  {
+    "type": "assistant.turn_start",
+    "data": {
+      "turnId": "0",
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038"
+    },
+    "id": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf",
+    "timestamp": "2026-08-31T09:23:30.368Z",
+    "parentId": "96d222dc-9f70-4a43-a790-86d0c1277eb9"
+  },
+  {
+    "type": "session.usage_info",
+    "ephemeral": true,
+    "data": {
+      "tokenLimit": 128000,
+      "currentTokens": 12565,
+      "messagesLength": 4,
+      "systemTokens": 5597,
+      "conversationTokens": 81,
+      "toolDefinitionsTokens": 6887,
+      "isInitial": true
+    },
+    "id": "4363338b-1319-494a-ae40-c8b986bdfee3",
+    "timestamp": "2026-08-31T09:23:30.398Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "model.log",
+    "data": {
+      "kind": "log",
+      "level": "debug",
+      "message": "Model does not support vision, skipping image processing"
+    },
+    "ephemeral": true,
+    "id": "c522baa6-67ae-4df5-ab02-beab3b09f9f6",
+    "timestamp": "2026-08-31T09:23:30.399Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "model.call_start",
+    "data": {
+      "turnId": "0",
+      "model": "spike-model"
+    },
+    "ephemeral": true,
+    "id": "98c5b64f-82ef-472b-9d60-9fee10d175c1",
+    "timestamp": "2026-08-31T09:23:30.400Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "model.model_call_started",
+    "data": {
+      "kind": "model_call_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168210400
+    },
+    "ephemeral": true,
+    "id": "29ef17f0-0653-4394-aea4-ab1e33c1067e",
+    "timestamp": "2026-08-31T09:23:30.400Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 33
+    },
+    "ephemeral": true,
+    "id": "23697e21-39eb-42b4-ab96-ce4a46e3fd10",
+    "timestamp": "2026-08-31T09:23:30.402Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "assistant.tool_call_delta",
+    "data": {
+      "toolCallId": "call_spike_2",
+      "toolName": "bash",
+      "toolType": "function",
+      "inputDelta": "{\"command\":\"echo SPIKE_PERM\"}"
+    },
+    "ephemeral": true,
+    "id": "8f331db6-a322-4b70-851a-af618c6da77e",
+    "timestamp": "2026-08-31T09:23:30.403Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "assistant.usage",
+    "data": {
+      "model": "spike-model",
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "reasoningTokens": 0,
+      "cost": 0,
+      "duration": 5,
+      "timeToFirstTokenMs": 1.891769,
+      "outputTtftMs": 1.93505,
+      "interTokenLatencyMs": 0.2085925,
+      "initiator": "user",
+      "interactionType": "conversation-agent",
+      "isByok": true,
+      "isAuto": false,
+      "maxPromptTokens": 128000,
+      "transport": "http",
+      "apiCallId": "chatcmpl-spike-2",
+      "rte": false,
+      "apiEndpoint": "/chat/completions",
+      "quotaSnapshots": {},
+      "reasoningEffort": "medium",
+      "availableToolCount": 22,
+      "toolTokenCount": 6887,
+      "frontierSource": "estimated",
+      "cacheDetailsReported": false,
+      "numToolCalls": 1,
+      "toolCounts": {
+        "bash": 1
+      },
+      "finishReason": "tool_calls",
+      "contentFilterTriggered": false
+    },
+    "ephemeral": true,
+    "id": "eb2a4ca9-434f-4caf-9594-2d60d2c132ad",
+    "timestamp": "2026-08-31T09:23:30.405Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "model.model_call_success",
+    "data": {
+      "kind": "model_call_success",
+      "turn": 0,
+      "modelCallDurationMs": 5,
+      "ttftMs": 1.891769,
+      "outputTtftMs": 1.93505,
+      "interTokenLatencyMs": 0.2085925,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-2",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "user",
+        "transport": "http"
+      },
+      "responseChunk": {
+        "object": "chat.completion.chunk",
+        "id": "chatcmpl-spike-2",
+        "choices": [
+          {
+            "delta": {
+              "role": "assistant",
+              "content": null,
+              "refusal": null,
+              "tool_calls": [
+                {
+                  "id": "call_spike_2",
+                  "type": "function",
+                  "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"echo SPIKE_PERM\"}"
+                  },
+                  "index": 0
+                }
+              ]
+            },
+            "finish_reason": "tool_calls",
+            "index": 0
+          }
+        ],
+        "created": 1788168210,
+        "model": "spike-model"
+      },
+      "quotaSnapshots": {},
+      "rte": false,
+      "reasoningEffort": "medium",
+      "maxPromptTokens": 128000,
+      "toolCount": 22,
+      "toolTokenCount": 6887
+    },
+    "ephemeral": true,
+    "id": "fe0f4eb2-2719-4062-bc4c-40bfd00212c3",
+    "timestamp": "2026-08-31T09:23:30.407Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "model.call_finished",
+    "data": {
+      "turnId": "0",
+      "dispatchDurationMs": 5,
+      "outcome": "success",
+      "editClassifierVersion": 1,
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038",
+      "containsBuiltInFileEditRequest": false
+    },
+    "ephemeral": true,
+    "id": "a730bd61-6c7f-403d-970d-e882fd359ede",
+    "timestamp": "2026-08-31T09:23:30.407Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "model.message",
+    "data": {
+      "kind": "message",
+      "turn": 0,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-2",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "user",
+        "transport": "http"
+      },
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "refusal": null,
+        "tool_calls": [
+          {
+            "id": "call_spike_2",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"echo SPIKE_PERM\"}"
+            }
+          }
+        ],
+        "apiCallId": "chatcmpl-spike-2"
+      }
+    },
+    "ephemeral": true,
+    "id": "7716db4b-c6f9-44b7-9bdd-446ee05ac3f4",
+    "timestamp": "2026-08-31T09:23:30.407Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "assistant.message",
+    "data": {
+      "messageId": "b329431a-1631-44b9-99ef-ed24865c1842",
+      "model": "spike-model",
+      "content": "",
+      "toolRequests": [
+        {
+          "toolCallId": "call_spike_2",
+          "name": "bash",
+          "arguments": {
+            "command": "echo SPIKE_PERM"
+          },
+          "type": "function",
+          "intentionSummary": "echo SPIKE_PERM"
+        }
+      ],
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038",
+      "turnId": "0",
+      "rte": false,
+      "apiCallId": "chatcmpl-spike-2"
+    },
+    "id": "bb4d4694-bf3e-4a73-bf79-7a1ca070a089",
+    "timestamp": "2026-08-31T09:23:30.408Z",
+    "parentId": "af3a446e-99c9-4c9e-8b3d-c71e7d3e1caf"
+  },
+  {
+    "type": "tool.execution_start",
+    "data": {
+      "toolCallId": "call_spike_2",
+      "toolName": "bash",
+      "arguments": {
+        "command": "echo SPIKE_PERM"
+      },
+      "turnId": "0",
+      "model": "spike-model",
+      "shellToolInfo": {
+        "possiblePaths": [],
+        "hasWriteFileRedirection": false
+      }
+    },
+    "id": "ff0f27b6-f87c-4f4d-9351-8de145b6858f",
+    "timestamp": "2026-08-31T09:23:30.409Z",
+    "parentId": "bb4d4694-bf3e-4a73-bf79-7a1ca070a089"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "55577b8a-3125-44cd-8821-8c988a81e019",
+    "timestamp": "2026-08-31T09:23:30.435Z",
+    "parentId": "ff0f27b6-f87c-4f4d-9351-8de145b6858f"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "8ab5ad83-1264-4a99-8299-b03099b66bd6",
+    "timestamp": "2026-08-31T09:23:30.436Z",
+    "parentId": "ff0f27b6-f87c-4f4d-9351-8de145b6858f"
+  },
+  {
+    "type": "permission.requested",
+    "data": {
+      "requestId": "157990c8-1c8d-4f5d-a7b4-db3c6a6385ea",
+      "permissionRequest": {
+        "kind": "shell",
+        "toolCallId": "call_spike_2",
+        "fullCommandText": "echo SPIKE_PERM",
+        "intention": "Running command",
+        "commands": [
+          {
+            "identifier": "echo SPIKE_PERM",
+            "readOnly": false
+          }
+        ],
+        "commandSegments": [
+          {
+            "identifier": "echo",
+            "fullCommandText": "echo SPIKE_PERM"
+          }
+        ],
+        "possiblePaths": [],
+        "possibleUrls": [],
+        "hasWriteFileRedirection": false,
+        "canOfferSessionApproval": false
+      },
+      "promptRequest": {
+        "kind": "commands",
+        "fullCommandText": "echo SPIKE_PERM",
+        "intention": "Running command",
+        "commandIdentifiers": [
+          "echo SPIKE_PERM"
+        ],
+        "canOfferSessionApproval": false,
+        "toolCallId": "call_spike_2"
+      }
+    },
+    "id": "64aef674-be13-43e1-849a-68d6d06d4239",
+    "timestamp": "2026-08-31T09:23:30.436Z",
+    "parentId": "ff0f27b6-f87c-4f4d-9351-8de145b6858f"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "5cd43eb3-291b-4ad4-8229-f80851a02972",
+    "timestamp": "2026-08-31T09:23:30.437Z",
+    "parentId": "64aef674-be13-43e1-849a-68d6d06d4239"
+  },
+  {
+    "type": "permission.completed",
+    "data": {
+      "requestId": "157990c8-1c8d-4f5d-a7b4-db3c6a6385ea",
+      "toolCallId": "call_spike_2",
+      "result": {
+        "kind": "approved"
+      }
+    },
+    "id": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94",
+    "timestamp": "2026-08-31T09:23:30.442Z",
+    "parentId": "64aef674-be13-43e1-849a-68d6d06d4239"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "9d775618-cff3-44af-a454-46e39de8f52b",
+    "timestamp": "2026-08-31T09:23:30.443Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "7962c1a6-8451-4da7-b65c-e5101717e096",
+    "timestamp": "2026-08-31T09:23:30.444Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "265b70ff-e46f-4bb9-9a6d-6243bc0e97b6",
+    "timestamp": "2026-08-31T09:23:30.444Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "38ceb111-6427-431f-b52e-df5d408bb16e",
+    "timestamp": "2026-08-31T09:23:30.444Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "5cfc5e04-1198-40aa-aa90-8dad64aa640a",
+    "timestamp": "2026-08-31T09:23:30.452Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "37b28332-1260-4bef-8bb5-0d18825b5193",
+    "timestamp": "2026-08-31T09:23:30.454Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "316d3189-c50b-4e14-8f2d-d3f22a3231e1",
+    "timestamp": "2026-08-31T09:23:30.455Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "sandbox.decision",
+    "data": {
+      "kind": "enforcement_state",
+      "control": "process",
+      "outcome": "inactive",
+      "toolCallId": "call_spike_2",
+      "platform": "linux",
+      "backend": "unsupported",
+      "enforcementPoint": "shell"
+    },
+    "ephemeral": true,
+    "id": "15e14d5f-c0e6-4c3a-b534-80fae45fdc29",
+    "timestamp": "2026-08-31T09:23:30.457Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "tool.execution_partial_result",
+    "data": {
+      "toolCallId": "call_spike_2",
+      "partialOutput": "SPIKE_PERM\n"
+    },
+    "ephemeral": true,
+    "id": "3474aaf6-6645-457f-a8dd-e7a2d4b4f279",
+    "timestamp": "2026-08-31T09:23:30.457Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "tool.execution_partial_result",
+    "data": {
+      "toolCallId": "call_spike_2",
+      "partialOutput": "SPIKE_PERM\n"
+    },
+    "ephemeral": true,
+    "id": "3875e117-a152-4a91-ae90-b1cbc0a4b197",
+    "timestamp": "2026-08-31T09:23:30.457Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "1e3b3fb8-495d-4df8-96ea-faba0498305b",
+    "timestamp": "2026-08-31T09:23:30.458Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "1a083fd7-aeee-4ab2-954f-6e18b9e9cf51",
+    "timestamp": "2026-08-31T09:23:30.458Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "39fd5255-5a3b-4e5e-b045-63301d1e32e6",
+    "timestamp": "2026-08-31T09:23:30.458Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "fe9978a3-5a1b-4cdf-b189-5ea7d3b51ed8",
+    "timestamp": "2026-08-31T09:23:30.459Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "b7eebaf8-cdde-43b4-867d-cf6e4cf36d5c",
+    "timestamp": "2026-08-31T09:23:30.459Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "9559050a-4f6a-4446-b72e-33c7a59ee374",
+    "timestamp": "2026-08-31T09:23:30.459Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "ab27f70a-f682-45c1-ad05-2020427d5c1c",
+    "timestamp": "2026-08-31T09:23:30.459Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "bd51f220-f9db-4552-8b9b-a4ec7e53e3ea",
+    "timestamp": "2026-08-31T09:23:30.460Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "a7e92275-76a0-4ad5-a24a-1d80918a975b",
+    "timestamp": "2026-08-31T09:23:30.462Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "701bb0b9-830a-4d3b-b796-9a9fd7eb7391",
+    "timestamp": "2026-08-31T09:23:30.464Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "e0baa17b-62d9-4e2e-826f-87e239c67cdf",
+    "timestamp": "2026-08-31T09:23:30.465Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "model.message",
+    "data": {
+      "kind": "message",
+      "turn": 0,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-2",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "user",
+        "transport": "http"
+      },
+      "message": {
+        "role": "tool",
+        "tool_call_id": "call_spike_2",
+        "content": "SPIKE_PERM\n<shellId: 0 completed with exit code 0>"
+      }
+    },
+    "ephemeral": true,
+    "id": "19781311-8677-4233-9efd-5cebea08b96e",
+    "timestamp": "2026-08-31T09:23:30.465Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "abbc3d9e-c7a8-45ad-9094-4af281b5c48b",
+    "timestamp": "2026-08-31T09:23:30.466Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "tool.execution_complete",
+    "data": {
+      "toolCallId": "call_spike_2",
+      "model": "spike-model",
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038",
+      "turnId": "0",
+      "rte": false,
+      "success": true,
+      "result": {
+        "content": "SPIKE_PERM\n<shellId: 0 completed with exit code 0>",
+        "detailedContent": "SPIKE_PERM\n<shellId: 0 completed with exit code 0>",
+        "contents": [
+          {
+            "type": "shell_exit",
+            "shellId": "0",
+            "exitCode": 0,
+            "cwd": "/tmp/relay-fixture-workspace",
+            "outputPreview": "SPIKE_PERM\n"
+          }
+        ]
+      },
+      "toolTelemetry": {
+        "properties": {
+          "customTimeout": "false",
+          "executionMode": "sync",
+          "detached": "false",
+          "sandboxApplied": "false",
+          "sandboxOptOutRequested": "false"
+        },
+        "metrics": {
+          "commandTimeout": 30000
+        }
+      }
+    },
+    "id": "571076a7-43d9-4d6c-9397-e3a9d72a7ada",
+    "timestamp": "2026-08-31T09:23:30.466Z",
+    "parentId": "4f91c2cc-c1a0-46c9-923c-21ef5cecdc94"
+  },
+  {
+    "type": "model.tool_execution",
+    "data": {
+      "kind": "tool_execution",
+      "turn": 0,
+      "toolCallId": "call_spike_2",
+      "toolResult": {
+        "textResultForLlm": "SPIKE_PERM\n<shellId: 0 completed with exit code 0>",
+        "resultType": "success",
+        "sessionLog": "SPIKE_PERM\n<shellId: 0 completed with exit code 0>",
+        "toolTelemetry": {
+          "properties": {
+            "customTimeout": "false",
+            "executionMode": "sync",
+            "detached": "false",
+            "sandboxApplied": "false",
+            "sandboxOptOutRequested": "false"
+          },
+          "metrics": {
+            "commandTimeout": 30000
+          }
+        },
+        "contents": [
+          {
+            "type": "shell_exit",
+            "shellId": "0",
+            "exitCode": 0,
+            "cwd": "/tmp/relay-fixture-workspace",
+            "outputPreview": "SPIKE_PERM\n"
+          }
+        ]
+      },
+      "durationMs": 54.256086,
+      "rte": false
+    },
+    "ephemeral": true,
+    "id": "aa53abce-ed04-42b6-a77c-d855fbc1eac3",
+    "timestamp": "2026-08-31T09:23:30.468Z",
+    "parentId": "571076a7-43d9-4d6c-9397-e3a9d72a7ada"
+  },
+  {
+    "type": "model.turn_ended",
+    "data": {
+      "kind": "turn_ended",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 0,
+      "timestampMs": 1788168210472
+    },
+    "ephemeral": true,
+    "id": "80500500-7c1c-429b-8faa-7c295779f803",
+    "timestamp": "2026-08-31T09:23:30.472Z",
+    "parentId": "571076a7-43d9-4d6c-9397-e3a9d72a7ada"
+  },
+  {
+    "type": "assistant.turn_end",
+    "data": {
+      "turnId": "0"
+    },
+    "id": "d5070fe6-4882-4d67-94f4-d8bbebba3491",
+    "timestamp": "2026-08-31T09:23:30.472Z",
+    "parentId": "571076a7-43d9-4d6c-9397-e3a9d72a7ada"
+  },
+  {
+    "type": "model.turn_started",
+    "data": {
+      "kind": "turn_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 1,
+      "timestampMs": 1788168210472
+    },
+    "ephemeral": true,
+    "id": "f70fefd2-9167-431e-a51f-7d74e4004eea",
+    "timestamp": "2026-08-31T09:23:30.472Z",
+    "parentId": "d5070fe6-4882-4d67-94f4-d8bbebba3491"
+  },
+  {
+    "type": "assistant.turn_start",
+    "data": {
+      "turnId": "1",
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038"
+    },
+    "id": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c",
+    "timestamp": "2026-08-31T09:23:30.472Z",
+    "parentId": "d5070fe6-4882-4d67-94f4-d8bbebba3491"
+  },
+  {
+    "type": "session.usage_info",
+    "ephemeral": true,
+    "data": {
+      "tokenLimit": 128000,
+      "currentTokens": 12618,
+      "messagesLength": 6,
+      "systemTokens": 5597,
+      "conversationTokens": 134,
+      "toolDefinitionsTokens": 6887,
+      "isInitial": false
+    },
+    "id": "d8513d7e-9122-4845-a1b2-4471a405b493",
+    "timestamp": "2026-08-31T09:23:30.496Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "model.log",
+    "data": {
+      "kind": "log",
+      "level": "debug",
+      "message": "Model does not support vision, skipping image processing"
+    },
+    "ephemeral": true,
+    "id": "ad6521b2-6dce-4ba8-9570-efc19f1bf7ab",
+    "timestamp": "2026-08-31T09:23:30.497Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "model.call_start",
+    "data": {
+      "turnId": "1",
+      "model": "spike-model"
+    },
+    "ephemeral": true,
+    "id": "462eff3e-bab0-4723-8853-5ea5a6069462",
+    "timestamp": "2026-08-31T09:23:30.498Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "model.model_call_started",
+    "data": {
+      "kind": "model_call_started",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 1,
+      "timestampMs": 1788168210498
+    },
+    "ephemeral": true,
+    "id": "ae77913e-96bb-4db0-b5b0-028283d1acc7",
+    "timestamp": "2026-08-31T09:23:30.498Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 36
+    },
+    "ephemeral": true,
+    "id": "4471837e-6c98-4a8a-8a24-e2a29f453a3e",
+    "timestamp": "2026-08-31T09:23:30.501Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.message_start",
+    "data": {
+      "messageId": "e7e71fd2-5d8b-4276-9ff0-80fcf8525090"
+    },
+    "ephemeral": true,
+    "id": "568099d6-aa64-4adc-8f00-00ca10307a0a",
+    "timestamp": "2026-08-31T09:23:30.501Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "e7e71fd2-5d8b-4276-9ff0-80fcf8525090",
+      "deltaContent": "SPI"
+    },
+    "ephemeral": true,
+    "id": "cdddb132-7422-41e5-ad0e-5dbdafc613b9",
+    "timestamp": "2026-08-31T09:23:30.501Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 38
+    },
+    "ephemeral": true,
+    "id": "2cd657cb-d716-4dac-a255-9147dbf93930",
+    "timestamp": "2026-08-31T09:23:30.582Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "e7e71fd2-5d8b-4276-9ff0-80fcf8525090",
+      "deltaContent": "KE"
+    },
+    "ephemeral": true,
+    "id": "498b2238-0950-4493-b00d-ad44f14b0a63",
+    "timestamp": "2026-08-31T09:23:30.582Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 39
+    },
+    "ephemeral": true,
+    "id": "3feadd2f-be43-418c-9b68-4c8cdb9622bf",
+    "timestamp": "2026-08-31T09:23:30.663Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "e7e71fd2-5d8b-4276-9ff0-80fcf8525090",
+      "deltaContent": "_"
+    },
+    "ephemeral": true,
+    "id": "9ed440cf-b17d-4ad5-bd06-3aaad9c47a97",
+    "timestamp": "2026-08-31T09:23:30.663Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.streaming_delta",
+    "data": {
+      "totalResponseSizeBytes": 41
+    },
+    "ephemeral": true,
+    "id": "6a8a6228-968f-4307-9232-86f2d885f325",
+    "timestamp": "2026-08-31T09:23:30.743Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.message_delta",
+    "data": {
+      "messageId": "e7e71fd2-5d8b-4276-9ff0-80fcf8525090",
+      "deltaContent": "OK"
+    },
+    "ephemeral": true,
+    "id": "1d119a5d-0680-4795-b35c-517a34d19d6b",
+    "timestamp": "2026-08-31T09:23:30.744Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.usage",
+    "data": {
+      "model": "spike-model",
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "reasoningTokens": 0,
+      "cost": 0,
+      "duration": 328,
+      "timeToFirstTokenMs": 2.1582600000000003,
+      "outputTtftMs": 2.186653,
+      "interTokenLatencyMs": 64.5249366,
+      "initiator": "agent",
+      "interactionType": "conversation-agent",
+      "isByok": true,
+      "isAuto": false,
+      "maxPromptTokens": 128000,
+      "transport": "http",
+      "apiCallId": "chatcmpl-spike-3",
+      "rte": false,
+      "apiEndpoint": "/chat/completions",
+      "quotaSnapshots": {},
+      "reasoningEffort": "medium",
+      "availableToolCount": 22,
+      "toolTokenCount": 6887,
+      "frontierSource": "estimated",
+      "cacheDetailsReported": false,
+      "numToolCalls": 0,
+      "toolCounts": {},
+      "finishReason": "stop",
+      "contentFilterTriggered": false
+    },
+    "ephemeral": true,
+    "id": "abdf76ee-4e29-46f3-a035-9262e2929337",
+    "timestamp": "2026-08-31T09:23:30.826Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "model.model_call_success",
+    "data": {
+      "kind": "model_call_success",
+      "turn": 1,
+      "modelCallDurationMs": 328,
+      "ttftMs": 2.1582600000000003,
+      "outputTtftMs": 2.186653,
+      "interTokenLatencyMs": 64.5249366,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-3",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "agent",
+        "transport": "http"
+      },
+      "responseChunk": {
+        "object": "chat.completion.chunk",
+        "id": "chatcmpl-spike-3",
+        "choices": [
+          {
+            "delta": {
+              "responses_message_status": "completed",
+              "role": "assistant",
+              "content": "SPIKE_OK",
+              "refusal": null
+            },
+            "finish_reason": "stop",
+            "index": 0
+          }
+        ],
+        "created": 1788168210,
+        "model": "spike-model"
+      },
+      "quotaSnapshots": {},
+      "rte": false,
+      "reasoningEffort": "medium",
+      "maxPromptTokens": 128000,
+      "toolCount": 22,
+      "toolTokenCount": 6887
+    },
+    "ephemeral": true,
+    "id": "017bd538-b1f2-4031-9dcc-bd1d387c528e",
+    "timestamp": "2026-08-31T09:23:30.828Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "model.call_finished",
+    "data": {
+      "turnId": "1",
+      "dispatchDurationMs": 328,
+      "outcome": "success",
+      "editClassifierVersion": 1,
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038",
+      "containsBuiltInFileEditRequest": false
+    },
+    "ephemeral": true,
+    "id": "a7c3c123-c49b-4d18-b631-f77ec60c458c",
+    "timestamp": "2026-08-31T09:23:30.828Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "model.message",
+    "data": {
+      "kind": "message",
+      "turn": 1,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-3",
+        "api_endpoint": "/chat/completions",
+        "request_id": null,
+        "client_request_id": null,
+        "service_request_id": null,
+        "rte": false,
+        "initiator": "agent",
+        "transport": "http"
+      },
+      "message": {
+        "content": "SPIKE_OK",
+        "role": "assistant",
+        "refusal": null,
+        "apiCallId": "chatcmpl-spike-3"
+      }
+    },
+    "ephemeral": true,
+    "id": "1363af70-b284-4ef3-8686-e69702073a66",
+    "timestamp": "2026-08-31T09:23:30.828Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "assistant.message",
+    "data": {
+      "messageId": "e7e71fd2-5d8b-4276-9ff0-80fcf8525090",
+      "model": "spike-model",
+      "content": "SPIKE_OK",
+      "toolRequests": [],
+      "interactionId": "2779f759-206d-4053-aade-86b1c78c5038",
+      "turnId": "1",
+      "rte": false,
+      "apiCallId": "chatcmpl-spike-3"
+    },
+    "id": "480e4bfc-15ed-4a49-8afb-ecfce594d85b",
+    "timestamp": "2026-08-31T09:23:30.828Z",
+    "parentId": "a0e4ae4b-671d-4fc6-80c6-2ec00b98176c"
+  },
+  {
+    "type": "model.response",
+    "data": {
+      "kind": "response",
+      "turn": 1,
+      "modelCall": {
+        "model": "spike-model",
+        "api_id": "chatcmpl-spike-3"
+      },
+      "response": {
+        "content": "SPIKE_OK",
+        "role": "assistant",
+        "refusal": null
+      }
+    },
+    "ephemeral": true,
+    "id": "254835fc-23af-4e0c-b385-71bf9f9a1f29",
+    "timestamp": "2026-08-31T09:23:30.829Z",
+    "parentId": "480e4bfc-15ed-4a49-8afb-ecfce594d85b"
+  },
+  {
+    "type": "model.turn_ended",
+    "data": {
+      "kind": "turn_ended",
+      "model": "spike-model",
+      "modelInfo": {
+        "id": "spike-model",
+        "name": "spike-model",
+        "capabilities": {
+          "supports": {
+            "vision": false,
+            "adaptive_thinking": "unsupported"
+          },
+          "limits": {
+            "max_prompt_tokens": 128000,
+            "max_context_window_tokens": 200000,
+            "vision": {
+              "max_prompt_image_size": 3145728,
+              "max_prompt_images": 1,
+              "supported_media_types": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        "supported_endpoints": [
+          "/chat/completions"
+        ]
+      },
+      "turn": 1,
+      "timestampMs": 1788168210830
+    },
+    "ephemeral": true,
+    "id": "44af1d48-8e0f-4cb7-86c4-8f2ecf8bfebe",
+    "timestamp": "2026-08-31T09:23:30.830Z",
+    "parentId": "480e4bfc-15ed-4a49-8afb-ecfce594d85b"
+  },
+  {
+    "type": "assistant.turn_end",
+    "data": {
+      "turnId": "1"
+    },
+    "id": "904062c6-4791-4570-b963-fee41f7107b2",
+    "timestamp": "2026-08-31T09:23:30.830Z",
+    "parentId": "480e4bfc-15ed-4a49-8afb-ecfce594d85b"
+  },
+  {
+    "type": "assistant.idle",
+    "data": {},
+    "ephemeral": true,
+    "id": "7c0e9c07-621e-43f4-bf90-f78cee6a1345",
+    "timestamp": "2026-08-31T09:23:30.834Z",
+    "parentId": "904062c6-4791-4570-b963-fee41f7107b2"
+  },
+  {
+    "type": "session.background_tasks_changed",
+    "data": {},
+    "ephemeral": true,
+    "id": "d1010171-fbad-48db-8d85-b18ecbc47cc8",
+    "timestamp": "2026-08-31T09:23:30.835Z",
+    "parentId": "904062c6-4791-4570-b963-fee41f7107b2"
+  },
+  {
+    "type": "session.idle",
+    "data": {
+      "mode": "interactive"
+    },
+    "ephemeral": true,
+    "id": "7b4b83dc-b380-4166-b4f8-926851c1fd4e",
+    "timestamp": "2026-08-31T09:23:30.835Z",
+    "parentId": "904062c6-4791-4570-b963-fee41f7107b2"
+  }
+]

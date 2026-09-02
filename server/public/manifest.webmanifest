@@ -1,7 +1,7 @@
 {
-  "name": "Copilot Remote",
-  "short_name": "Copilot",
-  "description": "Installable Copilot Remote web app with standalone launcher support.",
+  "name": "OAR",
+  "short_name": "OAR",
+  "description": "OAR — Open Agent Relay: drive your local coding agents from any browser.",
   "id": "./__copilot_remote_pwa__",
   "start_url": "./",
   "scope": "./",

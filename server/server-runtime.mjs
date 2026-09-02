@@ -39,6 +39,9 @@ import { registerGitRoutes } from './routes/git-routes.mjs';
 import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
+import { createClaudeAuthService } from './services/claude-auth-service.mjs';
+import { createCliInstallService, writeCliBinariesToConfigFile } from './services/cli-install-service.mjs';
+import { createGrokAuthService } from './services/grok-auth-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
 import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
@@ -75,7 +78,7 @@ import { createSessionWorkerRegistry } from './services/session-worker-registry-
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
 import { latestModelCatalogRefresh } from '../shared/model-catalog-freshness.mjs';
-import { applyClaudeProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
 import {
@@ -97,7 +100,7 @@ import {
 import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { FEATURES, normalizeFeatureFlags } from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
-import { DEFAULT_QUESTION_TIMEOUT_MS } from '../shared/question-timeout.mjs';
+import { DEFAULT_QUESTION_TIMEOUT_MS, questionExpiresAt } from '../shared/question-timeout.mjs';
 import {
   parseTurnCeilingUpdate,
   readTurnCeilingSetting,
@@ -1212,6 +1215,14 @@ const OPENAI_MODEL_SETTING_KEY = 'openai_model';
 const OPENAI_MODELS_SETTING_KEY = 'openai_models';
 const OPENAI_BASE_URL_SETTING_KEY = 'openai_base_url';
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+// Which engine runs a Copilot (github / openai-provider) conversation: the
+// `copilot` CLI under a PTY with the web-relay extension injected, or the
+// headless SDK worker. The provider SET is unchanged by this — `github` and
+// `openai` stay the provider types, and this only selects the worker kind they
+// spawn, so model catalogs, usage cards and routing all stay put.
+const COPILOT_ENGINE_SETTING_KEY = 'copilot_engine';
+const COPILOT_ENGINES = ['extension', 'sdk'];
+const DEFAULT_COPILOT_ENGINE = 'extension';
 const CLAUDE_ENABLED_SETTING_KEY = 'claude_enabled';
 const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
@@ -1796,6 +1807,44 @@ function readAppSettingValue(key) {
   const normalizedKey = String(key || '').trim();
   if (!normalizedKey || typeof stmts?.getAppSetting?.get !== 'function') return '';
   return String(stmts.getAppSetting.get(normalizedKey)?.value || '').trim();
+}
+
+/**
+ * The Copilot engine setting, normalised. An unset or unrecognised stored value
+ * reads as the default (`extension`) rather than throwing: this value picks a
+ * worker kind at spawn time, and a relay that cannot decide must still be able
+ * to start a conversation on the engine that has been shipping.
+ */
+function getCopilotEngine() {
+  const stored = readAppSettingValue(COPILOT_ENGINE_SETTING_KEY).toLowerCase();
+  return COPILOT_ENGINES.includes(stored) ? stored : DEFAULT_COPILOT_ENGINE;
+}
+
+function getCopilotProviderSettings() {
+  return { engine: getCopilotEngine(), engines: [...COPILOT_ENGINES] };
+}
+
+function setCopilotProviderSettings({ engine } = {}) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Copilot settings are unavailable' };
+  }
+  const normalized = String(engine || '').trim().toLowerCase();
+  if (!COPILOT_ENGINES.includes(normalized)) return { ok: false, error: 'Invalid Copilot engine' };
+  if (normalized === 'sdk') {
+    // Refuse rather than persist a setting that cannot take effect. Both
+    // preconditions are boot-time facts this module owns: the launch
+    // environment is snapshotted once at startup, and the routing flag decides
+    // whether any node worker is ever spawned at all.
+    const unavailable = copilotSdkEngineUnavailableReason({
+      env: sessionWorkerLaunchEnv,
+      routingEnabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
+    });
+    // 409, not 400: the request is well-formed, the relay is not in a state to
+    // honour it.
+    if (unavailable) return { ok: false, status: 409, error: unavailable };
+  }
+  stmts.upsertAppSetting.run(COPILOT_ENGINE_SETTING_KEY, normalized, new Date().toISOString());
+  return { ok: true, ...getCopilotProviderSettings() };
 }
 
 function getTurnCeilingMinutes() {
@@ -2981,6 +3030,58 @@ const stmts = {
   ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+// Owns the `claude auth …` child processes, so the runtime (not the route
+// module) constructs it: shutdownRuntime() has to be able to dispose a login
+// PTY that is still holding a process group.
+const claudeAuthService = createClaudeAuthService();
+// Same ownership reason for `grok login --device-auth`: it polls x.ai for up to
+// ten minutes, so a shutdown mid-login has to be able to signal its process
+// group.
+const grokAuthService = createGrokAuthService();
+
+// ─── Provider CLI install / binary binding ────────────────────────────────────
+// A resolved CLI path is host state, not conversation state, so it lives beside
+// the port and the token in config.json rather than in the app_settings table
+// (a relay moved to another machine must not carry the old machine's paths in
+// its database).
+function readCliBinariesFromConfig() {
+  const stored = config?.cliBinaries;
+  return stored && typeof stored === 'object' && !Array.isArray(stored) ? { ...stored } : {};
+}
+
+// Read-modify-write against the file, never a dump of the in-memory `config`:
+// that object carries values deliberately kept off disk (a `--token` override,
+// the generated fallback token), and writing it back wholesale would persist
+// them. The merge, the refusal to write over a config that could not be read,
+// and the tmp-file+rename all live in the service so they can be tested — see
+// writeCliBinariesToConfigFile() for why each of those is load-bearing.
+// Throwing is the contract: bindResolvedBinary() keeps the in-process binding
+// and logs the reason.
+function writeCliBinariesToConfig(binaries) {
+  writeCliBinariesToConfigFile(CONFIG_PATH, binaries);
+  config.cliBinaries = { ...binaries };
+}
+
+// Owned here for the same reason as the auth services: shutdownRuntime() has to
+// be able to signal an installer that is still holding a process group.
+const cliInstallService = createCliInstallService({
+  readBoundBinaries: readCliBinariesFromConfig,
+  writeBoundBinaries: writeCliBinariesToConfig,
+});
+// Re-apply what a previous install resolved before anything can spawn a worker,
+// so a restarted relay finds the same binaries it found before — including on a
+// host where the vendor installer could not symlink into a directory that is
+// already on PATH (each bound binary's own directory is hoisted onto PATH).
+// A relay with nothing bound is left with the PATH the host gave it.
+try {
+  const boundCliBinaries = cliInstallService.applyPersistedBindings();
+  const boundIds = Object.keys(boundCliBinaries);
+  if (boundIds.length) {
+    console.log(`[cli-install] bound provider CLI binaries: ${boundIds.join(', ')}`);
+  }
+} catch (error) {
+  console.warn(`[cli-install] failed to apply persisted CLI bindings: ${error?.message || error}`);
+}
 
 // ─── Web Push ─────────────────────────────────────────────────────────────────
 // VAPID keys are generated once and persisted in app_settings; regenerating
@@ -3292,7 +3393,7 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
   // Clear every provider's variables first (the appliers' kind-guarded deletes
   // keep the chained clears order-independent), then apply only the bound one.
-  const cleared = applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv))));
+  const cleared = applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv)))));
   if (providerType === 'claude') {
     const claudeSettings = getClaudeProviderSettings();
     const claudeModel = String(runtimeSession?.provider_model || runtimeSession?.model || claudeSettings.model).trim();
@@ -3322,17 +3423,38 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
       command: String(process.env.GROK_CLI_COMMAND || process.env.GROK_COMMAND || '').trim(),
     });
   }
+  // Only the two providers the Copilot CLI serves get this far, so the setting
+  // is read here rather than at the top of the function: claude/cursor/grok
+  // spawns would otherwise pay a DB read whose answer they always discard.
+  //
+  // The toggle picks the WORKER KIND, not the provider type — routing, model
+  // catalogs and usage cards are unaffected. Read per spawn, so flipping the
+  // setting takes effect on the next worker without disturbing running ones.
+  const copilotSdkEngine = getCopilotEngine() === 'sdk';
   if (providerType !== 'openai') {
-    return cleared;
+    // github (and any unknown provider, which binds to github): the extension
+    // engine is the absence of a worker kind, the SDK engine names one.
+    if (!copilotSdkEngine) return cleared;
+    return applyCopilotSdkProviderEnvironment(cleared, {
+      enabled: true,
+      model: String(runtimeSession?.provider_model || runtimeSession?.model || '').trim(),
+    });
   }
   const settings = getOpenAIProviderSettings();
   const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
-  return applyOpenAIProviderEnvironment(cleared, {
+  // BYOK first, engine second: the OpenAI applier owns the COPILOT_PROVIDER_*
+  // family on both engines (the extension's CLI startup layer reads it, and the
+  // SDK worker re-expresses it as SessionConfig.provider because the runtime
+  // ignores it for SDK-created sessions), and the engine applier only adds the
+  // worker kind on top.
+  const openAiEnv = applyOpenAIProviderEnvironment(cleared, {
     enabled: true,
     apiKey: settings.apiKey,
     model,
     baseUrl: settings.baseUrl,
   });
+  if (!copilotSdkEngine) return openAiEnv;
+  return applyCopilotSdkProviderEnvironment(openAiEnv, { enabled: true, model });
 }
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
@@ -6539,6 +6661,8 @@ const sharedRouteDeps = {
   getOpenAIProviderSettings,
   setOpenAIProviderSettings,
   refreshOpenAIProviderModels,
+  getCopilotProviderSettings,
+  setCopilotProviderSettings,
   getClaudeProviderSettings,
   setClaudeProviderSettings,
   refreshClaudeProviderModels,
@@ -6663,6 +6787,9 @@ const sharedRouteDeps = {
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
+  claudeAuthService,
+  cliInstallService,
+  grokAuthService,
   imageOperationService,
   windowsAutostartService,
   pushDispatchService,
@@ -6743,10 +6870,19 @@ recoverStaleMessages(); // run immediately on startup
 
 function expirePendingQuestions() {
   const now = new Date().toISOString();
-  const result = stmts.expireQuestions.run(now);
-  if (result.changes > 0) {
-    console.log(`${runtimeLogPrefix()}Timed out ${result.changes} relay question(s)`);
-    io.emit('relay_question_changed', { expired: result.changes });
+  const expired = stmts.expireQuestions.all(now);
+  if (expired.length > 0) {
+    // Log id + age: a question timing out seconds after creation is a bug (a
+    // zero timeout), not a user walking away, and the age is what shows that.
+    const nowMs = Date.parse(now);
+    const detail = expired
+      .map((row) => {
+        const ageMs = nowMs - new Date(row.created_at || now).getTime();
+        return `${String(row.id || '').slice(0, 8)} age=${Math.max(0, Math.round(ageMs / 1000))}s`;
+      })
+      .join(', ');
+    console.log(`${runtimeLogPrefix()}Timed out ${expired.length} relay question(s): ${detail}`);
+    io.emit('relay_question_changed', { expired: expired.length });
   }
 }
 runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
@@ -6951,13 +7087,6 @@ if (typeof runtimeTimers.pendingWorkerPrime.unref === 'function') runtimeTimers.
 // POST /api/heartbeat — CLI sends a ping every poll interval
 
 // ─── Relay Question Routes ────────────────────────────────────────────────────
-
-function questionExpiresAt(createdAt, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS) {
-  const normalizedTimeoutMs = Number.isFinite(Number(timeoutMs))
-    ? Math.max(0, Math.trunc(Number(timeoutMs)))
-    : DEFAULT_QUESTION_TIMEOUT_MS;
-  return new Date(new Date(createdAt).getTime() + normalizedTimeoutMs).toISOString();
-}
 
 function sanitizeRelayQuestionPrompt(requestBody) {
   const prompt = String(
@@ -7177,6 +7306,15 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   void sdkSessionImportService.dispose().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session importer shutdown failed: ${error?.message || error}`);
   });
+  try { claudeAuthService.dispose(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}Claude auth service shutdown failed: ${error?.message || error}`);
+  }
+  try { cliInstallService.dispose(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}CLI install service shutdown failed: ${error?.message || error}`);
+  }
+  try { grokAuthService.dispose(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}Grok auth service shutdown failed: ${error?.message || error}`);
+  }
   sessionWorkerWebSocketService.stop();
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();

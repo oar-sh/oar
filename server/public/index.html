@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#161b22">
-<meta name="application-name" content="Copilot Remote">
-<meta name="apple-mobile-web-app-title" content="Copilot Remote">
+<meta name="application-name" content="OAR">
+<meta name="apple-mobile-web-app-title" content="OAR">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -24,7 +24,7 @@
     ? __APP_CONFIG.basePath.replace(/\/+$/, '')
     : __deriveBasePathFromLocation();
   const __IS_SHARED_ROUTE = typeof __APP_CONFIG?.sharedToken === 'string' && __APP_CONFIG.sharedToken.trim().length > 0;
-  const __PWA_VERSION = '0';
+  const __PWA_VERSION = '1';
   __APP_CONFIG.pwaVersion = __PWA_VERSION;
   window.__COPILOT_PWA_VERSION = __PWA_VERSION;
   window.addEventListener('DOMContentLoaded', () => {
@@ -171,7 +171,7 @@
   document.write(`<link rel="icon" type="image/svg+xml" href="${__APP_BASE}/app-icon.svg?${__PWA_BUST}">`);
   document.write(`<link rel="apple-touch-icon" href="${__APP_BASE}/app-icon-192.png?${__PWA_BUST}">`);
 </script>
-<title>Copilot Remote</title>
+<title>OAR — Open Agent Relay</title>
 <script>document.write('<scr'+'ipt src="'+__APP_BASE+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
@@ -944,6 +944,12 @@
     flex-direction: column;
     align-items: flex-start;
   }
+  /* Author `display: flex` above outranks the UA [hidden] rule, so rows that
+     are hidden from script (e.g. #push-settings-section in shared view) need
+     this to actually disappear. */
+  .settings-row[hidden] {
+    display: none;
+  }
   .settings-help {
     color: var(--muted);
     font-size: var(--fs-meta-sm);
@@ -952,6 +958,103 @@
   .settings-provider-status[data-state="active"] { color: #3fb950; }
   .settings-provider-status[data-state="saved"] { color: var(--accent); }
   .settings-provider-status[data-state="error"] { color: #f85149; }
+  /* These rows are laid out as flex and hidden from script via `.hidden = true`.
+     Their `display: flex` lives HERE rather than in a style="" attribute on
+     purpose: an inline declaration outranks every selector-based rule (short of
+     !important), so an inline flex would beat both the UA [hidden] rule and the
+     one below, and the row would stay on screen while script believed it hidden.
+     Declared as author CSS, the [hidden] rule wins on specificity (id+attribute
+     over id) and hiding works — the same shape as .settings-row above. */
+  #claude-auth-url-row,
+  #claude-auth-code-row,
+  #grok-auth-url-row,
+  #grok-auth-code-row,
+  #grok-auth-actions-row {
+    display: flex;
+  }
+  #claude-auth-url-row[hidden],
+  #claude-auth-code-row[hidden],
+  #grok-auth-url-row[hidden],
+  #grok-auth-code-row[hidden],
+  #grok-auth-actions-row[hidden] {
+    display: none;
+  }
+  /* Provider CLI install rows (cli-install-ui.js). */
+  .cli-install-label { font-weight: 600; flex: 0 0 auto; }
+  .cli-install-log { width: 100%; margin-top: 8px; }
+  .cli-install-log > summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    word-break: break-all;
+  }
+  /* Capped: an installer can print thousands of lines and the settings modal
+     must not grow a second scrollbar the length of the page. */
+  .cli-install-log pre,
+  .cli-install-command {
+    max-height: 220px;
+    overflow: auto;
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--fs-meta-sm);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  /* Settings modal tabs: same visual language as .summary-btn.model-provider-tab. */
+  .settings-tab-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .settings-tab {
+    flex: 0 0 auto;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 8px;
+    height: 32px;
+    padding: 0 12px;
+    font-size: var(--fs-meta-md);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .settings-tab.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .settings-subtab-strip {
+    padding: 0 0 12px;
+    border-bottom: none;
+    background: transparent;
+  }
+  .settings-subtab {
+    height: 28px;
+    padding: 0 10px;
+    background: transparent;
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+  }
+  .settings-subtab.active {
+    background: var(--bg2);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .settings-panel:focus {
+    outline: none;
+  }
+  .settings-panel[hidden] {
+    display: none;
+  }
   #pending-question-banner {
     display: none;
     border: 1px solid rgba(88, 166, 255, 0.45);
@@ -1344,6 +1447,15 @@
     border-top: 1px dashed var(--border);
   }
   .msg-bubble-actions:empty { display: none; }
+  /* Fix-it buttons on a terminal turn failure (relay-error-ctas.mjs). */
+  .msg-error-cta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .msg-error-cta:empty { display: none; }
   .msg.user .bubble-action-btn {
     color: var(--user-bubble-fg);
     border-color: var(--user-bubble-border);
@@ -1791,6 +1903,44 @@
      Shares the context-usage bar/table vocabulary so the two modals read as
      one family, but leads with per-provider plan cards. */
   .plan-usage { display: flex; flex-direction: column; gap: 16px; }
+  /* One provider at a time, same accent-bordered active tab as .settings-tab. */
+  .plan-usage-tab-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .plan-usage-tab {
+    flex: 0 0 auto;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 8px;
+    height: 30px;
+    padding: 0 12px;
+    font-size: var(--fs-meta-md);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .plan-usage-tab.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .plan-usage-card-titles {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .plan-usage-account {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .plan-usage-account-signed-out { color: var(--warn); }
+  /* Explicit so a future display rule on the card cannot outrank [hidden]. */
+  .plan-usage-card[hidden] { display: none; }
   .plan-usage-card {
     border: 1px solid var(--border);
     border-radius: 10px;
@@ -2640,6 +2790,32 @@
     color: var(--text);
   }
   #new-conversation-cwd-manual[hidden] { display: none; }
+  /* Shared row/button recipe for the file-explorer CWD browse buttons in the
+     New chat and Change CWD modals — one place to restyle both. */
+  .cwd-browse-row {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .cwd-browse-row > :first-child {
+    flex: 1;
+    min-width: 0;
+  }
+  .cwd-browse-btn {
+    flex: 0 0 auto;
+    min-height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg3);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .cwd-browse-btn:hover { border-color: var(--accent); }
+  #new-conversation-cwd-browse {
+    min-height: 42px;
+    margin-top: 8px;
+  }
   .tmux-inspector-dialog {
     width: min(1120px, 100%);
     height: min(80vh, 760px);
@@ -3480,6 +3656,27 @@
     padding: 14px;
   }
   #repo-browser-modal.visible { display: flex; }
+  /* CWD-pick mode is launched from the summary / new-chat modals (z 12050),
+     so the browser must stack above them; toasts stay on top at 12500. */
+  #repo-browser-modal.cwd-pick-mode { z-index: 12400; }
+  .repo-cwd-pick-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .repo-cwd-pick-bar[hidden] { display: none; }
+  .repo-cwd-pick-path {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--fs-meta-md);
+    color: var(--muted);
+    word-break: break-all;
+  }
+  #repo-cwd-pick-confirm { white-space: nowrap; }
+  #repo-cwd-pick-confirm:disabled { opacity: 0.55; cursor: default; }
   .repo-browser-dialog {
     width: min(1200px, 100%);
     height: min(92vh, 920px);
@@ -4347,6 +4544,32 @@
       max-height: calc(var(--app-height) - 16px);
       border-radius: 10px;
     }
+    /* The tab strips scroll sideways so .summary-body stays the only vertical
+       scroll container inside the dialog. */
+    .settings-tab-strip {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      padding: 8px 12px;
+    }
+    .settings-tab-strip::-webkit-scrollbar {
+      display: none;
+    }
+    .settings-subtab-strip {
+      padding: 0 0 12px;
+    }
+    .plan-usage-tab-strip {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }
+    .plan-usage-tab-strip::-webkit-scrollbar {
+      display: none;
+    }
     #new-conversation-model-modal {
       align-items: center;
     }
@@ -4525,7 +4748,7 @@
 <!-- Auth Gate -->
 <div id="auth-gate">
   <div class="auth-box">
-    <h1>🤖 Copilot Remote</h1>
+    <h1>🛶 OAR</h1>
     <p>Enter your access token to connect</p>
     <input id="token-input" type="password" placeholder="Access token" autofocus onkeydown="if(event.key==='Enter')window.__copilotAuthConnect(event)">
     <button onclick="window.__copilotAuthConnect(event)">Connect</button>
@@ -4533,7 +4756,7 @@
   </div>
 </div>
 
-<div id="startup-loading" role="status" aria-live="polite">Connecting to Copilot Remote…</div>
+<div id="startup-loading" role="status" aria-live="polite">Connecting to OAR…</div>
 
 <!-- Sidebar overlay (mobile) -->
 <div id="sidebar-overlay" onclick="closeSidebar()"></div>
@@ -4642,7 +4865,7 @@
           <option value="">Unavailable</option>
         </select>
         <button id="send-btn" onclick="sendMessage()">Send</button>
-        <a id="shared-github-pill" href="https://github.com/materia79/copilot-remote" target="_blank" rel="noopener" aria-label="Fork copilot-remote on GitHub">
+        <a id="shared-github-pill" href="https://github.com/oar-sh/oar" target="_blank" rel="noopener" aria-label="Fork OAR on GitHub">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
           <span>Fork on GitHub</span>
         </a>
@@ -4686,6 +4909,10 @@
         <div id="repo-folder-breadcrumb" class="repo-pane-head repo-breadcrumb"></div>
         <div id="repo-folder"></div>
       </section>
+    </div>
+    <div id="repo-cwd-pick-bar" class="repo-cwd-pick-bar" hidden>
+      <span id="repo-cwd-pick-path" class="repo-cwd-pick-path"></span>
+      <button id="repo-cwd-pick-confirm" class="repo-browser-btn" type="button" onclick="confirmRepoBrowserCwdPick()">✅ Use this folder as CWD</button>
     </div>
   </div>
 </div>
@@ -4734,336 +4961,661 @@
         <button class="summary-close" onclick="closeSettingsModal()" aria-label="Close settings">×</button>
       </div>
     </div>
+    <div class="settings-tab-strip" role="tablist" aria-label="Settings sections">
+      <button
+        id="settings-tab-general"
+        class="settings-tab active"
+        type="button"
+        role="tab"
+        aria-selected="true"
+        aria-controls="settings-panel-general"
+        tabindex="0"
+        data-settings-tab="general"
+      >General</button>
+      <button
+        id="settings-tab-providers"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-providers"
+        tabindex="-1"
+        data-settings-tab="providers"
+      >Providers</button>
+      <button
+        id="settings-tab-previews"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-previews"
+        tabindex="-1"
+        data-settings-tab="previews"
+      >Previews</button>
+      <button
+        id="settings-tab-notifications"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-notifications"
+        tabindex="-1"
+        data-settings-tab="notifications"
+      >Notifications</button>
+    </div>
     <div class="summary-body" style="padding: 16px;">
-      <div class="settings-row">
-        <label for="theme-select">Theme</label>
-        <select id="theme-select" onchange="updateTheme(this.value)">
-          <option value="dark">Dark</option>
-          <option value="light">Light</option>
-        </select>
-      </div>
-      <div class="settings-row" style="margin-bottom: 0;">
-        <label for="font-scale-select">Text scaling</label>
-        <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling"></select>
-      </div>
-      <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="show-suspend-host-toggle">Show Suspend host action</label>
-        <input
-          id="show-suspend-host-toggle"
-          type="checkbox"
-          onchange="updateShowSuspendHostSetting(this.checked)"
-          aria-label="Show Suspend host action"
-          checked
-        >
-      </div>
-      <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="turn-ceiling-slider">Max turn duration <span id="turn-ceiling-value">No limit</span></label>
-        <input
-          id="turn-ceiling-slider"
-          type="range"
-          min="0"
-          max="600"
-          step="5"
-          value="60"
-          aria-label="Maximum turn duration in minutes"
-          oninput="previewTurnCeilingSetting(this.value)"
-          onchange="updateTurnCeilingSetting(this.value)"
-        >
-      </div>
-      <div class="settings-help" style="margin-top: 6px;">A hard cap on how long one turn may run before the relay requeues it. Turns are already kept alive by worker heartbeats, and a turn waiting on your answer to a question is never cut off — so this only catches a worker that has hung. Set to 0 for no limit.</div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">No limit</span></label>
-        <input
-          id="background-task-timeout-slider"
-          type="range"
-          min="0"
-          max="600"
-          step="5"
-          value="0"
-          aria-label="Background task timeout in minutes"
-          oninput="previewBackgroundTaskTimeoutSetting(this.value)"
-          onchange="updateBackgroundTaskTimeoutSetting(this.value)"
-        >
-      </div>
-      <div class="settings-help" style="margin-top: 6px;">How long background tasks (backgrounded commands, subagents, monitors) may keep a Claude session's CLI process alive after its turn ends. When the limit is reached the tasks are stopped and the agent reports what they left behind. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
-      <div id="windows-autostart-setting" hidden>
-        <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
-          <label for="windows-autostart-toggle">Autostart (Windows)</label>
-          <input
-            id="windows-autostart-toggle"
-            type="checkbox"
-            onchange="updateWindowsAutostartSettingFromToggle(this.checked)"
-            aria-label="Autostart on Windows sign-in"
-          >
-        </div>
-        <div class="settings-help" style="margin-top: 6px;">Open a visible terminal and start only the web relay server when you sign in. A Copilot CLI host must attach separately to process turns.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="pwa-app-name-input">Install app name</label>
-        <input
-          id="pwa-app-name-input"
-          type="text"
-          maxlength="60"
-          placeholder="Copilot Remote"
-          aria-label="Install app name"
-          onchange="updatePwaAppName(this.value)"
-        >
-        <div class="settings-help">Used for the installed PWA app label. Some platforms may require reinstalling the app after a rename.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="default-session-workspace-root-input">Default CWD for new sessions</label>
-        <input
-          id="default-session-workspace-root-input"
-          type="text"
-          placeholder="Leave empty to use relay workspace root"
-          aria-label="Default CWD for new sessions"
-          onchange="updateDefaultSessionWorkspaceRootSetting(this.value)"
-        >
-        <div class="settings-help">Applies to newly created sessions. Leave blank to fallback to the relay workspace root.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="openai-api-key-input">OpenAI API key</label>
-        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
-          <label for="openai-enabled-toggle">Enable OpenAI API key for New Chat model selection</label>
-          <input id="openai-enabled-toggle" type="checkbox" onchange="toggleOpenAIProvider(this.checked)" disabled>
-        </div>
-        <input
-          id="openai-api-key-input"
-          type="password"
-          autocomplete="off"
-          placeholder="sk-..."
-          aria-label="OpenAI API key"
-        >
-        <label for="openai-model-input" style="margin-top: 8px;">OpenAI model ID</label>
-        <input
-          id="openai-model-input"
-          type="text"
-          value="gpt-4o"
-          placeholder="gpt-4o"
-          aria-label="OpenAI model ID"
-        >
-        <label for="openai-base-url-input" style="margin-top: 8px;">Base URL <span style="font-weight:normal;opacity:.7;">(optional, default: https://api.openai.com/v1)</span></label>
-        <input
-          id="openai-base-url-input"
-          type="text"
-          placeholder="https://api.openai.com/v1"
-          aria-label="OpenAI base URL"
-        >
-        <div id="openai-settings-status" class="settings-help settings-provider-status">Loading OpenAI settings…</div>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <button id="openai-save-btn" type="button" class="summary-btn" onclick="saveOpenAISettings()">Save OpenAI settings</button>
-          <button id="openai-remove-btn" type="button" class="summary-btn" onclick="removeOpenAISettings()">Remove saved key</button>
-        </div>
-        <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="claude-model-input">Claude SDK</label>
-        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
-          <label for="claude-enabled-toggle">Enable Claude for New Chat model selection</label>
-          <input id="claude-enabled-toggle" type="checkbox" onchange="toggleClaudeProvider(this.checked)">
-        </div>
-        <label for="claude-model-input" style="margin-top: 8px;">Claude model ID</label>
-        <input
-          id="claude-model-input"
-          type="text"
-          value="claude-sonnet-5"
-          placeholder="claude-sonnet-5"
-          aria-label="Claude model ID"
-        >
-        <div id="claude-settings-status" class="settings-help settings-provider-status">Loading Claude settings…</div>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
-        </div>
-        <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="grok-model-input">Grok</label>
-        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
-          <label for="grok-enabled-toggle">Enable Grok for New Chat model selection</label>
-          <input id="grok-enabled-toggle" type="checkbox" onchange="toggleGrokProvider(this.checked)">
-        </div>
-        <label for="grok-model-input" style="margin-top: 8px;">Grok model ID</label>
-        <input
-          id="grok-model-input"
-          type="text"
-          value="grok-4.5"
-          placeholder="grok-4.5"
-          aria-label="Grok model ID"
-        >
-        <div id="grok-settings-status" class="settings-help settings-provider-status">Loading Grok settings…</div>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <button id="grok-save-btn" type="button" class="summary-btn" onclick="saveGrokSettings()">Save Grok settings</button>
-        </div>
-        <div class="settings-help">Uses the host machine's logged-in Grok credentials (grok login or XAI_API_KEY). No API key is stored in the browser. Disabling also rebinds conversations that have not sent a message yet.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="grok-allowance-monthly-input">Grok monthly plan allowance</label>
-        <div class="settings-help">Grok does not expose remaining plan credits over ACP. Optional: enter your monthly USD budget so Check Usage can show an estimated remaining meter. Last-turn tokens and cost are always shown after a Grok turn.</div>
-        <label for="grok-allowance-monthly-input" style="margin-top: 8px;">Monthly allowance (USD)</label>
-        <input
-          id="grok-allowance-monthly-input"
-          type="number"
-          min="0"
-          step="0.01"
-          inputmode="decimal"
-          placeholder="e.g. 30"
-          aria-label="Grok monthly allowance in US dollars"
-        >
-        <label for="grok-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
-        <input
-          id="grok-allowance-reset-day-input"
-          type="number"
-          min="1"
-          max="31"
-          step="1"
-          inputmode="numeric"
-          placeholder="1"
-          aria-label="Grok billing reset day of month"
-        >
-        <div id="grok-allowance-status" class="settings-help settings-provider-status">Loading Grok allowances…</div>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <button id="grok-allowance-save-btn" type="button" class="summary-btn" onclick="saveGrokAllowanceSettings()">Save allowances</button>
-          <button id="grok-allowance-reset-btn" type="button" class="summary-btn" onclick="resetGrokAllowanceAccounting()">Reset tracked spend</button>
-        </div>
-        <div class="settings-help">Reset tracked spend after changing plan or account. Authoritative billing: <a href="https://console.x.ai" target="_blank" rel="noopener noreferrer">console.x.ai</a>.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="cursor-api-key-input">Cursor SDK</label>
-        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
-          <label for="cursor-enabled-toggle">Enable Cursor for New Chat model selection</label>
-          <input id="cursor-enabled-toggle" type="checkbox" onchange="toggleCursorProvider(this.checked)" disabled>
-        </div>
-        <input
-          id="cursor-api-key-input"
-          type="password"
-          autocomplete="off"
-          placeholder="Cursor API key…"
-          aria-label="Cursor API key"
-        >
-        <label for="cursor-model-input" style="margin-top: 8px;">Cursor model ID</label>
-        <input
-          id="cursor-model-input"
-          type="text"
-          value="composer-2.5"
-          placeholder="composer-2.5"
-          aria-label="Cursor model ID"
-        >
-        <div id="cursor-settings-status" class="settings-help settings-provider-status">Loading Cursor settings…</div>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <button id="cursor-save-btn" type="button" class="summary-btn" onclick="saveCursorSettings()">Save Cursor settings</button>
-          <button id="cursor-remove-btn" type="button" class="summary-btn" onclick="removeCursorSettings()">Remove saved key</button>
-        </div>
-        <div class="settings-help">Runs Cursor conversations through the Cursor Agent SDK using your saved Cursor API key. The key is stored on the relay host and never sent to browsers.</div>
-      </div>
-      <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label for="cursor-allowance-cursor-models-input">Cursor monthly plan allowance</label>
-        <div class="settings-help">Cursor does not expose your included pools through its SDK, so enter the monthly allowance from your plan. Spend is measured with raw model cost and reset on the day you choose.</div>
-        <label for="cursor-allowance-cursor-models-input" style="margin-top: 8px;">Cursor Models pool (USD)</label>
-        <input
-          id="cursor-allowance-cursor-models-input"
-          type="number"
-          min="0"
-          step="0.01"
-          inputmode="decimal"
-          placeholder="e.g. 20"
-          aria-label="Cursor Models monthly allowance in US dollars"
-        >
-        <label for="cursor-allowance-other-models-input" style="margin-top: 8px;">Other Models pool (USD)</label>
-        <input
-          id="cursor-allowance-other-models-input"
-          type="number"
-          min="0"
-          step="0.01"
-          inputmode="decimal"
-          placeholder="e.g. 20"
-          aria-label="Other Models monthly allowance in US dollars"
-        >
-        <label for="cursor-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
-        <input
-          id="cursor-allowance-reset-day-input"
-          type="number"
-          min="1"
-          max="31"
-          step="1"
-          inputmode="numeric"
-          placeholder="1"
-          aria-label="Cursor billing reset day of month"
-        >
-        <div id="cursor-allowance-status" class="settings-help settings-provider-status">Loading Cursor allowances…</div>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <button id="cursor-allowance-save-btn" type="button" class="summary-btn" onclick="saveCursorAllowanceSettings()">Save allowances</button>
-          <button id="cursor-allowance-reset-btn" type="button" class="summary-btn" onclick="resetCursorAllowanceAccounting()">Reset tracked spend</button>
-        </div>
-        <div class="settings-help">Reset tracked spend after changing plan or account: tracking re-baselines from each agent's current totals, so past spend is never counted twice.</div>
-        <label for="cursor-dashboard-token-input" style="margin-top: 12px;">Dashboard session token (live plan bars)</label>
-        <input
-          id="cursor-dashboard-token-input"
-          type="password"
-          autocomplete="off"
-          placeholder="WorkosCursorSessionToken cookie value"
-          aria-label="Cursor dashboard session token"
-        >
-        <div id="cursor-dashboard-token-status" class="settings-help settings-provider-status">Loading dashboard token state…</div>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <button id="cursor-dashboard-token-save-btn" type="button" class="summary-btn" onclick="saveCursorDashboardToken()">Save token</button>
-          <button id="cursor-dashboard-token-remove-btn" type="button" class="summary-btn" onclick="removeCursorDashboardToken()">Remove</button>
-        </div>
-        <div class="settings-help">Unlocks the live "Included in plan" percentage bars on Check Usage. Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Headless hosts can also set <code>CURSOR_SESSION_TOKEN</code> in the relay environment. Tokens stay on the relay.</div>
-      </div>
-      <div id="previews-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label>Live previews</label>
-        <div id="settings-previews-list"></div>
-        <div id="settings-previews-empty" class="settings-help">Loading previews…</div>
-        <div class="settings-help">Local dev servers published on the preview host. Previews never expire on their own — they live until you close them here or the relay restarts. Every link is public: anyone with the URL reaches the app without logging in.</div>
-      </div>
-      <div id="push-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-        <label>Push notifications</label>
-        <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
-          <label for="push-enabled-toggle">Enable push notifications on this device</label>
-          <input id="push-enabled-toggle" type="checkbox" onchange="togglePushOnThisDevice(this.checked)" disabled>
-        </div>
-        <div id="push-settings-status" class="settings-help settings-provider-status">Loading push settings…</div>
-        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
-          <label for="push-include-title-toggle">Include conversation title</label>
-          <input id="push-include-title-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
-        </div>
-        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
-          <label for="push-preview-select">Message preview</label>
-          <select id="push-preview-select" onchange="updatePushPreferencesFromControls()" disabled>
-            <option value="none">None (generic text)</option>
-            <option value="truncated">Truncated</option>
-            <option value="full">Full text</option>
+      <div
+        id="settings-panel-general"
+        class="settings-panel active"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-general"
+        data-settings-panel="general"
+      >
+        <div class="settings-row">
+          <label for="theme-select">Theme</label>
+          <select id="theme-select" onchange="updateTheme(this.value)">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
           </select>
         </div>
-        <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
-          <label for="push-preview-chars-input">Preview length (characters)</label>
-          <input id="push-preview-chars-input" type="number" min="20" max="500" value="80" style="width: 90px;" onchange="updatePushPreferencesFromControls()" disabled>
+        <div class="settings-row" style="margin-bottom: 0;">
+          <label for="font-scale-select">Text scaling</label>
+          <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling"></select>
         </div>
-        <label style="margin-top: 10px;">Notify about</label>
-        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
-          <label for="push-event-question-toggle">Questions from the agent</label>
-          <input id="push-event-question-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="show-suspend-host-toggle">Show Suspend host action</label>
+          <input
+            id="show-suspend-host-toggle"
+            type="checkbox"
+            onchange="updateShowSuspendHostSetting(this.checked)"
+            aria-label="Show Suspend host action"
+            checked
+          >
         </div>
-        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
-          <label for="push-event-turn-complete-toggle">Turn completed</label>
-          <input id="push-event-turn-complete-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
+        <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="turn-ceiling-slider">Max turn duration <span id="turn-ceiling-value">No limit</span></label>
+          <input
+            id="turn-ceiling-slider"
+            type="range"
+            min="0"
+            max="600"
+            step="5"
+            value="60"
+            aria-label="Maximum turn duration in minutes"
+            oninput="previewTurnCeilingSetting(this.value)"
+            onchange="updateTurnCeilingSetting(this.value)"
+          >
         </div>
-        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
-          <label for="push-event-turn-failed-toggle">Turn failed</label>
-          <input id="push-event-turn-failed-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        <div class="settings-help" style="margin-top: 6px;">A hard cap on how long one turn may run before the relay requeues it. Turns are already kept alive by worker heartbeats, and a turn waiting on your answer to a question is never cut off — so this only catches a worker that has hung. Set to 0 for no limit.</div>
+        <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">No limit</span></label>
+          <input
+            id="background-task-timeout-slider"
+            type="range"
+            min="0"
+            max="600"
+            step="5"
+            value="0"
+            aria-label="Background task timeout in minutes"
+            oninput="previewBackgroundTaskTimeoutSetting(this.value)"
+            onchange="updateBackgroundTaskTimeoutSetting(this.value)"
+          >
         </div>
-        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
-          <label for="push-event-board-toggle">Boards (plan reviews)</label>
-          <input id="push-event-board-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+        <div class="settings-help" style="margin-top: 6px;">How long background tasks (backgrounded commands, subagents, monitors) may keep a Claude session's CLI process alive after its turn ends. When the limit is reached the tasks are stopped and the agent reports what they left behind. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
+        <div id="windows-autostart-setting" hidden>
+          <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="windows-autostart-toggle">Autostart (Windows)</label>
+            <input
+              id="windows-autostart-toggle"
+              type="checkbox"
+              onchange="updateWindowsAutostartSettingFromToggle(this.checked)"
+              aria-label="Autostart on Windows sign-in"
+            >
+          </div>
+          <div class="settings-help" style="margin-top: 6px;">Open a visible terminal and start only the web relay server when you sign in. A Copilot CLI host must attach separately to process turns.</div>
         </div>
-        <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
-          <label for="push-event-cli-offline-toggle">CLI went offline</label>
-          <input id="push-event-cli-offline-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+        <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="pwa-app-name-input">Install app name</label>
+          <input
+            id="pwa-app-name-input"
+            type="text"
+            maxlength="60"
+            placeholder="OAR"
+            aria-label="Install app name"
+            onchange="updatePwaAppName(this.value)"
+          >
+          <div class="settings-help">Used for the installed PWA app label. Some platforms may require reinstalling the app after a rename.</div>
         </div>
-        <label style="margin-top: 10px;">Devices</label>
-        <div id="push-device-list" style="width: 100%;"></div>
-        <div class="settings-help">Notifications are only sent while no device has the app in the foreground. Content defaults to generic text; message previews are opt-in per device.</div>
+        <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="default-session-workspace-root-input">Default CWD for new sessions</label>
+          <input
+            id="default-session-workspace-root-input"
+            type="text"
+            placeholder="Leave empty to use relay workspace root"
+            aria-label="Default CWD for new sessions"
+            onchange="updateDefaultSessionWorkspaceRootSetting(this.value)"
+          >
+          <div class="settings-help">Applies to newly created sessions. Leave blank to fallback to the relay workspace root.</div>
+        </div>
+      </div>
+      <div
+        id="settings-panel-providers"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-providers"
+        data-settings-panel="providers"
+        hidden
+      >
+        <div class="settings-tab-strip settings-subtab-strip" role="tablist" aria-label="Provider settings">
+          <button
+            id="settings-provider-tab-copilot"
+            class="settings-tab settings-subtab active"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="settings-provider-panel-copilot"
+            tabindex="0"
+            data-settings-provider-tab="copilot"
+          >Copilot</button>
+          <button
+            id="settings-provider-tab-openai"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-openai"
+            tabindex="-1"
+            data-settings-provider-tab="openai"
+          >OpenAI</button>
+          <button
+            id="settings-provider-tab-claude"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-claude"
+            tabindex="-1"
+            data-settings-provider-tab="claude"
+          >Claude</button>
+          <button
+            id="settings-provider-tab-grok"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-grok"
+            tabindex="-1"
+            data-settings-provider-tab="grok"
+          >Grok</button>
+          <button
+            id="settings-provider-tab-cursor"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-cursor"
+            tabindex="-1"
+            data-settings-provider-tab="cursor"
+          >Cursor</button>
+        </div>
+        <div
+          id="settings-provider-panel-copilot"
+          class="settings-panel active"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-copilot"
+          data-settings-provider-panel="copilot"
+        >
+          <!-- Provider CLI status row; cli-install-ui.js drives the state. Copilot
+               is detect-only (npm-global on this host), so its payload carries no
+               commands and every action button stays hidden. -->
+          <div id="cli-copilot-section" style="margin-top: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <span id="cli-copilot-label" class="cli-install-label">GitHub Copilot CLI</span>
+              <div id="cli-copilot-status" class="settings-help settings-provider-status" style="flex: 1 1 auto;">Checking…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="cli-copilot-install-btn" type="button" class="summary-btn" onclick="confirmCliInstall('copilot', 'install')" hidden>Install</button>
+                <button id="cli-copilot-update-btn" type="button" class="summary-btn" onclick="confirmCliInstall('copilot', 'update')" hidden>Update</button>
+                <button id="cli-copilot-migrate-btn" type="button" class="summary-btn" onclick="confirmCliInstall('copilot', 'migrate')" hidden>Switch to native installer</button>
+                <button id="cli-copilot-cancel-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Cancel</button>
+                <button id="cli-copilot-dismiss-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Dismiss</button>
+              </div>
+            </div>
+            <div id="cli-copilot-note" class="settings-help settings-provider-status" style="margin-top: 6px;" hidden></div>
+            <details id="cli-copilot-log-details" class="cli-install-log" hidden>
+              <summary id="cli-copilot-log-summary">Install log</summary>
+              <pre id="cli-copilot-log"></pre>
+            </details>
+          </div>
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="copilot-engine-select">Copilot engine</label>
+            <select id="copilot-engine-select" aria-label="Copilot engine">
+              <option value="extension">Extension — current</option>
+              <option value="sdk">SDK — experimental</option>
+            </select>
+            <div id="copilot-settings-status" class="settings-help settings-provider-status">Loading Copilot settings…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="copilot-save-btn" type="button" class="summary-btn" onclick="saveCopilotSettings()">Save Copilot settings</button>
+            </div>
+            <div class="settings-help">Chooses how GitHub Copilot conversations run. <strong>Extension</strong> is the current default: the Copilot CLI in a terminal session, which you can attach to with the tmux inspector. <strong>SDK</strong> is experimental and headless — no CLI extension to install, but no tmux inspector for those sessions. Applies to newly started conversations; sessions already running keep their engine until their worker restarts.</div>
+          </div>
+        </div>
+        <div
+          id="settings-provider-panel-openai"
+          class="settings-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-openai"
+          data-settings-provider-panel="openai"
+          hidden
+        >
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="openai-api-key-input">OpenAI API key</label>
+            <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+              <label for="openai-enabled-toggle">Enable OpenAI API key for New Chat model selection</label>
+              <input id="openai-enabled-toggle" type="checkbox" onchange="toggleOpenAIProvider(this.checked)" disabled>
+            </div>
+            <input
+              id="openai-api-key-input"
+              type="password"
+              autocomplete="off"
+              placeholder="sk-..."
+              aria-label="OpenAI API key"
+            >
+            <label for="openai-model-input" style="margin-top: 8px;">OpenAI model ID</label>
+            <input
+              id="openai-model-input"
+              type="text"
+              value="gpt-4o"
+              placeholder="gpt-4o"
+              aria-label="OpenAI model ID"
+            >
+            <label for="openai-base-url-input" style="margin-top: 8px;">Base URL <span style="font-weight:normal;opacity:.7;">(optional, default: https://api.openai.com/v1)</span></label>
+            <input
+              id="openai-base-url-input"
+              type="text"
+              placeholder="https://api.openai.com/v1"
+              aria-label="OpenAI base URL"
+            >
+            <div id="openai-settings-status" class="settings-help settings-provider-status">Loading OpenAI settings…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="openai-save-btn" type="button" class="summary-btn" onclick="saveOpenAISettings()">Save OpenAI settings</button>
+              <button id="openai-remove-btn" type="button" class="summary-btn" onclick="removeOpenAISettings()">Remove saved key</button>
+            </div>
+            <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
+          </div>
+        </div>
+        <div
+          id="settings-provider-panel-claude"
+          class="settings-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-claude"
+          data-settings-provider-panel="claude"
+          hidden
+        >
+          <!-- Provider CLI install / update row; cli-install-ui.js drives the state. -->
+          <div id="cli-claude-section" style="margin-bottom: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <span id="cli-claude-label" class="cli-install-label">Claude Code CLI</span>
+              <div id="cli-claude-status" class="settings-help settings-provider-status" style="flex: 1 1 auto;">Checking…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="cli-claude-install-btn" type="button" class="summary-btn" onclick="confirmCliInstall('claude', 'install')" hidden>Install</button>
+                <button id="cli-claude-update-btn" type="button" class="summary-btn" onclick="confirmCliInstall('claude', 'update')" hidden>Update</button>
+                <button id="cli-claude-migrate-btn" type="button" class="summary-btn" onclick="confirmCliInstall('claude', 'migrate')" hidden>Switch to native installer</button>
+                <button id="cli-claude-cancel-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Cancel</button>
+                <button id="cli-claude-dismiss-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Dismiss</button>
+              </div>
+            </div>
+            <div id="cli-claude-note" class="settings-help settings-provider-status" style="margin-top: 6px;" hidden></div>
+            <details id="cli-claude-log-details" class="cli-install-log" hidden>
+              <summary id="cli-claude-log-summary">Install log</summary>
+              <pre id="cli-claude-log"></pre>
+            </details>
+          </div>
+          <!-- Claude account auth UI (Relogin / Logout); claude-auth-ui.js drives the state. -->
+          <div id="claude-auth-section">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <div id="claude-auth-account" class="settings-help settings-provider-status">Loading Claude account…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="claude-auth-relogin-btn" type="button" class="summary-btn" onclick="startClaudeRelogin()">Relogin</button>
+                <button id="claude-auth-logout-btn" type="button" class="summary-btn" onclick="openClaudeLogoutConfirmation()">Logout</button>
+              </div>
+            </div>
+            <div id="claude-auth-login-area" class="settings-row settings-row-column" style="margin-top: 10px; margin-bottom: 0;" hidden>
+              <div id="claude-auth-login-status" class="settings-help settings-provider-status">Starting login…</div>
+              <div id="claude-auth-url-row" style="gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+                <a
+                  id="claude-auth-url-link"
+                  href="#"
+                  target="_blank"
+                  rel="noopener"
+                  style="flex: 1 1 auto; word-break: break-all; font-size: var(--fs-meta-sm);"
+                >Open the Claude login page</a>
+                <button id="claude-auth-copy-btn" type="button" class="summary-btn" style="flex: 0 0 auto;" onclick="copyClaudeLoginUrl()">Copy link</button>
+              </div>
+              <div id="claude-auth-code-row" style="gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 8px;" hidden>
+                <input
+                  id="claude-auth-code-input"
+                  type="text"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  placeholder="Paste the code from claude.ai"
+                  aria-label="Claude login code"
+                  onkeydown="handleClaudeLoginCodeKey(event)"
+                >
+                <button id="claude-auth-submit-btn" type="button" class="summary-btn" onclick="submitClaudeLoginCodeFromInput()">Submit code</button>
+                <button id="claude-auth-cancel-btn" type="button" class="summary-btn" onclick="cancelClaudeRelogin()">Cancel</button>
+              </div>
+            </div>
+            <div class="settings-help" style="margin-top: 8px;">Running Claude sessions continue on the previous account until their workers restart; new sessions use the new account.</div>
+          </div>
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="claude-model-input">Claude SDK</label>
+            <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+              <label for="claude-enabled-toggle">Enable Claude for New Chat model selection</label>
+              <input id="claude-enabled-toggle" type="checkbox" onchange="toggleClaudeProvider(this.checked)">
+            </div>
+            <label for="claude-model-input" style="margin-top: 8px;">Claude model ID</label>
+            <input
+              id="claude-model-input"
+              type="text"
+              value="claude-sonnet-5"
+              placeholder="claude-sonnet-5"
+              aria-label="Claude model ID"
+            >
+            <div id="claude-settings-status" class="settings-help settings-provider-status">Loading Claude settings…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
+            </div>
+            <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
+          </div>
+        </div>
+        <div
+          id="settings-provider-panel-grok"
+          class="settings-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-grok"
+          data-settings-provider-panel="grok"
+          hidden
+        >
+          <!-- Provider CLI install / update row; cli-install-ui.js drives the state. -->
+          <div id="cli-grok-section" style="margin-top: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <span id="cli-grok-label" class="cli-install-label">Grok CLI</span>
+              <div id="cli-grok-status" class="settings-help settings-provider-status" style="flex: 1 1 auto;">Checking…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="cli-grok-install-btn" type="button" class="summary-btn" onclick="confirmCliInstall('grok', 'install')" hidden>Install</button>
+                <button id="cli-grok-update-btn" type="button" class="summary-btn" onclick="confirmCliInstall('grok', 'update')" hidden>Update</button>
+                <button id="cli-grok-migrate-btn" type="button" class="summary-btn" onclick="confirmCliInstall('grok', 'migrate')" hidden>Switch to native installer</button>
+                <button id="cli-grok-cancel-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Cancel</button>
+                <button id="cli-grok-dismiss-btn" type="button" class="summary-btn" onclick="cancelCliInstallRun()" hidden>Dismiss</button>
+              </div>
+            </div>
+            <div id="cli-grok-note" class="settings-help settings-provider-status" style="margin-top: 6px;" hidden></div>
+            <details id="cli-grok-log-details" class="cli-install-log" hidden>
+              <summary id="cli-grok-log-summary">Install log</summary>
+              <pre id="cli-grok-log"></pre>
+            </details>
+          </div>
+          <!-- Grok account auth UI (device-code Sign in / Sign out); grok-auth-ui.js
+               drives the state. No code input: the device code rides in the URL. -->
+          <div id="grok-auth-section" style="margin-top: 12px;">
+            <div class="settings-row" style="margin-bottom: 0;">
+              <div id="grok-auth-account" class="settings-help settings-provider-status">Loading Grok account…</div>
+              <div style="display: flex; gap: 8px; flex: 0 0 auto;">
+                <button id="grok-auth-signin-btn" type="button" class="summary-btn" onclick="startGrokSignIn()">Sign in</button>
+                <button id="grok-auth-logout-btn" type="button" class="summary-btn" onclick="openGrokLogoutConfirmation()">Sign out</button>
+              </div>
+            </div>
+            <div id="grok-auth-login-area" class="settings-row settings-row-column" style="margin-top: 10px; margin-bottom: 0;" hidden>
+              <div id="grok-auth-login-status" class="settings-help settings-provider-status">Starting sign-in…</div>
+              <div id="grok-auth-url-row" style="gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+                <a
+                  id="grok-auth-url-link"
+                  href="#"
+                  target="_blank"
+                  rel="noopener"
+                  style="flex: 1 1 auto; word-break: break-all; font-size: var(--fs-meta-sm);"
+                >Open the Grok sign-in page</a>
+                <button id="grok-auth-copy-btn" type="button" class="summary-btn" style="flex: 0 0 auto;" onclick="copyGrokLoginUrl()">Copy link</button>
+              </div>
+              <div id="grok-auth-code-row" style="gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 8px;" hidden>
+                <span class="settings-help">Confirm this code in the browser:</span>
+                <code id="grok-auth-user-code" style="font-size: var(--fs-meta-md); letter-spacing: 0.08em;"></code>
+              </div>
+              <!-- Its own row, not the code row: a scrape that never found the
+                   code must still leave the session cancellable. -->
+              <div id="grok-auth-actions-row" style="gap: 8px; align-items: center; width: 100%; margin-top: 8px;" hidden>
+                <button id="grok-auth-cancel-btn" type="button" class="summary-btn" onclick="cancelGrokSignIn()">Cancel</button>
+              </div>
+            </div>
+            <div class="settings-help" style="margin-top: 8px;">Sign in runs <code>grok login --device-auth</code> on the relay host and finishes by itself once you authorise the code — the link opens on any device. Running Grok sessions continue on the previous account until their workers restart.</div>
+          </div>
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="grok-model-input">Grok</label>
+            <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+              <label for="grok-enabled-toggle">Enable Grok for New Chat model selection</label>
+              <input id="grok-enabled-toggle" type="checkbox" onchange="toggleGrokProvider(this.checked)">
+            </div>
+            <label for="grok-model-input" style="margin-top: 8px;">Grok model ID</label>
+            <input
+              id="grok-model-input"
+              type="text"
+              value="grok-4.5"
+              placeholder="grok-4.5"
+              aria-label="Grok model ID"
+            >
+            <div id="grok-settings-status" class="settings-help settings-provider-status">Loading Grok settings…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="grok-save-btn" type="button" class="summary-btn" onclick="saveGrokSettings()">Save Grok settings</button>
+            </div>
+            <div class="settings-help">Uses the host machine's logged-in Grok credentials (grok login or XAI_API_KEY). No API key is stored in the browser. Disabling also rebinds conversations that have not sent a message yet.</div>
+          </div>
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="grok-allowance-monthly-input">Grok monthly plan allowance</label>
+            <div class="settings-help">Grok does not expose remaining plan credits over ACP. Optional: enter your monthly USD budget so Check Usage can show an estimated remaining meter. Last-turn tokens and cost are always shown after a Grok turn.</div>
+            <label for="grok-allowance-monthly-input" style="margin-top: 8px;">Monthly allowance (USD)</label>
+            <input
+              id="grok-allowance-monthly-input"
+              type="number"
+              min="0"
+              step="0.01"
+              inputmode="decimal"
+              placeholder="e.g. 30"
+              aria-label="Grok monthly allowance in US dollars"
+            >
+            <label for="grok-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
+            <input
+              id="grok-allowance-reset-day-input"
+              type="number"
+              min="1"
+              max="31"
+              step="1"
+              inputmode="numeric"
+              placeholder="1"
+              aria-label="Grok billing reset day of month"
+            >
+            <div id="grok-allowance-status" class="settings-help settings-provider-status">Loading Grok allowances…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="grok-allowance-save-btn" type="button" class="summary-btn" onclick="saveGrokAllowanceSettings()">Save allowances</button>
+              <button id="grok-allowance-reset-btn" type="button" class="summary-btn" onclick="resetGrokAllowanceAccounting()">Reset tracked spend</button>
+            </div>
+            <div class="settings-help">Reset tracked spend after changing plan or account. Authoritative billing: <a href="https://console.x.ai" target="_blank" rel="noopener noreferrer">console.x.ai</a>.</div>
+          </div>
+        </div>
+        <div
+          id="settings-provider-panel-cursor"
+          class="settings-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-cursor"
+          data-settings-provider-panel="cursor"
+          hidden
+        >
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="cursor-api-key-input">Cursor SDK</label>
+            <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+              <label for="cursor-enabled-toggle">Enable Cursor for New Chat model selection</label>
+              <input id="cursor-enabled-toggle" type="checkbox" onchange="toggleCursorProvider(this.checked)" disabled>
+            </div>
+            <input
+              id="cursor-api-key-input"
+              type="password"
+              autocomplete="off"
+              placeholder="Cursor API key…"
+              aria-label="Cursor API key"
+            >
+            <label for="cursor-model-input" style="margin-top: 8px;">Cursor model ID</label>
+            <input
+              id="cursor-model-input"
+              type="text"
+              value="composer-2.5"
+              placeholder="composer-2.5"
+              aria-label="Cursor model ID"
+            >
+            <div id="cursor-settings-status" class="settings-help settings-provider-status">Loading Cursor settings…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="cursor-save-btn" type="button" class="summary-btn" onclick="saveCursorSettings()">Save Cursor settings</button>
+              <button id="cursor-remove-btn" type="button" class="summary-btn" onclick="removeCursorSettings()">Remove saved key</button>
+            </div>
+            <div class="settings-help">Runs Cursor conversations through the Cursor Agent SDK using your saved Cursor API key. The key is stored on the relay host and never sent to browsers.</div>
+          </div>
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="cursor-allowance-cursor-models-input">Cursor monthly plan allowance</label>
+            <div class="settings-help">Cursor does not expose your included pools through its SDK, so enter the monthly allowance from your plan. Spend is measured with raw model cost and reset on the day you choose.</div>
+            <label for="cursor-allowance-cursor-models-input" style="margin-top: 8px;">Cursor Models pool (USD)</label>
+            <input
+              id="cursor-allowance-cursor-models-input"
+              type="number"
+              min="0"
+              step="0.01"
+              inputmode="decimal"
+              placeholder="e.g. 20"
+              aria-label="Cursor Models monthly allowance in US dollars"
+            >
+            <label for="cursor-allowance-other-models-input" style="margin-top: 8px;">Other Models pool (USD)</label>
+            <input
+              id="cursor-allowance-other-models-input"
+              type="number"
+              min="0"
+              step="0.01"
+              inputmode="decimal"
+              placeholder="e.g. 20"
+              aria-label="Other Models monthly allowance in US dollars"
+            >
+            <label for="cursor-allowance-reset-day-input" style="margin-top: 8px;">Billing resets on day of month</label>
+            <input
+              id="cursor-allowance-reset-day-input"
+              type="number"
+              min="1"
+              max="31"
+              step="1"
+              inputmode="numeric"
+              placeholder="1"
+              aria-label="Cursor billing reset day of month"
+            >
+            <div id="cursor-allowance-status" class="settings-help settings-provider-status">Loading Cursor allowances…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="cursor-allowance-save-btn" type="button" class="summary-btn" onclick="saveCursorAllowanceSettings()">Save allowances</button>
+              <button id="cursor-allowance-reset-btn" type="button" class="summary-btn" onclick="resetCursorAllowanceAccounting()">Reset tracked spend</button>
+            </div>
+            <div class="settings-help">Reset tracked spend after changing plan or account: tracking re-baselines from each agent's current totals, so past spend is never counted twice.</div>
+            <label for="cursor-dashboard-token-input" style="margin-top: 12px;">Dashboard session token (live plan bars)</label>
+            <input
+              id="cursor-dashboard-token-input"
+              type="password"
+              autocomplete="off"
+              placeholder="WorkosCursorSessionToken cookie value"
+              aria-label="Cursor dashboard session token"
+            >
+            <div id="cursor-dashboard-token-status" class="settings-help settings-provider-status">Loading dashboard token state…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="cursor-dashboard-token-save-btn" type="button" class="summary-btn" onclick="saveCursorDashboardToken()">Save token</button>
+              <button id="cursor-dashboard-token-remove-btn" type="button" class="summary-btn" onclick="removeCursorDashboardToken()">Remove</button>
+            </div>
+            <div class="settings-help">Unlocks the live "Included in plan" percentage bars on Check Usage. Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Headless hosts can also set <code>CURSOR_SESSION_TOKEN</code> in the relay environment. Tokens stay on the relay.</div>
+          </div>
+        </div>
+      </div>
+      <div
+        id="settings-panel-previews"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-previews"
+        data-settings-panel="previews"
+        hidden
+      >
+        <div id="previews-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label>Live previews</label>
+          <div id="settings-previews-list"></div>
+          <div id="settings-previews-empty" class="settings-help">Loading previews…</div>
+          <div class="settings-help">Local dev servers published on the preview host. Previews never expire on their own — they live until you close them here or the relay restarts. Every link is public: anyone with the URL reaches the app without logging in.</div>
+        </div>
+      </div>
+      <div
+        id="settings-panel-notifications"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-notifications"
+        data-settings-panel="notifications"
+        hidden
+      >
+        <div id="push-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label>Push notifications</label>
+          <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+            <label for="push-enabled-toggle">Enable push notifications on this device</label>
+            <input id="push-enabled-toggle" type="checkbox" onchange="togglePushOnThisDevice(this.checked)" disabled>
+          </div>
+          <div id="push-settings-status" class="settings-help settings-provider-status">Loading push settings…</div>
+          <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+            <label for="push-include-title-toggle">Include conversation title</label>
+            <input id="push-include-title-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+          </div>
+          <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+            <label for="push-preview-select">Message preview</label>
+            <select id="push-preview-select" onchange="updatePushPreferencesFromControls()" disabled>
+              <option value="none">None (generic text)</option>
+              <option value="truncated">Truncated</option>
+              <option value="full">Full text</option>
+            </select>
+          </div>
+          <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 0;">
+            <label for="push-preview-chars-input">Preview length (characters)</label>
+            <input id="push-preview-chars-input" type="number" min="20" max="500" value="80" style="width: 90px;" onchange="updatePushPreferencesFromControls()" disabled>
+          </div>
+          <label style="margin-top: 10px;">Notify about</label>
+          <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+            <label for="push-event-question-toggle">Questions from the agent</label>
+            <input id="push-event-question-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+          </div>
+          <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+            <label for="push-event-turn-complete-toggle">Turn completed</label>
+            <input id="push-event-turn-complete-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+          </div>
+          <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+            <label for="push-event-turn-failed-toggle">Turn failed</label>
+            <input id="push-event-turn-failed-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+          </div>
+          <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+            <label for="push-event-board-toggle">Boards (plan reviews)</label>
+            <input id="push-event-board-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+          </div>
+          <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+            <label for="push-event-cli-offline-toggle">CLI went offline</label>
+            <input id="push-event-cli-offline-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+          </div>
+          <label style="margin-top: 10px;">Devices</label>
+          <div id="push-device-list" style="width: 100%;"></div>
+          <div class="settings-help">Notifications are only sent while no device has the app in the foreground. Content defaults to generic text; message previews are opt-in per device.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -5082,9 +5634,12 @@
     </div>
     <div class="summary-body" style="padding: 16px;">
       <label for="new-conversation-cwd-select">Working directory</label>
-      <select id="new-conversation-cwd-select">
-        <option value="">Default</option>
-      </select>
+      <div class="cwd-browse-row">
+        <select id="new-conversation-cwd-select">
+          <option value="">Default</option>
+        </select>
+        <button id="new-conversation-cwd-browse" class="cwd-browse-btn" type="button" title="Pick a folder with the file explorer" aria-label="Pick a folder with the file explorer">📁</button>
+      </div>
       <input id="new-conversation-cwd-manual" type="text" hidden autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Full path of the launch directory">
       <div id="new-conversation-cwd-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);word-break:break-word;">New chats start in the relay default directory.</div>
       <div id="new-conversation-provider-row">

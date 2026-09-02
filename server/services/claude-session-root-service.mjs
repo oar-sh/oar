@@ -62,10 +62,11 @@ export function claudeProjectDirSlug(cwd) {
 /**
  * Candidate `<configRoot>/projects` directories, most specific first.
  *
- * Both `$CLAUDE_CONFIG_DIR` and `~/.claude` are probed because the two worker
- * launch paths disagree: the tmux path forwards an explicit env allowlist that
- * omits CLAUDE_CONFIG_DIR, while the detached spawn inherits the full
- * environment. So the worker and the relay can be looking at different roots.
+ * Both `$CLAUDE_CONFIG_DIR` and `~/.claude` are probed because a session may
+ * predate the override: the tmux launch path now forwards CLAUDE_CONFIG_DIR in
+ * its env allowlist (matching the detached spawn path, which inherits the full
+ * environment), but transcripts written before that fix still live under
+ * `~/.claude`.
  */
 export function resolveClaudeProjectsRoots({ env = process.env, homedir = os.homedir, path = nodePath } = {}) {
   const roots = [];

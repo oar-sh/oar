@@ -17,6 +17,10 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
       text TEXT NOT NULL, timestamp TEXT NOT NULL
     );
     CREATE TABLE deleted_sdk_sessions (sdk_session_id TEXT PRIMARY KEY);
+    CREATE TABLE runtime_sessions (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, provider_type TEXT,
+      created_at TEXT, last_used_at TEXT
+    );
     CREATE TABLE relay_session_links (
       sdk_session_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, created_at TEXT NOT NULL
     );
@@ -29,6 +33,7 @@ function makeHarness({ eventsBySession = {}, failSessions = new Set(), sessionMe
   const stmts = {
     getDeletedSdkSession: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions WHERE sdk_session_id = ?`),
     getRelaySessionLink: db.prepare(`SELECT * FROM relay_session_links WHERE sdk_session_id = ?`),
+    getRuntimeSessionByConversation: db.prepare(`SELECT * FROM runtime_sessions WHERE conversation_id = ? ORDER BY last_used_at DESC LIMIT 1`),
     getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? ORDER BY updated_at DESC LIMIT 1`),
     getSdkSessionImport: db.prepare(`SELECT * FROM sdk_session_imports WHERE sdk_session_id = ?`),
     upsertSdkSessionImport: db.prepare(`INSERT INTO sdk_session_imports (sdk_session_id, conversation_id, status, attempt_count, updated_at) VALUES (?, ?, 'pending', 0, ?) ON CONFLICT(sdk_session_id) DO NOTHING`),
@@ -243,6 +248,34 @@ test('relay execution sessions are never imported as conversations', async () =>
   assert.equal(summary.new, 1);
   assert.deepEqual(resumed, ['normal-cli']);
   assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM conversations WHERE id = 'relay-vehicle'`).get().count, 0);
+});
+
+test('a conversation the relay executes under its own id is never re-imported', async () => {
+  // The SDK-engine workers use the relay conversation id AS the CLI session
+  // id, so the "different id" relay-vehicle guard above does not fire. The
+  // runtime binding is the ownership signal (burn-in incident 2026-08-31:
+  // the import overwrote relay history with the raw runtime transcript,
+  // instruction preambles surfacing as user bubbles and titles).
+  const { db, service, resumed } = makeHarness({
+    eventsBySession: {
+      'sdk-owned-conv': [{ id: 'm1', role: 'user', text: '[Relay mode: autopilot] preamble' }],
+    },
+  });
+  db.prepare(`
+    INSERT INTO conversations (id, title, sdk_session_id, created_at, updated_at)
+    VALUES ('sdk-owned-conv', 'Timer test', 'sdk-owned-conv', '2026-08-11T12:00:00.000Z', '2026-08-11T12:00:00.000Z')
+  `).run();
+  db.prepare(`
+    INSERT INTO runtime_sessions (id, conversation_id, provider_type, created_at, last_used_at)
+    VALUES ('rs-owned-1', 'sdk-owned-conv', 'github', '2026-08-11T12:00:00.000Z', '2026-08-11T12:00:00.000Z')
+  `).run();
+
+  const summary = await service.runStartupImport();
+
+  assert.equal(summary['relay-owned'], 1);
+  assert.equal(db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE conversation_id = 'sdk-owned-conv'`).get().c, 0);
+  assert.equal(db.prepare(`SELECT title FROM conversations WHERE id = 'sdk-owned-conv'`).get().title, 'Timer test');
+  assert.deepEqual(resumed, []);
 });
 
 test('sessions bound to an existing conversation under another id are not duplicated', async () => {

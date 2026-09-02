@@ -41,7 +41,7 @@ import { setBackgroundTasksConversation, setConversationBackgroundTasks } from '
 import { mergeConversationPreviews } from './preview-cards.mjs';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { loadRelayBoards } from './relay-board-view.js';
-import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRepoBrowserLaunchCwdPath } from './attachments-view.js';
+import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRepoBrowserLaunchCwdPath, openRepoBrowserForCwdPick } from './attachments-view.js';
 import { buildKnownCwdOptions, normalizeKnownCwdPath } from './known-cwd-options.mjs';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
@@ -858,6 +858,22 @@ function populateNewConversationCwdSelect() {
   if (manual && manual.dataset.cwdBound !== '1') {
     manual.dataset.cwdBound = '1';
     manual.addEventListener('input', syncNewConversationCwdControls);
+  }
+  const browse = document.getElementById('new-conversation-cwd-browse');
+  if (browse && browse.dataset.cwdBound !== '1') {
+    browse.dataset.cwdBound = '1';
+    browse.addEventListener('click', (event) => {
+      event.preventDefault();
+      // The picked path lands in the "Custom path…" manual input, so it goes
+      // through the exact same submit/validation path as a typed one.
+      openRepoBrowserForCwdPick((pickedPath) => {
+        const cwdSelect = document.getElementById('new-conversation-cwd-select');
+        const manualInput = document.getElementById('new-conversation-cwd-manual');
+        if (cwdSelect) cwdSelect.value = NEW_CHAT_CUSTOM_CWD_VALUE;
+        if (manualInput) manualInput.value = pickedPath;
+        syncNewConversationCwdControls();
+      });
+    });
   }
   syncNewConversationCwdControls();
 }

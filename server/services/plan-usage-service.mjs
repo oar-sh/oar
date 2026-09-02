@@ -409,11 +409,17 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     const grokSettings = normalizeGrokAllowanceSettings(grokAllowances || {});
     const grokCycle = readGrokCycleTotals({ resetDay: grokSettings.resetDay });
     const grokSnapshot = readSnapshot('grok');
+    // The SDK engine's per-turn detail. Stored under its own key rather than
+    // 'github' so it stays clearly additive: the Copilot card's meters come
+    // from the account-level quota API and are correct for both engines, and
+    // an install still on the extension engine simply has no row here.
+    const copilotWorkerSnapshot = readSnapshot('copilot-sdk');
 
     const providers = [
       buildCopilotPlanCard({
         summary: copilotSummary,
         billing: copilotBilling,
+        workerUsage: copilotWorkerSnapshot?.payload || null,
         error: copilotError,
         capturedAt: generatedAt,
         stale: copilotStale === true,

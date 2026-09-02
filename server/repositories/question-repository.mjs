@@ -12,7 +12,10 @@ export function createQuestionRepository(db) {
         timeoutQuestion:db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE id = ? AND status = 'pending'`),
         cancelPendingQuestionsByMessage: db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = COALESCE(answered_at, ?) WHERE message_id = ? AND status = 'pending'`),
         deleteConvQuestions: db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`),
-        expireQuestions: db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE status = 'pending' AND expires_at < ?`),
+        // RETURNING (run via .all) so the expiry log names exactly the rows
+        // that flipped — a separate pre-SELECT could race an answer landing
+        // between the two statements.
+        expireQuestions: db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE status = 'pending' AND expires_at < ? RETURNING id, created_at`),
 
         // relay activity
         insertActivity: db.prepare(`INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),

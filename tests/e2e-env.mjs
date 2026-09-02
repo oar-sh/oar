@@ -28,6 +28,28 @@ export function relayDataDir() {
   return requireEnv("RELAY_TEST_DATA_DIR");
 }
 
+// Fake credentials file the Claude auth stub CLI treats as "logged in".
+// Lives under the test server's isolated CLAUDE_CONFIG_DIR, never the host's.
+export function relayClaudeCredFile() {
+  return requireEnv("RELAY_TEST_CLAUDE_CRED_FILE");
+}
+
+// Fake Grok auth store the stub CLI writes and readGrokCliAuthKey() reads.
+// Lives under the test server's isolated HOME, never the host's ~/.grok.
+export function relayGrokAuthFile() {
+  return requireEnv("RELAY_TEST_GROK_AUTH_FILE");
+}
+
+// The stub's stand-in for authorising (or refusing) the device code in a
+// browser: `grok login --device-auth` polls for these and then exits.
+export function relayGrokLoginAuthorizedFile() {
+  return requireEnv("RELAY_TEST_GROK_LOGIN_AUTHORIZED_FILE");
+}
+
+export function relayGrokLoginDeniedFile() {
+  return requireEnv("RELAY_TEST_GROK_LOGIN_DENIED_FILE");
+}
+
 export function relayDbPath() {
   return path.join(relayDataDir(), "copilot.db");
 }

@@ -54,6 +54,10 @@ import { buildTranscriptPreviewCard } from './preview-cards.mjs';
 import { closeSlashAutocomplete, handleSlashAutocompleteKey, updateSlashAutocomplete } from './slash-autocomplete.mjs';
 import { evaluateUnknownCommandGuard } from './slash-commands.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
+import { relayErrorCtaActions } from './relay-error-ctas.mjs';
+import { confirmCliInstall } from './cli-install-ui.js';
+import { startGrokSignIn } from './grok-auth-ui.js';
+import { openSettingsModal } from './settings-modal.js';
 import {
   serializeDraftAttachments,
   hydrateDraftAttachments,
@@ -892,12 +896,23 @@ function createMessageNode(msg, msgId = null, force = false) {
         <button type="button" class="msg-share-visibility-btn" data-action="toggle-share-visibility" data-message-id="${escHtml(msgId)}" data-hidden-from-shares="${hiddenFromShares ? 'true' : 'false'}" title="${hiddenFromShares ? 'Shows this message in shared conversations' : 'Hides this message from shared conversations'}">${hiddenFromShares ? 'Unhide' : 'Hide'}</button>
       </div>`
     : '';
+  // A terminal failure whose fix lives in the relay UI gets the fix as a button
+  // instead of an instruction to open a shell on the host. Shared viewers get
+  // none of them: they cannot install or sign in to anything.
+  const relayErrorActions = (!IS_SHARED_VIEW && msg.role === 'assistant')
+    ? relayErrorCtaActions(msg.text)
+    : [];
+  const relayErrorCtaHtml = relayErrorActions.length
+    ? `<div class="msg-error-cta">${relayErrorActions
+      .map((item) => `<button type="button" class="bubble-action-btn" data-action="relay-error-cta" data-cta="${escHtml(item.action)}">${escHtml(item.label)}</button>`)
+      .join('')}</div>`
+    : '';
   const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -2210,12 +2225,37 @@ async function toggleMessageShareVisibility(conversationId, messageId, hiddenFro
   }
 }
 
+// Each CTA lands the user where the state actually lives: the provider panel
+// shows the install log / the device code, so the settings modal is opened
+// first and the action then runs on top of it.
+function runRelayErrorCta(cta) {
+  if (cta === 'install-grok-cli') {
+    openSettingsModal('providers', 'grok');
+    // The confirm sheet — never a bare curl | bash from a chat bubble.
+    void confirmCliInstall('grok', 'install');
+    return;
+  }
+  if (cta === 'sign-in-to-grok') {
+    openSettingsModal('providers', 'grok');
+    void startGrokSignIn();
+    return;
+  }
+  if (cta === 'open-grok-settings') openSettingsModal('providers', 'grok');
+  if (cta === 'open-claude-settings') openSettingsModal('providers', 'claude');
+}
+
 function handleBubbleActionClick(event) {
   const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn');
   if (!btn) return;
   const action = btn.dataset.action;
   const messageId = btn.dataset.messageId;
   const subagentRunId = btn.dataset.subagentRunId;
+
+  if (action === 'relay-error-cta') {
+    event.preventDefault();
+    event.stopPropagation();
+    runRelayErrorCta(String(btn.dataset.cta || ''));
+  }
 
   if (action === 'toggle-share-visibility' && messageId) {
     event.preventDefault();
