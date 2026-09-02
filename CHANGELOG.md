@@ -3,6 +3,14 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.1] — 2026-09-02
+
+### Fixed
+
+- The globally installed `oar` command silently did nothing: npm's bin symlink
+  names `argv[1]` plain `oar`, which the `oar.js` entrypoint check never
+  matched. The guard now resolves real paths (and ships the executable bit).
+
 ## [0.9.0] — 2026-09-02
 
 ### Changed
