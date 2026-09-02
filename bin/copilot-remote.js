@@ -8,6 +8,11 @@ import { EventEmitter } from 'events';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { spawn } from 'child_process';
 
+import {
+  migrateStateToOarRoot,
+  resolveOarRoot,
+} from '../server/services/oar-state-migration-service.mjs';
+
 function resolvePackageRoot(metaUrl = import.meta.url) {
   return path.resolve(path.dirname(fileURLToPath(metaUrl)), '..');
 }
@@ -71,23 +76,45 @@ function openAppendFileDescriptor(filePath) {
   return fs.openSync(filePath, 'a');
 }
 
-function getUserConfigDir() {
+// Pre-OAR managed config location — kept only as a migration source and as the
+// config home for git checkouts, where nothing may change underfoot.
+function getLegacyManagedConfigDir(env = process.env) {
   if (process.platform === 'win32') {
     return path.join(
-      process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
+      env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
       'copilot-remote',
     );
   }
   return path.join(
-    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+    env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
     'copilot-remote',
   );
 }
 
-function getLauncherLogDir(env = process.env) {
+function isGitCheckout(packageRoot) {
+  try { return fs.existsSync(path.join(packageRoot, '.git')); } catch { return false; }
+}
+
+/**
+ * Where launcher-managed state lives. A git checkout keeps every pre-OAR
+ * default (repo-local server/data, legacy managed config) so development and
+ * the two existing machines change nothing. A global install gets the OAR
+ * state root: config, data, logs all under ~/.oar (APPDATA\oar on Windows),
+ * which survives `npm i -g` updates.
+ */
+function resolveStateLayout({ packageRoot, env = process.env } = {}) {
+  if (isGitCheckout(packageRoot)) {
+    return { checkout: true, root: null, configDir: getLegacyManagedConfigDir(env), dataDir: null };
+  }
+  const root = resolveOarRoot(env);
+  return { checkout: false, root, configDir: root, dataDir: path.join(root, 'data') };
+}
+
+function getLauncherLogDir(env = process.env, layout = null) {
   const envLogDir = String(env.COPILOT_WEB_RELAY_LOG_DIR || '').trim();
   if (envLogDir) return envLogDir;
-  return path.join(getUserConfigDir(), 'logs');
+  if (layout && !layout.checkout) return path.join(layout.root, 'logs');
+  return path.join(getLegacyManagedConfigDir(env), 'logs');
 }
 
 function getCopilotHomeDir(env = process.env) {
@@ -157,15 +184,17 @@ function createDefaultConfig({ port = 3333, token = '' } = {}) {
   };
 }
 
-function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = '', relayPort = 3333 } = {}) {
+function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = '', relayPort = 3333, layout = null } = {}) {
   const envConfigPath = String(env.COPILOT_WEB_RELAY_CONFIG || '').trim();
   const repoConfigPath = path.join(packageRoot, 'server', 'config.json');
+  const oarConfigPath = layout && !layout.checkout ? path.join(layout.configDir, 'config.json') : null;
   const seedPath = (
     (envConfigPath && fs.existsSync(envConfigPath) && envConfigPath)
+    || (oarConfigPath && fs.existsSync(oarConfigPath) && oarConfigPath)
     || (fs.existsSync(repoConfigPath) && repoConfigPath)
     || null
   );
-  const managedPath = path.join(getUserConfigDir(), 'config.json');
+  const managedPath = oarConfigPath || path.join(getLegacyManagedConfigDir(env), 'config.json');
   const configPath = seedPath || managedPath;
   const seedConfig = readJsonFile(seedPath) || {};
   const runtimeConfig = {
@@ -224,12 +253,16 @@ export async function launchRelay({
   const installExtensionOnly = args.includes('--install-extension');
   const skipExtensionInstall = args.includes('--no-install-extension');
   const separatorIdx = args.indexOf('--');
-  const launcherArgs = (separatorIdx === -1 ? args : args.slice(0, separatorIdx))
+  const rawLauncherArgs = separatorIdx === -1 ? args : args.slice(0, separatorIdx);
+  const migrateFromIdx = rawLauncherArgs.indexOf('--migrate-from');
+  const migrateFromRoot = migrateFromIdx !== -1 ? String(rawLauncherArgs[migrateFromIdx + 1] || '').trim() : '';
+  const launcherArgs = rawLauncherArgs
+    .filter((arg, idx) => idx !== migrateFromIdx && idx !== migrateFromIdx + 1)
     .filter((arg) => arg !== '--install-extension' && arg !== '--no-install-extension');
   const forwardedArgs = separatorIdx === -1 ? [] : args.slice(separatorIdx + 1);
   if (args.includes('--help') || args.includes('-h')) {
     logger.log([
-      'Usage: copilot-remote [--port <port>] [--token <token>] [--install-extension] [--no-install-extension] [-- [gh copilot args...]]',
+      'Usage: copilot-remote [--port <port>] [--token <token>] [--migrate-from <old-checkout>] [--install-extension] [--no-install-extension] [-- [gh copilot args...]]',
       '',
       'Starts the web relay server if needed, then launches gh copilot in the current shell.',
       '--install-extension installs/updates a user-global web-relay wrapper extension and exits.',
@@ -253,7 +286,31 @@ export async function launchRelay({
 
   const port = parsePort(launcherArgs);
   const serverDir = path.join(packageRoot, 'server');
-  const lockPath = path.join(serverDir, 'data', 'relay-server.lock');
+  const layout = resolveStateLayout({ packageRoot, env });
+
+  if (!layout.checkout) {
+    // Global install: state lives in the OAR root. Migrate pre-OAR state in
+    // exactly once (marker-guarded); a live source relay blocks the migration.
+    try {
+      const migration = await migrateStateToOarRoot({
+        targetRoot: layout.root,
+        repoServerDir: migrateFromRoot ? path.join(path.resolve(migrateFromRoot), 'server') : null,
+        managedConfigDir: getLegacyManagedConfigDir(env),
+        logger,
+      });
+      if (migration.status === 'blocked-live-relay') {
+        logger.error?.(`[oar] ${migration.error}`);
+        return { code: 1, reason: 'migration-blocked' };
+      }
+    } catch (error) {
+      logger.error?.(`[oar] State migration failed, nothing was changed at the source: ${error?.message || error}`);
+      return { code: 1, reason: 'migration-failed', error };
+    }
+  }
+
+  const lockPath = layout.checkout
+    ? path.join(serverDir, 'data', 'relay-server.lock')
+    : path.join(layout.dataDir, 'relay-server.lock');
   const statusUrl = `http://localhost:${port}/api/status`;
   const running = await detectRunningRelay({
     lockPath,
@@ -266,6 +323,7 @@ export async function launchRelay({
     env,
     relayToken: running?.lock?.token || '',
     relayPort: port,
+    layout,
   });
   if (runtimeConfig.managed || !fs.existsSync(runtimeConfig.configPath)) {
     writeJsonFile(runtimeConfig.configPath, runtimeConfig.config);
@@ -277,7 +335,12 @@ export async function launchRelay({
     COPILOT_WEB_RELAY_ROOT: packageRoot,
     COPILOT_WEB_RELAY_SERVER_DIR: serverDir,
     COPILOT_WEB_RELAY_CONFIG: runtimeConfig.configPath,
-    COPILOT_WEB_RELAY_LOG_DIR: getLauncherLogDir(env),
+    COPILOT_WEB_RELAY_LOG_DIR: getLauncherLogDir(env, layout),
+    // Checkouts keep the repo-local server/data default; global installs point
+    // the server at the OAR root so updates cannot wipe the database.
+    ...(layout.checkout ? {} : {
+      COPILOT_WEB_RELAY_DATA_DIR: String(env.COPILOT_WEB_RELAY_DATA_DIR || '').trim() || layout.dataDir,
+    }),
     GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: String(env.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || 'true'),
   };
 
