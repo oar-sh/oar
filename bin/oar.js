@@ -652,8 +652,18 @@ function main() {
   return launchRelay();
 }
 
-const executedName = process.argv[1] ? path.basename(String(process.argv[1])) : '';
-if (executedName === 'oar.js') {
+// Run main() when this file is the process entrypoint. npm bin shims make
+// argv[1] a symlink named plain `oar`, so compare real paths first and fall
+// back to the shim basename — a bare basename === 'oar.js' check silently
+// no-ops for every global install.
+const selfPath = fileURLToPath(import.meta.url);
+const invokedPath = (() => {
+  const raw = String(process.argv[1] || '');
+  if (!raw) return '';
+  try { return fs.realpathSync(raw); } catch { return raw; }
+})();
+const invokedName = invokedPath ? path.basename(invokedPath) : '';
+if (invokedPath === selfPath || invokedName === 'oar.js' || invokedName === 'oar') {
   main().then(({ code }) => {
     process.exit(code ?? 0);
   }).catch((error) => {
