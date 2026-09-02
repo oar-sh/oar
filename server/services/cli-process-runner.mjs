@@ -103,6 +103,36 @@ export function tailOf(text, limit = MAX_ERROR_TAIL_CHARS) {
 }
 
 /**
+ * Windows cannot `CreateProcess` a `.cmd`/`.bat` at all, and Node has refused
+ * to pretend otherwise since the CVE-2024-27980 fix — it fails the spawn with
+ * EINVAL unless a shell is asked for explicitly. npm ships every global CLI on
+ * Windows as exactly such a shim (`claude.cmd`, `copilot.cmd`), so every
+ * service that spawns a provider CLI needs the same detection; this is the one
+ * copy (lifted out of cli-install-service.mjs, which held it first).
+ */
+export function isBatchLauncher(command, platform = process.platform) {
+  return platform === 'win32' && /\.(cmd|bat)$/i.test(String(command || ''));
+}
+
+/**
+ * `shell: true` makes Node join `[command, ...args]` with spaces into one
+ * string and hand it to `cmd.exe /d /s /c` *without quoting anything itself*,
+ * so every token has to be quoted here — `C:\Program Files\…\claude.cmd`
+ * would otherwise split on its own space.
+ *
+ * This is belt-and-braces, not a security boundary: every caller passes argv
+ * built from frozen literals or a path it resolved off the filesystem, never
+ * anything a request sent. cmd.exe has no escape for a quote inside a quoted
+ * token — doubling it is the closest thing, and a Windows path cannot contain
+ * one anyway. `%VAR%` still expands inside double quotes; a directory named
+ * after a *set* environment variable would mis-resolve, which is the one
+ * residual gap and still better than refusing batch launchers outright.
+ */
+export function quoteForCmd(value) {
+  return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+/**
  * Signals the child's whole process group where the platform has one, so a
  * `script`/`bash -lc` wrapper cannot leave the real CLI running behind it.
  * A child that has already exited is left alone.

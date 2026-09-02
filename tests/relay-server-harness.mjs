@@ -110,6 +110,15 @@ export function createStateRoot() {
   const sdkStubDir = path.join(stateRoot, "copilot-sdk-stub");
   fs.mkdirSync(sdkStubDir, { recursive: true });
   fs.writeFileSync(path.join(sdkStubDir, "extension.js"), "// e2e stub — never imported\n");
+  // On Windows the installed-Copilot search (copilot-sdk-runtime.mjs) walks
+  // %LOCALAPPDATA%\copilot\pkg — a host path HOME/USERPROFILE overrides do not
+  // touch. Left alone, an "isolated" relay finds the developer's real Copilot
+  // CLI, stdio-spawns it at boot, and that app then manages a config.json in
+  // the temp HOME — clobbering the relay's own config file with its comment
+  // banner. Pointing LOCALAPPDATA into the state root closes the hole the same
+  // way the XDG paths already are on POSIX (they live under HOME).
+  const localAppDataDir = path.join(stateRoot, "AppData", "Local");
+  fs.mkdirSync(localAppDataDir, { recursive: true });
   // The only directory the CLI install service is allowed to resolve provider
   // binaries from (COPILOT_WEB_RELAY_CLI_BIN_DIR below). Starts empty, so every
   // provider row reads "not installed" until a spec installs into it — see the
@@ -135,6 +144,7 @@ export function createStateRoot() {
     claudeCredFile,
     sdkStubDir,
     cliBinDir,
+    localAppDataDir,
     grokAuthFile,
     grokLoginAuthorizedFile,
     grokLoginDeniedFile,
@@ -156,6 +166,7 @@ export function buildRelayServerEnv({
   claudeCredFile,
   sdkStubDir,
   cliBinDir,
+  localAppDataDir,
   grokAuthFile,
   grokLoginAuthorizedFile,
   grokLoginDeniedFile,
@@ -163,6 +174,11 @@ export function buildRelayServerEnv({
   overrides = {},
 } = {}) {
   const fixtures = path.join(repoRoot, "server", "services", "fixtures");
+  // host-platform: each stub is one Node script behind two launchers, and only
+  // the launcher is platform-specific — Windows cannot spawn a shebang .sh
+  // (and the services' batch-launcher path expects a .cmd there, the same
+  // shape a real npm-installed CLI has on that host).
+  const stubExt = process.platform === "win32" ? ".cmd" : ".sh";
   // The test server must never spawn real Copilot CLI clients or Claude workers.
   // Set RELAY_E2E_ALLOW_CLI=1 explicitly (with user permission) to test live turns.
   const disableCliSpawn = allowCli ? "" : "1";
@@ -196,6 +212,12 @@ export function buildRelayServerEnv({
     COPILOT_SESSION_STATE_DIR: path.join(stateRoot, "session-state"),
     HOME: stateRoot,
     USERPROFILE: stateRoot,
+    // Windows twin of the HOME override: the installed-Copilot search walks
+    // %LOCALAPPDATA%\copilot\pkg, and inheriting the host's would let the
+    // "isolated" relay find and stdio-spawn the developer's real Copilot CLI —
+    // which then manages a config.json inside the temp HOME, right on top of
+    // the relay's own (see createStateRoot).
+    ...(localAppDataDir ? { LOCALAPPDATA: localAppDataDir } : {}),
     // The Claude CLI reads CLAUDE_CONFIG_DIR ahead of HOME, and the relay
     // now passes it straight through to `claude auth …`; without an
     // override the "isolated" server would address the developer's real
@@ -203,7 +225,7 @@ export function buildRelayServerEnv({
     CLAUDE_CONFIG_DIR: claudeConfigDir,
     // Second belt: even with RELAY_E2E_ALLOW_CLI=1 the auth subcommands hit
     // a stub that only touches the temp state root, never the real CLI.
-    COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN: path.join(fixtures, "claude-auth-stub.sh"),
+    COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN: path.join(fixtures, `claude-auth-stub${stubExt}`),
     CLAUDE_AUTH_STUB_CRED_FILE: claudeCredFile,
     // The CLI kill switch below would otherwise refuse the auth spawns too.
     // This opt-in is only honoured together with the stub path above, so the
@@ -224,7 +246,7 @@ export function buildRelayServerEnv({
     // Same paired-flag shape as the Claude auth stub above: the opt-in is only
     // honoured together with an explicit command override, so a relay with the
     // kill switch on can never end up running a real `curl … | bash`.
-    COPILOT_WEB_RELAY_CLI_INSTALL_COMMAND: path.join(fixtures, "cli-install-stub.sh"),
+    COPILOT_WEB_RELAY_CLI_INSTALL_COMMAND: path.join(fixtures, `cli-install-stub${stubExt}`),
     COPILOT_WEB_RELAY_CLI_INSTALL_ALLOW_STUB_SPAWN: "1",
     // Where the stub's fake binary lands: the one directory above, so the
     // install really is followed by a resolve → bind → broadcast.
@@ -233,7 +255,7 @@ export function buildRelayServerEnv({
     // --- Grok account (device-code login) ---------------------------------
     // Second belt again: the auth spawns are pointed at the stub, so the host's
     // real `grok` is never asked to log in — or, far worse, to log *out*.
-    GROK_CLI_COMMAND: path.join(fixtures, "grok-stub.sh"),
+    GROK_CLI_COMMAND: path.join(fixtures, `grok-stub${stubExt}`),
     COPILOT_WEB_RELAY_GROK_AUTH_ALLOW_STUB_SPAWN: "1",
     // The fake auth store, inside the temp HOME the relay already reads
     // ~/.grok/auth.json from, so the stub and readGrokCliAuthKey() agree.

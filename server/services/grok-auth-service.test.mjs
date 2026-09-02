@@ -772,3 +772,37 @@ test('dispose tears down the running session and stops broadcasting', async () =
   await flush();
   assert.equal(harness.states.length, before, 'no listener fires after dispose');
 });
+
+test('a .cmd grok on win32 spawns through a shell with every token quoted', async () => {
+  const harness = createHarness({
+    platform: 'win32',
+    env: { GROK_CLI_COMMAND: 'C:\Users\dev\AppData\Roaming\npm\grok.cmd' },
+  });
+  try {
+    harness.service.startLogin();
+    const call = harness.calls[0];
+    // CVE-2024-27980: Windows cannot CreateProcess a .cmd, so the spawn asks
+    // for a shell and pre-quotes each token itself (cli-process-runner.mjs).
+    assert.equal(call.options.shell, true);
+    assert.equal(call.command, '"C:\Users\dev\AppData\Roaming\npm\grok.cmd"');
+    assert.deepEqual(call.args, ['"login"', '"--device-auth"']);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('a plain grok binary on win32 still spawns directly, without a shell', async () => {
+  const harness = createHarness({
+    platform: 'win32',
+    env: { GROK_CLI_COMMAND: 'C:\Users\dev\.grok\bin\grok.exe' },
+  });
+  try {
+    harness.service.startLogin();
+    const call = harness.calls[0];
+    assert.equal(call.options.shell, undefined);
+    assert.equal(call.command, 'C:\Users\dev\.grok\bin\grok.exe');
+    assert.deepEqual(call.args, ['login', '--device-auth']);
+  } finally {
+    harness.cleanup();
+  }
+});

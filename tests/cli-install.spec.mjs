@@ -30,7 +30,9 @@ import { repoRoot, startRelayServer } from "./relay-server-harness.mjs";
  * alone.
  */
 
-const INSTALL_STUB = path.join(repoRoot, "server", "services", "fixtures", "cli-install-stub.sh");
+// The Node script directly (not its .sh/.cmd launcher): the spec invokes it
+// through process.execPath, which works identically on every platform.
+const INSTALL_STUB = path.join(repoRoot, "server", "services", "fixtures", "cli-install-stub.mjs");
 // The stub's default version, i.e. what a relay-run install produces.
 const INSTALLED_VERSION = "9.9.9";
 // A deliberately older one, seeded straight from the same fixture, to reach the
@@ -49,28 +51,49 @@ const GROK_CLI_MISSING_TEXT = "Grok CLI was not found on PATH. Install it from S
 // from the plan's live audit (§2.3). No fixture covers this: cli-install-stub.sh
 // writes a *native* install, and this is the one case that earns its own
 // affordance, so the spec writes the binary that reports it.
-const NPM_GLOBAL_CLAUDE_STUB = `#!/bin/sh
-# Written by tests/cli-install.spec.mjs. Answers only the two probes
-# cli-install-service.mjs runs against Claude.
-if [ "$1" = "--version" ]; then
-  printf '2.1.247 (Claude Code)\\n'
-  exit 0
-fi
-if [ "$1" = "doctor" ]; then
-  cat <<'DOCTOR'
-Running: npm-global (2.1.247)
+const NPM_GLOBAL_CLAUDE_STUB_IMPL = `// Written by tests/cli-install.spec.mjs. Answers only the two probes
+// cli-install-service.mjs runs against Claude. The doctor payload is verbatim
+// from the plan's live audit of an npm-global host, Linux path included.
+if (process.argv[2] === "--version") {
+  process.stdout.write("2.1.247 (Claude Code)\\n");
+  process.exit(0);
+}
+if (process.argv[2] === "doctor") {
+  process.stdout.write(\`Running: npm-global (2.1.247)
 Path: /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude
 Auto-updates: enabled
 Last update attempt: failed (no_permissions) - 2026-08-26
 1 warning found
 - Can't auto-update: npm global folder isn't writable
   Fix: Run claude install to switch to the native installer (no sudo)
-DOCTOR
-  exit 0
-fi
-printf 'claude-stub: unsupported command: %s\\n' "$*" >&2
-exit 2
+\`);
+  process.exit(0);
+}
+process.stderr.write(\`claude-stub: unsupported command: \${process.argv.slice(2).join(" ")}\\n\`);
+process.exit(2);
 `;
+
+/**
+ * Writes the npm-global Claude stand-in as a Node script behind a platform
+ * launcher — the same one-logic-two-launchers shape as the checked-in fixtures,
+ * because Windows cannot spawn a shebang script at all.
+ */
+function writeNpmGlobalClaudeStub(binDir) {
+  const implPath = path.join(binDir, "claude-npm-fake-cli.mjs");
+  fs.writeFileSync(implPath, NPM_GLOBAL_CLAUDE_STUB_IMPL);
+  // host-platform: the launcher must match the platform the relay under test
+  // spawns on; the .cmd shim is also exactly what a real npm global install
+  // puts on a Windows PATH.
+  if (process.platform === "win32") { // host-platform: launcher must match the spawning OS
+    const target = path.join(binDir, "claude.cmd");
+    fs.writeFileSync(target, `@node "%~dp0claude-npm-fake-cli.mjs" %*\r\n`);
+    return target;
+  }
+  const target = path.join(binDir, "claude");
+  fs.writeFileSync(target, `#!/bin/sh\nexec node "$(dirname "$0")/claude-npm-fake-cli.mjs" "$@"\n`);
+  fs.chmodSync(target, 0o755);
+  return target;
+}
 
 test.describe.serial("Provider CLI install rows", () => {
   // A relay boot plus three stubbed installs that each stall deliberately.
@@ -109,7 +132,7 @@ test.describe.serial("Provider CLI install rows", () => {
 
   /** "Already installed", produced by the same fixture the relay runs. */
   function seedInstalledBinary(providerId, version) {
-    execFileSync(INSTALL_STUB, [providerId, "install"], {
+    execFileSync(process.execPath, [INSTALL_STUB, providerId, "install"], {
       env: {
         ...process.env,
         CLI_INSTALL_STUB_BIN_DIR: relay.cliBinDir,
@@ -216,10 +239,17 @@ test.describe.serial("Provider CLI install rows", () => {
       // stub is what this relay will actually run.
       await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
       await expect(page.locator("#summary-modal-title")).toHaveText("Install Grok CLI");
+      // host-platform: the sheet quotes the descriptor entry for the platform
+      // the relay under test runs on, so the expected literal follows it.
+      const windowsRelay = process.platform === "win32"; // host-platform: sheet quotes this platform's descriptor
       await expect(page.locator("#summary-modal-body")).toContainText(
-        "curl -fsSL https://x.ai/cli/install.sh | bash",
+        windowsRelay
+          ? "irm https://x.ai/cli/install.ps1 | iex"
+          : "curl -fsSL https://x.ai/cli/install.sh | bash",
       );
-      await expect(page.locator("#summary-modal-body")).toContainText("~/.grok/bin");
+      await expect(page.locator("#summary-modal-body")).toContainText(
+        windowsRelay ? "%USERPROFILE%\\.grok\\bin" : "~/.grok/bin",
+      );
       await expect(page.locator("#summary-modal-body")).toContainText("without sudo");
 
       await page.locator("#summary-modal-body button", { hasText: "Cancel" }).click();
@@ -237,7 +267,10 @@ test.describe.serial("Provider CLI install rows", () => {
     await openProviderSettings(page, "grok");
     await runActionFromRow(page, "grok", "install", "Install");
 
-    const installedPath = path.join(relay.cliBinDir, "grok");
+    // host-platform: the stub installs the same launcher shape a real install
+    // leaves behind on each platform, so the resolved path carries .cmd on a
+    // Windows relay.
+    const installedPath = path.join(relay.cliBinDir, process.platform === "win32" ? "grok.cmd" : "grok"); // host-platform: launcher shape per OS
     await expect(logBody(page, "grok")).toContainText(`Installed grok ${INSTALLED_VERSION}`);
     await expect(status(page, "grok")).toContainText(INSTALLED_VERSION);
     await expect(status(page, "grok")).toContainText(installedPath);
@@ -293,9 +326,7 @@ test.describe.serial("Provider CLI install rows", () => {
   });
 
   test("an npm-global Claude that cannot auto-update offers the native installer", async ({ page }) => {
-    const claudePath = path.join(relay.cliBinDir, "claude");
-    fs.writeFileSync(claudePath, NPM_GLOBAL_CLAUDE_STUB, { mode: 0o755 });
-    fs.chmodSync(claudePath, 0o755);
+    writeNpmGlobalClaudeStub(relay.cliBinDir);
 
     await loadApp(page);
     await openProviderSettings(page, "claude");

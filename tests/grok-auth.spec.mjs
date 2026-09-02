@@ -13,7 +13,8 @@ import {
  * Grok account management (Settings → Providers → Grok) end to end through the
  * real UI.
  *
- * The relay talks to `server/services/fixtures/grok-stub.sh` instead of the real
+ * The relay talks to `server/services/fixtures/grok-stub.mjs` (behind its
+ * platform launcher) instead of the real
  * CLI (GROK_CLI_COMMAND, wired in tests/relay-server-harness.mjs), so the host's
  * own Grok login is never touched — least of all by `grok logout`, which would
  * sign the developer's machine out. "Signed in" means a fake auth.json exists

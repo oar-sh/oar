@@ -767,3 +767,22 @@ test('dispose tears down the running session and stops broadcasting', async () =
   child.exit(143);
   assert.equal(harness.states.length, before, 'no listener fires after dispose');
 });
+
+test('a .cmd claude on win32 spawns through a shell with every token quoted', async () => {
+  const harness = createHarness({
+    platform: 'win32',
+    env: { COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN: 'C:\Users\dev\AppData\Roaming\npm\claude.cmd' },
+  });
+  try {
+    harness.service.startLogin();
+    const call = harness.calls[0];
+    // CVE-2024-27980: Windows cannot CreateProcess a .cmd — npm's global shim
+    // is exactly that — so the spawn asks for a shell and pre-quotes each
+    // token itself (cli-process-runner.mjs).
+    assert.equal(call.options.shell, true);
+    assert.equal(call.command, '"C:\Users\dev\AppData\Roaming\npm\claude.cmd"');
+    assert.deepEqual(call.args, ['"auth"', '"login"']);
+  } finally {
+    harness.cleanup();
+  }
+});

@@ -5,7 +5,9 @@ import { EventEmitter } from 'node:events';
 import * as claudeAuth from './claude-auth-service.mjs';
 import {
   CLI_SPAWN_DISABLED_ERROR,
+  isBatchLauncher,
   killTree,
+  quoteForCmd,
   runToCompletion,
   tailOf,
 } from './cli-process-runner.mjs';
@@ -227,4 +229,21 @@ test('a completed run clears its timeout so nothing fires later', async () => {
   child.exit(0);
   await pending;
   assert.deepEqual(timers.delays(), []);
+});
+
+test('isBatchLauncher flags .cmd and .bat on win32 only', () => {
+  assert.equal(isBatchLauncher('C:\Users\dev\claude.cmd', 'win32'), true);
+  assert.equal(isBatchLauncher('C:\Users\dev\copilot.BAT', 'win32'), true);
+  assert.equal(isBatchLauncher('C:\Users\dev\grok.exe', 'win32'), false);
+  assert.equal(isBatchLauncher('C:\Users\dev\grok', 'win32'), false);
+  // A .cmd suffix on POSIX is just a file name, not a batch launcher.
+  assert.equal(isBatchLauncher('/home/dev/claude.cmd', 'linux'), false);
+  assert.equal(isBatchLauncher('', 'win32'), false);
+  assert.equal(isBatchLauncher(null, 'win32'), false);
+});
+
+test('quoteForCmd wraps every token and doubles embedded quotes', () => {
+  assert.equal(quoteForCmd('C:\Program Files\App\claude.cmd'), '"C:\Program Files\App\claude.cmd"');
+  assert.equal(quoteForCmd('plain'), '"plain"');
+  assert.equal(quoteForCmd('say "hi"'), '"say ""hi"""');
 });

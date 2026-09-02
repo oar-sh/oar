@@ -9,8 +9,10 @@ import { spawn } from 'child_process';
 import {
   CLI_SPAWN_DISABLED_ERROR,
   MAX_CAPTURED_OUTPUT_CHARS,
+  isBatchLauncher,
   joinWrappedLines,
   killTree as killProcessTree,
+  quoteForCmd,
   runToCompletion as runProcessToCompletion,
   scrubSecrets,
   stripTerminalEscapes,
@@ -235,11 +237,15 @@ export function createClaudeAuthService({
   function spawnAuthProcess(args, { pty = true, stdin = 'pipe' } = {}) {
     if (cliSpawnsDisabled()) throw new Error(CLI_SPAWN_DISABLED_ERROR);
     const bin = resolveClaudeAuthBinary(env);
+    // On Windows the npm-installed `claude` is `claude.cmd`, which only spawns
+    // through a shell — shared batch-launcher handling in cli-process-runner.mjs.
+    const batch = isBatchLauncher(bin, platform);
     const child = (!pty || platform === 'win32')
-      ? spawnImpl(bin, args, {
+      ? spawnImpl(batch ? quoteForCmd(bin) : bin, batch ? args.map(quoteForCmd) : args, {
         stdio: [stdin, 'pipe', 'pipe'],
         env: buildSpawnEnv(),
         windowsHide: true,
+        ...(batch ? { shell: true } : {}),
       })
       : spawnImpl('script', ['-qec', [bin, ...args].map(shellQuote).join(' '), '/dev/null'], {
         stdio: [stdin, 'pipe', 'pipe'],

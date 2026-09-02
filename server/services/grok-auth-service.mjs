@@ -8,7 +8,9 @@ import { spawn } from 'child_process';
 import {
   CLI_SPAWN_DISABLED_ERROR,
   MAX_CAPTURED_OUTPUT_CHARS,
+  isBatchLauncher,
   killTree as killProcessTree,
+  quoteForCmd,
   runToCompletion as runProcessToCompletion,
   scrubSecrets,
   stripTerminalEscapes,
@@ -243,7 +245,13 @@ export function createGrokAuthService({
   function spawnGrokProcess(args) {
     if (cliSpawnsDisabled()) throw new Error(CLI_SPAWN_DISABLED_ERROR);
     const bin = resolveGrokAuthBinary(env);
-    return spawnImpl(bin, args, {
+    // A `grok` installed through npm (or any wrapper shipped as a shim) is
+    // `grok.cmd` on Windows, which only spawns through a shell — the shared
+    // batch-launcher handling (cli-process-runner.mjs) covers the EINVAL story
+    // and the quoting rules.
+    const batch = isBatchLauncher(bin, platform);
+    return spawnImpl(batch ? quoteForCmd(bin) : bin, batch ? args.map(quoteForCmd) : args, {
+      ...(batch ? { shell: true } : {}),
       // stdin is never written to, so it is closed outright rather than left as
       // a pipe nothing ever drains.
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -7,7 +7,9 @@ import path from 'path';
 import {
   CLI_SPAWN_DISABLED_ERROR,
   MAX_CAPTURED_OUTPUT_CHARS,
+  isBatchLauncher as isBatchLauncherImpl,
   killTree as killProcessTree,
+  quoteForCmd,
   runToCompletion as runProcessToCompletion,
   stripTerminalEscapes,
   tailOf,
@@ -499,35 +501,14 @@ export function createCliInstallService({
   }
 
   /**
-   * Windows cannot `CreateProcess` a `.cmd`/`.bat` at all, and Node has refused
-   * to pretend otherwise since the CVE-2024-27980 fix — it fails the spawn with
-   * EINVAL unless a shell is asked for explicitly. `candidateNames()` resolves
-   * exactly those extensions through PATHEXT, and npm's shim for `copilot` on a
-   * Windows host *is* `copilot.cmd` — so without this, that row would report
-   * "installed, version unknown" on every probe and any `.cmd`-shimmed
-   * update/migrate would die instantly.
+   * `candidateNames()` resolves `.cmd`/`.bat` through PATHEXT, and npm's shim
+   * for `copilot` on a Windows host *is* `copilot.cmd` — so without the shared
+   * batch-launcher handling (cli-process-runner.mjs, where the EINVAL story is
+   * documented), that row would report "installed, version unknown" on every
+   * probe and any `.cmd`-shimmed update/migrate would die instantly.
    */
   function isBatchLauncher(command) {
-    return platform === 'win32' && /\.(cmd|bat)$/i.test(String(command || ''));
-  }
-
-  /**
-   * `shell: true` makes Node join `[command, ...args]` with spaces into one
-   * string and hand it to `cmd.exe /d /s /c` *without quoting anything itself*,
-   * so every token has to be quoted here — `C:\Program Files\…\copilot.cmd`
-   * would otherwise split on its own space.
-   *
-   * This is belt-and-braces, not the security boundary: the argv is frozen
-   * literals from the descriptor table plus a path this module resolved off the
-   * filesystem, never anything a caller sent (§6). cmd.exe has no escape for a
-   * quote inside a quoted token — doubling it is the closest thing, and a
-   * Windows path cannot contain one anyway. `%VAR%` still expands inside double
-   * quotes; a bin directory named after a *set* environment variable would
-   * mis-resolve, which is the one residual gap and is still better than the
-   * alternative of not running batch launchers at all.
-   */
-  function quoteForCmd(value) {
-    return `"${String(value).replace(/"/g, '""')}"`;
+    return isBatchLauncherImpl(command, platform);
   }
 
   function spawnCliProcess(argv) {

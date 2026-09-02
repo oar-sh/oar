@@ -4,8 +4,8 @@ import { expect, test } from "@playwright/test";
 import { relayBaseUrl, relayClaudeCredFile, relayToken } from "./e2e-env.mjs";
 
 // Claude account management (Settings → Providers → Claude) end to end through
-// the real UI. The relay talks to `server/services/fixtures/claude-auth-stub.sh`
-// instead of the real CLI (COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN, wired in
+// the real UI. The relay talks to `server/services/fixtures/claude-auth-stub.mjs`
+// (behind its platform launcher) instead of the real CLI (COPILOT_WEB_RELAY_CLAUDE_AUTH_BIN, wired in
 // tests/run-e2e.mjs), so the host's own Claude login is never touched: the stub
 // treats a file under the test server's isolated CLAUDE_CONFIG_DIR as the
 // credentials, accepts the code `goodcode` and rejects everything else.
