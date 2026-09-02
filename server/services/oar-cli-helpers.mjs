@@ -45,13 +45,16 @@ export function relayUrl({ config, lanAddress = null } = {}) {
  * so a `gh copilot` session is not tied to the unit's lifetime.
  */
 export function buildSystemdUnit({ nodeBin, packageRoot, configPath, dataDir, logDir }) {
+  // systemd units are Linux-only, so the path inside the unit is always
+  // posix-joined — host-platform path.join would write backslashes when this
+  // template is exercised on Windows (tests; the CLI never writes it there).
   return [
     '[Unit]',
     'Description=OAR — Open Agent Relay',
     'After=network-online.target',
     '',
     '[Service]',
-    `ExecStart=${nodeBin} ${path.join(packageRoot, 'server', 'server.js')}`,
+    `ExecStart=${nodeBin} ${path.posix.join(packageRoot, 'server', 'server.js')}`,
     `Environment=COPILOT_WEB_RELAY_CONFIG=${configPath}`,
     `Environment=COPILOT_WEB_RELAY_DATA_DIR=${dataDir}`,
     `Environment=COPILOT_WEB_RELAY_LOG_DIR=${logDir}`,

@@ -30,10 +30,13 @@ const FORBIDDEN = [
 ];
 
 function readPackList() {
+  // On win32 npm is npm.cmd, which execFileSync only resolves through a shell;
+  // the arguments are static strings, so shell interpolation has nothing to bite.
   const raw = execFileSync('npm', ['pack', '--dry-run', '--json'], {
     cwd: repoRoot,
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
+    shell: process.platform === 'win32', // host-platform: npm.cmd needs a shell; this test really invokes the host npm
     // npm pack --json still writes human noise to stderr; stdout is the JSON.
   });
   const parsed = JSON.parse(raw);
