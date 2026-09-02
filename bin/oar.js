@@ -471,7 +471,184 @@ export async function launchRelay({
   return { code: exitCode, reason: 'exited' };
 }
 
+function readPackageVersion(packageRoot = resolvePackageRoot()) {
+  try {
+    return String(JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version || '0.0.0');
+  } catch {
+    return '0.0.0';
+  }
+}
+
+async function promptYesNo(question, { defaultYes = false, interactive = true } = {}) {
+  if (!interactive) return defaultYes;
+  const readline = await import('node:readline/promises');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const suffix = defaultYes ? '[Y/n]' : '[y/N]';
+    const answer = (await rl.question(`${question} ${suffix} `)).trim().toLowerCase();
+    if (!answer) return defaultYes;
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+async function runSetup({ argv = [], env = process.env, logger = console } = {}) {
+  const {
+    buildDefaultConfig, buildSystemdUnit, generateAuthToken, primaryLanAddress, relayUrl,
+  } = await import('../server/services/oar-cli-helpers.mjs');
+
+  const packageRoot = resolvePackageRoot();
+  const layout = resolveStateLayout({ packageRoot, env });
+  const useDefaults = argv.includes('--defaults') || !process.stdin.isTTY;
+  const migrateFromIdx = argv.indexOf('--migrate-from');
+  const migrateFromRoot = migrateFromIdx !== -1 ? String(argv[migrateFromIdx + 1] || '').trim() : '';
+
+  if (!layout.checkout) {
+    const migration = await migrateStateToOarRoot({
+      targetRoot: layout.root,
+      repoServerDir: migrateFromRoot ? path.join(path.resolve(migrateFromRoot), 'server') : null,
+      managedConfigDir: getLegacyManagedConfigDir(env),
+      logger,
+    });
+    if (migration.status === 'blocked-live-relay') {
+      logger.error?.(`[oar] ${migration.error}`);
+      return { code: 1, reason: 'migration-blocked' };
+    }
+    if (migration.status === 'migrated') {
+      logger.log(`[oar] Migrated existing relay state into ${layout.root} (sources untouched).`);
+    }
+  }
+
+  const configPath = layout.checkout
+    ? path.join(packageRoot, 'server', 'config.json')
+    : path.join(layout.configDir, 'config.json');
+  const existing = readJsonFile(configPath);
+
+  let token = String(existing?.authToken || '').trim();
+  if (token) {
+    const regenerate = await promptYesNo('A config already exists. Generate a new auth token (logs every device out)?', {
+      defaultYes: false,
+      interactive: !useDefaults,
+    });
+    if (regenerate) token = generateAuthToken();
+  } else {
+    token = generateAuthToken();
+  }
+
+  const lanAccess = existing
+    ? existing.localhostOnly === false
+    : await promptYesNo('Allow LAN access so your phone can connect directly (otherwise localhost + tunnel only)?', {
+      defaultYes: false,
+      interactive: !useDefaults,
+    });
+
+  const config = { ...buildDefaultConfig({ token }), ...(existing || {}) };
+  config.authToken = token;
+  config.localhostOnly = !lanAccess;
+
+  if (await promptYesNo('Enable the managed cloudflared tunnel (public URL for remote access)?', {
+    defaultYes: false,
+    interactive: !useDefaults,
+  })) {
+    config.cloudflaredTunnel = { ...(config.cloudflaredTunnel || {}), enabled: true };
+  }
+
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(configPath, 0o600); } catch {}
+  }
+  logger.log(`[oar] Wrote ${configPath}`);
+
+  if (process.platform === 'linux' && !layout.checkout) {
+    if (await promptYesNo('Install a systemd user service so the relay starts on login?', {
+      defaultYes: false,
+      interactive: !useDefaults,
+    })) {
+      const unitDir = path.join(os.homedir(), '.config', 'systemd', 'user');
+      const unitPath = path.join(unitDir, 'oar.service');
+      fs.mkdirSync(unitDir, { recursive: true });
+      fs.writeFileSync(unitPath, buildSystemdUnit({
+        nodeBin: process.execPath,
+        packageRoot,
+        configPath,
+        dataDir: layout.dataDir,
+        logDir: getLauncherLogDir(env, layout),
+      }));
+      logger.log(`[oar] Wrote ${unitPath} — enable it with: systemctl --user enable --now oar`);
+    }
+  } else if (process.platform === 'win32') {
+    logger.log('[oar] Autostart on Windows: enable it in the web UI under Settings → Autostart.');
+  }
+
+  const url = relayUrl({ config, lanAddress: primaryLanAddress() });
+  logger.log('');
+  logger.log(`[oar] Relay URL: ${url}`);
+  if (config.localhostOnly) {
+    logger.log('[oar] localhostOnly is on — reach it from other devices via the tunnel, or rerun `oar setup` for LAN access.');
+  }
+  try {
+    const qrcode = (await import('qrcode-terminal')).default;
+    qrcode.generate(url, { small: true }, (qr) => logger.log(qr));
+  } catch {
+    // QR is a convenience — the URL above is the contract.
+  }
+  logger.log('[oar] Start the relay with: oar');
+  return { code: 0, reason: 'setup-complete' };
+}
+
+async function runDoctor({ env = process.env, logger = console } = {}) {
+  const { DOCTOR_PROBES, renderDoctorReport } = await import('../server/services/oar-cli-helpers.mjs');
+  const { spawnSync } = await import('node:child_process');
+
+  const packageRoot = resolvePackageRoot();
+  const layout = resolveStateLayout({ packageRoot, env });
+  const configPath = layout.checkout
+    ? path.join(packageRoot, 'server', 'config.json')
+    : path.join(layout.configDir, 'config.json');
+  const dbPath = layout.checkout
+    ? path.join(packageRoot, 'server', 'data', 'copilot.db')
+    : path.join(layout.dataDir, 'copilot.db');
+
+  let dbSizeBytes = null;
+  try { dbSizeBytes = fs.statSync(dbPath).size; } catch {}
+
+  const probes = DOCTOR_PROBES.map((probe) => {
+    try {
+      const result = spawnSync(probe.binary, probe.args, { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      const ok = result.status === 0;
+      const version = ok ? String(result.stdout || '').trim().split('\n')[0].slice(0, 60) : '';
+      return { id: probe.id, ok, version };
+    } catch {
+      return { id: probe.id, ok: false };
+    }
+  });
+  probes.push({ id: 'cursor', ok: true, version: 'bundled (@cursor/sdk)' });
+
+  logger.log(renderDoctorReport({
+    version: readPackageVersion(packageRoot),
+    nodeVersion: process.version,
+    platform: process.platform,
+    layout,
+    configPath,
+    config: readJsonFile(configPath),
+    dbPath,
+    dbSizeBytes,
+    probes,
+  }));
+  return { code: 0, reason: 'doctor' };
+}
+
 function main() {
+  const argv = process.argv.slice(2);
+  const command = String(argv[0] || '').trim();
+  if (command === '--version' || command === '-v') {
+    console.log(readPackageVersion());
+    return Promise.resolve({ code: 0, reason: 'version' });
+  }
+  if (command === 'setup') return runSetup({ argv: argv.slice(1) });
+  if (command === 'doctor') return runDoctor({});
   return launchRelay();
 }
 
