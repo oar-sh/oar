@@ -42,7 +42,7 @@ function createMockDb() {
   };
 }
 
-function registerAutostartRoutes(windowsAutostartService) {
+function registerAutostartRoutes(windowsAutostartService, windowsBootAutostartService) {
   const app = createMockApp();
   const auth = (_req, _res, next) => next();
   registerSessionsRoutes(app, {
@@ -103,8 +103,41 @@ function registerAutostartRoutes(windowsAutostartService) {
     sessionWorkerRegistry: null,
     resolveSessionStateRoot: () => null,
     windowsAutostartService,
+    windowsBootAutostartService,
   });
   return { app, auth };
+}
+
+/** A boot service double whose task state the test scripts directly. */
+function createBootServiceDouble({ taskStatus = 'missing', legacyTaskPresent = false } = {}) {
+  const calls = [];
+  const state = {
+    supported: true,
+    platform: 'win32',
+    taskStatus,
+    taskName: 'oar-relay',
+    legacyTaskPresent,
+    launcherPath: null,
+    pendingElevation: null,
+    lastError: null,
+    manualCommand: 'schtasks /create /tn "oar-relay" /xml "C:\\Users\\dev\\task.xml" /f',
+  };
+  return {
+    calls,
+    state,
+    getState: async () => ({ ...state }),
+    requestEnable: async () => {
+      calls.push('enable');
+      state.pendingElevation = 'enable';
+      return { ...state, accepted: true };
+    },
+    requestDisable: async () => {
+      calls.push('disable');
+      state.taskStatus = 'missing';
+      state.legacyTaskPresent = false;
+      return { ...state, accepted: true };
+    },
+  };
 }
 
 async function callRoute(handlers, req = {}) {
@@ -130,17 +163,25 @@ async function callRoute(handlers, req = {}) {
   return response;
 }
 
-test('Windows autostart settings routes are authenticated and return current state', async () => {
-  const service = {
-    getState: () => ({ supported: true, enabled: false, platform: 'win32' }),
-    setEnabled: (enabled) => ({
-      supported: true,
-      enabled,
-      platform: 'win32',
-      changed: true,
-    }),
+function createSigninServiceDouble({ enabled = false, supported = true } = {}) {
+  const platform = supported ? 'win32' : 'linux';
+  const calls = [];
+  let isEnabled = enabled;
+  return {
+    calls,
+    getState: () => ({ supported, enabled: isEnabled, platform }),
+    setEnabled: (next) => {
+      calls.push(next);
+      isEnabled = next;
+      return { supported, enabled: isEnabled, platform, changed: true };
+    },
   };
-  const { app, auth } = registerAutostartRoutes(service);
+}
+
+test('Windows autostart settings routes are authenticated and merge both services into a mode', async () => {
+  const signin = createSigninServiceDouble();
+  const boot = createBootServiceDouble();
+  const { app, auth } = registerAutostartRoutes(signin, boot);
   const getHandlers = app.routes.get('GET /api/settings/windows-autostart');
   const postHandlers = app.routes.get('POST /api/settings/windows-autostart');
   assert.equal(getHandlers[0], auth);
@@ -148,44 +189,97 @@ test('Windows autostart settings routes are authenticated and return current sta
 
   const getResponse = await callRoute(getHandlers);
   assert.equal(getResponse.statusCode, 200);
-  assert.deepEqual(getResponse.body, {
-    supported: true,
-    enabled: false,
-    platform: 'win32',
-  });
+  assert.equal(getResponse.body.mode, 'off');
+  assert.equal(getResponse.body.enabled, false);
+  assert.equal(getResponse.body.boot.taskStatus, 'missing');
 
+  // Back-compat: the pre-mode boolean POST still lands on sign-in mode.
   const postResponse = await callRoute(postHandlers, { body: { enabled: true } });
   assert.equal(postResponse.statusCode, 200);
-  assert.deepEqual(postResponse.body, {
-    supported: true,
-    enabled: true,
-    platform: 'win32',
-    changed: true,
-  });
+  assert.equal(postResponse.body.mode, 'signin');
+  assert.equal(postResponse.body.enabled, true);
+  assert.deepEqual(signin.calls, [true]);
+  assert.deepEqual(boot.calls, [], 'no elevation for a sign-in toggle with no boot task');
+});
+
+test('a ready boot task defines the mode even with a leftover Startup entry present', async () => {
+  const signin = createSigninServiceDouble({ enabled: true });
+  const boot = createBootServiceDouble({ taskStatus: 'ready' });
+  const { app } = registerAutostartRoutes(signin, boot);
+  const response = await callRoute(app.routes.get('GET /api/settings/windows-autostart'));
+  assert.equal(response.body.mode, 'boot');
+  assert.equal(response.body.signinEnabled, true, 'the leftover .cmd is reported, not hidden');
+});
+
+test('selecting boot mode requests the elevated enable and reports pending', async () => {
+  const signin = createSigninServiceDouble({ enabled: true });
+  const boot = createBootServiceDouble();
+  const { app } = registerAutostartRoutes(signin, boot);
+  const response = await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'boot' } });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(boot.calls, ['enable']);
+  assert.equal(response.body.accepted, true);
+  assert.equal(response.body.boot.pendingElevation, 'enable');
+  assert.deepEqual(signin.calls, [], 'the .cmd survives until the UAC is actually confirmed');
+});
+
+test('leaving boot mode sweeps the task first, then applies the sign-in half', async () => {
+  const signin = createSigninServiceDouble();
+  const boot = createBootServiceDouble({ taskStatus: 'ready' });
+  const { app } = registerAutostartRoutes(signin, boot);
+  const response = await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'signin' } });
+  assert.deepEqual(boot.calls, ['disable']);
+  assert.deepEqual(signin.calls, [true]);
+  assert.equal(response.body.accepted, true);
+});
+
+test('a foreign task under our name is never deleted by picking sign-in mode', async () => {
+  const signin = createSigninServiceDouble();
+  const boot = createBootServiceDouble({ taskStatus: 'foreign' });
+  const { app } = registerAutostartRoutes(signin, boot);
+  await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'signin' } });
+  assert.deepEqual(boot.calls, [], 'foreign tasks are replaced only through an explicit boot enable');
+  assert.deepEqual(signin.calls, [true]);
+});
+
+test('a lingering legacy task is swept even when switching to off', async () => {
+  const signin = createSigninServiceDouble({ enabled: true });
+  const boot = createBootServiceDouble({ taskStatus: 'missing', legacyTaskPresent: true });
+  const { app } = registerAutostartRoutes(signin, boot);
+  await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'off' } });
+  assert.deepEqual(boot.calls, ['disable']);
+  assert.deepEqual(signin.calls, [false]);
 });
 
 test('Windows autostart update rejects malformed and unsupported requests', async () => {
-  let mutationCount = 0;
-  const service = {
-    getState: () => ({ supported: false, enabled: false, platform: 'linux' }),
-    setEnabled() {
-      mutationCount += 1;
-      return {};
-    },
-  };
-  const { app } = registerAutostartRoutes(service);
+  const unsupported = createSigninServiceDouble({ supported: false });
+  const { app } = registerAutostartRoutes(unsupported, createBootServiceDouble());
   const handlers = app.routes.get('POST /api/settings/windows-autostart');
 
   const malformedResponse = await callRoute(handlers, { body: { enabled: 'true' } });
   assert.equal(malformedResponse.statusCode, 400);
-  assert.deepEqual(malformedResponse.body, { error: 'enabled must be a boolean' });
+  assert.match(malformedResponse.body.error, /mode must be/);
+
+  const badModeResponse = await callRoute(handlers, { body: { mode: 'reboot' } });
+  assert.equal(badModeResponse.statusCode, 400);
 
   const unsupportedResponse = await callRoute(handlers, { body: { enabled: true } });
   assert.equal(unsupportedResponse.statusCode, 400);
   assert.deepEqual(unsupportedResponse.body, {
     error: 'Windows autostart is only available on Windows',
   });
-  assert.equal(mutationCount, 0);
+  assert.deepEqual(unsupported.calls, []);
+});
+
+test('the routes work without a boot service (boot reported as null)', async () => {
+  const signin = createSigninServiceDouble({ enabled: true });
+  const { app } = registerAutostartRoutes(signin, undefined);
+  const getResponse = await callRoute(app.routes.get('GET /api/settings/windows-autostart'));
+  assert.equal(getResponse.body.mode, 'signin');
+  assert.equal(getResponse.body.boot, null);
+  const postResponse = await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'off' } });
+  assert.equal(postResponse.statusCode, 200);
+  assert.equal(postResponse.body.mode, 'off');
 });
 
 test('Windows autostart routes do not expose filesystem error details', async () => {

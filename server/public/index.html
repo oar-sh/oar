@@ -5065,16 +5065,26 @@
         </div>
         <div class="settings-help" style="margin-top: 6px;">How long background tasks (backgrounded commands, subagents, monitors) may keep a Claude session's CLI process alive after its turn ends. When the limit is reached the tasks are stopped and the agent reports what they left behind. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
         <div id="windows-autostart-setting" hidden>
-          <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
-            <label for="windows-autostart-toggle">Autostart (Windows)</label>
-            <input
-              id="windows-autostart-toggle"
-              type="checkbox"
-              onchange="updateWindowsAutostartSettingFromToggle(this.checked)"
-              aria-label="Autostart on Windows sign-in"
-            >
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label>Autostart (Windows)</label>
+            <div role="radiogroup" aria-label="Windows autostart mode" style="display: flex; flex-direction: column; gap: 4px;">
+              <label style="font-weight: normal;">
+                <input type="radio" name="windows-autostart-mode" value="off" onchange="updateWindowsAutostartMode('off')"> Off
+              </label>
+              <label style="font-weight: normal;">
+                <input type="radio" name="windows-autostart-mode" value="signin" onchange="updateWindowsAutostartMode('signin')"> At sign-in — visible terminal after you log on
+              </label>
+              <label style="font-weight: normal;">
+                <input type="radio" name="windows-autostart-mode" value="boot" onchange="updateWindowsAutostartMode('boot')"> At system startup — headless, no logon needed
+              </label>
+            </div>
           </div>
-          <div class="settings-help" style="margin-top: 6px;">Open a visible terminal and start only the web relay server when you sign in. A Copilot CLI host must attach separately to process turns.</div>
+          <div class="settings-help" style="margin-top: 6px;">System startup runs the relay as your user via a scheduled task (no password stored), reachable ~60&nbsp;s after boot before anyone signs in. Switching modes asks for one admin confirmation on the PC itself. The task's identity has no network-share credentials — local files and the tunnel are unaffected.</div>
+          <div id="windows-autostart-status" class="settings-help" style="margin-top: 6px;" hidden></div>
+          <div id="windows-autostart-manual" class="settings-help" style="margin-top: 6px;" hidden>
+            Run this from an elevated PowerShell instead:
+            <code id="windows-autostart-manual-command" style="display: block; margin-top: 4px; user-select: all;"></code>
+          </div>
         </div>
         <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
           <label for="pwa-app-name-input">Install app name</label>

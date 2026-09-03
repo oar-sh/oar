@@ -2063,6 +2063,7 @@ export function registerSessionsRoutes(app, deps) {
     getSharedWatcherCount,
     statusEventService,
     windowsAutostartService,
+    windowsBootAutostartService,
     isSha256,
     uploadPathForSha,
   } = deps;
@@ -5615,12 +5616,45 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  app.get('/api/settings/windows-autostart', auth, (_req, res) => {
+  /**
+   * Merge the two Windows autostart services into one mode-shaped state.
+   * A ready boot task wins the mode call even when a Startup .cmd also
+   * exists (that mixed state is real on upgraded hosts): the boot task is
+   * what owns the running relay there, and the leftover .cmd is reported so
+   * the UI can offer cleanup instead of hiding the race.
+   */
+  async function windowsAutostartMergedState() {
+    const signin = windowsAutostartService.getState();
+    const boot = windowsBootAutostartService
+      ? await windowsBootAutostartService.getState()
+      : { supported: false };
+    const bootReady = boot.supported && boot.taskStatus === 'ready';
+    const mode = bootReady ? 'boot' : (signin.enabled ? 'signin' : 'off');
+    return {
+      supported: signin.supported,
+      platform: signin.platform,
+      mode,
+      // Back-compat for pre-mode clients: their toggle keeps meaning
+      // "starts automatically somehow".
+      enabled: mode !== 'off',
+      boot: boot.supported ? {
+        taskStatus: boot.taskStatus,
+        taskName: boot.taskName,
+        legacyTaskPresent: boot.legacyTaskPresent,
+        pendingElevation: boot.pendingElevation,
+        lastError: boot.lastError,
+        manualCommand: boot.manualCommand,
+      } : null,
+      signinEnabled: signin.enabled,
+    };
+  }
+
+  app.get('/api/settings/windows-autostart', auth, async (_req, res) => {
     if (!windowsAutostartService) {
       return res.status(500).json({ error: 'Windows autostart settings are unavailable' });
     }
     try {
-      return res.json(windowsAutostartService.getState());
+      return res.json(await windowsAutostartMergedState());
     } catch {
       return res.status(500).json({
         error: 'Unable to read Windows autostart. Check access to your user Startup folder.',
@@ -5628,19 +5662,49 @@ export function registerSessionsRoutes(app, deps) {
     }
   });
 
-  app.post('/api/settings/windows-autostart', auth, (req, res) => {
-    if (typeof req.body?.enabled !== 'boolean') {
-      return res.status(400).json({ error: 'enabled must be a boolean' });
+  app.post('/api/settings/windows-autostart', auth, async (req, res) => {
+    const rawMode = req.body?.mode;
+    const hasBoolean = typeof req.body?.enabled === 'boolean';
+    // Pre-mode clients send {enabled}; it maps onto the sign-in mode exactly
+    // as before this endpoint learned about boot mode.
+    const mode = rawMode !== undefined
+      ? String(rawMode)
+      : (hasBoolean ? (req.body.enabled ? 'signin' : 'off') : null);
+    if (!['off', 'signin', 'boot'].includes(mode)) {
+      return res.status(400).json({ error: "mode must be 'off', 'signin' or 'boot' (or enabled a boolean)" });
     }
     if (!windowsAutostartService) {
       return res.status(500).json({ error: 'Windows autostart settings are unavailable' });
     }
     try {
-      const currentState = windowsAutostartService.getState();
-      if (!currentState.supported) {
+      if (!windowsAutostartService.getState().supported) {
         return res.status(400).json({ error: 'Windows autostart is only available on Windows' });
       }
-      return res.json(windowsAutostartService.setEnabled(req.body.enabled));
+      if (mode === 'boot') {
+        if (!windowsBootAutostartService) {
+          return res.status(500).json({ error: 'Windows boot autostart is unavailable' });
+        }
+        // The sweep's completion also removes the Startup .cmd entries; the
+        // sign-in service is not touched here so a declined UAC leaves the
+        // previous mode fully intact.
+        const result = await windowsBootAutostartService.requestEnable();
+        return res.json({ ...(await windowsAutostartMergedState()), accepted: result.accepted });
+      }
+      // Leaving boot mode needs its own elevated sweep before the sign-in
+      // half applies; a declined UAC must not leave both modes armed.
+      const boot = windowsBootAutostartService ? await windowsBootAutostartService.getState() : null;
+      let accepted = true;
+      if (boot?.supported && (boot.taskStatus === 'ready' || boot.taskStatus === 'foreign' || boot.legacyTaskPresent)) {
+        if (boot.taskStatus === 'foreign' && mode === 'signin') {
+          // Someone else's task under our name: never delete it as a side
+          // effect of picking sign-in mode.
+          windowsAutostartService.setEnabled(true);
+          return res.json({ ...(await windowsAutostartMergedState()), accepted: true });
+        }
+        accepted = (await windowsBootAutostartService.requestDisable()).accepted;
+      }
+      windowsAutostartService.setEnabled(mode === 'signin');
+      return res.json({ ...(await windowsAutostartMergedState()), accepted });
     } catch {
       return res.status(500).json({
         error: 'Unable to update Windows autostart. Check access to your user Startup folder.',

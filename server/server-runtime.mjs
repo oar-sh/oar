@@ -89,6 +89,7 @@ import { createPreviewProxyServer } from './services/preview-proxy-server.mjs';
 import { createPreviewHealthProbe } from './services/preview-health-probe.mjs';
 import { createTunnelWorkerPathGuard } from './services/tunnel-worker-path-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
+import { createWindowsBootAutostartService } from './services/windows-boot-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
 import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
@@ -6605,6 +6606,10 @@ const windowsAutostartService = createWindowsAutostartService({
   packageRoot: REPO_ROOT,
   configPath: CONFIG_PATH,
 });
+const windowsBootAutostartService = createWindowsBootAutostartService({
+  packageRoot: REPO_ROOT,
+  configPath: CONFIG_PATH,
+});
 
 const gitChangesService = createGitChangesService();
 const sharedRouteDeps = {
@@ -6792,6 +6797,7 @@ const sharedRouteDeps = {
   grokAuthService,
   imageOperationService,
   windowsAutostartService,
+  windowsBootAutostartService,
   pushDispatchService,
 };
 registerMessagesRoutes(app, sharedRouteDeps);

@@ -265,7 +265,7 @@ import {
   toggleCursorProvider,
   applyCursorSettingsState,
   refreshCursorSettingsState,
-  updateWindowsAutostartSettingFromToggle,
+  updateWindowsAutostartMode,
   previewTurnCeilingSetting,
   updateTurnCeilingSetting,
   previewBackgroundTaskTimeoutSetting,
@@ -4231,7 +4231,7 @@ window.saveGrokAllowanceSettings = saveGrokAllowanceSettings;
 window.resetGrokAllowanceAccounting = resetGrokAllowanceAccounting;
 window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
-window.updateWindowsAutostartSettingFromToggle = updateWindowsAutostartSettingFromToggle;
+window.updateWindowsAutostartMode = updateWindowsAutostartMode;
 window.previewTurnCeilingSetting = previewTurnCeilingSetting;
 window.updateTurnCeilingSetting = updateTurnCeilingSetting;
 window.previewBackgroundTaskTimeoutSetting = previewBackgroundTaskTimeoutSetting;

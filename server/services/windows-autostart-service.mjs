@@ -2,9 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
 
-export const WINDOWS_AUTOSTART_FILENAME = 'copilot-remote-web-relay.cmd';
+export const WINDOWS_AUTOSTART_FILENAME = 'oar-web-relay.cmd';
+// The pre-rebrand name. Never written anymore, but still recognized (an install
+// that enabled autostart before the OAR rename has this file) and cleaned up on
+// every state change so the two names can never both launch a relay.
+export const LEGACY_WINDOWS_AUTOSTART_FILENAME = 'copilot-remote-web-relay.cmd';
 
-function escapeBatchValue(value) {
+export function escapeBatchValue(value) {
   return String(value || '').replaceAll('%', '%%');
 }
 
@@ -33,7 +37,7 @@ export function buildWindowsAutostartScript({
   const serverPath = pathImpl.join(resolvedPackageRoot, 'server', 'server.js');
   const lines = [
     '@echo off',
-    'title Copilot Remote Web Relay',
+    'title OAR Web Relay',
   ];
   if (String(configPath || '').trim()) {
     lines.push(`set "COPILOT_WEB_RELAY_CONFIG=${escapeBatchValue(pathImpl.resolve(configPath))}"`);
@@ -64,12 +68,31 @@ export function createWindowsAutostartService({
     );
   }
 
+  function legacyEntryPath() {
+    return pathImpl.join(
+      resolveWindowsStartupDirectory(env, pathImpl),
+      LEGACY_WINDOWS_AUTOSTART_FILENAME,
+    );
+  }
+
   function getState() {
+    // The legacy-named entry still counts as "enabled": it starts the relay at
+    // sign-in exactly like the current name does, and reporting it as off
+    // would invite enabling a second copy next to it.
+    const enabled = supported
+      && (fsImpl.existsSync(entryPath()) || fsImpl.existsSync(legacyEntryPath()));
     return {
       supported,
-      enabled: supported ? fsImpl.existsSync(entryPath()) : false,
+      enabled: supported ? enabled : false,
       platform,
     };
+  }
+
+  function removeLegacyEntry() {
+    const target = legacyEntryPath();
+    if (!fsImpl.existsSync(target)) return false;
+    fsImpl.unlinkSync(target);
+    return true;
   }
 
   function setEnabled(enabled) {
@@ -83,9 +106,13 @@ export function createWindowsAutostartService({
     const targetPath = entryPath();
     const existed = fsImpl.existsSync(targetPath);
     if (!enabled) {
+      const removedLegacy = removeLegacyEntry();
       if (existed) fsImpl.unlinkSync(targetPath);
-      return { ...getState(), changed: existed };
+      return { ...getState(), changed: existed || removedLegacy };
     }
+    // Enabling always converges on the one current filename; if only the
+    // legacy entry existed, the current-name write below reports the change.
+    removeLegacyEntry();
 
     const script = buildWindowsAutostartScript({
       packageRoot,

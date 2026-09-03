@@ -411,10 +411,13 @@ export async function loadWindowsAutostartSetting() {
   return apiFetch('/api/settings/windows-autostart');
 }
 
-export async function updateWindowsAutostartSetting(enabled) {
+export async function updateWindowsAutostartSetting(mode) {
+  // Mode string ('off' | 'signin' | 'boot'); a boolean still works for the
+  // pre-mode call sites and maps onto signin/off server-side.
+  const body = typeof mode === 'boolean' ? { enabled: mode } : { mode: String(mode) };
   return apiFetch('/api/settings/windows-autostart', {
     method: 'POST',
-    body: JSON.stringify({ enabled: !!enabled }),
+    body: JSON.stringify(body),
   });
 }
 

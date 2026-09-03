@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  LEGACY_WINDOWS_AUTOSTART_FILENAME,
   WINDOWS_AUTOSTART_FILENAME,
   buildWindowsAutostartScript,
   createWindowsAutostartService,
@@ -55,7 +56,7 @@ test('buildWindowsAutostartScript quotes installed paths and escapes percent exp
     configPath: 'C:\\Users\\Example\\AppData\\Local\\copilot-remote\\config.json',
     pathImpl: path.win32,
   });
-  assert.match(script, /title Copilot Remote Web Relay/);
+  assert.match(script, /title OAR Web Relay/);
   assert.match(
     script,
     /set "COPILOT_WEB_RELAY_CONFIG=C:\\Users\\Example\\AppData\\Local\\copilot-remote\\config\.json"/,
@@ -123,4 +124,27 @@ test('non-Windows state is unsupported and mutation is rejected', () => {
     platform: 'linux',
   });
   assert.throws(() => service.setEnabled(true), /only available on Windows/);
+});
+
+test('a pre-rebrand entry still reads as enabled and converges on the new name', () => {
+  const context = createTestContext();
+  try {
+    const legacyPath = path.join(context.startupDirectory, LEGACY_WINDOWS_AUTOSTART_FILENAME);
+    fs.mkdirSync(context.startupDirectory, { recursive: true });
+    fs.writeFileSync(legacyPath, '@echo off\r\n');
+    assert.equal(context.service.getState().enabled, true, 'the old file starts a relay too');
+
+    const enabled = context.service.setEnabled(true);
+    assert.equal(enabled.enabled, true);
+    assert.equal(fs.existsSync(legacyPath), false, 'legacy name removed on enable');
+    assert.equal(fs.existsSync(context.entryPath), true);
+
+    fs.writeFileSync(legacyPath, '@echo off\r\n');
+    const disabled = context.service.setEnabled(false);
+    assert.equal(disabled.enabled, false);
+    assert.equal(fs.existsSync(legacyPath), false, 'disable sweeps both names');
+    assert.equal(fs.existsSync(context.entryPath), false);
+  } finally {
+    context.cleanup();
+  }
 });

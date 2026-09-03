@@ -69,7 +69,8 @@ function ensureOpenAISettingsInputTracking() {
   }
 }
 let windowsAutostartUpdateInFlight = false;
-let windowsAutostartEnabled = false;
+let windowsAutostartState = null;
+let windowsAutostartPollTimer = null;
 
 // Mirrors shared/turn-ceiling.mjs, which the browser cannot import — only
 // server/public is served. The authoritative bounds come from the API response;
@@ -1250,15 +1251,79 @@ export async function removeOpenAISettings() {
   }
 }
 
+function windowsAutostartStatusText() {
+  const boot = windowsAutostartState?.boot;
+  if (boot?.pendingElevation) {
+    return 'Confirm the admin prompt on the PC… (it only appears on the physical desktop)';
+  }
+  if (boot?.lastError) return boot.lastError;
+  if (windowsAutostartState?.mode === 'boot' && windowsAutostartState?.signinEnabled) {
+    return 'A sign-in Startup entry also exists and can double-start the relay. Re-select "At system startup" to clean it up.';
+  }
+  if (boot?.taskStatus === 'foreign') {
+    return `A task named "${boot.taskName}" exists but was not created by OAR. Selecting "At system startup" replaces it.`;
+  }
+  if (boot?.legacyTaskPresent && windowsAutostartState?.mode !== 'boot') {
+    return 'A pre-rebrand boot task exists. Selecting "At system startup" migrates it (one admin confirmation).';
+  }
+  return '';
+}
+
 function syncWindowsAutostartSetting() {
   const container = document.getElementById('windows-autostart-setting');
-  const checkbox = document.getElementById('windows-autostart-toggle');
   const supported = serverPlatform === 'win32';
   if (container) container.hidden = !supported;
-  if (checkbox instanceof HTMLInputElement) {
-    checkbox.checked = windowsAutostartEnabled;
-    checkbox.disabled = !supported || windowsAutostartUpdateInFlight;
+  const mode = windowsAutostartState?.mode || 'off';
+  const pending = !!windowsAutostartState?.boot?.pendingElevation;
+  for (const radio of document.querySelectorAll('input[name="windows-autostart-mode"]')) {
+    radio.checked = radio.value === mode;
+    radio.disabled = !supported || windowsAutostartUpdateInFlight || pending;
   }
+  const status = document.getElementById('windows-autostart-status');
+  if (status) {
+    const text = windowsAutostartStatusText();
+    status.hidden = !text;
+    status.textContent = text;
+  }
+  const manual = document.getElementById('windows-autostart-manual');
+  const manualCommand = document.getElementById('windows-autostart-manual-command');
+  const showManual = !!windowsAutostartState?.boot?.lastError && !!windowsAutostartState?.boot?.manualCommand;
+  if (manual) manual.hidden = !showManual;
+  if (manualCommand && showManual) manualCommand.textContent = windowsAutostartState.boot.manualCommand;
+}
+
+function stopWindowsAutostartPoll() {
+  if (windowsAutostartPollTimer) {
+    clearTimeout(windowsAutostartPollTimer);
+    windowsAutostartPollTimer = null;
+  }
+}
+
+/**
+ * The UAC prompt renders on the PC's own desktop, so a remote browser can
+ * only wait: poll until the elevation resolves either way, bounded to the
+ * service's own 120s timeout.
+ */
+function pollWindowsAutostartWhilePending(deadline) {
+  stopWindowsAutostartPoll();
+  if (!windowsAutostartState?.boot?.pendingElevation || Date.now() > deadline) return;
+  windowsAutostartPollTimer = setTimeout(async () => {
+    try {
+      windowsAutostartState = await loadWindowsAutostartSetting();
+    } catch {
+      // transient; the next tick retries
+    }
+    syncWindowsAutostartSetting();
+    if (windowsAutostartState?.boot?.pendingElevation) {
+      pollWindowsAutostartWhilePending(deadline);
+    } else if (!windowsAutostartState?.boot?.lastError) {
+      showTransientRelayNotice(
+        windowsAutostartState?.mode === 'boot'
+          ? 'System-startup autostart enabled.'
+          : 'Boot task removed.',
+      );
+    }
+  }, 2_000);
 }
 
 export async function refreshWindowsAutostartSetting() {
@@ -1272,16 +1337,19 @@ export async function refreshWindowsAutostartSetting() {
       alert('Failed to read the Windows autostart setting.');
       return;
     }
-    windowsAutostartEnabled = !!result.enabled;
+    windowsAutostartState = result;
   } catch (error) {
     alert(error?.message || 'Failed to read the Windows autostart setting.');
   } finally {
     windowsAutostartUpdateInFlight = false;
     syncWindowsAutostartSetting();
+    if (windowsAutostartState?.boot?.pendingElevation) {
+      pollWindowsAutostartWhilePending(Date.now() + 120_000);
+    }
   }
 }
 
-export async function updateWindowsAutostartSettingFromToggle(enabled) {
+export async function updateWindowsAutostartMode(mode) {
   if (serverPlatform !== 'win32' || windowsAutostartUpdateInFlight) {
     syncWindowsAutostartSetting();
     return;
@@ -1289,17 +1357,21 @@ export async function updateWindowsAutostartSettingFromToggle(enabled) {
   windowsAutostartUpdateInFlight = true;
   syncWindowsAutostartSetting();
   try {
-    const result = await updateWindowsAutostartSetting(!!enabled);
+    const result = await updateWindowsAutostartSetting(String(mode));
     if (!result?.supported) {
       alert('Failed to update the Windows autostart setting.');
       return;
     }
-    windowsAutostartEnabled = !!result.enabled;
-    showTransientRelayNotice(
-      windowsAutostartEnabled
-        ? 'Windows autostart enabled.'
-        : 'Windows autostart disabled.',
-    );
+    windowsAutostartState = result;
+    if (result?.boot?.pendingElevation) {
+      pollWindowsAutostartWhilePending(Date.now() + 120_000);
+    } else if (!result?.boot?.lastError) {
+      showTransientRelayNotice(
+        result.mode === 'signin' ? 'Sign-in autostart enabled.'
+          : result.mode === 'off' ? 'Windows autostart disabled.'
+            : 'Windows autostart updated.',
+      );
+    }
   } catch (error) {
     alert(error?.message || 'Failed to update the Windows autostart setting.');
   } finally {
