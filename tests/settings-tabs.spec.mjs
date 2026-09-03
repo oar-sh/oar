@@ -23,7 +23,11 @@ const LEGACY_SETTINGS_IDS = [
   "background-task-timeout-value",
   "background-task-timeout-slider",
   "windows-autostart-setting",
-  "windows-autostart-toggle",
+  // The autostart checkbox became a radio group (name="windows-autostart-mode",
+  // no per-radio IDs) plus these status/fallback elements in e5a9579.
+  "windows-autostart-status",
+  "windows-autostart-manual",
+  "windows-autostart-manual-command",
   "pwa-app-name-input",
   "default-session-workspace-root-input",
   // Providers → OpenAI
