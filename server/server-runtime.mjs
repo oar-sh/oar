@@ -71,6 +71,7 @@ import { createClaudeSessionRootResolver } from './services/claude-session-root-
 import { createCursorSessionRootResolver } from './services/cursor-session-root-service.mjs';
 import { createGitChangesService } from './services/git-changes-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
+import { resolveDataDir } from './services/data-dir-resolution.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
 import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
@@ -147,9 +148,10 @@ const ttyConsoleRuntime = await maybeStartTtyConsole({
 const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
   ? path.resolve(String(process.env.COPILOT_WEB_RELAY_CONFIG))
   : path.join(__dirname, 'config.json');
-const DATA_DIR       = process.env.COPILOT_WEB_RELAY_DATA_DIR
-  ? path.resolve(String(process.env.COPILOT_WEB_RELAY_DATA_DIR))
-  : path.join(__dirname, 'data');
+// env var > config.json `dataDir` > <server>/data — see data-dir-resolution.mjs
+// for why the config can carry it (a dev checkout pointing at a release
+// install's data, and autostart launchers that only pin the config path).
+const DATA_DIR = resolveDataDir({ env: process.env, configPath: CONFIG_PATH, serverDir: __dirname });
 const DB_PATH        = path.join(DATA_DIR, 'copilot.db');
 const RELAY_LOCK_PATH = path.join(DATA_DIR, 'relay-server.lock');
 const UPLOAD_DIR     = process.env.COPILOT_WEB_RELAY_DATA_DIR
