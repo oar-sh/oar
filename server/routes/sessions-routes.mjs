@@ -1273,7 +1273,7 @@ export function buildSessionWorkerStatusPayload({
   return {
     enabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
     continuationRoutingEnabled: featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true,
-    fallbackRestartEnabled: false,
+    fallbackRestartEnabled: featureFlags?.SESSION_WORKER_FALLBACK_RESTART_ENABLED === true,
     uiState: normalizeWorkerStatusText(snapshot?.health?.uiState, 'white'),
     degradedReason: normalizeWorkerStatusText(snapshot?.health?.degradedReason, null),
     health: snapshot?.health && typeof snapshot.health === 'object' ? snapshot.health : null,
@@ -2057,6 +2057,8 @@ export function registerSessionsRoutes(app, deps) {
     resolveCursorSessionRoot = null,
     getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
+    getFeatureFlagsSettingsState = () => [],
+    setFeatureFlagSetting = () => ({ ok: false, error: 'Feature settings are unavailable' }),
     getBackgroundTaskTimeoutMinutes = () => DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     setBackgroundTaskTimeoutMinutes = () => ({ ok: false, error: 'Background task timeout settings are unavailable' }),
     markSharedViewerPresence,
@@ -5614,6 +5616,31 @@ export function registerSessionsRoutes(app, deps) {
       stepMinutes: BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
       defaultMinutes: DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     });
+  });
+
+  const featureFlagsSettingsPayload = () => {
+    const flags = getFeatureFlagsSettingsState();
+    return {
+      flags,
+      restartRequired: flags.some((flag) => flag.restartRequired === true),
+    };
+  };
+
+  app.get('/api/settings/features', auth, (_req, res) => {
+    res.json(featureFlagsSettingsPayload());
+  });
+
+  app.post('/api/settings/features', auth, (req, res) => {
+    const name = String(req.body?.name || '').trim();
+    const enabled = req.body?.enabled;
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be a boolean' });
+    const result = setFeatureFlagSetting(name, enabled);
+    if (!result.ok) {
+      const status = result.error === 'Unknown feature flag' ? 400 : 500;
+      return res.status(status).json({ error: result.error });
+    }
+    return res.json(featureFlagsSettingsPayload());
   });
 
   /**

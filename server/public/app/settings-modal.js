@@ -29,6 +29,9 @@ import {
   updateTurnCeilingSetting as requestTurnCeilingSetting,
   loadBackgroundTaskTimeoutSetting,
   updateBackgroundTaskTimeoutSetting as requestBackgroundTaskTimeoutSetting,
+  loadFeatureFlagSettings,
+  updateFeatureFlagSetting as requestFeatureFlagSetting,
+  requestRelayRestart,
 } from './api-client.js';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
@@ -1380,6 +1383,131 @@ export async function updateWindowsAutostartMode(mode) {
   }
 }
 
+// ─── Features tab ─────────────────────────────────────────────────────────────
+// Flags are resolved once at relay boot; the rows here render entirely from the
+// server's registry payload (labels and descriptions live in server/features.mjs),
+// and the restart notice appears whenever a stored value differs from the
+// running snapshot. Rows are dynamic, so listeners are attached during render
+// instead of via inline onchange globals.
+
+let featureFlagsState = null;
+let featureFlagsUpdateInFlight = false;
+let featuresRestartButtonBound = false;
+
+function featureToggleId(name) {
+  return `feature-toggle-${String(name || '').toLowerCase()}`;
+}
+
+function syncFeatureFlagsSection() {
+  const list = document.getElementById('features-flag-list');
+  if (!list) return;
+  list.textContent = '';
+  const flags = Array.isArray(featureFlagsState?.flags) ? featureFlagsState.flags : [];
+  for (const flag of flags) {
+    const row = document.createElement('div');
+    row.className = 'settings-row';
+    row.style.marginTop = '12px';
+    row.style.marginBottom = '0';
+
+    const label = document.createElement('label');
+    label.htmlFor = featureToggleId(flag.name);
+    label.textContent = flag.label || flag.name;
+    row.appendChild(label);
+
+    const checkbox = document.createElement('input');
+    checkbox.id = featureToggleId(flag.name);
+    checkbox.type = 'checkbox';
+    checkbox.checked = flag.effectiveNext === true;
+    checkbox.disabled = featureFlagsUpdateInFlight || flag.envOverride !== null;
+    checkbox.setAttribute('aria-label', flag.label || flag.name);
+    checkbox.addEventListener('change', () => {
+      void updateFeatureFlagFromToggle(flag.name, checkbox.checked);
+    });
+    row.appendChild(checkbox);
+    list.appendChild(row);
+
+    const help = document.createElement('div');
+    help.className = 'settings-help';
+    help.style.marginTop = '6px';
+    let text = String(flag.description || '');
+    if (flag.envOverride !== null) {
+      text += ` Pinned ${flag.envOverride ? 'on' : 'off'} by COPILOT_REMOTE_${flag.name} in the relay's environment; the toggle is locked while that variable is set.`;
+    }
+    if (flag.restartRequired) {
+      text += ' Restart pending: the saved value takes effect after the relay restarts.';
+    }
+    help.textContent = text;
+    list.appendChild(help);
+  }
+
+  const notice = document.getElementById('features-restart-notice');
+  if (notice) notice.hidden = featureFlagsState?.restartRequired !== true;
+  const restartBtn = document.getElementById('features-restart-btn');
+  if (restartBtn) {
+    restartBtn.disabled = featureFlagsUpdateInFlight;
+    if (!featuresRestartButtonBound) {
+      featuresRestartButtonBound = true;
+      restartBtn.addEventListener('click', () => { void restartRelayForFeatureFlags(); });
+    }
+  }
+}
+
+function setFeaturesSettingsStatus(text) {
+  const status = document.getElementById('features-settings-status');
+  if (!status) return;
+  status.hidden = !text;
+  status.textContent = text || '';
+}
+
+export async function refreshFeatureFlagsSection() {
+  syncFeatureFlagsSection();
+  const result = await loadFeatureFlagSettings();
+  if (!result || !Array.isArray(result.flags)) {
+    setFeaturesSettingsStatus('Failed to load feature flags from the relay.');
+    return;
+  }
+  featureFlagsState = result;
+  setFeaturesSettingsStatus('');
+  syncFeatureFlagsSection();
+}
+
+async function updateFeatureFlagFromToggle(name, enabled) {
+  if (featureFlagsUpdateInFlight) {
+    syncFeatureFlagsSection();
+    return;
+  }
+  featureFlagsUpdateInFlight = true;
+  syncFeatureFlagsSection();
+  try {
+    const result = await requestFeatureFlagSetting(name, enabled);
+    if (!result || !Array.isArray(result.flags)) {
+      alert('Failed to update the feature flag.');
+      return;
+    }
+    featureFlagsState = result;
+  } finally {
+    featureFlagsUpdateInFlight = false;
+    syncFeatureFlagsSection();
+  }
+}
+
+async function restartRelayForFeatureFlags() {
+  if (featureFlagsUpdateInFlight) return;
+  featureFlagsUpdateInFlight = true;
+  syncFeatureFlagsSection();
+  try {
+    const result = await requestRelayRestart({ reason: 'feature-flags-changed' });
+    if (!result) {
+      alert('Failed to request a relay restart. Restarts can only be requested from the relay host itself.');
+      return;
+    }
+    showTransientRelayNotice('Relay restart requested. It will restart once the queue is idle.');
+  } finally {
+    featureFlagsUpdateInFlight = false;
+    syncFeatureFlagsSection();
+  }
+}
+
 function readShowSuspendHostSetting() {
   const stored = String(readLocalStorage(SHOW_SUSPEND_HOST_STORAGE_KEY) || '').trim().toLowerCase();
   if (!stored) return true;
@@ -1545,6 +1673,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshBackgroundTaskTimeoutSetting();
   void refreshPushSettingsSection();
   void refreshPreviewsSection();
+  void refreshFeatureFlagsSection();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }

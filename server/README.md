@@ -523,25 +523,36 @@ cards with a reply box.
 The active conversation header includes a `✍️` button for renaming the conversation inline.
 Title edits are saved to the database and broadcast to other open clients immediately.
 
-## Session worker rollout flags
+## Feature flags
 
-Session-worker refactor gates are OFF by default and can be enabled per flag:
+Feature flags are declared in one registry (`server/features.mjs`) and managed
+from the web UI's Settings → Features tab, which renders each flag with its
+user-facing description. Current flags and defaults:
 
-- `SESSION_WORKER_ROUTING_ENABLED`
-- `SESSION_WORKER_CONTINUATION_ROUTING_ENABLED`
-- `SESSION_WORKER_FALLBACK_RESTART_ENABLED`
+- `SESSION_WORKER_ROUTING_ENABLED` — ON by default; per-conversation worker
+  processes with ownership and crash recovery (off = legacy shared polling).
+- `SESSION_WORKER_CONTINUATION_ROUTING_ENABLED` — ON by default; strict
+  ownership validation when routing clarification answers back to the asking
+  worker.
+- `SESSION_WORKER_FALLBACK_RESTART_ENABLED` — OFF by default; reserved rollout
+  gate, no effect yet.
+- `IMAGE_CONVERSATION_CONTINUITY_ENABLED` — ON by default; keeps
+  generated-image context across turns so *Edit this image* can continue from
+  the right source image.
 
-Other flags:
+Resolution happens once at relay startup, with this precedence:
 
-- `IMAGE_CONVERSATION_CONTINUITY_ENABLED` — ON by default; keeps generated-image context across turns
-  so *Edit this image* can continue from the right source image.
+1. Registry defaults
+2. Stored settings (`app_settings` rows, written by the Features tab via
+   `GET/POST /api/settings/features`)
+3. Environment override: `COPILOT_REMOTE_{FLAG_NAME}` (`true/false`, `1/0`,
+   `yes/no`, `on/off`)
 
-Configuration precedence is:
-
-1. `server/config.json` → `features.{FLAG_NAME}` (`true/false`, `1/0`, `yes/no`, `on/off`)
-2. Environment override: `COPILOT_REMOTE_{FLAG_NAME}`
-
-Unknown flag names and invalid values are ignored safely.
+Changes saved in the Features tab take effect after a relay restart; the tab
+shows a restart notice and offers the queue-idle-deferred restart. A legacy
+`features` key in `config.json` is migrated into `app_settings` once at boot
+and stripped from the file. Unknown flag names and invalid values are ignored
+safely.
 
 Question bridge rule:
 

@@ -443,6 +443,17 @@ export async function updateBackgroundTaskTimeoutSetting(timeoutMinutes) {
   });
 }
 
+export async function loadFeatureFlagSettings() {
+  return apiFetch('/api/settings/features');
+}
+
+export async function updateFeatureFlagSetting(name, enabled) {
+  return apiFetch('/api/settings/features', {
+    method: 'POST',
+    body: JSON.stringify({ name: String(name || ''), enabled: enabled === true }),
+  });
+}
+
 export async function launchSessionWorker(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return null;

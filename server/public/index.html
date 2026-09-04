@@ -5002,6 +5002,16 @@
         tabindex="-1"
         data-settings-tab="notifications"
       >Notifications</button>
+      <button
+        id="settings-tab-features"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-features"
+        tabindex="-1"
+        data-settings-tab="features"
+      >Features</button>
     </div>
     <div class="summary-body" style="padding: 16px;">
       <div
@@ -5626,6 +5636,23 @@
           <div id="push-device-list" style="width: 100%;"></div>
           <div class="settings-help">Notifications are only sent while no device has the app in the foreground. Content defaults to generic text; message previews are opt-in per device.</div>
         </div>
+      </div>
+      <div
+        id="settings-panel-features"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-features"
+        data-settings-panel="features"
+        hidden
+      >
+        <div class="settings-help" style="margin-top: 12px;">Feature flags are applied when the relay starts. Changes here are saved immediately, but only take effect after the relay restarts.</div>
+        <div id="features-flag-list"></div>
+        <div id="features-restart-notice" class="settings-help" style="margin-top: 12px;" hidden>
+          Saved changes differ from the running relay.
+          <button id="features-restart-btn" type="button" style="margin-left: 8px;">Restart relay</button>
+        </div>
+        <div id="features-settings-status" class="settings-help" style="margin-top: 12px;" hidden></div>
       </div>
     </div>
   </div>

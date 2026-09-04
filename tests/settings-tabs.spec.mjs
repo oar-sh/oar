@@ -87,9 +87,15 @@ const LEGACY_SETTINGS_IDS = [
   "push-event-board-toggle",
   "push-event-cli-offline-toggle",
   "push-device-list",
+  // Features
+  "settings-panel-features",
+  "features-flag-list",
+  "features-restart-notice",
+  "features-restart-btn",
+  "features-settings-status",
 ];
 
-const TABS = ["general", "providers", "previews", "notifications"];
+const TABS = ["general", "providers", "previews", "notifications", "features"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
 const PROVIDER_TABS = ["copilot", "openai", "claude", "grok", "cursor"];
@@ -140,7 +146,7 @@ async function expectActiveProviderTab(page, providerTab) {
 }
 
 test.describe("tabbed settings modal", () => {
-  test("renders four top-level tabs with one panel visible at a time", async ({ page }) => {
+  test("renders five top-level tabs with one panel visible at a time", async ({ page }) => {
     await loadApp(page);
     await openSettings(page, "general");
 

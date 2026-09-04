@@ -188,17 +188,22 @@ export function buildRelayServerEnv({
     COPILOT_WORKSPACE_ROOT: repoRoot,
     COPILOT_WEB_RELAY_DATA_DIR: dataDir,
     COPILOT_WEB_RELAY_CONFIG: path.join(stateRoot, "config.json"),
-    // Pin session-worker routing OFF rather than inheriting whatever the host's
-    // live config enables (features.mjs reads the config file
-    // COPILOT_WEB_RELAY_CONFIG points at, but an explicit pin keeps specs
-    // deterministic even so). Routing-on cannot work for queue specs here:
-    // owned rows are only released to a live worker lifecycle, and this server
-    // runs with CLI spawn disabled, so every owned dequeue would block on
-    // "spawn-failed". The routing queue logic itself is covered by the
-    // route-level suites (messages-routes-session-worker*.test.mjs); the spec
-    // helpers still send x-relay-session-id whenever a queue response carries an
-    // ownerSessionId, so a future routed harness works without spec changes.
+    // Pin session-worker routing OFF. Feature flags now live in app_settings
+    // (this server's database is isolated and empty, so registry defaults —
+    // routing ON — would apply), and the env override is the layer that wins
+    // over both. Routing-on cannot work for queue specs here: owned rows are
+    // only released to a live worker lifecycle, and this server runs with CLI
+    // spawn disabled, so every owned dequeue would block on "spawn-failed".
+    // The routing queue logic itself is covered by the route-level suites
+    // (messages-routes-session-worker*.test.mjs); the spec helpers still send
+    // x-relay-session-id whenever a queue response carries an ownerSessionId,
+    // so a future routed harness works without spec changes.
     COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "0",
+    // Pinned so the flag's default flip (off -> on) can't change e2e behavior
+    // wholesale: continuation routing adds strict ownership rejections on
+    // clarification answers, and a spec that wants them should un-pin this
+    // deliberately rather than inherit them by default.
+    COPILOT_REMOTE_SESSION_WORKER_CONTINUATION_ROUTING_ENABLED: "0",
     // Pinned for the same reason routing is: without it the relay derives the
     // path from whatever Copilot CLI the host happens to have installed, and the
     // Copilot engine setting would refuse (or accept) differently per machine.

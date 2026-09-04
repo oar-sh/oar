@@ -100,7 +100,13 @@ import {
   resolveLaunchWorkspaceRootPath,
 } from './services/workspace-root-defaults-service.mjs';
 import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
-import { FEATURES, normalizeFeatureFlags } from './features.mjs';
+import {
+  computeFeatureFlagState,
+  FEATURE_REGISTRY,
+  featureSettingKey,
+  migrateLegacyConfigFeatures,
+  resolveBootFeatureFlags,
+} from './features.mjs';
 import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS, questionExpiresAt } from '../shared/question-timeout.mjs';
 import {
@@ -1864,6 +1870,31 @@ function setTurnCeilingMinutes(value) {
   return { ok: true, ceilingMinutes: parsed.minutes };
 }
 
+function getFeatureFlagsSettingsState() {
+  // `featureFlags` is const-declared later in boot; this only runs from request
+  // handlers, well after the snapshot exists (same shape as setCopilotProviderSettings).
+  return computeFeatureFlagState({
+    readSetting: readAppSettingValue,
+    env: process.env,
+    activeFlags: featureFlags,
+  });
+}
+
+function setFeatureFlagSetting(name, enabled) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Feature settings are unavailable' };
+  }
+  const normalized = String(name || '').trim();
+  if (!FEATURE_REGISTRY.some((entry) => entry.name === normalized)) {
+    return { ok: false, error: 'Unknown feature flag' };
+  }
+  if (typeof enabled !== 'boolean') {
+    return { ok: false, error: 'enabled must be a boolean' };
+  }
+  stmts.upsertAppSetting.run(featureSettingKey(normalized), enabled ? '1' : '0', new Date().toISOString());
+  return { ok: true };
+}
+
 const BACKGROUND_TASK_TIMEOUT_SETTING_KEY = 'background_task_timeout_minutes';
 
 function getBackgroundTaskTimeoutMinutes() {
@@ -3506,7 +3537,16 @@ const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   diagnosticPlanReference: () => path.join(currentWorkspaceRootPath(), '.cursor', 'plans', 'worker-startup-monitoring-plan.md'),
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
 });
-const featureFlags = normalizeFeatureFlags(FEATURES);
+// Feature flags moved from config.json into app_settings; adopt any legacy
+// `features` key once, then resolve the boot snapshot (defaults < stored rows
+// < COPILOT_REMOTE_* env). The snapshot is frozen for the process lifetime —
+// the Features settings tab persists changes and asks for a relay restart.
+migrateLegacyConfigFeatures({
+  configPath: CONFIG_PATH,
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+});
+const featureFlags = resolveBootFeatureFlags({ readSetting: readAppSettingValue });
 
 async function stopSessionWorkerForProviderRebind(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
@@ -6790,6 +6830,8 @@ const sharedRouteDeps = {
   setTurnCeilingMinutes,
   getBackgroundTaskTimeoutMinutes,
   setBackgroundTaskTimeoutMinutes,
+  getFeatureFlagsSettingsState,
+  setFeatureFlagSetting,
   requestRelayShutdown,
   markSharedViewerPresence,
   getSharedWatcherCount,
