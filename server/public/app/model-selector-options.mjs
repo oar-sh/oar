@@ -63,10 +63,21 @@ export function normalizeModelSelectorOptions(models = [], {
     );
     return labelOrder || left.localeCompare(right);
   });
-  return [
+  const options = [
     { value: normalizedAuto, label: String(labelFor(normalizedAuto) || normalizedAuto) },
     ...values.map((value) => ({ value, label: String(labelFor(value) || value) })),
   ];
+  // Date-stripping in humanizeModelLabel can collapse an alias and its dated
+  // snapshot ("claude-fable-5-1" + "claude-fable-5-1-20251103") into the same
+  // label; two indistinguishable rows are worse than one ugly one, so
+  // colliding labels fall back to the raw id.
+  const labelCounts = new Map();
+  for (const option of options) {
+    labelCounts.set(option.label, (labelCounts.get(option.label) || 0) + 1);
+  }
+  return options.map((option) => (
+    labelCounts.get(option.label) > 1 ? { ...option, label: option.value } : option
+  ));
 }
 
 export function modelSelectorOptionsEqual(currentOptions = [], nextOptions = []) {

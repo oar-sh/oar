@@ -132,6 +132,7 @@ import {
   mergeClaudeModelEfforts,
   mergeDiscoveredClaudeModels,
 } from '../shared/claude-model-catalog.mjs';
+import { humanizeModelLabel } from './public/app/model-selector-options.mjs';
 import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../shared/claude-thinking.mjs';
 import {
@@ -2297,43 +2298,12 @@ function modelProviderForId(modelId) {
   return 'other';
 }
 
-function titleCaseWord(word) {
-  const text = String(word || '').trim();
-  if (!text) return '';
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
+// Single source of truth with the composer's labels: the server-built variant
+// labels are preferred by the client, so a second formatter here would drift
+// (it did — "Claude Sonnet 4.6" in the catalog modal vs "Sonnet 4.6" in the
+// composer). The module is pure browser-neutral ESM.
 function modelDisplayLabel(modelId) {
-  const text = String(modelId || '').trim();
-  if (!text) return '';
-  if (/^gpt-/i.test(text)) {
-    return text
-      .replace(/^gpt-/i, 'GPT-')
-      .replace(/-codex$/i, ' Codex')
-      .replace(/-mini$/i, ' Mini')
-      .replace(/\bmini\b/gi, 'Mini')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-  if (/^claude-/i.test(text)) {
-    return text
-      .replace(/^claude-/i, 'Claude ')
-      .split('-')
-      .map((part) => (/^\d+(\.\d+)?$/.test(part) ? part : titleCaseWord(part)))
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-  if (/^gemini-/i.test(text)) {
-    return text
-      .replace(/^gemini-/i, 'Gemini ')
-      .split('-')
-      .map((part) => (/^\d+(\.\d+)?$/.test(part) ? part : titleCaseWord(part)))
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-  return text;
+  return humanizeModelLabel(modelId);
 }
 
 function buildModelVariantId(baseModelId, reasoningEffort = null) {

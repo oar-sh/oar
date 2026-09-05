@@ -48,3 +48,14 @@ test('non-claude labels keep their family prefixes', () => {
   assert.equal(humanizeModelLabel('grok-4'), 'grok-4', 'unknown families pass through untouched');
   assert.equal(humanizeModelLabel(''), '');
 });
+
+test('colliding labels (alias + dated snapshot) fall back to raw ids', () => {
+  const options = normalizeModelSelectorOptions(
+    ['claude-fable-5-1', 'claude-fable-5-1-20251103', 'claude-sonnet-5'],
+    { labelFor: humanizeModelLabel },
+  );
+  const byValue = Object.fromEntries(options.map((option) => [option.value, option.label]));
+  assert.equal(byValue['claude-fable-5-1'], 'claude-fable-5-1', 'ambiguous label degrades to the id');
+  assert.equal(byValue['claude-fable-5-1-20251103'], 'claude-fable-5-1-20251103');
+  assert.equal(byValue['claude-sonnet-5'], 'Sonnet 5', 'unambiguous labels keep the compact form');
+});
