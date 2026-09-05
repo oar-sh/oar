@@ -48,6 +48,7 @@ import {
   SHARED_CONVERSATION_TOKEN,
   getConversationWatcherCount,
   generateId,
+  imageEditTarget,
 } from './store.js';
 import {
   verifyExistingSession,
@@ -122,6 +123,7 @@ import {
   resolveConversationComposerSelection,
 } from './conversation-preferences.mjs';
 import {
+  composerPlaceholderFor,
   humanizeModelLabel,
   modelSelectorOptionsEqual,
   normalizeModelSelectorOptions,
@@ -1318,6 +1320,25 @@ function activeComposerProviderType() {
   ).trim().toLowerCase();
 }
 
+/**
+ * Keeps "Message <who>…" in step with the current model selection. The two
+ * standing overrides win: the shared read-only text owns the field for the
+ * whole session, and an active image-edit target owns it until cleared
+ * (clearImageEditTarget calls back in through the window global).
+ */
+function syncComposerPlaceholder() {
+  const input = document.getElementById('msg-input');
+  if (!input) return;
+  if (isSharedReaderMode()) return;
+  if (imageEditTarget) return;
+  const rawValue = String(document.getElementById('model-select')?.value || '');
+  const { baseModelId } = splitVariantId(rawValue);
+  input.placeholder = composerPlaceholderFor({
+    modelId: baseModelId || rawValue,
+    providerType: normalizeModelSelectorProviderType(activeComposerProviderType()),
+  });
+}
+
 function normalizeModelSelectorProviderType(providerType = '') {
   const normalized = String(providerType || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
@@ -1656,6 +1677,10 @@ function updateModelCatalogState(payload) {
 
   syncModelMetadataBlocker();
   syncAutoModelAvailability();
+  // After syncAutoModelAvailability: it can rewrite select.value (auto
+  // fallback, runtime-lock pin) and the placeholder must describe the final
+  // selection, not the transient one.
+  syncComposerPlaceholder();
   // The rebuilt catalog may now contain the conversation's preferred model for
   // the first time (provider models arrive after the initial catalog load).
   if (currentConvId) applyConversationPreferencesForConversation(currentConvId);
@@ -1903,6 +1928,7 @@ function applyConversationPreferences({
       String(preferredReasoningEffort || '').trim().toLowerCase(),
     );
     updateContextTierSelector(selection.model || modelSelect.value);
+    syncComposerPlaceholder();
     const tierSelect = document.getElementById('context-tier-select');
     const desiredTier = String(preferredContextTier || 'default').trim().toLowerCase();
     if (tierSelect && Array.from(tierSelect.options).some((option) => option.value === desiredTier)) {
@@ -1976,6 +2002,8 @@ function initModelSelector() {
       if (suppressConversationPreferenceSync) return;
       if (currentConversationHasMessages() && select.value.toLowerCase() === AUTO_MODEL_OPTION) {
         syncAutoModelAvailability();
+        // The revert rewrites select.value; keep the placeholder describing it.
+        syncComposerPlaceholder();
         setModelBanner('⚠️ Auto model selection is available only for a new conversation.');
         return;
       }
@@ -1989,6 +2017,7 @@ function initModelSelector() {
         { persist: true },
       );
       updateContextTierSelector(select.value);
+      syncComposerPlaceholder();
       syncSessionLockNote({ pinnedModel: currentRuntimeModelLock()?.model || '' });
       refreshComposerAttachmentWarning();
       void persistCurrentConversationPreferences().catch(() => {});
@@ -4300,6 +4329,7 @@ window.submitRelayBoardAction = submitRelayBoardAction;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
 window.syncComposerControlState = syncComposerControlState;
+window.syncComposerPlaceholder = syncComposerPlaceholder;
 window.persistComposerAttachments = persistComposerAttachments;
 window.appendMessage = appendMessage;
 window.loadOlderConversationMessages = loadOlderConversationMessages;

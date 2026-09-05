@@ -1,4 +1,32 @@
 /**
+ * The composer placeholder, decided by the MODEL FAMILY of the current
+ * selection (Simon's rule: the hint names who answers, whatever runtime serves
+ * it — claude-* through Cursor's catalog still reads "Message Claude…").
+ * Provider only breaks ties: Auto/empty follows the conversation's bound
+ * provider, unknown families on the OpenAI BYOK provider read OpenAI, and
+ * everything else falls back to the historical Copilot text.
+ */
+export function composerPlaceholderFor({ modelId = '', providerType = '' } = {}) {
+  const provider = String(providerType || '').trim().toLowerCase();
+  const id = String(modelId || '').trim().toLowerCase().replace(/\[[^\]]*\]$/, '');
+  const providerFallback = () => {
+    if (provider === 'claude') return 'Message Claude…';
+    if (provider === 'grok') return 'Message Grok…';
+    if (provider === 'openai' || provider === 'openai-byok') return 'Message OpenAI…';
+    if (provider === 'cursor') return 'Message Cursor…';
+    return 'Message Copilot…';
+  };
+  if (!id || id === 'auto') return providerFallback();
+  if (id.startsWith('claude-')) return 'Message Claude…';
+  if (id.startsWith('grok-')) return 'Message Grok…';
+  if (id.startsWith('gpt-')) return 'Message GPT…';
+  if (id.startsWith('gemini-')) return 'Message Gemini…';
+  // Composer is Cursor's house model family.
+  if (id.startsWith('composer-')) return 'Message Cursor…';
+  return providerFallback();
+}
+
+/**
  * Human label for a model id, tuned to fit narrow composer selects.
  *
  * Claude ids drop the redundant "claude-" prefix (Opus/Sonnet/Haiku/Fable are

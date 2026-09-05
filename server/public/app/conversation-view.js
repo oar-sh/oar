@@ -192,8 +192,14 @@ export function setImageEditTarget(target) {
 export function clearImageEditTarget() {
   setStoredImageEditTarget(null);
   renderImageEditTarget();
-  const input = document.getElementById('msg-input');
-  if (input) input.placeholder = 'Message Copilot…';
+  // The placeholder is provider/model-aware; bootstrap owns the sync (window
+  // global to avoid a circular import) with the static text as fallback.
+  if (typeof window.syncComposerPlaceholder === 'function') {
+    window.syncComposerPlaceholder();
+  } else {
+    const input = document.getElementById('msg-input');
+    if (input) input.placeholder = 'Message Copilot…';
+  }
 }
 
 export function jumpToImageParent(messageId) {

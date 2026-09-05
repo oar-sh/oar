@@ -134,6 +134,8 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
     // against the rebuilt Cursor options, not the ones left over here.
     await startConversation(page, { provider: "github", model: "auto" });
     await expect(page.locator("#model-select")).toHaveValue("auto");
+    // Auto on an unlocked/Copilot chat keeps the historical placeholder.
+    await expect(page.locator("#msg-input")).toHaveAttribute("placeholder", "Message Copilot…");
 
     const conversationId = await startCursorGrokConversation(page);
     expect(bootstrapResponse?.selectedModel).toBe("grok-4.5");
@@ -143,6 +145,9 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
     await expect(page.locator("#new-conversation-model-modal")).not.toHaveClass(/visible/);
     await expect(page.locator("#model-select")).toHaveValue("grok-4.5");
     await expect(page.locator("#reasoning-effort-select")).toHaveValue("high");
+    // The placeholder follows the model family — grok-4.5 through the Cursor
+    // runtime still reads Grok (docs/plans/dynamic-composer-placeholder.md).
+    await expect(page.locator("#msg-input")).toHaveAttribute("placeholder", "Message Grok…");
 
     const stored = await request.get(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers });
     expect(stored.ok()).toBeTruthy();

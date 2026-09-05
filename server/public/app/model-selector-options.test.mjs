@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  composerPlaceholderFor,
   humanizeModelLabel,
   modelSelectorOptionsEqual,
   normalizeModelSelectorOptions,
@@ -58,4 +59,32 @@ test('colliding labels (alias + dated snapshot) fall back to raw ids', () => {
   assert.equal(byValue['claude-fable-5-1'], 'claude-fable-5-1', 'ambiguous label degrades to the id');
   assert.equal(byValue['claude-fable-5-1-20251103'], 'claude-fable-5-1-20251103');
   assert.equal(byValue['claude-sonnet-5'], 'Sonnet 5', 'unambiguous labels keep the compact form');
+});
+
+test('the composer placeholder follows the model family', () => {
+  const cases = [
+    ['claude-fable-5-1', '', 'Message Claude…'],
+    ['claude-sonnet-5', 'cursor', 'Message Claude…'],
+    ['grok-4.5', '', 'Message Grok…'],
+    ['gpt-5.4-mini', 'github', 'Message GPT…'],
+    ['gpt-5.6-luna', 'openai', 'Message GPT…'],
+    ['gemini-3.5-flash', 'github', 'Message Gemini…'],
+    ['composer-2.5', 'cursor', 'Message Cursor…'],
+    ['claude-opus-5[1m]', 'claude', 'Message Claude…'],
+  ];
+  for (const [modelId, providerType, expected] of cases) {
+    assert.equal(composerPlaceholderFor({ modelId, providerType }), expected, `${modelId} (${providerType})`);
+  }
+});
+
+test('Auto and unknown models fall back to the bound provider', () => {
+  assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'claude' }), 'Message Claude…');
+  assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'grok' }), 'Message Grok…');
+  assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'openai' }), 'Message OpenAI…');
+  assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'cursor' }), 'Message Cursor…');
+  assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'github' }), 'Message Copilot…');
+  assert.equal(composerPlaceholderFor({ modelId: '', providerType: '' }), 'Message Copilot…');
+  assert.equal(composerPlaceholderFor({ modelId: 'my-custom-endpoint-model', providerType: 'openai' }), 'Message OpenAI…');
+  assert.equal(composerPlaceholderFor({ modelId: 'my-custom-endpoint-model', providerType: 'github' }), 'Message Copilot…');
+  assert.equal(composerPlaceholderFor(), 'Message Copilot…');
 });
