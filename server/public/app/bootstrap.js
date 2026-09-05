@@ -166,7 +166,7 @@ import {
   initFullscreenButton,
   promptInstallApp,
   toggleFullscreen,
-  applyPwaManifestFromSettings,
+  adoptLegacyPwaAppName,
   registerPwaShell,
   updatePwaAppName,
 } from './pwa-install.js';
@@ -1314,6 +1314,9 @@ function clearModelMetadataHardFail() {
 async function startAppWithErrorHandling() {
   try {
     await initApp();
+    // Post-auth: move a legacy per-browser install app name to the relay so
+    // manifest fetches (Android WebAPK checks included) stop reverting it.
+    void adoptLegacyPwaAppName();
     return true;
   } catch (error) {
     console.error('[bootstrap] initApp failed', error);
@@ -4163,9 +4166,6 @@ async function bootstrap() {
     navigator.serviceWorker.getRegistrations()
       .then((registrations) => Promise.all(registrations.map((registration) => registration.unregister().catch(() => false))))
       .catch(() => {});
-  }
-  if (!sharedMode) {
-    await applyPwaManifestFromSettings();
   }
   if (!sharedMode) {
     registerPwaShell();

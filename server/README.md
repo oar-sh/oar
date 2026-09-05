@@ -194,8 +194,12 @@ When opened in a regular browser tab, the in-app **Install** button remains avai
 in the chat header (shown as `⬇` on small screens).
 
 You can rename the installed app label from **⚙️ Settings → Install app name**.
-The new label is stored per browser and used for future installs; some platforms may
-require reinstalling the app before the launcher label updates.
+The name is stored on the relay (app settings) and served in the web app manifest
+to every browser and origin (LAN and tunnel agree), so future installs pick it up
+immediately and already-installed Android apps receive it through Chrome's normal
+manifest-update flow — one confirmation prompt showing the new name, then the
+launcher label updates. A legacy per-browser name is adopted by the relay the
+first time that browser loads the app.
 
 You can also hide the **💤 Suspend host** action from **⚙️ Settings** with the
 **Show Suspend host action** checkbox. This only controls UI visibility; it does not

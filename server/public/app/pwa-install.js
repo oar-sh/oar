@@ -1,16 +1,21 @@
 import { BASE, IS_SHARED_VIEW, showTransientRelayNotice } from './store.js';
+import { loadPwaAppNameSetting, updatePwaAppNameSetting } from './api-client.js';
 
 const THEME_COLOR_BASE = '#0d1117';
 const THEME_COLOR_IMMERSIVE = '#161b22';
+// Legacy per-browser storage of the app name; kept only so adoptLegacyPwaAppName
+// can move an existing value to the server once. The name itself now lives in
+// app_settings and is served by /manifest.webmanifest.
 const PWA_APP_NAME_STORAGE_KEY = 'copilot_pwa_app_name';
-const PWA_APP_NAME_DEFAULT = 'OAR';
-const PWA_APP_NAME_MAX_LENGTH = 60;
 const INSTALLED_DISPLAY_MODE_QUERIES = ['(display-mode: standalone)', '(display-mode: fullscreen)'];
 
 let deferredInstallPrompt = null;
 let pendingInstalledFullscreenGesture = false;
-let manifestTemplateCache = null;
-let customManifestUrl = null;
+let pwaAppName = '';
+// Monotonic sequence so overlapping loads/saves resolve latest-wins: a stale
+// background GET must never repaint over a just-saved name, and a second edit
+// must never be dropped in favor of an older in-flight save.
+let pwaAppNameRequestSeq = 0;
 
 function matchesDisplayMode(query) {
   try {
@@ -298,152 +303,75 @@ export function initFullscreenButton() {
   updateFullscreenButton();
 }
 
-function normalizePwaAppName(rawValue, { allowEmpty = true } = {}) {
-  const normalized = String(rawValue || '').replace(/\s+/g, ' ').trim();
-  if (!normalized) {
-    return allowEmpty
-      ? { value: '', error: null }
-      : { value: '', error: 'App name cannot be empty.' };
-  }
-  if (normalized.length > PWA_APP_NAME_MAX_LENGTH) {
-    return { value: '', error: `App name must be ${PWA_APP_NAME_MAX_LENGTH} characters or fewer.` };
-  }
-  return { value: normalized, error: null };
-}
+// The app name is stored on the relay and baked into /manifest.webmanifest by
+// the server, so every manifest fetch — including Android's out-of-page WebAPK
+// update checks — sees the same name. The client only edits the setting.
 
-function derivePwaShortName(name) {
-  const text = String(name || '').trim();
-  if (!text) return 'Copilot';
-  const firstWord = text.split(/\s+/)[0] || text;
-  if (firstWord.length <= 12) return firstWord;
-  return text.slice(0, 12).trim() || 'Copilot';
-}
-
-function resolveManifestUrlValue(rawValue, baseHref) {
-  const value = String(rawValue || '').trim();
-  if (!value || value.startsWith('data:') || value.startsWith('blob:')) return value;
-  try {
-    return new URL(value, baseHref).href;
-  } catch {
-    return value;
-  }
-}
-
-function normalizeManifestForBlob(manifest, defaultHref) {
-  const baseHref = new URL(String(defaultHref || '').trim(), window.location.href).href;
-  const next = { ...(manifest || {}) };
-  next.id = resolveManifestUrlValue(next.id, baseHref);
-  next.start_url = resolveManifestUrlValue(next.start_url, baseHref);
-  next.scope = resolveManifestUrlValue(next.scope, baseHref);
-  if (Array.isArray(next.icons)) {
-    next.icons = next.icons.map((icon) => {
-      if (!icon || typeof icon !== 'object') return icon;
-      const source = resolveManifestUrlValue(icon.src, baseHref);
-      return { ...icon, src: source };
-    });
-  }
-  return next;
-}
-
-function readStoredPwaAppName() {
-  const { value } = normalizePwaAppName(localStorage.getItem(PWA_APP_NAME_STORAGE_KEY), { allowEmpty: true });
-  return value;
+function paintPwaAppNameInput() {
+  const input = document.getElementById('pwa-app-name-input');
+  if (!input) return;
+  // Don't clobber typing when a background refresh lands mid-edit.
+  if (document.activeElement === input) return;
+  input.value = pwaAppName;
 }
 
 export function syncPwaAppNameInput() {
-  const input = document.getElementById('pwa-app-name-input');
-  if (!input) return;
-  input.value = readStoredPwaAppName();
+  paintPwaAppNameInput();
+  const seq = ++pwaAppNameRequestSeq;
+  void loadPwaAppNameSetting().then((result) => {
+    if (seq !== pwaAppNameRequestSeq) return; // superseded by a newer load/save
+    if (!result || typeof result.appName !== 'string') return;
+    pwaAppName = result.appName;
+    paintPwaAppNameInput();
+  });
 }
 
-async function loadManifestTemplate(defaultHref) {
-  if (manifestTemplateCache) return { ...manifestTemplateCache };
-  const fallback = {
-    name: PWA_APP_NAME_DEFAULT,
-    short_name: derivePwaShortName(PWA_APP_NAME_DEFAULT),
-    description: 'OAR — Open Agent Relay: drive your local coding agents from any browser.',
-    id: './__copilot_remote_pwa__',
-    start_url: './',
-    scope: './',
-    display_override: ['standalone'],
-    display: 'standalone',
-    background_color: '#161b22',
-    theme_color: '#161b22',
-    icons: [
-      { src: 'app-icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
-      { src: 'app-icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-      { src: 'app-icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-    ],
-  };
+export async function updatePwaAppName(rawValue) {
+  const seq = ++pwaAppNameRequestSeq;
+  const result = await updatePwaAppNameSetting(rawValue);
+  if (!result || typeof result.appName !== 'string') {
+    alert('Failed to update the install app name.');
+    if (seq === pwaAppNameRequestSeq) paintPwaAppNameInput();
+    return;
+  }
+  if (seq !== pwaAppNameRequestSeq) return; // a newer edit owns the UI now
+  pwaAppName = result.appName;
+  showTransientRelayNotice(result.appName
+    ? `Install app name updated to "${result.appName}".`
+    : 'Install app name reset to default.');
+  paintPwaAppNameInput();
+}
+
+/**
+ * One-time move of a legacy per-browser name into the relay's settings. The
+ * key is removed whether the value is adopted or the server already has a
+ * name — either way it is dead weight; only a network/auth failure keeps it
+ * so the next boot can retry.
+ */
+export async function adoptLegacyPwaAppName() {
+  if (IS_SHARED_VIEW) return;
+  let stored = '';
   try {
-    const response = await fetch(defaultHref, { cache: 'no-store' });
-    const manifest = response.ok ? await response.json() : null;
-    if (manifest && typeof manifest === 'object' && !Array.isArray(manifest)) {
-      manifestTemplateCache = manifest;
-      return { ...manifestTemplateCache };
-    }
-  } catch (error) {
-    console.warn('Failed to load manifest template; using fallback.', error);
-  }
-  manifestTemplateCache = fallback;
-  return { ...manifestTemplateCache };
-}
-
-export async function applyPwaManifestFromSettings() {
-  const manifestLink = document.querySelector('link[rel="manifest"]');
-  if (!manifestLink) return;
-
-  const defaultHref = String(manifestLink.dataset.defaultHref || manifestLink.getAttribute('href') || '').trim();
-  if (!defaultHref) return;
-  if (!manifestLink.dataset.defaultHref) manifestLink.dataset.defaultHref = defaultHref;
-
-  const customName = readStoredPwaAppName();
-  if (!customName) {
-    if (customManifestUrl) {
-      URL.revokeObjectURL(customManifestUrl);
-      customManifestUrl = null;
-    }
-    manifestLink.setAttribute('href', defaultHref);
+    stored = String(localStorage.getItem(PWA_APP_NAME_STORAGE_KEY) || '').trim();
+  } catch {
     return;
   }
-
-  const baseManifest = await loadManifestTemplate(defaultHref);
-  const nextManifest = {
-    ...baseManifest,
-    name: customName,
-    short_name: derivePwaShortName(customName),
-  };
-  const normalizedManifest = normalizeManifestForBlob(nextManifest, defaultHref);
-  const manifestBlob = new Blob([JSON.stringify(normalizedManifest, null, 2)], { type: 'application/manifest+json' });
-  const objectUrl = URL.createObjectURL(manifestBlob);
-  if (customManifestUrl) URL.revokeObjectURL(customManifestUrl);
-  customManifestUrl = objectUrl;
-  manifestLink.setAttribute('href', objectUrl);
-}
-
-export function updatePwaAppName(rawValue) {
-  const normalized = normalizePwaAppName(rawValue, { allowEmpty: true });
-  if (normalized.error) {
-    alert(normalized.error);
-    syncPwaAppNameInput();
-    return;
+  if (!stored) return;
+  // A legacy over-long value would 400 forever; best-effort truncate instead.
+  if (stored.length > 60) stored = stored.slice(0, 60).trim();
+  const seq = ++pwaAppNameRequestSeq;
+  const current = await loadPwaAppNameSetting();
+  if (!current || typeof current.appName !== 'string') return; // offline/unauthed: retry next boot
+  let adoptedName = current.appName;
+  if (!current.appName) {
+    const adopted = await updatePwaAppNameSetting(stored);
+    if (!adopted || typeof adopted.appName !== 'string') return; // POST failed: keep the key
+    adoptedName = adopted.appName;
   }
-  if (normalized.value) {
-    localStorage.setItem(PWA_APP_NAME_STORAGE_KEY, normalized.value);
-  } else {
-    localStorage.removeItem(PWA_APP_NAME_STORAGE_KEY);
-  }
-  applyPwaManifestFromSettings()
-    .then(() => {
-      syncPwaAppNameInput();
-      showTransientRelayNotice(normalized.value
-        ? `Install app name updated to "${normalized.value}".`
-        : 'Install app name reset to default.');
-    })
-    .catch((error) => {
-      alert(error?.message || 'Failed to apply install app name');
-      syncPwaAppNameInput();
-    });
+  try { localStorage.removeItem(PWA_APP_NAME_STORAGE_KEY); } catch {}
+  if (seq !== pwaAppNameRequestSeq) return; // the user already edited; their state wins
+  pwaAppName = adoptedName;
+  paintPwaAppNameInput();
 }
 
 export function registerPwaShell() {

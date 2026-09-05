@@ -66,6 +66,11 @@ import {
   BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
   parseBackgroundTaskTimeoutUpdate,
 } from '../../shared/background-task-timeout.mjs';
+import {
+  PWA_APP_NAME_DEFAULT,
+  PWA_APP_NAME_MAX_LENGTH,
+  derivePwaShortName,
+} from '../../shared/pwa-app-name.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -2059,6 +2064,8 @@ export function registerSessionsRoutes(app, deps) {
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
     getFeatureFlagsSettingsState = () => [],
     setFeatureFlagSetting = () => ({ ok: false, error: 'Feature settings are unavailable' }),
+    getPwaAppName = () => '',
+    setPwaAppName = () => ({ ok: false, status: 500, error: 'App name settings are unavailable' }),
     getBackgroundTaskTimeoutMinutes = () => DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     setBackgroundTaskTimeoutMinutes = () => ({ ok: false, error: 'Background task timeout settings are unavailable' }),
     markSharedViewerPresence,
@@ -5616,6 +5623,25 @@ export function registerSessionsRoutes(app, deps) {
       stepMinutes: BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
       defaultMinutes: DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     });
+  });
+
+  const pwaAppNamePayload = (appName) => ({
+    appName,
+    defaultName: PWA_APP_NAME_DEFAULT,
+    shortName: derivePwaShortName(appName || PWA_APP_NAME_DEFAULT),
+    maxLength: PWA_APP_NAME_MAX_LENGTH,
+  });
+
+  app.get('/api/settings/pwa-app-name', auth, (_req, res) => {
+    res.json(pwaAppNamePayload(getPwaAppName()));
+  });
+
+  app.post('/api/settings/pwa-app-name', auth, (req, res) => {
+    const result = setPwaAppName(req.body?.appName);
+    if (!result.ok) {
+      return res.status(result.status || 400).json({ error: result.error });
+    }
+    return res.json(pwaAppNamePayload(result.appName));
   });
 
   const featureFlagsSettingsPayload = () => {

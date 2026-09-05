@@ -443,6 +443,17 @@ export async function updateBackgroundTaskTimeoutSetting(timeoutMinutes) {
   });
 }
 
+export async function loadPwaAppNameSetting() {
+  return apiFetch('/api/settings/pwa-app-name');
+}
+
+export async function updatePwaAppNameSetting(appName) {
+  return apiFetch('/api/settings/pwa-app-name', {
+    method: 'POST',
+    body: JSON.stringify({ appName: String(appName ?? '') }),
+  });
+}
+
 export async function loadFeatureFlagSettings() {
   return apiFetch('/api/settings/features');
 }

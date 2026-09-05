@@ -114,6 +114,11 @@ import {
   readTurnCeilingSetting,
   turnCeilingMinutesToMs,
 } from '../shared/turn-ceiling.mjs';
+import {
+  normalizePwaAppName,
+  readPwaAppNameSetting,
+  resolvePwaManifestNames,
+} from '../shared/pwa-app-name.mjs';
 import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../shared/claude-thinking.mjs';
 import {
@@ -1868,6 +1873,29 @@ function setTurnCeilingMinutes(value) {
   if (!parsed.ok) return parsed;
   stmts.upsertAppSetting.run(TURN_CEILING_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
   return { ok: true, ceilingMinutes: parsed.minutes };
+}
+
+const PWA_APP_NAME_SETTING_KEY = 'pwa_app_name';
+
+/** '' means "no custom name": the manifest falls back to the template default. */
+function getPwaAppName() {
+  return readPwaAppNameSetting(readAppSettingValue(PWA_APP_NAME_SETTING_KEY));
+}
+
+function setPwaAppName(rawValue) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+    // status carries the intended HTTP mapping so the route never has to key
+    // off the error text (a reworded message must not turn 500s into 400s).
+    return { ok: false, status: 500, error: 'App name settings are unavailable' };
+  }
+  const normalized = normalizePwaAppName(rawValue);
+  if (!normalized.ok) return normalized;
+  if (normalized.value) {
+    stmts.upsertAppSetting.run(PWA_APP_NAME_SETTING_KEY, normalized.value, new Date().toISOString());
+  } else {
+    stmts.deleteAppSetting.run(PWA_APP_NAME_SETTING_KEY);
+  }
+  return { ok: true, appName: normalized.value };
 }
 
 function getFeatureFlagsSettingsState() {
@@ -5916,9 +5944,9 @@ function renderIndexHtmlWithPwaVersion(appConfigOverrides = {}) {
 
 function loadPwaManifestTemplate() {
   const fallback = {
-    name: 'Copilot Remote',
-    short_name: 'Copilot',
-    description: 'Installable Copilot Remote web app with standalone launcher support.',
+    name: 'OAR',
+    short_name: 'OAR',
+    description: 'OAR — Open Agent Relay: drive your local coding agents from any browser.',
     display_override: ['standalone'],
     display: 'standalone',
     background_color: '#161b22',
@@ -5939,9 +5967,15 @@ function loadPwaManifestTemplate() {
 
 function buildScopedPwaManifest({ shared = false } = {}) {
   const manifest = loadPwaManifestTemplate();
+  // The custom name must be baked into every served manifest: Android's WebAPK
+  // update check re-fetches this route outside any page session, so a name the
+  // route doesn't know reverts on the phone with an accept-or-uninstall prompt.
+  const names = resolvePwaManifestNames(getPwaAppName(), manifest.name);
   if (shared) {
     return {
       ...manifest,
+      name: names.name,
+      short_name: names.short_name,
       id: './__copilot_remote_shared__',
       start_url: './',
       scope: './',
@@ -5952,6 +5986,8 @@ function buildScopedPwaManifest({ shared = false } = {}) {
   }
   return {
     ...manifest,
+    name: names.name,
+    short_name: names.short_name,
     id: './__copilot_remote_pwa__',
     start_url: './',
     scope: './',
@@ -6832,6 +6868,8 @@ const sharedRouteDeps = {
   setBackgroundTaskTimeoutMinutes,
   getFeatureFlagsSettingsState,
   setFeatureFlagSetting,
+  getPwaAppName,
+  setPwaAppName,
   requestRelayShutdown,
   markSharedViewerPresence,
   getSharedWatcherCount,
