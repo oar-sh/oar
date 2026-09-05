@@ -2515,8 +2515,10 @@
   .model-pricing-grid b { color: var(--text); font-weight: 600; }
   #mode-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
-    border-radius: 12px; height: 46px; padding: 0 12px; font-size: var(--fs-core-control);
-    min-width: 70px; width: 70px; outline: none;
+    border-radius: 12px; height: 46px; padding: 0 8px; font-size: var(--fs-core-control);
+    /* Wide enough for "Autopilot", the longest mode; the model select is the
+       flexible column and its labels are kept short (humanizeModelLabel). */
+    min-width: 84px; width: 84px; outline: none;
   }
   #mode-select:focus { border-color: var(--accent); }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }

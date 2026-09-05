@@ -1,3 +1,50 @@
+/**
+ * Human label for a model id, tuned to fit narrow composer selects.
+ *
+ * Claude ids drop the redundant "claude-" prefix (Opus/Sonnet/Haiku/Fable are
+ * unmistakably Claude), join hyphenated version parts with dots, and drop
+ * trailing -YYYYMMDD snapshot dates: `claude-fable-5-1` -> "Fable 5.1",
+ * `claude-haiku-4-5-20251001` -> "Haiku 4.5". A bracketed capability suffix
+ * survives verbatim: `claude-opus-5[1m]` -> "Opus 5 [1m]".
+ */
+export function humanizeModelLabel(modelId = '') {
+  const text = String(modelId || '').trim();
+  if (!text) return '';
+  if (/^gpt-/i.test(text)) {
+    return text
+      .replace(/^gpt-/i, 'GPT-')
+      .replace(/-codex$/i, ' Codex')
+      .replace(/-mini$/i, ' Mini');
+  }
+  if (/^claude-/i.test(text)) {
+    const suffixMatch = /\[([^\]]+)\]$/.exec(text);
+    const base = suffixMatch ? text.slice(0, suffixMatch.index) : text;
+    const parts = base
+      .replace(/^claude-/i, '')
+      .split('-')
+      .filter((part, index, all) => !(index === all.length - 1 && /^\d{8}$/.test(part)));
+    const words = [];
+    for (const part of parts) {
+      const isNumeric = /^\d+(\.\d+)?$/.test(part);
+      if (isNumeric && words.length && words[words.length - 1].isNumeric) {
+        words[words.length - 1].text += `.${part}`;
+      } else {
+        words.push({ text: isNumeric ? part : part.charAt(0).toUpperCase() + part.slice(1), isNumeric });
+      }
+    }
+    const label = words.map((word) => word.text).join(' ');
+    return suffixMatch ? `${label} [${suffixMatch[1]}]` : label;
+  }
+  if (/^gemini-/i.test(text)) {
+    return text
+      .replace(/^gemini-/i, 'Gemini ')
+      .split('-')
+      .map((part) => (/^\d+(\.\d+)?$/.test(part) ? part : (part.charAt(0).toUpperCase() + part.slice(1))))
+      .join(' ');
+  }
+  return text;
+}
+
 export function normalizeModelSelectorOptions(models = [], {
   autoValue = 'auto',
   labelFor = (modelId) => modelId,

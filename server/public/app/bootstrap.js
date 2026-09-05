@@ -122,6 +122,7 @@ import {
   resolveConversationComposerSelection,
 } from './conversation-preferences.mjs';
 import {
+  humanizeModelLabel,
   modelSelectorOptionsEqual,
   normalizeModelSelectorOptions,
 } from './model-selector-options.mjs';
@@ -1082,32 +1083,6 @@ function splitVariantId(modelVariantId = '') {
     baseModelId: String(match[1] || '').trim(),
     reasoningEffort: String(match[2] || '').trim().toLowerCase(),
   };
-}
-
-function humanizeModelLabel(modelId = '') {
-  const text = String(modelId || '').trim();
-  if (!text) return '';
-  if (/^gpt-/i.test(text)) {
-    return text
-      .replace(/^gpt-/i, 'GPT-')
-      .replace(/-codex$/i, ' Codex')
-      .replace(/-mini$/i, ' Mini');
-  }
-  if (/^claude-/i.test(text)) {
-    return text
-      .replace(/^claude-/i, 'Claude ')
-      .split('-')
-      .map((part) => (/^\d+(\.\d+)?$/.test(part) ? part : (part.charAt(0).toUpperCase() + part.slice(1))))
-      .join(' ');
-  }
-  if (/^gemini-/i.test(text)) {
-    return text
-      .replace(/^gemini-/i, 'Gemini ')
-      .split('-')
-      .map((part) => (/^\d+(\.\d+)?$/.test(part) ? part : (part.charAt(0).toUpperCase() + part.slice(1))))
-      .join(' ');
-  }
-  return text;
 }
 
 function modelOptionLabel(modelVariantId = '') {
