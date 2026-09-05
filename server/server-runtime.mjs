@@ -128,6 +128,10 @@ import {
   createUpdateInstallService,
   reconcileUpdateAttempt,
 } from './services/update-install-service.mjs';
+import {
+  mergeClaudeModelEfforts,
+  mergeDiscoveredClaudeModels,
+} from '../shared/claude-model-catalog.mjs';
 import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../shared/claude-thinking.mjs';
 import {
@@ -529,9 +533,17 @@ async function refreshClaudeProviderModels() {
       return { ok: false, models: settings.models, error: 'Claude model discovery returned no models' };
     }
     const nowIso = new Date().toISOString();
-    const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
+    // Merge rather than replace: supportedModels() reports only the current
+    // lineup, so replacing would drop a model mid-use the moment a successor
+    // ships (Fable 5 -> Fable 5.1). Retained ids still run via `--model`.
+    const models = mergeDiscoveredClaudeModels({
+      defaultModel: settings.model,
+      discovered,
+      previouslyKnown: readClaudeModelListSetting(CLAUDE_MODELS_SETTING_KEY),
+    });
+    const mergedEfforts = mergeClaudeModelEfforts(readClaudeModelEffortsSetting(), effortsByModel);
     stmts.upsertAppSetting.run(CLAUDE_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
-    stmts.upsertAppSetting.run(CLAUDE_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
+    stmts.upsertAppSetting.run(CLAUDE_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(mergedEfforts), nowIso);
     return { ok: true, models, error: null };
   } catch (error) {
     return {
