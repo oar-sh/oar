@@ -2138,6 +2138,12 @@
     border: none; border-radius: 999px; background: rgba(0,0,0,0.65); color: var(--text);
     cursor: pointer; line-height: 22px; font-size: var(--fs-meta-md);
   }
+  .attachment-preview-annotate {
+    position: absolute; top: 4px; left: 4px; width: 22px; height: 22px;
+    border-radius: 999px; background: rgba(0,0,0,0.65);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; pointer-events: none;
+  }
   .attachment-preview-status {
     position: absolute; inset: 0 0 26px 0;
     display: flex; align-items: center; justify-content: center;
@@ -2193,6 +2199,11 @@
     padding: 6px 10px;
     margin-bottom: 10px;
     font-size: var(--fs-meta-sm);
+    /* Transient notices must stay readable over full-screen modals (the
+       annotation editor's error paths rely on them), so the banner paints
+       above every overlay in the z-index ladder. */
+    position: relative;
+    z-index: 12600;
     text-align: center;
   }
   #model-banner.visible { display: block; }
@@ -2757,6 +2768,112 @@
     color: var(--muted);
     margin-top: 10px;
   }
+
+  /* Annotation editor. Clones the file-preview shell, but sits above it
+     (z-index 11500) so annotating a sent image can layer over the lightbox. */
+  #image-annotate-modal {
+    position: fixed; inset: 0; z-index: 11500;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.78);
+    padding: 12px;
+  }
+  #image-annotate-modal.visible { display: flex; }
+  .annotate-dialog {
+    width: min(1100px, 100%);
+    height: min(92vh, 900px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .annotate-header {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .annotate-title {
+    min-width: 0;
+    font-size: var(--fs-meta-md);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .annotate-close {
+    flex: none;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 10px;
+    width: 40px;
+    height: 40px;
+    cursor: pointer;
+  }
+  #annotate-stage {
+    flex: 1;
+    min-height: 0;          /* lets the stage shrink inside the dialog's height */
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+    background: #0b0f14;
+    /* The editor owns every gesture: no browser panning, and a pinch at the
+       edge must not scroll the page behind the modal. */
+    touch-action: none;
+    overscroll-behavior: contain;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: crosshair;
+  }
+  #annotate-surface {
+    position: relative;
+    transform-origin: center center;
+    line-height: 0;
+  }
+  #annotate-image {
+    display: block;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  #annotate-canvas {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;   /* the stage is the single gesture surface */
+  }
+  #annotate-toolbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .annotate-color, .annotate-width, .annotate-action {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 40px; height: 40px;   /* thumb-sized targets */
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg2);
+    color: var(--text);
+    font-size: var(--fs-meta-md);
+    cursor: pointer;
+  }
+  .annotate-color { padding: 0; }
+  .annotate-color.active,
+  .annotate-width.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent);
+  }
+  .annotate-width-dot {
+    display: block;
+    border-radius: 50%;
+    background: var(--text);
+  }
+  .annotate-width[data-width="thin"] .annotate-width-dot { width: 5px; height: 5px; }
+  .annotate-width[data-width="medium"] .annotate-width-dot { width: 9px; height: 9px; }
+  .annotate-width[data-width="thick"] .annotate-width-dot { width: 15px; height: 15px; }
+  .annotate-action { font-size: 1.1rem; }
+  .annotate-toolbar-gap { flex: 1 1 auto; min-width: 8px; }
+  #annotate-toolbar button:disabled { opacity: 0.45; cursor: default; }
 
   #settings-modal, #summary-modal, #tmux-inspector-modal, #new-conversation-model-modal {
     position: fixed;
@@ -5796,10 +5913,40 @@
       <button id="file-preview-mode-raw" class="file-preview-btn" onclick="setFilePreviewMode('raw')">Raw</button>
       <button id="file-preview-html-toggle" class="file-preview-btn" onclick="toggleFilePreviewHtml()">Show literal HTML</button>
       <a id="file-preview-open-raw" class="file-preview-btn" download>Download</a>
+      <button id="file-preview-annotate-btn" class="file-preview-btn" type="button" onclick="openAnnotateEditorForPreview()" hidden>🖍️ Annotate</button>
       <span id="file-preview-warning" class="file-preview-warning">⚠ Safe layout HTML enabled; active content is blocked</span>
     </div>
     <div id="file-preview-meta" class="file-preview-meta"></div>
     <div id="file-preview-body" class="file-preview-body"></div>
+  </div>
+</div>
+
+<!-- Image annotation editor (all listeners are attached by annotate-editor.js) -->
+<div id="image-annotate-modal" aria-hidden="true">
+  <div class="annotate-dialog" role="dialog" aria-modal="true" aria-label="Annotate image">
+    <div class="annotate-header">
+      <div id="annotate-title" class="annotate-title">Annotate image</div>
+      <button id="annotate-close-btn" class="annotate-close" type="button" aria-label="Close without saving">✖</button>
+    </div>
+    <div id="annotate-stage">
+      <div id="annotate-surface">
+        <img id="annotate-image" alt="Image being annotated">
+        <canvas id="annotate-canvas"></canvas>
+      </div>
+    </div>
+    <div id="annotate-toolbar">
+      <button class="annotate-color active" type="button" data-color="yellow" style="background: #ffdd00;" aria-label="Yellow marker"></button>
+      <button class="annotate-color" type="button" data-color="red" style="background: #ff3b30;" aria-label="Red marker"></button>
+      <button class="annotate-color" type="button" data-color="green" style="background: #34c759;" aria-label="Green marker"></button>
+      <button class="annotate-color" type="button" data-color="blue" style="background: #0a84ff;" aria-label="Blue marker"></button>
+      <button class="annotate-width" type="button" data-width="thin" aria-label="Thin stroke"><span class="annotate-width-dot"></span></button>
+      <button class="annotate-width active" type="button" data-width="medium" aria-label="Medium stroke"><span class="annotate-width-dot"></span></button>
+      <button class="annotate-width" type="button" data-width="thick" aria-label="Thick stroke"><span class="annotate-width-dot"></span></button>
+      <span class="annotate-toolbar-gap"></span>
+      <button id="annotate-undo-btn" class="annotate-action" type="button" aria-label="Undo" disabled>↩️</button>
+      <button id="annotate-reset-btn" class="annotate-action" type="button" aria-label="Clear all" disabled>🗑️</button>
+      <button id="annotate-accept-btn" class="annotate-action" type="button" aria-label="Accept" disabled>✅</button>
+    </div>
   </div>
 </div>
 

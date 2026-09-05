@@ -12,7 +12,9 @@ import {
   workspaceRootPath,
   showTransientRelayNotice,
   getConversationCurrentWorkspaceRootPath,
+  IS_SHARED_VIEW,
 } from './store.js';
+import { openAnnotateEditor } from './annotate-editor.js';
 import {
   uploadAttachment,
   loadWorkspaceFilePreview,
@@ -226,9 +228,13 @@ export function renderAttachmentPreview() {
 
   el.innerHTML = selectedAttachments.map((att, idx) => {
     const state = String(att?.uploadState || 'uploaded');
+    const annotatable = att.isImage && att.previewUrl && isAnnotatableImageType(att.type);
     const thumb = att.isImage && att.previewUrl
-      ? `<img src="${escHtml(att.previewUrl)}" alt="${escHtml(att.name)}">`
+      ? `<img src="${escHtml(att.previewUrl)}" alt="${escHtml(att.name)}"${annotatable ? ` onclick="openAnnotateEditorForPending(${idx})" title="Annotate ${escHtml(att.name)}" style="cursor: pointer;"` : ''}>`
       : `<div class="attachment-preview-meta" style="height:88px;display:flex;align-items:center;justify-content:center">📎</div>`;
+    const annotateBadge = annotatable
+      ? `<span class="attachment-preview-annotate" aria-hidden="true">🖍️</span>`
+      : '';
     const overlay = state === 'pending' || state === 'uploading'
       ? `<div class="attachment-preview-status attachment-preview-status-uploading" role="status" aria-label="Uploading ${escHtml(att.name)}"><span class="attachment-preview-spinner"></span></div>`
       : state === 'error'
@@ -238,6 +244,7 @@ export function renderAttachmentPreview() {
     <div class="attachment-preview-item attachment-preview-${escHtml(state)}">
       <button class="attachment-preview-remove" onclick="removeAttachment(${idx})" title="Remove">×</button>
       ${thumb}
+      ${annotateBadge}
       ${overlay}
       <div class="attachment-preview-meta">${escHtml(att.name)}${att.size ? ` · ${formatBytes(att.size)}` : ''}</div>
     </div>
@@ -374,6 +381,86 @@ export function retryAttachmentUpload(idx) {
   void startAttachmentUpload(attachment);
 }
 
+// ─── Marker annotations ───────────────────────────────────────────────────────
+
+/** Animated GIFs would silently flatten to one frame, SVGs can't be served back. */
+function isAnnotatableImageType(type) {
+  const normalized = String(type || '').trim().toLowerCase();
+  return normalized.startsWith('image/')
+    && normalized !== 'image/gif'
+    && normalized !== 'image/svg+xml';
+}
+
+async function fetchImageBlob(url) {
+  // Upload/generated-image content URLs are cookie-authenticated (the same way
+  // the <img> tags load them), so a plain same-origin fetch works.
+  const response = await fetch(url, { credentials: 'same-origin' });
+  if (!response.ok) throw new Error('Could not load the image');
+  return response.blob();
+}
+
+/**
+ * Swaps a pending composer attachment for its annotated copy. Keyed on the
+ * attachment object, not its index — the list can shift while the editor is
+ * open. Returns false (editor stays open) when the slot vanished.
+ */
+async function replacePendingAttachment(target, file) {
+  const prepared = await prepareIncomingFile(file, { source: 'annotate', now: new Date(), index: 0 });
+  // Resolve the slot AFTER the await: prepareIncomingFile can spend real time
+  // downscaling, and a draft re-hydration or conversation switch in that window
+  // must not make the splice land on an unrelated attachment.
+  const idx = selectedAttachments.indexOf(target);
+  if (idx === -1) {
+    releaseAttachmentPreviewUrl(prepared);
+    showTransientRelayNotice('That attachment is no longer in the composer.');
+    return false;
+  }
+  const [replaced] = selectedAttachments.splice(idx, 1, prepared);
+  releaseAttachmentPreviewUrl(replaced);
+  renderAttachmentPreview();
+  void startAttachmentUpload(prepared);
+  window.persistComposerAttachments?.();
+  return true;
+}
+
+export function openAnnotateEditorForPending(idx) {
+  const attachment = selectedAttachments[idx];
+  if (!attachment?.isImage || !isAnnotatableImageType(attachment.type)) return;
+  openAnnotateEditor({
+    name: attachment.name,
+    getBlob: async () => (attachment.file ? attachment.file : fetchImageBlob(attachment.previewUrl)),
+    onAccept: (file) => replacePendingAttachment(attachment, file),
+  });
+}
+
+/** True when the currently previewed lightbox item can host the 🖍️ button. */
+export function filePreviewSupportsAnnotation() {
+  if (IS_SHARED_VIEW) return false;
+  const payload = filePreviewState?.payload;
+  return payload?.kind === 'image'
+    && !!String(payload.rawUrl || '')
+    && isAnnotatableImageType(payload.contentType);
+}
+
+export function openAnnotateEditorForPreview() {
+  if (!filePreviewSupportsAnnotation()) return;
+  const url = String(filePreviewState.payload.rawUrl || '');
+  const name = String(filePreviewState.payload.name || 'screenshot');
+  closeFilePreview();
+  openAnnotateEditor({
+    name,
+    getBlob: () => fetchImageBlob(url),
+    onAccept: async (file) => {
+      // The sent message is never mutated: the annotated copy joins the
+      // composer for the next message. ingestFiles enforces the attachment
+      // cap and shows its own over-cap notice; an empty result keeps the
+      // editor open so a slot can be freed and accept retried.
+      const added = await ingestFiles([file], { source: 'annotate' });
+      return added.length > 0;
+    },
+  });
+}
+
 /**
  * Single ingestion path shared by the file picker, paste and drag-and-drop.
  * Files are normalized, optionally downscaled, capped, and uploaded immediately
@@ -480,6 +567,8 @@ function updateFilePreviewUiState() {
   const backBtn = document.getElementById('file-preview-back');
   backBtn.hidden = filePreviewHistory.length === 0;
   backBtn.disabled = filePreviewHistory.length === 0;
+  const annotateBtn = document.getElementById('file-preview-annotate-btn');
+  if (annotateBtn) annotateBtn.hidden = !filePreviewSupportsAnnotation();
 }
 
 function snapshotFilePreviewState() {
