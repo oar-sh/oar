@@ -5108,6 +5108,41 @@
           >
           <div class="settings-help">Used for the installed PWA app label on every device connecting to this relay. On Android, a rename reaches an already-installed app after a short delay, with one confirmation prompt showing the new name.</div>
         </div>
+        <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="update-auto-check-toggle">Check for updates automatically</label>
+          <input
+            id="update-auto-check-toggle"
+            type="checkbox"
+            onchange="updateAutoCheckSetting(this.checked)"
+            aria-label="Check for updates automatically"
+          >
+        </div>
+        <div class="settings-help" style="margin-top: 6px;">Off by default — OAR sends no traffic anywhere unless you opt in. When enabled, the relay asks oar.sh for the latest version about twice a day. Manual checks below work regardless.</div>
+        <div id="update-check-killed-help" class="settings-help" style="margin-top: 6px;" hidden>Update checks are disabled by OAR_NO_UPDATE_CHECK in this relay's environment.</div>
+        <div class="settings-row" style="margin-top: 6px; margin-bottom: 0;">
+          <button id="update-check-now-btn" class="chat-title-action-btn" type="button" onclick="checkForUpdatesNow()">Check for updates</button>
+          <span id="update-last-checked" class="settings-help"></span>
+        </div>
+        <div id="update-available-card" class="settings-help" style="margin-top: 6px;" hidden>
+          <span id="update-available-text"></span>
+          <a id="update-notes-link" target="_blank" rel="noopener" hidden>release notes</a>
+          <div class="settings-row" style="margin-top: 6px; margin-bottom: 0;">
+            <button id="update-apply-btn" class="chat-title-action-btn" type="button" onclick="applyAvailableUpdate()">Update</button>
+            <button id="update-dismiss-btn" class="chat-title-action-btn" type="button" onclick="dismissAvailableUpdate()">Dismiss</button>
+          </div>
+          <div id="update-git-hint" style="margin-top: 4px;" hidden>This relay runs from a git checkout — pull and restart to update.</div>
+        </div>
+        <div id="update-install-status" class="settings-help" style="margin-top: 6px;" hidden></div>
+        <button id="update-cancel-btn" class="chat-title-action-btn" type="button" style="margin-top: 4px;" onclick="cancelRunningUpdate()" hidden>Cancel update</button>
+        <details id="update-install-log" class="cli-install-log" hidden>
+          <summary>Update log</summary>
+          <pre id="update-install-log-pre"></pre>
+        </details>
+        <div id="update-outcome" class="settings-help" style="margin-top: 6px;" hidden>
+          <span id="update-outcome-text"></span>
+          <pre id="update-outcome-log" hidden></pre>
+          <button id="update-outcome-dismiss-btn" class="chat-title-action-btn" type="button" onclick="dismissUpdateOutcome()">Dismiss</button>
+        </div>
         <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
           <label for="default-session-workspace-root-input">Default CWD for new sessions</label>
           <input

@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform } from './store.js';
+import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform, setUpdateState } from './store.js';
 
 // fetch() has no default timeout. Without one, a request issued while the app is
 // being backgrounded can hang indefinitely on a half-open mobile connection and
@@ -93,6 +93,7 @@ export async function verifyExistingSession(tokenCandidate = '') {
         setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
         setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
         if (payload?.platform) setServerPlatform(payload.platform);
+        setUpdateState(payload?.update || null);
       }
       if (response.ok) noteFetchSuccess();
       return {
@@ -150,6 +151,7 @@ export async function verifyToken(token) {
       setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
       setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
       if (payload?.platform) setServerPlatform(payload.platform);
+      setUpdateState(payload?.update || null);
     }
     if (response.ok) noteFetchSuccess();
     return {
@@ -179,6 +181,7 @@ export async function refreshWorkspaceRootHints() {
     setActiveRuntimeSessionCount(status?.activeRuntimeSessionCount);
     setRuntimeSessionBindingCount(status?.runtimeSessionBindingCount);
     if (status?.platform) setServerPlatform(status.platform);
+    setUpdateState(status?.update || null);
   }
   return status;
 }
@@ -452,6 +455,39 @@ export async function updatePwaAppNameSetting(appName) {
     method: 'POST',
     body: JSON.stringify({ appName: String(appName ?? '') }),
   });
+}
+
+export async function loadUpdateState() {
+  return apiFetch('/api/update/state');
+}
+
+export async function setUpdateAutoCheck(enabled) {
+  return apiFetch('/api/update/auto-check', {
+    method: 'POST',
+    body: JSON.stringify({ enabled: enabled === true }),
+  });
+}
+
+export async function checkForUpdateNow() {
+  return apiFetch('/api/update/check', { method: 'POST' });
+}
+
+export async function dismissUpdate(body) {
+  return apiFetch('/api/update/dismiss', {
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  });
+}
+
+export async function applyUpdate(version) {
+  return apiFetch('/api/update/apply', {
+    method: 'POST',
+    body: JSON.stringify({ version: String(version || '') }),
+  });
+}
+
+export async function cancelUpdate() {
+  return apiFetch('/api/update/cancel', { method: 'POST' });
 }
 
 export async function loadFeatureFlagSettings() {

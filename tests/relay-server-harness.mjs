@@ -204,6 +204,11 @@ export function buildRelayServerEnv({
     // clarification answers, and a spec that wants them should un-pin this
     // deliberately rather than inherit them by default.
     COPILOT_REMOTE_SESSION_WORKER_CONTINUATION_ROUTING_ENABLED: "0",
+    // Kill the update-check service outright: the isolated test server must
+    // never reach oar.sh, and update checking is opt-in anyway — a spec that
+    // exercises the update flow un-pins this and points
+    // OAR_UPDATE_MANIFEST_URL at its own stub server.
+    OAR_NO_UPDATE_CHECK: "1",
     // Pinned for the same reason routing is: without it the relay derives the
     // path from whatever Copilot CLI the host happens to have installed, and the
     // Copilot engine setting would refuse (or accept) differently per machine.

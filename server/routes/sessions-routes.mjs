@@ -1986,6 +1986,10 @@ export function registerSessionsRoutes(app, deps) {
     // Owns the relay-wide single-flight CLI install/update, the descriptor
     // table and the binary bindings, on the same terms as claudeAuthService.
     cliInstallService = null,
+    updateCheckService = null,
+    updateInstallService = null,
+    buildUpdateStatePayload = null,
+    runningVersion = null,
     getCursorProviderSettings = () => ({ configured: false, enabled: false, model: 'composer-2.5', models: [] }),
     setCursorProviderSettings = () => ({ ok: false, error: 'Cursor settings are unavailable' }),
     refreshCursorProviderModels = async () => ({ ok: false, models: [], error: 'Cursor model discovery is unavailable' }),
@@ -4799,6 +4803,8 @@ export function registerSessionsRoutes(app, deps) {
       platform: process.platform,
       features: featureFlags || {},
       sessionWorker: sessionWorkerStatus,
+      version: runningVersion || null,
+      update: typeof buildUpdateStatePayload === 'function' ? buildUpdateStatePayload() : null,
     });
   });
 
@@ -5272,6 +5278,72 @@ export function registerSessionsRoutes(app, deps) {
       ...cliInstall.getCachedStatusSnapshot(),
       install: result.install,
     });
+  });
+
+  // --- OAR self-update ----------------------------------------------------
+  // Checking is opt-in (zero telemetry by default). All routes are no-ops
+  // with clear errors when OAR_NO_UPDATE_CHECK killed the check service.
+  const updateStatePayload = () => (typeof buildUpdateStatePayload === 'function' ? buildUpdateStatePayload() : null);
+
+  app.get('/api/update/state', auth, (_req, res) => {
+    res.json({ ok: true, update: updateStatePayload() });
+  });
+
+  app.post('/api/update/auto-check', auth, (req, res) => {
+    if (!updateCheckService) {
+      return res.status(503).json({ error: 'Update checks are disabled on this relay (OAR_NO_UPDATE_CHECK)' });
+    }
+    const enabled = req.body?.enabled;
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean' });
+    }
+    updateCheckService.setAutoCheck(enabled);
+    return res.json({ ok: true, update: updateStatePayload() });
+  });
+
+  app.post('/api/update/check', auth, async (_req, res) => {
+    if (!updateCheckService) {
+      return res.status(503).json({ error: 'Update checks are disabled on this relay (OAR_NO_UPDATE_CHECK)' });
+    }
+    await updateCheckService.checkNow();
+    return res.json({ ok: true, update: updateStatePayload() });
+  });
+
+  app.post('/api/update/dismiss', auth, (req, res) => {
+    if (req.body?.outcome === true) {
+      const cleared = updateInstallService?.clearOutcome?.();
+      return cleared?.ok
+        ? res.json({ ok: true, update: updateStatePayload() })
+        : res.status(500).json({ error: 'Update state is unavailable' });
+    }
+    if (!updateCheckService) {
+      return res.status(503).json({ error: 'Update checks are disabled on this relay (OAR_NO_UPDATE_CHECK)' });
+    }
+    const result = updateCheckService.dismissVersion(req.body?.version);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    return res.json({ ok: true, update: updateStatePayload() });
+  });
+
+  app.post('/api/update/cancel', auth, (_req, res) => {
+    if (!updateInstallService?.cancel) {
+      return res.status(503).json({ error: 'Updates are unavailable on this relay' });
+    }
+    updateInstallService.cancel();
+    return res.json({ ok: true, update: updateStatePayload() });
+  });
+
+  app.post('/api/update/apply', auth, async (req, res) => {
+    if (!updateInstallService) {
+      return res.status(503).json({ error: 'Updates are unavailable on this relay' });
+    }
+    const result = await updateInstallService.startUpdate({ version: req.body?.version });
+    if (!result.ok) {
+      return res.status(Number(result.statusCode) || 400).json({
+        error: result.error || 'Failed to start the update',
+        update: updateStatePayload(),
+      });
+    }
+    return res.json({ ok: true, targetVersion: result.targetVersion, update: updateStatePayload() });
   });
 
   // --- Grok account (CLI device-code OAuth) -------------------------------

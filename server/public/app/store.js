@@ -73,6 +73,9 @@ export let relayOnline = false;
 // Latest cloudflared tunnel status, from /api/status on load and the
 // cloudflared_tunnel_status socket event thereafter. Null until first reported.
 export let cloudflaredTunnelState = null;
+// Latest self-update payload, from /api/status on load and the update_state
+// socket event thereafter. Null until first reported.
+export let updateState = null;
 export let activeRuntimeSessionCount = 0;
 export let runtimeSessionBindingCount = 0;
 export let conversations = {};
@@ -765,6 +768,14 @@ export function setRelayOnline(value) {
 export function setCloudflaredTunnelState(value) {
   cloudflaredTunnelState = value && typeof value === 'object' ? value : null;
   updateCliStatus();
+}
+
+export function setUpdateState(value) {
+  updateState = value && typeof value === 'object' ? value : null;
+}
+
+export function getUpdateState() {
+  return updateState;
 }
 
 export function setImageEditTarget(value) {

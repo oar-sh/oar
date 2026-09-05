@@ -527,6 +527,28 @@ cards with a reply box.
 The active conversation header includes a `✍️` button for renaming the conversation inline.
 Title edits are saved to the database and broadcast to other open clients immediately.
 
+## Updates
+
+OAR never phones home by default. Automatic update checking is **opt-in**:
+enable **Check for updates automatically** in ⚙️ Settings (stored in app
+settings, off unless you turn it on) and the relay asks `oar.sh/latest.json`
+for the newest version about twice a day (12 h ± 1 h jitter, ETag-aware, 5 s
+timeout, failures silent). A manual **Check for updates** button works without
+opting in — that single request is the only traffic it creates. Set
+`OAR_NO_UPDATE_CHECK=1` in the relay's environment to disable even manual
+checks; `OAR_UPDATE_MANIFEST_URL` points the check at a different manifest
+(used by tests and staging).
+
+When a newer version is available, Settings shows a dismissible-per-version
+card (not dismissible if the release is marked critical — it still never
+auto-applies). On npm-global installs, **Update** runs
+`npm i -g @oar-sh/oar@<version>` with the log streamed into the card, then the
+relay restarts once the message queue is idle. After the restart the relay
+verifies the running version actually changed; if not, the npm log is surfaced
+as a failure. Git checkouts are detect-only — the card shows a "pull to
+update" hint instead of the button. `oar update [--beta] [--to X.Y.Z]` does
+the same from a terminal, and rollback is `oar update --to <previous>`.
+
 ## Feature flags
 
 Feature flags are declared in one registry (`server/features.mjs`) and managed

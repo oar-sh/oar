@@ -119,6 +119,15 @@ import {
   readPwaAppNameSetting,
   resolvePwaManifestNames,
 } from '../shared/pwa-app-name.mjs';
+import {
+  createUpdateCheckService,
+  isUpdateCheckKilled,
+  resolveUpdateManifestUrl,
+} from './services/update-check-service.mjs';
+import {
+  createUpdateInstallService,
+  reconcileUpdateAttempt,
+} from './services/update-install-service.mjs';
 import { parseAutoCompactWindow } from '../shared/auto-compact-window.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../shared/claude-thinking.mjs';
 import {
@@ -142,6 +151,20 @@ import { selectModelIdsForVariantRefresh } from '../shared/model-refresh.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
+// The installed package root: set by bin/oar.js for launched relays, falling
+// back to the checkout for direct `node server/server.js` runs. Version and
+// install method feed the update mechanism and /api/status.
+const PACKAGE_ROOT = String(process.env.COPILOT_WEB_RELAY_ROOT || '').trim()
+  ? path.resolve(String(process.env.COPILOT_WEB_RELAY_ROOT).trim())
+  : REPO_ROOT;
+const RUNNING_VERSION = (() => {
+  try {
+    return String(JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8')).version || '0.0.0');
+  } catch {
+    return '0.0.0';
+  }
+})();
+const INSTALL_METHOD = fs.existsSync(path.join(PACKAGE_ROOT, '.git')) ? 'git-checkout' : 'npm-global';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
 const PWA_MANIFEST_PATH = path.join(PUBLIC_DIR, 'manifest.webmanifest');
@@ -3576,6 +3599,55 @@ migrateLegacyConfigFeatures({
 });
 const featureFlags = resolveBootFeatureFlags({ readSetting: readAppSettingValue });
 
+// Settle any persisted self-update attempt from the previous run: an unchanged
+// version after the restart becomes a visible failure carrying the npm log.
+reconcileUpdateAttempt({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  deleteSetting: (key) => stmts.deleteAppSetting.run(key),
+  runningVersion: RUNNING_VERSION,
+});
+
+// Update checking is opt-in (zero telemetry by default): the service exists so
+// manual "check now" and the settings toggle work, but never fetches unless
+// the stored setting says so. OAR_NO_UPDATE_CHECK=1 kills even that.
+const updateCheckKilled = isUpdateCheckKilled(process.env);
+const updateCheckService = updateCheckKilled ? null : createUpdateCheckService({
+  runningVersion: RUNNING_VERSION,
+  installMethod: INSTALL_METHOD,
+  manifestUrl: resolveUpdateManifestUrl(process.env),
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  logger: console,
+  onStateChange: () => emitUpdateState(),
+});
+const updateInstallService = createUpdateInstallService({
+  runningVersion: RUNNING_VERSION,
+  installMethod: INSTALL_METHOD,
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  deleteSetting: (key) => stmts.deleteAppSetting.run(key),
+  requestRelayShutdown: (options) => requestRelayShutdown(options),
+  logger: console,
+});
+updateInstallService.subscribe(() => emitUpdateState());
+
+function buildUpdateStatePayload() {
+  return {
+    runningVersion: RUNNING_VERSION,
+    installMethod: INSTALL_METHOD,
+    checkKilled: updateCheckKilled,
+    check: updateCheckService?.getSnapshot() || null,
+    install: updateInstallService.getSnapshot(),
+  };
+}
+
+function emitUpdateState() {
+  // `io` is created later in boot; emits only fire from user actions and
+  // timers, both post-boot, so the reference is safe by then.
+  try { io.emit('update_state', buildUpdateStatePayload()); } catch {}
+}
+
 async function stopSessionWorkerForProviderRebind(sdkSessionId) {
   const sessionId = String(sdkSessionId || '').trim();
   if (!sessionId) return false;
@@ -6876,6 +6948,10 @@ const sharedRouteDeps = {
   statusEventService,
   claudeAuthService,
   cliInstallService,
+  updateCheckService,
+  updateInstallService,
+  buildUpdateStatePayload,
+  runningVersion: RUNNING_VERSION,
   grokAuthService,
   imageOperationService,
   windowsAutostartService,
@@ -6983,6 +7059,8 @@ if (sweptUploads > 0) {
 }
 runtimeTimers.uploadSweep = setInterval(sweepUnreferencedUploadBlobs, 6 * 60 * 60 * 1000);
 if (typeof runtimeTimers.uploadSweep.unref === 'function') runtimeTimers.uploadSweep.unref();
+// Arms the 12h update poller only when the user opted in; otherwise silent.
+updateCheckService?.startIfEnabled();
 const runtimeBindingsBootstrapped = bootstrapRuntimeSessionBindings();
 if (runtimeBindingsBootstrapped > 0) {
   console.log(`${runtimeLogPrefix()}Runtime sessions bootstrapped: ${runtimeBindingsBootstrapped}`);
@@ -7391,6 +7469,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   runtimeShutdownStarted = true;
   console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
+  try { updateCheckService?.stop(); } catch {}
   void sdkSessionImportService.dispose().catch((error) => {
     console.warn(`${runtimeLogPrefix()}SDK session importer shutdown failed: ${error?.message || error}`);
   });

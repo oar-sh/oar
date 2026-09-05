@@ -27,8 +27,10 @@ test('default config carries the documented defaults and a token', () => {
     pollIntervalMs: 3000,
     processingTimeoutMs: 600000,
     conversationSessionMode: 'isolated',
-    updateCheck: true,
   });
+  // Zero telemetry out of the box: no updateCheck key — automatic update
+  // checking is an opt-in app setting, never a config default.
+  assert.equal('updateCheck' in config, false);
 });
 
 test('primaryLanAddress skips internal and IPv6 entries', () => {

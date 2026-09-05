@@ -93,6 +93,21 @@ const LEGACY_SETTINGS_IDS = [
   "features-restart-notice",
   "features-restart-btn",
   "features-settings-status",
+  // Updates
+  "update-auto-check-toggle",
+  "update-check-now-btn",
+  "update-last-checked",
+  "update-available-card",
+  "update-available-text",
+  "update-notes-link",
+  "update-apply-btn",
+  "update-dismiss-btn",
+  "update-git-hint",
+  "update-cancel-btn",
+  "update-install-log",
+  "update-install-status",
+  "update-outcome",
+  "update-outcome-dismiss-btn",
 ];
 
 const TABS = ["general", "providers", "previews", "notifications", "features"];

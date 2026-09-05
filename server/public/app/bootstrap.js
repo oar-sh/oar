@@ -311,6 +311,14 @@ import {
   runCliInstall,
   cancelCliInstallRun,
 } from './cli-install-ui.js';
+import {
+  updateAutoCheckSetting,
+  checkForUpdatesNow,
+  applyAvailableUpdate,
+  cancelRunningUpdate,
+  dismissAvailableUpdate,
+  dismissUpdateOutcome,
+} from './update-ui.js';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 // The New Chat modal used to keep its own model key, so a selection made there
@@ -4219,6 +4227,12 @@ window.confirmGrokLogout = confirmGrokLogout;
 window.confirmCliInstall = confirmCliInstall;
 window.runCliInstall = runCliInstall;
 window.cancelCliInstallRun = cancelCliInstallRun;
+window.updateAutoCheckSetting = updateAutoCheckSetting;
+window.checkForUpdatesNow = checkForUpdatesNow;
+window.applyAvailableUpdate = applyAvailableUpdate;
+window.cancelRunningUpdate = cancelRunningUpdate;
+window.dismissAvailableUpdate = dismissAvailableUpdate;
+window.dismissUpdateOutcome = dismissUpdateOutcome;
 window.saveGrokSettings = saveGrokSettings;
 window.toggleGrokProvider = toggleGrokProvider;
 window.saveCursorSettings = saveCursorSettings;

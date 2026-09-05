@@ -19,7 +19,8 @@ export function buildDefaultConfig({ token = generateAuthToken(), port = 3333, l
     pollIntervalMs: 3000,
     processingTimeoutMs: 600000,
     conversationSessionMode: 'isolated',
-    updateCheck: true,
+    // No updateCheck key: automatic update checking is opt-in from the web
+    // UI (app_settings), never a config default — zero telemetry out of the box.
   };
 }
 

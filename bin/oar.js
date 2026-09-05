@@ -640,6 +640,118 @@ async function runDoctor({ env = process.env, logger = console } = {}) {
   return { code: 0, reason: 'doctor' };
 }
 
+/**
+ * `oar update [--beta] [--to X.Y.Z]` — the terminal twin of the web UI's
+ * Update button. Fetching the manifest here is an explicit user action, so it
+ * happens regardless of the relay's opt-in auto-check setting.
+ */
+async function runUpdate({ argv = [], env = process.env, logger = console, fetchImpl = globalThis.fetch, spawnImpl = spawn } = {}) {
+  const { channelForVersion, compareSemverIsh, parseSemverIsh } = await import('../shared/update-semver.mjs');
+  const packageRoot = resolvePackageRoot();
+  const runningVersion = readPackageVersion(packageRoot);
+
+  if (isGitCheckout(packageRoot)) {
+    logger.error('[oar] This install runs from a git checkout — update with git pull, then restart the relay.');
+    return { code: 1, reason: 'git-checkout' };
+  }
+
+  const toIdx = argv.indexOf('--to');
+  let target = toIdx !== -1 ? String(argv[toIdx + 1] || '').trim() : '';
+  if (target && !parseSemverIsh(target)) {
+    logger.error(`[oar] --to expects a release version like 0.9.2, got "${target}".`);
+    return { code: 1, reason: 'bad-target' };
+  }
+  if (!target) {
+    // The kill switch means "never phone home from this host", so it blocks
+    // the manifest fetch too — an explicit `--to X.Y.Z` still works because
+    // that path talks only to the npm registry the install already uses.
+    if (String(env.OAR_NO_UPDATE_CHECK || '').trim() === '1') {
+      logger.error('[oar] Update checks are disabled on this host (OAR_NO_UPDATE_CHECK). Use `oar update --to X.Y.Z` to update to a known version.');
+      return { code: 1, reason: 'check-killed' };
+    }
+    const manifestUrl = String(env.OAR_UPDATE_MANIFEST_URL || '').trim() || 'https://oar.sh/latest.json';
+    let manifest = null;
+    try {
+      const response = await fetchImpl(manifestUrl, { signal: AbortSignal.timeout?.(5000) });
+      manifest = response?.ok ? await response.json() : null;
+    } catch {}
+    if (!manifest) {
+      logger.error(`[oar] Could not fetch ${manifestUrl}.`);
+      return { code: 1, reason: 'manifest-unreachable' };
+    }
+    if (manifest.schemaVersion !== 1) {
+      logger.error(`[oar] ${manifestUrl} has schemaVersion ${manifest.schemaVersion}, which this oar does not understand — update manually.`);
+      return { code: 1, reason: 'manifest-unsupported' };
+    }
+    const channel = argv.includes('--beta') ? 'beta' : channelForVersion(runningVersion);
+    target = String(manifest.channels?.[channel]?.version || manifest.channels?.stable?.version || '').trim();
+    if (!parseSemverIsh(target)) {
+      logger.error('[oar] The update manifest carries no usable version.');
+      return { code: 1, reason: 'manifest-empty' };
+    }
+    if (compareSemverIsh(target, runningVersion) <= 0) {
+      logger.log(`[oar] Already up to date (${runningVersion}).`);
+      return { code: 0, reason: 'up-to-date' };
+    }
+  }
+
+  logger.log(`[oar] Updating @oar-sh/oar ${runningVersion} -> ${target} ...`);
+  const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const exitCode = await new Promise((resolve) => {
+    const child = spawnImpl(npmCommand, ['install', '-g', `@oar-sh/oar@${target}`], {
+      stdio: 'inherit',
+      ...(process.platform === 'win32' ? { shell: true, windowsHide: true } : {}),
+    });
+    child.on('error', (error) => {
+      logger.error(`[oar] npm spawn failed: ${error?.message || error}`);
+      resolve(1);
+    });
+    child.on('close', (code) => resolve(code ?? 1));
+  });
+  if (exitCode !== 0) {
+    logger.error('[oar] npm install failed; the running install is unchanged.');
+    return { code: 1, reason: 'npm-failed' };
+  }
+  logger.log(`[oar] Installed @oar-sh/oar@${target}.`);
+
+  // A running relay picks the new code up on restart; ask for the queue-idle
+  // deferred one so no in-flight turn is cut off.
+  const layout = resolveStateLayout({ packageRoot, env });
+  const configPath = layout.checkout
+    ? path.join(packageRoot, 'server', 'config.json')
+    : path.join(layout.configDir, 'config.json');
+  const config = readJsonFile(configPath);
+  const port = Number(config?.port) || 3333;
+  const lockPath = layout.checkout
+    ? path.join(packageRoot, 'server', 'data', 'relay-server.lock')
+    : path.join(layout.dataDir, 'relay-server.lock');
+  const running = await detectRunningRelay({ lockPath, statusUrl: `http://localhost:${port}/api/status`, fetchImpl });
+  if (!running.running) {
+    logger.log('[oar] No running relay detected — the update loads on the next start.');
+    return { code: 0, reason: 'updated' };
+  }
+  const token = String(running.lock?.token || config?.authToken || '').trim();
+  try {
+    const response = await fetchImpl(`http://localhost:${port}/api/relay/shutdown`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ reason: 'self-update-cli', requestedBy: 'oar-update', restart: true }),
+      signal: AbortSignal.timeout?.(5000),
+    });
+    if (response?.ok) {
+      logger.log('[oar] Relay restart requested — it restarts once the queue is idle.');
+    } else {
+      logger.log('[oar] Could not request a relay restart; restart it manually to load the update.');
+    }
+  } catch {
+    logger.log('[oar] Could not request a relay restart; restart it manually to load the update.');
+  }
+  return { code: 0, reason: 'updated' };
+}
+
 function main() {
   const argv = process.argv.slice(2);
   const command = String(argv[0] || '').trim();
@@ -649,6 +761,7 @@ function main() {
   }
   if (command === 'setup') return runSetup({ argv: argv.slice(1) });
   if (command === 'doctor') return runDoctor({});
+  if (command === 'update') return runUpdate({ argv: argv.slice(1) });
   return launchRelay();
 }
 

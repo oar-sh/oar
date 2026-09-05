@@ -28,6 +28,7 @@ import {
   addSubagentThought,
   clearSubagentCancelInFlight,
   setConversationWatcherCount,
+  setUpdateState,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
@@ -43,6 +44,7 @@ import { setPreviews } from './preview-cards.mjs';
 import { applyClaudeAuthState } from './claude-auth-ui.js';
 import { applyGrokAuthState } from './grok-auth-ui.js';
 import { applyCliInstallState } from './cli-install-ui.js';
+import { renderUpdateSection } from './update-ui.js';
 import {
   showThinking,
   removeThinking,
@@ -375,6 +377,12 @@ export async function connectSocket(overrideDeps) {
   // mid-install renders the full log instead of a suffix.
   socket.on('cli_install_state', (payload) => {
     applyCliInstallState(payload || null);
+  });
+  // Self-update transitions AND npm log chunks; same whole-buffer contract as
+  // cli_install_state, so a client connecting mid-update renders the full log.
+  socket.on('update_state', (payload) => {
+    setUpdateState(payload || null);
+    renderUpdateSection();
   });
   socket.on('grok_settings_updated', (payload) => {
     deps?.applyGrokSettingsState?.(payload || {});

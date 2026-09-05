@@ -41,6 +41,7 @@ import { selectSettingsTab } from './settings-tabs.js';
 import { refreshClaudeAuthSection } from './claude-auth-ui.js';
 import { refreshGrokAuthSection } from './grok-auth-ui.js';
 import { refreshCliInstallSections } from './cli-install-ui.js';
+import { refreshUpdateSection } from './update-ui.js';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -1674,6 +1675,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshPushSettingsSection();
   void refreshPreviewsSection();
   void refreshFeatureFlagsSection();
+  void refreshUpdateSection();
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
 }
