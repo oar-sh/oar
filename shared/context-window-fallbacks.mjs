@@ -20,6 +20,7 @@ export const MODEL_FALLBACK_LIMITS = Object.freeze({
   'claude-haiku-4.5': 200000,
   // Anthropic Claude Fable
   'claude-fable-5': 200000,
+  'claude-fable-5.1': 200000,
   // Anthropic Claude Opus
   'claude-opus-5': 200000,
   'claude-opus-4.8': 200000,
