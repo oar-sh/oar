@@ -191,30 +191,34 @@ test.describe.serial("Copilot engine panel on an SDK-capable relay", () => {
   test("saves the SDK engine from the panel and keeps it across a reload", async ({ page, request }) => {
     page.on("dialog", (dialog) => { dialog.accept().catch(() => {}); });
 
+    // Since extension-retirement Phase 6 an SDK-capable relay defaults to the
+    // SDK engine, so the panel opens there.
     await loadApp(page, { baseUrl: relay.baseUrl, token: relay.token });
     await openCopilotSettings(page);
-    await expect(engineSelect(page)).toHaveValue("extension");
-
-    await saveEngineFromPanel(page, "sdk");
+    await expect(engineSelect(page)).toHaveValue("sdk");
     await expect(engineStatus(page)).toHaveAttribute("data-state", "active");
     await expect(engineStatus(page)).toHaveText(SDK_STATUS);
-    await expect(engineSelect(page)).toHaveValue("sdk");
+
+    // The panel is not a one-way door: extension stays selectable.
+    await saveEngineFromPanel(page, "extension");
+    await expect(engineStatus(page)).toHaveAttribute("data-state", "unconfigured");
+    await expect(engineSelect(page)).toHaveValue("extension");
 
     // Persistence is the point of the setting: a worker spawned after a relay
     // restart has to pick the same engine.
     expect(await readEngine(request, { baseUrl: relay.baseUrl, token: relay.token }))
-      .toEqual({ engine: "sdk", engines: ["extension", "sdk"] });
+      .toEqual({ engine: "extension", engines: ["extension", "sdk"] });
 
     await loadApp(page, { baseUrl: relay.baseUrl, token: relay.token });
     await openCopilotSettings(page);
-    await expect(engineSelect(page)).toHaveValue("sdk");
-    await expect(engineStatus(page)).toHaveAttribute("data-state", "active");
+    await expect(engineSelect(page)).toHaveValue("extension");
 
-    // And back, so the panel is not a one-way door.
-    await saveEngineFromPanel(page, "extension");
-    await expect(engineStatus(page)).toHaveAttribute("data-state", "unconfigured");
+    // And back to the SDK default.
+    await saveEngineFromPanel(page, "sdk");
+    await expect(engineStatus(page)).toHaveAttribute("data-state", "active");
+    await expect(engineStatus(page)).toHaveText(SDK_STATUS);
     expect((await readEngine(request, { baseUrl: relay.baseUrl, token: relay.token })).engine)
-      .toBe("extension");
+      .toBe("sdk");
   });
 
   test("names the missing SDK path, distinctly from the routing refusal", async ({ request }) => {
