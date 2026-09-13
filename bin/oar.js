@@ -363,7 +363,10 @@ export async function launchRelay({
     const serverErrFd = openAppendFileDescriptor(serverErrPath);
     try {
       serverProc = spawnImpl(nodeBin, serverArgs, {
-        cwd: packageRoot,
+        // Global installs run from the OAR state root: on Windows a process
+        // pins its cwd, and `npm i -g` (self-update) must be able to replace
+        // the package directory. Checkouts keep the repo as cwd.
+        cwd: layout.checkout ? packageRoot : layout.root,
         env: baseEnv,
         stdio: ['ignore', serverOutFd, serverErrFd],
         windowsHide: false,

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { resolveOarRoot } from './oar-state-migration-service.mjs';
 
 export const WINDOWS_AUTOSTART_FILENAME = 'oar-web-relay.cmd';
 // The pre-rebrand name. Never written anymore, but still recognized (an install
@@ -24,6 +25,10 @@ export function buildWindowsAutostartScript({
   packageRoot,
   nodePath = process.execPath,
   configPath = '',
+  // On Windows a process pins its cwd, and self-update must be able to
+  // replace the package directory — so the relay runs from the OAR state
+  // root, not from the code it executes.
+  workingDirectory = '',
   pathImpl = path,
 } = {}) {
   const resolvedPackageRoot = pathImpl.resolve(String(packageRoot || ''));
@@ -42,8 +47,11 @@ export function buildWindowsAutostartScript({
   if (String(configPath || '').trim()) {
     lines.push(`set "COPILOT_WEB_RELAY_CONFIG=${escapeBatchValue(pathImpl.resolve(configPath))}"`);
   }
+  const cwdTarget = String(workingDirectory || '').trim()
+    ? pathImpl.resolve(String(workingDirectory))
+    : resolvedPackageRoot;
   lines.push(
-    `cd /d "${escapeBatchValue(resolvedPackageRoot)}"`,
+    `cd /d "${escapeBatchValue(cwdTarget)}"`,
     `"${escapeBatchValue(resolvedNodePath)}" "${escapeBatchValue(serverPath)}"`,
     '',
   );
@@ -118,6 +126,7 @@ export function createWindowsAutostartService({
       packageRoot,
       nodePath,
       configPath,
+      workingDirectory: resolveOarRoot(env, platform),
       pathImpl,
     });
     if (existed && fsImpl.readFileSync(targetPath, 'utf8') === script) {

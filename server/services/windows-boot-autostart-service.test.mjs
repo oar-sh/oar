@@ -32,16 +32,20 @@ const LAUNCHER = path.win32.join(OAR_ROOT, BOOT_LAUNCHER_FILENAME);
 
 // ─── Launcher script ─────────────────────────────────────────────────────────
 
-test('the boot launcher pins config, cds to the package root and runs server.js', () => {
+test('the boot launcher pins config, cds to the OAR root (not the package dir) and runs server.js', () => {
   const script = buildBootLauncherScript({
     packageRoot: PACKAGE_ROOT,
     nodePath: NODE_PATH,
     configPath: CONFIG_PATH,
+    workingDirectory: OAR_ROOT,
     pathImpl: path.win32,
   });
   assert.match(script, /^@echo off\r\n/);
   assert.ok(script.includes(`set "COPILOT_WEB_RELAY_CONFIG=${CONFIG_PATH}"`));
-  assert.ok(script.includes(`cd /d "${PACKAGE_ROOT}"`));
+  // cwd must NOT be the package dir: a Windows process pins its cwd, and
+  // self-update has to be able to replace the package directory.
+  assert.ok(script.includes(`cd /d "${OAR_ROOT}"`));
+  assert.ok(!script.includes(`cd /d "${PACKAGE_ROOT}"`));
   assert.ok(script.includes(`"${NODE_PATH}" "${PACKAGE_ROOT}\\server\\server.js"`));
   // Session 0 has no console; a `title` line would be pure noise.
   assert.ok(!script.includes('title '));
@@ -60,7 +64,7 @@ test('the launcher omits the config line when no config path is set, and escapes
 // ─── Task XML ────────────────────────────────────────────────────────────────
 
 test('the task XML carries the proven settings: S4U by SID, boot+30s, no time limit, restart policy', () => {
-  const xml = buildBootTaskXml({ sid: SID, launcherPath: LAUNCHER, packageRoot: PACKAGE_ROOT });
+  const xml = buildBootTaskXml({ sid: SID, launcherPath: LAUNCHER, packageRoot: PACKAGE_ROOT, workingDirectory: OAR_ROOT });
   assert.ok(xml.includes(`<UserId>${SID}</UserId>`));
   assert.ok(xml.includes('<LogonType>S4U</LogonType>'));
   assert.ok(xml.includes('<BootTrigger>'));
@@ -73,7 +77,7 @@ test('the task XML carries the proven settings: S4U by SID, boot+30s, no time li
   assert.ok(xml.includes(`<URI>\\${BOOT_TASK_NAME}</URI>`));
   assert.ok(xml.includes('<Command>C:\\Windows\\System32\\cmd.exe</Command>'));
   assert.ok(xml.includes(`<Arguments>/d /c "${LAUNCHER}"</Arguments>`));
-  assert.ok(xml.includes(`<WorkingDirectory>${PACKAGE_ROOT}</WorkingDirectory>`));
+  assert.ok(xml.includes(`<WorkingDirectory>${OAR_ROOT}</WorkingDirectory>`));
 });
 
 test('the task XML refuses a non-SID and escapes XML-hostile paths', () => {

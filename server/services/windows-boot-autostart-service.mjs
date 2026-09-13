@@ -63,6 +63,11 @@ export function buildBootLauncherScript({
   packageRoot,
   nodePath = process.execPath,
   configPath = '',
+  // Where the relay process lives, NOT where its code lives: on Windows a
+  // process pins its cwd, and self-update must be able to replace the package
+  // directory. Callers pass the OAR state root; the package-root default only
+  // serves builders that predate self-update.
+  workingDirectory = '',
   pathImpl = path,
 } = {}) {
   if (!normalizeText(packageRoot)) {
@@ -81,8 +86,11 @@ export function buildBootLauncherScript({
   if (normalizeText(configPath)) {
     lines.push(`set "COPILOT_WEB_RELAY_CONFIG=${escapeBatchValue(pathImpl.resolve(configPath))}"`);
   }
+  const cwdTarget = normalizeText(workingDirectory)
+    ? pathImpl.resolve(String(workingDirectory))
+    : resolvedPackageRoot;
   lines.push(
-    `cd /d "${escapeBatchValue(resolvedPackageRoot)}"`,
+    `cd /d "${escapeBatchValue(cwdTarget)}"`,
     `"${escapeBatchValue(pathImpl.resolve(nodePath))}" "${escapeBatchValue(serverPath)}"`,
     '',
   );
@@ -98,6 +106,9 @@ export function buildBootTaskXml({
   sid,
   launcherPath,
   packageRoot,
+  // See buildBootLauncherScript: the task's cwd must survive a self-update
+  // replacing the package directory, so callers pass the OAR state root.
+  workingDirectory = '',
   description = 'Starts the OAR web relay at system startup (S4U, no logon required). Managed by OAR settings.',
 } = {}) {
   if (!/^S-1-[\d-]+$/.test(normalizeText(sid))) {
@@ -143,7 +154,7 @@ export function buildBootTaskXml({
     '    <Exec>',
     '      <Command>C:\\Windows\\System32\\cmd.exe</Command>',
     `      <Arguments>/d /c "${escapeXml(launcherPath)}"</Arguments>`,
-    `      <WorkingDirectory>${escapeXml(packageRoot)}</WorkingDirectory>`,
+    `      <WorkingDirectory>${escapeXml(normalizeText(workingDirectory) || packageRoot)}</WorkingDirectory>`,
     '    </Exec>',
     '  </Actions>',
     '</Task>',
@@ -414,7 +425,7 @@ export function createWindowsBootAutostartService({
       return { ...(await getState()), accepted: false };
     }
     lastError = null;
-    writeFileAtomic(launcherPath(), buildBootLauncherScript({ packageRoot, nodePath, configPath, pathImpl }));
+    writeFileAtomic(launcherPath(), buildBootLauncherScript({ packageRoot, nodePath, configPath, workingDirectory: oarRoot(), pathImpl }));
     const who = await execFileImpl('whoami', ['/user', '/fo', 'csv']);
     const sid = parseSidFromWhoami(who.stdout);
     if (!sid) {
@@ -425,6 +436,7 @@ export function createWindowsBootAutostartService({
       sid,
       launcherPath: launcherPath(),
       packageRoot: pathImpl.resolve(String(packageRoot)),
+      workingDirectory: oarRoot(),
     })));
     writeFileAtomic(elevationScriptPath(), buildElevationScript({ action: 'enable', xmlPath: xmlPath() }));
     spawnElevated('enable', (ok) => {
