@@ -39,6 +39,10 @@ test('a probe opens no HTTP request against the app', async (t) => {
   const requests = [];
   const server = net.createServer((socket) => {
     socket.on('data', (chunk) => requests.push(chunk.toString('utf8')));
+    // The probe hangs up the instant it connects, which on Windows arrives as
+    // an RST rather than a clean FIN. Without a handler that surfaces as an
+    // uncaught ECONNRESET and fails the test the reset is supposed to prove.
+    socket.on('error', () => {});
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
