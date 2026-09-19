@@ -125,6 +125,12 @@ async function main() {
     token,
     dbg,
     getSessionReady: () => true,
+    // Mid-turn steering: while a turn is running and the runner can absorb
+    // another message into it, the link keeps signalling readiness, so a
+    // message sent while Claude is thinking is pushed into the live turn
+    // instead of waiting for the result (docs/plans/2026-09-19-claude-mid-
+    // turn-steering.md).
+    getSteeringReady: () => turnRunner.canAcceptSteering(),
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
     onDeliver: async (pending, reason) => {

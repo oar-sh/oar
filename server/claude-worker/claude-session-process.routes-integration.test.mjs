@@ -311,6 +311,96 @@ test('an absorbed steering turn settles the real queue rows through the real rou
   await settled(runner);
 });
 
+test('a steered delivered turn persists kind=absorbed on the interrupted reply', async (t) => {
+  const { db, stmts, deps, api } = bootRelayRoutes();
+  const cwd = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'claude-routes-absorb-'));
+  t.after(() => { fsSync.rmSync(cwd, { recursive: true, force: true }); });
+
+  const enqueue1 = await api('POST', '/api/message', {
+    clientId: 'client-absorb-1',
+    conversationId: CONV,
+    text: 'first',
+    model: MODEL,
+    relayMode: 'agent',
+  });
+  const msg1Id = enqueue1.messageId;
+  const delivered1 = dequeueForWorker({ db, stmts, deps });
+  assert.equal(delivered1?.id, msg1Id);
+
+  const turn = scriptedTurn();
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: CONV,
+    cwd,
+    startClaudeSessionImpl: () => turn,
+    relocateTranscriptImpl: noopRelocate,
+    continuationRetryDelayMs: 10,
+    lifecyclePollMs: 10,
+  });
+
+  // Turn 1 streams before it is absorbed, so its row keeps that text.
+  const first = runner.handlePendingPayload({ message: delivered1 });
+  turn.emit(initMessage('native-absorb-1'));
+  turn.emit(userReplay('first'));
+  turn.emit({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'starting the first thing' } },
+  });
+  await waitFor(
+    () => db.prepare(`SELECT COUNT(*) AS cnt FROM relay_stream_events WHERE queue_message_id = ?`).get(msg1Id).cnt > 0,
+    { label: 'turn 1 streamed before absorption' },
+  );
+
+  // Message 2 arrives mid-turn and the CLI absorbs it (steering).
+  const enqueue2 = await api('POST', '/api/message', {
+    clientId: 'client-absorb-1',
+    conversationId: CONV,
+    text: 'and also this',
+    model: MODEL,
+    relayMode: 'agent',
+  });
+  const msg2Id = enqueue2.messageId;
+  const delivered2 = dequeueForWorker({ db, stmts, deps });
+  assert.equal(delivered2?.id, msg2Id);
+
+  const second = runner.handlePendingPayload({ message: delivered2 });
+  await waitFor(
+    () => runner._getProcess()?.pendingDelivered?.length === 1,
+    { label: 'message 2 pushed into the live turn' },
+  );
+  turn.emit(userReplay('and also this'));
+  turn.emit({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'did both things' } },
+  });
+  turn.emit(resultMessage('did both things', 'native-absorb-1'));
+
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  const row1 = stmts.findQById.get(msg1Id);
+  assert.equal(row1.status, 'done', 'the interrupted row completes (never requeued — the CLI consumed it)');
+  const assistant1 = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(row1.response_message_id);
+  assert.equal(assistant1?.kind, 'absorbed', 'the interrupted reply is stamped kind=absorbed');
+  assert.equal(assistant1?.text, 'starting the first thing');
+
+  const row2 = stmts.findQById.get(msg2Id);
+  assert.equal(row2.status, 'done');
+  const assistant2 = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(row2.response_message_id);
+  assert.equal(assistant2?.text, 'did both things');
+  assert.notEqual(assistant2?.kind, 'absorbed', 'the steered row owns the real answer, not the merge marker');
+
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS cnt FROM queue WHERE status = 'processing'`).get().cnt,
+    0,
+    'no queue row is left processing',
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
 // ---------------------------------------------------------------------------
 // Idempotent continuation registration. The worker mints one operationId
 // before its first POST and repeats it on retries, so a retry whose previous

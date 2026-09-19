@@ -45,6 +45,14 @@ export function createWorkerWebSocketLink({
   // task). Never blocks delivery; failures are the handler's to log.
   onControl = () => {},
   getSessionReady = () => false,
+  // Mid-turn steering opt-in. A worker whose runner can absorb another
+  // delivered message into the live turn (the Claude session runner; the
+  // Copilot runner's steerIntoActiveTurn is compatible but not yet opted in)
+  // reports so here, and the link then keeps signalling readiness while a
+  // delivery is still in flight and runs the resulting concurrent delivery
+  // instead of coalescing it. Workers that leave this unset keep the strict
+  // single-flight contract.
+  getSteeringReady = null,
   getSessionId = () => null,
   getPid = () => null,
   minBackoffMs = 1000,
@@ -65,7 +73,9 @@ export function createWorkerWebSocketLink({
   let readyRefreshTimer = null;
   let reconnectAttempt = 0;
   let reconnectDelayMs = 0;
-  let deliveryInFlight = null;
+  // Insertion-ordered: the first entry is the oldest in-flight delivery, which
+  // is what a coalesced redelivery waits on.
+  const deliveriesInFlight = new Set();
   let lastOpenAt = null;
   let lastMessageAt = null;
   let lastHelloSentAt = null;
@@ -106,8 +116,18 @@ export function createWorkerWebSocketLink({
     return sent;
   }
 
+  function steeringReady() {
+    if (typeof getSteeringReady !== "function") return false;
+    try {
+      return getSteeringReady() === true;
+    } catch {
+      return false;
+    }
+  }
+
   async function notifyReady(reason = "worker-ready") {
-    if (!getSessionReady() || deliveryInFlight) return false;
+    if (!getSessionReady()) return false;
+    if (deliveriesInFlight.size && !steeringReady()) return false;
     const sent = send({
       type: "worker.ready",
       reason,
@@ -132,8 +152,19 @@ export function createWorkerWebSocketLink({
 
   async function deliverPending(pending, reason = "queue-deliver") {
     if (!getSessionReady()) return false;
-    if (deliveryInFlight) return deliveryInFlight;
-    deliveryInFlight = Promise.resolve()
+    // Without steering, a delivery landing while one is in flight is a
+    // redelivery (socket reconnect): coalesce onto the running one rather than
+    // double-running the turn. With the worker steering-ready, it is a second
+    // message meant for the live turn and runs as its own delivery — the
+    // server only hands out distinct *pending* rows, so this is a genuinely new
+    // message, not a redelivery of the one already running. (There is no
+    // id-level dedup backstop; a same-id redelivery is only possible once a
+    // delivery has settled and its lease lapsed, a window that already defeats
+    // the coalescing below, so steering does not widen it.)
+    if (deliveriesInFlight.size && !steeringReady()) {
+      return deliveriesInFlight.values().next().value;
+    }
+    const delivery = Promise.resolve()
       .then(() => onDeliver(pending, reason))
       .catch((error) => {
         dbg("worker ws delivery failed", reason, error?.message || String(error));
@@ -141,9 +172,10 @@ export function createWorkerWebSocketLink({
       })
       .finally(() => {
         lastDeliveryAt = getNowMs();
-        deliveryInFlight = null;
+        deliveriesInFlight.delete(delivery);
       });
-    return deliveryInFlight;
+    deliveriesInFlight.add(delivery);
+    return delivery;
   }
 
   function clearReconnectTimer() {
@@ -173,7 +205,12 @@ export function createWorkerWebSocketLink({
       return closeStaleSocket(`no-server-message:${reason}`);
     }
     notifyPing(reason);
-    if (deliveryInFlight) return true;
+    if (deliveriesInFlight.size) {
+      // notifyReady gates itself: it only goes through mid-delivery when the
+      // worker is steering-ready. Hello stays an idle-only affair.
+      void notifyReady(reason);
+      return true;
+    }
     notifyHello(reason);
     void notifyReady(reason);
     return true;
@@ -302,7 +339,7 @@ export function createWorkerWebSocketLink({
     const connected = !!ws && ws.readyState === resolveSocketStateValue(ws, "OPEN", 1);
     return {
       connected,
-      delivering: !!deliveryInFlight,
+      delivering: deliveriesInFlight.size > 0,
       reconnectAttempt,
       reconnectDelayMs,
       lastOpenAt,

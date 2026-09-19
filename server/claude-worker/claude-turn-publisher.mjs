@@ -180,7 +180,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     }).catch(() => {});
   }
 
-  async function publishResponse(message, { text, model, terminalError = null, modelOrigin }) {
+  async function publishResponse(message, { text, model, terminalError = null, modelOrigin, absorbed = false }) {
     // Final digests of workflows that settled since the last response ride the
     // next successful response publish — the summarizing turn is the natural
     // transcript anchor for the "Finished background task" card. Terminal
@@ -199,6 +199,9 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
       ...(Array.isArray(workflowRuns) && workflowRuns.length ? { workflowRuns } : {}),
       ...(terminalError ? { terminalError } : {}),
+      // A steering absorption: the reply continues after the next (steered)
+      // user message; the relay stamps kind='absorbed' for the merged render.
+      ...(absorbed ? { absorbed: true } : {}),
       ...attemptFields(message),
     }).catch(async (error) => {
       // A stale_attempt 409 means the row already moved on to another attempt

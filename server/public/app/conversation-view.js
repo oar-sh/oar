@@ -83,6 +83,7 @@ import {
   relayActivityEntryText,
 } from './activity-replay-state.mjs';
 import { SEPARATOR_CLASS, syncSeparatorRail, syncTranscriptSeparators } from './transcript-separators.mjs';
+import { ABSORBED_MSG_CLASS, syncSteeredTurnMerge } from './steered-turn-merge.mjs';
 import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
@@ -110,6 +111,7 @@ function syncSeparatorsNow() {
   const el = getMessagesElement();
   if (!el) return;
   syncTranscriptSeparators(el);
+  syncSteeredTurnMerge(el);
   observeTranscriptResize(el);
 }
 
@@ -306,6 +308,9 @@ const conversationHistoryLoader = createInfiniteLoader({
     // separator rows, and the height delta the restore measures has to include
     // them or the viewport jumps.
     syncTranscriptSeparators(el);
+    // A steering pair split across the page boundary heals here (the absorbed
+    // reply just arrived above its already-rendered steered user row).
+    syncSteeredTurnMerge(el);
     requestAnimationFrame(() => {
       if (!el || String(currentConvId || '').trim() !== currentId) return;
       const nextScrollHeight = el.scrollHeight;
@@ -830,6 +835,12 @@ function createMessageNode(msg, msgId = null, force = false) {
   const continuationTag = (msg.role === 'assistant' && String(msg?.kind || '').trim() === 'continuation')
     ? ' <span class="msg-continuation" title="The agent continued on its own after a background task finished.">background continuation</span>'
     : '';
+  // A steering absorption: this reply continues through the next (steered)
+  // user message. The class feeds syncSteeredTurnMerge, which joins the trio
+  // into one visual flow.
+  if (msg.role === 'assistant' && String(msg?.kind || '').trim() === 'absorbed') {
+    div.classList.add(ABSORBED_MSG_CLASS);
+  }
   // A turn answered by a different provider than the conversation is bound to
   // (e.g. the Copilot relay answering a Cursor conversation) must be visible,
   // not silent: it ran on another plan than the header indicates.
@@ -2440,6 +2451,9 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
       mode: String(item?.mode || '').trim(),
       attachments: Array.isArray(item?.attachments) ? item.attachments.length : 0,
       hiddenFromShares: item?.hiddenFromShares === true,
+      // The continuation badge and the absorbed (steering) merge both hang
+      // off kind; a payload differing only in it must not short-circuit.
+      kind: String(item?.kind || '').trim(),
       // Without this, a payload that differs from the last render only by a
       // newly linked compaction activity short-circuits below and the break
       // row never appears until some unrelated field changes.

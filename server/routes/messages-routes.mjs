@@ -6058,6 +6058,11 @@ export function registerMessagesRoutes(app, deps) {
   app.post('/api/response', auth, async (req, res) => {
     touchCli();
     const { messageId, conversationId, text, model, mode, generatedImages: rawGeneratedImages } = req.body;
+    // A steering absorption (Claude worker): this reply ends where a message
+    // pushed mid-turn was picked up, and the turn continues on that message's
+    // own row. Stamped as kind='absorbed' so the transcript renders the two
+    // turns as one merged flow.
+    const absorbed = req.body.absorbed === true;
     const trimmedText = String(text || '').trim();
     const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
     // Final digests of background workflows that settled during this turn —
@@ -6282,6 +6287,8 @@ export function registerMessagesRoutes(app, deps) {
       );
       if (String(q?.kind || '') === 'continuation') {
         stmts.setMessageKind?.run('continuation', responseId);
+      } else if (absorbed) {
+        stmts.setMessageKind?.run('absorbed', responseId);
       }
       // The workflow cards persist atomically with the assistant message they
       // annotate — keyed directly on the response id (see workflow_runs DDL).
@@ -6520,18 +6527,24 @@ export function registerMessagesRoutes(app, deps) {
         activities,
         thoughts,
         executedProvider,
-        kind: String(q?.kind || '') === 'continuation' ? 'continuation' : undefined,
+        kind: String(q?.kind || '') === 'continuation'
+          ? 'continuation'
+          : (absorbed ? 'absorbed' : undefined),
         // Live-appended messages must show their workflow cards without a
         // reload; conversation reloads serve the same digests from the DB.
         workflowRuns: workflowRuns.length ? workflowRuns : undefined,
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
-    void pushDispatchService?.notifyTurnComplete?.({
-      conversationId: targetConversationId,
-      messageId: responseId,
-      text: resolvedText,
-    });
+    // An absorbed row is not a finished turn — the reply continues on the
+    // steered message's row, whose own completion sends the one notification.
+    if (!absorbed) {
+      void pushDispatchService?.notifyTurnComplete?.({
+        conversationId: targetConversationId,
+        messageId: responseId,
+        text: resolvedText,
+      });
+    }
     cancelPendingRelayQuestionsForMessage(messageId);
     res.json({ ok: true });
   });

@@ -872,7 +872,15 @@ test('a message absorbed into a running delivered turn frees both rows', async (
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
   turn.emit(initMessage('native-1'));
   turn.emit(userReplay('hello'));
-  turn.emit(assistantText('working on it'));
+  turn.emit({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'working on it' } },
+  });
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/stream' && call.body.messageId === 'q-1'),
+    { label: 'the first turn is streaming before it is absorbed' },
+  );
   // Second message lands while the first turn is still streaming; the CLI
   // absorbs it: replay mid-turn, one result for the combined turn.
   const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and also this' } });
@@ -891,10 +899,86 @@ test('a message absorbed into a running delivered turn frees both rows', async (
     undefined,
   );
   const firstResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
-  assert.match(firstResponse.body.text, /merged into the next message/);
+  // The absorbed row keeps what it streamed and is stamped absorbed:true, so
+  // the transcript merges it with the steered message instead of showing a
+  // prose "merged" note in the body.
+  assert.equal(firstResponse.body.text, 'working on it');
+  assert.equal(firstResponse.body.absorbed, true);
   const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
   assert.equal(secondResponse.body.text, 'did both things');
+  assert.notEqual(secondResponse.body.absorbed, true);
   assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an absorbed delivered turn that streamed nothing keeps an explanatory stub', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  // No assistant text before the steered message is absorbed.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and also this' } });
+  await tick(20);
+  turn.emit(userReplay('and also this'));
+  turn.emit(resultMessage('did both things', 'native-1'));
+
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  const firstResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  // A marker-blind or exported view still needs to know the stub is not the
+  // real answer, so the empty case keeps a note — and is still absorbed:true.
+  assert.match(firstResponse.body.text, /Answered together with the next message/);
+  assert.equal(firstResponse.body.absorbed, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('canAcceptSteering gates on a live, uncomplicated turn', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  // No process yet.
+  assert.equal(runner.canAcceptSteering(), false);
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  // A turn is live and unencumbered: steering is allowed.
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'steering opens on a live turn' });
+
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+  // The turn ended: back to no live context, so steering closes.
+  await waitFor(() => runner.canAcceptSteering() === false, { label: 'steering closes after the result' });
+  turn.endInput();
+  await settled(runner);
+});
+
+test('steering is refused while a control round-trip (question) is pending', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'steering opens' });
+
+  // Simulate a pending canUseTool round-trip (AskUserQuestion / plan approval).
+  runner._getProcess().pendingControlRequests += 1;
+  assert.equal(runner.canAcceptSteering(), false);
+  runner._getProcess().pendingControlRequests -= 1;
+  assert.equal(runner.canAcceptSteering(), true);
+
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
   turn.endInput();
   await settled(runner);
 });
@@ -2269,7 +2353,7 @@ test('a mid-turn absorption picks the message it matches, not the queue head', {
   const answerFor = (id) => stub.calls.find(
     (call) => call.routePath === '/api/response' && call.body.messageId === id,
   )?.body.text;
-  assert.match(answerFor('q-1'), /merged into the next message/);
+  assert.match(answerFor('q-1'), /Answered together with the next message/);
   assert.equal(answerFor('q-3'), 'done');
 
   turn.emit(userReplay('second'));

@@ -1075,11 +1075,14 @@ export function createClaudeSessionRunner({
       // NEVER requeue an absorbed delivered row: the CLI already consumed
       // the prompt into the running turn — re-delivery would execute it a
       // second time (and the requeue route marks the healthy worker errored).
-      const text = fallbackText
-        ? `${fallbackText}\n\n_(This turn was merged into the next message — the reply continues there.)_`
-        : '_(This turn was merged into the next message — see the following reply.)_';
+      // `absorbed: true` becomes `kind='absorbed'` on the assistant message,
+      // and the transcript renders the reply as continuing through the next
+      // (steered) user message — so the text carries no prose note when
+      // something streamed; the empty case keeps one so an exported or
+      // marker-blind view still explains the stub.
+      const text = fallbackText || '_(Answered together with the next message.)_';
       await publisher.publishFinalStream(ctx.message, text);
-      await publisher.publishResponse(ctx.message, { text, model });
+      await publisher.publishResponse(ctx.message, { text, model, absorbed: true });
     } else if (fallbackText) {
       await publisher.publishFinalStream(ctx.message, fallbackText);
       await publisher.publishResponse(ctx.message, { text: fallbackText, model });
@@ -2304,11 +2307,47 @@ export function createClaudeSessionRunner({
   // ---------------------------------------------------------------------------
   // Relay contract
 
+  /**
+   * Whether a new delivered message may be pushed into the live turn
+   * (mid-turn steering) instead of waiting in the relay queue for the
+   * result. The CLI dequeues a mid-turn push into the running turn; the
+   * absorbed-steering handoff in resolveContext is the receiving end.
+   * Deliberately narrow — every exclusion here guards an invariant that
+   * already exists:
+   *  - a pending canUseTool round-trip (AskUserQuestion, plan approval)
+   *    holds steering entirely, so the bridge reply and a steered push can
+   *    never race in the CLI (a deliberate product decision, 2026-09-19);
+   *  - a compaction replays the turn when it finishes, and a push into that
+   *    window would land inside the replay;
+   *  - a provisional post-compaction adoption may still be unwound on the
+   *    premise that the CLI never consumed the row's prompt — steering
+   *    another message in would spend that premise for it;
+   *  - one steered message at a time: the previous push must attach before
+   *    another may ride (this is also what re-arms the link's readiness).
+   */
+  function canAcceptSteering() {
+    if (!proc || proc.closing || proc.aborted) return false;
+    const ctx = proc.activeCtx;
+    if (!ctx || ctx.finalized || ctx.discarded || ctx.interrupted) return false;
+    if (ctx.adoptedFromCompaction) return false;
+    if (proc.pendingDelivered.length) return false;
+    if (proc.pendingControlRequests > 0) return false;
+    if (isCompacting()) return false;
+    return true;
+  }
+
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
     try {
-      if (proc && !proc.closing && !proc.aborted) {
+      // A steered delivery (a turn is live) must not run the settings diffs:
+      // setModel/effort/mode against a mid-flight turn would disturb the very
+      // turn the message is steering into, and the mode-change recycle is
+      // refused under live work anyway. The next between-turns delivery
+      // re-runs adaptProcess with the then-current settings, so nothing is
+      // lost — the steered message's own model/mode intent applies from the
+      // next turn on, same as Claude Code.
+      if (proc && !proc.closing && !proc.aborted && !proc.activeCtx) {
         await adaptProcess(message);
       }
       if (!proc || proc.closing || proc.aborted) {
@@ -2410,6 +2449,7 @@ export function createClaudeSessionRunner({
 
   return {
     handlePendingPayload,
+    canAcceptSteering,
     getActiveQueueMessageId,
     getActiveQueueMessageIds,
     isTurnActive,

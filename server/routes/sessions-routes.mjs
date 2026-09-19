@@ -1775,6 +1775,10 @@ export function buildConversationMessages({
           timestamp: message?.timestamp,
           sourceMessageId,
           executedProvider: message?.executed_provider || message?.executedProvider || undefined,
+          // 'continuation' badges a self-started turn; 'absorbed' marks a
+          // reply that continues through the next (steered) user message.
+          // Without this the live-appended badge/merge vanished on reload.
+          kind: message?.kind || undefined,
         };
       })
     : [];
