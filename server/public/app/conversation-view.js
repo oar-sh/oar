@@ -10,6 +10,7 @@ import {
   hasPendingUserMessageDuplicate,
   clearPendingUserMessage,
   pendingUserMessageIds,
+  pendingUserMessageEntries,
   trackPendingUserMessage,
   seenMessageIds,
   relayActivities,
@@ -2505,7 +2506,29 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
       .map((item) => [String(item?.id || '').trim(), item])
       .filter(([id]) => !!id),
   );
-  if (!ordered.length) {
+  // Preserve optimistic pending user bubbles the payload does not yet carry.
+  // A message is persisted the instant it is sent, but a poll whose response
+  // predates the send returns a payload without it; rebuilding from that stale
+  // payload would drop the just-sent bubble until the next poll catches up
+  // (it "vanishes then reappears"). Steering makes this visible because the
+  // absorbed-reply broadcast forces extra rebuilds during the send window.
+  // Capturing the live DOM nodes keeps their exact content and handlers; the
+  // wipe below orphans them but the references keep them alive to re-append.
+  // Matches store.js pendingConversationKey (trimmed id, or '__new__').
+  const renderConversationKey = String(meta.conversationId || currentConvId || '').trim() || '__new__';
+  const preservedPendingNodes = [];
+  for (const id of pendingUserMessageIds) {
+    const pendingId = String(id || '').trim();
+    if (!pendingId || messageById.has(pendingId)) continue;
+    // Only this conversation's pending bubbles: a bubble still waiting in
+    // another conversation must never be carried into the one being rendered
+    // (a switch would otherwise drag it along).
+    const entry = pendingUserMessageEntries.get(pendingId);
+    if (String(entry?.conversationKey || '').trim() !== renderConversationKey) continue;
+    const node = el.querySelector(`[data-message-id="${CSS.escape(pendingId)}"]`);
+    if (node) preservedPendingNodes.push(node);
+  }
+  if (!ordered.length && !preservedPendingNodes.length) {
     el.innerHTML = `<div class="empty-state">
       <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
       <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
@@ -2573,6 +2596,10 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   });
   withSuspendedSeparatorSync(() => {
     for (const m of ordered) appendMessage(m, false, m.id || null, true, getMessageThreadAnchor(m, messageById), false);
+    // A pending bubble the payload lacks is the newest message, so it re-joins
+    // at the end. Re-appending the original node (not a fresh one) keeps its
+    // cancel button and click handlers intact.
+    for (const node of preservedPendingNodes) el.appendChild(node);
   });
   syncSeparatorsNow();
   renderRelayQuestions();

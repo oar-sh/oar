@@ -405,6 +405,15 @@ export function createClaudeSessionRunner({
   // the slowest cold start observed; the primary absorbed-steering fix in
   // resolveContext should make this fire only for unknown variants.
   pendingDeliveredTimeoutMs = 5 * 60_000,
+  // How long a STEERED entry (pushed while a turn was already running) may sit
+  // unattached once the process goes idle before it is settled as merged into
+  // the turn it was folded into. The CLI folds a mid-turn push into the running
+  // turn and answers with one result on that turn, without replaying the
+  // steered text — so a short grace after idle (long enough to rule out the CLI
+  // opening its own turn for it, which it does immediately if at all) is all it
+  // takes to distinguish a fold from a queued run. Far below the watchdog so a
+  // folded row settles as answered, not failed with a "resend" error.
+  steeredFoldGraceMs = 2_000,
   // Backstop for the compaction hold. A compaction is announced ONCE by
   // `status: 'compacting'` (the CLI's periodic re-emit is gated on the
   // remote-control client's activity callback, which the plain SDK `query()`
@@ -1870,6 +1879,61 @@ export function createClaudeSessionRunner({
     restoreAdoptedContext(ctx);
   }
 
+  /**
+   * Settle steered entries the CLI folded into a turn without replaying them.
+   * A mid-turn push is folded into the running turn and answered by that turn's
+   * single result — the steered entry never gets its own replay, so
+   * resolveContext's absorbed-steering handoff never fires and the entry would
+   * otherwise sit until the 5-minute watchdog fails it with a bogus "resend".
+   * Once the process is idle (nothing left that could still attach it) for the
+   * short fold grace, settle it as merged into the reply it was folded into.
+   */
+  function reapFoldedSteeredEntries(now) {
+    if (!proc || !proc.pendingDelivered.length) return;
+    if (!(steeredFoldGraceMs > 0)) return;
+    if (!proc.sawInit) return;
+    if (proc.activeCtx || proc.liveTasks.size || proc.pendingControlRequests > 0 || isCompacting()) {
+      // Not idle: the CLI may still open a turn for it (the ordinary
+      // delivered-attach path), so the fold clock has not started.
+      for (const entry of proc.pendingDelivered) entry.foldSince = 0;
+      return;
+    }
+    const folded = [];
+    proc.pendingDelivered = proc.pendingDelivered.filter((entry) => {
+      // A non-steered entry (pushed with no turn active) is a genuine queued
+      // turn or a real drop — that stays the watchdog's to resolve.
+      if (!entry.steered) return true;
+      if (!entry.foldSince) { entry.foldSince = now; return true; }
+      if (now - entry.foldSince < steeredFoldGraceMs) return true;
+      folded.push(entry);
+      return false;
+    });
+    for (const entry of folded) {
+      dbg('steered message folded into the finished turn; settling as merged', entry.ctx.message?.id || '(no id)');
+      void settleFoldedSteeredEntry(entry).catch((error) => dbg('folded-steer settle failed', error?.message || String(error)));
+    }
+  }
+
+  async function settleFoldedSteeredEntry(entry) {
+    const ctx = entry.ctx;
+    if (ctx.finalized) return;
+    ctx.finalized = true;
+    controlPoller?.stop?.(ctx.controlState);
+    const model = ctx.state.responseModel || proc?.model || null;
+    // No streamed text of its own — the answer lives on the turn it was folded
+    // into. absorbed:true stamps kind='absorbed' so the transcript renders it
+    // as merged rather than as a standalone unanswered turn.
+    const text = '_(Handled together with the previous reply — this message was steered into that turn.)_';
+    try {
+      await publisher.publishResponse(ctx.message, { text, model, absorbed: true });
+    } finally {
+      // The entry is already spliced out of pendingDelivered, so nothing else
+      // can resolve this delivery — resolveDone must run even if the publish
+      // threw, or handlePendingPayload's `await ctx.done` would hang forever.
+      ctx.resolveDone?.(true);
+    }
+  }
+
   function reapStalePendingDelivered(now) {
     if (!proc || !proc.pendingDelivered.length) return;
     if (!(pendingDeliveredTimeoutMs > 0)) return; // 0 = watchdog disabled
@@ -1907,6 +1971,9 @@ export function createClaudeSessionRunner({
     if (!proc || proc.closing) return;
     const now = Date.now();
     reapSilentProvisionalAdoption(now);
+    // Before the 5-minute watchdog: a folded steered entry settles as merged
+    // within the short fold grace instead of failing over.
+    reapFoldedSteeredEntries(now);
     reapStalePendingDelivered(now);
     if (hasLiveWork()) {
       // Track how long background tasks alone have held the process, for the
@@ -2377,7 +2444,17 @@ export function createClaudeSessionRunner({
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const procRef = proc;
         const ctx = createDeliveredContext(message);
-        procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now() });
+        // A message pushed while a turn is already active is a steered
+        // delivery. The CLI folds it into that running turn and answers
+        // everything with ONE result on the turn it was already running —
+        // it does NOT necessarily replay the steered text as a turn-opening
+        // user message, so the absorbed-steering handoff in resolveContext
+        // (which needs that replay) may never fire. Mark the entry so the
+        // fold reaper can settle it as merged once the turn it joined ends,
+        // instead of leaving its queue row stuck `processing` until the
+        // 5-minute watchdog fails it with a bogus "resend" error.
+        const steered = Boolean(procRef.activeCtx);
+        procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now(), steered });
         try {
           procRef.turn.pushUserMessage(content);
         } catch (pushError) {

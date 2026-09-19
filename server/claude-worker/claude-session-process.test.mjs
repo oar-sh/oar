@@ -937,6 +937,86 @@ test('an absorbed delivered turn that streamed nothing keeps an explanatory stub
   await settled(runner);
 });
 
+test('a steered message the CLI folds into the turn (no replay) settles as merged, not stuck', async () => {
+  // The real CLI folds a mid-turn push into the running turn and answers
+  // everything with ONE result on that turn — it does NOT replay the steered
+  // text as its own turn-opening user message, so resolveContext's absorbed
+  // handoff never fires. Without the fold reaper the steered row sits in
+  // pendingDelivered (queue row stuck `processing`) until the 5-minute
+  // watchdog fails it with a bogus "resend" — the 2026-09-19 regression.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  // The user steers a second message mid-turn; it is pushed and marked steered.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and stop after' } });
+  await waitFor(
+    () => runner._getProcess().pendingDelivered.length === 1 && runner._getProcess().pendingDelivered[0].steered === true,
+    { label: 'the steered entry is pending and tagged' },
+  );
+
+  // The CLI folds q-2 into the turn and emits ONE result for the whole turn —
+  // no replay for q-2. q-1 owns that result.
+  turn.emit(resultMessage('did the work and will stop', 'native-1'));
+  assert.equal(await first, true);
+  const firstResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.equal(firstResponse.body.text, 'did the work and will stop');
+  assert.notEqual(firstResponse.body.absorbed, true);
+
+  // After the short fold grace the steered row settles as merged — done with
+  // absorbed:true, NOT a watchdog failure.
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.absorbed, true);
+  assert.match(secondResponse.body.text, /Handled together with the previous reply/);
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-2'),
+    undefined,
+    'a folded steer is never requeued',
+  );
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'nothing left stuck in pendingDelivered');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a non-steered delivered entry the CLI never opens a turn for still fails over (watchdog)', async () => {
+  // The fold reaper must not swallow a genuine drop: a message delivered with
+  // no turn active (steered=false) whose replay never arrives is still the
+  // watchdog's to fail over.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    pendingDeliveredTimeoutMs: 60,
+    lifecyclePollMs: 10,
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  // No replay ever arrives and the entry was not steered (no active turn at
+  // push): the watchdog fails it, the fold reaper leaves it alone.
+  assert.equal(await pending, true);
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.ok(response.body.terminalError, 'a genuine drop still fails over');
+  assert.notEqual(response.body.absorbed, true);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('canAcceptSteering gates on a live, uncomplicated turn', async () => {
   const stub = makeApiStub();
   const turn = scriptedTurn();

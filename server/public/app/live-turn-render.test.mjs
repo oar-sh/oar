@@ -61,6 +61,22 @@ test('a background conversation finishing its turn cannot wipe the viewed live b
   );
 });
 
+test('renderMessages preserves optimistic pending bubbles the payload does not carry', () => {
+  // Regression (2026-09-19 steering): a poll whose response predates a just-sent
+  // message rebuilt the transcript without it and dropped the optimistic bubble
+  // until the next poll ("vanishes then reappears"). renderMessages must capture
+  // pending bubbles absent from the payload and re-append the live nodes.
+  const body = functionBody(readSource('./conversation-view.js'), 'renderMessages');
+  assert.match(body, /preservedPendingNodes/, 'renderMessages must collect pending bubbles missing from the payload');
+  assert.match(body, /pendingUserMessageIds/, 'the pending set drives which bubbles to preserve');
+  assert.match(body, /messageById\.has\(pendingId\)/, 'a bubble already in the payload is left to the rebuild');
+  assert.match(body, /conversationKey.*!==.*renderConversationKey|renderConversationKey/, 'a pending bubble from another conversation is never dragged in');
+  assert.match(body, /for \(const node of preservedPendingNodes\) el\.appendChild\(node\)/, 'preserved nodes are re-appended after the rebuild');
+  // The empty-state must not claim the transcript is empty while a pending
+  // bubble is still on screen.
+  assert.match(body, /!ordered\.length && !preservedPendingNodes\.length/);
+});
+
 test('message_status blacklists live streaming only on terminal statuses', () => {
   const source = readSource('./socket-handlers.js');
   assert.match(source, /if \(messageId && isTerminalStatus\) clearRelayStreamStateForMessage\(messageId\);/);

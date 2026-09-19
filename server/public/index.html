@@ -2578,16 +2578,20 @@
     background: rgba(63, 185, 80, 0.12); color: var(--relay-tone-online);
     border-radius: 6px; padding: 0 6px; font-size: var(--fs-meta-sm);
   }
-  /* Mid-turn steering: an absorbed reply, the user message steered into the
-     running turn, and the continuing reply render as one flow — the group
-     tightens against the transcript's 12px gap and the steered bubble reads
-     as injected rather than as a fresh turn. Classes come from
-     steered-turn-merge.mjs (kind='absorbed' on the interrupted reply). */
-  .msg.assistant.msg-absorbed { margin-bottom: -6px; }
-  .msg.assistant.msg-absorbed .msg-label::after { content: ' · reply continues below'; }
-  .msg.user.msg-steered { margin-top: -2px; }
+  /* Mid-turn steering. Two shapes reach here: the CLI usually FOLDS a steered
+     message into the running turn and answers everything with one reply, then
+     the steered row settles as a compact merged note (kind='absorbed'); more
+     rarely the turn is handed off and the steered message carries the
+     continuing reply. The absorbed row is a marker, not a real answer, so it
+     renders muted and compact — and never claims a continuation it cannot
+     guarantee. steered-turn-merge.mjs adds the adjacency classes. */
+  .msg.assistant.msg-absorbed .msg-bubble {
+    font-size: var(--fs-meta-md); color: var(--muted); font-style: italic;
+    padding: 6px 12px; opacity: 0.85;
+  }
+  .msg.assistant.msg-absorbed { margin-top: -4px; }
   .msg.user.msg-steered .msg-bubble { border-style: dashed; }
-  .msg.user.msg-steered .msg-label::after { content: ' · sent mid-turn'; }
+  .msg.user.msg-steered .msg-label::after { content: ' · steered mid-turn'; }
   .msg.assistant.msg-steered-continuation { margin-top: -2px; }
   body.shared-reader-mode #background-tasks-panel { display: none; }
   #model-pricing-details {

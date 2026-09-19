@@ -211,6 +211,14 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         dbg('response refused as stale_attempt; dropping', message.id);
         return;
       }
+      // NEVER requeue an absorbed row: the CLI already folded this prompt into
+      // a completed turn, so re-delivery would execute it a second time. On a
+      // failed publish the row stays processing and the worker's watchdog
+      // fails it over terminally instead — a stuck row beats a double run.
+      if (absorbed) {
+        dbg('absorbed response publish failed; not requeuing a consumed prompt', message.id);
+        return;
+      }
       await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
     });
   }
