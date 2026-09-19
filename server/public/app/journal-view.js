@@ -58,6 +58,7 @@ import {
   conversationProviderIndicatorLabel,
 } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
+import { normalizeConversationFilter, filterConversations, drainRemainingPages } from './conversation-list-filter.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 1000;
@@ -74,9 +75,12 @@ const CLAUDE_LONG_CONTEXT_PATTERN = /\[1m\]$/i;
 const OPENAI_IMAGE_SIZE_STORAGE_KEY = 'copilot_openai_image_size';
 const NEW_CHAT_CWD_STORAGE_KEY = 'copilot_new_chat_cwd';
 const NEW_CHAT_CUSTOM_CWD_VALUE = '__custom__';
+const CONV_FILTER_DEBOUNCE_MS = 220;
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let lastConvListHtml = '';
+let conversationListFilterText = '';
+let conversationFilterDrainActive = false;
 let openConversationVersion = 0;
 let newConversationInFlight = false;
 
@@ -273,6 +277,11 @@ export async function refreshConversations(options = {}) {
   });
   renderConvList();
   updateCompactButton();
+  // A reset bumps the loader version, which aborts any in-flight filter drain;
+  // restart it so an active filter keeps covering the unloaded pages.
+  if (normalizeConversationFilter(conversationListFilterText)) {
+    void drainConversationListForFilter();
+  }
 }
 
 export function renderConvList() {
@@ -282,9 +291,19 @@ export function renderConvList() {
     if (updatedAtDelta !== 0) return updatedAtDelta;
     return String(b?.id || '').trim().localeCompare(String(a?.id || '').trim());
   });
+  const activeFilter = normalizeConversationFilter(conversationListFilterText);
+  const visible = activeFilter ? filterConversations(sorted, activeFilter) : sorted;
   const pendingByConversation = getPendingQuestionCountsByConversation();
   let hasProcessingConversation = false;
   const footerHtml = (() => {
+    if (activeFilter) {
+      // While a filter is active the drain loads older pages by itself; a
+      // "scroll for more" hint would point at a gesture that does nothing, and
+      // "Searching…" must only show while something is actually loading.
+      return (conversationFilterDrainActive || conversationListPaginationState.isLoading)
+        ? '<div class="conv-list-footer">Searching older conversations…</div>'
+        : '';
+    }
     if (conversationListPaginationState.isLoading) {
       return '<div class="conv-list-footer">Loading older conversations…</div>';
     }
@@ -293,10 +312,14 @@ export function renderConvList() {
     }
     return '';
   })();
-  if (sorted.length === 0) {
+  if (visible.length === 0) {
     ensureProcessingDotTimer(false);
-    list.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">No conversations yet</div>';
+    const emptyText = activeFilter && sorted.length > 0
+      ? 'No conversations match your filter'
+      : 'No conversations yet';
+    list.innerHTML = `<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">${emptyText}</div>${footerHtml}`;
     lastConvListHtml = '';
+    scheduleConversationListBoundaryCheck();
     return;
   }
   const conversationView = (conversation) => {
@@ -312,7 +335,7 @@ export function renderConvList() {
     if (processing) hasProcessingConversation = true;
     return { visualState, processing };
   };
-  const listHtml = `${sorted.map((c) => {
+  const listHtml = `${visible.map((c) => {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
     const providerIndicatorLabel = conversationProviderIndicatorLabel(c);
@@ -1143,6 +1166,71 @@ export function initConversationListLazyLoading() {
     void conversationListLoader.handleBoundaryDistance(getConversationListBoundaryDistance());
   }, { passive: true });
   scheduleConversationListBoundaryCheck();
+}
+
+// A title filter has to search conversations that only exist on unloaded pages,
+// so an active filter drains the remaining pages in the background. Each page
+// re-renders via applyPage, so matches appear as they load.
+async function drainConversationListForFilter() {
+  if (conversationFilterDrainActive) return;
+  conversationFilterDrainActive = true;
+  renderConvList();
+  try {
+    await drainRemainingPages(
+      conversationListLoader,
+      () => !!normalizeConversationFilter(conversationListFilterText),
+    );
+  } finally {
+    conversationFilterDrainActive = false;
+    // The "Searching older conversations…" footer keys off the drain flag.
+    renderConvList();
+  }
+}
+
+function setConversationListFilter(text) {
+  const next = String(text ?? '');
+  if (next === conversationListFilterText) return;
+  conversationListFilterText = next;
+  const list = getConversationListElement();
+  if (list) list.scrollTop = 0;
+  renderConvList();
+  if (normalizeConversationFilter(next)) void drainConversationListForFilter();
+}
+
+export function initConversationFilter() {
+  const input = document.getElementById('conv-filter-input');
+  const clearButton = document.getElementById('conv-filter-clear');
+  if (!input || input.dataset.filterBound === '1') return;
+  input.dataset.filterBound = '1';
+  let debounceTimer = null;
+  const syncClearButton = () => {
+    if (clearButton) clearButton.hidden = input.value === '';
+  };
+  const applyFilterNow = () => {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+    syncClearButton();
+    setConversationListFilter(input.value);
+  };
+  input.addEventListener('input', () => {
+    syncClearButton();
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(applyFilterNow, CONV_FILTER_DEBOUNCE_MS);
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || input.value === '') return;
+    event.stopPropagation();
+    input.value = '';
+    applyFilterNow();
+  });
+  clearButton?.addEventListener('click', () => {
+    input.value = '';
+    applyFilterNow();
+    input.focus();
+  });
+  syncClearButton();
 }
 
 export async function deleteConv(e, id) {

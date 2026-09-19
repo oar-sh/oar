@@ -76,7 +76,7 @@ import {
   reportSharedViewerPresence,
   setNetworkRequestsEnabled,
 } from './api-client.js';
-import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading } from './journal-view.js';
+import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading, initConversationFilter } from './journal-view.js';
 import {
   newConversation,
   confirmNewConversationModel,
@@ -4164,6 +4164,7 @@ async function initApp() {
   initEmojiPicker();
   initSlashAutocomplete();
   initConversationListLazyLoading();
+  initConversationFilter();
   initConversationHistoryLazyLoading();
   initBubbleActionHandlers();
   initMessageScrollPersistence();
