@@ -1017,6 +1017,55 @@ test('a non-steered delivered entry the CLI never opens a turn for still fails o
   await settled(runner);
 });
 
+test('a steered message carries its image attachment into the folded turn', async () => {
+  // Attachments must survive steering: the delivery + content-build path is the
+  // same as any message, but pin it so a steered image is never silently
+  // dropped. A data-url image needs no filesystem.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const pngData = Buffer.from('fake-png').toString('base64');
+  const second = runner.handlePendingPayload({
+    message: {
+      ...baseMessage,
+      id: 'q-2',
+      text: 'what is in this image?',
+      attachments: [{ name: 'shot.png', type: 'image/png', dataUrl: `data:image/png;base64,${pngData}` }],
+    },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'the steered message was pushed' });
+
+  // The pushed content for the steered message carries the image block, not
+  // just its text.
+  const steeredContent = turn.pushed[1];
+  assert.ok(Array.isArray(steeredContent), 'the steered push is a content-block array');
+  const imageBlock = steeredContent.find((block) => block.type === 'image');
+  assert.ok(imageBlock, 'the steered message carried its image into the turn');
+  assert.equal(imageBlock.source.media_type, 'image/png');
+  assert.equal(imageBlock.source.data, pngData);
+
+  // The turn folds it and settles the row as merged, image and all.
+  turn.emit(resultMessage('it is a picture', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.absorbed, true);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('canAcceptSteering gates on a live, uncomplicated turn', async () => {
   const stub = makeApiStub();
   const turn = scriptedTurn();

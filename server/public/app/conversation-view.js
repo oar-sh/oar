@@ -414,6 +414,16 @@ function getActiveTurnForConversation(conversationId) {
   return activeTurnsByConversation.get(conversationKey) || null;
 }
 
+// Which conversations deliver a message typed mid-turn INTO the running turn
+// (steering) rather than queueing it behind. Only the Claude worker opts into
+// the mid-turn delivery path today; the others stay strictly serial, so their
+// composer keeps saying "Queue".
+function conversationSupportsSteering(conversationId) {
+  const conversationKey = String(conversationId || '').trim();
+  if (!conversationKey) return false;
+  return String(conversations[conversationKey]?.runtimeProviderType || '').trim().toLowerCase() === 'claude';
+}
+
 function syncSendButtonState() {
   const btn = document.getElementById('send-btn');
   if (!btn) return;
@@ -428,6 +438,7 @@ function syncSendButtonState() {
     sendInFlight,
     modelMetadataBlocked: window.isModelMetadataBlocked?.() === true,
     attachmentsUploading: hasUploadingAttachments(selectedAttachments),
+    steeringSupported: conversationSupportsSteering(currentConvId),
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;

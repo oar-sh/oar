@@ -20,10 +20,38 @@ test('idle composer offers an enabled Send', () => {
   assert.equal(state.disabled, false);
 });
 
-test('an active turn with a draft offers Queue', () => {
+test('an active turn with a draft offers Queue on a serial provider', () => {
   const state = deriveComposerControlState({ hasActiveTurn: true, hasDraft: true });
   assert.equal(state.action, 'queue');
+  assert.equal(state.label, 'Queue');
+  assert.match(state.title, /queue/i);
   assert.equal(state.disabled, false);
+});
+
+test('an active turn with a draft offers Steer where the provider steers', () => {
+  const state = deriveComposerControlState({ hasActiveTurn: true, hasDraft: true, steeringSupported: true });
+  assert.equal(state.action, 'steer');
+  assert.equal(state.label, 'Steer');
+  assert.match(state.title, /steer message into the running turn/i);
+  assert.equal(state.disabled, false);
+});
+
+test('the steer wording carries through the send-in-flight and uploading windows', () => {
+  const inFlight = deriveComposerControlState({
+    hasActiveTurn: true, hasDraft: true, steeringSupported: true, sendInFlight: true,
+  });
+  assert.equal(inFlight.label, 'Steer');
+  assert.equal(inFlight.disabled, true);
+  const uploading = deriveComposerControlState({
+    hasActiveTurn: true, hasDraft: true, steeringSupported: true, attachmentsUploading: true,
+  });
+  assert.equal(uploading.label, 'Steer');
+  assert.equal(uploading.disabled, true);
+});
+
+test('steeringSupported is inert without an active turn or draft', () => {
+  assert.equal(deriveComposerControlState({ steeringSupported: true }).label, 'Send');
+  assert.equal(deriveComposerControlState({ hasActiveTurn: true, steeringSupported: true }).action, 'stop');
 });
 
 test('an active turn without a draft offers Stop', () => {

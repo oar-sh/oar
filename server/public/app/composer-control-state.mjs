@@ -26,12 +26,24 @@ export function deriveComposerControlState({
   sendInFlight = false,
   modelMetadataBlocked = false,
   attachmentsUploading = false,
+  // The conversation's provider delivers a message typed during a live turn
+  // INTO that turn (mid-turn steering, currently the Claude worker) rather than
+  // queueing it behind — so the control says "Steer", not "Queue". Providers
+  // that still serialize keep the queue wording.
+  steeringSupported = false,
 } = {}) {
   const active = !!hasActiveTurn;
   const stopping = !!cancelRequested;
   const draft = !!hasDraft;
   const metadataBlocked = !!modelMetadataBlocked;
   const uploading = !!attachmentsUploading;
+  // The label/title/action for a draft typed during a live turn: steer into it
+  // where the provider supports that, queue behind it otherwise.
+  const midTurnAction = steeringSupported ? 'steer' : 'queue';
+  const midTurnLabel = steeringSupported ? 'Steer' : 'Queue';
+  const midTurnTitle = steeringSupported
+    ? 'Steer message into the running turn'
+    : 'Queue message behind current turn';
 
   if (metadataBlocked && !active) {
     return {
@@ -43,13 +55,13 @@ export function deriveComposerControlState({
   }
 
   // Uploads are eager, so the blocking window is short. Keeping the button
-  // labelled Send/Queue (rather than switching to Stop) avoids the control
-  // flipping meaning mid-upload while a turn is running.
+  // labelled Send/Steer/Queue (rather than switching to Stop) avoids the
+  // control flipping meaning mid-upload while a turn is running.
   if (uploading) {
-    const queueing = active && draft;
+    const midTurn = active && draft;
     return {
-      action: queueing ? 'queue' : 'send',
-      label: queueing ? 'Queue' : 'Send',
+      action: midTurn ? midTurnAction : 'send',
+      label: midTurn ? midTurnLabel : 'Send',
       title: 'Waiting for attachments to finish uploading',
       disabled: true,
     };
@@ -58,9 +70,9 @@ export function deriveComposerControlState({
   if (sendInFlight) {
     if (active && draft) {
       return {
-        action: 'queue',
-        label: 'Queue',
-        title: 'Queue message behind current turn',
+        action: midTurnAction,
+        label: midTurnLabel,
+        title: midTurnTitle,
         disabled: true,
       };
     }
@@ -82,9 +94,9 @@ export function deriveComposerControlState({
 
   if (active && draft) {
     return {
-      action: 'queue',
-      label: 'Queue',
-      title: 'Queue message behind current turn',
+      action: midTurnAction,
+      label: midTurnLabel,
+      title: midTurnTitle,
       disabled: false,
     };
   }
