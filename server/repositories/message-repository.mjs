@@ -120,7 +120,15 @@ export function createMessageRepository(db) {
         // Quiet teardown for a continuation whose worker died: there is no
         // user to answer, so it fails without the terminal-failure ceremony.
         dropStaleContinuation: db.prepare(`UPDATE queue SET status = 'failed', processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status = 'processing' AND kind = 'continuation'`),
-        findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND COALESCE(kind, '') != 'continuation' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END ASC, COALESCE(next_attempt_at, timestamp) ASC, timestamp ASC LIMIT 1`),
+        // Claim ordering (all findPending* variants): retry_count ASC keeps a
+        // genuinely failing row from head-of-line blocking fresh work, then
+        // strict send order. The WHERE clause already excludes rows whose
+        // backoff has not matured, so next_attempt_at must NOT appear in the
+        // ORDER BY: ranking expired-backoff rows behind fresh arrivals starved
+        // them for as long as new messages kept coming (live 2026-09-19: a
+        // steer-recovered row waited 5 minutes while newer messages jumped it).
+        // rowid breaks same-millisecond timestamp ties in insertion order.
+        findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND COALESCE(kind, '') != 'continuation' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, timestamp ASC, rowid ASC LIMIT 1`),
         // Global fallback for requesters without a session identity (the legacy
         // Copilot relay CLI). Conversations bound to a session-worker provider
         // (claude/cursor/grok) are excluded outright: handing one of their turns
@@ -153,9 +161,8 @@ export function createMessageRepository(db) {
             )) NOT IN (${sessionWorkerProviderSqlList()})
           ORDER BY
             q.retry_count ASC,
-            CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
-            COALESCE(q.next_attempt_at, q.timestamp) ASC,
-            q.timestamp ASC
+            q.timestamp ASC,
+            q.rowid ASC
           LIMIT 1
         `),
         findPendingForWorker: db.prepare(`
@@ -199,9 +206,8 @@ export function createMessageRepository(db) {
               ELSE 1
             END ASC,
             q.retry_count ASC,
-            CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
-            COALESCE(q.next_attempt_at, q.timestamp) ASC,
-            q.timestamp ASC
+            q.timestamp ASC,
+            q.rowid ASC
           LIMIT 1
         `),
         findPendingForSessionAffinity: db.prepare(`
@@ -221,9 +227,8 @@ export function createMessageRepository(db) {
             ) = ?
           ORDER BY
             q.retry_count ASC,
-            CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
-            COALESCE(q.next_attempt_at, q.timestamp) ASC,
-            q.timestamp ASC
+            q.timestamp ASC,
+            q.rowid ASC
           LIMIT 1
         `),
         countQueueWorkForSessionAffinity: db.prepare(`

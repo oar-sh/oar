@@ -33,42 +33,10 @@ test('message share visibility preserves owner history and filters shared histor
 
 test('routed worker dequeue uses runtime session binding when queue owner is empty', () => {
   const db = createTestDb();
-  const findPendingForWorker = db.prepare(`
-    SELECT q.*
-    FROM queue q
-    LEFT JOIN runtime_sessions rs
-      ON rs.id = q.runtime_session_id
-    LEFT JOIN conversations c
-      ON c.id = q.conversation_id
-    WHERE q.status = 'pending'
-      AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
-      AND (
-        COALESCE(
-          NULLIF(q.owner_sdk_session_id, ''),
-          NULLIF(rs.sdk_session_id, ''),
-          NULLIF(c.sdk_session_id, '')
-        ) IS NULL
-        OR COALESCE(
-          NULLIF(q.owner_sdk_session_id, ''),
-          NULLIF(rs.sdk_session_id, ''),
-          NULLIF(c.sdk_session_id, '')
-        ) = ?
-      )
-    ORDER BY
-      CASE
-        WHEN COALESCE(
-          NULLIF(q.owner_sdk_session_id, ''),
-          NULLIF(rs.sdk_session_id, ''),
-          NULLIF(c.sdk_session_id, '')
-        ) = ? THEN 0
-        ELSE 1
-      END ASC,
-      q.retry_count ASC,
-      CASE WHEN q.next_attempt_at IS NULL THEN 0 ELSE 1 END ASC,
-      COALESCE(q.next_attempt_at, q.timestamp) ASC,
-      q.timestamp ASC
-    LIMIT 1
-  `);
+  // Use the shipped statement: an inline copy of the SQL used to live here and
+  // silently drifted from production (missing the continuation and provider
+  // guards) — the test must exercise what actually runs.
+  const { findPendingForWorker } = createMessageRepository(db);
   const now = '2026-06-11T20:00:00.000Z';
 
   db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run(
@@ -268,6 +236,66 @@ test('anonymous dequeue skips provider-worker rows but the owning worker still g
   });
   assert.equal(claimed?.id, 'message-cursor');
   assert.equal(claimed?.status, 'processing');
+});
+
+// ─── Claim ordering: expired backoff must not lose FIFO position ─────────────
+// Live regression (2026-09-19): a message delivered mid-turn while the steer
+// slot was busy was recovered to pending with a 2s next_attempt_at. The old
+// ORDER BY ranked any row with a non-null next_attempt_at behind every fresh
+// arrival, so the row starved for 5 minutes while newer messages jumped it.
+// Eligibility (backoff maturity) is the WHERE clause's job; among eligible
+// rows, only retry_count and send order may rank.
+
+test('claim ordering: a recovered row with expired backoff keeps its send-order position', () => {
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  const now = '2026-09-19T23:14:00.000Z';
+
+  const insert = db.prepare(`
+    INSERT INTO queue (
+      id, conversation_id, runtime_session_id, is_new_conversation, model,
+      model_variant_id, reasoning_effort, relay_mode, text, attachments,
+      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
+    ) VALUES (?, ?, NULL, 0, 'gpt-5.4-mini', 'gpt-5.4-mini', NULL, 'agent', ?, NULL, 'pending', ?, ?, ?, ?)
+  `);
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES ('conv-1', 'Conv', 'active', 'sdk-1', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+
+  // Older message, steer-recovered: backoff stamped but long expired, retry_count untouched.
+  insert.run('message-recovered', 'conv-1', 'recovered', '2026-09-19T23:09:23.000Z', 0, '2026-09-19T23:09:40.000Z', 'sdk-1');
+  // Newer fresh message, no backoff stamp.
+  insert.run('message-fresh', 'conv-1', 'fresh', '2026-09-19T23:09:32.000Z', 0, null, 'sdk-1');
+
+  assert.equal(repo.findPending.get(now)?.id, 'message-recovered');
+  assert.equal(repo.findPendingForSessionAffinity.get(now, 'sdk-1')?.id, 'message-recovered');
+  assert.equal(repo.findPendingForWorker.get(now, 'sdk-1', 'sdk-1')?.id, 'message-recovered');
+
+  // A genuinely retried row still yields to fresh work (poison-message guard).
+  db.prepare(`UPDATE queue SET retry_count = 1 WHERE id = 'message-recovered'`).run();
+  assert.equal(repo.findPending.get(now)?.id, 'message-fresh');
+
+  // An immature backoff stays ineligible entirely.
+  db.prepare(`UPDATE queue SET retry_count = 0, next_attempt_at = '2026-09-19T23:59:00.000Z' WHERE id = 'message-recovered'`).run();
+  assert.equal(repo.findPending.get(now)?.id, 'message-fresh');
+});
+
+test('claim ordering: legacy-relay dequeue also keeps expired-backoff rows in send order', () => {
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  const now = '2026-09-19T23:14:00.000Z';
+
+  // Unowned github rows: the only kind the legacy relay may claim.
+  const insert = db.prepare(`
+    INSERT INTO queue (
+      id, conversation_id, runtime_session_id, is_new_conversation, model,
+      model_variant_id, reasoning_effort, relay_mode, text, attachments,
+      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
+    ) VALUES (?, 'conv-legacy', NULL, 0, 'gpt-5.4-mini', 'gpt-5.4-mini', NULL, 'agent', ?, NULL, 'pending', ?, 0, ?, '')
+  `);
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES ('conv-legacy', 'Legacy', 'active', '', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  insert.run('message-legacy-recovered', 'recovered', '2026-09-19T23:09:23.000Z', '2026-09-19T23:09:40.000Z');
+  insert.run('message-legacy-fresh', 'fresh', '2026-09-19T23:09:32.000Z', null);
+
+  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-legacy-recovered');
 });
 
 test('executed provider derives from responder identity, never from the response payload', () => {
