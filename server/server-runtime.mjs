@@ -24,6 +24,7 @@ import {
   normalizeWorkspaceRootKey,
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
+import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { applySchema } from './db-schema.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
@@ -4880,8 +4881,36 @@ const backgroundTaskStore = {
   },
 };
 
+// The live turn among a conversation's processing rows. Mid-turn steering can
+// leave two processing at once — the running turn and a steered message the CLI
+// folded into it — and the folded row produces no stream/activity of its own.
+// So the live turn is the processing row that is actually producing output
+// (most recent stream event, then most activity); with nothing to separate
+// them yet, the oldest processing row (the turn a steered message joins) wins.
+// Returns the whole row so callers get relay_mode/timestamps too.
+function resolveLiveTurnQueueRow(conversationId) {
+  const rows = stmts.listProcessingQueueByConversation?.all(conversationId)
+    || (stmts.getLatestProcessingQueueByConversation.get(conversationId)
+      ? [stmts.getLatestProcessingQueueByConversation.get(conversationId)]
+      : []);
+  if (!rows.length) return null;
+  if (rows.length === 1) return rows[0];
+  const byId = new Map(rows.map((row) => [String(row.id), row]));
+  const liveId = pickLiveTurnRowId(rows.map((row) => {
+    const streamEvents = relayStreamEventsForQueueMessage(row.id);
+    const lastStream = streamEvents.length ? streamEvents[streamEvents.length - 1] : null;
+    return {
+      id: String(row.id),
+      lastStreamSeq: Number(lastStream?.seq || 0),
+      activityCount: (relayActivityForQueueMessage(row.id) || []).length,
+      processingAtMs: Date.parse(String(row.processing_at || row.timestamp || '')) || 0,
+    };
+  }));
+  return byId.get(liveId) || rows[0];
+}
+
 function inFlightStateForConversation(conversationId) {
-  const row = stmts.getLatestProcessingQueueByConversation.get(conversationId);
+  const row = resolveLiveTurnQueueRow(conversationId);
   if (!row) return null;
   const streamEvents = relayStreamEventsForQueueMessage(row.id);
   const lastStreamEvent = streamEvents.length ? streamEvents[streamEvents.length - 1] : null;
@@ -6113,6 +6142,7 @@ const sharedRouteDeps = {
   previewCardsForResponse,
   sanitizeActivityText,
   inFlightStateForConversation,
+  resolveLiveTurnQueueRow,
   backgroundTaskStore,
   // A closure, not the registry itself: this deps object is built before the
   // preview lane is constructed further down the file.

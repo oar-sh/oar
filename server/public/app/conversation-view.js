@@ -2539,7 +2539,17 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     const node = el.querySelector(`[data-message-id="${CSS.escape(pendingId)}"]`);
     if (node) preservedPendingNodes.push(node);
   }
-  if (!ordered.length && !preservedPendingNodes.length) {
+  // Preserve the live thinking bubble across the wipe. It holds in-progress
+  // thoughts, streamed text and subagent bubbles that a full re-derive would
+  // lose (or briefly blank while restoreInFlightThinking rebuilds from the
+  // server's inFlight snapshot). Re-appending the same node lets that restore
+  // update it in place instead of rebuilding — the same reuse showThinking
+  // already relies on. removeThinking() still drops it when the turn ends.
+  const thinkingNode = document.getElementById('thinking-indicator');
+  // Only when it genuinely lives in the transcript being rebuilt — a detached
+  // or foreign node must not be spliced in as an extra row.
+  const preservedThinkingNode = (thinkingNode && thinkingNode.parentNode === el) ? thinkingNode : null;
+  if (!ordered.length && !preservedPendingNodes.length && !preservedThinkingNode) {
     el.innerHTML = `<div class="empty-state">
       <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
       <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
@@ -2611,6 +2621,9 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     // at the end. Re-appending the original node (not a fresh one) keeps its
     // cancel button and click handlers intact.
     for (const node of preservedPendingNodes) el.appendChild(node);
+    // The live thinking bubble re-joins last; anchorThinkingBubble (via the
+    // restore/stream paths that run after this) settles its final position.
+    if (preservedThinkingNode) el.appendChild(preservedThinkingNode);
   });
   syncSeparatorsNow();
   renderRelayQuestions();

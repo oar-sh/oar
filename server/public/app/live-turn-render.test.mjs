@@ -72,6 +72,11 @@ test('renderMessages preserves optimistic pending bubbles the payload does not c
   assert.match(body, /messageById\.has\(pendingId\)/, 'a bubble already in the payload is left to the rebuild');
   assert.match(body, /conversationKey.*!==.*renderConversationKey|renderConversationKey/, 'a pending bubble from another conversation is never dragged in');
   assert.match(body, /for \(const node of preservedPendingNodes\) el\.appendChild\(node\)/, 'preserved nodes are re-appended after the rebuild');
+  // The live thinking bubble survives the rebuild too, so a re-render mid-turn
+  // never blanks the in-progress thoughts/stream.
+  assert.match(body, /thinkingNode = document\.getElementById\('thinking-indicator'\)/, 'the live thinking bubble is captured before the wipe');
+  assert.match(body, /thinkingNode\.parentNode === el/, 'only a thinking bubble genuinely in the transcript is preserved');
+  assert.match(body, /if \(preservedThinkingNode\) el\.appendChild\(preservedThinkingNode\)/, 'the live thinking bubble is re-appended after the rebuild');
   // The empty-state must not claim the transcript is empty while a pending
   // bubble is still on screen.
   assert.match(body, /!ordered\.length && !preservedPendingNodes\.length/);

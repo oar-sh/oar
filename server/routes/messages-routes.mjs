@@ -1757,6 +1757,10 @@ export function registerMessagesRoutes(app, deps) {
     sanitizeActivityText,
     readSessionTranscriptMessages,
     inFlightStateForConversation,
+    // Resolves the live turn among a conversation's processing rows (mid-turn
+    // steering can leave more than one). Falls back to the newest-processing
+    // query for older wiring/tests that do not supply it.
+    resolveLiveTurnQueueRow = (conversationId) => stmts.getLatestProcessingQueueByConversation.get(conversationId) || null,
     emitToClientsExceptSessionId,
     relayBridgeOwnerService,
     relayRestartOrchestrator,
@@ -2747,7 +2751,10 @@ export function registerMessagesRoutes(app, deps) {
       return rejectSessionBinding(res, sessionState.status, sessionState.error);
     }
 
-    const queueRow = stmts.getLatestProcessingQueueByConversation.get(conversationId) || null;
+    // The live turn, not merely the newest processing row: a steered message
+    // folded into the running turn is also `processing`, and Stop must target
+    // the turn actually executing (which the worker interrupts as a whole).
+    const queueRow = resolveLiveTurnQueueRow(conversationId) || null;
     if (!queueRow) {
       return res.json({
         ok: true,

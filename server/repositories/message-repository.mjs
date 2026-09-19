@@ -390,6 +390,12 @@ export function createMessageRepository(db) {
         listConversationIdsWithActiveQueue: db.prepare(`SELECT DISTINCT conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         deleteQueueById: db.prepare(`DELETE FROM queue WHERE id = ?`),
         getLatestProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) DESC LIMIT 1`),
+        // All processing rows, oldest first. Mid-turn steering means a
+        // conversation can have more than one processing row at once (the live
+        // turn plus a steered message folded into it), so the single-row query
+        // above is ambiguous — callers that need "the live turn" resolve it
+        // from this list by which row is actually producing output.
+        listProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) ASC`),
         parkPendingQueueForRestart: db.prepare(`
           UPDATE queue
           SET
