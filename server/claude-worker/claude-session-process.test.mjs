@@ -991,6 +991,106 @@ test('a steered message the CLI folds into the turn (no replay) settles as merge
   await settled(runner);
 });
 
+test('a folded steer settles as merged even while a background task is still running', async () => {
+  // Live 2026-09-20 wedge: a turn spawned a background Bash task that hung for
+  // 35 minutes; a message steered into a LATER turn was folded and answered by
+  // that turn's result, but the fold reaper's idle gate counted the live task
+  // as "not idle", so the steered row sat `processing` indefinitely — steer
+  // slot occupied, worker.ready suppressed, the whole conversation stuck. A
+  // live background task must not hold the fold clock: the CLI opens turns for
+  // pushed messages regardless of tasks, so "no turn opened within the grace"
+  // means folded, tasks or no tasks.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  // The turn spawns a background task that outlives it.
+  turn.emit({
+    type: 'system', subtype: 'background_tasks_changed',
+    tasks: [{ task_id: 'bg-hung', task_type: 'local_shell', description: 'hung pdf extraction' }],
+  });
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick follow-up' } });
+  await waitFor(
+    () => runner._getProcess().pendingDelivered.length === 1 && runner._getProcess().pendingDelivered[0].steered === true,
+    { label: 'the steered entry is pending and tagged' },
+  );
+
+  // The turn ends (one result, no replay for q-2) while the task stays live.
+  turn.emit(resultMessage('did the work', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(runner._getProcess().liveTasks.size, 1, 'the background task is still running');
+
+  // The fold reaper must settle q-2 as merged despite the live task.
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.absorbed, true);
+  assert.match(secondResponse.body.text, /Handled together with the previous reply/);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'nothing left stuck in pendingDelivered');
+  turn.emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a steered message the CLI replays as its own turn attaches instead of folding, task or no task', async () => {
+  // Companion to the fold-under-tasks test: removing the liveTasks hold must
+  // not eat a steered message the CLI decided to QUEUE rather than fold. The
+  // CLI opens q-2's own turn shortly after the first result — inside the fold
+  // grace — and the entry has to attach to that turn, not settle as merged.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 500,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit({
+    type: 'system', subtype: 'background_tasks_changed',
+    tasks: [{ task_id: 'bg-live', task_type: 'local_shell', description: 'still running' }],
+  });
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick follow-up' } });
+  await waitFor(
+    () => runner._getProcess().pendingDelivered.length === 1,
+    { label: 'the steered entry is pending' },
+  );
+
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  // Inside the fold grace the CLI opens q-2's own turn (queued, not folded).
+  turn.emit(userReplay('quick follow-up'));
+  turn.emit(assistantText('second answer'));
+  turn.emit(resultMessage('second answer', 'native-1'));
+
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.text, 'second answer');
+  assert.notEqual(secondResponse.body.absorbed, true, 'a replayed steer is a real turn, never the merged stub');
+  turn.emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+  turn.endInput();
+  await settled(runner);
+});
+
 test('a non-steered delivered entry the CLI never opens a turn for still fails over (watchdog)', async () => {
   // The fold reaper must not swallow a genuine drop: a message delivered with
   // no turn active (steered=false) whose replay never arrives is still the
@@ -1007,12 +1107,20 @@ test('a non-steered delivered entry the CLI never opens a turn for still fails o
 
   const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
   turn.emit(initMessage('native-1'));
+  // A live background task must not pin the watchdog clock either (same
+  // premise as the fold reaper: the CLI opens turns for pushed messages
+  // regardless of tasks) — the drop still fails over while the task runs.
+  turn.emit({
+    type: 'system', subtype: 'background_tasks_changed',
+    tasks: [{ task_id: 'bg-live', task_type: 'local_shell', description: 'still running' }],
+  });
   // No replay ever arrives and the entry was not steered (no active turn at
   // push): the watchdog fails it, the fold reaper leaves it alone.
   assert.equal(await pending, true);
   const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
   assert.ok(response.body.terminalError, 'a genuine drop still fails over');
   assert.notEqual(response.body.absorbed, true);
+  turn.emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
   turn.endInput();
   await settled(runner);
 });

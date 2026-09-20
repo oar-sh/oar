@@ -556,6 +556,7 @@ export function createClaudeSessionRunner({
     proc.continuationInitPending = false;
     proc.notificationPendingAt = 0;
     proc.taskSettledAt = 0;
+    proc.lastApiRetryAt = 0;
     if (proc.initModel && !ctx.state.responseModel) ctx.state.responseModel = proc.initModel;
     ctx.controlState = controlPoller?.start?.({
       queueMessageId: ctx.message?.id || '',
@@ -903,7 +904,12 @@ export function createClaudeSessionRunner({
 
     if (type === 'assistant' || type === 'stream_event' || type === 'user') {
       if (proc.lastBoundary !== 'self-opened') {
-        if (proc.pendingDelivered.length) return attachDeliveredContext();
+        // A background subagent's frames arrive at top level carrying
+        // `parent_tool_use_id` (same marker the adoption commit checks): they
+        // are a LIVE task's chatter, not the delivered message's turn, and
+        // attaching on them would both publish the wrong output and splice the
+        // entry out of the fold reaper's reach.
+        if (proc.pendingDelivered.length && !sdkMessage?.parent_tool_use_id) return attachDeliveredContext();
         // Between-turn chatter — a background subagent's stream, a stray
         // top-level tool_result — is not a turn of its own. Only traffic that
         // follows a self-opened boundary (the CLI's task-notification replay)
@@ -920,7 +926,9 @@ export function createClaudeSessionRunner({
         proc.lastBoundary = null;
         return null;
       }
-      if (proc.lastBoundary !== 'self-opened' && proc.pendingDelivered.length) return attachDeliveredContext();
+      if (proc.lastBoundary !== 'self-opened' && proc.pendingDelivered.length && !sdkMessage?.parent_tool_use_id) {
+        return attachDeliveredContext();
+      }
       if (proc.lastBoundary === 'self-opened') return openContinuationContext();
       return null;
     }
@@ -1679,6 +1687,17 @@ export function createClaudeSessionRunner({
           if (typeof last === 'string' && last.startsWith('Anthropic API')) proc.pendingActivities.pop();
           carryPendingActivity(notice);
         }
+        // A retry with no active turn means the CLI is mid-request for a turn
+        // it is about to open — likely for a pending delivered entry. Hold the
+        // fold clock so the entry is not settled as "merged" out from under
+        // the turn that will answer it. The hold must be a freshness window,
+        // not just a clock reset: a 529 backoff routinely exceeds the 2s fold
+        // grace, so a reset alone would re-arm and fire between notices.
+        proc.lastApiRetryAt = Date.now();
+        for (const entry of proc.pendingDelivered) {
+          entry.foldSince = 0;
+          entry.unattachedSince = 0;
+        }
       }
       return;
     }
@@ -1828,6 +1847,17 @@ export function createClaudeSessionRunner({
     return fresh(proc.notificationPendingAt) || fresh(proc.taskSettledAt);
   }
 
+  /**
+   * The CLI recently reported an API retry with no turn open: it is
+   * mid-request for a turn it has not opened yet (retry backoffs run tens of
+   * seconds), so the fold/stale reapers must not settle a pending delivered
+   * entry out from under it. Cleared when a turn opens (activateContext).
+   */
+  function isApiRetryPending() {
+    if (!proc) return false;
+    return Boolean(proc.lastApiRetryAt) && Date.now() - proc.lastApiRetryAt < notificationGraceMs;
+  }
+
   function hasLiveWork() {
     if (!proc) return false;
     return Boolean(
@@ -1885,14 +1915,29 @@ export function createClaudeSessionRunner({
    * single result — the steered entry never gets its own replay, so
    * resolveContext's absorbed-steering handoff never fires and the entry would
    * otherwise sit until the 5-minute watchdog fails it with a bogus "resend".
-   * Once the process is idle (nothing left that could still attach it) for the
+   * Once nothing turn-shaped could still attach the entry (no active turn, no
+   * control round-trip, no compaction, no imminent task continuation — but
+   * deliberately NOT "no live background tasks", see the gate comment) for the
    * short fold grace, settle it as merged into the reply it was folded into.
    */
   function reapFoldedSteeredEntries(now) {
     if (!proc || !proc.pendingDelivered.length) return;
     if (!(steeredFoldGraceMs > 0)) return;
     if (!proc.sawInit) return;
-    if (proc.activeCtx || proc.liveTasks.size || proc.pendingControlRequests > 0 || isCompacting()) {
+    // Live background tasks deliberately do NOT hold the fold clock: a task
+    // can run for an hour and the CLI opens turns for pushed messages
+    // regardless, so a steered entry folded into an already-finished turn
+    // would otherwise sit `processing` — steer slot occupied, worker.ready
+    // suppressed, every later message in the conversation stuck behind it —
+    // until the task exits (live 2026-09-20: a hung 35-minute Bash task
+    // wedged exactly this way). If the CLI is instead going to open a real
+    // turn for the push, it does so within the grace, tasks or no tasks.
+    // A task that just SETTLED is different: its continuation turn is about
+    // to dequeue and may replay the steered text, so that window holds the
+    // clock (isContinuationImminent). So does a fresh API retry notice: the
+    // CLI is mid-request for a turn it has not opened yet.
+    if (proc.activeCtx || proc.pendingControlRequests > 0 || isCompacting() || isContinuationImminent()
+      || isApiRetryPending()) {
       // Not idle: the CLI may still open a turn for it (the ordinary
       // delivered-attach path), so the fold clock has not started.
       for (const entry of proc.pendingDelivered) entry.foldSince = 0;
@@ -1940,8 +1985,15 @@ export function createClaudeSessionRunner({
     // A silent cold boot (no init yet) is slow, not wedged: a CLI that never
     // inits dies on its own and cleanupProcess rejects the contexts then.
     if (!proc.sawInit) return;
-    if (proc.activeCtx || proc.liveTasks.size || proc.pendingControlRequests > 0 || isCompacting()) {
-      // A turn, task, control round-trip, or compaction may still attach these
+    // Same gate as the fold reaper, for the same reason: a live background
+    // task does not stop the CLI opening turns for pushed messages, so it
+    // must not pin this clock either — a dropped entry under an hour-long
+    // task would otherwise block the conversation for the hour instead of
+    // failing over after the timeout. Just-settled tasks (continuation
+    // imminent) and in-flight API retries still hold it.
+    if (proc.activeCtx || proc.pendingControlRequests > 0 || isCompacting() || isContinuationImminent()
+      || isApiRetryPending()) {
+      // A turn, control round-trip, or compaction may still attach these
       // entries — the unattached clock starts over once the process actually
       // goes quiet. A compaction is silent work, not idleness: the CLI replays
       // the turn these entries belong to once it finishes.
@@ -2156,6 +2208,7 @@ export function createClaudeSessionRunner({
       lastEventAt: Date.now(),
       heldForTasksSince: 0,
       taskSettledAt: 0,
+      lastApiRetryAt: 0,
       tasksExpired: false,
       tasksExpiredAt: 0,
       aborted: false,
