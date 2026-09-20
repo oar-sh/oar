@@ -3,6 +3,41 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [Unreleased]
+
+### Added
+
+- **Mid-turn steering** for Claude conversations: messages sent while a turn is
+  running are pushed into the live turn (any number of them — Claude Code
+  parity) instead of queueing behind it. Folded messages settle with a compact
+  *merged* marker; a message the CLI answers on its own turn gets its real
+  reply as before.
+- A **conversation title filter** above the sidebar list. Case-insensitive,
+  clears with × or Escape, and automatically loads older pages while active so
+  it searches every conversation, not just the loaded ones.
+
+### Changed
+
+- The composer's send button no longer turns into **Stop** while a turn runs.
+  It reads **Steer** when a Claude turn is live and text is drafted, stays
+  disabled on an empty composer, and disables with an explanation while
+  steering is held (open question card, plan approval, compaction). Stopping
+  now lives where the work is: the running reply's bubble carries **Stop**, and
+  queued messages carry **Cancel** until they are picked up.
+- Queued messages are claimed strictly in send order. Previously a message that
+  had been through a delivery retry was ranked behind every newer message for
+  as long as new ones kept arriving — it could starve for minutes in an active
+  conversation.
+- `@anthropic-ai/claude-agent-sdk` 0.3.278 (bundled Claude Code 2.1.278).
+
+### Fixed
+
+- A steered message could wedge its conversation indefinitely when a
+  long-running (or hung) background task was alive: the merge settle waited for
+  a full idle that never came, keeping every later message stuck behind it.
+  Background tasks no longer block the settle; delivery watchdogs share the
+  same rule.
+
 ## [0.9.1] — 2026-09-02
 
 ### Fixed

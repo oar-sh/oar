@@ -1,6 +1,6 @@
 # SDK Feature Tracker
 
-Updated: 2026-08-31
+Updated: 2026-09-20
 Scope: `server/` + `server/claude-worker/` + `.github/extensions/web-relay/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
@@ -31,6 +31,7 @@ checklist for a new provider (details per column in the per-SDK files).
 | Turn execution + live reply streaming | Implemented | Implemented | Implemented (`run.stream()` + `onDelta` merged) | Implemented (ACP `session/update`) |
 | Thought / reasoning streaming | Implemented | Implemented | Implemented (`thinking-delta` / `thinking` events) | Implemented |
 | Stop (whole turn) | Implemented | Implemented | Implemented (`run.cancel()` + abort-signal race) | Implemented (`session/cancel`) |
+| Mid-turn steering (message into the live turn) | Not implemented (the SDK runner's `steerIntoActiveTurn` is compatible; opt-in deferred until the Claude path finishes burn-in) | Implemented — **unbounded per turn** ([claude-sdk.md](claude-sdk.md)); composer says "Steer", stopping lives on the bubbles | Not implemented (messages queue behind the turn) | Not implemented (messages queue behind the turn) |
 | Targeted subagent abort | Partial (capability-probed) | Implemented for backgrounded subagents (`stopTask` via the task↔tool_use_id map, 2026-08-16); in-turn subagents remain whole-turn Stop | Not implemented (SDK gap; button pins "Stop unavailable") | Not implemented (protocol gap) |
 | Question cards (ask user) | Implemented (`onUserInputRequest`) | Implemented (`AskUserQuestion` via `canUseTool`; between-turn background-agent questions ride a continuation turn) | Implemented (`ask_user` custom tool; 10/10 live compliance) | Not implemented — **protocol gap**: ACP has no free-form ask-user surface (only `session/request_permission`, which the relay auto-approves) |
 | Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | n/a | n/a |
@@ -56,7 +57,9 @@ but are not Copilot SDK surface.
 | Per-conversation provider binding | Implemented | `runtime_sessions.provider_type` / `provider_model` pin a conversation to `github`, `openai`, or `claude`. `reconcileUnstartedConversationProviders` (`server/server-runtime.mjs`) is provider-parameterized, only rebinds conversations with no messages and no queued work, restores the previous binding when a provider is re-enabled, and stops/restarts the session worker when worker routing is enabled. Worker-kind routing sets `COPILOT_WEB_RELAY_WORKER_KIND` via `applyClaudeProviderEnvironment` (`server/services/session-worker-launch-service.mjs`). |
 | Conversation draft persistence + conflict checks | Implemented | Draft saves are always enabled; `PATCH /api/conversation/:id/draft` rejects stale writes with 409 `draft-version-conflict` on `baseDraftUpdatedAt` mismatch (`server/routes/sessions-routes.mjs`, `server/public/app/conversation-view.js` → `persistConversationDraft`, `server/public/app/conversation-draft-timestamp-utils.mjs`). |
 | Default session workspace root / relaunch | Implemented | Launches and workspace-root updates honor a default CWD setting plus recent-root state (`server/services/workspace-root-defaults-service.mjs` → `resolveDefaultSessionWorkspaceRootState`, `server/services/session-worker-launch-service.mjs`). Since 2026-08-02 extended by `workspace-root-path-policy.mjs` (validation / normalization / allow-list), `workspace-root-relaunch-service.mjs` (`evaluateWorkspaceRootRelaunch`, `evaluateReuseCwdMismatch`, relaunch coalescing), and `session-worker-stop-service.mjs` (`stopSessionWorkerProcesses`). Since 2026-08-05 `POST /api/conversation/bootstrap` accepts a validated `workspaceRootPath` and seeds the configured root before the first worker launch; the New Chat modal offers the known-CWD list (`server/public/app/known-cwd-options.mjs`, shared with the Change CWD picker). |
-| Model catalog composition | Implemented | Copilot, OpenAI BYOK, and Claude catalogs are layered into one payload and filtered per conversation provider — `buildModelCatalogWithProviders` wraps `buildModelCatalogWithClaudeProvider` over `buildModelCatalogWithOpenAIProvider` over the base catalog (`server/routes/sessions-routes.mjs`). |
+| Model catalog composition | Implemented | Copilot, OpenAI BYOK, and Claude catalogs are layered into one payload and filtered per conversation provider — `buildModelCatalogWithProviders` wraps `buildModelCatalogWithClaudeProvider` over `buildModelCatalogWithOpenAIProvider` over the base catalog (`server/routes/sessions-routes.mjs`). **Newly discovered models are ingested disabled by design** (`defaultEnabled: false` on every runtime-ingest path in `server/services/model-variant-catalog-service.mjs`; existing rows keep their stored flag): a refresh that "found nothing" usually found the model and parked it — enable via `PATCH /api/model-variants` / the models UI. |
+| Queue claim ordering | Implemented | Eligible pending rows are claimed strictly FIFO: `ORDER BY retry_count, timestamp, rowid` across every `findPending*` variant (`server/repositories/message-repository.mjs`) and the owner-transfer scan; backoff maturity is solely the `WHERE` clause's job. The old `CASE next_attempt_at` tier permanently ranked once-recovered rows behind every fresh arrival (live 2026-09-20: a steer-recovered row starved 5 minutes while newer messages jumped it). `retry_count` first keeps a genuinely failing row from head-of-line blocking; `rowid` makes same-millisecond ties deterministic. |
+| Conversation list title filter | Implemented | Sidebar filter input (debounced, case-insensitive title substring; × / Escape clears; no persistence). Because the list is paginated, an active filter drains the remaining pages through the infinite loader so it searches every conversation (`server/public/app/conversation-list-filter.mjs` → `drainRemainingPages`, bounded busy-retries; wiring in `journal-view.js`). |
 | Installable PWA shell / scoped manifest / service worker | Implemented | Server renders the shell with a path-relative scoped manifest and versioned service worker (`server/public/index.html`, `server/public/manifest.webmanifest`, `server/public/sw.js`). |
 | `/compact` workflow | Implemented | Provider-agnostic: branches to a new conversation seeded with a summary rather than using any SDK compaction primitive. (Claude additionally *observes* host-driven compaction, marks it in the transcript, and configures its window — see [claude-sdk.md](claude-sdk.md).) |
 | Native chat fork at message X | Not implemented (SDK gaps) | No public primitive wired in any provider for true server-side branch/fork semantics. |
@@ -64,6 +67,25 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-09-20: **Multi-steering** — the per-turn steer cap on Claude conversations is gone
+  (unbounded, Claude Code parity), and the composer never doubles as Stop anymore: "Steer" only with
+  a live turn plus draft, disabled while steering is held (question card / plan approval, compaction,
+  post-compaction adoption — the hold rides the worker heartbeat as `steeringState()` into the worker
+  registry and down to `deriveComposerControlState`), stopping lives solely on the bubbles. Shipped on
+  top of a fix wave the first live days surfaced: the fold reaper no longer counts live background
+  tasks as "not idle" (a hung 35-minute Bash task had wedged a steered row — steer slot occupied,
+  `worker.ready` suppressed — until the task exited; just-settled tasks and API-retry storms still
+  hold the clock), folded steers settle sequentially in push order, subagent chatter
+  (`parent_tool_use_id` frames) can no longer attach a pending entry, and queue claim ordering became
+  strict FIFO after the old `next_attempt_at` ORDER BY tier starved steer-recovered rows behind every
+  fresh arrival. Also: `session-repository.mjs` lost its 25 dead queue/message statement copies
+  (shadowed by `message-repository.mjs` in the runtime spread since the split — 8 had silently
+  fossilized), and `@anthropic-ai/claude-agent-sdk` moved to 0.3.278 (bundled Claude Code 2.1.278;
+  the bundle is now a manifest + extract-at-runtime layout instead of a `vendor/` directory).
+- 2026-09-19: Mid-turn steering shipped for Claude conversations (single-steer at first; see the
+  [claude-sdk.md](claude-sdk.md) row for the fold model and the same-day corrections), and the
+  conversation sidebar gained a **title filter** that auto-drains the paginated list so it searches
+  every conversation.
 - 2026-08-31: Provider CLIs can be **installed and updated from the web UI**, and the **Grok account
   can be signed in and out** there. The trigger was a dead end: a Grok turn failed with
   `relay.grok-cli-missing` and the only fix was a shell on the relay host — the exact thing the relay

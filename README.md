@@ -346,7 +346,12 @@ What Claude conversations support:
 - All four relay modes — `plan` maps to the SDK's plan permission mode and produces a **Plan ready** board, `ask` and `autopilot` adjust the system prompt
 - Image and file attachments (images up to ~5 MB are inlined; larger files are passed as paths for Claude to read)
 - Question cards, thinking/thought streams, live reply streaming, and nested subagent bubbles
-- **Stop** to abort the running turn
+- **Mid-turn steering** — messages sent while a turn runs are pushed into the live turn (any number
+  of them, Claude Code parity) instead of waiting behind it; each folded message keeps a compact
+  *merged* marker in the transcript. The composer button reads **Steer** during a live turn and
+  disables while the turn is waiting on a question card or compacting
+- **Stop** to abort the running turn — on the reply bubble; queued messages carry their own **Cancel**
+  until they are picked up
 - Background tasks that outlive the reply that started them: the composer's task panel lists them live with their own **Stop**, and an **Ultracode** workflow folds out into a tree of its phases and agents (state, model, tokens). When the workflow finishes, the summarizing reply keeps a collapsed *Finished background task* card holding the final tree, which survives reloads
 - Session continuity across worker restarts — the native Agent SDK session id is stored and resumed
 - Real context-window metrics, reported after each turn
