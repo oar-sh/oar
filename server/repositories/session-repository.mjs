@@ -1,9 +1,6 @@
 'use strict';
 
-import { createShareVisibilityStatements } from './share-visibility-statements.mjs';
-
 export function createSessionRepository(db) {
-    const shareVisibility = createShareVisibilityStatements(db);
     const runtimeSessionColumns = new Set(
       db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((column) => String(column?.name || '').trim()),
     );
@@ -36,39 +33,15 @@ export function createSessionRepository(db) {
         archiveConv:    db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`),
         deleteConv:     db.prepare(`DELETE FROM conversations WHERE id = ?`),
 
-        // messages
-        getMessages:    db.prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC`),
-        getSharedMessages: shareVisibility.getSharedMessages,
-        getMessageByConversation: db.prepare(`SELECT * FROM messages WHERE id = ? AND conversation_id = ? LIMIT 1`),
-        setMessageShareVisibility: shareVisibility.setMessageShareVisibility,
+        // Queue and message statements live in message-repository.mjs — the
+        // single source of truth. Copies used to live here too; the runtime's
+        // {...sessionRepo, ...messageRepo} spread shadowed all of them, and the
+        // dead copies silently fossilized (this one's findPending predated the
+        // continuation-row exclusion — claiming through it would have replayed
+        // a background continuation as a user prompt). The two counts below are
+        // the only message/queue statements this repository actually owns.
         getConversationMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`),
         getConversationActiveQueueCount: db.prepare(`SELECT COUNT(*) AS count FROM queue WHERE conversation_id = ? AND status IN ('pending', 'processing', 'parked')`),
-        getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
-        getRecentMessagesDesc: db.prepare(`SELECT role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
-        insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-
-        // queue
-        insertQ:        db.prepare(`INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, model_variant_id, reasoning_effort, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL)`),
-        // Same claim ordering as message-repository's findPending* family: the
-        // WHERE clause already enforces backoff maturity, so next_attempt_at
-        // must not influence rank (it starved recovered rows behind fresh ones).
-        findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY retry_count ASC, timestamp ASC, rowid ASC LIMIT 1`),
-        countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
-        countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
-        setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ? WHERE id = ?`),
-        setQueueRuntimeSession: db.prepare(`UPDATE queue SET runtime_session_id = ? WHERE id = ?`),
-        setQueueResponseMessageId: db.prepare(`UPDATE queue SET response_message_id = ? WHERE id = ?`),
-        setDone:        db.prepare(`UPDATE queue SET status = 'done', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ? AND status IN ('processing', 'pending')`),
-        setFailed:      db.prepare(`UPDATE queue SET status = 'failed', response = ?, processing_at = NULL, next_attempt_at = NULL WHERE id = ?`),
-        deleteConvQ:    db.prepare(`DELETE FROM queue WHERE conversation_id = ?`),
-        findQById:      db.prepare(`SELECT * FROM queue WHERE id = ?`),
-        pruneQueue:     db.prepare(`DELETE FROM queue WHERE status = 'done' AND id NOT IN (SELECT id FROM queue WHERE status = 'done' ORDER BY timestamp DESC LIMIT 200)`),
-        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
-        listRecoverableProcessing: db.prepare(`SELECT id, conversation_id FROM queue WHERE status = 'processing' AND processing_at < ?`),
-        recoverProcessingBefore: db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, next_attempt_at = ? WHERE status = 'processing' AND processing_at < ?`),
-        listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
-        deleteQueueById: db.prepare(`DELETE FROM queue WHERE id = ?`),
-        getLatestProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) DESC LIMIT 1`),
 
         // runtime sessions
         getRuntimeSessionByConversation: db.prepare(`SELECT * FROM runtime_sessions WHERE conversation_id = ?`),

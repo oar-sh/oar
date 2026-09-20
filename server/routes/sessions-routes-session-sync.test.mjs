@@ -4,6 +4,7 @@ import Database from 'better-sqlite3';
 
 import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
+import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
 import { createSdkSessionImportService } from '../services/sdk-session-import-service.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
@@ -85,7 +86,9 @@ function makeLearnConversationWorkspaceRoot(db, stmts) {
 function setup({ eventsBySession = {} } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
-  const stmts = createSessionRepository(db);
+  // Mirror the runtime's stmts composition (server-runtime.mjs): message
+  // statements come from message-repository, not session-repository.
+  const stmts = { ...createSessionRepository(db), ...createMessageRepository(db) };
   const emitted = [];
   const app = createMockApp();
   const sessionWorkerRegistry = createSessionWorkerRegistry();
