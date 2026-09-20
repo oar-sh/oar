@@ -15,6 +15,7 @@ import {
   persistConversationModelPreference as persistConversationModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
+import { normalizeWorkerSteeringSnapshot } from '../services/session-worker-registry-service.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
 import {
   fetchUsageSummaryPromise,
@@ -4752,6 +4753,24 @@ export function registerMessagesRoutes(app, deps) {
           sdkSessionId: requesterSessionId,
           pid: normalizedRequesterPid,
         });
+      }
+      // The worker's composer-facing steering snapshot rides the heartbeat;
+      // store it on the registry entry (status payload spreads it to clients)
+      // only when it actually changed, so quiet heartbeats stay write-free.
+      // Normalized with the registry's own rules BEFORE comparing — comparing
+      // raw against stored would never converge for values the registry drops.
+      const steering = normalizeWorkerSteeringSnapshot(req.body?.steering);
+      if (steering) {
+        const workerForSteering = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
+        const stored = workerForSteering?.steering || null;
+        const changed = !stored
+          || stored.turnActive !== steering.turnActive
+          || stored.canSteer !== steering.canSteer
+          || (stored.holdReason || null) !== (steering.holdReason || null)
+          || (stored.messageId || null) !== (steering.messageId || null);
+        if (workerForSteering && changed) {
+          sessionWorkerRegistry?.upsertWorker?.({ ...workerForSteering, steering });
+        }
       }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
       if (activeQueueMessageIds.length) {

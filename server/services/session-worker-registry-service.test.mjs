@@ -107,3 +107,40 @@ test('rekeyWorker is a no-op without a placeholder entry or with equal ids', () 
   assert.equal(registry.listWorkers().length, 1);
   assert.equal(registry.getWorker('sdk-1')?.conversationId, 'conv-1');
 });
+
+test('the steering snapshot is normalized, stored, and survives spread-convention upserts', () => {
+  const registry = createSessionWorkerRegistry();
+  registry.upsertWorker({ sdkSessionId: 'sdk-1', status: 'ready' });
+  assert.equal(registry.getWorker('sdk-1').steering, null);
+
+  registry.upsertWorker({
+    ...registry.getWorker('sdk-1'),
+    steering: { turnActive: true, canSteer: false, holdReason: 'QUESTION', messageId: 'q-7' },
+  });
+  assert.deepEqual(registry.getWorker('sdk-1').steering, {
+    turnActive: true,
+    canSteer: false,
+    holdReason: 'question',
+    messageId: 'q-7',
+  });
+
+  // An unrelated update that spreads the existing entry (the registry's
+  // caller convention) keeps the last snapshot.
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), pid: 42 });
+  assert.equal(registry.getWorker('sdk-1').pid, 42);
+  assert.deepEqual(registry.getWorker('sdk-1').steering, {
+    turnActive: true,
+    canSteer: false,
+    holdReason: 'question',
+    messageId: 'q-7',
+  });
+
+  // Unknown hold reasons are dropped to null; junk shapes normalize to null.
+  registry.upsertWorker({
+    ...registry.getWorker('sdk-1'),
+    steering: { turnActive: true, canSteer: false, holdReason: 'weird-new-reason' },
+  });
+  assert.equal(registry.getWorker('sdk-1').steering.holdReason, null);
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), steering: 'garbage' });
+  assert.equal(registry.getWorker('sdk-1').steering, null);
+});

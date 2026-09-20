@@ -10,6 +10,10 @@ export function createHeartbeatController({
   // queued behind it, and a background continuation at once). Each reported
   // id gets its owner lease refreshed; unreported owned rows are recovered.
   getActiveQueueMessageIds,
+  // Optional: the worker's steering snapshot ({turnActive, canSteer,
+  // holdReason}) for the composer. Workers that do not steer leave it unset
+  // and the heartbeat body is unchanged.
+  getSteeringState,
 }) {
   async function pulseHeartbeat() {
     if (!getSessionReady()) return false;
@@ -20,9 +24,13 @@ export function createHeartbeatController({
       const activeQueueMessageIds = typeof getActiveQueueMessageIds === "function"
         ? (getActiveQueueMessageIds() || []).map((id) => String(id || "").trim()).filter(Boolean)
         : [];
+      const steering = typeof getSteeringState === "function"
+        ? getSteeringState()
+        : null;
       const body = {
         ...(activeQueueMessageId ? { activeQueueMessageId } : {}),
         ...(activeQueueMessageIds.length ? { activeQueueMessageIds } : {}),
+        ...(steering && typeof steering === "object" ? { steering } : {}),
       };
       await api("POST", "/api/heartbeat", body);
       return true;

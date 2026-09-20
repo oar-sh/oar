@@ -1953,10 +1953,20 @@ export function createClaudeSessionRunner({
       folded.push(entry);
       return false;
     });
-    for (const entry of folded) {
-      dbg('steered message folded into the finished turn; settling as merged', entry.ctx.message?.id || '(no id)');
-      void settleFoldedSteeredEntry(entry).catch((error) => dbg('folded-steer settle failed', error?.message || String(error)));
-    }
+    if (!folded.length) return;
+    // Settle sequentially, in push order: concurrent publishes could commit a
+    // later steer's merge stub before an earlier one's, and the transcript
+    // order is part of the multi-steer contract.
+    void (async () => {
+      for (const entry of folded) {
+        dbg('steered message folded into the finished turn; settling as merged', entry.ctx.message?.id || '(no id)');
+        try {
+          await settleFoldedSteeredEntry(entry);
+        } catch (error) {
+          dbg('folded-steer settle failed', error?.message || String(error));
+        }
+      }
+    })();
   }
 
   async function settleFoldedSteeredEntry(entry) {
@@ -2442,18 +2452,63 @@ export function createClaudeSessionRunner({
    *  - a provisional post-compaction adoption may still be unwound on the
    *    premise that the CLI never consumed the row's prompt — steering
    *    another message in would spend that premise for it;
-   *  - one steered message at a time: the previous push must attach before
-   *    another may ride (this is also what re-arms the link's readiness).
+   *  - a NON-steered pending entry means a turn-opening delivery is still
+   *    mid-flight (pushed with no turn active, replay not yet arrived) — a
+   *    steer would race the very turn that entry is about to open.
+   * The number of steered entries in flight is deliberately unbounded
+   * (Claude Code parity — the CLI queues any number of mid-turn messages and
+   * folds or replays them in push order; attach matches by expectedText,
+   * oldest first, and the fold reaper settles every leftover as merged).
    */
   function canAcceptSteering() {
     if (!proc || proc.closing || proc.aborted) return false;
     const ctx = proc.activeCtx;
     if (!ctx || ctx.finalized || ctx.discarded || ctx.interrupted) return false;
     if (ctx.adoptedFromCompaction) return false;
-    if (proc.pendingDelivered.length) return false;
+    if (proc.pendingDelivered.some((entry) => !entry.steered)) return false;
     if (proc.pendingControlRequests > 0) return false;
     if (isCompacting()) return false;
     return true;
+  }
+
+  /**
+   * Composer-facing steering snapshot: whether a turn is live, whether a
+   * message typed now would steer into it, and — when it would not — why.
+   * Rides the worker heartbeat to the relay's worker registry, so the client
+   * can disable the Steer button during holds instead of silently queueing.
+   * holdReason is a coarse enum, not a diagnostic: 'question' (a canUseTool
+   * round-trip — question card / plan approval — is open), 'compaction',
+   * 'adoption' (provisional post-compaction adoption), 'delivery' (a
+   * turn-opening delivery is still mid-flight).
+   */
+  function steeringState() {
+    // A closing/aborted process is about to die — nothing about its last turn
+    // should hold the composer of the worker that replaces it.
+    if (!proc || proc.closing || proc.aborted) {
+      return { turnActive: false, canSteer: false, holdReason: null, messageId: null };
+    }
+    const ctx = proc.activeCtx || null;
+    const ctxLive = Boolean(ctx && !ctx.finalized && !ctx.discarded && !ctx.interrupted);
+    // A turn-opening delivery in flight (pushed with no active ctx, replay not
+    // yet arrived) reads as an active turn to the user — the row is already
+    // `processing` — so it must report as one here, with a 'delivery' hold.
+    const openingDelivery = proc.pendingDelivered.find((entry) => !entry.steered) || null;
+    const turnActive = ctxLive || Boolean(openingDelivery);
+    const canSteer = canAcceptSteering();
+    let holdReason = null;
+    if (turnActive && !canSteer) {
+      if (proc.pendingControlRequests > 0) holdReason = 'question';
+      else if (isCompacting()) holdReason = 'compaction';
+      else if (ctxLive && ctx.adoptedFromCompaction) holdReason = 'adoption';
+      else if (openingDelivery) holdReason = 'delivery';
+      else holdReason = 'other';
+    }
+    // The turn this snapshot describes, so a client can discard a stale hold
+    // that belongs to a previous turn.
+    const messageId = String(
+      (ctxLive ? ctx.message?.id : '') || openingDelivery?.ctx?.message?.id || '',
+    ).trim() || null;
+    return { turnActive, canSteer, holdReason, messageId };
   }
 
   async function handlePendingPayload(pending) {
@@ -2580,6 +2635,7 @@ export function createClaudeSessionRunner({
   return {
     handlePendingPayload,
     canAcceptSteering,
+    steeringState,
     getActiveQueueMessageId,
     getActiveQueueMessageIds,
     isTurnActive,

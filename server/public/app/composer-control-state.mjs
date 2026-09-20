@@ -19,9 +19,18 @@ export function hasUploadingAttachments(attachments = []) {
   return countUploadingAttachments(attachments) > 0;
 }
 
+// Why the composer is refusing to steer right now — worker-reported hold
+// reasons mapped to a human title. Stopping a turn lives on the message
+// bubbles, never here, so every state below is a Send/Steer/Queue shape.
+const STEERING_HOLD_TITLES = Object.freeze({
+  question: 'Waiting on your answer to the open question',
+  compaction: 'Compacting the conversation — steering resumes afterwards',
+  adoption: 'Recovering from a compaction — steering resumes shortly',
+  delivery: 'Delivering a message — steering resumes shortly',
+});
+
 export function deriveComposerControlState({
   hasActiveTurn = false,
-  cancelRequested = false,
   hasDraft = false,
   sendInFlight = false,
   modelMetadataBlocked = false,
@@ -31,12 +40,18 @@ export function deriveComposerControlState({
   // queueing it behind — so the control says "Steer", not "Queue". Providers
   // that still serialize keep the queue wording.
   steeringSupported = false,
+  // The worker reports steering as momentarily held (open question card or
+  // plan approval, compaction, post-compaction adoption). The button stays
+  // "Steer" but disables, truthfully: a send now would neither steer nor be
+  // answerable until the hold clears.
+  steeringHeld = false,
+  steeringHoldReason = null,
 } = {}) {
   const active = !!hasActiveTurn;
-  const stopping = !!cancelRequested;
   const draft = !!hasDraft;
   const metadataBlocked = !!modelMetadataBlocked;
   const uploading = !!attachmentsUploading;
+  const held = active && !!steeringSupported && !!steeringHeld;
   // The label/title/action for a draft typed during a live turn: steer into it
   // where the provider supports that, queue behind it otherwise.
   const midTurnAction = steeringSupported ? 'steer' : 'queue';
@@ -44,6 +59,8 @@ export function deriveComposerControlState({
   const midTurnTitle = steeringSupported
     ? 'Steer message into the running turn'
     : 'Queue message behind current turn';
+  const heldTitle = STEERING_HOLD_TITLES[String(steeringHoldReason || '').trim()]
+    || 'Steering is momentarily unavailable';
 
   if (metadataBlocked && !active) {
     return {
@@ -54,9 +71,8 @@ export function deriveComposerControlState({
     };
   }
 
-  // Uploads are eager, so the blocking window is short. Keeping the button
-  // labelled Send/Steer/Queue (rather than switching to Stop) avoids the
-  // control flipping meaning mid-upload while a turn is running.
+  // Uploads are eager, so the blocking window is short. The control keeps its
+  // Send/Steer/Queue meaning while it waits.
   if (uploading) {
     const midTurn = active && draft;
     return {
@@ -68,31 +84,23 @@ export function deriveComposerControlState({
   }
 
   if (sendInFlight) {
-    if (active && draft) {
-      return {
-        action: midTurnAction,
-        label: midTurnLabel,
-        title: midTurnTitle,
-        disabled: true,
-      };
-    }
-    if (active) {
-      return {
-        action: 'stop',
-        label: stopping ? 'Stopping…' : 'Stop',
-        title: stopping ? 'Stopping the current turn' : 'Stop the current turn',
-        disabled: true,
-      };
-    }
     return {
-      action: 'send',
-      label: 'Send',
-      title: 'Send message',
+      action: active && draft ? midTurnAction : 'send',
+      label: active && draft ? midTurnLabel : 'Send',
+      title: active && draft ? midTurnTitle : 'Send message',
       disabled: true,
     };
   }
 
   if (active && draft) {
+    if (held) {
+      return {
+        action: midTurnAction,
+        label: midTurnLabel,
+        title: heldTitle,
+        disabled: true,
+      };
+    }
     return {
       action: midTurnAction,
       label: midTurnLabel,
@@ -102,11 +110,14 @@ export function deriveComposerControlState({
   }
 
   if (active) {
+    // Empty composer during a live turn: nothing to send, nothing to steer.
+    // The label stays "Send" (it only reads "Steer" with text present) and
+    // re-enables the moment the user types or the turn ends.
     return {
-      action: 'stop',
-      label: stopping ? 'Stopping…' : 'Stop',
-      title: stopping ? 'Stopping the current turn' : 'Stop the current turn',
-      disabled: stopping,
+      action: 'send',
+      label: 'Send',
+      title: 'Type a message to send',
+      disabled: true,
     };
   }
 

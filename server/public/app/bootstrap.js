@@ -3240,6 +3240,9 @@ async function refreshSessionWorkerStatus() {
   syncQueueStatusMenuEntry(status);
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();
+    // A worker steering snapshot may have changed; the composer's Steer
+    // button disable state derives from it.
+    syncComposerControlState();
   }
   updateCliStatus();
   const nextWorkerState = currentSdkSessionId ? getSessionWorkerState(currentSdkSessionId) : null;

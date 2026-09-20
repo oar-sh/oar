@@ -118,6 +118,9 @@ async function main() {
     // the crash guard below takes the entries whole so its requeues stay
     // fenced to this attempt.
     getActiveQueueMessageIds: () => turnRunner.getActiveQueueMessageIds().map((entry) => entry.id),
+    // Composer steering snapshot; ~10s worst-case latency is fine because the
+    // client covers the instant case (open question card) from its own state.
+    getSteeringState: () => turnRunner.steeringState(),
   });
 
   const wsLink = createWorkerWebSocketLink({

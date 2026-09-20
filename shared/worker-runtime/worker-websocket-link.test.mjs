@@ -349,8 +349,16 @@ test("a steering-ready worker keeps signalling readiness and runs a concurrent d
   assert.deepEqual(deliveries, ["m1", "m2-steered"]);
   assert.equal(link.status().delivering, true);
 
-  // Both deliveries settle with the turn; the link is idle only after the
+  // Steering is unbounded per turn: a third delivery rides alongside the
+  // first two while the probe keeps answering true.
+  socket.receive({ type: "queue.deliver", pending: { message: { id: "m3-steered" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(deliveries, ["m1", "m2-steered", "m3-steered"]);
+  assert.equal(link.status().delivering, true);
+
+  // All deliveries settle with the turn; the link is idle only after the
   // last one resolves.
+  settles.get("m3-steered")();
   settles.get("m2-steered")();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(link.status().delivering, true);

@@ -75,6 +75,8 @@ export function upsertRelayQuestion(question) {
   relayQuestions.set(question.id, question);
   updatePendingQuestionBanner();
   window.renderConvList?.();
+  // A question opening or settling flips the composer's steering hold.
+  window.syncComposerControlState?.();
   renderRelayQuestions();
 }
 
@@ -102,6 +104,7 @@ export async function loadRelayQuestions(conversationId) {
   for (const [id, q] of next.entries()) relayQuestions.set(id, q);
   updatePendingQuestionBanner();
   window.renderConvList?.();
+  window.syncComposerControlState?.();
 
   if (!conversationId && pending.length) {
     const latest = pending
@@ -467,6 +470,7 @@ export async function submitRelayStructuredAnswer(questionId) {
     if (r.question) relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();
+    window.syncComposerControlState?.();
     renderRelayQuestions();
     window.showTransientRelayNotice?.(`✅ Answer received · Agent continuing…`, 7000);
   } catch (e) {
@@ -525,6 +529,7 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
     relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();
+    window.syncComposerControlState?.();
     renderRelayQuestions();
     window.showTransientRelayNotice?.(`✅ Answer received: ${answer} · Agent continuing…`, 7000);
   } catch (e) {

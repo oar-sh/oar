@@ -44,7 +44,9 @@ import {
   SHARED_CONVERSATION_TOKEN,
   imageEditTarget,
   setImageEditTarget as setStoredImageEditTarget,
+  getSessionWorkerState,
 } from './store.js';
+import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, parseAppFileHref, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
@@ -424,13 +426,61 @@ function conversationSupportsSteering(conversationId) {
   return String(conversations[conversationKey]?.runtimeProviderType || '').trim().toLowerCase() === 'claude';
 }
 
+// Whether steering into this conversation's live turn is momentarily held,
+// and why. Two sources, freshest first: the client's own knowledge of an open
+// question card (instant — the worker's heartbeat snapshot lags up to ~10s),
+// then the worker-reported steering snapshot for the slower holds only it can
+// see (compaction, post-compaction adoption).
+function steeringHoldForConversation(conversationId) {
+  const conversationKey = String(conversationId || '').trim();
+  if (!conversationKey || !conversationSupportsSteering(conversationKey)) {
+    return { held: false, reason: null };
+  }
+  try {
+    const pendingQuestions = Number(getPendingQuestionCountsByConversation()?.[conversationKey] || 0);
+    if (pendingQuestions > 0) return { held: true, reason: 'question' };
+  } catch {}
+  const conversation = conversations[conversationKey] || null;
+  // Same hydration shapes validateSelectedConversationBeforeSend handles:
+  // camelCase, snake_case, or only the runtime session binding.
+  const sdkSessionId = String(
+    conversation?.sdkSessionId
+    || conversation?.sdk_session_id
+    || conversation?.runtimeSession?.sdkSessionId
+    || conversation?.runtimeSession?.sdk_session_id
+    || '',
+  ).trim();
+  const steering = sdkSessionId ? (getSessionWorkerState(sdkSessionId)?.steering || null) : null;
+  if (steering && steering.turnActive && !steering.canSteer) {
+    // The client's own question knowledge is authoritative both ways: it saw
+    // the card answered instantly, while the worker snapshot lags ~10s.
+    if (steering.holdReason === 'question') return { held: false, reason: null };
+    // The 'delivery' hold covers the seconds while a turn-opening delivery is
+    // still in flight — but a heartbeat-captured copy outlives that window by
+    // up to a poll cycle and names the SAME turn, so the client cannot tell
+    // stale from live. Ignore it: a steer sent into that window just queues
+    // and rides in moments later, which was always safe.
+    if (steering.holdReason === 'delivery') return { held: false, reason: null };
+    // A snapshot naming a different turn than the one the client is watching
+    // is a leftover from the previous turn — ignore it.
+    const clientTurnMessageId = String(getActiveTurnForConversation(conversationKey)?.messageId || '').trim();
+    if (steering.messageId && clientTurnMessageId && steering.messageId !== clientTurnMessageId) {
+      return { held: false, reason: null };
+    }
+    return { held: true, reason: steering.holdReason || null };
+  }
+  return { held: false, reason: null };
+}
+
 function syncSendButtonState() {
   const btn = document.getElementById('send-btn');
   if (!btn) return;
   const currentTurn = getActiveTurnForConversation(currentConvId);
+  const steeringHold = currentTurn
+    ? steeringHoldForConversation(currentConvId)
+    : { held: false, reason: null };
   const state = deriveComposerControlState({
     hasActiveTurn: !!currentTurn,
-    cancelRequested: currentTurn?.cancelRequested === true,
     hasDraft: hasComposerDraft({
       text: document.getElementById('msg-input')?.value || '',
       attachmentCount: selectedAttachments.length,
@@ -439,6 +489,8 @@ function syncSendButtonState() {
     modelMetadataBlocked: window.isModelMetadataBlocked?.() === true,
     attachmentsUploading: hasUploadingAttachments(selectedAttachments),
     steeringSupported: conversationSupportsSteering(currentConvId),
+    steeringHeld: steeringHold.held,
+    steeringHoldReason: steeringHold.reason,
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
@@ -1993,58 +2045,9 @@ export function applyConversationTurnStatus({ conversationId, messageId, status 
   syncSendButtonState();
 }
 
-async function stopCurrentConversationTurn(conversationId) {
-  const conversationKey = String(conversationId || '').trim();
-  const activeTurn = getActiveTurnForConversation(conversationKey);
-  if (!conversationKey || !activeTurn?.messageId) return;
-  if (activeTurn.cancelRequested) return;
-  if (isMobileComposerViewport() && !confirm('Stop the current turn?')) return;
-  setConversationTurnState(conversationKey, {
-    messageId: activeTurn.messageId,
-    status: activeTurn.status || 'processing',
-    cancelRequested: true,
-  });
-  const expectedMessageId = activeTurn.messageId;
-  const result = await cancelConversationTurn(conversationKey, {
-    clientId: CLIENT_ID,
-    messageId: expectedMessageId,
-  });
-  if (!result?.ok) {
-    setConversationTurnState(conversationKey, {
-      messageId: expectedMessageId,
-      status: activeTurn.status || 'processing',
-      cancelRequested: false,
-    });
-    showTransientRelayNotice('Could not stop the current turn.');
-    return;
-  }
-  if (
-    result.acknowledgement === 'already-finished'
-    || result.acknowledgement === 'no-active-turn'
-    || result.acknowledgement === 'message-mismatch'
-  ) {
-    const latestTurn = getActiveTurnForConversation(conversationKey);
-    if (latestTurn?.messageId === expectedMessageId) {
-      setConversationTurnState(conversationKey, null);
-    }
-    showTransientRelayNotice('That turn already finished.');
-    return;
-  }
-  if (result.acknowledgement === 'active-turn-unbound') {
-    const latestTurn = getActiveTurnForConversation(conversationKey);
-    if (latestTurn?.messageId === expectedMessageId) {
-      setConversationTurnState(conversationKey, {
-        messageId: expectedMessageId,
-        status: activeTurn.status || 'processing',
-        cancelRequested: false,
-      });
-    }
-    showTransientRelayNotice('The active turn is not bound to a live SDK session.');
-    return;
-  }
-  showTransientRelayNotice('Stopping the current turn…');
-}
-
+// Stopping a turn lives on the message bubbles only (the live turn's Stop and
+// pending rows' Cancel). The composer's send button never doubles as Stop —
+// the old stopCurrentConversationTurn composer path is gone with it.
 async function stopTurnByMessageId(conversationId, messageId) {
   const conversationKey = String(conversationId || '').trim();
   const targetMessageId = String(messageId || '').trim();
@@ -2735,6 +2738,15 @@ export async function sendMessage() {
     releaseComposerFocusAfterSend(input);
     const result = await runPreviewCommand(previewCommand, { conversationId: currentConvId });
     showTransientRelayNotice(result.notice);
+    return;
+  }
+
+  // The steering hold guards every agent-bound entry path (button, Enter,
+  // Ctrl/Cmd+Enter): a disabled Steer button must not have a live keyboard
+  // twin that sends into the hold anyway. Deliberately AFTER the local
+  // commands above — /compact and /preview never touch the held turn.
+  if (activeTurn && steeringHoldForConversation(currentConvId).held) {
+    showTransientRelayNotice('Steering is momentarily unavailable — answer the open card or wait a moment.');
     return;
   }
 

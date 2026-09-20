@@ -60,6 +60,26 @@ function normalizeStatus(value) {
   return ALLOWED_STATUSES.has(mapped) ? mapped : 'new';
 }
 
+const STEERING_HOLD_REASONS = new Set(['question', 'compaction', 'adoption', 'delivery', 'other']);
+
+// The worker's composer-facing steering snapshot, published on its heartbeat.
+// Callers follow the registry convention of spreading the existing entry into
+// upserts, so an update without `steering` keeps the last known snapshot.
+// Exported so the heartbeat route compares apples to apples: normalizing there
+// with different rules would make an unknown holdReason never converge and
+// re-upsert on every heartbeat.
+export function normalizeWorkerSteeringSnapshot(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const holdReason = String(raw.holdReason || '').trim().toLowerCase();
+  const messageId = String(raw.messageId || '').trim().slice(0, 64);
+  return {
+    turnActive: raw.turnActive === true,
+    canSteer: raw.canSteer === true,
+    holdReason: STEERING_HOLD_REASONS.has(holdReason) ? holdReason : null,
+    messageId: messageId || null,
+  };
+}
+
 function sanitizeState(raw = null) {
   const nowIso = new Date().toISOString();
   const base = raw && typeof raw === 'object' ? raw : {};
@@ -74,6 +94,7 @@ function sanitizeState(raw = null) {
     queueDepth: toNonNegativeInt(base.queueDepth, 0),
     retryCount: toNonNegativeInt(base.retryCount, 0),
     lastError: String(base.lastError || '').trim() || null,
+    steering: normalizeWorkerSteeringSnapshot(base.steering),
     updatedAt: normalizeTimestamp(base.updatedAt, nowIso),
     createdAt,
   };

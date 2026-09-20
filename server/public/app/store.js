@@ -881,6 +881,7 @@ function normalizeWorkerStateEntry(worker) {
   if (!sdkSessionId) return null;
   const explicitUiState = normalizeUiState(worker?.uiState || worker?.ui_state);
   const derivedUiState = normalizeUiStateFromStatus(worker?.status);
+  const rawSteering = worker?.steering && typeof worker.steering === 'object' ? worker.steering : null;
   return {
     sdkSessionId,
     status: normalizeWorkerStatus(worker?.status),
@@ -889,13 +890,28 @@ function normalizeWorkerStateEntry(worker) {
     workerId: String(worker?.workerId || '').trim() || null,
     pid: Number.isInteger(Number(worker?.pid)) ? Number(worker.pid) : null,
     updatedAt: String(worker?.updatedAt || '').trim() || null,
+    // Composer steering snapshot from the worker's heartbeat: whether a typed
+    // message would steer into the live turn, and why not when it wouldn't.
+    steering: rawSteering
+      ? {
+          turnActive: rawSteering.turnActive === true,
+          canSteer: rawSteering.canSteer === true,
+          holdReason: String(rawSteering.holdReason || '').trim() || null,
+          // The turn the snapshot describes — lets the composer drop a hold
+          // that belongs to a previous turn (the heartbeat lags ~10s).
+          messageId: String(rawSteering.messageId || '').trim() || null,
+        }
+      : null,
   };
 }
 
 function buildSessionWorkerStateHash(map) {
   const parts = [];
   for (const [sid, state] of map.entries()) {
-    parts.push(`${sid}:${state.status}:${state.uiState || ''}:${state.derivedUiState || ''}:${state.workerId || ''}:${state.pid || ''}:${state.updatedAt || ''}`);
+    const steering = state.steering
+      ? `${state.steering.turnActive ? 1 : 0}${state.steering.canSteer ? 1 : 0}${state.steering.holdReason || ''}:${state.steering.messageId || ''}`
+      : '';
+    parts.push(`${sid}:${state.status}:${state.uiState || ''}:${state.derivedUiState || ''}:${state.workerId || ''}:${state.pid || ''}:${state.updatedAt || ''}:${steering}`);
   }
   return parts.sort().join('|');
 }

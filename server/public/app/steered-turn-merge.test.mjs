@@ -106,3 +106,23 @@ test('a healed pair split across a history-page boundary classes on the later pa
   assert.equal(changes, 1);
   assert.equal(steered.classList.contains(STEERED_MSG_CLASS), true);
 });
+
+test('the fold shape (multi-steer) renders per-message markers, no trio classes', () => {
+  // Multi-steering fold: several user rows sent mid-turn, ONE real answer on
+  // the original row, then one absorbed stub per steered row. Each stub is its
+  // own compact marker; none of the user rows form a replay-handoff trio (the
+  // row above each is a user row or the real answer, never an absorbed reply
+  // directly above a steered user).
+  const el = container();
+  addMsg(el, { role: 'user' });                     // q1
+  const q2 = addMsg(el, { role: 'user' });          // steered
+  const q3 = addMsg(el, { role: 'user' });          // steered
+  const answer = addMsg(el, { role: 'assistant' }); // the turn's one result
+  addMsg(el, { role: 'assistant', absorbed: true }); // q2's merge stub
+  addMsg(el, { role: 'assistant', absorbed: true }); // q3's merge stub
+
+  assert.equal(syncSteeredTurnMerge(el), 0, 'no classes to add or remove');
+  assert.equal(q2.classList.contains(STEERED_MSG_CLASS), false);
+  assert.equal(q3.classList.contains(STEERED_MSG_CLASS), false);
+  assert.equal(answer.classList.contains(STEERED_CONTINUATION_CLASS), false);
+});

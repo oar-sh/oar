@@ -991,6 +991,137 @@ test('a steered message the CLI folds into the turn (no replay) settles as merge
   await settled(runner);
 });
 
+test('multiple messages steered into one turn all settle as merged, in push order', async () => {
+  // Multi-steering: the per-turn steer count is unbounded (Claude Code
+  // parity). Three mid-turn pushes fold into the same running turn; ONE
+  // result answers everything and every steered row settles as merged —
+  // oldest first — with nothing left in pendingDelivered.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer two' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'first steer pending' });
+  assert.equal(runner.canAcceptSteering(), true, 'the steer slot is not exhausted by one entry');
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'steer three' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 2, { label: 'second steer pending' });
+  assert.equal(runner.canAcceptSteering(), true, 'still open after two');
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4', text: 'steer four' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 3, { label: 'third steer pending' });
+
+  turn.emit(resultMessage('did everything at once', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(await third, true);
+  assert.equal(await fourth, true);
+
+  const firstResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.equal(firstResponse.body.text, 'did everything at once');
+  for (const id of ['q-2', 'q-3', 'q-4']) {
+    const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === id);
+    assert.equal(response.body.absorbed, true, `${id} settles as merged`);
+    assert.match(response.body.text, /Handled together with the previous reply/);
+  }
+  // Push order is settle order: q-2's merge publishes before q-4's.
+  const responseOrder = stub.calls
+    .filter((call) => call.routePath === '/api/response' && ['q-2', 'q-3', 'q-4'].includes(call.body.messageId))
+    .map((call) => call.body.messageId);
+  assert.deepEqual(responseOrder, ['q-2', 'q-3', 'q-4']);
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'nothing left stuck in pendingDelivered');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a steer the CLI queues instead of folding attaches to its own turn; the rest merge', async () => {
+  // Mixed outcome: with several steers in flight the CLI may fold some and
+  // replay others as their own turns. The replay attaches by text and gets its
+  // real answer; the folded ones settle as merged — no cross-attribution.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 200,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer folded' } });
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'steer replayed' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 2, { label: 'both steers pending' });
+
+  // The first turn ends having folded q-2 only; the CLI immediately replays
+  // q-3 as its own turn (inside the fold grace).
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+  turn.emit(userReplay('steer replayed'));
+  turn.emit(assistantText('second answer'));
+  turn.emit(resultMessage('second answer', 'native-1'));
+
+  assert.equal(await third, true);
+  const thirdResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-3');
+  assert.equal(thirdResponse.body.text, 'second answer');
+  assert.notEqual(thirdResponse.body.absorbed, true, 'a replayed steer is a real turn, never the merged stub');
+
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.absorbed, true, 'the folded steer settles as merged');
+  assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('steeringState reports the composer-facing snapshot', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  assert.deepEqual(runner.steeringState(), { turnActive: false, canSteer: false, holdReason: null, messageId: null });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1' });
+
+  // Steered entries in flight do not hold steering (unbounded), and the
+  // snapshot keeps naming the turn they steer into.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer two' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pending' });
+  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1' });
+
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('a folded steer settles as merged even while a background task is still running', async () => {
   // Live 2026-09-20 wedge: a turn spawned a background Bash task that hung for
   // 35 minutes; a message steered into a LATER turn was folded and answered by
