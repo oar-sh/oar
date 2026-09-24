@@ -43,7 +43,7 @@
     "test:e2e:raw": "node ./node_modules/@playwright/test/cli.js test --config tests/playwright.config.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.278",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.281",
     "@cursor/sdk": "^1.0.27",
     "@github/copilot-sdk": "^1.0.13",
     "better-sqlite3": "^12.10.0",
