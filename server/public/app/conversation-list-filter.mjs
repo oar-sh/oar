@@ -25,10 +25,11 @@ export function filterConversations(conversations, filterText) {
   return list.filter((conversation) => conversationMatchesFilter(conversation, normalized));
 }
 
-export function describeFilterMatchCount(count) {
+export function describeFilterMatchCount(count, { loadedOnly = false } = {}) {
   const n = Math.max(0, Number(count) || 0);
-  if (n === 0) return 'No conversations match';
-  return n === 1 ? '1 conversation matches' : `${n} conversations match`;
+  const noun = loadedOnly ? 'loaded conversation' : 'conversation';
+  if (n === 0) return `No ${noun}s match`;
+  return n === 1 ? `1 ${noun} matches` : `${n} ${noun}s match`;
 }
 
 function cursorKey(state) {

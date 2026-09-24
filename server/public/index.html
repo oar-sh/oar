@@ -521,9 +521,12 @@
     background: var(--bg2);
     color: var(--text);
     padding: 0 38px 0 10px;
-    /* iOS Safari zooms the page on focus for inputs under 16px, and the
-       mobile root font is 12-14px, so 1rem alone is not enough. */
-    font-size: max(16px, 1rem);
+    font-size: var(--fs-meta-md);
+  }
+  /* iOS Safari zooms the page on focus for inputs under 16px, and the mobile
+     root font is 12-14px, so 1rem alone is not enough. */
+  @media (pointer: coarse), (max-width: 680px) {
+    #conv-filter-input { font-size: max(16px, 1rem); }
   }
   #conv-filter-input:focus {
     outline: none;

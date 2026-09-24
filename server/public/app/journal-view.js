@@ -1212,19 +1212,25 @@ async function drainConversationListForFilter() {
 
 // Announced only when the (debounced) filter applies and when its drain ends,
 // not on every page render, so screen readers are not flooded while typing.
+// Unchanged text is not rewritten: refresh-triggered drains (session bind,
+// reconnect) must not re-announce without a user action.
 function announceConversationFilterResults() {
   const status = document.getElementById('conv-filter-status');
   if (!status) return;
   const activeFilter = normalizeConversationFilter(conversationListFilterText);
-  if (!activeFilter) {
-    status.textContent = '';
-    return;
+  let text = '';
+  if (activeFilter) {
+    const count = filterConversations(Object.values(conversations), activeFilter).length;
+    if (!conversationListLoader.getState().hasMore) {
+      text = describeFilterMatchCount(count);
+    } else if (conversationFilterDrainActive) {
+      text = `${describeFilterMatchCount(count)} so far, searching older conversations`;
+    } else {
+      // The drain gave up with pages left, so the search is not complete.
+      text = describeFilterMatchCount(count, { loadedOnly: true });
+    }
   }
-  const count = filterConversations(Object.values(conversations), activeFilter).length;
-  const searching = conversationFilterDrainActive && conversationListLoader.getState().hasMore;
-  status.textContent = searching
-    ? `${describeFilterMatchCount(count)} so far, searching older conversations`
-    : describeFilterMatchCount(count);
+  if (status.textContent !== text) status.textContent = text;
 }
 
 function setConversationListFilter(text) {

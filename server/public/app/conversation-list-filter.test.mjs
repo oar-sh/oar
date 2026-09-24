@@ -70,6 +70,9 @@ test('describeFilterMatchCount pluralizes the announced result count', () => {
   assert.equal(describeFilterMatchCount(1), '1 conversation matches');
   assert.equal(describeFilterMatchCount(7), '7 conversations match');
   assert.equal(describeFilterMatchCount(undefined), 'No conversations match');
+  assert.equal(describeFilterMatchCount(0, { loadedOnly: true }), 'No loaded conversations match');
+  assert.equal(describeFilterMatchCount(1, { loadedOnly: true }), '1 loaded conversation matches');
+  assert.equal(describeFilterMatchCount(4, { loadedOnly: true }), '4 loaded conversations match');
 });
 
 test('filterConversations tolerates a non-array input', () => {
