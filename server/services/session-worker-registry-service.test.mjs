@@ -144,3 +144,40 @@ test('the steering snapshot is normalized, stored, and survives spread-conventio
   registry.upsertWorker({ ...registry.getWorker('sdk-1'), steering: 'garbage' });
   assert.equal(registry.getWorker('sdk-1').steering, null);
 });
+
+test('a steering snapshot does not outlive the worker process it describes', () => {
+  const registry = createSessionWorkerRegistry();
+  const hold = { turnActive: true, canSteer: false, holdReason: 'question', messageId: 'q-7' };
+  const seed = () => registry.upsertWorker({ sdkSessionId: 'sdk-1', status: 'processing', pid: 100, steering: hold });
+
+  // A replacement process (pid change), even through a spreading upsert.
+  seed();
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), pid: 200 });
+  assert.equal(registry.getWorker('sdk-1').steering, null, 'pid change');
+
+  // The worker died (dead-worker recovery marks it errored) or is restarting.
+  for (const status of ['error', 'starting', 'stopped']) {
+    registry.removeWorker('sdk-1');
+    seed();
+    registry.upsertWorker({ ...registry.getWorker('sdk-1'), status });
+    assert.equal(registry.getWorker('sdk-1').steering, null, `status → ${status}`);
+  }
+
+  // Staying errored while the live worker keeps heartbeating keeps the fresh
+  // snapshot (a requeue retry marks a live worker errored).
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), steering: hold });
+  assert.deepEqual(registry.getWorker('sdk-1').steering, hold);
+
+  // An ordinary status change of a live worker keeps it.
+  registry.removeWorker('sdk-1');
+  seed();
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), status: 'ready' });
+  assert.deepEqual(registry.getWorker('sdk-1').steering, hold);
+
+  // Socket-close death detection clears it explicitly.
+  assert.equal(registry.clearSteering('sdk-1'), true);
+  assert.equal(registry.getWorker('sdk-1').steering, null);
+  assert.equal(registry.getWorker('sdk-1').pid, 100, 'nothing else changes');
+  assert.equal(registry.clearSteering('sdk-1'), false);
+  assert.equal(registry.clearSteering('missing'), false);
+});

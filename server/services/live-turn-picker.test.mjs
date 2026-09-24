@@ -17,34 +17,43 @@ test('the streaming turn wins over a folded steered row with no output', () => {
   // (newer, silent): the live turn is the one producing output, so the empty
   // steered row never captures the live bubble.
   const live = pickLiveTurnRowId([
-    { id: 'turn', processingAtMs: 1000, lastStreamSeq: 42, activityCount: 7 },
-    { id: 'steered', processingAtMs: 2000, lastStreamSeq: 0, activityCount: 0 },
+    { id: 'turn', processingAtMs: 1000, lastOutputAtMs: 5000 },
+    { id: 'steered', processingAtMs: 2000, lastOutputAtMs: 0 },
   ]);
   assert.equal(live, 'turn');
 });
 
-test('activity breaks the tie when neither row has streamed yet', () => {
+test('the row that took the turn over wins over a long handed-off row', () => {
+  // Replay handoff: row A streamed and ran tools for minutes (hundreds of
+  // events, so a high per-row seq), then B took the turn and has written a
+  // single snapshot since. Per-row seq would pick A and aim Stop at a row
+  // that is already settling; recency picks B.
   const live = pickLiveTurnRowId([
-    { id: 'turn', processingAtMs: 1000, lastStreamSeq: 0, activityCount: 3 },
-    { id: 'steered', processingAtMs: 2000, lastStreamSeq: 0, activityCount: 0 },
+    { id: 'long-a', processingAtMs: 1000, lastOutputAtMs: 90_000 },
+    { id: 'live-b', processingAtMs: 60_000, lastOutputAtMs: 90_500 },
   ]);
-  assert.equal(live, 'turn');
+  assert.equal(live, 'live-b');
+});
+
+test('an activity line counts as output as much as a stream snapshot', () => {
+  // A turn running tools writes activity before any prose.
+  const live = pickLiveTurnRowId([
+    { id: 'quiet-since', processingAtMs: 1000, lastOutputAtMs: 3000 },
+    { id: 'running-tools', processingAtMs: 2000, lastOutputAtMs: 4000 },
+  ]);
+  assert.equal(live, 'running-tools');
 });
 
 test('with nothing to separate them, the oldest processing row wins', () => {
   // The instant a message is steered in, before the turn streams: the running
   // turn is the older row, so the live bubble stays with it.
   const live = pickLiveTurnRowId([
-    { id: 'turn', processingAtMs: 1000, lastStreamSeq: 0, activityCount: 0 },
-    { id: 'steered', processingAtMs: 2000, lastStreamSeq: 0, activityCount: 0 },
+    { id: 'turn', processingAtMs: 1000, lastOutputAtMs: 0 },
+    { id: 'steered', processingAtMs: 2000, lastOutputAtMs: 0 },
   ]);
   assert.equal(live, 'turn');
-});
-
-test('a higher stream seq outranks more activity', () => {
-  const live = pickLiveTurnRowId([
-    { id: 'streaming', processingAtMs: 2000, lastStreamSeq: 10, activityCount: 1 },
-    { id: 'chatty', processingAtMs: 1000, lastStreamSeq: 5, activityCount: 99 },
-  ]);
-  assert.equal(live, 'streaming');
+  assert.equal(pickLiveTurnRowId([
+    { id: 'steered', processingAtMs: 2000, lastOutputAtMs: 7000 },
+    { id: 'turn', processingAtMs: 1000, lastOutputAtMs: 7000 },
+  ]), 'turn', 'equal output times fall back to the older row too');
 });

@@ -4882,12 +4882,12 @@ const backgroundTaskStore = {
 };
 
 // The live turn among a conversation's processing rows. Mid-turn steering can
-// leave two processing at once — the running turn and a steered message the CLI
-// folded into it — and the folded row produces no stream/activity of its own.
-// So the live turn is the processing row that is actually producing output
-// (most recent stream event, then most activity); with nothing to separate
-// them yet, the oldest processing row (the turn a steered message joins) wins.
-// Returns the whole row so callers get relay_mode/timestamps too.
+// leave several processing at once — the running turn, steered messages the
+// CLI folded into it (no output of their own), a handed-off row still settling
+// — so the live turn is the row that produced output most recently; with
+// nothing to separate them yet, the oldest processing row (the turn a steered
+// message joins) wins. See live-turn-picker.mjs for why recency, not per-row
+// stream seq. Returns the whole row so callers get relay_mode/timestamps too.
 function resolveLiveTurnQueueRow(conversationId) {
   const rows = stmts.listProcessingQueueByConversation?.all(conversationId)
     || (stmts.getLatestProcessingQueueByConversation.get(conversationId)
@@ -4897,12 +4897,10 @@ function resolveLiveTurnQueueRow(conversationId) {
   if (rows.length === 1) return rows[0];
   const byId = new Map(rows.map((row) => [String(row.id), row]));
   const liveId = pickLiveTurnRowId(rows.map((row) => {
-    const streamEvents = relayStreamEventsForQueueMessage(row.id);
-    const lastStream = streamEvents.length ? streamEvents[streamEvents.length - 1] : null;
+    const lastOutputAt = stmts.getLastOutputAtByQueueMessage?.get(row.id, row.id)?.last_output_at || '';
     return {
       id: String(row.id),
-      lastStreamSeq: Number(lastStream?.seq || 0),
-      activityCount: (relayActivityForQueueMessage(row.id) || []).length,
+      lastOutputAtMs: Date.parse(String(lastOutputAt)) || 0,
       processingAtMs: Date.parse(String(row.processing_at || row.timestamp || '')) || 0,
     };
   }));
@@ -5843,11 +5841,15 @@ function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
   const owned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
-  if (!owned.length) return;
+  // A dead worker's steering snapshot must not keep holding the composer even
+  // when it owned no rows (the hold can outlive them, e.g. a continuation's).
+  const heldSteering = Boolean(sessionWorkerRegistry?.getWorker?.(sid)?.steering);
+  if (!owned.length && !heldSteering) return;
   const timer = setTimeout(() => {
     try {
       if (runtimeShutdownStarted) return;
       if (isWorkerSessionProcessAlive(sid, pid)) return; // reconnect or socket flap
+      sessionWorkerRegistry?.clearSteering?.(sid);
       const stillOwned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
       if (!stillOwned.length) return;
       console.warn(`${runtimeLogPrefix()}WORKER DIED session=${sid.slice(0, 8)} rows=${stillOwned.length} trigger=socket-close — recovering owned turns`);

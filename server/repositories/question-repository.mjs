@@ -25,6 +25,17 @@ export function createQuestionRepository(db) {
         linkActivityToResponse: db.prepare(`UPDATE relay_activity SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
         listActivityByResponse: db.prepare(`SELECT text, subagent_run_id, metadata_json FROM relay_activity WHERE response_message_id = ? ORDER BY id ASC`),
         listActivityByQueueMessage: db.prepare(`SELECT text, subagent_run_id, metadata_json FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
+        // When a queue row last produced output — its newest stream snapshot
+        // (rows are rewritten in place and re-stamped per update) or activity
+        // line. The live-turn picker compares rows by this, never by the
+        // per-row stream seq.
+        getLastOutputAtByQueueMessage: db.prepare(`
+          SELECT MAX(at) AS last_output_at FROM (
+            SELECT MAX(created_at) AS at FROM relay_stream_events WHERE queue_message_id = ?
+            UNION ALL
+            SELECT MAX(created_at) AS at FROM relay_activity WHERE queue_message_id = ?
+          )
+        `),
         deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
 
         // relay stream events — every update carries the full text-so-far

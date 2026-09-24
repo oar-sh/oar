@@ -100,6 +100,17 @@ function sanitizeState(raw = null) {
   };
 }
 
+// Statuses that mean the process a snapshot described is gone or not yet
+// replaced by one that has reported. 'error' counts only on the way IN: a
+// live worker marked errored (a requeue retry) keeps heartbeating, and its
+// next snapshot must stick rather than be cleared on every upsert.
+const WORKER_GONE_STATUSES = new Set(['new', 'starting', 'stopped', 'error']);
+
+function isWorkerReplacedOrGone(existing, next) {
+  if (existing.pid && next.pid !== existing.pid) return true;
+  return next.status !== existing.status && WORKER_GONE_STATUSES.has(next.status);
+}
+
 function toSnapshot(entry) {
   return Object.freeze({ ...entry });
 }
@@ -184,10 +195,24 @@ export function createSessionWorkerRegistry() {
       createdAt: existing?.createdAt || state.createdAt,
       updatedAt: new Date().toISOString(),
     });
+    // A steering snapshot describes one live worker process. Callers spread
+    // the old entry into every upsert, so without this a crashed worker's
+    // hold outlived it and the composer showed it until a replacement
+    // heartbeated — indefinitely, if none ever did.
+    if (existing && isWorkerReplacedOrGone(existing, next)) next.steering = null;
     clearIndexesForSession(existing);
     bySession.set(state.sdkSessionId, next);
     updateIndexesForSession(next);
     return toSnapshot(next);
+  }
+
+  /** Drop a session's steering snapshot (its worker process is known dead). */
+  function clearSteering(sdkSessionId) {
+    const sessionId = normalizeSessionId(sdkSessionId);
+    const existing = sessionId ? bySession.get(sessionId) : null;
+    if (!existing?.steering) return false;
+    bySession.set(sessionId, { ...existing, steering: null, updatedAt: new Date().toISOString() });
+    return true;
   }
 
   function removeWorker(sdkSessionId) {
@@ -245,6 +270,7 @@ export function createSessionWorkerRegistry() {
     getWorkerByRuntimeSessionId,
     listWorkers,
     upsertWorker,
+    clearSteering,
     removeWorker,
     rekeyWorker,
     clearAll,

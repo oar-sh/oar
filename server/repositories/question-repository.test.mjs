@@ -117,3 +117,23 @@ test('preview cards: insert with queue id, link at finalize, list by response', 
   repo.deleteConvPreviewCards.run('conv-1');
   assert.deepEqual(repo.listPreviewCardsByResponse.all('resp-1'), []);
 });
+
+test('getLastOutputAtByQueueMessage reports the newest stream or activity write, per row', () => {
+  const db = makeDb();
+  const repo = createQuestionRepository(db);
+  // queue-1: a long turn — many activity lines and a big stream, all older.
+  for (let i = 0; i < 40; i += 1) {
+    repo.insertActivity.run('queue-1', null, 'conv-1', 'agent', `tool ${i}`, `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`, null, null);
+  }
+  repo.insertStreamEvent.run('queue-1', null, 'conv-1', 'agent', 57, 'long answer', 0, '2026-01-01T00:00:50.000Z', null);
+  // queue-2: took over later with one snapshot.
+  repo.insertStreamEvent.run('queue-2', null, 'conv-1', 'agent', 1, 'new', 0, '2026-01-01T00:01:05.000Z', null);
+  // queue-3: activity only.
+  repo.insertActivity.run('queue-3', null, 'conv-1', 'agent', 'thinking', '2026-01-01T00:00:30.000Z', null, null);
+
+  const at = (id) => repo.getLastOutputAtByQueueMessage.get(id, id).last_output_at;
+  assert.equal(at('queue-1'), '2026-01-01T00:00:50.000Z');
+  assert.equal(at('queue-2'), '2026-01-01T00:01:05.000Z');
+  assert.equal(at('queue-3'), '2026-01-01T00:00:30.000Z');
+  assert.equal(at('queue-4'), null, 'no output yet');
+});
