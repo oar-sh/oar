@@ -3880,7 +3880,14 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(400).json({ error: 'Invalid baseDraftUpdatedAt timestamp' });
     }
     const existingDraftUpdatedAt = normalizeOptionalIsoTimestamp(existing.draft_updated_at);
-    if (hasConversationDraftVersionConflict({
+    // A pagehide copy taken while this client's own send was in flight carries
+    // the pre-send base; the send transaction has since moved the version. That
+    // move (recorded with the sender's client id) is the only mismatch it may
+    // pass — a newer draft from anyone else still conflicts.
+    const acceptsOwnSendVersion = req.body?.acceptOwnSend === true
+      && !!senderClientId
+      && String(existing.draft_updated_by_client_id || '') === senderClientId;
+    if (!acceptsOwnSendVersion && hasConversationDraftVersionConflict({
       existingDraftUpdatedAt,
       baseDraftUpdatedAt: normalizedBaseDraftUpdatedAt,
       compareEnabled: comparesDraftVersion,

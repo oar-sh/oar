@@ -1,5 +1,5 @@
 import { BASE, CLIENT_ID, authHeaders, conversations } from './store.js';
-import { draftFlushRequestBody, getSyncedDraft } from './conversation-draft-sync.mjs';
+import { draftFlushRequestBody, getSyncedDraft, isStaleDraftFlushEntry } from './conversation-draft-sync.mjs';
 
 // Durable outbox for Background Sync: message sends, ask_user answers, and
 // draft flushes that failed (or might die mid-flight on pagehide) are queued
@@ -130,6 +130,10 @@ export async function replayOutboxFromPage() {
     db = await openOutboxDb();
     const entries = await readOutboxEntries(db);
     for (const { key, value } of entries) {
+      if (isStaleDraftFlushEntry(value)) {
+        await deleteOutboxEntry(db, key);
+        continue;
+      }
       let response = null;
       try {
         response = await fetch(`${BASE}${value.path}`, {

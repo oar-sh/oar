@@ -656,17 +656,28 @@ function saveComposerIfUnsynced(conversationId) {
   void scheduleConversationDraftSave({ conversationId, draftText: text, draftAttachments: attachments });
 }
 
+// The server echoes a stored message to its sender (user_message with this
+// client's id), which drops it from pendingUserMessageIds; status events for
+// it do the same. Either means the send landed even if its response failed.
+function hasSendEchoArrived(clientMessageId) {
+  const id = String(clientMessageId || '').trim();
+  return !!id && !pendingUserMessageIds.has(id);
+}
+
 // A send that failed hands its text back to the composer. Text typed while it
 // was in flight is kept after it (blank line between) instead of being
 // replaced, so neither is lost; if the send never emptied the composer, the
-// composer still holds the message and is kept as it is.
-function restoreComposerAfterFailedSend(conversationId, originalText, { viewing, composerCleared }) {
+// composer still holds the message and is kept as it is. A send whose echo
+// already arrived did land (the failure was only the response): putting its
+// text back would invite a duplicate, so only the typing is kept.
+function restoreComposerAfterFailedSend(conversationId, originalText, { viewing, composerCleared, sendLanded = false }) {
   const input = document.getElementById('msg-input');
   const current = viewing
     ? String(input?.value || '')
     : String(conversations[conversationId]?.draftText || '');
   let text = originalText;
-  if (!composerCleared) text = current || originalText;
+  if (sendLanded) text = current;
+  else if (!composerCleared) text = current || originalText;
   else if (current.trim()) text = `${originalText}
 
 ${current}`;
@@ -3161,14 +3172,18 @@ export async function sendMessage() {
           return;
         }
       }
-      clearPendingUserMessage(clientMessageId);
-      const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
-      pendingNode?.remove();
-      pendingUserMessageIds.delete(clientMessageId);
-      seenMessageIds.delete(clientMessageId);
+      const sendLanded = hasSendEchoArrived(clientMessageId);
+      if (!sendLanded) {
+        clearPendingUserMessage(clientMessageId);
+        const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
+        pendingNode?.remove();
+        pendingUserMessageIds.delete(clientMessageId);
+        seenMessageIds.delete(clientMessageId);
+      }
       restoreComposerAfterFailedSend(targetConversationId, originalComposerText, {
         viewing: viewingSendConversation(),
         composerCleared: composerClearedBySend,
+        sendLanded,
       });
       if (!mobileSend && viewingSendConversation()) input.focus();
       setModelBanner('⚠️ Message could not be sent. Please try again.');
@@ -3301,7 +3316,8 @@ export async function sendMessage() {
       scrollBottomAfterSend();
     }
   } catch (e) {
-    if (clientMessageId) {
+    const sendLanded = hasSendEchoArrived(clientMessageId);
+    if (clientMessageId && !sendLanded) {
       clearPendingUserMessage(clientMessageId);
       const pendingNode = document.querySelector(`[data-message-id="${clientMessageId}"]`);
       pendingNode?.remove();
@@ -3311,6 +3327,7 @@ export async function sendMessage() {
     restoreComposerAfterFailedSend(targetConversationId, originalComposerText, {
       viewing: viewingSendConversation(),
       composerCleared: composerClearedBySend,
+      sendLanded,
     });
     alert(e.message || 'Failed to send message');
   } finally {

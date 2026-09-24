@@ -205,6 +205,9 @@ const SYNC_DB_VERSION = 1;
 const SYNC_STORE_NAME = 'outbox';
 const SYNC_TAG = 'copilot-outbox';
 const SYNC_MAX_REPLAY_ATTEMPTS = 10;
+// Mirrors DRAFT_FLUSH_MAX_AGE_MS in app/conversation-draft-sync.mjs: a draft
+// flush replayed later than this would overwrite whatever the draft became.
+const SYNC_DRAFT_FLUSH_MAX_AGE_MS = 5 * 60 * 1000;
 
 function openSyncDb() {
   return new Promise((resolve, reject) => {
@@ -271,6 +274,10 @@ async function replaySyncOutbox() {
   try {
     const entries = await readSyncEntries(db);
     for (const { key, value } of entries) {
+      if (value?.kind === 'draft-flush' && !(Date.now() - Number(value.createdAt || 0) <= SYNC_DRAFT_FLUSH_MAX_AGE_MS)) {
+        await deleteSyncEntry(db, key);
+        continue;
+      }
       let response = null;
       try {
         response = await fetch(scopeUrl(String(value.path || '').replace(/^\//, '')), {

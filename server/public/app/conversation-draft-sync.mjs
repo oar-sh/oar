@@ -151,14 +151,37 @@ export function draftFlushRequestBody({
   const draftText = draftTextForSync(inputText);
   const serverText = synced ? synced.text : draftTextForSync(fallbackText);
   if (draftText === serverText) return null;
-  // A send in flight will move the server's version past any base known now,
-  // so a versioned copy would always be rejected on replay. What the page
-  // holds then is text typed after that send: replay it unconditionally.
-  if (afterPendingSend) return { draftText, clientId };
+  if (afterPendingSend) {
+    // An emptied composer after a send is what the send leaves anyway.
+    if (!draftText.trim()) return null;
+    // The send will move the server's version past this base. acceptOwnSend
+    // lets the replay through only while that move is this client's own (the
+    // send transaction records the sender); anyone else's newer draft still
+    // wins with a 409.
+    return {
+      draftText,
+      clientId,
+      draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION,
+      baseDraftUpdatedAt: (synced ? synced.updatedAt : fallbackUpdatedAt) || null,
+      acceptOwnSend: true,
+    };
+  }
   return {
     draftText,
     clientId,
     draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION,
     baseDraftUpdatedAt: (synced ? synced.updatedAt : fallbackUpdatedAt) || null,
   };
+}
+
+// A queued draft flush replayed later than this (Firefox/Safari replay the
+// outbox only on the next page load, possibly hours on) would write text
+// nobody is looking at over whatever the draft became meanwhile. sw.js
+// mirrors this value; a test pins them together.
+export const DRAFT_FLUSH_MAX_AGE_MS = 5 * 60 * 1000;
+
+export function isStaleDraftFlushEntry(entry, now = Date.now()) {
+  if (String(entry?.kind || '') !== 'draft-flush') return false;
+  const createdAt = Number(entry?.createdAt || 0);
+  return !Number.isFinite(createdAt) || createdAt <= 0 || now - createdAt > DRAFT_FLUSH_MAX_AGE_MS;
 }

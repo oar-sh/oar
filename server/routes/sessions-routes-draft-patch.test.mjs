@@ -116,12 +116,12 @@ function setup() {
     return captured;
   };
 
-  const insertConversation = (id, { draftText = null, draftUpdatedAt = null } = {}) => {
+  const insertConversation = (id, { draftText = null, draftUpdatedAt = null, updatedByClientId = null } = {}) => {
     const nowIso = '2026-09-24T10:00:00.000Z';
     db.prepare(`
-      INSERT INTO conversations (id, title, created_at, status, updated_at, draft_text, draft_updated_at)
-      VALUES (?, 'Draft test', ?, 'active', ?, ?, ?)
-    `).run(id, nowIso, nowIso, draftText, draftUpdatedAt);
+      INSERT INTO conversations (id, title, created_at, status, updated_at, draft_text, draft_updated_at, draft_updated_by_client_id)
+      VALUES (?, 'Draft test', ?, 'active', ?, ?, ?, ?)
+    `).run(id, nowIso, nowIso, draftText, draftUpdatedAt, updatedByClientId);
   };
 
   const readDraft = (id) => db.prepare(`SELECT draft_text, draft_updated_at FROM conversations WHERE id = ?`).get(id);
@@ -233,6 +233,30 @@ test('an emoji straddling the limit is cut whole, identically on server and clie
   assert.equal(stored, 'e'.repeat(MAX_CONVERSATION_DRAFT_LENGTH - 1), 'no lone surrogate (stored back as U+FFFD)');
   assert.ok(!stored.includes('�'));
   assert.equal(response.body.draftText, draftTextForSync(text), 'the client compares against exactly what was stored');
+});
+
+test('a pagehide copy from mid-send passes the version check only over its own send', async () => {
+  const { patchDraft, insertConversation, readDraft } = setup();
+  const PRE_SEND = '2026-09-24T10:00:00.000Z';
+  const body = {
+    draftText: 'typed during the send', clientId: 'laptop', draftSyncVersion: 2,
+    baseDraftUpdatedAt: PRE_SEND, acceptOwnSend: true,
+  };
+
+  // The send transaction moved the version and recorded its sender.
+  insertConversation('conv-own-send', { draftUpdatedAt: SERVER_VERSION, updatedByClientId: 'laptop' });
+  const ownSend = await patchDraft('conv-own-send', body);
+  assert.equal(ownSend.status, 200);
+  assert.equal(readDraft('conv-own-send').draft_text, 'typed during the send');
+
+  insertConversation('conv-other-device', { draftText: 'newer, from the phone', draftUpdatedAt: SERVER_VERSION, updatedByClientId: 'phone' });
+  const otherDevice = await patchDraft('conv-other-device', body);
+  assert.equal(otherDevice.status, 409, 'a newer draft from another device still wins');
+  assert.equal(readDraft('conv-other-device').draft_text, 'newer, from the phone');
+
+  insertConversation('conv-no-flag', { draftUpdatedAt: SERVER_VERSION, updatedByClientId: 'laptop' });
+  const withoutFlag = await patchDraft('conv-no-flag', { ...body, acceptOwnSend: undefined });
+  assert.equal(withoutFlag.status, 409, 'only a copy that asks for it gets the exception');
 });
 
 test('an absent base (legacy client) still saves unconditionally', async () => {

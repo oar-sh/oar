@@ -1609,7 +1609,7 @@ function createVersionedDraftServer(convId, { text = '', attachments = [], updat
   server.handler = async (url, opts = {}) => {
     if (url.includes(`/api/conversation/${convId}?`)) return validationPayload('sess-v', '/root-v', 'V');
     if (url.includes('/api/message')) {
-      const result = onMessage ? await onMessage() : { conversationId: convId, messageId: nextId('srv') };
+      const result = onMessage ? await onMessage(JSON.parse(opts.body || '{}')) : { conversationId: convId, messageId: nextId('srv') };
       server.text = '';
       server.attachments = [];
       server.updatedAt = nextVersion();
@@ -1879,6 +1879,72 @@ test('draft sync: a successful send removes only its own attachments; ones added
   view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
   resetComposer('');
   store.selectedAttachments.length = 0;
+});
+
+test('draft sync: switching away and back during a send still removes the sent attachment afterwards', async () => {
+  const convId = nextId('conv-draft');
+  const otherId = nextId('conv-other');
+  const runningId = primeQueuedSend(convId, 'message with a screenshot');
+  conversations[otherId] = { id: otherId, title: 'Other', draftText: '', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 };
+  const sentShot = { sha256: 'a'.repeat(64), name: 'sent.png', type: 'image/png', size: 10 };
+  store.selectedAttachments.length = 0;
+  store.selectedAttachments.push({ id: 'att-sent', ...sentShot, uploadState: 'uploaded', uploaded: sentShot });
+  conversations[convId].draftAttachments = [sentShot];
+  const post = deferred();
+  const server = createVersionedDraftServer(convId, {
+    text: 'message with a screenshot', attachments: [sentShot], updatedAt: PRE_SEND_DRAFT_AT, onMessage: () => post.promise,
+  });
+  view.hydrateConversationDraft(convId, { draftText: 'message with a screenshot', draftAttachments: [sentShot], draftUpdatedAt: PRE_SEND_DRAFT_AT });
+  fetchHandler = server.handler;
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  // Away and back: the return rebuilds the composer from the draft cache,
+  // so the sent screenshot is back as a new object.
+  setCurrentConv(otherId);
+  view.beginConversationDraftSwitch(otherId);
+  store.selectedAttachments.length = 0;
+  setCurrentConv(convId);
+  view.beginConversationDraftSwitch(convId);
+  post.resolve({ conversationId: convId, messageId: nextId('srv') });
+  await sendPromise;
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await settle();
+
+  assert.deepEqual(store.selectedAttachments, [], 'the sent screenshot left the composer');
+  assert.deepEqual(server.attachments, [], 'and is not written back as the draft');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+  resetComposer('');
+});
+
+test('draft sync: a send that landed but reported failure puts back only the text typed meanwhile', async () => {
+  const convId = nextId('conv-draft');
+  const runningId = primeQueuedSend(convId, 'this one actually landed');
+  const post = deferred();
+  const server = createVersionedDraftServer(convId, {
+    text: 'this one actually landed',
+    updatedAt: PRE_SEND_DRAFT_AT,
+    onMessage: async (body) => {
+      await post.promise;
+      // The server stored it and echoed it to this client (user_message),
+      // then the response was lost.
+      store.pendingUserMessageIds.delete(body.messageId);
+      throw new Error('response lost');
+    },
+  });
+  view.hydrateConversationDraft(convId, { draftText: 'this one actually landed', draftAttachments: [], draftUpdatedAt: PRE_SEND_DRAFT_AT });
+  fetchHandler = server.handler;
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  typeIntoComposer('typed while it was sending');
+  post.resolve();
+  await sendPromise;
+  await settle();
+
+  assert.equal(getById('msg-input').value, 'typed while it was sending', 'the landed message is not put back to be sent twice');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+  resetComposer('');
 });
 
 test('renderMessages re-renders when only a message\'s workflowRuns change', () => {

@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 import {
+  DRAFT_FLUSH_MAX_AGE_MS,
   DRAFT_SYNC_PROTOCOL_VERSION,
   MAX_DRAFT_TEXT_LENGTH,
   draftTextForSync,
@@ -10,6 +12,7 @@ import {
   forgetSyncedDraft,
   getSyncedDraft,
   isDraftSaveNoop,
+  isStaleDraftFlushEntry,
   recordSyncedDraft,
   resolveDraftConflict,
   shouldApplyIncomingDraftToComposer,
@@ -140,12 +143,39 @@ test('draftFlushRequestBody queues only unsaved text, with the synced base and t
   );
   assert.deepEqual(
     draftFlushRequestBody({ inputText: 'typed during a send', synced, clientId: 'c1', afterPendingSend: true }),
-    { draftText: 'typed during a send', clientId: 'c1' },
-    'during a send the base is about to go stale, so the pagehide copy replays unconditionally',
+    {
+      draftText: 'typed during a send',
+      clientId: 'c1',
+      draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION,
+      baseDraftUpdatedAt: synced.updatedAt,
+      acceptOwnSend: true,
+    },
+    'during a send the copy keeps its base and may only pass the client\'s own send',
+  );
+  assert.equal(
+    draftFlushRequestBody({ inputText: '', synced, clientId: 'c1', afterPendingSend: true }),
+    null,
+    'an emptied composer after a send is not queued',
   );
   assert.deepEqual(
     draftFlushRequestBody({ inputText: 'x', synced: null, fallbackText: '', fallbackUpdatedAt: null, clientId: 'c1' }),
     { draftText: 'x', clientId: 'c1', draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION, baseDraftUpdatedAt: null },
   );
+});
+
+test('queued draft flushes expire after a few minutes; other outbox entries do not', () => {
+  const now = Date.parse('2026-09-24T12:00:00.000Z');
+  assert.equal(isStaleDraftFlushEntry({ kind: 'draft-flush', createdAt: now - 60_000 }, now), false);
+  assert.equal(isStaleDraftFlushEntry({ kind: 'draft-flush', createdAt: now - DRAFT_FLUSH_MAX_AGE_MS - 1 }, now), true);
+  assert.equal(isStaleDraftFlushEntry({ kind: 'draft-flush' }, now), true, 'an entry without a timestamp is not trusted');
+  assert.equal(isStaleDraftFlushEntry({ kind: 'message', createdAt: 0 }, now), false, 'queued sends are never aged out');
+});
+
+test('the service worker ages draft flushes out with the same limit', () => {
+  const swSource = fs.readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
+  const match = /const SYNC_DRAFT_FLUSH_MAX_AGE_MS = ([\d\s*]+);/.exec(swSource);
+  assert.ok(match, 'sw.js declares its draft-flush age cap');
+  assert.equal(Function(`return ${match[1]}`)(), DRAFT_FLUSH_MAX_AGE_MS);
+  assert.match(swSource, /if \(value\?\.kind === 'draft-flush' && !\(Date\.now\(\) - Number\(value\.createdAt \|\| 0\) <= SYNC_DRAFT_FLUSH_MAX_AGE_MS\)\)/);
 });
 

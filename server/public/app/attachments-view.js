@@ -293,19 +293,36 @@ export function clearAttachments() {
   renderAttachmentPreview();
 }
 
+function composerAttachmentSha(attachment) {
+  return String(attachment?.sha256 || attachment?.uploaded?.sha256 || '').trim().toLowerCase();
+}
+
 /**
- * Removes exactly these composer entries (by identity) — the ones a send took
- * with it — and keeps anything added after that snapshot, uploading or not.
- * Persisting what remains is the caller's job.
+ * Removes the composer entries a send took with it and keeps anything added
+ * after that snapshot, uploading or not. Matches by identity first, then by
+ * content hash — switching away and back mid-send rebuilds the composer from
+ * the draft cache as new objects — and removes one entry per sent attachment,
+ * so a genuine second copy survives. Persisting what remains is the caller's
+ * job.
  */
 export function removeComposerAttachments(sent = []) {
-  const taken = new Set(Array.isArray(sent) ? sent : []);
-  if (!taken.size) return;
-  const kept = selectedAttachments.filter((att) => !taken.has(att));
-  if (kept.length === selectedAttachments.length) return;
-  for (const att of selectedAttachments) {
-    if (taken.has(att)) releaseAttachmentPreviewUrl(att);
+  const pending = (Array.isArray(sent) ? sent : []).filter(Boolean);
+  if (!pending.length) return;
+  const removed = new Set();
+  const unmatched = [];
+  for (const att of pending) {
+    if (selectedAttachments.includes(att) && !removed.has(att)) removed.add(att);
+    else unmatched.push(att);
   }
+  for (const att of unmatched) {
+    const sha = composerAttachmentSha(att);
+    if (!sha) continue;
+    const match = selectedAttachments.find((candidate) => !removed.has(candidate) && composerAttachmentSha(candidate) === sha);
+    if (match) removed.add(match);
+  }
+  if (!removed.size) return;
+  const kept = selectedAttachments.filter((att) => !removed.has(att));
+  for (const att of removed) releaseAttachmentPreviewUrl(att);
   selectedAttachments.length = 0;
   selectedAttachments.push(...kept);
   renderAttachmentPreview();
