@@ -1045,6 +1045,176 @@ test('multiple messages steered into one turn all settle as merged, in push orde
   await settled(runner);
 });
 
+/** Drive q-1 live, steer q-2 into it, and end the turn with no q-2 replay. */
+async function foldOneSteer(runner, turn) {
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and stop after', attemptId: 'attempt-2' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'the steer is pending' });
+  turn.emit(resultMessage('did both', 'native-1'));
+  assert.equal(await first, true);
+  return { second };
+}
+
+const ownedIds = (runner) => runner.getActiveQueueMessageIds().map((entry) => entry.id);
+
+test('a folded steer stays owned until its marker is saved, so a heartbeat cannot recover it', async () => {
+  // The fold reaper used to splice the entry out BEFORE publishing: from then
+  // on getActiveQueueMessageIds stopped reporting the row, a heartbeat
+  // recovered it (owner-heartbeat-mismatch / -idle → pending) and it was
+  // delivered again — the CLI ran the prompt twice.
+  let releaseMarker = null;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': (body) => (body.messageId === 'q-2'
+        ? new Promise((resolve) => { releaseMarker = () => resolve({ ok: true }); })
+        : { ok: true }),
+    },
+  });
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, steeredFoldGraceMs: 30, lifecyclePollMs: 10 });
+
+  const { second } = await foldOneSteer(runner, turn);
+  await waitFor(() => releaseMarker, { label: 'the marker publish is in flight' });
+  assert.equal(runner._getProcess().pendingDelivered.length, 0, 'spliced out of the pending queue');
+  assert.deepEqual(ownedIds(runner), ['q-2'], 'still reported to the heartbeat while it settles');
+  const settlingEntry = runner.getActiveQueueMessageIds()[0];
+  assert.equal(settlingEntry.attemptId, 'attempt-2');
+  assert.equal(settlingEntry.terminalError?.stableCode, 'relay.steer-settle-failed', 'a crash fails it, never requeues it');
+
+  releaseMarker();
+  assert.equal(await second, true);
+  assert.deepEqual(ownedIds(runner), [], 'released once the relay committed the marker');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a folded steer whose marker cannot be saved retries, then fails terminally — never requeued', async () => {
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': (body) => {
+        if (body.messageId === 'q-2' && !body.terminalError) throw new Error('relay 503');
+        return { ok: true };
+      },
+    },
+  });
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    settleRetryDelaysMs: [5, 5, 5],
+  });
+
+  const { second } = await foldOneSteer(runner, turn);
+  assert.equal(await second, true);
+  const markerAttempts = stub.calls.filter((call) => call.routePath === '/api/response'
+    && call.body.messageId === 'q-2' && !call.body.terminalError);
+  assert.equal(markerAttempts.length, 4, 'one attempt plus one per retry delay');
+  assert.ok(markerAttempts.every((call) => call.body.absorbed === true && call.body.attemptId === 'attempt-2'));
+  const terminal = stub.calls.find((call) => call.routePath === '/api/response'
+    && call.body.messageId === 'q-2' && call.body.terminalError);
+  assert.equal(terminal.body.terminalError.stableCode, 'relay.steer-settle-failed');
+  assert.match(terminal.body.text, /already sent to Claude — check the reply above/);
+  assert.match(terminal.body.terminalError.guidance, /only if it went unanswered/);
+  assert.equal(
+    stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-2'),
+    undefined,
+    'a prompt Claude already saw is never requeued',
+  );
+  assert.deepEqual(ownedIds(runner), []);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a handed-off absorbed turn stays owned while its settle is retried', async () => {
+  // The replay handoff detaches the outgoing context before publishing it —
+  // the same window as the fold reaper's, with the same double-run result.
+  let failures = 1;
+  let releaseRetry = null;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': (body) => {
+        if (body.messageId !== 'q-1') return { ok: true };
+        if (failures > 0) { failures -= 1; throw new Error('relay 503'); }
+        return new Promise((resolve) => { releaseRetry = () => resolve({ ok: true }); });
+      },
+    },
+  });
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, settleRetryDelaysMs: [5] });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and also this' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'q-2 pushed' });
+  turn.emit(userReplay('and also this'));
+
+  await waitFor(() => releaseRetry, { label: 'the retried handoff publish is in flight' });
+  assert.ok(ownedIds(runner).includes('q-1'), 'the handed-off row is still reported while it settles');
+  releaseRetry();
+  assert.equal(await first, true);
+  turn.emit(resultMessage('did both', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-1'), undefined);
+  assert.equal(ownedIds(runner).includes('q-1'), false);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('Stop with steers in flight settles them as stopped, not merged, and never requeues', async () => {
+  // Decision 5: the Stop cut the turn short, so "Handled together with the
+  // previous reply" would claim an answer that never came. They settle
+  // kind='stopped' (the client offers Resend) — still no requeue, since the
+  // CLI saw the prompts.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  let capturedAbort = null;
+  const controlPoller = {
+    start: ({ queueMessageId, onAbortTurn }) => {
+      if (queueMessageId === 'q-1') capturedAbort = onAbortTurn;
+      return {};
+    },
+    stop: () => {},
+  };
+  const runner = makeRunner({ stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer two' } });
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'steer three' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 2, { label: 'both steers pushed' });
+
+  await capturedAbort();
+  assert.equal(turn.interrupts, 1);
+  assert.equal(runner.isDeliveryHeld(), true, 'nothing new is pushed into a turn being stopped');
+  turn.emit({ ...resultMessage('', 'native-1'), is_interrupt: true });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(await third, true);
+
+  for (const id of ['q-2', 'q-3']) {
+    const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === id);
+    assert.equal(response.body.kind, 'stopped', `${id} is stamped stopped`);
+    assert.notEqual(response.body.absorbed, true);
+    assert.match(response.body.text, /Stopped with the turn — not answered/);
+    assert.doesNotMatch(response.body.text, /Handled together/);
+    assert.equal(stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === id), undefined);
+  }
+  turn.endInput();
+  await settled(runner);
+});
+
 test('a steer the CLI queues instead of folding attaches to its own turn; the rest merge', async () => {
   // Mixed outcome: with several steers in flight the CLI may fold some and
   // replay others as their own turns. The replay attaches by text and gets its

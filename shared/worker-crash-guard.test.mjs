@@ -31,6 +31,22 @@ test('an uncaught exception requeues every owed row and exits non-zero', async (
   assert.match(errors[0], /test-worker uncaughtException/);
 });
 
+test('a row carrying a terminal error is failed, not requeued to run again', async () => {
+  const terminalError = { code: 'steer-settle-failed', stableCode: 'relay.steer-settle-failed', message: 'already sent' };
+  const { processImpl, calls } = makeHarness({
+    activeIds: [
+      { id: 'q-1', attemptId: 'a-1' },
+      { id: 'q-2', attemptId: 'a-2', terminalError },
+    ],
+  });
+  processImpl.emit('uncaughtException', new Error('boom'));
+  await settle();
+  assert.deepEqual(calls.map((call) => call.body), [
+    { messageId: 'q-1', attemptId: 'a-1' },
+    { messageId: 'q-2', attemptId: 'a-2', terminalError },
+  ]);
+});
+
 test('an unhandled rejection takes the same path', async () => {
   const { processImpl, calls, exits } = makeHarness({ activeIds: ['q-9'] });
   processImpl.emit('unhandledRejection', new Error('async boom'));

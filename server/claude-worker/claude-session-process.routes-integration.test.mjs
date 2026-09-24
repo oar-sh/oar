@@ -7,6 +7,7 @@ import nodePathModule from 'node:path';
 import Database from 'better-sqlite3';
 
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
+import { buildSteerSettleFailure, STEER_SETTLE_FAILED_TEXT } from './claude-turn-publisher.mjs';
 import {
   noopRelocate,
   waitFor,
@@ -28,6 +29,7 @@ import {
   captureRoutes,
   makeApi,
 } from '../routes/messages-routes-test-harness.mjs';
+import { buildConversationMessages } from '../routes/sessions-routes.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createQuestionRepository } from '../repositories/question-repository.mjs';
@@ -487,6 +489,92 @@ test('a message sent while a question card is open is requeued penalty-free and 
   assert.equal(cardRow()?.status, 'answered', 'the card kept its answer');
   turn.endInput();
   await settled(runner);
+});
+
+test('steers cut off by Stop persist kind=stopped and reload with it', async (t) => {
+  const { db, stmts, deps, api, emitted } = bootRelayRoutes();
+  const cwd = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'claude-routes-stopped-'));
+  t.after(() => { fsSync.rmSync(cwd, { recursive: true, force: true }); });
+
+  await api('POST', '/api/message', { clientId: 'client-stop-1', conversationId: CONV, text: 'first', model: MODEL, relayMode: 'agent' });
+  const delivered1 = dequeueForWorker({ db, stmts, deps });
+  const turn = scriptedTurn();
+  let abortTurn = null;
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: CONV,
+    cwd,
+    startClaudeSessionImpl: () => turn,
+    relocateTranscriptImpl: noopRelocate,
+    controlPoller: {
+      start: ({ queueMessageId, onAbortTurn }) => {
+        if (queueMessageId === delivered1.id) abortTurn = onAbortTurn;
+        return {};
+      },
+      stop: () => {},
+    },
+    lifecyclePollMs: 10,
+    steeredFoldGraceMs: 30,
+  });
+
+  const first = runner.handlePendingPayload({ message: delivered1 });
+  turn.emit(initMessage('native-stop-1'));
+  turn.emit(userReplay('first'));
+  turn.emit(assistantText('working'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'turn 1 is live' });
+  const msg2Id = (await api('POST', '/api/message', {
+    clientId: 'client-stop-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent',
+  })).messageId;
+  const second = runner.handlePendingPayload({ message: dequeueForWorker({ db, stmts, deps }) });
+  await waitFor(() => runner._getProcess()?.pendingDelivered?.length === 1, { label: 'the steer is pushed' });
+
+  await abortTurn();
+  turn.emit({ ...resultMessage('', 'native-stop-1'), is_interrupt: true });
+  await first;
+  assert.equal(await second, true);
+
+  const row2 = stmts.findQById.get(msg2Id);
+  assert.equal(row2.status, 'done', 'settled, never requeued');
+  assert.equal(Number(row2.retry_count || 0), 0);
+  const stub = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(row2.response_message_id);
+  assert.equal(stub.kind, 'stopped');
+  assert.match(stub.text, /Stopped with the turn — not answered/);
+  const live = emitted.find((entry) => entry.event === 'assistant_message' && entry.payload.sourceMessageId === msg2Id);
+  assert.equal(live.payload.message.kind, 'stopped', 'the live append carries the kind');
+
+  // The conversation reload payload serves the kind from the DB.
+  const reloaded = buildConversationMessages({
+    dbMessages: stmts.getMessages.all(CONV),
+    responseMessageToSourceId: new Map([[row2.response_message_id, msg2Id]]),
+  });
+  assert.equal(reloaded.find((message) => message.id === row2.response_message_id)?.kind, 'stopped');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a steer-settle failure fails the row terminally with the resend-only-if-unanswered wording', async () => {
+  const { db, stmts, deps, api } = bootRelayRoutes();
+  await api('POST', '/api/message', { clientId: 'client-settle-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent' });
+  const delivered = dequeueForWorker({ db, stmts, deps });
+
+  // Exactly what publishSettleMarker sends after its retry budget is spent.
+  await api('POST', '/api/response', {
+    messageId: delivered.id,
+    conversationId: CONV,
+    text: STEER_SETTLE_FAILED_TEXT,
+    terminalError: buildSteerSettleFailure(delivered),
+    attemptId: delivered.attemptId,
+  });
+
+  const row = stmts.findQById.get(delivered.id);
+  assert.equal(row.status, 'failed', 'terminal — nothing requeues it');
+  assert.equal(Number(row.retry_count || 0), 0);
+  assert.match(row.response, /already sent to Claude — check the reply above/);
+  assert.match(row.response, /relay\.steer-settle-failed/);
+  assert.match(row.response, /Resend it only if it went unanswered/);
+  // A late requeue from anywhere cannot revive it.
+  await api('POST', '/api/requeue', { messageId: delivered.id });
+  assert.equal(stmts.findQById.get(delivered.id).status, 'failed');
 });
 
 // ---------------------------------------------------------------------------

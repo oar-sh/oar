@@ -26,7 +26,13 @@ import {
 } from './claude-sdk-adapter.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
-import { attemptFields, createClaudeTurnPublisher, isStaleAttemptError } from './claude-turn-publisher.mjs';
+import {
+  attemptFields,
+  buildSteerSettleFailure,
+  createClaudeTurnPublisher,
+  isStaleAttemptError,
+  STEER_SETTLE_FAILED_TEXT,
+} from './claude-turn-publisher.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 
 /**
@@ -41,6 +47,12 @@ function modeAppendClass(relayMode) {
   const mode = String(relayMode || 'agent').trim().toLowerCase();
   return mode === 'ask' || mode === 'autopilot' ? mode : 'none';
 }
+
+/**
+ * The settle stub of a message steered into a turn the user stopped. Stamped
+ * kind='stopped' — the stable handle the client keys its Resend on.
+ */
+export const STEER_STOPPED_TEXT = '_(Stopped with the turn — not answered.)_';
 
 /** Task types that run a model of their own (vs. bash/monitor/workflow). */
 const AGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
@@ -431,6 +443,9 @@ export function createClaudeSessionRunner({
   // by the first turn to open regardless.
   compactReplayAdoptionMs = 60_000,
   continuationRetryDelayMs = 500,
+  // Backoff between attempts to save a consumed steer's settle marker (~31 s
+  // in all); after the last one the row fails terminally instead.
+  settleRetryDelaysMs = [1_000, 2_000, 4_000, 8_000, 8_000, 8_000],
   workflowPollMs = 2_000,
   resolveWorkflowSessionDirImpl = null,
   askUserBridgeOptions = {},
@@ -454,6 +469,10 @@ export function createClaudeSessionRunner({
   // gap is held instead of racing the first into the CLI.
   let admittingDeliveries = 0;
   let lastReportedDeliveryReady = true;
+  // Rows whose prompt the CLI consumed and whose settle marker is being saved
+  // (id → relay message). Runner-level, not per process: a process dying
+  // mid-settle must not drop them from the heartbeat's owned set.
+  const settlingMessages = new Map();
 
   async function persistNativeSessionId(conversationId, sessionId) {
     const normalized = String(sessionId || '').trim();
@@ -490,22 +509,30 @@ export function createClaudeSessionRunner({
   }
 
   // Every queue row this worker currently owes work for, as { id, attemptId }
-  // entries: the running turn (delivered or continuation) plus any delivered
-  // message queued behind it. The heartbeat reports all of them (id-only — its
-  // call site unwraps) so the server's owner-recovery never replays a row the
-  // process still holds; the crash guard takes the entries whole so its
-  // requeues stay fenced to this attempt.
+  // entries: the running turn (delivered or continuation), any delivered
+  // message queued behind it, and every consumed steer whose settle marker is
+  // still being saved. The heartbeat reports all of them (id-only — its call
+  // site unwraps) so the server's owner-recovery never replays a row the
+  // worker still holds; the crash guard takes the entries whole so its
+  // requeues stay fenced to this attempt — and a settling row carries the
+  // terminal failure the guard must send instead of a requeue, because its
+  // prompt must never run twice.
   function getActiveQueueMessageIds() {
-    if (!proc) return [];
-    return [
-      proc.activeCtx?.message,
-      ...proc.pendingDelivered.map((entry) => entry.ctx.message),
-    ]
-      .map((message) => ({
+    const live = proc
+      ? [proc.activeCtx?.message, ...proc.pendingDelivered.map((entry) => entry.ctx.message)]
+      : [];
+    const entries = live.map((message) => ({
+      id: String(message?.id || '').trim(),
+      attemptId: message?.attemptId || null,
+    }));
+    for (const message of settlingMessages.values()) {
+      entries.push({
         id: String(message?.id || '').trim(),
         attemptId: message?.attemptId || null,
-      }))
-      .filter((entry) => entry.id);
+        terminalError: buildSteerSettleFailure(message),
+      });
+    }
+    return entries.filter((entry) => entry.id);
   }
 
   function isTurnActive() {
@@ -1064,6 +1091,10 @@ export function createClaudeSessionRunner({
    * ordered.
    */
   function handoffAbsorbedTurn(ctx) {
+    // Claimed as settling BEFORE the detach: from the detach on nothing else
+    // reports this row, and a heartbeat landing in between would recover it
+    // and re-run a prompt the CLI already consumed.
+    if (ctx.kind === 'delivered' && ctx.message?.id) settlingMessages.set(String(ctx.message.id), ctx.message);
     detachActiveContext(ctx);
     if (ctx.kind === 'continuation' && !ctx.registered) {
       // Registration (or its buffered-action drain) is still in flight:
@@ -1079,6 +1110,8 @@ export function createClaudeSessionRunner({
     dbg('active turn absorbed a delivered message; handing off', ctx.message?.id || '(unregistered continuation)');
     return settleHandedOffContext(ctx, fallbackText).catch((error) => {
       dbg('absorbed-turn handoff settle failed', error?.message || String(error));
+    }).finally(() => {
+      if (ctx.kind === 'delivered' && ctx.message?.id) settlingMessages.delete(String(ctx.message.id));
     });
   }
 
@@ -1110,7 +1143,7 @@ export function createClaudeSessionRunner({
       // marker-blind view still explains the stub.
       const text = fallbackText || '_(Answered together with the next message.)_';
       await publisher.publishFinalStream(ctx.message, text);
-      await publisher.publishResponse(ctx.message, { text, model, absorbed: true });
+      await publishSettleMarker(ctx.message, { text, model, kind: 'absorbed' });
     } else if (fallbackText) {
       await publisher.publishFinalStream(ctx.message, fallbackText);
       await publisher.publishResponse(ctx.message, { text: fallbackText, model });
@@ -1125,6 +1158,13 @@ export function createClaudeSessionRunner({
 
   async function interruptActiveTurn(ctx) {
     ctx.interrupted = true;
+    // Steers already pushed into the turn being stopped went with it: if the
+    // CLI does not open a turn of its own for one, it settles as 'stopped',
+    // not as handled by the reply the Stop cut short. Still never requeued —
+    // the CLI saw the prompt (2026-09-20 decision).
+    for (const entry of proc?.pendingDelivered || []) {
+      if (entry.steered) entry.stoppedWithTurn = true;
+    }
     syncDeliveryReadiness();
     try {
       await proc.turn.interrupt();
@@ -1963,6 +2003,9 @@ export function createClaudeSessionRunner({
       if (!entry.foldSince) { entry.foldSince = now; return true; }
       if (now - entry.foldSince < steeredFoldGraceMs) return true;
       folded.push(entry);
+      // Moved, not dropped: the row stays in the heartbeat's owned set until
+      // its marker is committed (see publishSettleMarker).
+      if (entry.ctx.message?.id) settlingMessages.set(String(entry.ctx.message.id), entry.ctx.message);
       return false;
     });
     if (!folded.length) return;
@@ -1983,21 +2026,80 @@ export function createClaudeSessionRunner({
 
   async function settleFoldedSteeredEntry(entry) {
     const ctx = entry.ctx;
-    if (ctx.finalized) return;
+    if (ctx.finalized) {
+      settlingMessages.delete(String(ctx.message?.id || ''));
+      return;
+    }
     ctx.finalized = true;
     controlPoller?.stop?.(ctx.controlState);
     const model = ctx.state.responseModel || proc?.model || null;
     // No streamed text of its own — the answer lives on the turn it was folded
-    // into. absorbed:true stamps kind='absorbed' so the transcript renders it
-    // as merged rather than as a standalone unanswered turn.
-    const text = '_(Handled together with the previous reply — this message was steered into that turn.)_';
+    // into, and kind='absorbed' renders it as merged rather than as a
+    // standalone unanswered turn. A steer pushed into a turn the user then
+    // stopped was never answered: kind='stopped' says so (and the client
+    // offers to resend it) instead of claiming the stopped reply handled it.
+    const stopped = entry.stoppedWithTurn === true;
+    const text = stopped
+      ? STEER_STOPPED_TEXT
+      : '_(Handled together with the previous reply — this message was steered into that turn.)_';
     try {
-      await publisher.publishResponse(ctx.message, { text, model, absorbed: true });
+      await publishSettleMarker(ctx.message, { text, model, kind: stopped ? 'stopped' : 'absorbed' });
     } finally {
       // The entry is already spliced out of pendingDelivered, so nothing else
       // can resolve this delivery — resolveDone must run even if the publish
       // threw, or handlePendingPayload's `await ctx.done` would hang forever.
       ctx.resolveDone?.(true);
+    }
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /**
+   * Save the settle marker of a steered message the CLI already consumed —
+   * at most once. The row stays in `settlingMessages`, and so in every
+   * heartbeat, until the relay commits the marker: reporting it gone first
+   * let owner-heartbeat recovery put the row back to pending (and a heartbeat
+   * between splice and publish nulled its attempt, 409-ing the publish), and
+   * the CLI ran the prompt twice. A marker that cannot be saved within the
+   * retry budget ends as a terminal failure — never a requeue.
+   */
+  async function publishSettleMarker(message, { text, model, kind }) {
+    const id = String(message?.id || '').trim();
+    if (!id) return;
+    settlingMessages.set(id, message);
+    try {
+      for (let attempt = 0; ; attempt += 1) {
+        const outcome = await publisher.publishResponse(message, { text, model, kind });
+        if (outcome !== 'failed') return;
+        if (attempt >= settleRetryDelaysMs.length) break;
+        await sleep(settleRetryDelaysMs[attempt]);
+      }
+      dbg('settle marker could not be saved; failing the row terminally', id);
+      const terminalError = buildSteerSettleFailure(message);
+      const retryMs = Math.max(100, Number(settleRetryDelaysMs.at(-1)) || 0);
+      // Unbounded on purpose: giving up would drop the row from the heartbeat
+      // and hand it to recovery, i.e. re-run it. The relay being unreachable
+      // is the only way to stay in here, and then nothing else moves either.
+      for (;;) {
+        const outcome = await publisher.publishResponse(message, {
+          text: STEER_SETTLE_FAILED_TEXT,
+          model,
+          terminalError,
+          requeueOnFailure: false,
+        });
+        if (outcome !== 'failed') return;
+        // Second channel: the requeue route fails a row outright when handed
+        // a terminal error.
+        const failedViaRequeue = await api('POST', '/api/requeue', {
+          messageId: id,
+          terminalError,
+          ...attemptFields(message),
+        }).then(() => true, (error) => isStaleAttemptError(error));
+        if (failedViaRequeue) return;
+        await sleep(retryMs);
+      }
+    } finally {
+      settlingMessages.delete(id);
     }
   }
 
@@ -2134,11 +2236,18 @@ export function createClaudeSessionRunner({
         api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks: [] }).catch(() => {});
       }
     }
+    // Steers pushed into a turn the user stopped: if the Stop fell back to
+    // killing the process (no interrupt support), they settle as 'stopped'
+    // here rather than being left processing for recovery to re-run.
+    const stoppedSteers = processRef.pendingDelivered.filter((entry) => entry.stoppedWithTurn && !entry.ctx.finalized);
     const openContexts = [
       ...(processRef.activeCtx ? [processRef.activeCtx] : []),
-      ...processRef.pendingDelivered.map((entry) => entry.ctx),
+      ...processRef.pendingDelivered.filter((entry) => !stoppedSteers.includes(entry)).map((entry) => entry.ctx),
     ];
     processRef.pendingDelivered = [];
+    for (const entry of stoppedSteers) {
+      if (entry.ctx.message?.id) settlingMessages.set(String(entry.ctx.message.id), entry.ctx.message);
+    }
     processRef.activeCtx = null;
     if (proc === processRef) proc = null;
     for (const ctx of openContexts) {
@@ -2162,6 +2271,11 @@ export function createClaudeSessionRunner({
         aborted: processRef.aborted,
         model: processRef.model,
       }).catch(() => {});
+    }
+    for (const entry of stoppedSteers) {
+      await settleFoldedSteeredEntry(entry).catch((error) => {
+        dbg('stopped-steer settle failed', error?.message || String(error));
+      });
     }
     syncDeliveryReadiness();
   }

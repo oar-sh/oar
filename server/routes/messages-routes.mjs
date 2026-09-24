@@ -6089,6 +6089,11 @@ export function registerMessagesRoutes(app, deps) {
     // own row. Stamped as kind='absorbed' so the transcript renders the two
     // turns as one merged flow.
     const absorbed = req.body.absorbed === true;
+    // A message steered into a turn the user then stopped: settled unanswered
+    // (never re-run — the CLI saw it) and stamped kind='stopped' so the client
+    // can offer to resend it.
+    const stoppedSteer = !absorbed && String(req.body.kind || '').trim() === 'stopped';
+    const settledKind = absorbed ? 'absorbed' : (stoppedSteer ? 'stopped' : null);
     const trimmedText = String(text || '').trim();
     const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
     // Final digests of background workflows that settled during this turn —
@@ -6313,8 +6318,8 @@ export function registerMessagesRoutes(app, deps) {
       );
       if (String(q?.kind || '') === 'continuation') {
         stmts.setMessageKind?.run('continuation', responseId);
-      } else if (absorbed) {
-        stmts.setMessageKind?.run('absorbed', responseId);
+      } else if (settledKind) {
+        stmts.setMessageKind?.run(settledKind, responseId);
       }
       // The workflow cards persist atomically with the assistant message they
       // annotate — keyed directly on the response id (see workflow_runs DDL).
@@ -6555,7 +6560,7 @@ export function registerMessagesRoutes(app, deps) {
         executedProvider,
         kind: String(q?.kind || '') === 'continuation'
           ? 'continuation'
-          : (absorbed ? 'absorbed' : undefined),
+          : (settledKind || undefined),
         // Live-appended messages must show their workflow cards without a
         // reload; conversation reloads serve the same digests from the DB.
         workflowRuns: workflowRuns.length ? workflowRuns : undefined,
@@ -6564,7 +6569,8 @@ export function registerMessagesRoutes(app, deps) {
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
     // An absorbed row is not a finished turn — the reply continues on the
     // steered message's row, whose own completion sends the one notification.
-    if (!absorbed) {
+    // A stopped steer has no reply at all.
+    if (!settledKind) {
       void pushDispatchService?.notifyTurnComplete?.({
         conversationId: targetConversationId,
         messageId: responseId,

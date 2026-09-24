@@ -32,10 +32,17 @@ export function installWorkerCrashGuard({
         // when known, fences the requeue: a row that has already moved on to
         // another attempt must not be yanked back by a dying predecessor.
         const seen = new Set();
+        // An entry may carry a `terminalError`: a row whose prompt the runtime
+        // already consumed must fail, not be requeued and run a second time
+        // (the requeue route fails a row outright when handed one).
         const entries = (getActiveQueueMessageIds() || [])
           .map((entry) => (entry && typeof entry === 'object'
-            ? { id: String(entry.id || '').trim(), attemptId: String(entry.attemptId || '').trim() || null }
-            : { id: String(entry || '').trim(), attemptId: null }))
+            ? {
+              id: String(entry.id || '').trim(),
+              attemptId: String(entry.attemptId || '').trim() || null,
+              terminalError: entry.terminalError && typeof entry.terminalError === 'object' ? entry.terminalError : null,
+            }
+            : { id: String(entry || '').trim(), attemptId: null, terminalError: null }))
           .filter((entry) => {
             if (!entry.id || seen.has(entry.id)) return false;
             seen.add(entry.id);
@@ -46,6 +53,7 @@ export function installWorkerCrashGuard({
             Promise.allSettled(entries.map((entry) => api('POST', '/api/requeue', {
               messageId: entry.id,
               ...(entry.attemptId ? { attemptId: entry.attemptId } : {}),
+              ...(entry.terminalError ? { terminalError: entry.terminalError } : {}),
             }))),
             new Promise((resolve) => {
               const timer = setTimeout(resolve, Math.max(0, Number(requeueTimeoutMs) || 0));

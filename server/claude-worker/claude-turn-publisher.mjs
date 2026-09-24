@@ -25,6 +25,26 @@ export function isStaleAttemptError(error) {
   return detail.includes('stale_attempt');
 }
 
+export const STEER_SETTLE_FAILED_TEXT = 'This message was already sent to Claude — check the reply above.';
+
+/**
+ * The terminal failure for a steered message whose settle marker could not be
+ * saved. Claude already saw the prompt, so it must never run again: the row
+ * fails for good (terminal, so nothing requeues it) and tells the user to
+ * resend only if the reply above did not cover it.
+ */
+export function buildSteerSettleFailure(message) {
+  return {
+    kind: 'claude-steer-settle-failed',
+    code: 'steer-settle-failed',
+    stableCode: 'relay.steer-settle-failed',
+    message: STEER_SETTLE_FAILED_TEXT,
+    guidance: 'Resend it only if it went unanswered.',
+    failedAt: new Date().toISOString(),
+    queueMessageId: String(message?.id || '') || null,
+  };
+}
+
 export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}) {
   const summary = String(planText || '').trim();
   if (!summary) return null;
@@ -180,7 +200,26 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     }).catch(() => {});
   }
 
-  async function publishResponse(message, { text, model, terminalError = null, modelOrigin, absorbed = false }) {
+  /**
+   * Returns the outcome: 'published' (the relay took it), 'stale' (another
+   * attempt owns the row), 'failed' (not taken and NOT requeued), or
+   * 'requeued'. A `kind` marks a row whose prompt the CLI already consumed —
+   * 'absorbed' (the reply continues through the next, steered message) or
+   * 'stopped' (steered into a turn the user stopped) — and such a row is never
+   * requeued, since re-delivery would run the prompt a second time; the
+   * caller owns retrying it. `requeueOnFailure: false` opts any other publish
+   * into the same contract.
+   */
+  async function publishResponse(message, {
+    text,
+    model,
+    terminalError = null,
+    modelOrigin,
+    absorbed = false,
+    kind = null,
+    requeueOnFailure = true,
+  }) {
+    const responseKind = kind || (absorbed ? 'absorbed' : null);
     // Final digests of workflows that settled since the last response ride the
     // next successful response publish — the summarizing turn is the natural
     // transcript anchor for the "Finished background task" card. Terminal
@@ -190,37 +229,39 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     const workflowRuns = (!terminalError && typeof takeWorkflowRuns === 'function')
       ? takeWorkflowRuns()
       : null;
-    await api('POST', '/api/response', {
-      messageId: message.id,
-      conversationId: message.conversationId,
-      text: String(text || ''),
-      model: model || null,
-      modelOrigin: modelOrigin
-        || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
-      ...(Array.isArray(workflowRuns) && workflowRuns.length ? { workflowRuns } : {}),
-      ...(terminalError ? { terminalError } : {}),
-      // A steering absorption: the reply continues after the next (steered)
-      // user message; the relay stamps kind='absorbed' for the merged render.
-      ...(absorbed ? { absorbed: true } : {}),
-      ...attemptFields(message),
-    }).catch(async (error) => {
+    try {
+      await api('POST', '/api/response', {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        text: String(text || ''),
+        model: model || null,
+        modelOrigin: modelOrigin
+          || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
+        ...(Array.isArray(workflowRuns) && workflowRuns.length ? { workflowRuns } : {}),
+        ...(terminalError ? { terminalError } : {}),
+        // The relay stamps the assistant message's kind from these: 'absorbed'
+        // renders as merged into the next (steered) user message, 'stopped' as
+        // a steer the user's Stop cut off unanswered.
+        ...(responseKind === 'absorbed' ? { absorbed: true } : {}),
+        ...(responseKind && responseKind !== 'absorbed' ? { kind: responseKind } : {}),
+        ...attemptFields(message),
+      });
+      return 'published';
+    } catch (error) {
       // A stale_attempt 409 means the row already moved on to another attempt
       // (requeued and re-delivered); the requeue would 409 the same way, and
       // the newer attempt owes the row its answer — drop this one.
       if (isStaleAttemptError(error)) {
         dbg('response refused as stale_attempt; dropping', message.id);
-        return;
+        return 'stale';
       }
-      // NEVER requeue an absorbed row: the CLI already folded this prompt into
-      // a completed turn, so re-delivery would execute it a second time. On a
-      // failed publish the row stays processing and the worker's watchdog
-      // fails it over terminally instead — a stuck row beats a double run.
-      if (absorbed) {
-        dbg('absorbed response publish failed; not requeuing a consumed prompt', message.id);
-        return;
+      if (responseKind || !requeueOnFailure) {
+        dbg('response publish failed; not requeuing a consumed prompt', message.id, error?.message || String(error));
+        return 'failed';
       }
       await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
-    });
+      return 'requeued';
+    }
   }
 
   /**
