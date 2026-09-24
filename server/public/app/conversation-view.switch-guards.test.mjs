@@ -1845,6 +1845,42 @@ test('draft sync: an upload in flight survives another device changing the attac
   store.selectedAttachments.length = 0;
 });
 
+test('draft sync: a successful send removes only its own attachments; ones added meanwhile stay and are saved', async () => {
+  const convId = nextId('conv-draft');
+  const runningId = primeQueuedSend(convId, 'message with a screenshot');
+  const sentShot = { sha256: 'a'.repeat(64), name: 'sent.png', type: 'image/png', size: 10 };
+  const laterShot = { sha256: 'b'.repeat(64), name: 'later.png', type: 'image/png', size: 10 };
+  const sent = { id: 'att-sent', ...sentShot, uploadState: 'uploaded', uploaded: sentShot };
+  store.selectedAttachments.length = 0;
+  store.selectedAttachments.push(sent);
+  const post = deferred();
+  const server = createVersionedDraftServer(convId, {
+    text: 'message with a screenshot',
+    attachments: [sentShot],
+    updatedAt: PRE_SEND_DRAFT_AT,
+    onMessage: () => post.promise,
+  });
+  view.hydrateConversationDraft(convId, { draftText: 'message with a screenshot', draftAttachments: [sentShot], draftUpdatedAt: PRE_SEND_DRAFT_AT });
+  fetchHandler = server.handler;
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  const later = { id: 'att-later', ...laterShot, uploadState: 'uploaded', uploaded: laterShot };
+  const stillUploading = { id: 'att-uploading', name: 'big.png', type: 'image/png', uploadState: 'uploading' };
+  store.selectedAttachments.push(later, stillUploading);
+  await view.persistComposerAttachments();
+  post.resolve({ conversationId: convId, messageId: nextId('srv') });
+  await sendPromise;
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await settle();
+
+  assert.deepEqual(store.selectedAttachments, [later, stillUploading], 'only the sent attachment left the composer');
+  assert.deepEqual(server.attachments.map((row) => row.sha256), [laterShot.sha256], 'the later attachment is the saved draft');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+  resetComposer('');
+  store.selectedAttachments.length = 0;
+});
+
 test('renderMessages re-renders when only a message\'s workflowRuns change', () => {
   const convId = nextId('conv-wr');
   conversations[convId] = { id: convId, title: 'WR' };

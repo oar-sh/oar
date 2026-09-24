@@ -50,7 +50,7 @@ import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, parseAppFileHref, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
-import { renderAttachmentMarkup, clearAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo, openDriveFilePreview, openWorkspaceFilePreview, openUploadedAttachmentViewer } from './attachments-view.js';
+import { renderAttachmentMarkup, removeComposerAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo, openDriveFilePreview, openWorkspaceFilePreview, openUploadedAttachmentViewer } from './attachments-view.js';
 import { buildWorkflowRunCard } from './background-tasks-view.mjs';
 import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
 import { buildTranscriptPreviewCard } from './preview-cards.mjs';
@@ -3157,7 +3157,7 @@ export async function sendMessage() {
         if (queued) {
           void registerOutboxSync();
           showTransientRelayNotice('You are offline. Message queued — it will send when the connection returns.', 7000);
-          if (viewingSendConversation()) clearAttachments();
+          if (viewingSendConversation()) removeComposerAttachments(draftAttachments);
           return;
         }
       }
@@ -3200,7 +3200,7 @@ export async function sendMessage() {
       // conversation that was compacted.
       if (viewingSendConversation()) {
         await window.openConversation?.(r.compactedConversationId);
-        clearAttachments();
+        removeComposerAttachments(draftAttachments);
         if (!mobileSend) input.focus();
         scrollBottomAfterSend();
       }
@@ -3292,8 +3292,11 @@ export async function sendMessage() {
       if (!activeTurn?.messageId) showThinking(r.messageId || null);
     }
 
+    // Only what this message took leaves the composer: attachments added (or
+    // still uploading) since the send began stay, and the settle-time save
+    // below persists them.
     if (viewingSendConversation()) {
-      clearAttachments();
+      removeComposerAttachments(draftAttachments);
       if (!mobileSend) input.focus();
       scrollBottomAfterSend();
     }

@@ -294,6 +294,24 @@ export function clearAttachments() {
 }
 
 /**
+ * Removes exactly these composer entries (by identity) — the ones a send took
+ * with it — and keeps anything added after that snapshot, uploading or not.
+ * Persisting what remains is the caller's job.
+ */
+export function removeComposerAttachments(sent = []) {
+  const taken = new Set(Array.isArray(sent) ? sent : []);
+  if (!taken.size) return;
+  const kept = selectedAttachments.filter((att) => !taken.has(att));
+  if (kept.length === selectedAttachments.length) return;
+  for (const att of selectedAttachments) {
+    if (taken.has(att)) releaseAttachmentPreviewUrl(att);
+  }
+  selectedAttachments.length = 0;
+  selectedAttachments.push(...kept);
+  renderAttachmentPreview();
+}
+
+/**
  * Replaces composer attachments wholesale, used when hydrating a conversation's
  * cached draft attachments. Object URLs from the outgoing set are released.
  */
