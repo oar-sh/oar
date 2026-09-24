@@ -262,3 +262,40 @@ test('a failed Resend removes its bubble and can be tried again', async () => {
   assert.equal(button.disabled, false);
   assert.equal(button.textContent, 'Resend');
 });
+
+// ---------------------------------------------------------------------------
+// 3b — a message sent while steering is held (open question card) queues.
+// ---------------------------------------------------------------------------
+
+test('while a question card holds steering the button reads Queue, and sending it posts', async () => {
+  resetView();
+  const conv = openConversation('claude');
+  selectComposerPreferences();
+  view.renderMessages([{ id: 'u1', role: 'user', text: 'running', timestamp: at(0) }], false, { conversationId: conv });
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'processing' });
+  store.relayQuestions.set('rq-dom', { id: 'rq-dom', conversationId: conv, status: 'pending', createdAt: at(1) });
+  const input = document.getElementById('msg-input');
+  input.value = 'after the card';
+  view.syncComposerButtonState();
+  const button = document.getElementById('send-btn');
+  assert.equal(button.textContent, 'Queue');
+  assert.equal(button.disabled, false);
+  assert.match(button.title, /after you answer the question/i);
+
+  const post = pendingSendHarness(conv);
+  const sending = view.sendMessage();
+  await settle();
+  await settle();
+  const sent = fetchLog.find((entry) => entry.method === 'POST' && entry.url.endsWith('/api/message'));
+  assert.ok(sent, 'the held send is posted, not refused');
+  assert.equal(sent.body.text, 'after the card');
+  post.resolve({ conversationId: conv, messageId: sent.body.messageId });
+  await sending;
+
+  store.relayQuestions.delete('rq-dom');
+  input.value = 'steer now';
+  view.syncComposerButtonState();
+  assert.equal(button.textContent, 'Steer', 'the hold ends: back to Steer');
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
+  input.value = '';
+});

@@ -19,14 +19,14 @@ export function hasUploadingAttachments(attachments = []) {
   return countUploadingAttachments(attachments) > 0;
 }
 
-// Why the composer is refusing to steer right now — worker-reported hold
-// reasons mapped to a human title. Stopping a turn lives on the message
+// Why a message sent right now queues instead of steering — worker-reported
+// hold reasons mapped to a human title. Stopping a turn lives on the message
 // bubbles, never here, so every state below is a Send/Steer/Queue shape.
 const STEERING_HOLD_TITLES = Object.freeze({
-  question: 'Waiting on your answer to the open question',
-  compaction: 'Compacting the conversation — steering resumes afterwards',
-  adoption: 'Recovering from a compaction — steering resumes shortly',
-  delivery: 'Delivering a message — steering resumes shortly',
+  question: 'Will steer in after you answer the question',
+  compaction: 'Will steer in once the conversation finishes compacting',
+  adoption: 'Will steer in once the compaction recovery finishes',
+  delivery: 'Will steer in once the current delivery lands',
 });
 
 export function deriveComposerControlState({
@@ -41,9 +41,9 @@ export function deriveComposerControlState({
   // that still serialize keep the queue wording.
   steeringSupported = false,
   // The worker reports steering as momentarily held (open question card or
-  // plan approval, compaction, post-compaction adoption). The button stays
-  // "Steer" but disables, truthfully: a send now would neither steer nor be
-  // answerable until the hold clears.
+  // plan approval, compaction, post-compaction adoption). A send stays allowed
+  // and reads "Queue": the relay holds the message and it steers in once the
+  // hold clears.
   steeringHeld = false,
   steeringHoldReason = null,
 } = {}) {
@@ -53,14 +53,17 @@ export function deriveComposerControlState({
   const uploading = !!attachmentsUploading;
   const held = active && !!steeringSupported && !!steeringHeld;
   // The label/title/action for a draft typed during a live turn: steer into it
-  // where the provider supports that, queue behind it otherwise.
-  const midTurnAction = steeringSupported ? 'steer' : 'queue';
-  const midTurnLabel = steeringSupported ? 'Steer' : 'Queue';
-  const midTurnTitle = steeringSupported
-    ? 'Steer message into the running turn'
-    : 'Queue message behind current turn';
-  const heldTitle = STEERING_HOLD_TITLES[String(steeringHoldReason || '').trim()]
-    || 'Steering is momentarily unavailable';
+  // where the provider supports that (queued while steering is held), queue
+  // behind it otherwise.
+  const steerNow = !!steeringSupported && !held;
+  const midTurnAction = steerNow ? 'steer' : 'queue';
+  const midTurnLabel = steerNow ? 'Steer' : 'Queue';
+  const midTurnTitle = held
+    ? (STEERING_HOLD_TITLES[String(steeringHoldReason || '').trim()]
+      || 'Will steer in once steering resumes')
+    : (steeringSupported
+      ? 'Steer message into the running turn'
+      : 'Queue message behind current turn');
 
   if (metadataBlocked && !active) {
     return {
@@ -93,14 +96,6 @@ export function deriveComposerControlState({
   }
 
   if (active && draft) {
-    if (held) {
-      return {
-        action: midTurnAction,
-        label: midTurnLabel,
-        title: heldTitle,
-        disabled: true,
-      };
-    }
     return {
       action: midTurnAction,
       label: midTurnLabel,

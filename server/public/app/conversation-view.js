@@ -3183,7 +3183,8 @@ export async function sendMessage() {
   const originalComposerText = String(input?.value || '');
   const text = originalComposerText.trim();
   const mobileSend = isMobileComposerViewport();
-  const activeTurn = getActiveTurnForConversation(currentConvId);
+  // A send while steering is held is allowed: the relay holds the message
+  // and it steers in once the hold clears (the button reads "Queue").
   const hasDraft = hasComposerDraft({ text, attachmentCount: selectedAttachments.length });
   if (sendInFlight) {
     showTransientRelayNotice('Please wait for the current message to finish sending.');
@@ -3222,15 +3223,6 @@ export async function sendMessage() {
     void flushConversationDraft(currentConvId);
     const result = await runPreviewCommand(previewCommand, { conversationId: currentConvId });
     showTransientRelayNotice(result.notice);
-    return;
-  }
-
-  // The steering hold guards every agent-bound entry path (button, Enter,
-  // Ctrl/Cmd+Enter): a disabled Steer button must not have a live keyboard
-  // twin that sends into the hold anyway. Deliberately AFTER the local
-  // commands above — /compact and /preview never touch the held turn.
-  if (activeTurn && steeringHoldForConversation(currentConvId).held) {
-    showTransientRelayNotice('Steering is momentarily unavailable — answer the open card or wait a moment.');
     return;
   }
 

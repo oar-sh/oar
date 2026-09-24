@@ -46,7 +46,14 @@ test('no state ever produces a stop action', () => {
       for (const steeringSupported of [false, true]) {
         for (const sendInFlight of [false, true]) {
           for (const steeringHeld of [false, true]) {
-            combos.push({ hasActiveTurn, hasDraft, steeringSupported, sendInFlight, steeringHeld });
+            for (const attachmentsUploading of [false, true]) {
+              for (const steeringHoldReason of [null, 'question', 'compaction', 'adoption', 'delivery']) {
+                combos.push({
+                  hasActiveTurn, hasDraft, steeringSupported, sendInFlight,
+                  steeringHeld, attachmentsUploading, steeringHoldReason,
+                });
+              }
+            }
           }
         }
       }
@@ -74,29 +81,64 @@ test('the label reverts to Send when the turn ends with text still drafted', () 
   assert.equal(after.disabled, false);
 });
 
-test('a steering hold disables the Steer button and explains why', () => {
+test('a steering hold keeps the button enabled as Queue and explains why', () => {
   const question = deriveComposerControlState({
     hasActiveTurn: true, hasDraft: true, steeringSupported: true,
     steeringHeld: true, steeringHoldReason: 'question',
   });
-  assert.equal(question.action, 'steer');
-  assert.equal(question.label, 'Steer');
-  assert.equal(question.disabled, true);
-  assert.match(question.title, /question/i);
+  assert.equal(question.action, 'queue');
+  assert.equal(question.label, 'Queue');
+  assert.equal(question.disabled, false);
+  assert.match(question.title, /after you answer the question/i);
 
   const compaction = deriveComposerControlState({
     hasActiveTurn: true, hasDraft: true, steeringSupported: true,
     steeringHeld: true, steeringHoldReason: 'compaction',
   });
-  assert.equal(compaction.disabled, true);
+  assert.equal(compaction.label, 'Queue');
+  assert.equal(compaction.disabled, false);
   assert.match(compaction.title, /compact/i);
 
   const unknown = deriveComposerControlState({
     hasActiveTurn: true, hasDraft: true, steeringSupported: true,
     steeringHeld: true, steeringHoldReason: 'something-new',
   });
-  assert.equal(unknown.disabled, true);
-  assert.match(unknown.title, /unavailable/i);
+  assert.equal(unknown.label, 'Queue');
+  assert.equal(unknown.disabled, false);
+  assert.match(unknown.title, /steering resumes/i);
+});
+
+test('the held Queue wording carries through the send-in-flight and uploading windows', () => {
+  const base = {
+    hasActiveTurn: true, hasDraft: true, steeringSupported: true,
+    steeringHeld: true, steeringHoldReason: 'question',
+  };
+  const inFlight = deriveComposerControlState({ ...base, sendInFlight: true });
+  assert.equal(inFlight.label, 'Queue');
+  assert.equal(inFlight.disabled, true);
+  const uploading = deriveComposerControlState({ ...base, attachmentsUploading: true });
+  assert.equal(uploading.label, 'Queue');
+  assert.equal(uploading.disabled, true);
+});
+
+// The full matrix: a held Claude turn with a draft is the only place Queue
+// replaces Steer, and holding never disables a sendable draft.
+test('steering hold matrix', () => {
+  for (const hasDraft of [false, true]) {
+    for (const steeringSupported of [false, true]) {
+      for (const steeringHeld of [false, true]) {
+        const state = deriveComposerControlState({ hasActiveTurn: true, hasDraft, steeringSupported, steeringHeld });
+        const combo = JSON.stringify({ hasDraft, steeringSupported, steeringHeld });
+        if (!hasDraft) {
+          assert.equal(state.label, 'Send', combo);
+          assert.equal(state.disabled, true, combo);
+          continue;
+        }
+        assert.equal(state.disabled, false, combo);
+        assert.equal(state.label, steeringSupported && !steeringHeld ? 'Steer' : 'Queue', combo);
+      }
+    }
+  }
 });
 
 test('a steering hold is inert for serial (queue) providers', () => {
