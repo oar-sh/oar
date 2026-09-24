@@ -102,6 +102,12 @@ async function main() {
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     getAutoCompactWindow: () => autoCompactWindow,
     getThinking: () => thinking,
+    // Late-bound: the link is built below, and the runner only reports flips
+    // once deliveries are flowing.
+    onDeliveryReadinessChange: (ready) => {
+      if (ready) void wsLink?.notifyReady('steering-resumed');
+      else wsLink?.notifyUnready('steering-held');
+    },
     dbg,
   });
 
@@ -134,6 +140,9 @@ async function main() {
     // instead of waiting for the result (docs/plans/2026-09-19-claude-mid-
     // turn-steering.md).
     getSteeringReady: () => turnRunner.canAcceptSteering(),
+    // A hold (open question card, compaction, adoption) suppresses readiness
+    // even between deliveries — a delivery drawn into it is only handed back.
+    getDeliveryHeld: () => turnRunner.isDeliveryHeld(),
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
     onDeliver: async (pending, reason) => {

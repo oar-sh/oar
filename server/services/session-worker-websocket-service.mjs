@@ -396,7 +396,9 @@ export function createSessionWorkerWebSocketService({
       if (payload.type === 'worker.hello') {
         if (!bindSocketIdentity(ws, meta, payload)) return;
         meta.lastSeenAtMs = nowMsSafe();
-        meta.ready = true;
+        // A worker holding deliveries (open question card, compaction) binds
+        // its identity with hello but must not be handed work.
+        meta.ready = payload.ready !== false;
         meta.lastHelloAt = nowIso();
         noteHeartbeat(meta, 'worker-hello');
         emitEvent(ws, {
@@ -416,6 +418,17 @@ export function createSessionWorkerWebSocketService({
         meta.lastReadyAt = nowIso();
         noteHeartbeat(meta, String(payload.reason || 'worker-ready'));
         void maybeDeliverToSocket(ws, String(payload.reason || 'worker-ready'));
+        return;
+      }
+      if (payload.type === 'worker.unready') {
+        // Readiness is otherwise sticky until the next delivery: a ready sent
+        // while the worker could steer would still stand after a hold began,
+        // and the delivery it drew would only be handed back.
+        if (!bindSocketIdentity(ws, meta, payload)) return;
+        meta.lastSeenAtMs = nowMsSafe();
+        meta.ready = false;
+        meta.lastUnreadyAt = nowIso();
+        noteHeartbeat(meta, String(payload.reason || 'worker-unready'));
         return;
       }
       if (payload.type === 'worker.ping') {

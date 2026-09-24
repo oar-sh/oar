@@ -53,6 +53,12 @@ export function createWorkerWebSocketLink({
   // instead of coalescing it. Workers that leave this unset keep the strict
   // single-flight contract.
   getSteeringReady = null,
+  // Steering-capable workers only: true while the runner is holding deliveries
+  // (a question card or plan approval is open, a compaction or adoption is in
+  // progress, a turn-opening delivery is mid-flight). A held worker never
+  // signals readiness — idle or not — and tells the server so with
+  // worker.unready, because a delivery landing in a hold is handed back.
+  getDeliveryHeld = null,
   getSessionId = () => null,
   getPid = () => null,
   minBackoffMs = 1000,
@@ -74,12 +80,16 @@ export function createWorkerWebSocketLink({
   let reconnectAttempt = 0;
   let reconnectDelayMs = 0;
   // Insertion-ordered: the first entry is the oldest in-flight delivery, which
-  // is what a coalesced redelivery waits on.
+  // is what a legacy worker's coalesced delivery waits on.
   const deliveriesInFlight = new Set();
+  // message id → in-flight delivery. Only a redelivery of the SAME message is
+  // coalesced; a different message is never folded onto another's promise.
+  const deliveriesById = new Map();
   let lastOpenAt = null;
   let lastMessageAt = null;
   let lastHelloSentAt = null;
   let lastReadySentAt = null;
+  let lastUnreadySentAt = null;
   let lastPingSentAt = null;
   let lastPongAt = null;
   let lastQueueChangedAt = null;
@@ -104,20 +114,12 @@ export function createWorkerWebSocketLink({
     }
   }
 
-  function notifyHello(reason = "worker-hello") {
-    if (!getSessionReady()) return false;
-    const sent = send({
-      type: "worker.hello",
-      reason,
-      sessionId: normalizeText(getSessionId()),
-      pid: normalizePositiveInt(getPid()),
-    });
-    if (sent) lastHelloSentAt = getNowMs();
-    return sent;
+  function steeringCapable() {
+    return typeof getSteeringReady === "function";
   }
 
   function steeringReady() {
-    if (typeof getSteeringReady !== "function") return false;
+    if (!steeringCapable()) return false;
     try {
       return getSteeringReady() === true;
     } catch {
@@ -125,8 +127,47 @@ export function createWorkerWebSocketLink({
     }
   }
 
+  function deliveryHeld() {
+    if (typeof getDeliveryHeld !== "function") return false;
+    try {
+      return getDeliveryHeld() === true;
+    } catch {
+      // Fail closed: a held worker that signals ready bounces every delivery.
+      return true;
+    }
+  }
+
+  function notifyHello(reason = "worker-hello") {
+    if (!getSessionReady()) return false;
+    // The server treats hello as readiness; a held worker still has to bind
+    // its identity, so it says hello without claiming to be ready.
+    const held = deliveryHeld();
+    const sent = send({
+      type: "worker.hello",
+      reason,
+      sessionId: normalizeText(getSessionId()),
+      pid: normalizePositiveInt(getPid()),
+      ...(held ? { ready: false } : {}),
+    });
+    if (sent) lastHelloSentAt = getNowMs();
+    return sent;
+  }
+
+  function notifyUnready(reason = "worker-unready") {
+    if (!getSessionReady()) return false;
+    const sent = send({
+      type: "worker.unready",
+      reason,
+      sessionId: normalizeText(getSessionId()),
+      pid: normalizePositiveInt(getPid()),
+    });
+    if (sent) lastUnreadySentAt = getNowMs();
+    return sent;
+  }
+
   async function notifyReady(reason = "worker-ready") {
     if (!getSessionReady()) return false;
+    if (deliveryHeld()) return false;
     if (deliveriesInFlight.size && !steeringReady()) return false;
     const sent = send({
       type: "worker.ready",
@@ -152,16 +193,18 @@ export function createWorkerWebSocketLink({
 
   async function deliverPending(pending, reason = "queue-deliver") {
     if (!getSessionReady()) return false;
-    // Without steering, a delivery landing while one is in flight is a
-    // redelivery (socket reconnect): coalesce onto the running one rather than
-    // double-running the turn. With the worker steering-ready, it is a second
-    // message meant for the live turn and runs as its own delivery — the
-    // server only hands out distinct *pending* rows, so this is a genuinely new
-    // message, not a redelivery of the one already running. (There is no
-    // id-level dedup backstop; a same-id redelivery is only possible once a
-    // delivery has settled and its lease lapsed, a window that already defeats
-    // the coalescing below, so steering does not widen it.)
-    if (deliveriesInFlight.size && !steeringReady()) {
+    // A redelivery of a message that is already running (socket reconnect)
+    // coalesces onto it rather than double-running the turn.
+    const messageId = normalizeText(pending?.message?.id);
+    if (messageId && deliveriesById.has(messageId)) return deliveriesById.get(messageId);
+    // A DIFFERENT message while one is in flight: a steering-capable worker's
+    // runner decides — it steers the message into the live turn, or hands it
+    // back to the queue when the turn is holding (the server's readiness can
+    // lag a hold by a round-trip). Coalescing it here used to drop its payload
+    // and strand the row `processing` until heartbeat recovery. Workers
+    // without the steering opt-in keep strict single-flight: their runners
+    // have no hand-back path, and the heartbeat recovers the row.
+    if (deliveriesInFlight.size && !steeringCapable()) {
       return deliveriesInFlight.values().next().value;
     }
     const delivery = Promise.resolve()
@@ -173,8 +216,10 @@ export function createWorkerWebSocketLink({
       .finally(() => {
         lastDeliveryAt = getNowMs();
         deliveriesInFlight.delete(delivery);
+        if (messageId && deliveriesById.get(messageId) === delivery) deliveriesById.delete(messageId);
       });
     deliveriesInFlight.add(delivery);
+    if (messageId) deliveriesById.set(messageId, delivery);
     return delivery;
   }
 
@@ -205,6 +250,12 @@ export function createWorkerWebSocketLink({
       return closeStaleSocket(`no-server-message:${reason}`);
     }
     notifyPing(reason);
+    if (deliveryHeld()) {
+      // Re-asserted on every refresh: a ready frame that crossed the hold on
+      // the wire would otherwise leave the server's readiness stuck on.
+      notifyUnready(reason);
+      return true;
+    }
     if (deliveriesInFlight.size) {
       // notifyReady gates itself: it only goes through mid-delivery when the
       // worker is steering-ready. Hello stays an idle-only affair.
@@ -346,6 +397,7 @@ export function createWorkerWebSocketLink({
       lastMessageAt,
       lastHelloSentAt,
       lastReadySentAt,
+      lastUnreadySentAt,
       lastPingSentAt,
       lastPongAt,
       lastQueueChangedAt,
@@ -355,6 +407,7 @@ export function createWorkerWebSocketLink({
 
   return {
     notifyReady,
+    notifyUnready,
     start,
     stop,
     status,

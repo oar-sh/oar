@@ -7144,6 +7144,23 @@ export function registerMessagesRoutes(app, deps) {
       console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=provider-mismatch retry=${Number(q.retry_count || 0)}`);
       return res.json({ ok: true, mismatch: true });
     }
+    if (q && q.status === 'processing' && String(req.body?.class || '').trim() === 'steering-held') {
+      // The worker refused to push the message because its live turn is
+      // holding steering (an open question card, a compaction, an adoption).
+      // Not a failure: no retry increment, no backoff, and the owner is kept —
+      // the same worker takes it again the moment it signals ready, which is
+      // when the hold ends, so the message steers into the resumed turn.
+      const result = db.prepare(`
+        UPDATE queue
+        SET status = 'pending', processing_at = NULL, attempt_id = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL
+        WHERE id = ? AND status = 'processing'${claimedAttemptId ? ` AND attempt_id = ?` : ''}
+      `).run(...(claimedAttemptId ? [messageId, claimedAttemptId] : [messageId]));
+      if (result.changes > 0) {
+        io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'pending' });
+        console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=steering-held retry=${Number(q.retry_count || 0)}`);
+      }
+      return res.json({ ok: true, held: true });
+    }
     if (q && q.status === 'processing') {
       const retryCount = Number(q.retry_count || 0) + 1;
       if (retryCount >= MAX_REQUEUE_RETRIES) {

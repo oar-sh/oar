@@ -401,6 +401,94 @@ test('a steered delivered turn persists kind=absorbed on the interrupted reply',
   await settled(runner);
 });
 
+test('a message sent while a question card is open is requeued penalty-free and the card survives', async (t) => {
+  const { db, stmts, deps, api: routeApi } = bootRelayRoutes();
+  const cwd = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'claude-routes-held-'));
+  t.after(() => { fsSync.rmSync(cwd, { recursive: true, force: true }); });
+
+  // The question routes live outside messages-routes; this stand-in keeps the
+  // card in the REAL relay_questions table (FK + ON DELETE CASCADE on the
+  // owning queue row), which is what a wrong row transition would destroy.
+  const api = async (method, routePath, body) => {
+    if (method === 'POST' && routePath === '/api/relay-question') {
+      db.prepare(`
+        INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, prompt, status, created_at, expires_at)
+        VALUES ('rq-int', ?, ?, ?, ?, 'pending', ?, ?)
+      `).run(body.queueId, body.conversationId, body.messageId, body.prompt, NOW, '2099-01-01T00:00:00.000Z');
+      return { question: { id: 'rq-int' } };
+    }
+    if (method === 'GET' && routePath === '/api/relay-question/rq-int') {
+      const row = db.prepare(`SELECT * FROM relay_questions WHERE id = 'rq-int'`).get();
+      return { question: row ? { id: row.id, status: row.status, answer: row.answer } : null };
+    }
+    return routeApi(method, routePath, body);
+  };
+  const cardRow = () => db.prepare(`SELECT * FROM relay_questions WHERE id = 'rq-int'`).get();
+
+  const msg1Id = (await api('POST', '/api/message', {
+    clientId: 'client-held-1', conversationId: CONV, text: 'first', model: MODEL, relayMode: 'agent',
+  })).messageId;
+  const delivered1 = dequeueForWorker({ db, stmts, deps });
+  const turn = scriptedTurn();
+  let canUseTool = null;
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: CONV,
+    cwd,
+    startClaudeSessionImpl: (params) => { canUseTool = params.canUseTool; return turn; },
+    relocateTranscriptImpl: noopRelocate,
+    continuationRetryDelayMs: 10,
+    lifecyclePollMs: 10,
+    steeredFoldGraceMs: 60_000,
+    askUserBridgeOptions: { questionPollMs: 5 },
+  });
+
+  const first = runner.handlePendingPayload({ message: delivered1 });
+  turn.emit(initMessage('native-held-1'));
+  turn.emit(userReplay('first'));
+  turn.emit(assistantText('one question first'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'turn 1 is live' });
+  const decision = canUseTool('AskUserQuestion', {
+    questions: [{ question: 'Proceed?', options: [{ label: 'option A' }] }],
+  }, {});
+  await waitFor(() => cardRow()?.status === 'pending', { label: 'the card is open' });
+  assert.equal(cardRow().queue_id, msg1Id);
+
+  // Message 2 is claimed and delivered while the card is open.
+  const msg2Id = (await api('POST', '/api/message', {
+    clientId: 'client-held-1', conversationId: CONV, text: 'second', model: MODEL, relayMode: 'agent',
+  })).messageId;
+  const delivered2 = dequeueForWorker({ db, stmts, deps });
+  assert.equal(delivered2?.id, msg2Id);
+  assert.equal(await runner.handlePendingPayload({ message: delivered2 }), false);
+
+  const held = stmts.findQById.get(msg2Id);
+  assert.equal(held.status, 'pending', 'handed back to the queue');
+  assert.equal(Number(held.retry_count || 0), 0, 'no retry penalty');
+  assert.equal(held.next_attempt_at, null, 'no backoff: eligible the moment the worker is ready');
+  assert.equal(held.attempt_id, null);
+  assert.equal(cardRow()?.status, 'pending', 'the card is neither cancelled, timed out nor deleted');
+  assert.equal(stmts.findQById.get(msg1Id).status, 'processing', 'the card-owning row is untouched');
+
+  db.prepare(`UPDATE relay_questions SET status = 'answered', answer = 'option A', answered_at = ? WHERE id = 'rq-int'`).run(NOW);
+  assert.equal((await decision).behavior, 'allow');
+
+  // Re-delivered after the answer: it steers into the resumed turn.
+  const redelivered = dequeueForWorker({ db, stmts, deps });
+  assert.equal(redelivered?.id, msg2Id);
+  const second = runner.handlePendingPayload({ message: redelivered });
+  await waitFor(() => runner._getProcess()?.pendingDelivered?.length === 1, { label: 'message 2 steered in' });
+  turn.emit(userReplay('second'));
+  turn.emit(resultMessage('did A, then the second thing', 'native-held-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(stmts.findQById.get(msg2Id).status, 'done');
+  assert.equal(stmts.findQById.get(msg2Id).response, 'did A, then the second thing');
+  assert.equal(cardRow()?.status, 'answered', 'the card kept its answer');
+  turn.endInput();
+  await settled(runner);
+});
+
 // ---------------------------------------------------------------------------
 // Idempotent continuation registration. The worker mints one operationId
 // before its first POST and repeats it on retries, so a retry whose previous

@@ -921,6 +921,7 @@ test('an absorbed delivered turn that streamed nothing keeps an explanatory stub
   turn.emit(initMessage('native-1'));
   turn.emit(userReplay('hello'));
   // No assistant text before the steered message is absorbed.
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'the turn attached' });
   const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and also this' } });
   await tick(20);
   turn.emit(userReplay('and also this'));
@@ -1351,6 +1352,178 @@ test('steering is refused while a control round-trip (question) is pending', asy
   await settled(runner);
 });
 
+/**
+ * An api stub whose relay question stays pending until `answer()` is called,
+ * recording every call — the cards' fate is read off those calls.
+ */
+function makeQuestionApi() {
+  const calls = [];
+  let answered = false;
+  return {
+    calls,
+    answer() { answered = true; },
+    api: async (method, routePath, body) => {
+      calls.push({ method, routePath, body });
+      if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+      if (routePath === '/api/relay-question/rq-1') {
+        return { question: { id: 'rq-1', status: answered ? 'answered' : 'pending', answer: 'option A' } };
+      }
+      if (routePath === '/api/continuation-turn') return { messageId: 'cont-1', attemptId: 'attempt-cont-1' };
+      return { ok: true };
+    },
+  };
+}
+
+const askProceed = { questions: [{ question: 'Proceed?', options: [{ label: 'option A' }, { label: 'option B' }] }] };
+
+test('a message sent while a question card is open is held, then steers into the resumed turn', async () => {
+  // Decision 2 of the steering audit: a card is never dropped or bypassed by
+  // steering. The message is handed back to the queue (no retry penalty) while
+  // the card is open, the card is left alone, and the moment it is answered
+  // the runner re-arms readiness so the re-delivered message steers in.
+  const questionApi = makeQuestionApi();
+  const readiness = [];
+  let capturedCanUseTool = null;
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub: questionApi,
+    startImpl: (params) => { capturedCanUseTool = params.canUseTool; return turn; },
+    askUserBridgeOptions: { questionPollMs: 5 },
+    onDeliveryReadinessChange: (ready) => readiness.push(ready),
+    steeredFoldGraceMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('let me ask'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 turn is live' });
+  readiness.length = 0;
+
+  const decision = capturedCanUseTool('AskUserQuestion', askProceed, {});
+  await waitFor(
+    () => questionApi.calls.some((call) => call.routePath === '/api/relay-question'),
+    { label: 'the card is open' },
+  );
+  assert.deepEqual(readiness, [false], 'opening the card withdraws readiness');
+  assert.equal(runner.steeringState().holdReason, 'question');
+
+  const pushedBefore = turn.pushed.length;
+  const held = await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'also do X', attemptId: 'attempt-2' } });
+  assert.equal(held, false);
+  assert.equal(turn.pushed.length, pushedBefore, 'nothing was pushed into the hold');
+  const handBack = questionApi.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-2');
+  assert.deepEqual(handBack.body, { messageId: 'q-2', class: 'steering-held', attemptId: 'attempt-2' });
+  assert.equal(
+    questionApi.calls.some((call) => /\/api\/relay-question\/rq-1\/timeout/.test(call.routePath)),
+    false,
+    'the card was not timed out or cancelled by the send',
+  );
+  assert.equal(runner.getActiveQueueMessageIds().some((entry) => entry.id === 'q-2'), false, 'the held row is not claimed');
+
+  questionApi.answer();
+  const allowed = await decision;
+  assert.equal(allowed.behavior, 'allow');
+  assert.deepEqual(readiness, [false, true], 'the answer re-arms readiness at once');
+
+  // The relay re-delivers q-2: it steers into the resumed turn.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'also do X', attemptId: 'attempt-2b' } });
+  await waitFor(() => turn.pushed.length === pushedBefore + 1, { label: 'q-2 pushed after the answer' });
+  assert.equal(runner._getProcess().pendingDelivered[0].steered, true);
+  turn.emit(userReplay('also do X'));
+  turn.emit(resultMessage('did option A and X', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  const secondResponse = questionApi.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.text, 'did option A and X');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a question card opened between turns holds deliveries through its continuation', async () => {
+  // The between-turns AskUserQuestion runs on a continuation context — not a
+  // delivery — so the socket link used to report plain idle readiness and the
+  // runner pushed the next message as a steer straight past the card.
+  const questionApi = makeQuestionApi();
+  let capturedCanUseTool = null;
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub: questionApi,
+    startImpl: (params) => { capturedCanUseTool = params.canUseTool; return turn; },
+    askUserBridgeOptions: { questionPollMs: 5 },
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(runner.isDeliveryHeld(), false);
+
+  // A background agent asks a question with no turn active.
+  const decision = capturedCanUseTool('AskUserQuestion', askProceed, {});
+  await waitFor(
+    () => questionApi.calls.some((call) => call.routePath === '/api/relay-question'),
+    { label: 'the card is open on its continuation' },
+  );
+  assert.equal(runner.isDeliveryHeld(), true, 'the continuation card holds deliveries');
+  const pushedBefore = turn.pushed.length;
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'next' } }), false);
+  assert.equal(turn.pushed.length, pushedBefore);
+  assert.equal(
+    questionApi.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-2')?.body.class,
+    'steering-held',
+  );
+
+  questionApi.answer();
+  await decision;
+  assert.equal(runner.isDeliveryHeld(), false, 'the answer releases the hold');
+  turn.emit(assistantText('thanks'));
+  turn.emit(resultMessage('continuing', 'native-1'));
+  await waitFor(
+    () => questionApi.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the continuation settles' },
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a message sent during a compaction is held until the compaction ends', async () => {
+  const stub = makeApiStub();
+  const readiness = [];
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    onDeliveryReadinessChange: (ready) => readiness.push(ready),
+    steeredFoldGraceMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 turn is live' });
+  readiness.length = 0;
+
+  turn.emit(compactingStatusMessage());
+  await waitFor(() => readiness.includes(false), { label: 'the compaction withdraws readiness' });
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'later' } }), false);
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-2')?.body.class, 'steering-held');
+  assert.equal(turn.pushed.length, 1);
+
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_result: 'success' });
+  await waitFor(() => readiness.at(-1) === true, { label: 'the compaction end re-arms readiness' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'later' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'q-2 steered in' });
+  turn.emit(userReplay('later'));
+  turn.emit(resultMessage('both done', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('the watchdog fails over a delivered entry the CLI never opens a turn for', async () => {
   const stub = makeApiStub();
   const turn = scriptedTurn();
@@ -1698,6 +1871,30 @@ test('a streaming adopted turn is not unwound by a late notification', { timeout
 // A helper for the several orders below that need a settled background task
 // before the compaction: runs one delivered turn that dispatches `agent-1`,
 // then settles it. Leaves the process idle with nothing queued.
+/**
+ * Two messages steered into a live q-1 turn that then ends without folding or
+ * replaying them — the CLI queued both, so each is still owed its own turn.
+ * Since a hold hands a second turn-opening delivery back to the queue, this is
+ * the only way two entries wait in pendingDelivered at once. The runner needs
+ * a long steeredFoldGraceMs so the entries are not settled as merged.
+ */
+async function queueTwoSteersBehindFinishedTurn(runner, turn, { withTask = false } = {}) {
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  if (withTask) {
+    turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  }
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 turn is live' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 2, { label: 'both steers pending' });
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+  return { second, third };
+}
+
 async function settleOneBackgroundTask(runner, turn, stub) {
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
   turn.emit(initMessage('native-1'));
@@ -1826,15 +2023,19 @@ test('a provisional adoption absorbed as steering gives the row back instead of 
   // never replayed, so it is still owed a turn.
   const stub = makeApiStub();
   const turn = scriptedTurn();
-  const runner = makeRunner({ stub, startImpl: () => turn });
+  const runner = makeRunner({ stub, startImpl: () => turn, steeredFoldGraceMs: 60_000 });
 
-  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
-  turn.emit(initMessage('native-1'));
+  const { second, third } = await queueTwoSteersBehindFinishedTurn(runner, turn);
   turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
   turn.emit(compactSummaryReplay());
-  await tick(20);
-  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } });
-  await tick(20);
+  await waitFor(() => runner._getProcess().activeCtx?.adoptedFromCompaction === true, { label: 'q-2 provisionally adopted' });
+  // Nothing else may be pushed onto the premise that the CLI has not consumed
+  // q-2's prompt: a delivery during the provisional adoption is handed back.
+  const pushedBefore = turn.pushed.length;
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4', text: 'later' } }), false);
+  assert.equal(turn.pushed.length, pushedBefore);
+  const handBack = stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-4');
+  assert.equal(handBack.body.class, 'steering-held');
   turn.emit(userReplay('and another'));
   turn.emit(resultMessage('answering the third', 'native-1'));
   assert.equal(await third, true);
@@ -1890,17 +2091,17 @@ test('a handed-back row goes to the head of the queue, and only once', { timeout
   // notification cannot unwind it a second time.
   const stub = makeApiStub();
   const turn = scriptedTurn();
-  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30 });
-  await settleOneBackgroundTask(runner, turn, stub);
-
-  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
+  const runner = makeRunner({ stub, startImpl: () => turn, notificationGraceMs: 30, steeredFoldGraceMs: 60_000 });
+  const { second, third } = await queueTwoSteersBehindFinishedTurn(runner, turn, { withTask: true });
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
   await tick(20);
+
   turn.emit(compactingStatusMessage());
   turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
   turn.emit(compactSummaryReplay());
   await tick(20);
-  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } });
-  await tick(20);
+  assert.equal(runner._getProcess().activeCtx?.message?.id, 'q-2', 'the head was adopted');
   // Stamped as if the watchdog had already started counting this entry as
   // unattached; the restore has to clear it or the CLI's own compaction time
   // is charged against the row it is about to replay.
@@ -2023,14 +2224,12 @@ test('a restored row does not inherit the turn that displaced it', { timeout: 15
   // text as the restored row's answer — its stream text survives a result.
   const stub = makeApiStub();
   const turn = scriptedTurn();
-  const runner = makeRunner({ stub, startImpl: () => turn });
+  const runner = makeRunner({ stub, startImpl: () => turn, steeredFoldGraceMs: 60_000 });
 
-  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
-  turn.emit(initMessage('native-1'));
+  const { second, third } = await queueTwoSteersBehindFinishedTurn(runner, turn);
+  third.catch(() => {});
   turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
   turn.emit(compactSummaryReplay());
-  await tick(20);
-  runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'and another' } }).catch(() => {});
   await tick(20);
   turn.emit(userReplay('and another'));
   turn.emit({
@@ -2865,24 +3064,45 @@ test('two queued messages replayed out of order each get their own answer', { ti
   // turn; the replay's text is what identifies which entry it opens.
   const stub = makeApiStub();
   const turn = scriptedTurn();
-  const runner = makeRunner({ stub, startImpl: () => turn });
+  const runner = makeRunner({ stub, startImpl: () => turn, steeredFoldGraceMs: 60_000 });
 
-  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
-  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
-  turn.emit(initMessage('native-1'));
-  await tick(20);
+  const { second, third } = await queueTwoSteersBehindFinishedTurn(runner, turn);
+  turn.emit(userReplay('and another'));
+  turn.emit(resultMessage('the third answer', 'native-1'));
+  assert.equal(await third, true);
   turn.emit(userReplay('quick question'));
   turn.emit(resultMessage('the second answer', 'native-1'));
   assert.equal(await second, true);
-  turn.emit(userReplay('hello'));
-  turn.emit(resultMessage('the first answer', 'native-1'));
-  assert.equal(await first, true);
 
   const answerFor = (id) => stub.calls.find(
     (call) => call.routePath === '/api/response' && call.body.messageId === id,
   )?.body.text;
+  assert.equal(answerFor('q-3'), 'the third answer');
   assert.equal(answerFor('q-2'), 'the second answer');
-  assert.equal(answerFor('q-1'), 'the first answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a second turn-opening delivery before the first attaches is handed back, not pushed', async () => {
+  // A turn-opening delivery in flight holds steering ('delivery'), and the
+  // socket link no longer drops a different message onto the in-flight one:
+  // the runner hands it back, penalty-free, instead of racing the first push.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  assert.equal(runner.isDeliveryHeld(), true, 'held while the first delivery awaits its replay');
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } }), false);
+  assert.equal(turn.pushed.length, 1, 'only the first message reached the CLI');
+  const handBack = stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-2');
+  assert.equal(handBack.body.class, 'steering-held');
+
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(resultMessage('the first answer', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(runner.isDeliveryHeld(), false, 'idle again once the turn settles');
   turn.endInput();
   await settled(runner);
 });

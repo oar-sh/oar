@@ -366,6 +366,58 @@ test('a live worker socket still gets work through the liveness probe', async ()
   service.stop();
 });
 
+test('worker.unready withdraws a standing readiness so a hold draws no work', async () => {
+  // Readiness is sticky until the next delivery; a ready sent while the
+  // worker could steer must not survive the question hold that followed it.
+  const httpServer = new EventEmitter();
+  const requestedSessions = [];
+  let offerWork = false;
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    requestWork: async ({ sessionId }) => {
+      requestedSessions.push(sessionId);
+      return offerWork ? { message: { id: 'm-held', conversationId: 'c1' } } : { message: null };
+    },
+  });
+
+  service.start();
+  httpServer.emit('upgrade',
+    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-unready&pid=4242', headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  const socket = lastWss?.sockets?.[0] || null;
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'steering-ready' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(service.status().readyCount, 1, 'nothing to deliver: readiness stands');
+
+  socket.emit('message', JSON.stringify({ type: 'worker.unready', reason: 'steering-held' }));
+  assert.equal(service.status().readyCount, 0);
+  offerWork = true;
+  const before = requestedSessions.length;
+  service.emitQueueChanged('new-message');
+  // A ping keeps the socket live but is not readiness either.
+  socket.emit('message', JSON.stringify({ type: 'worker.ping', reason: 'readiness-refresh' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requestedSessions.length, before, 'a held worker is not asked for work');
+  assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), false);
+
+  // A held worker's hello binds identity without re-arming readiness.
+  socket.emit('message', JSON.stringify({ type: 'worker.hello', reason: 'ws-open', ready: false }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(service.status().readyCount, 0);
+  assert.equal(requestedSessions.length, before);
+
+  // The hold ends: ready draws the held message.
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'steering-resumed' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), true);
+  service.stop();
+});
+
 test('a worker socket closing invokes the death-detection hook with its identity', async () => {
   const httpServer = new EventEmitter();
   const closedEvents = [];

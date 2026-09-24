@@ -434,6 +434,11 @@ export function createClaudeSessionRunner({
   workflowPollMs = 2_000,
   resolveWorkflowSessionDirImpl = null,
   askUserBridgeOptions = {},
+  // Called with `true`/`false` whenever the runner flips between accepting
+  // deliveries and holding them (see isDeliveryHeld). The worker wires it to
+  // the socket link: a hold withdraws the relay's readiness, and its end
+  // re-arms it at once so a held message steers into the resumed turn.
+  onDeliveryReadinessChange = () => {},
   dbg = () => {},
 } = {}) {
   const publisher = createClaudeTurnPublisher({
@@ -444,6 +449,11 @@ export function createClaudeSessionRunner({
   const resolveWorkflowSessionDir = resolveWorkflowSessionDirImpl || createDefaultWorkflowSessionDirResolver();
   let claudeNativeSessionId = '';
   let proc = null;
+  // Turn-opening deliveries between entry and push (adaptProcess and a cold
+  // spawn await in between); counted so a second delivery arriving in that
+  // gap is held instead of racing the first into the CLI.
+  let admittingDeliveries = 0;
+  let lastReportedDeliveryReady = true;
 
   async function persistNativeSessionId(conversationId, sessionId) {
     const normalized = String(sessionId || '').trim();
@@ -1043,6 +1053,7 @@ export function createClaudeSessionRunner({
     detachActiveContext(ctx);
     ctx.resolveDone?.(handled);
     evaluateLifecycle();
+    syncDeliveryReadiness();
   }
 
   /**
@@ -1114,6 +1125,7 @@ export function createClaudeSessionRunner({
 
   async function interruptActiveTurn(ctx) {
     ctx.interrupted = true;
+    syncDeliveryReadiness();
     try {
       await proc.turn.interrupt();
     } catch (error) {
@@ -2030,6 +2042,13 @@ export function createClaudeSessionRunner({
   }
 
   function evaluateLifecycle() {
+    runLifecycle();
+    // The reapers and the compaction staleness cap change what a delivery
+    // would meet, and this tick is the backstop for every such change.
+    syncDeliveryReadiness();
+  }
+
+  function runLifecycle() {
     if (!proc || proc.closing) return;
     const now = Date.now();
     reapSilentProvisionalAdoption(now);
@@ -2144,6 +2163,7 @@ export function createClaudeSessionRunner({
         model: processRef.model,
       }).catch(() => {});
     }
+    syncDeliveryReadiness();
   }
 
   // ---------------------------------------------------------------------------
@@ -2253,6 +2273,7 @@ export function createClaudeSessionRunner({
       // the human thinks, and an idle shutdown under it would reject the
       // request with "Tool permission stream closed".
       processRef.pendingControlRequests += 1;
+      syncDeliveryReadiness();
       try {
         // A question from a background agent between turns has no active turn
         // to attach to, and /api/relay-question requires a processing queue
@@ -2273,6 +2294,9 @@ export function createClaudeSessionRunner({
       } finally {
         processRef.pendingControlRequests -= 1;
         processRef.lastEventAt = Date.now();
+        // The card was answered (or the prompt resolved): a message held
+        // behind it steers into the resumed turn within one round-trip.
+        syncDeliveryReadiness();
       }
     };
 
@@ -2315,6 +2339,7 @@ export function createClaudeSessionRunner({
       try {
         for await (const sdkMessage of processRef.turn) {
           await onSdkMessage(processRef, sdkMessage);
+          syncDeliveryReadiness();
         }
       } catch (error) {
         if (!processRef.aborted && !abortController.signal.aborted) streamError = error;
@@ -2472,6 +2497,56 @@ export function createClaudeSessionRunner({
   }
 
   /**
+   * The one steering gate. A delivery arriving now is held — handed back to
+   * the queue instead of pushed — when a turn is live (a context, anything
+   * pushed and not yet settled, or an open control round-trip) and that turn
+   * cannot accept a steer. The socket link consults this for its readiness
+   * too, idle or mid-delivery: a continuation holding a question card is not a
+   * delivery, so the link's own in-flight bookkeeping cannot see it.
+   */
+  function isDeliveryHeld() {
+    if (admittingDeliveries > 0) return true;
+    if (!proc || proc.closing || proc.aborted) return false;
+    if (!isTurnActive() && !(proc.pendingControlRequests > 0)) return false;
+    return !canAcceptSteering();
+  }
+
+  function syncDeliveryReadiness() {
+    const ready = !isDeliveryHeld();
+    if (ready === lastReportedDeliveryReady) return;
+    lastReportedDeliveryReady = ready;
+    try {
+      onDeliveryReadinessChange(ready);
+    } catch (error) {
+      dbg('delivery readiness listener failed', error?.message || String(error));
+    }
+  }
+
+  /**
+   * Give a held delivery back to the queue with no retry penalty. The relay
+   * re-delivers it once this worker signals ready again, i.e. when the hold
+   * ends — the message then steers into the resumed turn. Pushing it into the
+   * hold instead would bypass the question card or land inside a compaction's
+   * replay.
+   */
+  async function handBackHeldDelivery(message) {
+    dbg('steering held; handing the delivery back to the queue', message.id || '(no id)');
+    if (!message.id) return false;
+    await api('POST', '/api/requeue', {
+      messageId: message.id,
+      class: 'steering-held',
+      ...attemptFields(message),
+    }).catch((error) => {
+      if (isStaleAttemptError(error)) {
+        dbg('steering-held hand-back refused as stale_attempt', message.id);
+        return;
+      }
+      dbg('steering-held hand-back failed', message.id, error?.message || String(error));
+    });
+    return false;
+  }
+
+  /**
    * Composer-facing steering snapshot: whether a turn is live, whether a
    * message typed now would steer into it, and — when it would not — why.
    * Rides the worker heartbeat to the relay's worker registry, so the client
@@ -2514,6 +2589,19 @@ export function createClaudeSessionRunner({
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
+    if (isDeliveryHeld()) return handBackHeldDelivery(message);
+    // A turn-opening delivery awaits (adaptProcess, a draining process, a
+    // spawn) before it pushes; until then it counts as admitting, so nothing
+    // else is let in behind it. A steer pushes synchronously and needs none.
+    let admitting = !(proc && !proc.closing && !proc.aborted && proc.activeCtx);
+    if (admitting) admittingDeliveries += 1;
+    const endAdmission = () => {
+      if (!admitting) return;
+      admitting = false;
+      admittingDeliveries -= 1;
+      syncDeliveryReadiness();
+    };
+    syncDeliveryReadiness();
     try {
       // A steered delivery (a turn is live) must not run the settings diffs:
       // setModel/effort/mode against a mid-flight turn would disturb the very
@@ -2577,14 +2665,19 @@ export function createClaudeSessionRunner({
           spawnProcess(message);
           continue;
         }
+        // Pushed: the pending entry now holds the gate on its own.
+        endAdmission();
         return await ctx.done;
       }
       throw new Error('claude session process closed while accepting the message');
     } catch (error) {
+      endAdmission();
       const errorText = String(error?.message || error || 'unknown error');
       dbg('claude turn failed', message.id, errorText);
       await publisher.publishTurnException({ message, errorText });
       return true;
+    } finally {
+      endAdmission();
     }
   }
 
@@ -2635,6 +2728,7 @@ export function createClaudeSessionRunner({
   return {
     handlePendingPayload,
     canAcceptSteering,
+    isDeliveryHeld,
     steeringState,
     getActiveQueueMessageId,
     getActiveQueueMessageIds,

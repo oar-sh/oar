@@ -261,18 +261,27 @@ test("worker websocket link reconnect backoff caps at 8 seconds", () => {
   link.stop();
 });
 
-test("a delivery mid-delivery is coalesced when the worker is not steering-ready", async () => {
+test("a same-id redelivery coalesces; a different id reaches a steering worker's runner", async () => {
+  // The old "coalesce anything mid-delivery" rule dropped a DIFFERENT message's
+  // payload onto the in-flight promise whenever the server's sticky readiness
+  // outlived a hold — the row then sat `processing` until heartbeat recovery.
+  // Only a redelivery of the same message may coalesce; a different one goes
+  // to the runner, which steers it in or hands it back to the queue.
   FakeWebSocket.instances = [];
   const deliveries = [];
-  let releaseFirst = null;
+  const settles = new Map();
   const link = createWorkerWebSocketLink({
     serverUrl: "http://localhost:3333",
     token: "tok",
     getSessionReady: () => true,
     getSessionId: () => "sdk-serial",
+    getSteeringReady: () => false,
     onDeliver: async (pending) => {
-      deliveries.push(pending?.message?.id);
-      await new Promise((resolve) => { releaseFirst = releaseFirst || resolve; });
+      const id = pending?.message?.id;
+      deliveries.push(id);
+      if (id === "m2") return false; // the runner handed it back
+      await new Promise((resolve) => settles.set(id, resolve));
+      return true;
     },
     WebSocketImpl: FakeWebSocket,
     jitterMs: 0,
@@ -288,19 +297,111 @@ test("a delivery mid-delivery is coalesced when the worker is not steering-ready
   const readySignals = () => socket.sent.filter((frame) => frame.includes('"type":"worker.ready"')).length;
   const readyBefore = readySignals();
 
-  // A redelivery (socket reconnect shape) and a refresh both land while m1 is
-  // still running: no second onDeliver, no ready signal.
-  socket.receive({ type: "queue.deliver", pending: { message: { id: "m1-redelivered" } } });
+  // A redelivery of m1 (socket reconnect shape) and a refresh land while m1
+  // is still running: no second run of m1, no ready signal.
+  socket.receive({ type: "queue.deliver", pending: { message: { id: "m1" } } });
   socket.receive({ type: "queue.changed", reason: "new-message" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(deliveries, ["m1"]);
   assert.equal(readySignals(), readyBefore);
+
+  // A different message is never dropped: the runner sees it (and here hands
+  // it back), and the hand-back completing does not re-arm readiness while
+  // m1 is still in flight without steering.
+  socket.receive({ type: "queue.deliver", pending: { message: { id: "m2" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(deliveries, ["m1", "m2"]);
+  assert.equal(readySignals(), readyBefore);
   assert.equal(link.status().delivering, true);
 
-  releaseFirst();
+  settles.get("m1")();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(link.status().delivering, false);
   assert.equal(readySignals() > readyBefore, true);
+  link.stop();
+});
+
+test("a worker without the steering opt-in keeps strict single-flight", async () => {
+  // Copilot, Cursor and Grok runners have no hand-back path; running a second
+  // message concurrently would break them, so they keep coalescing and the
+  // heartbeat recovers the row.
+  FakeWebSocket.instances = [];
+  const deliveries = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-legacy",
+    onDeliver: async (pending) => {
+      deliveries.push(pending?.message?.id);
+      await new Promise(() => {});
+    },
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+  });
+
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.receive({ type: "queue.deliver", pending: { message: { id: "m1" } } });
+  socket.receive({ type: "queue.deliver", pending: { message: { id: "m2" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(deliveries, ["m1"]);
+  link.stop();
+});
+
+test("a held worker never signals ready and withdraws readiness with worker.unready", async () => {
+  FakeWebSocket.instances = [];
+  let held = true;
+  const intervals = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-held",
+    getPid: () => 77,
+    getSteeringReady: () => false,
+    getDeliveryHeld: () => held,
+    WebSocketImpl: FakeWebSocket,
+    readyRefreshMs: 1000,
+    jitterMs: 0,
+    setIntervalImpl: (fn, delay) => {
+      intervals.push({ fn, delay });
+      return { delay };
+    },
+    clearIntervalImpl: () => {},
+  });
+
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await new Promise((resolve) => setImmediate(resolve));
+  const frames = () => socket.sent.map((frame) => JSON.parse(frame));
+  // Hello still binds the identity, but says it is not ready; no ready frame.
+  assert.equal(frames()[0].type, "worker.hello");
+  assert.equal(frames()[0].ready, false);
+  assert.equal(frames().some((frame) => frame.type === "worker.ready"), false);
+
+  // Queue changes and server hellos do not re-arm a held worker, even idle.
+  socket.receive({ type: "queue.changed", reason: "new-message" });
+  socket.receive({ type: "server.hello", reason: "ack" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(frames().some((frame) => frame.type === "worker.ready"), false);
+
+  // The refresh tick re-asserts the hold instead of hello/ready.
+  intervals[0].fn();
+  assert.equal(frames().at(-1).type, "worker.unready");
+  assert.equal(frames().at(-1).sessionId, "sdk-held");
+  assert.equal(frames().some((frame) => frame.type === "worker.ready"), false);
+
+  // The worker's own flip reports go straight out.
+  assert.equal(link.notifyUnready("steering-held"), true);
+  assert.equal(frames().at(-1).reason, "steering-held");
+  held = false;
+  assert.equal(await link.notifyReady("steering-resumed"), true);
+  assert.equal(frames().at(-1).type, "worker.ready");
+  assert.equal(frames().at(-1).reason, "steering-resumed");
   link.stop();
 });
 
@@ -368,17 +469,16 @@ test("a steering-ready worker keeps signalling readiness and runs a concurrent d
   link.stop();
 });
 
-test("a throwing steering probe falls back to the strict single-flight contract", async () => {
+test("throwing steering and hold probes fail closed on readiness", async () => {
   FakeWebSocket.instances = [];
-  const deliveries = [];
   const link = createWorkerWebSocketLink({
     serverUrl: "http://localhost:3333",
     token: "tok",
     getSessionReady: () => true,
     getSessionId: () => "sdk-throw",
     getSteeringReady: () => { throw new Error("probe failed"); },
-    onDeliver: async (pending) => {
-      deliveries.push(pending?.message?.id);
+    getDeliveryHeld: () => { throw new Error("probe failed"); },
+    onDeliver: async () => {
       await new Promise(() => {});
     },
     WebSocketImpl: FakeWebSocket,
@@ -389,11 +489,10 @@ test("a throwing steering probe falls back to the strict single-flight contract"
   const socket = FakeWebSocket.instances[0];
   socket.open();
   await new Promise((resolve) => setImmediate(resolve));
-
   socket.receive({ type: "queue.deliver", pending: { message: { id: "m1" } } });
-  socket.receive({ type: "queue.deliver", pending: { message: { id: "m2" } } });
+  socket.receive({ type: "queue.changed", reason: "new-message" });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(deliveries, ["m1"]);
+  assert.equal(socket.sent.some((frame) => frame.includes('"type":"worker.ready"')), false);
   link.stop();
 });
 
