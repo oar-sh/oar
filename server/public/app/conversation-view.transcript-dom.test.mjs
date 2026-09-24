@@ -511,3 +511,135 @@ test('while a question card holds steering the button reads Queue, and sending i
   view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
   input.value = '';
 });
+
+// ---------------------------------------------------------------------------
+// Auto-scroll yields to an active selection or drag.
+// ---------------------------------------------------------------------------
+
+test('auto-scroll yields while the user selects or drags in the chat', () => {
+  let scrollTop = 0;
+  Object.defineProperty(messagesEl, 'scrollHeight', { configurable: true, get: () => 900 });
+  Object.defineProperty(messagesEl, 'scrollTop', { configurable: true, get: () => scrollTop, set: (value) => { scrollTop = value; } });
+  try {
+    chatSelectionGuard.pointerDown('messages');
+    store.scrollBottom();
+    assert.equal(scrollTop, 0, 'held: no programmatic scroll');
+    chatSelectionGuard.pointerUp();
+    store.scrollBottom();
+    assert.equal(scrollTop, 900);
+  } finally {
+    delete messagesEl.scrollHeight;
+    delete messagesEl.scrollTop;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Socket events driving the live turn: the real handlers, registered on a
+// fake socket.io client.
+// ---------------------------------------------------------------------------
+
+const socketHandlers = new Map();
+globalThis.io = () => ({
+  connected: true,
+  on: (event, handler) => socketHandlers.set(event, handler),
+  emit() {},
+  connect() {},
+});
+const refreshCurrentViewCalls = [];
+const { connectSocket } = await import('./socket-handlers.js');
+await connectSocket({
+  refreshCurrentView: async () => { refreshCurrentViewCalls.push(store.currentConvId); },
+  refreshSessionWorkerStatus: async () => {},
+  refreshModelCatalog: async () => {},
+  updateModelCatalogState: () => {},
+  applyConversationWorkspaceRootUpdate: () => {},
+  applyConversationTitleUpdate: () => {},
+  syncChatTitleControls: () => {},
+  applyConversationPreferencesForConversation: () => {},
+});
+const fire = (event, payload) => socketHandlers.get(event)(payload);
+
+function liveTurn(conv, messageId) {
+  view.renderMessages([{ id: messageId, role: 'user', text: 'working on it', timestamp: at(0) }], false, { conversationId: conv });
+  fire('message_status', { conversationId: conv, messageId, status: 'processing' });
+  assert.ok(liveBubble(), 'precondition: the turn has a live bubble');
+}
+
+test('only terminal statuses tear down the live bubble and refresh the view', () => {
+  resetView();
+  const conv = openConversation();
+  const messageId = uid('u');
+  liveTurn(conv, messageId);
+  refreshCurrentViewCalls.length = 0;
+  for (const status of ['pending', 'parked']) {
+    fire('message_status', { conversationId: conv, messageId, status });
+    assert.ok(liveBubble(), `'${status}' fires mid-turn and keeps the bubble`);
+  }
+  assert.equal(refreshCurrentViewCalls.length, 0);
+  fire('message_status', { conversationId: conv, messageId, status: 'done' });
+  assert.equal(liveBubble(), null);
+  assert.equal(refreshCurrentViewCalls.length, 1, 'the end of the turn reloads the view');
+});
+
+test('live stream frames survive the enqueue-time pending ack and stop after completion', () => {
+  resetView();
+  const conv = openConversation();
+  const messageId = uid('u');
+  liveTurn(conv, messageId);
+  fire('message_status', { conversationId: conv, messageId, status: 'pending' });
+  fire('relay_stream', { conversationId: conv, messageId, text: 'first words', seq: 1 });
+  const stream = () => liveBubble()?.querySelector('#thinking-stream');
+  assert.match(stream().textContent, /first words/, 'a pending ack never mutes the turn');
+  fire('message_status', { conversationId: conv, messageId, status: 'done' });
+  fire('relay_stream', { conversationId: conv, messageId, text: 'late frame', seq: 2 });
+  assert.equal(liveBubble(), null, 'a frame after completion does not resurrect the bubble');
+});
+
+test('a background conversation finishing its turn leaves the viewed live bubble alone', () => {
+  resetView();
+  const conv = openConversation();
+  const messageId = uid('u');
+  liveTurn(conv, messageId);
+  const bubble = liveBubble();
+  fire('assistant_message', {
+    conversationId: uid('conv-other'),
+    messageId: uid('a'),
+    sourceMessageId: uid('u'),
+    message: { role: 'assistant', text: 'elsewhere', timestamp: at(30) },
+  });
+  assert.equal(liveBubble(), bubble);
+  fire('assistant_message', {
+    conversationId: conv,
+    messageId: uid('a'),
+    sourceMessageId: messageId,
+    message: { role: 'assistant', text: 'here', timestamp: at(30), sourceMessageId: messageId },
+  });
+  assert.equal(liveBubble(), null, 'the viewed conversation\'s own answer replaces it');
+});
+
+test('a live-appended stopped marker can resend its original', () => {
+  resetView();
+  const conv = openConversation();
+  const userId = uid('u');
+  view.renderMessages([{ id: userId, role: 'user', text: 'cut off', timestamp: at(0) }], false, { conversationId: conv });
+  const markerId = uid('a');
+  fire('assistant_message', {
+    conversationId: conv,
+    messageId: markerId,
+    sourceMessageId: userId,
+    message: { role: 'assistant', text: '_(Stopped with the turn — not answered.)_', kind: 'stopped', sourceMessageId: userId, timestamp: at(5) },
+  });
+  assert.deepEqual(rowIds(), [userId, markerId]);
+  assert.equal(row(markerId).dataset.sourceMessageId, userId);
+  assert.ok(row(userId).classList.contains('msg-steered'));
+  assert.ok(row(markerId).querySelector('[data-action="resend-stopped-steer"]'));
+});
+
+test('deleting the viewed conversation over the socket clears its live bubble', () => {
+  resetView();
+  const conv = openConversation();
+  liveTurn(conv, uid('u'));
+  fire('conversation_deleted', { conversationId: conv });
+  assert.equal(store.currentConvId, null);
+  assert.equal(liveBubble(), null);
+});

@@ -3,11 +3,11 @@ import fs from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-// These modules touch window/document at module scope, so they cannot be
-// imported under plain node. The behaviour pinned here is structural — the
-// pattern used by attachments-view.repo-refresh.test.mjs. The live bubble and
-// pending-bubble rebuild behaviour is pinned on a real DOM in
-// conversation-view.transcript-dom.test.mjs.
+// Structural pins for wiring outside the transcript (repo-tree refresh paths,
+// the live poll's arming and deferral, the sidebar spinner) — the pattern used
+// by attachments-view.repo-refresh.test.mjs. The live turn's rendering itself
+// (live bubble, pending bubbles, status teardown, stream muting) is pinned by
+// behaviour on a real DOM in conversation-view.transcript-dom.test.mjs.
 function readSource(relativePath) {
   return fs.readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8');
 }
@@ -26,14 +26,12 @@ test('the live poll no longer reloads the repo tree from applyLoadedConversation
   assert.doesNotMatch(body, /loadRepoBrowserTree\(\)/);
 });
 
-test('only terminal statuses tear down the live bubble and refresh the view', () => {
+test('the end of a turn refreshes the tree through the restoring path', () => {
   const source = readSource('./socket-handlers.js');
-  assert.match(source, /isTerminalStatus = \['done', 'failed', 'dropped', 'cancelled'\]/);
   const teardownIndex = source.indexOf('conversationId === currentConvId && isTerminalStatus');
   assert.notEqual(teardownIndex, -1, 'the teardown block must gate on isTerminalStatus');
   const teardownBlock = source.slice(teardownIndex, teardownIndex + 600);
-  assert.match(teardownBlock, /refreshCurrentView\(\)/);
-  assert.match(teardownBlock, /refreshRepoBrowserIfWorkspaceOpen\(\)/, 'end of turn refreshes the tree through the restoring path');
+  assert.match(teardownBlock, /refreshRepoBrowserIfWorkspaceOpen\(\)/);
 });
 
 test('mid-turn tree refreshes route through the restoring path, never the bare reload', () => {
@@ -51,28 +49,6 @@ test('child loads survive a tree swap by re-resolving the node by path', () => {
   assert.match(body, /repoBrowserState\.nodeMap\.get\(nodePath\) \|\| null/);
 });
 
-test('a background conversation finishing its turn cannot wipe the viewed live bubble', () => {
-  const source = readSource('./socket-handlers.js');
-  const handlerIndex = source.indexOf("socket.on('assistant_message'");
-  assert.notEqual(handlerIndex, -1, 'expected the assistant_message handler');
-  const handler = source.slice(handlerIndex, handlerIndex + 700);
-  assert.match(
-    handler,
-    /if \(isCurrentConversation\) \{\s*collapseThinkingThoughts\(\);\s*removeThinking\(\);\s*\}/,
-    'the live-bubble teardown must be gated on the viewed conversation',
-  );
-});
-
-test('message_status blacklists live streaming only on terminal statuses', () => {
-  const source = readSource('./socket-handlers.js');
-  assert.match(source, /if \(messageId && isTerminalStatus\) clearRelayStreamStateForMessage\(messageId\);/);
-  assert.match(
-    source,
-    /else if \(messageId\) clearRelayStreamState\(messageId\);/,
-    "the enqueue-time 'pending' ack may reset stream bookkeeping but never mark the message complete",
-  );
-});
-
 test('the live poll stays armed while a locally-sent message is still queued', () => {
   const poll = functionBody(readSource('./bootstrap.js'), 'pollAuthenticatedCurrentConversationLive');
   assert.match(poll, /hasPendingUserMessageForConversation\(currentId\)/);
@@ -84,11 +60,6 @@ test('the live poll defers while the user selects or drags in the chat', () => {
   assert.match(poll, /isChatInteractionHeld\(\)/);
   assert.match(bootstrap, /chatSelectionGuard\.onRelease\(/);
   assert.match(bootstrap, /flushDeferredMessageRender\(\)/);
-});
-
-test('auto-scroll yields to an active selection or drag', () => {
-  const body = functionBody(readSource('./store.js'), 'scrollBottom');
-  assert.match(body, /isChatInteractionHeld\(\)/);
 });
 
 test('the sidebar spinner tick updates only the dot spans', () => {
