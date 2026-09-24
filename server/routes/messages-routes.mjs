@@ -3938,10 +3938,13 @@ export function registerMessagesRoutes(app, deps) {
     if (!messageId || !conversationId) return null;
     try {
       const original = db.prepare(`
-        SELECT id, text FROM messages WHERE id = ? AND conversation_id = ? AND role = 'user'
+        SELECT id, text, mode FROM messages WHERE id = ? AND conversation_id = ? AND role = 'user'
       `).get(messageId, conversationId);
       if (!original) return null;
-      if (normalizeDuplicateMessageText(original.text) !== normalizeDuplicateMessageText(text)) return null;
+      // Stored user text may carry the relay's prompt context; the incoming
+      // text is already stripped, so compare like with like.
+      const originalText = stripRelayPromptContext(original.text, original.mode);
+      if (normalizeDuplicateMessageText(originalText) !== normalizeDuplicateMessageText(text)) return null;
       const stopped = db.prepare(`
         SELECT 1 FROM messages
         WHERE conversation_id = ? AND role = 'assistant' AND kind = 'stopped'

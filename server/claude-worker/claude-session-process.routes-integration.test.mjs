@@ -609,7 +609,9 @@ test('a resend link is honored only for the original\'s own text, and never clea
   const { db, api } = bootRelayRoutes();
   const originalId = 'msg-resend-origin';
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES (?, ?, 'user', 'the stopped one', ?)`).run(originalId, CONV, now);
+  // Stored with the relay's prompt context (as imported transcripts are); the
+  // comparison is against the user's own text.
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, mode, timestamp) VALUES (?, ?, 'user', '[Relay mode: agent] the stopped one', 'agent', ?)`).run(originalId, CONV, now);
   db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp, kind, source_message_id) VALUES ('msg-resend-marker', ?, 'assistant', ?, ?, 'stopped', ?)`)
     .run(CONV, '_(Stopped with the turn — not answered.)_', now, originalId);
   db.prepare(`UPDATE conversations SET draft_text = 'half-typed next thought' WHERE id = ?`).run(CONV);

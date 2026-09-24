@@ -2370,6 +2370,7 @@ export function applyConversationTurnStatus({ conversationId, messageId, status 
   const conversationKey = String(conversationId || '').trim();
   const messageKey = String(messageId || '').trim();
   const normalizedStatus = String(status || '').trim().toLowerCase();
+  if (['cancelled', 'failed'].includes(normalizedStatus)) releaseStoppedSteerResendsOf(messageKey);
   if (!conversationKey) {
     syncSendButtonState();
     return;
@@ -2546,6 +2547,18 @@ function syncStoppedSteerResendButton(markerId) {
   btn.textContent = state?.status === 'sent' ? 'Resent' : (state ? 'Resending…' : 'Resend');
 }
 
+// The Resend a marker's "Resent" rests on was cancelled or failed: the
+// original may be resent again, as the relay agrees.
+function releaseStoppedSteerResendsOf(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return;
+  for (const [markerId, entry] of stoppedSteerResends) {
+    if (entry?.status !== 'sent' || entry.resentId !== id) continue;
+    stoppedSteerResends.delete(markerId);
+    syncStoppedSteerResendButton(markerId);
+  }
+}
+
 async function resendStoppedSteer(conversationId, markerId) {
   const conversationKey = String(conversationId || '').trim();
   const id = String(markerId || '').trim();
@@ -2568,6 +2581,9 @@ async function resendStoppedSteer(conversationId, markerId) {
   syncStoppedSteerResendButton(id);
   const clientMessageId = generateId();
   let sent = false;
+  // The message that now stands as this marker's Resend: a cancel or failure
+  // of it releases the page's "Resent" (releaseStoppedSteerResendsOf).
+  let resentId = clientMessageId;
   let bubbleAppended = false;
   const dropOptimisticBubble = () => {
     clearPendingUserMessage(clientMessageId);
@@ -2624,6 +2640,7 @@ async function resendStoppedSteer(conversationId, markerId) {
       if (r.alreadyResent) {
         // Resent before (another tab or device): nothing to retry.
         sent = true;
+        resentId = String(r.duplicateOfMessageId || '').trim() || null;
         showTransientRelayNotice('That message was already resent.');
         return;
       }
@@ -2637,13 +2654,6 @@ async function resendStoppedSteer(conversationId, markerId) {
     if (dropped > 0) {
       showTransientRelayNotice(`Resent without ${dropped} attachment${dropped === 1 ? '' : 's'} that ${dropped === 1 ? 'is' : 'are'} no longer available.`, 7000);
     }
-    if (r.compactedConversationId) {
-      // Auto-compact moved the conversation on, as for any send: follow it
-      // while the user is still looking at this one.
-      await window.refreshConversations?.();
-      if (isCurrentConversation(conversationKey)) await window.openConversation?.(r.compactedConversationId);
-      return;
-    }
     if (cliOnline && isCurrentConversation(conversationKey) && !getActiveTurnForConversation(conversationKey)?.messageId) {
       showThinking(r.messageId || null);
     }
@@ -2655,7 +2665,7 @@ async function resendStoppedSteer(conversationId, markerId) {
       sent = true;
     }
   } finally {
-    if (sent) stoppedSteerResends.set(id, { status: 'sent' });
+    if (sent) stoppedSteerResends.set(id, { status: 'sent', resentId });
     else stoppedSteerResends.delete(id);
     syncStoppedSteerResendButton(id);
   }
@@ -3042,6 +3052,17 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
       .map((item) => [String(item?.id || '').trim(), item])
       .filter(([id]) => !!id),
   );
+  // A payload that already carries this page's Resend but no resentAs on its
+  // marker is newer than the page's provisional "Resent": the Resend was
+  // cancelled or failed (possibly on another device), so the data wins.
+  for (const item of ordered) {
+    if (item?.role !== 'assistant' || String(item?.kind || '').trim() !== 'stopped') continue;
+    const markerId = String(item?.id || '').trim();
+    const entry = stoppedSteerResends.get(markerId);
+    if (entry?.status === 'sent' && entry.resentId && messageById.has(entry.resentId) && !String(item?.resentAs || '').trim()) {
+      stoppedSteerResends.delete(markerId);
+    }
+  }
   // Preserve optimistic pending user bubbles the payload does not yet carry.
   // A message is persisted the instant it is sent, but a poll whose response
   // predates the send returns a payload without it; rebuilding from that stale

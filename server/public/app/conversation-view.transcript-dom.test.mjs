@@ -358,25 +358,49 @@ test('a Resend that loses attachments says how many', async () => {
   assert.match(toastText(), /without 1 attachment/);
 });
 
-test('a Resend follows an auto-compact redirect like any send', async () => {
-  resetView();
-  const conv = openConversation();
-  selectComposerPreferences();
-  const { button } = renderStoppedPair(conv);
-  const opened = [];
-  window.openConversation = async (id) => { opened.push(id); };
-  window.refreshConversations = async () => {};
-  try {
-    resendHarness(conv, (body) => ({ ok: true, conversationId: conv, messageId: body.messageId, compactedConversationId: 'conv-compacted-next' }));
+test('a cancelled or failed Resend gives the Resend button back', async () => {
+  for (const status of ['cancelled', 'failed']) {
+    resetView();
+    const conv = openConversation();
+    selectComposerPreferences();
+    const { button } = renderStoppedPair(conv);
+    resendHarness(conv, (body) => ({ ok: true, conversationId: conv, messageId: body.messageId }));
     button().click();
     await settle();
     await settle();
-    await settle();
-    assert.deepEqual(opened, ['conv-compacted-next']);
-  } finally {
-    delete window.openConversation;
-    delete window.refreshConversations;
+    assert.equal(button().textContent, 'Resent');
+    const resentId = messagePosts()[0].body.messageId;
+    view.applyConversationTurnStatus({ conversationId: conv, messageId: uid('unrelated'), status });
+    assert.equal(button().textContent, 'Resent', `an unrelated ${status} status changes nothing`);
+    view.applyConversationTurnStatus({ conversationId: conv, messageId: resentId, status });
+    assert.equal(button().textContent, 'Resend', `${status}: available again`);
+    assert.equal(button().disabled, false);
   }
+});
+
+test('a payload that carries the Resend but no resentAs overrides the page\'s Resent; a stale one does not', async () => {
+  resetView();
+  const conv = openConversation();
+  selectComposerPreferences();
+  const { button, userId, markerId } = renderStoppedPair(conv);
+  resendHarness(conv, (body) => ({ ok: true, conversationId: conv, messageId: body.messageId }));
+  button().click();
+  await settle();
+  await settle();
+  const resentId = messagePosts()[0].body.messageId;
+  const base = [
+    { id: userId, role: 'user', text: 'cut off by Stop', timestamp: at(5) },
+    { id: markerId, role: 'assistant', text: '_(Stopped with the turn — not answered.)_', timestamp: at(10), sourceMessageId: userId, kind: 'stopped' },
+  ];
+  // A poll that predates the Resend: the page's Resent stands.
+  view.renderMessages([...base, { id: uid('a'), role: 'assistant', text: 'older reply', timestamp: at(1) }], false, { conversationId: conv });
+  assert.equal(button().textContent, 'Resent');
+  // A payload that has the Resend and still no resentAs: it was cancelled or
+  // failed elsewhere — the data wins.
+  view.renderMessages([...base, { id: resentId, role: 'user', text: 'cut off by Stop', timestamp: at(20) }], false, { conversationId: conv });
+  assert.equal(button().textContent, 'Resend');
+  assert.equal(button().disabled, false);
+  store.clearPendingUserMessage(resentId);
 });
 
 // ---------------------------------------------------------------------------
