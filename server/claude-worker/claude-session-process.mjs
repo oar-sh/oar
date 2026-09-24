@@ -31,7 +31,6 @@ import {
   buildSteerSettleFailure,
   createClaudeTurnPublisher,
   isStaleAttemptError,
-  STEER_SETTLE_FAILED_TEXT,
 } from './claude-turn-publisher.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 
@@ -446,6 +445,22 @@ export function createClaudeSessionRunner({
   // Backoff between attempts to save a consumed steer's settle marker (~31 s
   // in all); after the last one the row fails terminally instead.
   settleRetryDelaysMs = [1_000, 2_000, 4_000, 8_000, 8_000, 8_000],
+  // How many times the terminal failure itself is posted before the worker
+  // stops trying and hands the row to the relay via the heartbeat's
+  // `settleFailed` (a persistent HTTP error — say a 401 after a token change —
+  // would otherwise spin forever).
+  maxTerminalSettleAttempts = 5,
+  // After a Stop that cut off pushed steers, the CLI immediately opens a
+  // follow-up turn for them (a bare init, no user replay) that re-runs the
+  // interrupted tool call before answering (SDK probe 2026-09-24, CLI
+  // 2.1.281). A turn starting within this window of the Stop — or of the
+  // previous suppressed turn's end — is interrupted before it can do anything.
+  stopFollowUpWindowMs = 3_000,
+  // False while the connected relay does not understand the `steering-held`
+  // hand-back (a worker updated on disk before the relay restarted): a held
+  // delivery is then pushed the legacy way instead of being handed back into
+  // a retry-and-backoff requeue.
+  canHandBackHeldDelivery = () => true,
   workflowPollMs = 2_000,
   resolveWorkflowSessionDirImpl = null,
   askUserBridgeOptions = {},
@@ -473,6 +488,9 @@ export function createClaudeSessionRunner({
   // (id → relay message). Runner-level, not per process: a process dying
   // mid-settle must not drop them from the heartbeat's owned set.
   const settlingMessages = new Map();
+  // id → terminalError for settling rows the worker gave up posting; reported
+  // in the heartbeat's `settleFailed` until the relay confirms it failed them.
+  const settleFailedTerminals = new Map();
 
   async function persistNativeSessionId(conversationId, sessionId) {
     const normalized = String(sessionId || '').trim();
@@ -525,14 +543,64 @@ export function createClaudeSessionRunner({
       id: String(message?.id || '').trim(),
       attemptId: message?.attemptId || null,
     }));
-    for (const message of settlingMessages.values()) {
+    for (const { message, variant } of settlingMessages.values()) {
       entries.push({
         id: String(message?.id || '').trim(),
         attemptId: message?.attemptId || null,
-        terminalError: buildSteerSettleFailure(message),
+        terminalError: buildSteerSettleFailure(message, { variant }),
       });
     }
     return entries.filter((entry) => entry.id);
+  }
+
+  /**
+   * Claim a consumed row as settling — synchronously, BEFORE whatever detaches
+   * it from pendingDelivered/activeCtx, so no heartbeat can see it unowned.
+   * `variant` picks the terminal wording should its settle never land.
+   */
+  function claimSettling(message, variant = 'folded') {
+    const id = String(message?.id || '').trim();
+    if (id && !settlingMessages.has(id)) settlingMessages.set(id, { message, variant });
+  }
+
+  /**
+   * Mark rows whose prompt the CLI has taken as consumed on the relay, for the
+   * paths where no response carries the mark (a stopped turn, a handoff).
+   * Best-effort: the worker's own settle still owns these rows while it lives;
+   * the mark only protects them when it does not.
+   */
+  function markConsumed(conversationId, ids = []) {
+    const messageIds = ids.map((id) => String(id || '').trim()).filter(Boolean);
+    if (!messageIds.length) return;
+    api('POST', '/api/queue-consumed', {
+      conversationId: String(conversationId || sdkSessionId || ''),
+      messageIds,
+    }).catch((error) => {
+      dbg('consumed mark failed', messageIds.join(','), error?.message || String(error));
+    });
+  }
+
+  /** Release a settled row — unless it was handed to the relay to fail. */
+  function releaseSettling(id) {
+    const key = String(id || '').trim();
+    if (!settleFailedTerminals.has(key)) settlingMessages.delete(key);
+  }
+
+  /** Heartbeat payload: rows whose terminal failure the relay must post. */
+  function getSettleFailed() {
+    return [...settleFailedTerminals.entries()].map(([id, terminalError]) => ({
+      id,
+      attemptId: settlingMessages.get(id)?.message?.attemptId || null,
+      terminalError,
+    }));
+  }
+
+  function acknowledgeSettleFailed(ids = []) {
+    for (const id of ids) {
+      const key = String(id || '').trim();
+      if (!settleFailedTerminals.delete(key)) continue;
+      settlingMessages.delete(key);
+    }
   }
 
   function isTurnActive() {
@@ -1020,6 +1088,16 @@ export function createClaudeSessionRunner({
     // and model fallbacks must survive that.
     const turnRef = proc?.turn || null;
     const procModel = proc?.model || null;
+    // Steers pushed into this turn and still unsettled: the CLI has their
+    // prompts, so the relay marks them consumed with this turn's commit and
+    // never re-runs them even if this worker dies before settling them.
+    // Only while this turn is still the active one: a continuation finalizing
+    // late from its registration drain (see the finished-continuation path in
+    // resolveContext) no longer owns the steers pending behind a newer turn.
+    const consumedSteerIds = (proc?.activeCtx === ctx ? proc.pendingDelivered : [])
+      .filter((entry) => entry.steered)
+      .map((entry) => String(entry.ctx.message?.id || '').trim())
+      .filter(Boolean);
     // The control transport is alive for the process's whole life now, but
     // the snapshot still belongs to this turn's finalize so the composer
     // indicator updates with each reply.
@@ -1037,14 +1115,16 @@ export function createClaudeSessionRunner({
       // Same shape as the per-turn runner's abort path: surface what streamed,
       // let the server-side abort control own the queue row's fate.
       await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
+      markConsumed(ctx.message?.conversationId, consumedSteerIds);
     } else if (ctx.state.result?.isError) {
-      await publisher.publishErrorResult({ message: ctx.message, state: ctx.state, responseModel });
+      await publisher.publishErrorResult({ message: ctx.message, state: ctx.state, responseModel, consumedSteerIds });
     } else {
       await publisher.publishCompletedTurn({
         message: ctx.message,
         state: ctx.state,
         responseModel,
         planBoardPosted: ctx.planBoardPosted,
+        consumedSteerIds,
       });
     }
     closeContext(ctx, true);
@@ -1108,13 +1188,21 @@ export function createClaudeSessionRunner({
    * active context NOW. The caller attaches the delivered context
    * synchronously; onSdkMessage awaits the returned promise before
    * dispatching the new context's actions so the two rows' publishes stay
-   * ordered.
+   * ordered. That promise resolves after the settle's FIRST publish attempt,
+   * not the whole retry ladder: onSdkMessage runs inside the SDK stream loop,
+   * and waiting out ~30 s of retries there froze the new turn's stream. A
+   * failed first attempt keeps retrying in the background with the row still
+   * owned (settling).
    */
   function handoffAbsorbedTurn(ctx) {
     // Claimed as settling BEFORE the detach: from the detach on nothing else
     // reports this row, and a heartbeat landing in between would recover it
     // and re-run a prompt the CLI already consumed.
-    if (ctx.kind === 'delivered' && ctx.message?.id) settlingMessages.set(String(ctx.message.id), ctx.message);
+    const delivered = ctx.kind === 'delivered' && Boolean(ctx.message?.id);
+    if (delivered) {
+      claimSettling(ctx.message, 'handoff');
+      markConsumed(ctx.message.conversationId, [ctx.message.id]);
+    }
     detachActiveContext(ctx);
     if (ctx.kind === 'continuation' && !ctx.registered) {
       // Registration (or its buffered-action drain) is still in flight:
@@ -1128,14 +1216,18 @@ export function createClaudeSessionRunner({
     // so reading it later would see the absorbed turn's text too.
     const fallbackText = String(ctx.state.lastStreamedText || ctx.normalizer.finalStreamText() || '').trim();
     dbg('active turn absorbed a delivered message; handing off', ctx.message?.id || '(unregistered continuation)');
-    return settleHandedOffContext(ctx, fallbackText).catch((error) => {
+    let releaseOrder = () => {};
+    const firstAttempt = new Promise((resolve) => { releaseOrder = resolve; });
+    settleHandedOffContext(ctx, fallbackText, { onFirstAttempt: () => releaseOrder() }).catch((error) => {
       dbg('absorbed-turn handoff settle failed', error?.message || String(error));
     }).finally(() => {
-      if (ctx.kind === 'delivered' && ctx.message?.id) settlingMessages.delete(String(ctx.message.id));
+      releaseOrder();
+      if (delivered) releaseSettling(ctx.message.id);
     });
+    return firstAttempt;
   }
 
-  async function settleHandedOffContext(ctx, fallbackText) {
+  async function settleHandedOffContext(ctx, fallbackText, { onFirstAttempt = () => {} } = {}) {
     if (ctx.finalized) return;
     ctx.finalized = true;
     controlPoller?.stop?.(ctx.controlState);
@@ -1163,7 +1255,7 @@ export function createClaudeSessionRunner({
       // marker-blind view still explains the stub.
       const text = fallbackText || '_(Answered together with the next message.)_';
       await publisher.publishFinalStream(ctx.message, text);
-      await publishSettleMarker(ctx.message, { text, model, kind: 'absorbed' });
+      await publishSettleMarker(ctx.message, { text, model, kind: 'absorbed', variant: 'handoff', onFirstAttempt });
     } else if (fallbackText) {
       await publisher.publishFinalStream(ctx.message, fallbackText);
       await publisher.publishResponse(ctx.message, { text: fallbackText, model });
@@ -1182,8 +1274,19 @@ export function createClaudeSessionRunner({
     // CLI does not open a turn of its own for one, it settles as 'stopped',
     // not as handled by the reply the Stop cut short. Still never requeued —
     // the CLI saw the prompt (2026-09-20 decision).
+    let stoppedSteers = 0;
     for (const entry of proc?.pendingDelivered || []) {
-      if (entry.steered) entry.stoppedWithTurn = true;
+      if (!entry.steered) continue;
+      entry.stoppedWithTurn = true;
+      stoppedSteers += 1;
+    }
+    if (proc && stoppedSteers) {
+      // The CLI re-opens a turn for the queued steers right after the
+      // interrupt — re-running the stopped tool call — so the Stop would not
+      // stick. Arm the guard that interrupts those follow-up turns (see
+      // maybeSuppressStopFollowUp).
+      const now = Date.now();
+      proc.stopFollowUp = { settleSeq: proc.taskSettleSeq, until: now + stopFollowUpWindowMs, remaining: stoppedSteers };
     }
     syncDeliveryReadiness();
     try {
@@ -1808,6 +1911,7 @@ export function createClaudeSessionRunner({
       for (const taskId of previous.keys()) {
         if (!proc.liveTasks.has(taskId)) {
           proc.taskSettledAt = Date.now();
+          proc.taskSettleSeq += 1;
           break;
         }
       }
@@ -1868,6 +1972,7 @@ export function createClaudeSessionRunner({
       // continuation is coming, so nothing should pin the process for one.
       if (taskId && proc.knownTasks.has(taskId) && sdkMessage.skip_transcript !== true) {
         proc.notificationPendingAt = Date.now();
+        proc.taskSettleSeq += 1;
       }
       if (!activeContextPublishes()) {
         const status = String(sdkMessage.status || '').trim() || 'unknown';
@@ -1881,6 +1986,64 @@ export function createClaudeSessionRunner({
     }
   }
 
+  /**
+   * The Stop guard is armed and the stream is at a point where a turn the CLI
+   * opens by itself can only be the follow-up for the stopped steers: no turn
+   * is active, everything still pending was stopped with the turn (a message
+   * delivered after the Stop is held, never pushed — and pushing one disarms
+   * the guard), and no background task has settled since the Stop (its
+   * continuation would open the same bare-init way, and must run).
+   */
+  function isStopFollowUpArmed(now = Date.now()) {
+    const guard = proc?.stopFollowUp;
+    if (!guard || guard.remaining <= 0 || now >= guard.until) return false;
+    if (proc.activeCtx) return false;
+    if (!proc.pendingDelivered.length || !proc.pendingDelivered.every((entry) => entry.stoppedWithTurn)) return false;
+    // A counter, not the settle timestamps: a settle in the Stop's own
+    // millisecond must still count as after it.
+    if (proc.taskSettleSeq !== guard.settleSeq) return false;
+    return true;
+  }
+
+  function isStopFollowUpPending(now = Date.now()) {
+    return Boolean(proc?.suppressingTurn) || isStopFollowUpArmed(now);
+  }
+
+  /**
+   * Kill the CLI's follow-up turn for steers the user stopped. Without this
+   * the Stop does not stick: the follow-up re-runs the interrupted tool call
+   * and answers the steers on a phantom continuation. Interrupting it at its
+   * init ends it with an error result and no model output (SDK probe
+   * 2026-09-24). Everything that turn emits is swallowed — its error result
+   * must not settle a stopped steer as a failed turn — except process-level
+   * system frames (task bookkeeping). Returns 'swallow', 'observe-only', or
+   * null for a message the stream should handle normally.
+   */
+  function maybeSuppressStopFollowUp(sdkMessage) {
+    const type = String(sdkMessage?.type || '');
+    const subtype = String(sdkMessage?.subtype || '');
+    if (proc.suppressingTurn) {
+      if (type === 'result' && !sdkMessage?.parent_tool_use_id) {
+        proc.suppressingTurn = false;
+        // Several stopped steers may come back as several turns: the next
+        // one gets its own window from this one's end.
+        if (proc.stopFollowUp) proc.stopFollowUp.until = Date.now() + stopFollowUpWindowMs;
+        dbg('stopped-steer follow-up turn ended');
+        return 'swallow';
+      }
+      return type === 'system' && subtype !== 'init' ? 'observe-only' : 'swallow';
+    }
+    if (type !== 'system' || subtype !== 'init' || !isStopFollowUpArmed()) return null;
+    proc.suppressingTurn = true;
+    proc.stopFollowUp.remaining -= 1;
+    dbg('interrupting the CLI follow-up turn for steers the user stopped');
+    const turnRef = proc.turn;
+    Promise.resolve()
+      .then(() => turnRef?.interrupt?.())
+      .catch((error) => dbg('follow-up interrupt failed', error?.message || String(error)));
+    return 'swallow';
+  }
+
   async function onSdkMessage(processRef, sdkMessage) {
     // A superseded process (push-race respawn, mode-recycle timeout) may still
     // be draining its stream; its late messages must not mutate the state of
@@ -1888,7 +2051,10 @@ export function createClaudeSessionRunner({
     // cleanupProcess when the old stream ends.
     if (!proc || proc !== processRef) return;
     proc.lastEventAt = Date.now();
+    const suppressed = maybeSuppressStopFollowUp(sdkMessage);
+    if (suppressed === 'swallow') return;
     observeProcessLevel(sdkMessage);
+    if (suppressed === 'observe-only') return;
     const ctx = resolveContext(sdkMessage);
     if (proc.handoffSettling) {
       // An absorbed-steering handoff just settled the previous context;
@@ -2009,7 +2175,7 @@ export function createClaudeSessionRunner({
     // clock (isContinuationImminent). So does a fresh API retry notice: the
     // CLI is mid-request for a turn it has not opened yet.
     if (proc.activeCtx || proc.pendingControlRequests > 0 || isCompacting() || isContinuationImminent()
-      || isApiRetryPending()) {
+      || isApiRetryPending() || isStopFollowUpPending(now)) {
       // Not idle: the CLI may still open a turn for it (the ordinary
       // delivered-attach path), so the fold clock has not started.
       for (const entry of proc.pendingDelivered) entry.foldSince = 0;
@@ -2025,7 +2191,7 @@ export function createClaudeSessionRunner({
       folded.push(entry);
       // Moved, not dropped: the row stays in the heartbeat's owned set until
       // its marker is committed (see publishSettleMarker).
-      if (entry.ctx.message?.id) settlingMessages.set(String(entry.ctx.message.id), entry.ctx.message);
+      claimSettling(entry.ctx.message, entry.stoppedWithTurn ? 'stopped' : 'folded');
       return false;
     });
     if (!folded.length) return;
@@ -2047,7 +2213,7 @@ export function createClaudeSessionRunner({
   async function settleFoldedSteeredEntry(entry) {
     const ctx = entry.ctx;
     if (ctx.finalized) {
-      settlingMessages.delete(String(ctx.message?.id || ''));
+      releaseSettling(ctx.message?.id);
       return;
     }
     ctx.finalized = true;
@@ -2063,7 +2229,12 @@ export function createClaudeSessionRunner({
       ? STEER_STOPPED_TEXT
       : '_(Handled together with the previous reply — this message was steered into that turn.)_';
     try {
-      await publishSettleMarker(ctx.message, { text, model, kind: stopped ? 'stopped' : 'absorbed' });
+      await publishSettleMarker(ctx.message, {
+        text,
+        model,
+        kind: stopped ? 'stopped' : 'absorbed',
+        variant: stopped ? 'stopped' : 'folded',
+      });
     } finally {
       // The entry is already spliced out of pendingDelivered, so nothing else
       // can resolve this delivery — resolveDone must run even if the publish
@@ -2081,31 +2252,47 @@ export function createClaudeSessionRunner({
    * let owner-heartbeat recovery put the row back to pending (and a heartbeat
    * between splice and publish nulled its attempt, 409-ing the publish), and
    * the CLI ran the prompt twice. A marker that cannot be saved within the
-   * retry budget ends as a terminal failure — never a requeue.
+   * retry budget ends as a terminal failure — never a requeue — and if even
+   * that cannot be posted, the heartbeat hands the row to the relay to fail.
+   * `onFirstAttempt` fires once the first publish attempt has returned, for
+   * callers that must order other publishes behind it without waiting out
+   * the retries.
    */
-  async function publishSettleMarker(message, { text, model, kind }) {
+  async function publishSettleMarker(message, { text, model, kind, variant = 'folded', onFirstAttempt = () => {} }) {
     const id = String(message?.id || '').trim();
-    if (!id) return;
-    settlingMessages.set(id, message);
+    if (!id) {
+      onFirstAttempt();
+      return;
+    }
+    claimSettling(message, variant);
+    let firstAttemptReported = false;
+    const reportFirstAttempt = () => {
+      if (firstAttemptReported) return;
+      firstAttemptReported = true;
+      onFirstAttempt();
+    };
+    // Drained once and reused by every attempt: a digest drained by a failed
+    // attempt would otherwise be lost.
+    const workflowRuns = publisher.drainWorkflowRuns();
     try {
       for (let attempt = 0; ; attempt += 1) {
-        const outcome = await publisher.publishResponse(message, { text, model, kind });
+        const outcome = await publisher.publishResponse(message, { text, model, kind, workflowRuns });
+        reportFirstAttempt();
         if (outcome !== 'failed') return;
         if (attempt >= settleRetryDelaysMs.length) break;
         await sleep(settleRetryDelaysMs[attempt]);
       }
       dbg('settle marker could not be saved; failing the row terminally', id);
-      const terminalError = buildSteerSettleFailure(message);
+      const terminalError = buildSteerSettleFailure(message, { variant });
       const retryMs = Math.max(100, Number(settleRetryDelaysMs.at(-1)) || 0);
-      // Unbounded on purpose: giving up would drop the row from the heartbeat
-      // and hand it to recovery, i.e. re-run it. The relay being unreachable
-      // is the only way to stay in here, and then nothing else moves either.
-      for (;;) {
+      for (let attempt = 0; attempt < Math.max(1, maxTerminalSettleAttempts); attempt += 1) {
+        if (attempt) await sleep(retryMs);
         const outcome = await publisher.publishResponse(message, {
-          text: STEER_SETTLE_FAILED_TEXT,
+          text: terminalError.message,
           model,
           terminalError,
           requeueOnFailure: false,
+          workflowRuns: null,
         });
         if (outcome !== 'failed') return;
         // Second channel: the requeue route fails a row outright when handed
@@ -2116,12 +2303,17 @@ export function createClaudeSessionRunner({
           ...attemptFields(message),
         }).then(() => true, (error) => isStaleAttemptError(error));
         if (failedViaRequeue) return;
-        await sleep(retryMs);
       }
+      // Still owned (the lease keeps renewing) and reported as settleFailed:
+      // the relay fails it from the next heartbeat that gets through.
+      dbg('terminal settle could not be posted; handing it to the heartbeat', id);
+      settleFailedTerminals.set(id, terminalError);
     } finally {
-      settlingMessages.delete(id);
+      reportFirstAttempt();
+      releaseSettling(id);
     }
   }
+
 
   function reapStalePendingDelivered(now) {
     if (!proc || !proc.pendingDelivered.length) return;
@@ -2136,7 +2328,7 @@ export function createClaudeSessionRunner({
     // failing over after the timeout. Just-settled tasks (continuation
     // imminent) and in-flight API retries still hold it.
     if (proc.activeCtx || proc.pendingControlRequests > 0 || isCompacting() || isContinuationImminent()
-      || isApiRetryPending()) {
+      || isApiRetryPending() || isStopFollowUpPending(now)) {
       // A turn, control round-trip, or compaction may still attach these
       // entries — the unattached clock starts over once the process actually
       // goes quiet. A compaction is silent work, not idleness: the CLI replays
@@ -2173,6 +2365,10 @@ export function createClaudeSessionRunner({
   function runLifecycle() {
     if (!proc || proc.closing) return;
     const now = Date.now();
+    // The Stop guard lives exactly as long as the steers it protects.
+    if (proc.stopFollowUp && !proc.suppressingTurn && !proc.pendingDelivered.some((entry) => entry.stoppedWithTurn)) {
+      proc.stopFollowUp = null;
+    }
     reapSilentProvisionalAdoption(now);
     // Before the 5-minute watchdog: a folded steered entry settles as merged
     // within the short fold grace instead of failing over.
@@ -2265,9 +2461,7 @@ export function createClaudeSessionRunner({
       ...processRef.pendingDelivered.filter((entry) => !stoppedSteers.includes(entry)).map((entry) => entry.ctx),
     ];
     processRef.pendingDelivered = [];
-    for (const entry of stoppedSteers) {
-      if (entry.ctx.message?.id) settlingMessages.set(String(entry.ctx.message.id), entry.ctx.message);
-    }
+    for (const entry of stoppedSteers) claimSettling(entry.ctx.message, 'stopped');
     processRef.activeCtx = null;
     if (proc === processRef) proc = null;
     for (const ctx of openContexts) {
@@ -2365,6 +2559,10 @@ export function createClaudeSessionRunner({
       pendingActivities: [],
       sawInit: false,
       handoffSettling: null,
+      // Stop guard (see maybeSuppressStopFollowUp): armed by a Stop that cut
+      // off pushed steers; suppressingTurn while a follow-up turn is killed.
+      stopFollowUp: null,
+      suppressingTurn: false,
       activeCtx: null,
       pendingDelivered: [],
       lastBoundary: null,
@@ -2372,6 +2570,8 @@ export function createClaudeSessionRunner({
       lastEventAt: Date.now(),
       heldForTasksSince: 0,
       taskSettledAt: 0,
+      // Bumped by every task-settle signal; the Stop guard compares it.
+      taskSettleSeq: 0,
       lastApiRetryAt: 0,
       tasksExpired: false,
       tasksExpiredAt: 0,
@@ -2723,7 +2923,10 @@ export function createClaudeSessionRunner({
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
-    if (isDeliveryHeld()) return handBackHeldDelivery(message);
+    // An older relay (the worker updated on disk before the relay restarted)
+    // treats the hand-back as a failed delivery — retry, backoff, worker
+    // marked errored — so against one the message is pushed the legacy way.
+    if (isDeliveryHeld() && canHandBackHeldDelivery() !== false) return handBackHeldDelivery(message);
     // A turn-opening delivery awaits (adaptProcess, a draining process, a
     // spawn) before it pushes; until then it counts as admitting, so nothing
     // else is let in behind it. A steer pushes synchronously and needs none.
@@ -2801,6 +3004,10 @@ export function createClaudeSessionRunner({
         }
         // Pushed: the pending entry now holds the gate on its own.
         endAdmission();
+        // A genuinely new message reached the CLI (only possible against an
+        // older relay): the next turn may be its, so the Stop guard must not
+        // kill it.
+        if (procRef.stopFollowUp) procRef.stopFollowUp = null;
         return await ctx.done;
       }
       throw new Error('claude session process closed while accepting the message');
@@ -2866,6 +3073,8 @@ export function createClaudeSessionRunner({
     steeringState,
     getActiveQueueMessageId,
     getActiveQueueMessageIds,
+    getSettleFailed,
+    acknowledgeSettleFailed,
     isTurnActive,
     stopBackgroundTask,
     stopBackgroundTaskByToolUseId,

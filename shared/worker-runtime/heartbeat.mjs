@@ -14,6 +14,11 @@ export function createHeartbeatController({
   // holdReason}) for the composer. Workers that do not steer leave it unset
   // and the heartbeat body is unchanged.
   getSteeringState,
+  // Optional: rows the worker gave up settling ([{id, attemptId,
+  // terminalError}]); the relay fails them and names them back in
+  // `settleFailedHandled`, which `onSettleFailedHandled` receives.
+  getSettleFailed,
+  onSettleFailedHandled = () => {},
 }) {
   async function pulseHeartbeat() {
     if (!getSessionReady()) return false;
@@ -27,12 +32,20 @@ export function createHeartbeatController({
       const steering = typeof getSteeringState === "function"
         ? getSteeringState()
         : null;
+      const settleFailed = typeof getSettleFailed === "function"
+        ? (getSettleFailed() || []).filter((entry) => entry && String(entry.id || "").trim())
+        : [];
       const body = {
         ...(activeQueueMessageId ? { activeQueueMessageId } : {}),
         ...(activeQueueMessageIds.length ? { activeQueueMessageIds } : {}),
         ...(steering && typeof steering === "object" ? { steering } : {}),
+        ...(settleFailed.length ? { settleFailed } : {}),
       };
-      await api("POST", "/api/heartbeat", body);
+      const response = await api("POST", "/api/heartbeat", body);
+      const handled = Array.isArray(response?.settleFailedHandled) ? response.settleFailedHandled : [];
+      if (handled.length) {
+        try { onSettleFailedHandled(handled); } catch {}
+      }
       return true;
     } catch {
       return false;

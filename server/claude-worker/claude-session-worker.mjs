@@ -18,6 +18,7 @@ import { resolveDeliveredAutoCompactWindow } from '../../shared/auto-compact-win
 import { resolveDeliveredThinking } from '../../shared/claude-thinking.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
+import { createRunnerLinkBridge, failSettlingRowsOnShutdown } from './claude-worker-link-wiring.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HEARTBEAT_MS = 10_000;
@@ -82,6 +83,7 @@ async function main() {
     onAbortSubagent: (subagentRunId) => turnRunner.stopBackgroundTaskByToolUseId(subagentRunId),
     dbg,
   });
+  const linkBridge = createRunnerLinkBridge();
   const turnRunner = createClaudeSessionRunner({
     api,
     sdkSessionId,
@@ -102,12 +104,8 @@ async function main() {
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     getAutoCompactWindow: () => autoCompactWindow,
     getThinking: () => thinking,
-    // Late-bound: the link is built below, and the runner only reports flips
-    // once deliveries are flowing.
-    onDeliveryReadinessChange: (ready) => {
-      if (ready) void wsLink?.notifyReady('steering-resumed');
-      else wsLink?.notifyUnready('steering-held');
-    },
+    onDeliveryReadinessChange: (ready) => linkBridge.onDeliveryReadinessChange(ready),
+    canHandBackHeldDelivery: () => linkBridge.canHandBackHeldDelivery(),
     dbg,
   });
 
@@ -127,6 +125,9 @@ async function main() {
     // Composer steering snapshot; ~10s worst-case latency is fine because the
     // client covers the instant case (open question card) from its own state.
     getSteeringState: () => turnRunner.steeringState(),
+    // Consumed rows the runner could not fail itself; the relay fails them.
+    getSettleFailed: () => turnRunner.getSettleFailed(),
+    onSettleFailedHandled: (ids) => turnRunner.acknowledgeSettleFailed(ids),
   });
 
   const wsLink = createWorkerWebSocketLink({
@@ -176,20 +177,30 @@ async function main() {
       dbg('unknown worker control ignored', type || '(none)');
     },
   });
+  linkBridge.attach(wsLink);
 
-  const shutdown = (signal) => {
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     dbg(`shutting down (${signal})`);
     try { wsLink.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
+    // Consumed steers still settling must fail, not be left for dead-worker
+    // recovery to requeue and run twice (same 2 s cap as the crash guard).
+    try {
+      const failed = await failSettlingRowsOnShutdown({ api, runner: turnRunner, timeoutMs: 2_000 });
+      if (failed) dbg(`failed ${failed} settling row(s) before exit`);
+    } catch {}
     // Hard-close the persistent CLI process; a worker teardown cannot save
     // its background tasks, and the orphan-notification replay on the next
     // resume reports whatever they left behind.
     try { turnRunner.shutdown({ graceful: false }); } catch {}
     process.exit(0);
   };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
   installWorkerCrashGuard({
     api,
     workerName: 'claude-session-worker',

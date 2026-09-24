@@ -11,6 +11,45 @@
  * The requeue is strictly bounded: a crash handler that hangs is worse than
  * no handler at all.
  */
+/**
+ * Post a bounded, fenced requeue for each owed row. Entries are plain ids or
+ * { id, attemptId, terminalError } objects: the attempt id fences the requeue
+ * (a row that has moved on to another attempt must not be yanked back by a
+ * dying predecessor), and a `terminalError` makes the requeue route fail the
+ * row outright — for a row whose prompt was already consumed, which must not
+ * be requeued and run a second time. Never waits longer than `timeoutMs`.
+ */
+export async function requeueOwedRows({ api, entries = [], timeoutMs = 2_000 } = {}) {
+  const seen = new Set();
+  const owed = (Array.isArray(entries) ? entries : [])
+    .map((entry) => (entry && typeof entry === 'object'
+      ? {
+        id: String(entry.id || '').trim(),
+        attemptId: String(entry.attemptId || '').trim() || null,
+        terminalError: entry.terminalError && typeof entry.terminalError === 'object' ? entry.terminalError : null,
+      }
+      : { id: String(entry || '').trim(), attemptId: null, terminalError: null }))
+    .filter((entry) => {
+      if (!entry.id || seen.has(entry.id)) return false;
+      seen.add(entry.id);
+      return true;
+    });
+  if (!owed.length || typeof api !== 'function') return;
+  let timer = null;
+  await Promise.race([
+    Promise.allSettled(owed.map((entry) => api('POST', '/api/requeue', {
+      messageId: entry.id,
+      ...(entry.attemptId ? { attemptId: entry.attemptId } : {}),
+      ...(entry.terminalError ? { terminalError: entry.terminalError } : {}),
+    }))),
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, Math.max(0, Number(timeoutMs) || 0));
+      timer.unref?.();
+    }),
+  ]);
+  clearTimeout(timer);
+}
+
 export function installWorkerCrashGuard({
   api,
   workerName = 'session-worker',
@@ -28,39 +67,7 @@ export function installWorkerCrashGuard({
     logError(`${workerName} ${kind}:`, error?.stack || error?.message || error);
     (async () => {
       try {
-        // Entries are plain ids or { id, attemptId } objects. The attempt id,
-        // when known, fences the requeue: a row that has already moved on to
-        // another attempt must not be yanked back by a dying predecessor.
-        const seen = new Set();
-        // An entry may carry a `terminalError`: a row whose prompt the runtime
-        // already consumed must fail, not be requeued and run a second time
-        // (the requeue route fails a row outright when handed one).
-        const entries = (getActiveQueueMessageIds() || [])
-          .map((entry) => (entry && typeof entry === 'object'
-            ? {
-              id: String(entry.id || '').trim(),
-              attemptId: String(entry.attemptId || '').trim() || null,
-              terminalError: entry.terminalError && typeof entry.terminalError === 'object' ? entry.terminalError : null,
-            }
-            : { id: String(entry || '').trim(), attemptId: null, terminalError: null }))
-          .filter((entry) => {
-            if (!entry.id || seen.has(entry.id)) return false;
-            seen.add(entry.id);
-            return true;
-          });
-        if (entries.length && typeof api === 'function') {
-          await Promise.race([
-            Promise.allSettled(entries.map((entry) => api('POST', '/api/requeue', {
-              messageId: entry.id,
-              ...(entry.attemptId ? { attemptId: entry.attemptId } : {}),
-              ...(entry.terminalError ? { terminalError: entry.terminalError } : {}),
-            }))),
-            new Promise((resolve) => {
-              const timer = setTimeout(resolve, Math.max(0, Number(requeueTimeoutMs) || 0));
-              timer.unref?.();
-            }),
-          ]);
-        }
+        await requeueOwedRows({ api, entries: getActiveQueueMessageIds() || [], timeoutMs: requeueTimeoutMs });
       } catch {}
       try { onBeforeExit(); } catch {}
       exit(1);

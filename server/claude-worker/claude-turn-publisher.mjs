@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
+import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
 
 const PLAN_BOARD_ACTIONS = [
   { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
@@ -25,25 +26,8 @@ export function isStaleAttemptError(error) {
   return detail.includes('stale_attempt');
 }
 
-export const STEER_SETTLE_FAILED_TEXT = 'This message was already sent to Claude — check the reply above.';
-
-/**
- * The terminal failure for a steered message whose settle marker could not be
- * saved. Claude already saw the prompt, so it must never run again: the row
- * fails for good (terminal, so nothing requeues it) and tells the user to
- * resend only if the reply above did not cover it.
- */
-export function buildSteerSettleFailure(message) {
-  return {
-    kind: 'claude-steer-settle-failed',
-    code: 'steer-settle-failed',
-    stableCode: 'relay.steer-settle-failed',
-    message: STEER_SETTLE_FAILED_TEXT,
-    guidance: 'Resend it only if it went unanswered.',
-    failedAt: new Date().toISOString(),
-    queueMessageId: String(message?.id || '') || null,
-  };
-}
+export { buildSteerSettleFailure, steerSettleFailureText };
+export const STEER_SETTLE_FAILED_TEXT = steerSettleFailureText('folded');
 
 export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}) {
   const summary = String(planText || '').trim();
@@ -75,6 +59,11 @@ export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}
  * (delivered or background-continuation) through one publisher.
  */
 export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRuns = null } = {}) {
+  function drainWorkflowRuns({ terminal = false } = {}) {
+    if (terminal || typeof takeWorkflowRuns !== 'function') return null;
+    return takeWorkflowRuns();
+  }
+
   async function postActivity(message, text, subagentRunId = null, metadata = null) {
     if (!text) return;
     await api('POST', '/api/activity', {
@@ -218,6 +207,14 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     absorbed = false,
     kind = null,
     requeueOnFailure = true,
+    // Ids of steered queue rows pushed into the turn this response finishes
+    // and still unsettled: the relay marks them consumed in the same
+    // transaction, so no recovery path ever re-runs them (at-most-once even
+    // if this worker dies before settling them).
+    consumedSteerIds = null,
+    // A caller retrying one publish drains the settled workflow digests ONCE
+    // and passes them to every attempt, so a failed attempt cannot lose them.
+    workflowRuns: presetWorkflowRuns,
   }) {
     const responseKind = kind || (absorbed ? 'absorbed' : null);
     // Final digests of workflows that settled since the last response ride the
@@ -226,9 +223,12 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     // failures skip the drain so the digests stay buffered for a later turn;
     // if this POST fails (→ requeue) or the process dies before any response
     // publishes, the drained digests are lost — acceptable v1.
-    const workflowRuns = (!terminalError && typeof takeWorkflowRuns === 'function')
-      ? takeWorkflowRuns()
-      : null;
+    const workflowRuns = presetWorkflowRuns !== undefined
+      ? presetWorkflowRuns
+      : drainWorkflowRuns({ terminal: Boolean(terminalError) });
+    const consumed = Array.isArray(consumedSteerIds)
+      ? consumedSteerIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : [];
     try {
       await api('POST', '/api/response', {
         messageId: message.id,
@@ -244,6 +244,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         // a steer the user's Stop cut off unanswered.
         ...(responseKind === 'absorbed' ? { absorbed: true } : {}),
         ...(responseKind && responseKind !== 'absorbed' ? { kind: responseKind } : {}),
+        ...(consumed.length ? { consumedSteerIds: consumed } : {}),
         ...attemptFields(message),
       });
       return 'published';
@@ -296,7 +297,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
    * plan-mode fallback board, response row. Mirrors the pre-session-process
    * turn runner's tail exactly.
    */
-  async function publishCompletedTurn({ message, state, responseModel, planBoardPosted }) {
+  async function publishCompletedTurn({ message, state, responseModel, planBoardPosted, consumedSteerIds = null }) {
     const result = state.result;
     const finalText = String(
       state.resultTexts.join('\n\n') || result?.text || state.lastStreamedText || '',
@@ -318,10 +319,10 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     // fails the message with a misleading "Relay timeout".
     const publishedText = finalText || EMPTY_TURN_COMPLETION_NOTE;
     await publishFinalStream(message, publishedText);
-    await publishResponse(message, { text: publishedText, model: responseModel });
+    await publishResponse(message, { text: publishedText, model: responseModel, consumedSteerIds });
   }
 
-  async function publishErrorResult({ message, state, responseModel }) {
+  async function publishErrorResult({ message, state, responseModel, consumedSteerIds = null }) {
     const result = state.result;
     const errorText = result.text
       || `Claude turn failed (${result.subtype || 'unknown error'}).`;
@@ -337,6 +338,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         failedAt: new Date().toISOString(),
         queueMessageId: String(message.id || '') || null,
       },
+      consumedSteerIds,
     });
   }
 
@@ -360,6 +362,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
 
   return {
     postActivity,
+    drainWorkflowRuns,
     dispatchAction,
     publishContextUsage,
     publishPlanUsage,

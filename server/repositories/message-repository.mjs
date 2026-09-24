@@ -305,7 +305,7 @@ export function createMessageRepository(db) {
         // Recovery clears only the lease, never the owner: a recovered row must
         // stay routed to its provider worker so the primer respawns that worker
         // instead of the row becoming claimable by the global relay poll.
-        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, attempt_id = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND COALESCE(kind, '') != 'continuation' AND processing_at < ?`),
+        recoverStale:   db.prepare(`UPDATE queue SET status = 'pending', processing_at = NULL, attempt_id = NULL, next_attempt_at = ?, owner_lease_expires_at = NULL, owner_last_claimed_at = NULL WHERE status = 'processing' AND COALESCE(kind, '') != 'continuation' AND consumed_at IS NULL AND processing_at < ?`),
         // Staleness is inactivity, not elapsed turn time: owner_last_claimed_at is
         // refreshed by every worker heartbeat for the message it is working on, so a
         // long-but-alive turn keeps moving the cutoff. processing_at is only the
@@ -315,7 +315,7 @@ export function createMessageRepository(db) {
         // A turn blocked on an unanswered AskUserQuestion is never stale — it is
         // waiting on the human, and relay_questions carries its own expiry.
         listRecoverableProcessing: db.prepare(`
-          SELECT id, conversation_id, kind, relay_mode, model, retry_count
+          SELECT id, conversation_id, kind, relay_mode, model, retry_count, consumed_at
           FROM queue
           WHERE status = 'processing'
             AND COALESCE(kind, '') != 'continuation'
@@ -336,6 +336,7 @@ export function createMessageRepository(db) {
               retry_count = retry_count + 1
           WHERE status = 'processing'
             AND COALESCE(kind, '') != 'continuation'
+            AND consumed_at IS NULL
             AND (
               COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
               OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
@@ -351,7 +352,7 @@ export function createMessageRepository(db) {
         // worker can never collect its answer, so holding the row would leak
         // both the row and the question.
         listProcessingRowsForOwner: db.prepare(`
-          SELECT id, conversation_id, kind, retry_count
+          SELECT id, conversation_id, kind, retry_count, consumed_at, relay_mode, model
           FROM queue
           WHERE status = 'processing'
             AND NULLIF(owner_sdk_session_id, '') = ?
@@ -365,7 +366,13 @@ export function createMessageRepository(db) {
               owner_lease_expires_at = NULL,
               owner_last_claimed_at = NULL,
               retry_count = retry_count + 1
-          WHERE id = ? AND status = 'processing'
+          WHERE id = ? AND status = 'processing' AND consumed_at IS NULL
+        `),
+        // See the queue.consumed_at migration: at-most-once rows.
+        markQueueConsumed: db.prepare(`
+          UPDATE queue
+          SET consumed_at = COALESCE(consumed_at, ?)
+          WHERE id = ? AND conversation_id = ? AND status = 'processing'
         `),
         listProcessingOwnerSessionIds: db.prepare(`
           SELECT DISTINCT NULLIF(owner_sdk_session_id, '') AS sdk_session_id

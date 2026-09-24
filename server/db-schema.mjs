@@ -637,6 +637,13 @@ if (!queueColumns.includes('parked_at')) {
 if (!queueColumns.includes('parked_target_session_id')) {
   db.exec(`ALTER TABLE queue ADD COLUMN parked_target_session_id TEXT`);
 }
+if (!queueColumns.includes('consumed_at')) {
+  // Set when the Claude CLI has provably taken a row's prompt (a steer still
+  // pending when the turn it was pushed into finished). A consumed row is
+  // at-most-once: every recovery path fails it terminally instead of
+  // requeueing it, because a re-delivery would run the prompt a second time.
+  db.exec(`ALTER TABLE queue ADD COLUMN consumed_at TEXT`);
+}
 if (!queueColumns.includes('kind')) {
   // 'continuation' rows are synthetic turns for the Claude worker's
   // background-task continuations: born 'processing', never deliverable, and

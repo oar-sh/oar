@@ -41,3 +41,23 @@ test('a non-object steering snapshot is dropped from the body', async () => {
   await controller.pulseHeartbeat();
   assert.equal('steering' in calls[0].body, false);
 });
+
+test('settle-failed rows ride the heartbeat and the relay’s acknowledgement is handed back', async () => {
+  const calls = [];
+  const acknowledged = [];
+  let timer = null;
+  const entry = { id: 'q-9', attemptId: 'a-9', terminalError: { stableCode: 'relay.steer-settle-failed' } };
+  const controller = createHeartbeatController({
+    api: async (method, path, body) => { calls.push({ method, path, body }); return { ok: true, settleFailedHandled: ['q-9'] }; },
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => timer,
+    setHeartbeatTimer: (value) => { timer = value; },
+    getActiveQueueMessageIds: () => ['q-9'],
+    getSettleFailed: () => [entry],
+    onSettleFailedHandled: (ids) => acknowledged.push(...ids),
+  });
+  await controller.pulseHeartbeat();
+  assert.deepEqual(calls[0].body.settleFailed, [entry]);
+  assert.deepEqual(acknowledged, ['q-9']);
+});

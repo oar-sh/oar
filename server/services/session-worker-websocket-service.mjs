@@ -91,6 +91,13 @@ function queueSnapshotChanged(left, right) {
 // heartbeats and a retained socket no longer proves the worker is alive.
 const WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS = 30_000;
 
+// Protocol features this relay understands, advertised in server.hello. A
+// worker that updated on disk before the relay restarted must not rely on
+// them otherwise: an older relay ignores worker.unready / hello ready:false
+// and treats a `steering-held` requeue as a failure (retry, backoff,
+// worker marked errored).
+export const WORKER_PROTOCOL_CAPABILITIES = Object.freeze(['worker-unready', 'steering-held']);
+
 export function createSessionWorkerWebSocketService({
   WebSocketServerImpl,
   httpServer,
@@ -378,6 +385,7 @@ export function createSessionWorkerWebSocketService({
     emitEvent(ws, {
       type: 'server.hello',
       reason: 'connected',
+      capabilities: WORKER_PROTOCOL_CAPABILITIES,
       queue: normalizeQueueSnapshot(queueCounts()),
       sessionId: identity.sessionId,
       timestamp: nowIso(),
@@ -404,6 +412,7 @@ export function createSessionWorkerWebSocketService({
         emitEvent(ws, {
           type: 'server.hello',
           reason: 'ack',
+          capabilities: WORKER_PROTOCOL_CAPABILITIES,
           queue: normalizeQueueSnapshot(queueCounts()),
           sessionId: meta.sessionId,
           timestamp: nowIso(),

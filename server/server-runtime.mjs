@@ -25,6 +25,7 @@ import {
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
+import { buildSteerSettleFailure } from '../shared/steer-settle-failure.mjs';
 import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { applySchema } from './db-schema.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
@@ -4934,17 +4935,17 @@ function inFlightStateForConversation(conversationId) {
 // retry_count like /api/requeue does, but bypasses that route's budget check,
 // so the sweep enforces it here). Minimal mirror of the route-side
 // failQueueMessage: mark failed, insert the assistant failure message, emit.
-function failRecoveredRowTerminally(row, reason) {
+function failRecoveredRowTerminally(row, reason, { failureRecord = null, failureText: presetText = null } = {}) {
   const now = new Date().toISOString();
   const responseId = uuidv4();
   const retryCount = Number(row?.retry_count || 0) + 1;
-  const failureText = `Relay recovery limit reached after ${retryCount} attempts (${reason}). The worker kept dying before completing this turn, so the message was failed to keep the queue moving. Send it again to retry.`;
+  const failureText = presetText || `Relay recovery limit reached after ${retryCount} attempts (${reason}). The worker kept dying before completing this turn, so the message was failed to keep the queue moving. Send it again to retry.`;
   const requestedModel = String(row?.model || '').trim() || null;
   const tx = db.transaction(() => {
     // setFailed is compare-and-set on status (processing/pending/parked): a
     // row that settled between the sweep's listing and this write must not
     // grow an orphan failure bubble on top of its real outcome.
-    const result = stmts.setFailed.run(JSON.stringify({
+    const result = stmts.setFailed.run(JSON.stringify(failureRecord || {
       kind: 'recovery-limit',
       error: 'recovery-limit',
       code: 'recovery-limit',
@@ -4982,7 +4983,18 @@ function failRecoveredRowTerminally(row, reason) {
     message: { role: 'assistant', text: failureText, model: requestedModel || 'unknown', mode: String(row?.relay_mode || '').trim() || null, timestamp: now },
   });
   io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
-  console.warn(`${runtimeLogPrefix()}RECOVERY LIMIT ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
+  console.warn(`${runtimeLogPrefix()}${failureRecord ? 'CONSUMED FAILED' : 'RECOVERY LIMIT'} ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
+}
+
+// A row whose prompt the Claude CLI already consumed (queue.consumed_at) is
+// at-most-once: recovery must never requeue it — a re-delivery would run the
+// prompt twice — so it fails terminally with the steer-settle wording.
+function failConsumedRowTerminally(row, reason) {
+  const failureRecord = buildSteerSettleFailure(row);
+  failRecoveredRowTerminally(row, reason, {
+    failureRecord: { ...failureRecord, error: 'terminal-error', reason: String(reason || 'recovery') },
+    failureText: `${failureRecord.message} Error code: ${failureRecord.stableCode}. ${failureRecord.guidance}`,
+  });
 }
 
 function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso = null } = {}) {
@@ -4994,7 +5006,9 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
     stmts.dropStaleContinuation?.run?.(row.id);
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
   }
-  const allRows = stmts.listRecoverableProcessing.all(params);
+  const listedRows = stmts.listRecoverableProcessing.all(params);
+  for (const row of listedRows.filter((entry) => entry?.consumed_at)) failConsumedRowTerminally(row, 'stale-recovery');
+  const allRows = listedRows.filter((entry) => !entry?.consumed_at);
   if (!allRows.length) return [];
   // Enforce the retry budget before requeueing: failing these rows first
   // flips them out of 'processing' so the recovery UPDATE below skips them.
@@ -5798,6 +5812,10 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
       // No user prompt to replay: a dead worker's continuation is torn down.
       stmts.dropStaleContinuation?.run?.(row.id);
       io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+      continue;
+    }
+    if (row.consumed_at) {
+      failConsumedRowTerminally(row, `worker-died-${reason}`);
       continue;
     }
     if (Number(row.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES) {

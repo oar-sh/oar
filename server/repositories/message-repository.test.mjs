@@ -306,6 +306,35 @@ test('claim ordering: a recovered older row with a bumped retry_count is claimed
   assert.equal(repo.findPendingForWorker.get(matured, 'sdk-1', 'sdk-1')?.id, 'message-recovered');
 });
 
+test('recovery statements never put a consumed row back to pending, and surface it to fail', () => {
+  // Backstop for the consumed marker: every processing→pending recovery skips
+  // a row whose prompt the CLI took; the listings expose consumed_at so the
+  // callers fail it terminally instead.
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES ('conv-1', 'Conv', 'active', 'sdk-1', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  const insert = db.prepare(`
+    INSERT INTO queue (id, conversation_id, text, status, timestamp, processing_at, owner_sdk_session_id, retry_count)
+    VALUES (?, 'conv-1', ?, 'processing', '2026-09-24T10:00:00.000Z', '2026-09-24T10:00:00.000Z', 'sdk-1', 0)
+  `);
+  insert.run('consumed', 'steer');
+  insert.run('plain', 'turn');
+  assert.equal(repo.markQueueConsumed.run('2026-09-24T10:01:00.000Z', 'consumed', 'conv-1').changes, 1);
+  assert.equal(repo.markQueueConsumed.run('2026-09-24T10:02:00.000Z', 'consumed', 'other-conv').changes, 0, 'scoped to its conversation');
+  assert.equal(repo.findQById.get('consumed').consumed_at, '2026-09-24T10:01:00.000Z', 'first mark wins');
+
+  const later = '2026-09-24T11:00:00.000Z';
+  const listed = repo.listRecoverableProcessing.all({ inactiveBefore: later, ceilingBefore: null });
+  assert.equal(listed.find((row) => row.id === 'consumed')?.consumed_at, '2026-09-24T10:01:00.000Z');
+  assert.ok(repo.listProcessingRowsForOwner.all('sdk-1').find((row) => row.id === 'consumed')?.consumed_at);
+
+  repo.recoverProcessingRowKeepOwner.run(later, 'consumed');
+  repo.recoverProcessingBefore.run({ inactiveBefore: later, ceilingBefore: null, requeueAt: later });
+  repo.recoverStale.run(later, later);
+  assert.equal(repo.findQById.get('consumed').status, 'processing', 'never requeued by recovery');
+  assert.equal(repo.findQById.get('plain').status, 'pending', 'ordinary rows still recover');
+});
+
 test('claim ordering: legacy-relay dequeue also keeps expired-backoff rows in send order', () => {
   const db = createTestDb();
   const repo = createMessageRepository(db);

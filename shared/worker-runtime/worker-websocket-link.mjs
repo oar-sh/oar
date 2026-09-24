@@ -90,6 +90,9 @@ export function createWorkerWebSocketLink({
   let lastHelloSentAt = null;
   let lastReadySentAt = null;
   let lastUnreadySentAt = null;
+  // What the connected relay advertised in server.hello (see
+  // WORKER_PROTOCOL_CAPABILITIES in the relay's worker websocket service).
+  let serverCapabilities = new Set();
   let lastPingSentAt = null;
   let lastPongAt = null;
   let lastQueueChangedAt = null;
@@ -328,6 +331,7 @@ export function createWorkerWebSocketLink({
         return;
       }
       if (payload?.type === "server.hello") {
+        serverCapabilities = new Set(Array.isArray(payload.capabilities) ? payload.capabilities.map(String) : []);
         void notifyReady(String(payload.reason || "server-hello"));
         return;
       }
@@ -359,6 +363,8 @@ export function createWorkerWebSocketLink({
     });
     ws.addEventListener("close", () => {
       clearReadyRefreshTimer();
+      // The next connection may reach a different (restarted) relay.
+      serverCapabilities = new Set();
       if (stopped) return;
       dbg("worker ws disconnected");
       scheduleReconnect();
@@ -408,6 +414,7 @@ export function createWorkerWebSocketLink({
   return {
     notifyReady,
     notifyUnready,
+    serverSupports: (capability) => serverCapabilities.has(String(capability || "")),
     start,
     stop,
     status,

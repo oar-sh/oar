@@ -469,6 +469,33 @@ test("a steering-ready worker keeps signalling readiness and runs a concurrent d
   link.stop();
 });
 
+test("the link records what the relay advertises and forgets it on reconnect", async () => {
+  FakeWebSocket.instances = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-caps",
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+    setTimeoutImpl: () => ({}),
+    clearTimeoutImpl: () => {},
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  assert.equal(link.serverSupports("steering-held"), false, "nothing assumed before the hello");
+  // An older relay's hello carries no capabilities.
+  socket.receive({ type: "server.hello", reason: "connected" });
+  assert.equal(link.serverSupports("steering-held"), false);
+  socket.receive({ type: "server.hello", reason: "ack", capabilities: ["worker-unready", "steering-held"] });
+  assert.equal(link.serverSupports("steering-held"), true);
+  assert.equal(link.serverSupports("worker-unready"), true);
+  socket.close();
+  assert.equal(link.serverSupports("steering-held"), false, "a reconnect may reach a different relay");
+  link.stop();
+});
+
 test("throwing steering and hold probes fail closed on readiness", async () => {
   FakeWebSocket.instances = [];
   const link = createWorkerWebSocketLink({

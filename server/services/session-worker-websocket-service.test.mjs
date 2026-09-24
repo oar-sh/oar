@@ -405,6 +405,11 @@ test('worker.unready withdraws a standing readiness so a hold draws no work', as
   assert.equal(requestedSessions.length, before, 'a held worker is not asked for work');
   assert.equal(socket.sent.some((payload) => payload.includes('"type":"queue.deliver"')), false);
 
+  // Both server.hello frames advertise the protocol a new worker relies on.
+  const hellos = socket.sent.map((payload) => JSON.parse(payload)).filter((frame) => frame.type === 'server.hello');
+  assert.ok(hellos.length >= 1);
+  for (const hello of hellos) assert.deepEqual(hello.capabilities, ['worker-unready', 'steering-held']);
+
   // A held worker's hello binds identity without re-arming readiness.
   socket.emit('message', JSON.stringify({ type: 'worker.hello', reason: 'ws-open', ready: false }));
   await new Promise((resolve) => setImmediate(resolve));

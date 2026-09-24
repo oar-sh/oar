@@ -1223,6 +1223,99 @@ test('a handed-off absorbed turn stays owned while its settle is retried', async
   await settled(runner);
 });
 
+test('a handoff whose settle is retrying does not freeze the new turn’s stream', async () => {
+  // onSdkMessage awaits the handoff settle inside the SDK stream loop to keep
+  // the two rows' publishes ordered; it must wait for the FIRST attempt only,
+  // or a failing relay write froze the new turn for the whole retry ladder.
+  let q1Attempts = 0;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': (body) => {
+        if (body.messageId === 'q-1' && !body.terminalError) {
+          q1Attempts += 1;
+          if (q1Attempts < 3) throw new Error('relay 503');
+        }
+        return { ok: true };
+      },
+    },
+  });
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, settleRetryDelaysMs: [300, 300] });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and also this' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'q-2 pushed' });
+  turn.emit(userReplay('and also this'));
+  turn.emit({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'streaming the answer' } },
+  });
+
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/stream' && call.body.messageId === 'q-2'),
+    { label: 'q-2 streams while q-1 is still retrying', timeoutMs: 250 },
+  );
+  assert.equal(q1Attempts, 1, 'only the first settle attempt preceded the new turn’s output');
+  assert.ok(runner.getActiveQueueMessageIds().some((entry) => entry.id === 'q-1'), 'q-1 stays owned while it retries');
+  const firstQ2Publish = stub.calls.findIndex((call) => call.body?.messageId === 'q-2' && call.routePath !== '/api/activity');
+  const firstQ1Publish = stub.calls.findIndex((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.ok(firstQ1Publish < firstQ2Publish, 'transcript order is kept: q-1’s settle attempt went first');
+
+  turn.emit(resultMessage('streaming the answer', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(await first, true);
+  assert.equal(q1Attempts, 3);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a terminal settle that cannot be posted is handed to the heartbeat, still owned', async () => {
+  // A persistent error (e.g. a 401 after a token change) used to spin the
+  // terminal loop forever.
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': (body) => {
+        if (body.messageId === 'q-2') throw new Error('HTTP 401');
+        return { ok: true };
+      },
+      '/api/requeue': (body) => {
+        if (body.messageId === 'q-2') throw new Error('HTTP 401');
+        return { ok: true };
+      },
+    },
+  });
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, steeredFoldGraceMs: 30, lifecyclePollMs: 10, settleRetryDelaysMs: [5], maxTerminalSettleAttempts: 2,
+  });
+
+  const { second } = await foldOneSteer(runner, turn);
+  assert.equal(await second, true);
+  const terminalPosts = stub.calls.filter((call) => call.routePath === '/api/response'
+    && call.body.messageId === 'q-2' && call.body.terminalError);
+  assert.equal(terminalPosts.length, 2, 'bounded');
+  const [handedOver] = runner.getSettleFailed();
+  assert.equal(handedOver.id, 'q-2');
+  assert.equal(handedOver.attemptId, 'attempt-2');
+  assert.equal(handedOver.terminalError.stableCode, 'relay.steer-settle-failed');
+  assert.ok(runner.getActiveQueueMessageIds().some((entry) => entry.id === 'q-2'), 'the lease keeps renewing');
+  const callsBefore = stub.calls.length;
+  await tick(60);
+  assert.equal(stub.calls.filter((call) => call.body?.messageId === 'q-2').length,
+    stub.calls.slice(0, callsBefore).filter((call) => call.body?.messageId === 'q-2').length, 'no more posting');
+
+  runner.acknowledgeSettleFailed(['q-2']);
+  assert.deepEqual(runner.getSettleFailed(), []);
+  assert.equal(runner.getActiveQueueMessageIds().some((entry) => entry.id === 'q-2'), false);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('Stop with steers in flight settles them as stopped, not merged, and never requeues', async () => {
   // Decision 5: the Stop cut the turn short, so "Handled together with the
   // previous reply" would claim an answer that never came. They settle
@@ -1238,7 +1331,9 @@ test('Stop with steers in flight settles them as stopped, not merged, and never 
     },
     stop: () => {},
   };
-  const runner = makeRunner({ stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10 });
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 60,
+  });
 
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
   turn.emit(initMessage('native-1'));
@@ -1265,6 +1360,226 @@ test('Stop with steers in flight settles them as stopped, not merged, and never 
     assert.doesNotMatch(response.body.text, /Handled together/);
     assert.equal(stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === id), undefined);
   }
+  // Marked consumed on the relay the moment the stopped turn ended, so a
+  // worker death before the settle cannot get them re-run.
+  const consumed = stub.calls.find((call) => call.routePath === '/api/queue-consumed');
+  assert.deepEqual(consumed.body.messageIds, ['q-2', 'q-3']);
+  turn.endInput();
+  await settled(runner);
+});
+
+/**
+ * q-1 live with `steers` pushed into it, then the user stops it and the
+ * interrupted turn ends. Returns the pending handlePendingPayload promises.
+ */
+async function stopTurnWithSteers(runner, turn, getAbort, steers) {
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('running sleep 20'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const pending = steers.map((text, index) => runner.handlePendingPayload({
+    message: { ...baseMessage, id: `q-${index + 2}`, text },
+  }));
+  await waitFor(() => runner._getProcess().pendingDelivered.length === steers.length, { label: 'steers pushed' });
+  await getAbort()();
+  turn.emit({ ...resultMessage('', 'native-1'), is_interrupt: true });
+  assert.equal(await first, true);
+  return pending;
+}
+
+function abortCapturingPoller() {
+  let abort = null;
+  return {
+    getAbort: () => abort,
+    controlPoller: {
+      start: ({ queueMessageId, onAbortTurn }) => {
+        if (queueMessageId === 'q-1') abort = onAbortTurn;
+        return {};
+      },
+      stop: () => {},
+    },
+  };
+}
+
+// The follow-up turn as the SDK probe (2026-09-24, CLI 2.1.281) saw it: a
+// bare init with no user replay, the interrupted tool call re-run, and — once
+// interrupted at its init — an error_during_execution result.
+function emitFollowUpTurn(turn) {
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('re-running sleep 20 before answering'));
+  turn.emit({
+    type: 'result', subtype: 'error_during_execution', is_error: true, result: '', session_id: 'native-1',
+    num_turns: 1, duration_api_ms: 50,
+  });
+}
+
+test('the CLI follow-up turn for a stopped steer is interrupted at its init, and the steer settles stopped', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 500,
+  });
+
+  const [second] = await stopTurnWithSteers(runner, turn, getAbort, ['and then X']);
+  assert.equal(turn.interrupts, 1);
+  emitFollowUpTurn(turn);
+  await waitFor(() => turn.interrupts === 2, { label: 'the follow-up turn is interrupted' });
+  assert.equal(await second, true);
+
+  const responses = stub.calls.filter((call) => call.routePath === '/api/response');
+  assert.deepEqual(responses.map((call) => call.body.messageId), ['q-2'], 'only the stopped stub publishes');
+  assert.equal(responses[0].body.kind, 'stopped');
+  assert.equal(responses[0].body.terminalError, undefined, 'the killed turn is not a failed turn');
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/continuation-turn'), undefined, 'no phantom continuation');
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/stream' && /re-running/.test(call.body.text || '')), false);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('several stopped steers: every follow-up turn the CLI opens for them is interrupted', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 500,
+  });
+
+  const pending = await stopTurnWithSteers(runner, turn, getAbort, ['steer A', 'steer B']);
+  emitFollowUpTurn(turn);
+  await waitFor(() => turn.interrupts === 2, { label: 'first follow-up interrupted' });
+  await tick(20);
+  emitFollowUpTurn(turn);
+  await waitFor(() => turn.interrupts === 3, { label: 'second follow-up interrupted' });
+  for (const promise of pending) assert.equal(await promise, true);
+
+  const responses = stub.calls.filter((call) => call.routePath === '/api/response');
+  assert.deepEqual(responses.map((call) => call.body.messageId), ['q-2', 'q-3']);
+  assert.ok(responses.every((call) => call.body.kind === 'stopped'));
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/continuation-turn'), undefined);
+
+  // The guard is spent: a later bare init (a real continuation) runs.
+  turn.emit(initMessage('native-1'));
+  await tick(20);
+  assert.equal(turn.interrupts, 3);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a message sent right after Stop is held, then runs as its own turn untouched by the guard', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 200,
+  });
+
+  const [second] = await stopTurnWithSteers(runner, turn, getAbort, ['steer A']);
+  // Sent right after Stop: held, never pushed where the guard could kill it.
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-9', text: 'new question' } }), false);
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-9')?.body.class, 'steering-held');
+  emitFollowUpTurn(turn);
+  await waitFor(() => turn.interrupts === 2, { label: 'the follow-up is interrupted' });
+  assert.equal(await second, true);
+  await waitFor(() => runner.isDeliveryHeld() === false, { label: 'the hold ends once the steer settled' });
+
+  // Re-delivered: opens its own turn, which the spent guard leaves alone.
+  const ninth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-9', text: 'new question' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('new question'));
+  turn.emit(assistantText('here you go'));
+  turn.emit(resultMessage('here you go', 'native-1'));
+  assert.equal(await ninth, true);
+  assert.equal(turn.interrupts, 2);
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-9').body.text, 'here you go');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('against an older relay a message pushed after Stop disarms the guard so its turn runs', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    controlPoller,
+    steeredFoldGraceMs: 60_000,
+    lifecyclePollMs: 10,
+    stopFollowUpWindowMs: 500,
+    canHandBackHeldDelivery: () => false,
+  });
+
+  await stopTurnWithSteers(runner, turn, getAbort, ['steer A']);
+  const ninth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-9', text: 'new question' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'pushed the legacy way' });
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-9'), undefined,
+    'no hand-back an older relay would punish');
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('new question'));
+  turn.emit(resultMessage('answered', 'native-1'));
+  assert.equal(await ninth, true);
+  assert.equal(turn.interrupts, 1, 'the new message’s turn was not killed');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a background task continuation after Stop is not killed by the guard', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 500,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(assistantText('working'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer A' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pushed' });
+  await getAbort()();
+  turn.emit({ ...resultMessage('', 'native-1'), is_interrupt: true });
+  assert.equal(await first, true);
+
+  // The task settles inside the guard window: the next bare init may be its
+  // continuation, so the guard stands down rather than kill it.
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('the agent finished'));
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && ['q-2', 'cont-1'].includes(call.body.messageId)),
+    { label: 'the continuation turn published' },
+  );
+  assert.equal(turn.interrupts, 1, 'the continuation was not interrupted');
+  await second;
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a continuation starting after the Stop guard lapsed runs normally', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 50,
+  });
+
+  const [second] = await stopTurnWithSteers(runner, turn, getAbort, ['steer A']);
+  assert.equal(await second, true, 'no follow-up came: settled stopped once the window lapsed');
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('a background agent reports in'));
+  turn.emit(resultMessage('a background agent reports in', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the later continuation published' },
+  );
+  assert.equal(turn.interrupts, 1);
   turn.endInput();
   await settled(runner);
 });
