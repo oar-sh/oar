@@ -15,11 +15,13 @@
 // row that had actually taken over.
 
 /**
- * @param {Array<{id:string, lastOutputAtMs?:number, processingAtMs?:number}>} rows
+ * @param {Array<{id:string, lastOutputAtMs?:number, streamDone?:boolean, processingAtMs?:number}>} rows
  *   Processing rows for one conversation. `lastOutputAtMs` is when the row
- *   last wrote a stream snapshot or activity line (0 = never);
- *   `processingAtMs` is when it entered processing (final tie-break; smaller
- *   = older = wins).
+ *   last wrote a stream snapshot or activity line (0 = never); `streamDone`
+ *   marks a row whose main stream snapshot is final — a handed-off row
+ *   settling, whose closing snapshot re-stamps it as the newest write — and
+ *   ranks it below every row still open; `processingAtMs` is when it entered
+ *   processing (final tie-break; smaller = older = wins).
  * @returns {string} the live turn's row id, or '' when there are no rows.
  */
 export function pickLiveTurnRowId(rows = []) {
@@ -30,6 +32,10 @@ export function pickLiveTurnRowId(rows = []) {
   let best = null;
   for (const row of list) {
     if (!best) { best = row; continue; }
+    if (Boolean(row.streamDone) !== Boolean(best.streamDone)) {
+      if (!row.streamDone) best = row;
+      continue;
+    }
     const output = finite(row.lastOutputAtMs);
     const bestOutput = finite(best.lastOutputAtMs);
     if (output > bestOutput

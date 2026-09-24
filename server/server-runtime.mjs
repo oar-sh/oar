@@ -4897,10 +4897,11 @@ function resolveLiveTurnQueueRow(conversationId) {
   if (rows.length === 1) return rows[0];
   const byId = new Map(rows.map((row) => [String(row.id), row]));
   const liveId = pickLiveTurnRowId(rows.map((row) => {
-    const lastOutputAt = stmts.getLastOutputAtByQueueMessage?.get(row.id, row.id)?.last_output_at || '';
+    const output = stmts.getLastOutputAtByQueueMessage?.get({ id: row.id }) || null;
     return {
       id: String(row.id),
-      lastOutputAtMs: Date.parse(String(lastOutputAt)) || 0,
+      lastOutputAtMs: Date.parse(String(output?.last_output_at || '')) || 0,
+      streamDone: Number(output?.stream_done || 0) === 1,
       processingAtMs: Date.parse(String(row.processing_at || row.timestamp || '')) || 0,
     };
   }));

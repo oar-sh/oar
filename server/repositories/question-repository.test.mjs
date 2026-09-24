@@ -131,9 +131,17 @@ test('getLastOutputAtByQueueMessage reports the newest stream or activity write,
   // queue-3: activity only.
   repo.insertActivity.run('queue-3', null, 'conv-1', 'agent', 'thinking', '2026-01-01T00:00:30.000Z', null, null);
 
-  const at = (id) => repo.getLastOutputAtByQueueMessage.get(id, id).last_output_at;
-  assert.equal(at('queue-1'), '2026-01-01T00:00:50.000Z');
-  assert.equal(at('queue-2'), '2026-01-01T00:01:05.000Z');
-  assert.equal(at('queue-3'), '2026-01-01T00:00:30.000Z');
-  assert.equal(at('queue-4'), null, 'no output yet');
+  // queue-2's subagent thread finishing does not make its main stream final.
+  repo.insertStreamEvent.run('queue-2', null, 'conv-1', 'agent', 2, 'sub done', 1, '2026-01-01T00:01:00.000Z', 'sub-1');
+  // queue-1 settles: its main snapshot goes final.
+  db.prepare(`UPDATE relay_stream_events SET done = 1 WHERE queue_message_id = 'queue-1' AND subagent_run_id IS NULL`).run();
+
+  const read = (id) => repo.getLastOutputAtByQueueMessage.get({ id });
+  assert.equal(read('queue-1').last_output_at, '2026-01-01T00:00:50.000Z');
+  assert.equal(read('queue-2').last_output_at, '2026-01-01T00:01:05.000Z');
+  assert.equal(read('queue-3').last_output_at, '2026-01-01T00:00:30.000Z');
+  assert.equal(read('queue-4').last_output_at, null, 'no output yet');
+  assert.equal(read('queue-1').stream_done, 1);
+  assert.equal(read('queue-2').stream_done, 0);
+  assert.equal(read('queue-3').stream_done, null);
 });

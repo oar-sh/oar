@@ -28,13 +28,17 @@ export function createQuestionRepository(db) {
         // When a queue row last produced output — its newest stream snapshot
         // (rows are rewritten in place and re-stamped per update) or activity
         // line. The live-turn picker compares rows by this, never by the
-        // per-row stream seq.
+        // per-row stream seq. `stream_done` is 1 once the row's main-thread
+        // snapshot is final: a row settling after a handoff re-stamps its
+        // snapshot with done=1, which must not read as live output.
         getLastOutputAtByQueueMessage: db.prepare(`
-          SELECT MAX(at) AS last_output_at FROM (
-            SELECT MAX(created_at) AS at FROM relay_stream_events WHERE queue_message_id = ?
-            UNION ALL
-            SELECT MAX(created_at) AS at FROM relay_activity WHERE queue_message_id = ?
-          )
+          SELECT
+            (SELECT MAX(at) FROM (
+              SELECT MAX(created_at) AS at FROM relay_stream_events WHERE queue_message_id = @id
+              UNION ALL
+              SELECT MAX(created_at) AS at FROM relay_activity WHERE queue_message_id = @id
+            )) AS last_output_at,
+            (SELECT MAX(done) FROM relay_stream_events WHERE queue_message_id = @id AND subagent_run_id IS NULL) AS stream_done
         `),
         deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
 

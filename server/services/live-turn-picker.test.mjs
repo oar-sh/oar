@@ -35,6 +35,16 @@ test('the row that took the turn over wins over a long handed-off row', () => {
   assert.equal(live, 'live-b');
 });
 
+test('a handed-off row settling its final snapshot does not take the bubble back', () => {
+  // settleHandedOffContext publishes the outgoing row's done=1 snapshot AFTER
+  // the incoming row started streaming, re-stamping it as the newest write.
+  const live = pickLiveTurnRowId([
+    { id: 'handed-off', processingAtMs: 1000, lastOutputAtMs: 91_000, streamDone: true },
+    { id: 'live', processingAtMs: 60_000, lastOutputAtMs: 90_500, streamDone: false },
+  ]);
+  assert.equal(live, 'live');
+});
+
 test('an activity line counts as output as much as a stream snapshot', () => {
   // A turn running tools writes activity before any prose.
   const live = pickLiveTurnRowId([
