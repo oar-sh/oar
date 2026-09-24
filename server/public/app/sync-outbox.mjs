@@ -1,4 +1,5 @@
 import { BASE, CLIENT_ID, authHeaders, conversations } from './store.js';
+import { getSyncedDraft } from './conversation-draft-sync.mjs';
 
 // Durable outbox for Background Sync: message sends, ask_user answers, and
 // draft flushes that failed (or might die mid-flight on pagehide) are queued
@@ -192,7 +193,11 @@ export async function enqueueDraftFlushForBackgroundSync(conversationId) {
   if (!conversation) return false;
   const input = document.getElementById('msg-input');
   const draftText = String(input ? input.value : (conversation.draftText || ''));
-  if (draftText === String(conversation.draftText || '')) return false;
+  // Compared against the last server-acknowledged draft, not the local text
+  // (which every keystroke updates), so an unsaved edit is actually queued.
+  const synced = getSyncedDraft(id);
+  const serverText = synced ? synced.text : String(conversation.draftText || '');
+  if (draftText === serverText) return false;
   const queued = await enqueueOutboxRequest({
     kind: 'draft-flush',
     path: `/api/conversation/${encodeURIComponent(id)}/draft`,
@@ -200,7 +205,7 @@ export async function enqueueDraftFlushForBackgroundSync(conversationId) {
     body: JSON.stringify({
       draftText,
       clientId: CLIENT_ID,
-      baseDraftUpdatedAt: conversation.draftUpdatedAt || null,
+      baseDraftUpdatedAt: (synced ? synced.updatedAt : conversation.draftUpdatedAt) || null,
     }),
   });
   if (queued) void registerOutboxSync();

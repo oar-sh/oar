@@ -2282,6 +2282,19 @@
     pointer-events: none;
   }
   #relay-toast.visible { display: block; }
+  #relay-toast.has-action { pointer-events: auto; }
+  .relay-toast-action {
+    margin-left: 10px;
+    border: 1px solid var(--warn);
+    background: transparent;
+    color: var(--warn);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: var(--fs-meta-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .relay-toast-action:hover { background: rgba(210, 153, 34, 0.2); }
   #model-metadata-blocker {
     display: none;
     align-items: center;

@@ -99,7 +99,8 @@ import {
   updateComposerSlashMenu,
   getConversationLoadedMessageCount,
   loadOlderConversationMessages,
-  syncComposerControlState,
+  syncComposerButtonState,
+  syncComposerAfterUserEdit,
   persistComposerAttachments,
   flushConversationDraft,
   initConversationHistoryLazyLoading,
@@ -1139,7 +1140,7 @@ function syncModelMetadataBlocker(message = '') {
     reasoningSelect.disabled = blocked;
     reasoningSelect.title = blocked ? 'Reasoning metadata unavailable' : 'Reasoning effort';
   }
-  window.syncComposerControlState?.();
+  window.syncComposerButtonState?.();
 }
 
 function currentConversationHasMessages() {
@@ -3242,7 +3243,7 @@ async function refreshSessionWorkerStatus() {
     renderConvList();
     // A worker steering snapshot may have changed; the composer's Steer
     // button disable state derives from it.
-    syncComposerControlState();
+    syncComposerButtonState();
   }
   updateCliStatus();
   const nextWorkerState = currentSdkSessionId ? getSessionWorkerState(currentSdkSessionId) : null;
@@ -3355,7 +3356,7 @@ function setupViewportTracking() {
   if (input && input.dataset.viewportBound !== '1') {
     input.dataset.viewportBound = '1';
     input.addEventListener('input', () => {
-      syncComposerControlState();
+      syncComposerAfterUserEdit();
     }, { passive: true });
     input.addEventListener('focus', () => {
       document.body.classList.add('keyboard-open');
@@ -4369,7 +4370,7 @@ window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.submitRelayBoardAction = submitRelayBoardAction;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
-window.syncComposerControlState = syncComposerControlState;
+window.syncComposerButtonState = syncComposerButtonState;
 window.syncComposerPlaceholder = syncComposerPlaceholder;
 window.persistComposerAttachments = persistComposerAttachments;
 window.appendMessage = appendMessage;

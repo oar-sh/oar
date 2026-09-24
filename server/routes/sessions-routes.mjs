@@ -3858,7 +3858,11 @@ export function registerSessionsRoutes(app, deps) {
     if (!existing || String(existing.status || '').trim() === 'deleted') {
       return res.status(404).json({ error: 'Conversation not found' });
     }
-    const baseDraftUpdatedAtValue = req.body?.baseDraftUpdatedAt ?? req.body?.base_draft_updated_at;
+    // Only an absent field skips the check (legacy clients). An explicit null
+    // means "I have seen no draft" and conflicts with any versioned draft.
+    const baseDraftUpdatedAtValue = req.body?.baseDraftUpdatedAt !== undefined
+      ? req.body.baseDraftUpdatedAt
+      : req.body?.base_draft_updated_at;
     const comparesDraftVersion = baseDraftUpdatedAtValue !== undefined;
     const normalizedBaseDraftUpdatedAt = normalizeOptionalIsoTimestamp(baseDraftUpdatedAtValue);
     const suppliedBaseTimestamp = String(baseDraftUpdatedAtValue ?? '').trim();
@@ -3878,6 +3882,7 @@ export function registerSessionsRoutes(app, deps) {
         conflict: true,
         conversationId,
         draftText: String(existing.draft_text || ''),
+        draftAttachments: parseDraftAttachmentsColumn(existing.draft_attachments),
         draftUpdatedAt: existingDraftUpdatedAt,
         draftUpdatedByClientId: existing.draft_updated_by_client_id || null,
       });

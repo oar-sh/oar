@@ -91,6 +91,14 @@ import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments }
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
+import {
+  draftAttachmentsKey,
+  getSyncedDraft,
+  isDraftSaveNoop,
+  recordSyncedDraft,
+  resolveDraftConflict,
+  shouldApplyIncomingDraftToComposer,
+} from './conversation-draft-sync.mjs';
 import { isChatInteractionHeld, selectionIntersectsNode } from './selection-guard.mjs';
 import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
 import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
@@ -498,7 +506,16 @@ function syncSendButtonState() {
   btn.title = state.title;
 }
 
-export function syncComposerControlState() {
+// Button-only refresh for status, poll and question paths. It must never save
+// the draft: an idle client that saves on every poll tick writes its stale
+// composer text over another device's draft.
+export function syncComposerButtonState() {
+  syncSendButtonState();
+}
+
+// The composer's input handler: the user edited the text, so the draft is
+// saved (debounced) as well as the button refreshed.
+export function syncComposerAfterUserEdit() {
   syncSendButtonState();
   void scheduleConversationDraftSave({
     conversationId: currentConvId,
@@ -523,11 +540,18 @@ function isDraftOwnedByPendingSend(conversationId) {
   return sendOwnedDraftConversations.has(String(conversationId || '').trim());
 }
 
+function isDraftSavePending(conversationId) {
+  const id = String(conversationId || '').trim();
+  return draftSaveTimerByConversation.has(id) || draftSavePromiseByConversation.has(id);
+}
+
+// Omitted version fields keep their current values: a local edit changes the
+// text only, never the server version it was based on.
 function upsertConversationDraftState(conversationId, {
   draftText = '',
   draftAttachments = undefined,
-  draftUpdatedAt = null,
-  draftUpdatedByClientId = null,
+  draftUpdatedAt = undefined,
+  draftUpdatedByClientId = undefined,
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id || !conversations[id]) return;
@@ -538,8 +562,10 @@ function upsertConversationDraftState(conversationId, {
     draftAttachments: draftAttachments === undefined
       ? (existing.draftAttachments || [])
       : (Array.isArray(draftAttachments) ? draftAttachments : []),
-    draftUpdatedAt: draftUpdatedAt || null,
-    draftUpdatedByClientId: draftUpdatedByClientId || null,
+    draftUpdatedAt: draftUpdatedAt === undefined ? (existing.draftUpdatedAt || null) : (draftUpdatedAt || null),
+    draftUpdatedByClientId: draftUpdatedByClientId === undefined
+      ? (existing.draftUpdatedByClientId || null)
+      : (draftUpdatedByClientId || null),
   };
 }
 
@@ -563,37 +589,157 @@ export function persistComposerAttachments() {
   });
 }
 
-async function persistConversationDraft(conversationId, draftText, draftAttachments = undefined) {
+function isDraftVersionConflict(response) {
+  return response?.conflict === true || response?.code === 'draft-version-conflict';
+}
+
+function isCurrentConversation(conversationId) {
+  return String(currentConvId || '').trim() === String(conversationId || '').trim();
+}
+
+// The version a save is based on. Always sent — even when null, which tells
+// the server "I have seen no draft yet" and is conflict-checked like any other.
+function draftSaveBaseVersion(conversationId) {
+  const synced = getSyncedDraft(conversationId);
+  if (synced) return synced.updatedAt || null;
+  return conversations[conversationId]?.draftUpdatedAt || null;
+}
+
+function sendConversationDraft(conversationId, text, draftAttachments, baseDraftUpdatedAt) {
+  return updateConversationDraftApi(conversationId, {
+    draftText: text,
+    clientId: CLIENT_ID,
+    baseDraftUpdatedAt,
+    ...(draftAttachments === undefined ? {} : { draftAttachments }),
+  });
+}
+
+function acknowledgeSavedDraft(conversationId, response, sentText) {
+  const serverText = String(response?.draftText || '');
+  const updatedAt = response?.draftUpdatedAt || response?.updatedAt || null;
+  // The server stores whitespace-only text as "no draft"; remembering what was
+  // sent keeps that composer from looking modified against the empty echo.
+  const text = !serverText && !String(sentText || '').trim() ? String(sentText || '') : serverText;
+  recordSyncedDraft(conversationId, { text, attachments: response?.draftAttachments, updatedAt });
+  upsertConversationDraftState(conversationId, {
+    draftText: serverText,
+    draftAttachments: response?.draftAttachments,
+    draftUpdatedAt: updatedAt,
+    draftUpdatedByClientId: response?.draftUpdatedByClientId || response?.senderClientId || null,
+  });
+}
+
+function adoptServerDraft(conversationId, {
+  draftText = '',
+  draftAttachments = undefined,
+  draftUpdatedAt = null,
+  draftUpdatedByClientId = null,
+} = {}) {
+  const text = String(draftText || '');
+  clearDraftTimerForConversation(conversationId);
+  recordSyncedDraft(conversationId, { text, attachments: draftAttachments, updatedAt: draftUpdatedAt });
+  upsertConversationDraftState(conversationId, { draftText: text, draftAttachments, draftUpdatedAt, draftUpdatedByClientId });
+  if (!isCurrentConversation(conversationId)) return;
+  if (Array.isArray(draftAttachments)) {
+    const hydrated = hydrateDraftAttachments(draftAttachments);
+    if (!draftAttachmentsEqual(selectedAttachments, hydrated)) setComposerAttachments(hydrated);
+  }
+  const input = document.getElementById('msg-input');
+  if (input && input.value !== text) {
+    input.value = text;
+    autoResize(input);
+  }
+  syncSendButtonState();
+}
+
+function restoreConversationDraftText(conversationId, text) {
+  const id = String(conversationId || '').trim();
+  if (!id) return;
+  const input = document.getElementById('msg-input');
+  if (input && isCurrentConversation(id)) {
+    input.value = text;
+    autoResize(input);
+    syncSendButtonState();
+  }
+  void scheduleConversationDraftSave({ conversationId: id, draftText: text, immediate: true });
+}
+
+function offerDraftRestore(conversationId, losingText) {
+  showTransientRelayNotice('Your edit replaced a newer draft from another device.', 12000, {
+    actionLabel: 'Restore',
+    onAction: () => restoreConversationDraftText(conversationId, losingText),
+  });
+}
+
+// A 409 means another client saved since this one's base version. The local
+// composer is re-read here (not the text the save carried): it may have moved
+// on while the request was in flight, and the newest keystroke is what wins.
+async function resolveDraftSaveConflict(id, { text, draftAttachments, synced, conflict }) {
+  const serverText = String(conflict.draftText || '');
+  const serverAttachments = Array.isArray(conflict.draftAttachments) ? conflict.draftAttachments : undefined;
+  const viewing = isCurrentConversation(id);
+  const localText = viewing ? String(document.getElementById('msg-input')?.value ?? text) : text;
+  const localAttachments = draftAttachments === undefined
+    ? undefined
+    : (viewing ? serializeDraftAttachments(selectedAttachments) : draftAttachments);
+  const outcome = resolveDraftConflict({
+    localText,
+    localAttachmentsKey: draftAttachmentsKey(localAttachments),
+    baseText: synced ? synced.text : null,
+    baseAttachmentsKey: synced ? synced.attachmentsKey : null,
+    serverText,
+    serverAttachmentsKey: draftAttachmentsKey(serverAttachments),
+  });
+  if (outcome === 'adopt') {
+    adoptServerDraft(id, conflict);
+    return conflict;
+  }
+  recordSyncedDraft(id, { text: serverText, attachments: serverAttachments, updatedAt: conflict.draftUpdatedAt || null });
+  if (outcome === 'converged') {
+    upsertConversationDraftState(id, {
+      draftText: serverText,
+      draftAttachments: serverAttachments,
+      draftUpdatedAt: conflict.draftUpdatedAt || null,
+      draftUpdatedByClientId: conflict.draftUpdatedByClientId || null,
+    });
+    return conflict;
+  }
+  const retry = await sendConversationDraft(id, localText, localAttachments, conflict.draftUpdatedAt || null);
+  if (retry?.ok) {
+    acknowledgeSavedDraft(id, retry, localText);
+    if (serverText.trim() && serverText !== localText) offerDraftRestore(id, serverText);
+    return retry;
+  }
+  // Lost a second race: take the newer version as the base so the next edit
+  // saves over it, rather than retrying in a loop.
+  if (isDraftVersionConflict(retry)) {
+    recordSyncedDraft(id, {
+      text: String(retry.draftText || ''),
+      attachments: retry.draftAttachments,
+      updatedAt: retry.draftUpdatedAt || null,
+    });
+  }
+  return retry || null;
+}
+
+async function persistConversationDraft(conversationId, draftText, draftAttachments = undefined, { force = false } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const text = String(draftText || '');
   const runPersist = async () => {
-    const baseDraftUpdatedAt = conversations[id]?.draftUpdatedAt || null;
-    const response = await updateConversationDraftApi(id, {
-      draftText: text,
-      clientId: CLIENT_ID,
-      baseDraftUpdatedAt,
-      ...(draftAttachments === undefined ? {} : { draftAttachments }),
-    });
-    if (!response?.ok) {
-      if (response?.conflict === true || response?.code === 'draft-version-conflict') {
-        applyIncomingConversationDraftUpdate({
-          conversationId: id,
-          draftText: response.draftText || '',
-          draftAttachments: response.draftAttachments,
-          draftUpdatedAt: response.draftUpdatedAt || null,
-          draftUpdatedByClientId: response.draftUpdatedByClientId || null,
-        });
-      }
-      return response || null;
+    const synced = getSyncedDraft(id);
+    if (!force && isDraftSaveNoop({ synced, text, attachmentsKey: draftAttachmentsKey(draftAttachments) })) {
+      return { ok: true, skipped: true, conversationId: id, draftText: synced.text, draftUpdatedAt: synced.updatedAt };
     }
-    upsertConversationDraftState(id, {
-      draftText: response.draftText,
-      draftAttachments: response.draftAttachments,
-      draftUpdatedAt: response.draftUpdatedAt || response.updatedAt || null,
-      draftUpdatedByClientId: response.draftUpdatedByClientId || response.senderClientId || null,
-    });
-    return response;
+    const response = await sendConversationDraft(id, text, draftAttachments, draftSaveBaseVersion(id));
+    if (response?.ok) {
+      acknowledgeSavedDraft(id, response, text);
+      return response;
+    }
+    if (isDraftVersionConflict(response)) {
+      return resolveDraftSaveConflict(id, { text, draftAttachments, synced, conflict: response });
+    }
+    return response || null;
   };
   const previous = draftSavePromiseByConversation.get(id) || Promise.resolve();
   const next = previous
@@ -613,6 +759,7 @@ async function scheduleConversationDraftSave({
   draftText,
   draftAttachments = undefined,
   immediate = false,
+  force = false,
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
@@ -620,12 +767,12 @@ async function scheduleConversationDraftSave({
   upsertConversationDraftState(id, { draftText: text, draftAttachments });
   clearDraftTimerForConversation(id);
   if (immediate) {
-    return persistConversationDraft(id, text, draftAttachments);
+    return persistConversationDraft(id, text, draftAttachments, { force });
   }
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       draftSaveTimerByConversation.delete(id);
-      persistConversationDraft(id, text, draftAttachments).then(resolve).catch(() => resolve(null));
+      persistConversationDraft(id, text, draftAttachments, { force }).then(resolve).catch(() => resolve(null));
     }, COMPOSER_DRAFT_DEBOUNCE_MS);
     draftSaveTimerByConversation.set(id, timer);
   });
@@ -664,18 +811,28 @@ export function hydrateConversationDraft(conversationId, {
     draftUpdatedAt,
     draftUpdatedByClientId,
   });
-  if (String(currentConvId || '').trim() !== id) return;
+  const syncedDraft = { text: normalizedDraftText, attachments: normalizedAttachments, updatedAt: draftUpdatedAt };
+  if (String(currentConvId || '').trim() !== id) {
+    if (!isDraftSavePending(id)) recordSyncedDraft(id, syncedDraft);
+    return;
+  }
   // Restore the composer's pending attachments for the conversation being opened.
   if (!draftAttachmentsEqual(selectedAttachments, hydrateDraftAttachments(normalizedAttachments))) {
     setComposerAttachments(hydrateDraftAttachments(normalizedAttachments));
   }
   const input = document.getElementById('msg-input');
   if (!input) return;
-  const isFocused = document.activeElement === input;
-  if (isFocused && input.value !== normalizedDraftText) {
+  if (!shouldApplyIncomingDraftToComposer({
+    isFocused: document.activeElement === input,
+    inputText: input.value,
+    incomingText: normalizedDraftText,
+    syncedText: getSyncedDraft(id)?.text ?? null,
+    savePending: isDraftSavePending(id),
+  })) {
     syncSendButtonState();
     return;
   }
+  recordSyncedDraft(id, syncedDraft);
   if (input.value !== normalizedDraftText) {
     input.value = normalizedDraftText;
     autoResize(input);
@@ -707,7 +864,11 @@ export function applyIncomingConversationDraftUpdate({
     draftUpdatedAt,
     draftUpdatedByClientId: draftUpdatedByClientId || senderClientId || null,
   });
-  if (String(currentConvId || '').trim() !== id) return;
+  const syncedDraft = { text: incomingDraftText, attachments: draftAttachments, updatedAt: draftUpdatedAt };
+  if (String(currentConvId || '').trim() !== id) {
+    if (!isDraftSavePending(id)) recordSyncedDraft(id, syncedDraft);
+    return;
+  }
   if (draftAttachments !== undefined) {
     const merged = mergeDraftAttachmentUpdate({
       existing: selectedAttachments,
@@ -720,8 +881,14 @@ export function applyIncomingConversationDraftUpdate({
   }
   const input = document.getElementById('msg-input');
   if (!input) return;
-  const isFocused = document.activeElement === input;
-  if (isFocused && input.value !== incomingDraftText) return;
+  if (!shouldApplyIncomingDraftToComposer({
+    isFocused: document.activeElement === input,
+    inputText: input.value,
+    incomingText: incomingDraftText,
+    syncedText: getSyncedDraft(id)?.text ?? null,
+    savePending: isDraftSavePending(id),
+  })) return;
+  recordSyncedDraft(id, syncedDraft);
   if (input.value !== incomingDraftText) {
     input.value = incomingDraftText;
     autoResize(input);
@@ -2726,6 +2893,7 @@ export async function sendMessage() {
     input.value = '';
     autoResize(input);
     releaseComposerFocusAfterSend(input);
+    void flushConversationDraft(currentConvId);
     compactCurrentConversation();
     scrollBottomAfterSend();
     return;
@@ -2736,6 +2904,7 @@ export async function sendMessage() {
     input.value = '';
     autoResize(input);
     releaseComposerFocusAfterSend(input);
+    void flushConversationDraft(currentConvId);
     const result = await runPreviewCommand(previewCommand, { conversationId: currentConvId });
     showTransientRelayNotice(result.notice);
     return;
@@ -2955,10 +3124,13 @@ export async function sendMessage() {
     }
     const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
     if (persistedConversationId) {
+      // Forced: the send transaction already moved the server's version, and
+      // this round trip is how the client learns it (a 409 carries it).
       const clearedDraft = await scheduleConversationDraftSave({
         conversationId: persistedConversationId,
         draftText: '',
         immediate: true,
+        force: true,
       });
       upsertConversationDraftState(persistedConversationId, {
         draftText: '',

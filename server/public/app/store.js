@@ -1210,7 +1210,13 @@ export function setModelBanner(message) {
   el.classList.add('visible');
 }
 
-export function showTransientRelayNotice(message, ms = 4000) {
+let transientNoticeSeq = 0;
+
+/**
+ * `action` ({ actionLabel, onAction }) adds one button to the toast; the
+ * toast then takes pointer input and hides as soon as the button is used.
+ */
+export function showTransientRelayNotice(message, ms = 4000, action = null) {
   const text = String(message || '').trim();
   if (!text) return;
   // Transient notices render in the fixed #relay-toast, not #model-banner:
@@ -1225,14 +1231,30 @@ export function showTransientRelayNotice(message, ms = 4000) {
     }, Math.max(1500, Number(ms) || 4000));
     return;
   }
+  const noticeId = String(++transientNoticeSeq);
+  const hide = () => {
+    if (toast.dataset.noticeId !== noticeId) return;
+    toast.textContent = '';
+    toast.classList.remove('visible', 'has-action');
+  };
+  toast.dataset.noticeId = noticeId;
   toast.textContent = text;
+  const actionLabel = String(action?.actionLabel || '').trim();
+  const hasAction = !!actionLabel && typeof action?.onAction === 'function';
+  if (hasAction) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'relay-toast-action';
+    button.textContent = actionLabel;
+    button.addEventListener('click', () => {
+      hide();
+      action.onAction();
+    });
+    toast.appendChild(button);
+  }
+  toast.classList.toggle('has-action', hasAction);
   toast.classList.add('visible');
-  setTimeout(() => {
-    if (String(toast.textContent || '').trim() === text) {
-      toast.textContent = '';
-      toast.classList.remove('visible');
-    }
-  }, Math.max(1500, Number(ms) || 4000));
+  setTimeout(hide, Math.max(1500, Number(ms) || 4000));
 }
 
 export function syncViewportMetrics() {

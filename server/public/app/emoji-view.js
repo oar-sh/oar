@@ -43,6 +43,8 @@ function insertEmojiAtCaret(emoji) {
   input.selectionEnd = nextCaret;
   autoResize(input);
   input.focus();
+  // Runs the composer's input pipeline, which saves the draft.
+  input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 function handleEmojiChoice(emoji) {

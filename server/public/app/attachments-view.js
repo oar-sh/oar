@@ -221,7 +221,7 @@ export function renderAttachmentPreview() {
   if (!selectedAttachments.length) {
     el.innerHTML = '';
     el.classList.remove('visible');
-    window.syncComposerControlState?.();
+    window.syncComposerButtonState?.();
     syncComposerAttachmentWarning();
     return;
   }
@@ -251,7 +251,7 @@ export function renderAttachmentPreview() {
   `;
   }).join('');
   el.classList.add('visible');
-  window.syncComposerControlState?.();
+  window.syncComposerButtonState?.();
   syncComposerAttachmentWarning();
 }
 

@@ -1215,6 +1215,211 @@ test('draft restore: opening a conversation with no send in flight still hydrate
   resetComposer('');
 });
 
+// ---------------------------------------------------------------------------
+// Bug 7 — cross-device draft wipe. Status/poll/question paths used to share
+// the composer sync that also scheduled a draft save, and every local edit
+// nulled the base version, so an idle device saved its (empty) composer over
+// the other device's draft every few seconds without any version check.
+// ---------------------------------------------------------------------------
+
+const SERVER_DRAFT_V1 = '2026-09-24T09:00:00.000Z';
+const SERVER_DRAFT_V2 = '2026-09-24T09:05:00.000Z';
+
+function draftPatches(convId) {
+  return fetchLog
+    .filter((entry) => entry.method === 'PATCH' && entry.url.includes(`/api/conversation/${convId}/draft`))
+    .map((entry) => JSON.parse(entry.body));
+}
+
+// Opens `convId` with the server draft `text` at `version`, as a conversation
+// load would.
+function openWithServerDraft(convId, text, version) {
+  conversations[convId] = { id: convId, title: 'Sync' };
+  setCurrentConv(convId);
+  resetComposer('');
+  document.activeElement = null;
+  view.hydrateConversationDraft(convId, {
+    draftText: text,
+    draftAttachments: [],
+    draftUpdatedAt: version,
+    draftUpdatedByClientId: 'other-device',
+  });
+}
+
+test('draft sync: button-only refreshes never save the draft', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, '', SERVER_DRAFT_V1);
+  fetchHandler = async (url) => { throw new Error(`unexpected fetch: ${url}`); };
+  fetchLog.length = 0;
+
+  // What the 3s question poll, worker status poll and attachment preview do.
+  for (let i = 0; i < 3; i += 1) view.syncComposerButtonState();
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  assert.deepEqual(draftPatches(convId), [], 'no draft write comes from a button refresh');
+});
+
+test('draft sync: a local edit keeps the server base version and the save carries it', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'hello', SERVER_DRAFT_V1);
+  fetchHandler = async (url) => {
+    if (url.includes(`/api/conversation/${convId}/draft`)) {
+      return { ok: true, draftText: 'hello world', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V2 };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  fetchLog.length = 0;
+
+  getById('msg-input').value = 'hello world';
+  view.syncComposerAfterUserEdit();
+  assert.equal(conversations[convId].draftUpdatedAt, SERVER_DRAFT_V1, 'the keystroke does not erase the base version');
+  assert.equal(conversations[convId].draftText, 'hello world', 'the local text is tracked');
+
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const patches = draftPatches(convId);
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].baseDraftUpdatedAt, SERVER_DRAFT_V1, 'the save is version-checked against the synced draft');
+  assert.equal(conversations[convId].draftUpdatedAt, SERVER_DRAFT_V2, 'the acknowledged version becomes the next base');
+});
+
+test('draft sync: a never-versioned conversation sends an explicit null base', async () => {
+  const convId = nextId('conv-sync');
+  conversations[convId] = { id: convId, title: 'Fresh' };
+  setCurrentConv(convId);
+  resetComposer('first words');
+  fetchHandler = async (url) => {
+    if (url.includes(`/api/conversation/${convId}/draft`)) {
+      return { ok: true, draftText: 'first words', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  fetchLog.length = 0;
+
+  await view.flushConversationDraft(convId);
+
+  const [patch] = draftPatches(convId);
+  assert.ok(patch, 'the draft is saved');
+  assert.ok(Object.prototype.hasOwnProperty.call(patch, 'baseDraftUpdatedAt'), 'the base field is present');
+  assert.equal(patch.baseDraftUpdatedAt, null);
+  resetComposer('');
+});
+
+test('draft sync: flushing an unchanged composer sends nothing', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'already saved', SERVER_DRAFT_V1);
+  fetchHandler = async (url) => { throw new Error(`unexpected fetch: ${url}`); };
+  fetchLog.length = 0;
+
+  await view.flushConversationDraft(convId);
+  view.syncComposerAfterUserEdit();
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  assert.deepEqual(draftPatches(convId), [], 'text equal to the synced draft is not re-saved');
+  resetComposer('');
+});
+
+test('draft sync: a focused but untouched composer adopts another device\'s draft; a typed one keeps its text', () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, '', SERVER_DRAFT_V1);
+  const input = getById('msg-input');
+  document.activeElement = input;
+
+  view.applyIncomingConversationDraftUpdate({
+    conversationId: convId,
+    draftText: 'typed on the phone',
+    draftAttachments: [],
+    draftUpdatedAt: SERVER_DRAFT_V2,
+    senderClientId: 'other-device',
+  });
+  assert.equal(input.value, 'typed on the phone', 'the idle focused composer follows the remote draft');
+
+  input.value = 'typed on the phone, then edited here';
+  view.hydrateConversationDraft(convId, {
+    draftText: 'phone edits again',
+    draftAttachments: [],
+    draftUpdatedAt: '2026-09-24T09:10:00.000Z',
+    draftUpdatedByClientId: 'other-device',
+  });
+  assert.equal(input.value, 'typed on the phone, then edited here', 'unsaved local typing is never overwritten while focused');
+
+  document.activeElement = null;
+  resetComposer('');
+});
+
+test('draft sync: on a version conflict the newest local edit wins and the other device\'s text is offered back', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'base text', SERVER_DRAFT_V1);
+  let patchCount = 0;
+  fetchHandler = async (url, opts) => {
+    if (!url.includes(`/api/conversation/${convId}/draft`)) throw new Error(`unexpected fetch: ${url}`);
+    patchCount += 1;
+    const body = JSON.parse(opts.body);
+    if (patchCount === 1) {
+      return {
+        ok: false,
+        conflict: true,
+        code: 'draft-version-conflict',
+        draftText: 'written on the phone',
+        draftAttachments: [],
+        draftUpdatedAt: SERVER_DRAFT_V2,
+      };
+    }
+    return { ok: true, draftText: body.draftText, draftAttachments: [], draftUpdatedAt: new Date(Date.now() + patchCount).toISOString() };
+  };
+  fetchLog.length = 0;
+
+  getById('msg-input').value = 'written on the laptop';
+  await view.flushConversationDraft(convId);
+
+  const patches = draftPatches(convId);
+  assert.equal(patches.length, 2, 'the rejected save is retried once');
+  assert.equal(patches[0].baseDraftUpdatedAt, SERVER_DRAFT_V1);
+  assert.equal(patches[1].baseDraftUpdatedAt, SERVER_DRAFT_V2, 'the retry is based on the conflicting server version');
+  assert.equal(patches[1].draftText, 'written on the laptop');
+  assert.equal(getById('msg-input').value, 'written on the laptop', 'the local edit stays in the composer');
+
+  const toast = getById('relay-toast');
+  assert.ok(toast.classList.contains('has-action'), 'the toast offers an action');
+  const restore = toast.children.find((child) => child.className === 'relay-toast-action');
+  assert.ok(restore, 'a Restore button is shown');
+  restore.listeners.click[0]();
+  await settle();
+  assert.equal(getById('msg-input').value, 'written on the phone', 'Restore puts the other device\'s text back');
+  const restored = draftPatches(convId).at(-1);
+  assert.equal(restored.draftText, 'written on the phone', 'and saves it');
+  resetComposer('');
+});
+
+test('draft sync: a conflict against an unchanged composer silently adopts the server draft', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'same', SERVER_DRAFT_V1);
+  fetchHandler = async (url) => {
+    if (!url.includes(`/api/conversation/${convId}/draft`)) throw new Error(`unexpected fetch: ${url}`);
+    return {
+      ok: false,
+      conflict: true,
+      code: 'draft-version-conflict',
+      draftText: 'newer remote text',
+      draftAttachments: [],
+      draftUpdatedAt: SERVER_DRAFT_V2,
+    };
+  };
+  fetchLog.length = 0;
+  getById('relay-toast').children = [];
+
+  // The user types and then undoes back to the synced text while the save is
+  // in flight; the conflict finds the composer unmodified.
+  getById('msg-input').value = 'same plus';
+  const save = view.flushConversationDraft(convId);
+  getById('msg-input').value = 'same';
+  await save;
+
+  assert.equal(draftPatches(convId).length, 1, 'no retry');
+  assert.equal(getById('msg-input').value, 'newer remote text');
+  assert.equal(getById('relay-toast').children.length, 0, 'no restore toast');
+  resetComposer('');
+});
+
 test('renderMessages re-renders when only a message\'s workflowRuns change', () => {
   const convId = nextId('conv-wr');
   conversations[convId] = { id: convId, title: 'WR' };
