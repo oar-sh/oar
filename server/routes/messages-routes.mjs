@@ -2154,7 +2154,7 @@ export function registerMessagesRoutes(app, deps) {
           AND rs.sdk_session_id = ?
       )
       AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
-    ORDER BY q.retry_count ASC, q.timestamp ASC, q.rowid ASC
+    ORDER BY q.timestamp ASC, q.rowid ASC
     LIMIT 1
   `);
   const transferPendingOwnerToSession = db.prepare(`

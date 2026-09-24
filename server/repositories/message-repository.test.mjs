@@ -244,7 +244,9 @@ test('anonymous dequeue skips provider-worker rows but the owning worker still g
 // ORDER BY ranked any row with a non-null next_attempt_at behind every fresh
 // arrival, so the row starved for 5 minutes while newer messages jumped it.
 // Eligibility (backoff maturity) is the WHERE clause's job; among eligible
-// rows, only retry_count and send order may rank.
+// rows, only send order may rank — retry_count too was dropped (steering audit
+// 2g), since recovery and /api/requeue bump it and a recovered older message
+// then ran after newer ones in its conversation.
 
 test('claim ordering: a recovered row with expired backoff keeps its send-order position', () => {
   const db = createTestDb();
@@ -269,13 +271,39 @@ test('claim ordering: a recovered row with expired backoff keeps its send-order 
   assert.equal(repo.findPendingForSessionAffinity.get(now, 'sdk-1')?.id, 'message-recovered');
   assert.equal(repo.findPendingForWorker.get(now, 'sdk-1', 'sdk-1')?.id, 'message-recovered');
 
-  // A genuinely retried row still yields to fresh work (poison-message guard).
-  db.prepare(`UPDATE queue SET retry_count = 1 WHERE id = 'message-recovered'`).run();
-  assert.equal(repo.findPending.get(now)?.id, 'message-fresh');
-
   // An immature backoff stays ineligible entirely.
-  db.prepare(`UPDATE queue SET retry_count = 0, next_attempt_at = '2026-09-19T23:59:00.000Z' WHERE id = 'message-recovered'`).run();
+  db.prepare(`UPDATE queue SET next_attempt_at = '2026-09-19T23:59:00.000Z' WHERE id = 'message-recovered'`).run();
   assert.equal(repo.findPending.get(now)?.id, 'message-fresh');
+});
+
+test('claim ordering: a recovered older row with a bumped retry_count is claimed before newer ones', () => {
+  // Dead-worker recovery and /api/requeue bump retry_count. Ranking by it put
+  // the recovered older message behind every newer one in the conversation,
+  // so replies arrived out of send order.
+  const db = createTestDb();
+  const repo = createMessageRepository(db);
+  const insert = db.prepare(`
+    INSERT INTO queue (
+      id, conversation_id, runtime_session_id, is_new_conversation, model,
+      model_variant_id, reasoning_effort, relay_mode, text, attachments,
+      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
+    ) VALUES (?, 'conv-1', NULL, 0, 'gpt-5.4-mini', 'gpt-5.4-mini', NULL, 'agent', ?, NULL, 'pending', ?, ?, ?, ?)
+  `);
+  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES ('conv-1', 'Conv', 'active', 'sdk-1', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  insert.run('message-recovered', 'older, recovered twice', '2026-09-24T10:00:00.000Z', 2, '2026-09-24T10:00:30.000Z', 'sdk-1');
+  insert.run('message-newer', 'newer', '2026-09-24T10:00:10.000Z', 0, null, 'sdk-1');
+
+  // While the recovered row is backing off, fresh work is not blocked behind it.
+  const backingOff = '2026-09-24T10:00:20.000Z';
+  assert.equal(repo.findPending.get(backingOff)?.id, 'message-newer');
+  assert.equal(repo.findPendingForSessionAffinity.get(backingOff, 'sdk-1')?.id, 'message-newer');
+  assert.equal(repo.findPendingForWorker.get(backingOff, 'sdk-1', 'sdk-1')?.id, 'message-newer');
+
+  // Once the backoff matures it goes first again, retry count or not.
+  const matured = '2026-09-24T10:01:00.000Z';
+  assert.equal(repo.findPending.get(matured)?.id, 'message-recovered');
+  assert.equal(repo.findPendingForSessionAffinity.get(matured, 'sdk-1')?.id, 'message-recovered');
+  assert.equal(repo.findPendingForWorker.get(matured, 'sdk-1', 'sdk-1')?.id, 'message-recovered');
 });
 
 test('claim ordering: legacy-relay dequeue also keeps expired-backoff rows in send order', () => {
@@ -296,6 +324,8 @@ test('claim ordering: legacy-relay dequeue also keeps expired-backoff rows in se
   insert.run('message-legacy-fresh', 'fresh', '2026-09-19T23:09:32.000Z', null);
 
   assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-legacy-recovered');
+  db.prepare(`UPDATE queue SET retry_count = 3 WHERE id = 'message-legacy-recovered'`).run();
+  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-legacy-recovered', 'retries do not demote it');
 });
 
 test('executed provider derives from responder identity, never from the response payload', () => {
