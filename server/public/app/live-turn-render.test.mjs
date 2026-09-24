@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 
 // These modules touch window/document at module scope, so they cannot be
 // imported under plain node. The behaviour pinned here is structural — the
-// pattern used by attachments-view.repo-refresh.test.mjs.
+// pattern used by attachments-view.repo-refresh.test.mjs. The live bubble and
+// pending-bubble rebuild behaviour is pinned on a real DOM in
+// conversation-view.transcript-dom.test.mjs.
 function readSource(relativePath) {
   return fs.readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8');
 }
@@ -61,27 +63,6 @@ test('a background conversation finishing its turn cannot wipe the viewed live b
   );
 });
 
-test('renderMessages preserves optimistic pending bubbles the payload does not carry', () => {
-  // Regression (2026-09-19 steering): a poll whose response predates a just-sent
-  // message rebuilt the transcript without it and dropped the optimistic bubble
-  // until the next poll ("vanishes then reappears"). renderMessages must capture
-  // pending bubbles absent from the payload and re-append the live nodes.
-  const body = functionBody(readSource('./conversation-view.js'), 'renderMessages');
-  assert.match(body, /preservedPendingNodes/, 'renderMessages must collect pending bubbles missing from the payload');
-  assert.match(body, /pendingUserMessageIds/, 'the pending set drives which bubbles to preserve');
-  assert.match(body, /messageById\.has\(pendingId\)/, 'a bubble already in the payload is left to the rebuild');
-  assert.match(body, /conversationKey.*!==.*renderConversationKey|renderConversationKey/, 'a pending bubble from another conversation is never dragged in');
-  assert.match(body, /for \(const node of preservedPendingNodes\) el\.appendChild\(node\)/, 'preserved nodes are re-appended after the rebuild');
-  // The live thinking bubble survives the rebuild too, so a re-render mid-turn
-  // never blanks the in-progress thoughts/stream.
-  assert.match(body, /thinkingNode = document\.getElementById\('thinking-indicator'\)/, 'the live thinking bubble is captured before the wipe');
-  assert.match(body, /thinkingNode\.parentNode === el/, 'only a thinking bubble genuinely in the transcript is preserved');
-  assert.match(body, /if \(preservedThinkingNode\) el\.appendChild\(preservedThinkingNode\)/, 'the live thinking bubble is re-appended after the rebuild');
-  // The empty-state must not claim the transcript is empty while a pending
-  // bubble is still on screen.
-  assert.match(body, /!ordered\.length && !preservedPendingNodes\.length/);
-});
-
 test('message_status blacklists live streaming only on terminal statuses', () => {
   const source = readSource('./socket-handlers.js');
   assert.match(source, /if \(messageId && isTerminalStatus\) clearRelayStreamStateForMessage\(messageId\);/);
@@ -103,21 +84,6 @@ test('the live poll defers while the user selects or drags in the chat', () => {
   assert.match(poll, /isChatInteractionHeld\(\)/);
   assert.match(bootstrap, /chatSelectionGuard\.onRelease\(/);
   assert.match(bootstrap, /flushDeferredMessageRender\(\)/);
-});
-
-test('showThinking reuses the live bubble for the same message id', () => {
-  const body = functionBody(readSource('./conversation-view.js'), 'showThinking');
-  assert.match(body, /getElementById\('thinking-indicator'\)/);
-  const reuseIndex = body.indexOf('existing.dataset.messageId');
-  const removeIndex = body.indexOf('existing?.remove()');
-  assert.notEqual(reuseIndex, -1, 'expected a same-message reuse branch');
-  assert.ok(reuseIndex < removeIndex, 'the reuse branch must run before the rebuild');
-});
-
-test('restoreInFlightThinking skips identical payloads via the snapshot key', () => {
-  const body = functionBody(readSource('./conversation-view.js'), 'restoreInFlightThinking');
-  assert.match(body, /buildInFlightSnapshotKey\(inFlight\)/);
-  assert.match(body, /lastInFlightSnapshotKey/);
 });
 
 test('auto-scroll yields to an active selection or drag', () => {

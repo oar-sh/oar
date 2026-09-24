@@ -1661,11 +1661,19 @@ function anchorThinkingBubble(div, messageId) {
   }
 }
 
+// Which conversation a live bubble belongs to. #messages is shared by every
+// conversation, so a bubble is only ever reused or preserved for its own.
+function thinkingConversationKey() {
+  return String(currentConvId || '').trim() || '__new__';
+}
+
 export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
   if (nextMessageId) thinkingMessageId = nextMessageId;
   const existing = document.getElementById('thinking-indicator');
-  if (existing && (!nextMessageId || String(existing.dataset.messageId || '') === nextMessageId)) {
+  if (existing
+    && existing.dataset.conversationId === thinkingConversationKey()
+    && (!nextMessageId || String(existing.dataset.messageId || '') === nextMessageId)) {
     // Reuse the live bubble: rebuilding it every poll tick destroys any text
     // selection anchored inside and drops in-progress subagent bubbles.
     const stopBtn = existing.querySelector('[data-action="stop-turn"]');
@@ -1683,6 +1691,7 @@ export function showThinking(messageId = null, autoScroll = true) {
   const div = document.createElement('div');
   div.className = 'msg assistant';
   div.id = 'thinking-indicator';
+  div.dataset.conversationId = thinkingConversationKey();
   if (nextMessageId) div.dataset.messageId = nextMessageId;
   const isCancelInFlight = nextMessageId && bubbleCancelInFlight.has(nextMessageId);
   const stopBtnHtml = (!IS_SHARED_VIEW && nextMessageId)
@@ -3012,8 +3021,15 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   // wipe below orphans them but the references keep them alive to re-append.
   // Matches store.js pendingConversationKey (trimmed id, or '__new__').
   const renderConversationKey = String(meta.conversationId || currentConvId || '').trim() || '__new__';
+  const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
+  const hasMoreNewer = typeof meta.hasMoreNewer === 'boolean'
+    ? meta.hasMoreNewer
+    : !!pageInfo?.hasMoreNewer;
   const preservedPendingNodes = [];
-  for (const id of pendingUserMessageIds) {
+  // A kept pending bubble re-joins at the end of the loaded window, which is
+  // only the newest end when nothing newer is left unloaded (a search jump
+  // loads a window in the middle of the history).
+  for (const id of (hasMoreNewer ? [] : pendingUserMessageIds)) {
     const pendingId = String(id || '').trim();
     if (!pendingId || messageById.has(pendingId)) continue;
     // Only this conversation's pending bubbles: a bubble still waiting in
@@ -3031,9 +3047,14 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   // update it in place instead of rebuilding — the same reuse showThinking
   // already relies on. removeThinking() still drops it when the turn ends.
   const thinkingNode = document.getElementById('thinking-indicator');
-  // Only when it genuinely lives in the transcript being rebuilt — a detached
-  // or foreign node must not be spliced in as an extra row.
-  const preservedThinkingNode = (thinkingNode && thinkingNode.parentNode === el) ? thinkingNode : null;
+  // Only when it genuinely lives in the transcript being rebuilt and belongs
+  // to the conversation being rendered: a detached node must not be spliced
+  // in as an extra row, and another conversation's bubble must not leak into
+  // this one (it is dropped instead, so the next restore builds afresh).
+  const thinkingNodeInTranscript = !!thinkingNode && thinkingNode.parentNode === el;
+  const preservedThinkingNode = (thinkingNodeInTranscript
+    && thinkingNode.dataset.conversationId === renderConversationKey) ? thinkingNode : null;
+  if (thinkingNodeInTranscript && !preservedThinkingNode) removeThinking();
   if (!ordered.length && !preservedPendingNodes.length && !preservedThinkingNode) {
     el.innerHTML = `<div class="empty-state">
       <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
@@ -3047,13 +3068,9 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     return true;
   }
   const conversationId = String(meta.conversationId || currentConvId || '').trim();
-  const pageInfo = meta.pageInfo && typeof meta.pageInfo === 'object' ? meta.pageInfo : null;
   const hasMoreOlder = typeof meta.hasMoreOlder === 'boolean'
     ? meta.hasMoreOlder
     : (typeof meta.hasMoreHistory === 'boolean' ? meta.hasMoreHistory : !!pageInfo?.hasMoreOlder || !!pageInfo?.hasMore);
-  const hasMoreNewer = typeof meta.hasMoreNewer === 'boolean'
-    ? meta.hasMoreNewer
-    : !!pageInfo?.hasMoreNewer;
   const oldestMessageId = String(
     meta.historyCursor
     || pageInfo?.olderCursor?.beforeMessageId
@@ -3106,9 +3123,13 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     // at the end. Re-appending the original node (not a fresh one) keeps its
     // cancel button and click handlers intact.
     for (const node of preservedPendingNodes) el.appendChild(node);
-    // The live thinking bubble re-joins last; anchorThinkingBubble (via the
-    // restore/stream paths that run after this) settles its final position.
-    if (preservedThinkingNode) el.appendChild(preservedThinkingNode);
+    // The live thinking bubble re-joins under its owning message right here:
+    // restoreInFlightThinking skips an unchanged snapshot, so waiting for it
+    // to re-anchor left the bubble at the end, below later (steered) rows.
+    if (preservedThinkingNode) {
+      el.appendChild(preservedThinkingNode);
+      anchorThinkingBubble(preservedThinkingNode, preservedThinkingNode.dataset.messageId);
+    }
   });
   syncSeparatorsNow();
   renderRelayQuestions();
@@ -3278,7 +3299,7 @@ export async function sendMessage() {
     }
     const titleSeed = text || (attachments[0]?.name || 'Attachment');
     clientMessageId = generateId();
-    trackPendingUserMessage(clientMessageId, targetConversationId, text);
+    trackPendingUserMessage(clientMessageId, targetConversationId, text, { attachments });
     pendingUserMessageIds.add(clientMessageId);
     // The message leaves the draft: from here the cached draft is only what is
     // typed next, which the post-send save (or a failure restore) builds on.

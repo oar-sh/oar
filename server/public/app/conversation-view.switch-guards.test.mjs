@@ -959,6 +959,7 @@ function resetThinkingIndicatorStub() {
   const stub = getById('thinking-indicator');
   stub.remove();
   delete stub.dataset.messageId;
+  delete stub.dataset.conversationId;
   return stub;
 }
 
@@ -1014,6 +1015,7 @@ test('live bubble: the reuse branch re-anchors an indicator that drifted below n
   // message id, but stuck at the transcript end.
   const indicator = resetThinkingIndicatorStub();
   indicator.dataset.messageId = msgA.id;
+  indicator.dataset.conversationId = convId;
   indicator.className = 'msg assistant';
   messagesEl.appendChild(indicator);
   assert.equal(messagesEl.lastElementChild, indicator, 'precondition: the bubble is misplaced at the end');

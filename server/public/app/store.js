@@ -309,10 +309,23 @@ function cleanupStalePendingUserMessages(maxAgeMs = 15 * 60 * 1000) {
   }
 }
 
-export function trackPendingUserMessage(messageId, conversationId, text) {
+// An attachment-only send has no text to fingerprint; its attachments stand
+// in, so a screenshot send is tracked (and its bubble kept across rebuilds)
+// like any other.
+function pendingAttachmentFingerprint(attachments) {
+  const list = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
+  if (!list.length) return '';
+  const firstSha = String(list[0]?.sha256 || list[0]?.uploaded?.sha256 || '').trim().toLowerCase();
+  return `attachments:${list.length}:${firstSha}`;
+}
+
+// Always records the entry — the conversation key is what scopes a kept
+// pending bubble to its own conversation — even when there is nothing to
+// fingerprint for the duplicate check.
+export function trackPendingUserMessage(messageId, conversationId, text, { attachments = [] } = {}) {
   const id = String(messageId || '').trim();
-  const fingerprint = normalizePendingMessageText(text);
-  if (!id || !fingerprint) return false;
+  if (!id) return false;
+  const fingerprint = normalizePendingMessageText(text) || pendingAttachmentFingerprint(attachments);
   cleanupStalePendingUserMessages();
   pendingUserMessageEntries.set(id, {
     conversationKey: pendingConversationKey(conversationId),

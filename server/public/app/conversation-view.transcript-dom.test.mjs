@@ -264,6 +264,218 @@ test('a failed Resend removes its bubble and can be tried again', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 3c — the live bubble across rebuilds. #messages is shared by every
+// conversation; the bubble is kept only for its own and re-anchored under its
+// owning message on every rebuild.
+// ---------------------------------------------------------------------------
+
+test('a rebuild keeps the live bubble as the same node, anchored under its message above later rows', () => {
+  resetView();
+  const conv = openConversation();
+  const turn = [
+    { id: 'u1', role: 'user', text: 'long task', timestamp: at(0) },
+  ];
+  view.renderMessages(turn, false, { conversationId: conv });
+  view.showThinking('u1', false);
+  const bubble = liveBubble();
+  assert.deepEqual(rowIds(), ['u1', 'live']);
+
+  // A steered message lands and the poll rebuilds the transcript.
+  view.renderMessages([...turn, { id: 'u2', role: 'user', text: 'steer', timestamp: at(5) }], false, { conversationId: conv });
+  assert.equal(liveBubble(), bubble, 'the in-progress bubble is kept, not rebuilt');
+  assert.deepEqual(rowIds(), ['u1', 'live', 'u2'], 'anchored under its message, not left at the end');
+});
+
+test('the live bubble stays anchored when the in-flight snapshot is unchanged after a rebuild', () => {
+  resetView();
+  const conv = openConversation();
+  const inFlight = { messageId: 'u1', status: 'processing', activities: [], thoughts: [] };
+  const base = [{ id: 'u1', role: 'user', text: 'long task', timestamp: at(0) }];
+  view.renderMessages(base, false, { conversationId: conv });
+  view.restoreInFlightThinking(inFlight, false);
+  const bubble = liveBubble();
+  view.renderMessages([...base, { id: 'u2', role: 'user', text: 'steer', timestamp: at(5) }], false, { conversationId: conv });
+  // The live poll's restore skips an identical snapshot — nothing else would
+  // move the bubble back.
+  view.restoreInFlightThinking(inFlight, false);
+  assert.equal(liveBubble(), bubble, 'an identical snapshot is not rebuilt');
+  assert.deepEqual(rowIds(), ['u1', 'live', 'u2']);
+});
+
+test('opening another conversation drops the previous conversation\'s live bubble', () => {
+  resetView();
+  const convA = openConversation();
+  view.renderMessages([{ id: 'ua', role: 'user', text: 'running in A', timestamp: at(0) }], false, { conversationId: convA });
+  view.showThinking('ua', false);
+  assert.ok(liveBubble());
+
+  const convB = openConversation();
+  view.renderMessages([{ id: 'ub', role: 'user', text: 'quiet B', timestamp: at(0) }], false, { conversationId: convB });
+  assert.equal(liveBubble(), null, 'A\'s bubble never leaks into B');
+  assert.deepEqual(rowIds(), ['ub']);
+
+  // A later restore for B builds B's own bubble from scratch.
+  view.restoreInFlightThinking({ messageId: 'ub', status: 'processing' }, false);
+  assert.equal(liveBubble()?.dataset.conversationId, convB);
+  assert.deepEqual(rowIds(), ['ub', 'live']);
+});
+
+test('deleting the open conversation (render with no conversation) leaves no live bubble behind', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([{ id: 'u1', role: 'user', text: 'doomed', timestamp: at(0) }], false, { conversationId: conv });
+  view.showThinking('u1', false);
+  setCurrentConv(null);
+  view.renderMessages([]);
+  assert.equal(liveBubble(), null);
+  assert.ok(messagesEl.querySelector('.empty-state'), 'the empty state is shown, not a stray bubble');
+});
+
+test('showThinking reuses the bubble for the same message and rebuilds it for another', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'u1', role: 'user', text: 'one', timestamp: at(0) },
+    { id: 'a1', role: 'assistant', text: 'done', timestamp: at(9), sourceMessageId: 'u1' },
+    { id: 'u2', role: 'user', text: 'two', timestamp: at(10) },
+  ], false, { conversationId: conv });
+  view.showThinking('u1', false);
+  const first = liveBubble();
+  view.showThinking('u1', false);
+  assert.equal(liveBubble(), first, 'same message: the same node');
+  view.showThinking('u2', false);
+  assert.notEqual(liveBubble(), first, 'another message: a new bubble');
+  assert.equal(liveBubble().dataset.messageId, 'u2');
+  assert.deepEqual(rowIds(), ['u1', 'a1', 'u2', 'live']);
+  assert.equal(document.querySelectorAll('#thinking-indicator').length, 1);
+});
+
+test('restoreInFlightThinking skips an identical payload and repaints a changed one', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([{ id: 'u1', role: 'user', text: 'task', timestamp: at(0) }], false, { conversationId: conv });
+  view.restoreInFlightThinking({ messageId: 'u1', status: 'processing', activities: ['Reading a file'] }, false);
+  const bubble = liveBubble();
+  const activityRow = bubble.querySelector('.thinking-activity-item');
+  assert.match(activityRow.textContent, /Reading a file/);
+  view.restoreInFlightThinking({ messageId: 'u1', status: 'processing', activities: ['Reading a file'] }, false);
+  assert.equal(bubble.querySelector('.thinking-activity-item'), activityRow, 'identical payload: no repaint');
+  view.restoreInFlightThinking({ messageId: 'u1', status: 'processing', activities: ['Reading a file', 'Running tests'] }, false);
+  assert.equal(liveBubble(), bubble);
+  assert.equal(bubble.querySelectorAll('.thinking-activity-item').length, 2);
+  view.restoreInFlightThinking(null, false);
+  assert.equal(liveBubble(), null, 'a finished turn drops the bubble');
+});
+
+// ---------------------------------------------------------------------------
+// 3d — optimistic pending bubbles across rebuilds.
+// ---------------------------------------------------------------------------
+
+test('a stale rebuild keeps a just-sent text bubble as the same node, with its Cancel', async () => {
+  resetView();
+  const conv = openConversation('github');
+  selectComposerPreferences();
+  const history = [{ id: 'u1', role: 'user', text: 'earlier', timestamp: at(0) }];
+  view.renderMessages(history, false, { conversationId: conv });
+  document.getElementById('msg-input').value = 'just sent';
+  const post = pendingSendHarness(conv);
+  const sending = view.sendMessage();
+  await settle();
+  await settle();
+  const sentId = fetchLog.find((entry) => entry.method === 'POST')?.body.messageId;
+  const bubble = row(sentId);
+  assert.ok(bubble, 'the optimistic bubble is up');
+
+  // A poll whose response predates the send rebuilds without it.
+  view.renderMessages([...history, { id: 'a1', role: 'assistant', text: 'old reply', timestamp: at(9), sourceMessageId: 'u1' }], false, { conversationId: conv });
+  assert.equal(row(sentId), bubble, 'kept as the same node');
+  assert.ok(bubble.querySelector('[data-action="cancel-queued"]'));
+  assert.deepEqual(rowIds(), ['u1', 'a1', sentId], 'and still the newest row');
+
+  // Once the payload carries it, the rebuild renders it once.
+  post.resolve({ conversationId: conv, messageId: sentId });
+  await sending;
+  view.renderMessages([...history, { id: sentId, role: 'user', text: 'just sent', timestamp: at(20) }], false, { conversationId: conv });
+  assert.equal(messagesEl.querySelectorAll(`:scope > .msg[data-message-id="${sentId}"]`).length, 1);
+});
+
+test('a stale rebuild keeps an attachment-only (screenshot) send too', async () => {
+  resetView();
+  const conv = openConversation('github');
+  selectComposerPreferences();
+  const history = [{ id: 'u1', role: 'user', text: 'earlier', timestamp: at(0) }];
+  view.renderMessages(history, false, { conversationId: conv });
+  document.getElementById('msg-input').value = '';
+  const sha = 'b'.repeat(64);
+  store.selectedAttachments.push({
+    id: 'att-dom-1',
+    name: 'screen.png',
+    type: 'image/png',
+    uploadState: 'uploaded',
+    sha256: sha,
+    uploaded: { sha256: sha, name: 'screen.png', type: 'image/png', size: 900 },
+  });
+  const post = pendingSendHarness(conv);
+  const sending = view.sendMessage();
+  await settle();
+  await settle();
+  const sentPost = fetchLog.find((entry) => entry.method === 'POST' && entry.url.endsWith('/api/message'));
+  assert.equal(sentPost.body.text, '');
+  assert.equal(sentPost.body.attachments[0].sha256, sha);
+  const bubble = row(sentPost.body.messageId);
+  assert.ok(bubble);
+
+  // A poll whose response predates the send rebuilds without it.
+  view.renderMessages([...history, { id: uid('a'), role: 'assistant', text: 'old reply', timestamp: at(9), sourceMessageId: 'u1' }], false, { conversationId: conv });
+  assert.equal(row(sentPost.body.messageId), bubble, 'the screenshot bubble does not vanish');
+
+  post.resolve({ conversationId: conv, messageId: sentPost.body.messageId });
+  await sending;
+});
+
+test('a pending bubble is not appended to a window that has newer messages unloaded', () => {
+  resetView();
+  const conv = openConversation();
+  const pendingId = uid('pending');
+  store.trackPendingUserMessage(pendingId, conv, 'queued at the end');
+  store.pendingUserMessageIds.add(pendingId);
+  view.appendMessage({ role: 'user', text: 'queued at the end', timestamp: at(500) }, false, pendingId, true);
+  // A search jump loads a window in the middle of the history.
+  view.renderMessages([
+    { id: 'm1', role: 'user', text: 'middle question', timestamp: at(100) },
+    { id: 'm2', role: 'assistant', text: 'middle answer', timestamp: at(110), sourceMessageId: 'm1' },
+  ], false, { conversationId: conv, hasMoreNewer: true });
+  assert.deepEqual(rowIds(), ['m1', 'm2'], 'the newest message is not spliced below an old window');
+  store.clearPendingUserMessage(pendingId);
+});
+
+test('another conversation\'s pending bubble is never carried into the one being rendered', () => {
+  resetView();
+  const convA = openConversation();
+  const pendingId = uid('pending');
+  store.trackPendingUserMessage(pendingId, convA, 'waiting in A');
+  store.pendingUserMessageIds.add(pendingId);
+  view.appendMessage({ role: 'user', text: 'waiting in A', timestamp: at(0) }, false, pendingId, true);
+  const convB = openConversation();
+  view.renderMessages([{ id: 'b1', role: 'user', text: 'B only', timestamp: at(0) }], false, { conversationId: convB });
+  assert.deepEqual(rowIds(), ['b1']);
+  store.clearPendingUserMessage(pendingId);
+});
+
+test('the empty state is not shown while a pending bubble is on screen', () => {
+  resetView();
+  const conv = openConversation();
+  const pendingId = uid('pending');
+  store.trackPendingUserMessage(pendingId, conv, 'first message ever');
+  store.pendingUserMessageIds.add(pendingId);
+  view.appendMessage({ role: 'user', text: 'first message ever', timestamp: at(0) }, false, pendingId, true);
+  view.renderMessages([], false, { conversationId: conv });
+  assert.equal(messagesEl.querySelector('.empty-state'), null);
+  assert.deepEqual(rowIds(), [pendingId]);
+  store.clearPendingUserMessage(pendingId);
+});
+
+// ---------------------------------------------------------------------------
 // 3b — a message sent while steering is held (open question card) queues.
 // ---------------------------------------------------------------------------
 
