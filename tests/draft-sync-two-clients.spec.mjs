@@ -16,6 +16,34 @@ function readDraftText(conversationId) {
   }
 }
 
+function readDraftAttachmentCount(conversationId) {
+  const db = new DatabaseSync(relayDbPath(), { readOnly: true });
+  try {
+    const row = db.prepare(`SELECT draft_attachments FROM conversations WHERE id = ?`).get(conversationId);
+    const parsed = JSON.parse(String(row?.draft_attachments || "[]"));
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } finally {
+    db.close();
+  }
+}
+
+// A 1x1 PNG, pasted through the production paste handler.
+const ONE_PIXEL_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5Hh9kAAAAASUVORK5CYII=";
+
+async function pastePngIntoComposer(page) {
+  await page.evaluate((base64) => {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([bytes], "image.png", { type: "image/png" }));
+    const input = document.getElementById("msg-input");
+    input.focus();
+    input.dispatchEvent(new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }));
+  }, ONE_PIXEL_PNG_BASE64);
+}
+
 async function createConversation(request, headers, text) {
   const created = await request.post("/api/message", {
     headers,
@@ -94,6 +122,29 @@ test("a programmatic switch while the composer is focused never saves one conver
 
     expect(readDraftText(conversationB)).toBe("");
     expect(readDraftText(conversationA)).toBe("only meant for A");
+  } finally {
+    await device.context.close();
+  }
+});
+
+test("reopening the conversation on screen keeps its draft attachments", async ({ browser, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const conversationId = await createConversation(request, headers, "draft sync reopen");
+
+  const device = await openDevice(browser, token, conversationId);
+  try {
+    await pastePngIntoComposer(device.page);
+    await expect(device.page.locator(".attachment-preview-uploaded")).toHaveCount(1, { timeout: 15_000 });
+    await expect.poll(() => readDraftAttachmentCount(conversationId), { timeout: 10_000 }).toBe(1);
+
+    // What a session bind, a second click on the active conversation, or a
+    // push/search jump into it does.
+    await device.page.evaluate((id) => window.openConversation(id), conversationId);
+    await device.page.waitForTimeout(1_500);
+
+    await expect(device.page.locator(".attachment-preview-item")).toHaveCount(1);
+    expect(readDraftAttachmentCount(conversationId)).toBe(1);
   } finally {
     await device.context.close();
   }

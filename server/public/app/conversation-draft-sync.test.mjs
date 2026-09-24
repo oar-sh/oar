@@ -99,6 +99,10 @@ test('changed or uploading attachments make the composer modified', () => {
 test('drafts are compared and saved only up to the server\'s length limit', () => {
   const long = 'z'.repeat(MAX_DRAFT_TEXT_LENGTH + 10);
   assert.equal(draftTextForSync(long).length, MAX_DRAFT_TEXT_LENGTH);
+  const straddling = `${'e'.repeat(MAX_DRAFT_TEXT_LENGTH - 1)}😀tail`;
+  assert.equal(draftTextForSync(straddling), 'e'.repeat(MAX_DRAFT_TEXT_LENGTH - 1), 'a surrogate pair is never split');
+  const fitting = `${'e'.repeat(MAX_DRAFT_TEXT_LENGTH - 2)}😀tail`;
+  assert.equal(draftTextForSync(fitting), `${'e'.repeat(MAX_DRAFT_TEXT_LENGTH - 2)}😀`, 'a pair that fits is kept');
   assert.equal(
     shouldApplyIncomingDraftToComposer({ inputText: long, incomingText: 'other', syncedText: draftTextForSync(long) }),
     true,
@@ -133,6 +137,11 @@ test('draftFlushRequestBody queues only unsaved text, with the synced base and t
       baseDraftUpdatedAt: synced.updatedAt,
     },
     'compared with the synced draft, not the local text that tracks every keystroke',
+  );
+  assert.deepEqual(
+    draftFlushRequestBody({ inputText: 'typed during a send', synced, clientId: 'c1', afterPendingSend: true }),
+    { draftText: 'typed during a send', clientId: 'c1' },
+    'during a send the base is about to go stale, so the pagehide copy replays unconditionally',
   );
   assert.deepEqual(
     draftFlushRequestBody({ inputText: 'x', synced: null, fallbackText: '', fallbackUpdatedAt: null, clientId: 'c1' }),

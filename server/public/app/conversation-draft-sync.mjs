@@ -19,8 +19,15 @@ export const DRAFT_SYNC_PROTOCOL_VERSION = 2;
 // limited — only what survives as a draft.
 export const MAX_DRAFT_TEXT_LENGTH = 20_000;
 
+// Cuts at a code-point boundary, exactly like the server: a cut through a
+// surrogate pair would store a lone surrogate, which SQLite hands back as
+// U+FFFD — a different text at the same version.
 export function draftTextForSync(text) {
-  return String(text || '').slice(0, MAX_DRAFT_TEXT_LENGTH);
+  const value = String(text || '');
+  if (value.length <= MAX_DRAFT_TEXT_LENGTH) return value;
+  const cut = value.slice(0, MAX_DRAFT_TEXT_LENGTH);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
 const syncedDraftsByConversation = new Map();
@@ -139,10 +146,15 @@ export function draftFlushRequestBody({
   fallbackText = '',
   fallbackUpdatedAt = null,
   clientId = null,
+  afterPendingSend = false,
 } = {}) {
   const draftText = draftTextForSync(inputText);
   const serverText = synced ? synced.text : draftTextForSync(fallbackText);
   if (draftText === serverText) return null;
+  // A send in flight will move the server's version past any base known now,
+  // so a versioned copy would always be rejected on replay. What the page
+  // holds then is text typed after that send: replay it unconditionally.
+  if (afterPendingSend) return { draftText, clientId };
   return {
     draftText,
     clientId,

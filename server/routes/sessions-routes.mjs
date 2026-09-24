@@ -955,7 +955,11 @@ function normalizeConversationDraftText(value, { maxLength = MAX_CONVERSATION_DR
   const text = String(value ?? '');
   if (!text.trim()) return '';
   if (text.length <= maxLength) return text;
-  return text.slice(0, maxLength);
+  // Never split a surrogate pair: SQLite would store the lone half as U+FFFD,
+  // and the client (which cuts the same way) would no longer match its draft.
+  const cut = text.slice(0, maxLength);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
 export function normalizeOptionalIsoTimestamp(value) {

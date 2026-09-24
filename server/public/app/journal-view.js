@@ -464,8 +464,13 @@ export async function openConversation(id, options = {}) {
     repoBrowserState.error = '';
   }
   closeSidebar();
-  clearAttachments();
-  if (switchingConversation) beginConversationDraftSwitch(nextConversationId);
+  // Reopening the conversation on screen (session bind, clicking it again, a
+  // push or search jump) must leave its composer alone: emptied attachments
+  // would read as a user edit and be saved, dropping them from the draft.
+  if (switchingConversation) {
+    clearAttachments();
+    beginConversationDraftSwitch(nextConversationId);
+  }
   document.getElementById('chat-title').textContent = conversations[id]?.title || id;
   if (didLeaveStatusView) {
     restoreInFlightThinking(null);

@@ -221,6 +221,20 @@ test('a draft over the limit is stored truncated to exactly what the client comp
   assert.equal(readDraft('conv-long').draft_text.length, MAX_CONVERSATION_DRAFT_LENGTH);
 });
 
+test('an emoji straddling the limit is cut whole, identically on server and client', async () => {
+  const { patchDraft, insertConversation, readDraft } = setup();
+  insertConversation('conv-emoji');
+  // The emoji's high surrogate sits at index 19,999, its low one at 20,000.
+  const text = `${'e'.repeat(MAX_CONVERSATION_DRAFT_LENGTH - 1)}😀 and a local-only tail`;
+
+  const response = await patchDraft('conv-emoji', { draftText: text, draftSyncVersion: 2, baseDraftUpdatedAt: null });
+
+  const stored = readDraft('conv-emoji').draft_text;
+  assert.equal(stored, 'e'.repeat(MAX_CONVERSATION_DRAFT_LENGTH - 1), 'no lone surrogate (stored back as U+FFFD)');
+  assert.ok(!stored.includes('�'));
+  assert.equal(response.body.draftText, draftTextForSync(text), 'the client compares against exactly what was stored');
+});
+
 test('an absent base (legacy client) still saves unconditionally', async () => {
   const { patchDraft, insertConversation, readDraft } = setup();
   insertConversation('conv-legacy', { draftText: 'server text', draftUpdatedAt: SERVER_VERSION });

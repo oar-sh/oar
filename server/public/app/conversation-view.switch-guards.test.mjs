@@ -1770,6 +1770,81 @@ test('draft sync: text typed through the input handler while a send is in flight
   resetComposer('');
 });
 
+test('draft sync: text typed during a send survives switching away before the send lands', async () => {
+  const convId = nextId('conv-draft');
+  const otherId = nextId('conv-other');
+  const runningId = primeQueuedSend(convId, 'first message');
+  conversations[otherId] = { id: otherId, title: 'Other', draftText: '', draftUpdatedAt: SERVER_DRAFT_V1 };
+  const post = deferred();
+  const server = createVersionedDraftServer(convId, { text: 'first message', updatedAt: PRE_SEND_DRAFT_AT, onMessage: () => post.promise });
+  view.hydrateConversationDraft(convId, { draftText: 'first message', draftAttachments: [], draftUpdatedAt: PRE_SEND_DRAFT_AT });
+  fetchHandler = server.handler;
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  typeIntoComposer('typed during the send');
+  // openConversation(other): flush the previous conversation, then switch.
+  await view.flushConversationDraft(convId);
+  setCurrentConv(otherId);
+  view.beginConversationDraftSwitch(otherId);
+  post.resolve({ conversationId: convId, messageId: nextId('srv') });
+  await sendPromise;
+  await settle();
+
+  assert.equal(server.text, 'typed during the send', 'the held text is saved for the conversation it was typed in');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+  resetComposer('');
+});
+
+test('draft sync: a failed send puts its text back without replacing what was typed meanwhile', async () => {
+  const convId = nextId('conv-draft');
+  const runningId = primeQueuedSend(convId, 'the unsent message');
+  const post = deferred();
+  const server = createVersionedDraftServer(convId, {
+    text: 'the unsent message',
+    updatedAt: PRE_SEND_DRAFT_AT,
+    onMessage: () => post.promise,
+  });
+  view.hydrateConversationDraft(convId, { draftText: 'the unsent message', draftAttachments: [], draftUpdatedAt: PRE_SEND_DRAFT_AT });
+  fetchHandler = server.handler;
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  typeIntoComposer('a follow-up typed while it was sending');
+  post.reject(new Error('relay unreachable'));
+  await sendPromise;
+  await settle();
+
+  const expected = 'the unsent message\n\na follow-up typed while it was sending';
+  assert.equal(getById('msg-input').value, expected, 'both texts are kept, the failed message first');
+  assert.equal(server.text, expected, 'and saved');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+  resetComposer('');
+});
+
+test('draft sync: an upload in flight survives another device changing the attachments', async () => {
+  const convId = nextId('conv-sync');
+  const shotA = { sha256: 'a'.repeat(64), name: 'a.png', type: 'image/png', size: 10 };
+  const shotB = { sha256: 'b'.repeat(64), name: 'b.png', type: 'image/png', size: 10 };
+  conversations[convId] = { id: convId, title: 'Upload' };
+  setCurrentConv(convId);
+  resetComposer('');
+  view.hydrateConversationDraft(convId, { draftText: 'caption', draftAttachments: [shotA], draftUpdatedAt: SERVER_DRAFT_V1 });
+  // The phone replaced the screenshot meanwhile.
+  const server = createVersionedDraftServer(convId, { text: 'caption', attachments: [shotB], updatedAt: SERVER_DRAFT_V2 });
+  fetchHandler = server.handler;
+  const uploading = { id: 'att-uploading', name: 'new.png', type: 'image/png', uploadState: 'uploading' };
+  store.selectedAttachments.push(uploading);
+
+  view.hydrateConversationDraft(convId, { draftText: 'caption', draftAttachments: [shotB], draftUpdatedAt: SERVER_DRAFT_V2 });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await settle();
+
+  assert.ok(store.selectedAttachments.includes(uploading), 'the upload in flight is still in the composer');
+  resetComposer('');
+  store.selectedAttachments.length = 0;
+});
+
 test('renderMessages re-renders when only a message\'s workflowRuns change', () => {
   const convId = nextId('conv-wr');
   conversations[convId] = { id: convId, title: 'WR' };

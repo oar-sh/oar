@@ -101,6 +101,7 @@ import {
   loadOlderConversationMessages,
   syncComposerButtonState,
   syncComposerAfterUserEdit,
+  isConversationDraftHeldBySend,
   persistComposerAttachments,
   flushConversationDraft,
   initConversationHistoryLazyLoading,
@@ -3948,7 +3949,11 @@ async function initApp() {
     // The direct flush below can be killed mid-flight by the browser; the
     // queued copy survives and is replayed by Background Sync. If the direct
     // write wins, the replay hits a draft version conflict and is dropped.
-    if (!appSharedMode) void enqueueDraftFlushForBackgroundSync(currentConvId);
+    if (!appSharedMode) {
+      void enqueueDraftFlushForBackgroundSync(currentConvId, {
+        afterPendingSend: isConversationDraftHeldBySend(currentConvId),
+      });
+    }
     void flushConversationDraft(currentConvId);
     closeTmuxInspectorView();
   });

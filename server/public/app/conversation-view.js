@@ -517,15 +517,23 @@ export function syncComposerButtonState() {
 
 // The composer's input handler: the user edited the text, so the draft is
 // saved (debounced) as well as the button refreshed. While a send owns the
-// draft nothing is saved: the send transaction clears the draft
-// unconditionally after any such save, and the send's own post-send save
-// carries whatever the composer holds by then.
+// draft nothing is saved — the send transaction clears the draft
+// unconditionally after any such save — but the text is still cached, and
+// the send saves it when it settles, wherever the user is by then.
 export function syncComposerAfterUserEdit() {
   syncSendButtonState();
   const text = document.getElementById('msg-input')?.value || '';
   warnOnceIfDraftTooLong(text);
-  if (isDraftOwnedByPendingSend(currentConvId)) return;
+  if (isDraftOwnedByPendingSend(currentConvId)) {
+    upsertConversationDraftState(currentConvId, { draftText: draftTextForSync(text) });
+    return;
+  }
   void scheduleConversationDraftSave({ conversationId: currentConvId, draftText: text });
+}
+
+/** Whether a send in flight holds this conversation's draft saves back. */
+export function isConversationDraftHeldBySend(conversationId) {
+  return isDraftOwnedByPendingSend(conversationId);
 }
 
 let draftLengthWarningShown = false;
@@ -634,12 +642,39 @@ export function persistComposerAttachments() {
   });
 }
 
+// Saves the conversation's composer text (or, off screen, its cached text)
+// when it differs from the synced draft.
 function saveComposerIfUnsynced(conversationId) {
   const synced = getSyncedDraft(conversationId);
-  const text = draftTextForSync(document.getElementById('msg-input')?.value || '');
-  const attachments = serializeDraftAttachments(selectedAttachments);
-  if (synced && synced.text === text && (synced.attachmentsKey === null || synced.attachmentsKey === draftAttachmentsKey(attachments))) return;
+  const viewing = isCurrentConversation(conversationId);
+  const text = draftTextForSync(viewing
+    ? (document.getElementById('msg-input')?.value || '')
+    : (conversations[conversationId]?.draftText || ''));
+  const attachments = viewing ? serializeDraftAttachments(selectedAttachments) : undefined;
+  const attachmentsKey = draftAttachmentsKey(attachments);
+  if (synced && synced.text === text && (attachmentsKey === null || synced.attachmentsKey === null || synced.attachmentsKey === attachmentsKey)) return;
   void scheduleConversationDraftSave({ conversationId, draftText: text, draftAttachments: attachments });
+}
+
+// A send that failed hands its text back to the composer. Text typed while it
+// was in flight is kept after it (blank line between) instead of being
+// replaced, so neither is lost; if the send never emptied the composer, the
+// composer still holds the message and is kept as it is.
+function restoreComposerAfterFailedSend(conversationId, originalText, { viewing, composerCleared }) {
+  const input = document.getElementById('msg-input');
+  const current = viewing
+    ? String(input?.value || '')
+    : String(conversations[conversationId]?.draftText || '');
+  let text = originalText;
+  if (!composerCleared) text = current || originalText;
+  else if (current.trim()) text = `${originalText}
+
+${current}`;
+  if (viewing && input) {
+    input.value = text;
+    autoResize(input);
+  }
+  void scheduleConversationDraftSave({ conversationId, draftText: text, immediate: true });
 }
 
 function isDraftVersionConflict(response) {
@@ -775,7 +810,7 @@ async function resolveDraftSaveConflict(id, { text, draftAttachments, synced, co
   const localAttachments = draftAttachments === undefined
     ? undefined
     : (viewing ? serializeDraftAttachments(selectedAttachments) : draftAttachments);
-  const outcome = resolveDraftConflict({
+  let outcome = resolveDraftConflict({
     localText,
     localAttachmentsKey: draftAttachmentsKey(localAttachments),
     baseText: synced ? synced.text : null,
@@ -783,6 +818,9 @@ async function resolveDraftSaveConflict(id, { text, draftAttachments, synced, co
     serverText,
     serverAttachmentsKey: draftAttachmentsKey(serverAttachments),
   });
+  // Uploads in flight are not in the fingerprint; adopting would replace the
+  // attachment list and drop them, so they count as a local edit.
+  if (outcome === 'adopt' && viewing && hasUploadingAttachments(selectedAttachments)) outcome = 'keep-local';
   if (outcome === 'adopt') {
     adoptServerDraft(id, conflict);
     return conflict;
@@ -878,9 +916,14 @@ async function scheduleConversationDraftSave({
 
 export async function flushConversationDraft(conversationId = currentConvId) {
   const id = String(conversationId || '').trim();
-  if (!id || isDraftOwnedByPendingSend(id)) return null;
+  if (!id) return null;
   const input = document.getElementById('msg-input');
   const draftText = String((id === String(currentConvId || '').trim() && input) ? input.value : (conversations[id]?.draftText || ''));
+  if (isDraftOwnedByPendingSend(id)) {
+    // Held: the send saves the cached text once it settles.
+    upsertConversationDraftState(id, { draftText: draftTextForSync(draftText) });
+    return null;
+  }
   return scheduleConversationDraftSave({
     conversationId: id,
     draftText,
@@ -3050,6 +3093,7 @@ export async function sendMessage() {
   }
 
   setSendInFlight(true);
+  let composerClearedBySend = false;
   let attachments = [];
   let clientMessageId = null;
   try {
@@ -3065,6 +3109,10 @@ export async function sendMessage() {
     clientMessageId = generateId();
     trackPendingUserMessage(clientMessageId, targetConversationId, text);
     pendingUserMessageIds.add(clientMessageId);
+    // The message leaves the draft: from here the cached draft is only what is
+    // typed next, which the post-send save (or a failure restore) builds on.
+    if (targetConversationId) upsertConversationDraftState(targetConversationId, { draftText: '' });
+    composerClearedBySend = true;
     if (viewingSendConversation()) {
       input.value = '';
       autoResize(input);
@@ -3118,14 +3166,9 @@ export async function sendMessage() {
       pendingNode?.remove();
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
-      if (viewingSendConversation()) {
-        input.value = originalComposerText;
-        autoResize(input);
-      }
-      void scheduleConversationDraftSave({
-        conversationId: targetConversationId,
-        draftText: originalComposerText,
-        immediate: true,
+      restoreComposerAfterFailedSend(targetConversationId, originalComposerText, {
+        viewing: viewingSendConversation(),
+        composerCleared: composerClearedBySend,
       });
       if (!mobileSend && viewingSendConversation()) input.focus();
       setModelBanner('⚠️ Message could not be sent. Please try again.');
@@ -3222,7 +3265,9 @@ export async function sendMessage() {
       // this round trip is how the client learns it (a 409 carries it). What
       // is saved is the composer as it is now — the user may already have
       // typed the next message while this one was sending.
-      const postSendText = viewingSendConversation() ? String(input.value || '') : '';
+      const postSendText = viewingSendConversation()
+        ? String(input.value || '')
+        : String(conversations[persistedConversationId]?.draftText || '');
       const clearedDraft = await scheduleConversationDraftSave({
         conversationId: persistedConversationId,
         draftText: postSendText,
@@ -3260,14 +3305,9 @@ export async function sendMessage() {
       pendingUserMessageIds.delete(clientMessageId);
       seenMessageIds.delete(clientMessageId);
     }
-    if (viewingSendConversation()) {
-      input.value = originalComposerText;
-      autoResize(input);
-    }
-    void scheduleConversationDraftSave({
-      conversationId: targetConversationId,
-      draftText: originalComposerText,
-      immediate: true,
+    restoreComposerAfterFailedSend(targetConversationId, originalComposerText, {
+      viewing: viewingSendConversation(),
+      composerCleared: composerClearedBySend,
     });
     alert(e.message || 'Failed to send message');
   } finally {
@@ -3276,8 +3316,8 @@ export async function sendMessage() {
     // restored the composer text (offline/failure), or never touched it.
     if (targetConversationId) sendOwnedDraftConversations.delete(targetConversationId);
     // Edits made after the post-send save were held back while the send owned
-    // the draft; save them now.
-    if (targetConversationId && isCurrentConversation(targetConversationId)) saveComposerIfUnsynced(targetConversationId);
+    // the draft; save them now, on screen or not.
+    if (targetConversationId) saveComposerIfUnsynced(targetConversationId);
   }
 }
 

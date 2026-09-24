@@ -186,7 +186,7 @@ export async function initOutboxFallbackReplay() {
  * replay treats as final. Only queues when the draft differs from the last
  * persisted state.
  */
-export async function enqueueDraftFlushForBackgroundSync(conversationId) {
+export async function enqueueDraftFlushForBackgroundSync(conversationId, { afterPendingSend = false } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return false;
   const conversation = conversations[id];
@@ -198,6 +198,7 @@ export async function enqueueDraftFlushForBackgroundSync(conversationId) {
     fallbackText: conversation.draftText,
     fallbackUpdatedAt: conversation.draftUpdatedAt,
     clientId: CLIENT_ID,
+    afterPendingSend,
   });
   if (!body) return false;
   const queued = await enqueueOutboxRequest({
