@@ -37,6 +37,7 @@ import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
+import { isLiveResend } from '../services/steer-resend.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
@@ -186,14 +187,16 @@ function findRecentDuplicateUserMessage({
   now = Date.now(),
   windowMs = DUPLICATE_USER_MESSAGE_WINDOW_MS,
   // A message the user deliberately sends again (Resend of a steer a Stop
-  // cut off) is not a duplicate of its own original.
-  exemptMessageId = null,
+  // cut off) is not a duplicate of its own original, nor of an earlier Resend
+  // of it that was cancelled or failed.
+  exemptMessageIds = [],
 } = {}) {
   const fingerprint = normalizeDuplicateMessageText(text);
   if (!fingerprint) return null;
   const maxAgeMs = Math.max(60_000, Number(windowMs) || DUPLICATE_USER_MESSAGE_WINDOW_MS);
-  const exemptId = String(exemptMessageId || '').trim();
-  const isExempt = (row) => !!exemptId && String(row?.id || '').trim() === exemptId;
+  const exempt = new Set((Array.isArray(exemptMessageIds) ? exemptMessageIds : [])
+    .map((id) => String(id || '').trim()).filter(Boolean));
+  const isExempt = (row) => exempt.has(String(row?.id || '').trim());
 
   for (const row of Array.isArray(recentUserMessages) ? recentUserMessages : []) {
     if (isExempt(row)) continue;
@@ -3924,20 +3927,44 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
-  // The original of a Resend: only a user message whose own settle marker says
-  // a Stop cut it off unanswered (kind='stopped') — anything else gets the
-  // ordinary duplicate guard. A second Resend still collides with the first.
-  function resolveStoppedSteerResendOrigin(conversationId, rawMessageId) {
+  // A Resend of a steer a Stop cut off unanswered. Honored only for a user
+  // message of this conversation whose own settle marker is kind='stopped' and
+  // whose text is what is being sent; anything else is an ordinary send (and
+  // gets the ordinary duplicate guard). Returns { originId } to honor it,
+  // { alreadyResentAs } when an earlier Resend of it still stands (from any
+  // device, at any time), or null.
+  function resolveStoppedSteerResend(conversationId, rawMessageId, text) {
     const messageId = String(rawMessageId || '').trim();
     if (!messageId || !conversationId) return null;
     try {
-      const row = db.prepare(`
+      const original = db.prepare(`
+        SELECT id, text FROM messages WHERE id = ? AND conversation_id = ? AND role = 'user'
+      `).get(messageId, conversationId);
+      if (!original) return null;
+      if (normalizeDuplicateMessageText(original.text) !== normalizeDuplicateMessageText(text)) return null;
+      const stopped = db.prepare(`
         SELECT 1 FROM messages
         WHERE conversation_id = ? AND role = 'assistant' AND kind = 'stopped'
           AND (source_message_id = ? OR id IN (SELECT response_message_id FROM queue WHERE id = ?))
         LIMIT 1
       `).get(conversationId, messageId, messageId);
-      return row ? messageId : null;
+      if (!stopped) return null;
+      const earlier = db.prepare(`
+        SELECT m.id,
+          q.id AS queue_id,
+          q.status AS queue_status,
+          EXISTS (SELECT 1 FROM messages a WHERE a.role = 'assistant' AND a.source_message_id = m.id) AS answered
+        FROM messages m
+        LEFT JOIN queue q ON q.id = m.id
+        WHERE m.conversation_id = ? AND m.role = 'user' AND m.resend_of_message_id = ?
+      `).all(conversationId, messageId);
+      const standing = earlier.find((row) => isLiveResend({
+        hasQueueRow: !!row.queue_id,
+        queueStatus: row.queue_status,
+        answered: !!row.answered,
+      }));
+      if (standing) return { alreadyResentAs: standing.id };
+      return { originId: messageId, exemptIds: [messageId, ...earlier.map((row) => row.id)] };
     } catch {
       return null;
     }
@@ -3969,6 +3996,10 @@ export function registerMessagesRoutes(app, deps) {
     const requestedRelayMode = normalizeRelayMode(relayMode || mode);
     const trimmedText = stripRelayPromptContext(text, requestedRelayMode || relayMode || mode);
     const normalizedAttachments = normalizeAttachments(rawAttachments);
+    const requestedAttachmentCount = Math.min(
+      MAX_UPLOAD_ATTACHMENTS,
+      Array.isArray(rawAttachments) ? rawAttachments.filter((item) => item && typeof item === 'object').length : (rawAttachments ? 1 : 0),
+    );
     const referenceResolution = collectReferenceAttachmentsFromText(trimmedText);
     const attachments = mergeMessageAttachments(normalizedAttachments, referenceResolution.attachments);
     const imageTarget = rawImageTarget && typeof rawImageTarget === 'object'
@@ -4438,6 +4469,19 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
 
+    const resend = shouldCreateConversation
+      ? null
+      : resolveStoppedSteerResend(conversationId, req.body.resendOfMessageId, trimmedText);
+    if (resend?.alreadyResentAs) {
+      return res.json({
+        ok: true,
+        duplicate: true,
+        alreadyResent: true,
+        duplicateOfMessageId: resend.alreadyResentAs,
+        conversationId,
+      });
+    }
+    const resendOriginId = resend?.originId || null;
     if (!shouldCreateConversation) {
       const recentUserMessages = stmts.getRecentMessagesDesc.all(conversationId, 20);
       const recentQueueRows = db.prepare(`
@@ -4451,7 +4495,7 @@ export function registerMessagesRoutes(app, deps) {
         recentUserMessages,
         recentQueueRows,
         text: trimmedText,
-        exemptMessageId: resolveStoppedSteerResendOrigin(conversationId, req.body.resendOfMessageId),
+        exemptMessageIds: resend?.exemptIds || [],
       });
       if (duplicateMessage) {
         return res.json({
@@ -4557,27 +4601,32 @@ export function registerMessagesRoutes(app, deps) {
       );
       linkUploadReferences(convId, msgId, attachments);
       stmts.updateConvTime.run(now, convId);
-      if (typeof stmts.updateConvDraft?.run === 'function') {
-        stmts.updateConvDraft.run(null, now, sessionId || null, convId);
-      } else {
-        db.prepare(`
-          UPDATE conversations
-          SET draft_text = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
-          WHERE id = ?
-        `).run(now, sessionId || null, convId);
+      if (resendOriginId) stmts.setMessageResendOf?.run(resendOriginId, msgId);
+      // A Resend never came from the composer: whatever the user is typing
+      // there stays their draft.
+      if (!resendOriginId) {
+        if (typeof stmts.updateConvDraft?.run === 'function') {
+          stmts.updateConvDraft.run(null, now, sessionId || null, convId);
+        } else {
+          db.prepare(`
+            UPDATE conversations
+            SET draft_text = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
+            WHERE id = ?
+          `).run(now, sessionId || null, convId);
+        }
+        // The message now owns these blobs, so the draft placeholders can go. The
+        // sent-message references were just inserted above, so nothing is orphaned.
+        if (typeof stmts.updateConvDraftAttachments?.run === 'function') {
+          stmts.updateConvDraftAttachments.run(null, now, sessionId || null, convId);
+        } else {
+          db.prepare(`
+            UPDATE conversations
+            SET draft_attachments = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
+            WHERE id = ?
+          `).run(now, sessionId || null, convId);
+        }
+        stmts.deleteDraftUploadRefs?.run?.(convId);
       }
-      // The message now owns these blobs, so the draft placeholders can go. The
-      // sent-message references were just inserted above, so nothing is orphaned.
-      if (typeof stmts.updateConvDraftAttachments?.run === 'function') {
-        stmts.updateConvDraftAttachments.run(null, now, sessionId || null, convId);
-      } else {
-        db.prepare(`
-          UPDATE conversations
-          SET draft_attachments = NULL, draft_updated_at = ?, draft_updated_by_client_id = ?
-          WHERE id = ?
-        `).run(now, sessionId || null, convId);
-      }
-      stmts.deleteDraftUploadRefs?.run?.(convId);
       // Cursor allows per-turn model switching, so the pinned provider_model has
       // to follow the accepted model; otherwise the conversation list and the
       // composer keep restoring the model chosen at bootstrap.
@@ -4667,14 +4716,16 @@ export function registerMessagesRoutes(app, deps) {
       }
       throw error;
     }
-    io.emit('conversation_draft_updated', {
-      conversationId: convId,
-      draftText: '',
-      draftAttachments: [],
-      draftUpdatedAt: now,
-      draftUpdatedByClientId: sessionId || null,
-      senderClientId: sessionId || null,
-    });
+    if (!resendOriginId) {
+      io.emit('conversation_draft_updated', {
+        conversationId: convId,
+        draftText: '',
+        draftAttachments: [],
+        draftUpdatedAt: now,
+        draftUpdatedByClientId: sessionId || null,
+        senderClientId: sessionId || null,
+      });
+    }
     if (ownerSessionId) {
       const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
       sessionWorkerRegistry?.upsertWorker?.({
@@ -4790,6 +4841,9 @@ export function registerMessagesRoutes(app, deps) {
       ...workspaceRootPayload(),
       referenceAttachmentCount: referenceResolution.attachments.length,
       skippedReferenceAttachments: referenceResolution.skipped,
+      // Attachment references that no longer resolve (a deleted upload) are
+      // dropped silently by normalizeAttachments; the sender is told how many.
+      droppedAttachmentCount: Math.max(0, requestedAttachmentCount - normalizedAttachments.length),
       imageOperation: imageOperation
         ? {
             id: imageOperation.id,

@@ -691,10 +691,16 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, pa
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_continuation_op ON queue(continuation_op_id) WHERE continuation_op_id IS NOT NULL`);
 migrateImageConversationSchema(db);
 // After the queue's response_message_id exists: the source-link backfill
-// reads it.
-const steerSettleMarkersMigration = migrateSteerSettleMarkers(db);
-if (steerSettleMarkersMigration.foldStubsRekinded) {
-  console.log(`[steering] re-kinded ${steerSettleMarkersMigration.foldStubsRekinded} fold stub(s) as 'folded'`);
+// reads it. Not boot-critical — every reader of its columns tolerates their
+// absence — so a failure (e.g. SQLITE_BUSY) is logged and retried next boot
+// instead of keeping the relay down.
+try {
+  const steerSettleMarkersMigration = migrateSteerSettleMarkers(db);
+  if (steerSettleMarkersMigration.foldStubsRekinded) {
+    console.log(`[steering] re-kinded ${steerSettleMarkersMigration.foldStubsRekinded} fold stub(s) as 'folded'`);
+  }
+} catch (error) {
+  console.warn(`[steering] migration 0004 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

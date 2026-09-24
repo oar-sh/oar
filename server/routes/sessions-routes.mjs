@@ -1,4 +1,5 @@
 'use strict';
+import { liveResendsByOriginal } from '../services/steer-resend.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 
 import fs from 'fs';
@@ -1749,6 +1750,9 @@ export function buildConversationMessages({
       .map((row) => [String(row?.id || '').trim(), row])
       .filter(([id]) => !!id),
   );
+  // A stopped steer's marker says "Resent" from the data, so it holds across
+  // reloads and devices (the relay refuses a second Resend on the same basis).
+  const liveResends = liveResendsByOriginal(dbMessages, queueRows);
   const normalizedDbMessages = Array.isArray(dbMessages)
     ? dbMessages.map((message) => {
         const id = String(message?.id || '').trim();
@@ -1788,6 +1792,10 @@ export function buildConversationMessages({
           // 'folded'/'stopped' are a steer's settle markers. Without this the
           // live-appended badge/merge/marker vanished on reload.
           kind: message?.kind || undefined,
+          resendOfMessageId: message?.role === 'user' ? (message?.resend_of_message_id || undefined) : undefined,
+          resentAs: (message?.role === 'assistant' && message?.kind === 'stopped' && sourceMessageId)
+            ? (liveResends.get(sourceMessageId) || undefined)
+            : undefined,
         };
       })
     : [];
@@ -2449,7 +2457,7 @@ export function registerSessionsRoutes(app, deps) {
       (stmts.getSharedMessages || stmts.getMessages).all(resolvedConversationId),
     );
     const queueRows = db.prepare(`
-      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model, status
       FROM queue
       WHERE conversation_id = ?
     `).all(resolvedConversationId);
@@ -3194,7 +3202,7 @@ export function registerSessionsRoutes(app, deps) {
     });
     const dbMessages = stmts.getMessages.all(conversationId);
     const queueRows = db.prepare(`
-      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model, status
       FROM queue
       WHERE conversation_id = ?
     `).all(conversationId);
@@ -3596,7 +3604,7 @@ export function registerSessionsRoutes(app, deps) {
     });
     const dbMessages = stmts.getMessages.all(resolvedConversationId);
     const queueRows = db.prepare(`
-      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model
+      SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model, status
       FROM queue
       WHERE conversation_id = ?
     `).all(resolvedConversationId);

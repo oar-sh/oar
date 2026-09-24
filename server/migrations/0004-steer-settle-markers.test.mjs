@@ -97,3 +97,32 @@ test('production boot (applySchema) carries the column on a fresh database', () 
   // Re-running the whole boot sequence stays safe.
   applySchema(db);
 });
+
+test('the resend link column is added alongside the source link', () => {
+  const db = legacyDb();
+  migrateSteerSettleMarkers(db);
+  const columns = db.prepare(`PRAGMA table_info(messages)`).all().map((column) => column.name);
+  assert.ok(columns.includes('resend_of_message_id'));
+});
+
+test('a failing 0004 migration does not keep the relay from booting', (t) => {
+  const real = new Database(':memory:');
+  const db = new Proxy(real, {
+    get(target, key) {
+      if (key === 'exec') {
+        return (sql) => {
+          if (/ALTER TABLE messages ADD COLUMN source_message_id/.test(sql)) {
+            throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+          }
+          return target.exec(sql);
+        };
+      }
+      const value = target[key];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const warnings = [];
+  t.mock.method(console, 'warn', (message) => { warnings.push(String(message)); });
+  assert.doesNotThrow(() => applySchema(db));
+  assert.ok(warnings.some((message) => /migration 0004 failed/.test(message)));
+});

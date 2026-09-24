@@ -263,6 +263,122 @@ test('a failed Resend removes its bubble and can be tried again', async () => {
   assert.equal(button.textContent, 'Resend');
 });
 
+function renderStoppedPair(conv, { text = 'cut off by Stop', attachments = [], markerExtra = {} } = {}) {
+  const userId = uid('u');
+  const markerId = uid('a');
+  view.renderMessages([
+    { id: userId, role: 'user', text, timestamp: at(5), attachments },
+    { id: markerId, role: 'assistant', text: '_(Stopped with the turn — not answered.)_', timestamp: at(10), sourceMessageId: userId, kind: 'stopped', ...markerExtra },
+  ], false, { conversationId: conv });
+  return { userId, markerId, button: () => row(markerId).querySelector('[data-action="resend-stopped-steer"]') };
+}
+
+function resendHarness(conv, postResponse) {
+  fetchHandler = async (url, { method, body }) => {
+    if (method === 'GET' && url.includes(`/api/conversation/${conv}?`)) return validationPayload('sess-dom');
+    if (method === 'POST' && url.endsWith('/api/message')) return postResponse(body);
+    throw new Error(`unexpected fetch: ${method} ${url}`);
+  };
+}
+
+const toastText = () => document.getElementById('relay-toast')?.textContent || '';
+const messagePosts = () => fetchLog.filter((entry) => entry.method === 'POST' && entry.url.endsWith('/api/message'));
+
+test('a marker whose own message is not loaded never resends the message above it', async () => {
+  resetView();
+  const conv = openConversation();
+  selectComposerPreferences();
+  const markerId = uid('a');
+  // Page boundary: the marker's source is outside the window, and the row
+  // above is ANOTHER stopped steer.
+  view.renderMessages([
+    { id: 'other-u', role: 'user', text: 'a different stopped steer', timestamp: at(1) },
+    { id: 'other-a', role: 'assistant', text: '_(Stopped with the turn — not answered.)_', timestamp: at(2), sourceMessageId: 'other-u', kind: 'stopped' },
+    { id: markerId, role: 'assistant', text: '_(Stopped with the turn — not answered.)_', timestamp: at(3), sourceMessageId: 'not-loaded-u', kind: 'stopped' },
+  ], false, { conversationId: conv });
+  resendHarness(conv, () => { throw new Error('must not post'); });
+  row(markerId).querySelector('[data-action="resend-stopped-steer"]').click();
+  await settle();
+  assert.equal(messagePosts().length, 0);
+  assert.match(toastText(), /scroll up/i);
+  assert.equal(row(markerId).querySelector('[data-action="resend-stopped-steer"]').disabled, false);
+});
+
+test('a marker the relay reports as resent renders Resent, disabled, from the data', () => {
+  resetView();
+  const conv = openConversation();
+  const { button } = renderStoppedPair(conv, { markerExtra: { resentAs: 'msg-resent-elsewhere' } });
+  assert.equal(button().textContent, 'Resent');
+  assert.equal(button().disabled, true);
+});
+
+test('an unrelated recent message with the same text does not lock Resend', async () => {
+  resetView();
+  const conv = openConversation();
+  selectComposerPreferences();
+  const { button } = renderStoppedPair(conv);
+  resendHarness(conv, () => ({ ok: true, duplicate: true, duplicateOfMessageId: 'someone-typed-it', conversationId: conv }));
+  button().click();
+  await settle();
+  await settle();
+  assert.equal(button().disabled, false);
+  assert.equal(button().textContent, 'Resend');
+  assert.match(toastText(), /not resent/i);
+});
+
+test('a Resend the relay already has from another device settles as Resent', async () => {
+  resetView();
+  const conv = openConversation();
+  selectComposerPreferences();
+  const { button, userId, markerId } = renderStoppedPair(conv);
+  resendHarness(conv, () => ({ ok: true, duplicate: true, alreadyResent: true, duplicateOfMessageId: 'msg-from-phone', conversationId: conv }));
+  button().click();
+  await settle();
+  await settle();
+  assert.equal(button().textContent, 'Resent');
+  assert.deepEqual(rowIds(), [userId, markerId], 'no stray optimistic bubble');
+});
+
+test('a Resend that loses attachments says how many', async () => {
+  resetView();
+  const conv = openConversation();
+  selectComposerPreferences();
+  const sha = 'd'.repeat(64);
+  const { button } = renderStoppedPair(conv, {
+    attachments: [
+      { sha256: sha, name: 'kept.png', type: 'image/png' },
+      { name: 'inline.png', type: 'image/png', dataUrl: 'data:image/png;base64,AAAA' },
+    ],
+  });
+  resendHarness(conv, (body) => ({ ok: true, conversationId: conv, messageId: body.messageId, droppedAttachmentCount: 0 }));
+  button().click();
+  await settle();
+  await settle();
+  assert.deepEqual(messagePosts()[0].body.attachments.map((item) => item.sha256), [sha]);
+  assert.match(toastText(), /without 1 attachment/);
+});
+
+test('a Resend follows an auto-compact redirect like any send', async () => {
+  resetView();
+  const conv = openConversation();
+  selectComposerPreferences();
+  const { button } = renderStoppedPair(conv);
+  const opened = [];
+  window.openConversation = async (id) => { opened.push(id); };
+  window.refreshConversations = async () => {};
+  try {
+    resendHarness(conv, (body) => ({ ok: true, conversationId: conv, messageId: body.messageId, compactedConversationId: 'conv-compacted-next' }));
+    button().click();
+    await settle();
+    await settle();
+    await settle();
+    assert.deepEqual(opened, ['conv-compacted-next']);
+  } finally {
+    delete window.openConversation;
+    delete window.refreshConversations;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 3c — the live bubble across rebuilds. #messages is shared by every
 // conversation; the bubble is kept only for its own and re-anchored under its

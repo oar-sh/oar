@@ -7,8 +7,9 @@ export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
     const queueHasImageOperationId = db.prepare(`PRAGMA table_info(queue)`).all()
         .some((column) => column.name === 'image_operation_id');
-    const messagesHaveSourceId = db.prepare(`PRAGMA table_info(messages)`).all()
-        .some((column) => column.name === 'source_message_id');
+    const messageColumns = new Set(db.prepare(`PRAGMA table_info(messages)`).all().map((column) => column.name));
+    const messagesHaveSourceId = messageColumns.has('source_message_id');
+    const messagesHaveResendOf = messageColumns.has('resend_of_message_id');
     const insertQueueSql = queueHasImageOperationId
         ? `INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, model_variant_id, reasoning_effort, context_tier, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at, image_operation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?, ?)`
         : `INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, model_variant_id, reasoning_effort, context_tier, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?)`;
@@ -123,6 +124,9 @@ export function createMessageRepository(db) {
         // reload still anchors the reply under the message it answers.
         setMessageSourceId: messagesHaveSourceId
             ? db.prepare(`UPDATE messages SET source_message_id = ? WHERE id = ?`)
+            : null,
+        setMessageResendOf: messagesHaveResendOf
+            ? db.prepare(`UPDATE messages SET resend_of_message_id = ? WHERE id = ?`)
             : null,
         // Quiet teardown for a continuation whose worker died: there is no
         // user to answer, so it fails without the terminal-failure ceremony.

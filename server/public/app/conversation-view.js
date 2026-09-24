@@ -1330,7 +1330,10 @@ function createMessageNode(msg, msgId = null, force = false) {
   const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
     : '';
-  const resendState = isStoppedSteer && msgId ? stoppedSteerResends.get(msgId) : null;
+  // Resent per the relay (any device, survives reloads), or by this page.
+  const resendState = isStoppedSteer && msgId
+    ? (stoppedSteerResends.get(msgId) || (String(msg?.resentAs || '').trim() ? { status: 'sent' } : null))
+    : null;
   const resendLabel = resendState?.status === 'sent' ? 'Resent' : (resendState ? 'Resending…' : 'Resend');
   const stoppedSteerActionsHtml = (!IS_SHARED_VIEW && isStoppedSteer && msgId)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn" data-action="resend-stopped-steer" data-message-id="${escHtml(msgId)}" title="Send this message again as a new turn"${resendState ? ' disabled' : ''}>${resendLabel}</button></div>`
@@ -1375,9 +1378,11 @@ function createMessageNode(msg, msgId = null, force = false) {
   // What a Resend of this message would send, kept on the node itself so it
   // lives exactly as long as the row is on screen.
   if (msg.role === 'user') {
+    const { references, unavailable } = attachmentReferencesForResend(attachments);
     div[RESEND_PAYLOAD_KEY] = {
       text: String(msg.text || ''),
-      attachments: attachmentReferencesForResend(attachments),
+      attachments: references,
+      unavailableAttachments: unavailable,
     };
   }
   return div;
@@ -2497,8 +2502,11 @@ export function clearBubbleCancelState(messageId) {
 const stoppedSteerResends = new Map();
 const RESEND_PAYLOAD_KEY = '__relayResendPayload';
 
+// Only uploads (by sha256) can be re-referenced; anything else — a legacy
+// inline image — is counted so the user is told it was left out.
 function attachmentReferencesForResend(attachments) {
-  return (Array.isArray(attachments) ? attachments : [])
+  const list = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
+  const references = list
     .map((attachment) => {
       const sha256 = String(attachment?.sha256 || '').trim().toLowerCase();
       if (!sha256) return null;
@@ -2509,18 +2517,19 @@ function attachmentReferencesForResend(attachments) {
       };
     })
     .filter(Boolean);
+  return { references, unavailable: list.length - references.length };
 }
 
-// The user message a stopped marker settles: its source id when the payload
-// carried one, else the nearest user row above (a marker is rendered directly
-// under its own message).
+// The user message a stopped marker settles. By its source id whenever the
+// marker names one — if that row is not loaded (a page boundary) there is no
+// guessing, since the nearest user row above may be another stopped steer.
+// Only a marker without a source falls back to the user row right above it.
 function findStoppedSteerSource(markerNode) {
   const el = getMessagesElement();
   if (!el || !markerNode) return null;
   const sourceId = String(markerNode.dataset.sourceMessageId || '').trim();
   if (sourceId) {
-    const byId = el.querySelector(`.msg.user[data-message-id="${CSS.escape(sourceId)}"]`);
-    if (byId) return byId;
+    return el.querySelector(`.msg.user[data-message-id="${CSS.escape(sourceId)}"]`) || null;
   }
   for (let prev = markerNode.previousElementSibling; prev; prev = prev.previousElementSibling) {
     if (prev.classList?.contains(SEPARATOR_CLASS)) return null;
@@ -2546,8 +2555,12 @@ async function resendStoppedSteer(conversationId, markerId) {
   const payload = sourceNode?.[RESEND_PAYLOAD_KEY] || null;
   const text = String(payload?.text || '').trim();
   const attachments = Array.isArray(payload?.attachments) ? payload.attachments : [];
-  if (!text && !attachments.length) {
+  if (!payload) {
     showTransientRelayNotice('The original message is not loaded — scroll up to it, then try Resend again.');
+    return;
+  }
+  if (!text && !attachments.length) {
+    showTransientRelayNotice('Nothing left to resend: the original message\'s attachments are no longer available.');
     return;
   }
   // Claimed before the first await: this is what makes a double tap a no-op.
@@ -2608,12 +2621,29 @@ async function resendStoppedSteer(conversationId, markerId) {
     }
     if (r.duplicate) {
       dropOptimisticBubble();
-      // Already sent (a Resend from another tab or device): nothing to retry.
-      sent = true;
-      showTransientRelayNotice('That message was already sent again.');
+      if (r.alreadyResent) {
+        // Resent before (another tab or device): nothing to retry.
+        sent = true;
+        showTransientRelayNotice('That message was already resent.');
+        return;
+      }
+      // Another recent message has the same text — not a Resend of this one,
+      // so the button stays available.
+      showTransientRelayNotice('A message with the same text was sent in the last few minutes, so this one was not resent. Try again later.');
       return;
     }
     sent = true;
+    const dropped = Number(payload.unavailableAttachments || 0) + Math.max(0, Number(r.droppedAttachmentCount) || 0);
+    if (dropped > 0) {
+      showTransientRelayNotice(`Resent without ${dropped} attachment${dropped === 1 ? '' : 's'} that ${dropped === 1 ? 'is' : 'are'} no longer available.`, 7000);
+    }
+    if (r.compactedConversationId) {
+      // Auto-compact moved the conversation on, as for any send: follow it
+      // while the user is still looking at this one.
+      await window.refreshConversations?.();
+      if (isCurrentConversation(conversationKey)) await window.openConversation?.(r.compactedConversationId);
+      return;
+    }
     if (cliOnline && isCurrentConversation(conversationKey) && !getActiveTurnForConversation(conversationKey)?.messageId) {
       showThinking(r.messageId || null);
     }
@@ -2960,6 +2990,7 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
       // The continuation badge and the absorbed (steering) merge both hang
       // off kind; a payload differing only in it must not short-circuit.
       kind: String(item?.kind || '').trim(),
+      resentAs: String(item?.resentAs || '').trim(),
       // Without this, a payload that differs from the last render only by a
       // newly linked compaction activity short-circuits below and the break
       // row never appears until some unrelated field changes.

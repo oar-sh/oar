@@ -30,6 +30,7 @@ import {
 import {
   makeRouteDeps as baseRouteDeps,
   captureRoutes,
+  invokeRoute,
   makeApi,
 } from '../routes/messages-routes-test-harness.mjs';
 import { buildConversationMessages } from '../routes/sessions-routes.mjs';
@@ -496,7 +497,7 @@ test('a message sent while a question card is open is requeued penalty-free and 
 });
 
 test('steers cut off by Stop persist kind=stopped and reload with it', async (t) => {
-  const { db, stmts, deps, api, emitted } = bootRelayRoutes();
+  const { db, stmts, deps, api, emitted, captured } = bootRelayRoutes();
   const cwd = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'claude-routes-stopped-'));
   t.after(() => { fsSync.rmSync(cwd, { recursive: true, force: true }); });
 
@@ -572,8 +573,65 @@ test('steers cut off by Stop persist kind=stopped and reload with it', async (t)
     resendOfMessageId: msg2Id,
   });
   assert.equal(resentAgain.duplicate, true, 'a second Resend collides with the first');
+  assert.equal(resentAgain.alreadyResent, true, 'and is refused as a Resend, not as a text coincidence');
+  assert.equal(resentAgain.duplicateOfMessageId, resent.messageId);
+  assert.equal(
+    db.prepare(`SELECT resend_of_message_id FROM messages WHERE id = ?`).get(resent.messageId).resend_of_message_id,
+    msg2Id,
+    'the link is stored on the resent message',
+  );
+
+  // The transcript payload marks the stopped marker as resent — the same fact
+  // the relay refuses on, so it holds across reloads and devices.
+  const markerAfterResend = () => buildConversationMessages({
+    dbMessages: stmts.getMessages.all(CONV),
+    queueRows: db.prepare(`SELECT id, response_message_id, status FROM queue WHERE conversation_id = ?`).all(CONV),
+  }).find((message) => message.id === row2.response_message_id);
+  assert.equal(markerAfterResend()?.resentAs, resent.messageId);
+
+  // Cancelling the queued Resend frees the original for another one.
+  const { body: cancelled } = await invokeRoute(captured, 'POST', '/api/conversation/:conversationId/cancel-queued-turn', {
+    params: { conversationId: CONV },
+    body: { clientId: 'client-stop-1', messageId: resent.messageId },
+  });
+  assert.equal(cancelled.acknowledgement, 'cancelled');
+  assert.equal(markerAfterResend()?.resentAs, undefined);
+  const resentAfterCancel = await api('POST', '/api/message', {
+    clientId: 'client-stop-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent',
+    resendOfMessageId: msg2Id,
+  });
+  assert.notEqual(resentAfterCancel.duplicate, true);
   turn.endInput();
   await settled(runner);
+});
+
+test('a resend link is honored only for the original\'s own text, and never clears the composer draft', async () => {
+  const { db, api } = bootRelayRoutes();
+  const originalId = 'msg-resend-origin';
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES (?, ?, 'user', 'the stopped one', ?)`).run(originalId, CONV, now);
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp, kind, source_message_id) VALUES ('msg-resend-marker', ?, 'assistant', ?, ?, 'stopped', ?)`)
+    .run(CONV, '_(Stopped with the turn — not answered.)_', now, originalId);
+  db.prepare(`UPDATE conversations SET draft_text = 'half-typed next thought' WHERE id = ?`).run(CONV);
+
+  // Different text: an ordinary send, no link — and the ordinary send clears
+  // the draft as always.
+  const other = await api('POST', '/api/message', {
+    clientId: 'client-resend-3', conversationId: CONV, text: 'something else', model: MODEL, relayMode: 'agent',
+    resendOfMessageId: originalId,
+  });
+  assert.equal(db.prepare(`SELECT resend_of_message_id FROM messages WHERE id = ?`).get(other.messageId).resend_of_message_id, null);
+  db.prepare(`UPDATE conversations SET draft_text = 'half-typed next thought' WHERE id = ?`).run(CONV);
+
+  const resent = await api('POST', '/api/message', {
+    clientId: 'client-resend-3', conversationId: CONV, text: 'the stopped one', model: MODEL, relayMode: 'agent',
+    resendOfMessageId: originalId,
+    attachments: [{ sha256: 'c'.repeat(64), name: 'gone.png', type: 'image/png' }],
+  });
+  assert.notEqual(resent.duplicate, true);
+  assert.equal(db.prepare(`SELECT resend_of_message_id FROM messages WHERE id = ?`).get(resent.messageId).resend_of_message_id, originalId);
+  assert.equal(db.prepare(`SELECT draft_text FROM conversations WHERE id = ?`).get(CONV).draft_text, 'half-typed next thought');
+  assert.equal(resent.droppedAttachmentCount, 1, 'an attachment that no longer resolves is reported');
 });
 
 test('a resend link to a message that was not stopped does not bypass the duplicate guard', async () => {

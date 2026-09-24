@@ -10,7 +10,10 @@
  *    their anchor and fell back to response-time ordering: an absorbed
  *    (handed-off) reply then sorted below the steered message it hands off to,
  *    and the merge never applied. Backfilled from whatever queue rows remain.
- * 2. Fold stubs saved as kind='absorbed' become kind='folded'. 'absorbed'
+ * 2. `messages.resend_of_message_id` — on a user message sent with Resend,
+ *    the stopped steer it re-sends. Durable, so "Resent" survives reloads and
+ *    other devices, and the relay can refuse a second Resend of one original.
+ * 3. Fold stubs saved as kind='absorbed' become kind='folded'. 'absorbed'
  *    tells the client the reply continues through the NEXT user message, so
  *    the next ordinary message after a fold was styled as steered.
  *
@@ -46,8 +49,12 @@ export function migrateSteerSettleMarkers(db) {
   if (!columns.has('source_message_id')) {
     db.exec(`ALTER TABLE messages ADD COLUMN source_message_id TEXT`);
     columnAdded = true;
-    columns = columnNames(db, 'messages');
   }
+  if (!columns.has('resend_of_message_id')) {
+    db.exec(`ALTER TABLE messages ADD COLUMN resend_of_message_id TEXT`);
+    columnAdded = true;
+  }
+  if (columnAdded) columns = columnNames(db, 'messages');
   let sourceLinksBackfilled = 0;
   let foldStubsRekinded = 0;
   db.transaction(() => {
