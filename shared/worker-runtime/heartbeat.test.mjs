@@ -48,7 +48,10 @@ test('settle-failed rows ride the heartbeat and the relay’s acknowledgement is
   let timer = null;
   const entry = { id: 'q-9', attemptId: 'a-9', terminalError: { stableCode: 'relay.steer-settle-failed' } };
   const controller = createHeartbeatController({
-    api: async (method, path, body) => { calls.push({ method, path, body }); return { ok: true, settleFailedHandled: ['q-9'] }; },
+    api: async (method, path, body) => {
+      calls.push({ method, path, body });
+      return { ok: true, settleFailedHandled: ['q-9'], settleFailedSkipped: ['q-8'] };
+    },
     pollMs: 60_000,
     getSessionReady: () => true,
     getHeartbeatTimer: () => timer,
@@ -59,5 +62,5 @@ test('settle-failed rows ride the heartbeat and the relay’s acknowledgement is
   });
   await controller.pulseHeartbeat();
   assert.deepEqual(calls[0].body.settleFailed, [entry]);
-  assert.deepEqual(acknowledged, ['q-9']);
+  assert.deepEqual(acknowledged, ['q-9', 'q-8'], 'failed and skipped rows are both released');
 });

@@ -1606,6 +1606,118 @@ test('a continuation already due when the user stops is neither killed nor given
   await settled(runner);
 });
 
+test('a stopped row stays reported to the heartbeat until the interrupt and its publishes land', async () => {
+  // The context closes on the interrupted result, but the row stays
+  // `processing` until the abort ack (sent after interrupt() resolves) lands.
+  // Unreported in that gap, owner recovery failed it with the wrong wording —
+  // or requeued, i.e. re-ran, a row that had produced nothing yet.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  let releaseInterrupt = null;
+  turn.interrupt = () => new Promise((resolve) => { turn.interrupts += 1; releaseInterrupt = resolve; });
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, lifecyclePollMs: 10, stoppedRowLingerMs: 30, stoppedRowLingerMaxMs: 5_000,
+  });
+  const ids = () => runner.getActiveQueueMessageIds().map((entry) => entry.id);
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const aborting = getAbort()();
+  turn.emit({ ...resultMessage('', 'native-1'), is_interrupt: true });
+  assert.equal(await first, true);
+  assert.equal(runner._getProcess().activeCtx, null, 'the context closed on the interrupted result');
+  await tick(80);
+  assert.deepEqual(ids(), ['q-1'], 'still reported while the interrupt has not resolved');
+  assert.equal(runner.getActiveQueueMessageIds()[0].attemptId, 'attempt-1');
+
+  releaseInterrupt();
+  await aborting;
+  await waitFor(() => ids().length === 0, { label: 'released after the linger' });
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a lingering stopped row is released by the cap even if the interrupt never resolves', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  turn.interrupt = () => new Promise(() => { turn.interrupts += 1; });
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, lifecyclePollMs: 10, stoppedRowLingerMs: 10, stoppedRowLingerMaxMs: 80,
+  });
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  void getAbort()();
+  turn.emit({ ...resultMessage('', 'native-1'), is_interrupt: true });
+  assert.equal(await first, true);
+  assert.deepEqual(runner.getActiveQueueMessageIds().map((entry) => entry.id), ['q-1']);
+  await waitFor(() => runner.getActiveQueueMessageIds().length === 0, { label: 'capped' });
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a late Stop on an already-closed turn still opens the guard window', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 60_000, lifecyclePollMs: 10, stopFollowUpWindowMs: 50,
+  });
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer' } }).catch(() => {});
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pushed' });
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+  // The control poller's GET saw the Stop before the result; it lands now.
+  await getAbort()();
+  const guard = runner._getProcess().stopFollowUp;
+  assert.ok(guard, 'the guard is armed for the steer the Stop caught');
+  assert.ok(Number.isFinite(guard.until), 'and its window is open, not left at Infinity');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the un-mark of a stopped steer replayed as its own turn is ordered behind its consumed mark', async () => {
+  let releaseMark = null;
+  const consumedBodies = [];
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/queue-consumed': (body) => {
+        consumedBodies.push(body);
+        if (body.consumed === false) return { ok: true };
+        return new Promise((resolve) => { releaseMark = () => resolve({ ok: true }); });
+      },
+    },
+  });
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 60_000, lifecyclePollMs: 10, stopFollowUpWindowMs: 20,
+  });
+  const [second] = await stopTurnWithSteers(runner, turn, getAbort, ['steer A']);
+  await waitFor(() => releaseMark, { label: 'the consumed mark is in flight' });
+  // The CLI replays the steer as a turn of its own.
+  turn.emit(userReplay('steer A'));
+  await tick(40);
+  assert.deepEqual(consumedBodies.map((body) => body.consumed !== false), [true], 'the un-mark waits for the mark');
+  releaseMark();
+  await waitFor(() => consumedBodies.length === 2, { label: 'the un-mark follows' });
+  assert.equal(consumedBodies[1].consumed, false);
+  turn.emit(resultMessage('the steer’s answer', 'native-1'));
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('the Stop guard still catches the follow-up when finalizing the stopped turn is slow', async () => {
   // The follow-up init is only processed once the stopped turn's finalize
   // returns; with the /usage control request (10 s timeout) and relay POSTs in
@@ -2685,6 +2797,46 @@ test('a provisional adoption absorbed as steering gives the row back instead of 
   turn.emit(resultMessage('answering the second', 'native-1'));
   assert.equal(await second, true);
   assert.equal(answerFor('q-2'), 'answering the second');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a consumed steer is un-marked when its adoption commits, not while it is provisional', { timeout: 15_000 }, async () => {
+  // An unwound provisional adoption puts the row back as a pending steer —
+  // still consumed — so the un-mark must wait for the adoption to commit.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, steeredFoldGraceMs: 60_000 });
+  const unmarks = () => stub.calls.filter((call) => call.routePath === '/api/queue-consumed' && call.body.consumed === false);
+
+  await queueTwoSteersBehindFinishedTurn(runner, turn);
+  const hostResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.deepEqual(hostResponse.body.consumedSteerIds.map((entry) => entry.id), ['q-2', 'q-3']);
+
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await waitFor(() => runner._getProcess().activeCtx?.adoptedFromCompaction === true, { label: 'q-2 provisionally adopted' });
+  assert.equal(unmarks().length, 0, 'nothing un-marked on a provisional attach');
+
+  turn.emit(assistantText('answering q-2 after the compaction'));
+  await waitFor(() => unmarks().length === 1, { label: 'un-marked once the adoption commits' });
+  assert.deepEqual(unmarks()[0].body.entries.map((entry) => entry.id), ['q-2']);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('an unwound provisional adoption leaves the steer marked consumed', { timeout: 15_000 }, async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn, steeredFoldGraceMs: 60_000 });
+  await queueTwoSteersBehindFinishedTurn(runner, turn);
+  turn.emit(compactBoundaryMessage({ preTokens: 614117 }));
+  turn.emit(compactSummaryReplay());
+  await waitFor(() => runner._getProcess().activeCtx?.adoptedFromCompaction === true, { label: 'q-2 provisionally adopted' });
+  turn.emit(phantomResultMessage('native-1'));
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 2, { label: 'unwound back onto the queue' });
+  assert.equal(runner._getProcess().pendingDelivered[0].consumedMarked, true);
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/queue-consumed' && call.body.consumed === false), false);
   turn.endInput();
   await settled(runner);
 });

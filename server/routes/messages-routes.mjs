@@ -4783,6 +4783,7 @@ export function registerMessagesRoutes(app, deps) {
     const requester = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
     const settleFailedHandled = [];
+    const settleFailedSkipped = [];
     const activeQueueMessageId = String(req.body?.activeQueueMessageId || '').trim();
     // A persistent-process worker can hold several live rows at once (the
     // running turn plus a delivered message queued behind it plus a
@@ -4851,9 +4852,16 @@ export function registerMessagesRoutes(app, deps) {
         }
         // Only the worker that owns the row may have it failed, and only in a
         // conversation that worker serves.
-        if (normalizeSessionWorkerId(row.owner_sdk_session_id) !== requesterSessionId) continue;
+        // Anything else is acknowledged as skipped: the worker has no claim on
+        // the row, so it stops reporting it (and releases its hold), and the
+        // row takes the ordinary recovery path — where a consumed mark still
+        // fails it rather than re-running it.
         const rowSession = normalizeSessionWorkerId(stmts.getRuntimeSessionByConversation?.get(row.conversation_id)?.sdk_session_id);
-        if (rowSession !== requesterSessionId && String(row.conversation_id) !== String(requesterConversationForSettle || '')) continue;
+        if (normalizeSessionWorkerId(row.owner_sdk_session_id) !== requesterSessionId
+          || (rowSession !== requesterSessionId && String(row.conversation_id) !== String(requesterConversationForSettle || ''))) {
+          settleFailedSkipped.push(id);
+          continue;
+        }
         const attemptId = String(entry?.attemptId || '').trim() || null;
         if (attemptId && String(row.attempt_id || '') !== attemptId) {
           settleFailedHandled.push(id);
@@ -4884,7 +4892,12 @@ export function registerMessagesRoutes(app, deps) {
     }
     relayBridgeOwnerService?.observe?.(requester);
     const { pendingCount } = queueCounts();
-    res.json({ ok: true, pendingCount, ...(settleFailedHandled.length ? { settleFailedHandled } : {}) });
+    res.json({
+      ok: true,
+      pendingCount,
+      ...(settleFailedHandled.length ? { settleFailedHandled } : {}),
+      ...(settleFailedSkipped.length ? { settleFailedSkipped } : {}),
+    });
   });
 
   // POST /api/queue-consumed — the Claude worker marks rows whose prompt the

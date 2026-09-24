@@ -42,7 +42,12 @@ export function createHeartbeatController({
         ...(settleFailed.length ? { settleFailed } : {}),
       };
       const response = await api("POST", "/api/heartbeat", body);
-      const handled = Array.isArray(response?.settleFailedHandled) ? response.settleFailedHandled : [];
+      // Failed by the relay, or skipped because this worker has no claim on
+      // the row: either way the worker releases it.
+      const handled = [
+        ...(Array.isArray(response?.settleFailedHandled) ? response.settleFailedHandled : []),
+        ...(Array.isArray(response?.settleFailedSkipped) ? response.settleFailedSkipped : []),
+      ];
       if (handled.length) {
         try { onSettleFailedHandled(handled); } catch {}
       }

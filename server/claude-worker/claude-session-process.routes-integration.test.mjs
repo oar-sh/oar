@@ -696,9 +696,11 @@ test('the heartbeat fails the settle-failed rows a worker hands over', async () 
     settleFailed: [{ id: delivered.id, attemptId: delivered.attemptId, terminalError }],
   });
   assert.equal(unowned.settleFailedHandled, undefined);
+  assert.deepEqual(unowned.settleFailedSkipped, [delivered.id], 'acknowledged as skipped so the worker lets go');
   assert.equal(stmts.findQById.get(delivered.id).status, 'processing');
   db.prepare(`UPDATE queue SET owner_sdk_session_id = 'someone-else' WHERE id = ?`).run(delivered.id);
-  await api('POST', '/api/heartbeat', { settleFailed: [{ id: delivered.id, attemptId: delivered.attemptId, terminalError }] });
+  const otherOwner = await api('POST', '/api/heartbeat', { settleFailed: [{ id: delivered.id, attemptId: delivered.attemptId, terminalError }] });
+  assert.deepEqual(otherOwner.settleFailedSkipped, [delivered.id]);
   assert.equal(stmts.findQById.get(delivered.id).status, 'processing');
   db.prepare(`UPDATE queue SET owner_sdk_session_id = ? WHERE id = ?`).run(CONV, delivered.id);
 

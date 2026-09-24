@@ -456,6 +456,11 @@ export function createClaudeSessionRunner({
   // 2.1.281). A turn starting within this window of the Stop — or of the
   // previous suppressed turn's end — is interrupted before it can do anything.
   stopFollowUpWindowMs = 3_000,
+  // How long a stopped turn's row stays reported to the heartbeat after its
+  // interrupt and final publishes resolved (the abort ack is still landing),
+  // and the hard cap on that linger.
+  stoppedRowLingerMs = 5_000,
+  stoppedRowLingerMaxMs = 60_000,
   // False while the connected relay does not understand the `steering-held`
   // hand-back (a worker updated on disk before the relay restarted): a held
   // delivery is then pushed the legacy way instead of being handed back into
@@ -491,6 +496,8 @@ export function createClaudeSessionRunner({
   // id → terminalError for settling rows the worker gave up posting; reported
   // in the heartbeat's `settleFailed` until the relay confirms it failed them.
   const settleFailedTerminals = new Map();
+  // Row id → the latest in-flight /api/queue-consumed POST touching it.
+  const consumedMarkChains = new Map();
 
   async function persistNativeSessionId(conversationId, sessionId) {
     const normalized = String(sessionId || '').trim();
@@ -539,7 +546,7 @@ export function createClaudeSessionRunner({
     const live = proc
       ? [proc.activeCtx?.message, ...proc.pendingDelivered.map((entry) => entry.ctx.message)]
       : [];
-    const entries = live.map((message) => ({
+    const entries = [...live, ...[...lingeringStopped.values()].map((entry) => entry.message)].map((message) => ({
       id: String(message?.id || '').trim(),
       attemptId: message?.attemptId || null,
     }));
@@ -573,15 +580,25 @@ export function createClaudeSessionRunner({
     const rows = entries
       .map((entry) => ({ id: String(entry?.id || '').trim(), attemptId: entry?.attemptId || null }))
       .filter((entry) => entry.id);
-    if (!rows.length) return;
-    api('POST', '/api/queue-consumed', {
+    if (!rows.length) return Promise.resolve();
+    // Per-row ordering: a stopped turn's mark and the un-mark of a steer that
+    // then runs its own turn are separate fire-and-forget POSTs, and must
+    // reach the relay in the order they were decided.
+    const previous = Promise.allSettled(rows.map((row) => consumedMarkChains.get(row.id)).filter(Boolean));
+    const post = previous.then(() => api('POST', '/api/queue-consumed', {
       conversationId: String(conversationId || sdkSessionId || ''),
       entries: rows,
       ...(consumed ? {} : { consumed: false }),
-    }).catch((error) => {
+    })).catch((error) => {
       dbg('consumed mark failed', rows.map((entry) => entry.id).join(','), error?.message || String(error));
     });
+    for (const row of rows) consumedMarkChains.set(row.id, post);
+    post.then(() => {
+      for (const row of rows) if (consumedMarkChains.get(row.id) === post) consumedMarkChains.delete(row.id);
+    });
+    return post;
   }
+
 
   /** Release a settled row — unless it was handed to the relay to fail. */
   function releaseSettling(id) {
@@ -699,18 +716,31 @@ export function createClaudeSessionRunner({
    * back to back can replay out of order, and pairing by position alone would
    * answer each with the other's turn.
    */
-  function attachDeliveredContext(index = 0) {
+  function attachDeliveredContext(index = 0, { provisional = false } = {}) {
     const [entry] = proc.pendingDelivered.splice(index, 1);
     entry.ctx.deliveredEntry = entry;
-    // A steer marked consumed by the turn it was pushed into, now replayed as
-    // a turn of its own: from here it is an ordinary in-flight row, and a
-    // worker death mid-turn must not fail it with "check the reply above".
-    if (entry.consumedMarked) {
-      entry.consumedMarked = false;
-      markConsumed(entry.ctx.message?.conversationId, [entry.ctx.message], { consumed: false });
-    }
+    // A provisional (post-compaction) attach may still be unwound back onto
+    // the queue; its un-mark waits for the adoption to commit.
+    if (!provisional) unmarkConsumedOnOwnTurn(entry);
     activateContext(entry.ctx);
     return entry.ctx;
+  }
+
+  /**
+   * A steer marked consumed by the turn it was pushed into, now running as a
+   * turn of its own: from here it is an ordinary in-flight row, and a worker
+   * death mid-turn must not fail it with "check the reply above".
+   */
+  function unmarkConsumedOnOwnTurn(entry) {
+    if (!entry?.consumedMarked) return;
+    entry.consumedMarked = false;
+    markConsumed(entry.ctx.message?.conversationId, [entry.ctx.message], { consumed: false });
+  }
+
+  /** A provisional post-compaction adoption became final. */
+  function commitAdoption(ctx) {
+    ctx.adoptedFromCompaction = false;
+    unmarkConsumedOnOwnTurn(ctx.deliveredEntry);
   }
 
   /**
@@ -745,6 +775,9 @@ export function createClaudeSessionRunner({
     // not to the row: left set, `finalizeContext` would take its interrupted
     // branch when the row finally runs for real and publish no response at all.
     ctx.interrupted = false;
+    // Nothing will close this context as a stopped turn now, so a Stop guard
+    // armed by that abort opens its window here instead.
+    anchorStopFollowUpWindow();
     controlPoller?.stop?.(ctx.controlState);
     ctx.controlState = null;
     const entry = ctx.deliveredEntry;
@@ -949,7 +982,7 @@ export function createClaudeSessionRunner({
         // this prompt" — after this replay that premise is false, and putting
         // the row back would fail or re-run a message the CLI already took.
         if (signature !== null && signature === proc.activeCtx.deliveredEntry?.expectedText) {
-          proc.activeCtx.adoptedFromCompaction = false;
+          commitAdoption(proc.activeCtx);
           return proc.activeCtx;
         }
         if (signature !== null && isTaskNotificationReplay(sdkMessage)) {
@@ -981,7 +1014,7 @@ export function createClaudeSessionRunner({
         // lifecycle timer a window to reap a context that is already settling.
         if (!sdkMessage?.parent_tool_use_id
           && (type === 'assistant' || type === 'stream_event' || type === 'result')) {
-          proc.activeCtx.adoptedFromCompaction = false;
+          commitAdoption(proc.activeCtx);
         }
       }
       return proc.activeCtx;
@@ -1021,7 +1054,7 @@ export function createClaudeSessionRunner({
         && Date.now() < proc.compactReplayUntil
         && isCompactionReplayCandidate(sdkMessage)
       ) {
-        const ctx = attachDeliveredContext();
+        const ctx = attachDeliveredContext(0, { provisional: true });
         // Provisional: the summary row alone cannot rule out a continuation
         // whose notification replays after it (see the hand-back above).
         ctx.adoptedFromCompaction = true;
@@ -1119,9 +1152,8 @@ export function createClaudeSessionRunner({
       // would otherwise sit in front of it. Same shape as the per-turn
       // runner's abort path otherwise: surface what streamed, let the
       // server-side abort control own the queue row's fate.
-      closeContext(ctx, true);
       markConsumed(ctx.message?.conversationId, consumedSteerIds);
-      void (async () => {
+      const publishChain = (async () => {
         await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
         const [contextUsage, planUsage] = await Promise.all([
           readContextUsageImpl(turnRef, dbg),
@@ -1132,6 +1164,8 @@ export function createClaudeSessionRunner({
         await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model: procModel, sdkSessionId });
         await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId });
       })().catch((error) => dbg('stopped-turn publish failed', error?.message || String(error)));
+      lingerStoppedRow(ctx, publishChain);
+      closeContext(ctx, true);
       return;
     }
 
@@ -1212,10 +1246,7 @@ export function createClaudeSessionRunner({
     // The Stop guard's window runs from the stopped turn's END: the CLI opens
     // its follow-up right after the interrupted result, and anything slow in
     // between must not eat the window.
-    if (ctx.interrupted && proc?.stopFollowUp && !proc.stopFollowUp.anchored) {
-      proc.stopFollowUp.anchored = true;
-      proc.stopFollowUp.until = Date.now() + stopFollowUpWindowMs;
-    }
+    if (ctx.interrupted) anchorStopFollowUpWindow();
     detachActiveContext(ctx);
     ctx.resolveDone?.(handled);
     evaluateLifecycle();
@@ -1307,7 +1338,51 @@ export function createClaudeSessionRunner({
     closeContext(ctx, true);
   }
 
-  async function interruptActiveTurn(ctx) {
+  function anchorStopFollowUpWindow() {
+    if (!proc?.stopFollowUp || proc.stopFollowUp.anchored) return;
+    proc.stopFollowUp.anchored = true;
+    proc.stopFollowUp.until = Date.now() + stopFollowUpWindowMs;
+  }
+
+  /**
+   * The stopped turn's row until the Stop has fully landed: the context closes
+   * on the interrupted result, but the row stays `processing` until the
+   * control poller's abort ack reaches the relay — sent only after the
+   * interrupt call resolves, which races that result. Reported to the
+   * heartbeat meanwhile, or an owner-heartbeat recovery in the gap fails a
+   * streamed row with the wrong wording, or requeues (re-runs) one that
+   * produced nothing yet.
+   */
+  const lingeringStopped = new Map();
+
+  function lingerStoppedRow(ctx, publishChain) {
+    const id = String(ctx.message?.id || '').trim();
+    if (!id || ctx.kind !== 'delivered') return;
+    const token = {};
+    lingeringStopped.set(id, { message: ctx.message, token });
+    const release = () => {
+      if (lingeringStopped.get(id)?.token === token) lingeringStopped.delete(id);
+    };
+    const cap = setTimeout(release, stoppedRowLingerMaxMs);
+    cap.unref?.();
+    Promise.allSettled([publishChain, ctx.interruptDone || Promise.resolve()])
+      // The ack POST starts right after the interrupt resolves; give it time.
+      .then(() => new Promise((resolve) => {
+        const timer = setTimeout(resolve, stoppedRowLingerMs);
+        timer.unref?.();
+      }))
+      .then(() => {
+        clearTimeout(cap);
+        release();
+      });
+  }
+
+  function interruptActiveTurn(ctx) {
+    ctx.interruptDone = runInterrupt(ctx);
+    return ctx.interruptDone;
+  }
+
+  async function runInterrupt(ctx) {
     ctx.interrupted = true;
     // Steers already pushed into the turn being stopped went with it: if the
     // CLI does not open a turn of its own for one, it settles as 'stopped',
@@ -1335,6 +1410,10 @@ export function createClaudeSessionRunner({
         standDown: isContinuationImminent(),
       };
     }
+    // A late abort (the control poller does not re-check after its GET) can
+    // land on a context that has already closed: nothing will anchor the
+    // window at close, so it opens now.
+    if (ctx.finalized || ctx !== proc?.activeCtx) anchorStopFollowUpWindow();
     syncDeliveryReadiness();
     try {
       await proc.turn.interrupt();
