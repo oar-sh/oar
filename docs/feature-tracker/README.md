@@ -1,6 +1,6 @@
 # SDK Feature Tracker
 
-Updated: 2026-09-20
+Updated: 2026-09-24
 Scope: `server/` + `server/claude-worker/` + `.github/extensions/web-relay/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
@@ -67,6 +67,11 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-09-24: `@anthropic-ai/claude-agent-sdk` → 0.3.281 (bundled Claude Code 2.1.281) for
+  **Claude Opus 5.5** (`claude-opus-5-5`, now the SDK's `default`/`opus[1m]` alias). Discovery
+  (`refreshClaudeProviderModels` → `supportedModels()`) always runs the SDK-bundled CLI, so a
+  standalone `claude update` never surfaces a new model on its own; an npm bump plus relay restart
+  does.
 - 2026-09-20: **Multi-steering** — the per-turn steer cap on Claude conversations is gone
   (unbounded, Claude Code parity), and the composer never doubles as Stop anymore: "Steer" only with
   a live turn plus draft, disabled while steering is held (question card / plan approval, compaction,
