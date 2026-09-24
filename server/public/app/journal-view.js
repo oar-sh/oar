@@ -36,7 +36,7 @@ import {
   loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
-import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft } from './conversation-view.js';
+import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, abandonConversationDraftSwitch } from './conversation-view.js';
 import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { mergeConversationPreviews } from './preview-cards.mjs';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
@@ -450,6 +450,9 @@ export async function openConversation(id, options = {}) {
     await flushConversationDraft(previousConversationId);
     window.clearImageEditTarget?.();
   }
+  if (nextConversationId && previousConversationId !== nextConversationId) {
+    beginConversationDraftSwitch(nextConversationId);
+  }
   const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);
   if (repoBrowserState.activeRoot === 'workspace') {
@@ -508,6 +511,7 @@ export async function openConversation(id, options = {}) {
       });
     }
   } else {
+    abandonConversationDraftSwitch(id);
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
     renderMessages([]);

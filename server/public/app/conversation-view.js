@@ -92,6 +92,7 @@ import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
 import {
+  DRAFT_SYNC_PROTOCOL_VERSION,
   draftAttachmentsKey,
   getSyncedDraft,
   isDraftSaveNoop,
@@ -517,6 +518,7 @@ export function syncComposerButtonState() {
 // saved (debounced) as well as the button refreshed.
 export function syncComposerAfterUserEdit() {
   syncSendButtonState();
+  if (isAwaitingDraftHydrate(currentConvId)) return;
   void scheduleConversationDraftSave({
     conversationId: currentConvId,
     draftText: document.getElementById('msg-input')?.value || '',
@@ -543,6 +545,37 @@ function isDraftOwnedByPendingSend(conversationId) {
 function isDraftSavePending(conversationId) {
   const id = String(conversationId || '').trim();
   return draftSaveTimerByConversation.has(id) || draftSavePromiseByConversation.has(id);
+}
+
+// Conversation whose composer was just emptied by a switch and whose draft has
+// not arrived yet. Until it does, text in the composer cannot be told apart
+// from the previous conversation's, so edits are not saved.
+let draftHydrateAwaitedConversationId = '';
+
+function isAwaitingDraftHydrate(conversationId) {
+  const id = String(conversationId || '').trim();
+  return !!id && id === draftHydrateAwaitedConversationId;
+}
+
+/**
+ * Called by openConversation after the previous conversation's draft was
+ * flushed and before the next one loads: empties the composer (which still
+ * holds the previous conversation's, or the blank new-chat view's, text) so
+ * no later blur, keystroke or flush can save that text under the next
+ * conversation.
+ */
+export function beginConversationDraftSwitch(nextConversationId) {
+  draftHydrateAwaitedConversationId = String(nextConversationId || '').trim();
+  const input = document.getElementById('msg-input');
+  if (input && input.value) {
+    input.value = '';
+    autoResize(input);
+  }
+}
+
+/** The switched-to conversation failed to load: stop holding its saves back. */
+export function abandonConversationDraftSwitch(conversationId) {
+  if (isAwaitingDraftHydrate(conversationId)) draftHydrateAwaitedConversationId = '';
 }
 
 // Omitted version fields keep their current values: a local edit changes the
@@ -580,7 +613,7 @@ function upsertConversationDraftState(conversationId, {
  */
 export function persistComposerAttachments() {
   const id = String(currentConvId || '').trim();
-  if (!id) return null;
+  if (!id || isAwaitingDraftHydrate(id)) return null;
   return scheduleConversationDraftSave({
     conversationId: id,
     draftText: document.getElementById('msg-input')?.value || '',
@@ -609,6 +642,7 @@ function sendConversationDraft(conversationId, text, draftAttachments, baseDraft
   return updateConversationDraftApi(conversationId, {
     draftText: text,
     clientId: CLIENT_ID,
+    draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION,
     baseDraftUpdatedAt,
     ...(draftAttachments === undefined ? {} : { draftAttachments }),
   });
@@ -629,16 +663,7 @@ function acknowledgeSavedDraft(conversationId, response, sentText) {
   });
 }
 
-function adoptServerDraft(conversationId, {
-  draftText = '',
-  draftAttachments = undefined,
-  draftUpdatedAt = null,
-  draftUpdatedByClientId = null,
-} = {}) {
-  const text = String(draftText || '');
-  clearDraftTimerForConversation(conversationId);
-  recordSyncedDraft(conversationId, { text, attachments: draftAttachments, updatedAt: draftUpdatedAt });
-  upsertConversationDraftState(conversationId, { draftText: text, draftAttachments, draftUpdatedAt, draftUpdatedByClientId });
+function applyDraftToComposer(conversationId, text, draftAttachments = undefined) {
   if (!isCurrentConversation(conversationId)) return;
   if (Array.isArray(draftAttachments)) {
     const hydrated = hydrateDraftAttachments(draftAttachments);
@@ -652,23 +677,71 @@ function adoptServerDraft(conversationId, {
   syncSendButtonState();
 }
 
-function restoreConversationDraftText(conversationId, text) {
-  const id = String(conversationId || '').trim();
-  if (!id) return;
-  const input = document.getElementById('msg-input');
-  if (input && isCurrentConversation(id)) {
-    input.value = text;
-    autoResize(input);
-    syncSendButtonState();
-  }
-  void scheduleConversationDraftSave({ conversationId: id, draftText: text, immediate: true });
+function adoptServerDraft(conversationId, {
+  draftText = '',
+  draftAttachments = undefined,
+  draftUpdatedAt = null,
+  draftUpdatedByClientId = null,
+} = {}) {
+  const text = String(draftText || '');
+  clearDraftTimerForConversation(conversationId);
+  recordSyncedDraft(conversationId, { text, attachments: draftAttachments, updatedAt: draftUpdatedAt });
+  upsertConversationDraftState(conversationId, { draftText: text, draftAttachments, draftUpdatedAt, draftUpdatedByClientId });
+  applyDraftToComposer(conversationId, text, draftAttachments);
 }
 
-function offerDraftRestore(conversationId, losingText) {
-  showTransientRelayNotice('Your edit replaced a newer draft from another device.', 12000, {
-    actionLabel: 'Restore',
-    onAction: () => restoreConversationDraftText(conversationId, losingText),
+// The draft that lost the last conflict, per conversation, so it can be put
+// back. It lives outside the toast: a later notice may cover the toast, and
+// the action reads the slot when tapped. Cleared when the draft is sent.
+const restorableDraftByConversation = new Map();
+
+function draftHasContent({ text = '', attachments = undefined } = {}) {
+  return !!String(text || '').trim() || (Array.isArray(attachments) && attachments.length > 0);
+}
+
+function currentComposerDraft(conversationId) {
+  if (isCurrentConversation(conversationId)) {
+    return {
+      text: String(document.getElementById('msg-input')?.value || ''),
+      attachments: serializeDraftAttachments(selectedAttachments),
+    };
+  }
+  const conversation = conversations[conversationId] || {};
+  return {
+    text: String(conversation.draftText || ''),
+    attachments: Array.isArray(conversation.draftAttachments) ? conversation.draftAttachments : [],
+  };
+}
+
+function offerRestorableDraft(conversationId, message, actionLabel) {
+  showTransientRelayNotice(message, 20000, {
+    actionLabel,
+    onAction: () => swapRestorableDraft(conversationId),
   });
+}
+
+function keepLosingDraft(conversationId, losingDraft) {
+  if (!draftHasContent(losingDraft)) return;
+  restorableDraftByConversation.set(String(conversationId || '').trim(), losingDraft);
+  offerRestorableDraft(conversationId, 'Your edit replaced a newer draft from another device.', 'Restore');
+}
+
+// Restore is a swap: the draft it replaces takes the slot, so the offer can
+// always be reversed.
+function swapRestorableDraft(conversationId) {
+  const id = String(conversationId || '').trim();
+  const restored = restorableDraftByConversation.get(id);
+  if (!restored) return;
+  restorableDraftByConversation.set(id, currentComposerDraft(id));
+  const text = String(restored.text || '');
+  applyDraftToComposer(id, text, restored.attachments);
+  void scheduleConversationDraftSave({
+    conversationId: id,
+    draftText: text,
+    draftAttachments: Array.isArray(restored.attachments) ? restored.attachments : undefined,
+    immediate: true,
+  });
+  offerRestorableDraft(id, 'Draft restored.', 'Undo');
 }
 
 // A 409 means another client saved since this one's base version. The local
@@ -707,17 +780,17 @@ async function resolveDraftSaveConflict(id, { text, draftAttachments, synced, co
   const retry = await sendConversationDraft(id, localText, localAttachments, conflict.draftUpdatedAt || null);
   if (retry?.ok) {
     acknowledgeSavedDraft(id, retry, localText);
-    if (serverText.trim() && serverText !== localText) offerDraftRestore(id, serverText);
+    const localKey = draftAttachmentsKey(localAttachments);
+    const lostSomething = serverText !== localText
+      || (localKey !== null && localKey !== draftAttachmentsKey(serverAttachments));
+    if (lostSomething) keepLosingDraft(id, { text: serverText, attachments: serverAttachments });
     return retry;
   }
-  // Lost a second race: take the newer version as the base so the next edit
-  // saves over it, rather than retrying in a loop.
+  // Lost a second race. The base stays at the first conflict's version, so the
+  // retry scheduled here conflicts again and resolves (with its restore offer)
+  // through this same path instead of leaving the edit unsaved.
   if (isDraftVersionConflict(retry)) {
-    recordSyncedDraft(id, {
-      text: String(retry.draftText || ''),
-      attachments: retry.draftAttachments,
-      updatedAt: retry.draftUpdatedAt || null,
-    });
+    void scheduleConversationDraftSave({ conversationId: id, draftText: localText, draftAttachments: localAttachments });
   }
   return retry || null;
 }
@@ -728,7 +801,12 @@ async function persistConversationDraft(conversationId, draftText, draftAttachme
   const text = String(draftText || '');
   const runPersist = async () => {
     const synced = getSyncedDraft(id);
-    if (!force && isDraftSaveNoop({ synced, text, attachmentsKey: draftAttachmentsKey(draftAttachments) })) {
+    if (!force && isDraftSaveNoop({
+      synced,
+      text,
+      attachmentsKey: draftAttachmentsKey(draftAttachments),
+      knownUpdatedAt: conversations[id]?.draftUpdatedAt || null,
+    })) {
       return { ok: true, skipped: true, conversationId: id, draftText: synced.text, draftUpdatedAt: synced.updatedAt };
     }
     const response = await sendConversationDraft(id, text, draftAttachments, draftSaveBaseVersion(id));
@@ -780,7 +858,7 @@ async function scheduleConversationDraftSave({
 
 export async function flushConversationDraft(conversationId = currentConvId) {
   const id = String(conversationId || '').trim();
-  if (!id) return null;
+  if (!id || isAwaitingDraftHydrate(id)) return null;
   const input = document.getElementById('msg-input');
   const draftText = String((id === String(currentConvId || '').trim() && input) ? input.value : (conversations[id]?.draftText || ''));
   return scheduleConversationDraftSave({
@@ -788,6 +866,44 @@ export async function flushConversationDraft(conversationId = currentConvId) {
     draftText,
     immediate: true,
   });
+}
+
+// Shared tail of both incoming-draft paths (conversation load/poll and the
+// cross-client broadcast) for the conversation on screen.
+function reconcileIncomingComposerDraft(id, incoming) {
+  const input = document.getElementById('msg-input');
+  if (!input) return;
+  if (isAwaitingDraftHydrate(id)) {
+    draftHydrateAwaitedConversationId = '';
+    if (input.value && input.value !== incoming.text) {
+      // Typed into the just-opened composer before its draft arrived: the
+      // typing is the newest edit, and the server draft it displaces is kept
+      // for restore.
+      recordSyncedDraft(id, incoming);
+      keepLosingDraft(id, { text: incoming.text, attachments: incoming.attachments });
+      void scheduleConversationDraftSave({ conversationId: id, draftText: input.value });
+      syncSendButtonState();
+      return;
+    }
+  } else if (!shouldApplyIncomingDraftToComposer({
+    inputText: input.value,
+    incomingText: incoming.text,
+    syncedText: getSyncedDraft(id)?.text ?? null,
+  })) {
+    // An unsaved local edit (typing, or a flush that failed). Re-save it so
+    // the version check decides: the same version saves, a newer one conflicts.
+    if (!isDraftSavePending(id)) {
+      void scheduleConversationDraftSave({ conversationId: id, draftText: input.value });
+    }
+    syncSendButtonState();
+    return;
+  }
+  recordSyncedDraft(id, incoming);
+  if (input.value !== incoming.text) {
+    input.value = incoming.text;
+    autoResize(input);
+  }
+  syncSendButtonState();
 }
 
 export function hydrateConversationDraft(conversationId, {
@@ -804,7 +920,11 @@ export function hydrateConversationDraft(conversationId, {
   const normalizedAttachments = Array.isArray(draftAttachments) ? draftAttachments : [];
   const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
   const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
-  if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
+  if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) {
+    // The conversation's own load still ends the switch hold.
+    abandonConversationDraftSwitch(id);
+    return;
+  }
   upsertConversationDraftState(id, {
     draftText: normalizedDraftText,
     draftAttachments: normalizedAttachments,
@@ -820,24 +940,7 @@ export function hydrateConversationDraft(conversationId, {
   if (!draftAttachmentsEqual(selectedAttachments, hydrateDraftAttachments(normalizedAttachments))) {
     setComposerAttachments(hydrateDraftAttachments(normalizedAttachments));
   }
-  const input = document.getElementById('msg-input');
-  if (!input) return;
-  if (!shouldApplyIncomingDraftToComposer({
-    isFocused: document.activeElement === input,
-    inputText: input.value,
-    incomingText: normalizedDraftText,
-    syncedText: getSyncedDraft(id)?.text ?? null,
-    savePending: isDraftSavePending(id),
-  })) {
-    syncSendButtonState();
-    return;
-  }
-  recordSyncedDraft(id, syncedDraft);
-  if (input.value !== normalizedDraftText) {
-    input.value = normalizedDraftText;
-    autoResize(input);
-  }
-  syncSendButtonState();
+  reconcileIncomingComposerDraft(id, syncedDraft);
 }
 
 export function applyIncomingConversationDraftUpdate({
@@ -879,21 +982,7 @@ export function applyIncomingConversationDraftUpdate({
     });
     if (merged.changed) setComposerAttachments(merged.attachments);
   }
-  const input = document.getElementById('msg-input');
-  if (!input) return;
-  if (!shouldApplyIncomingDraftToComposer({
-    isFocused: document.activeElement === input,
-    inputText: input.value,
-    incomingText: incomingDraftText,
-    syncedText: getSyncedDraft(id)?.text ?? null,
-    savePending: isDraftSavePending(id),
-  })) return;
-  recordSyncedDraft(id, syncedDraft);
-  if (input.value !== incomingDraftText) {
-    input.value = incomingDraftText;
-    autoResize(input);
-  }
-  syncSendButtonState();
+  reconcileIncomingComposerDraft(id, syncedDraft);
 }
 
 function setConversationTurnState(conversationId, state = null) {
@@ -3124,16 +3213,20 @@ export async function sendMessage() {
     }
     const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
     if (persistedConversationId) {
+      restorableDraftByConversation.delete(persistedConversationId);
       // Forced: the send transaction already moved the server's version, and
-      // this round trip is how the client learns it (a 409 carries it).
+      // this round trip is how the client learns it (a 409 carries it). What
+      // is saved is the composer as it is now — the user may already have
+      // typed the next message while this one was sending.
+      const postSendText = viewingSendConversation() ? String(input.value || '') : '';
       const clearedDraft = await scheduleConversationDraftSave({
         conversationId: persistedConversationId,
-        draftText: '',
+        draftText: postSendText,
         immediate: true,
         force: true,
       });
       upsertConversationDraftState(persistedConversationId, {
-        draftText: '',
+        draftText: postSendText,
         // Prefer the server's version pointer (a 409 carries the one the send
         // transaction wrote when it cleared the draft) over this client's
         // clock: once the send releases the draft, every later refresh is

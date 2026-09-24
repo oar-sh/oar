@@ -5,6 +5,12 @@
 // draft save is checked against, so it must never be touched by a local edit.
 
 import { serializeDraftAttachments } from './composer-attachment-cache.mjs';
+import { normalizeDraftTimestampMs } from './conversation-draft-timestamp-utils.mjs';
+
+// Sent with every draft save. It is what lets the server conflict-check an
+// explicit null base: clients from before this protocol also send null (JSON
+// keeps it), and for them null has to keep meaning "unconditional".
+export const DRAFT_SYNC_PROTOCOL_VERSION = 2;
 
 const syncedDraftsByConversation = new Map();
 
@@ -48,10 +54,14 @@ export function forgetSyncedDraft(conversationId) {
 
 /**
  * A save is a no-op when the server already holds exactly this text (and,
- * for saves that carry attachments, exactly these attachments).
+ * for saves that carry attachments, exactly these attachments) — but only
+ * while no newer server version is known. If one is (a remote draft deferred
+ * while the user typed), the save must still go out so its version check
+ * surfaces that draft instead of silently keeping a stale base.
  */
-export function isDraftSaveNoop({ synced = null, text = '', attachmentsKey = null } = {}) {
+export function isDraftSaveNoop({ synced = null, text = '', attachmentsKey = null, knownUpdatedAt = null } = {}) {
   if (!synced) return false;
+  if (normalizeDraftTimestampMs(knownUpdatedAt) > normalizeDraftTimestampMs(synced.updatedAt)) return false;
   if (String(text || '') !== synced.text) return false;
   if (attachmentsKey === null) return true;
   return synced.attachmentsKey !== null && attachmentsKey === synced.attachmentsKey;
@@ -82,22 +92,42 @@ export function resolveDraftConflict({
 
 /**
  * Whether an incoming remote draft may replace the composer text of the
- * conversation on screen. An unmodified composer (text still equal to the last
- * synced draft) always adopts, focused or not — an idle focused composer must
- * never hold on to stale text it would later save back. A modified one keeps
- * its text while focused or while its own save is pending; that save's
- * version check then resolves the conflict.
+ * conversation on screen. Only an unmodified composer (text still equal to the
+ * last synced draft) adopts it, focused or not. A modified one never does —
+ * not even for an equal or newer version: its edit is unsaved (a failed flush
+ * leaves exactly this state), and the caller re-saves it so the version check
+ * decides. With nothing synced yet there is no local edit to protect.
  */
 export function shouldApplyIncomingDraftToComposer({
-  isFocused = false,
   inputText = '',
   incomingText = '',
   syncedText = null,
-  savePending = false,
 } = {}) {
   const current = String(inputText || '');
   if (current === String(incomingText || '')) return true;
-  if (syncedText !== null && current === syncedText) return true;
-  if (isFocused) return false;
-  return !savePending;
+  if (syncedText === null) return true;
+  return current === syncedText;
+}
+
+/**
+ * PATCH body for the pagehide Background Sync copy of a draft flush, or null
+ * when the composer holds nothing unsaved. Compared against the synced draft,
+ * not the local text (which every keystroke updates).
+ */
+export function draftFlushRequestBody({
+  inputText = '',
+  synced = null,
+  fallbackText = '',
+  fallbackUpdatedAt = null,
+  clientId = null,
+} = {}) {
+  const draftText = String(inputText || '');
+  const serverText = synced ? synced.text : String(fallbackText || '');
+  if (draftText === serverText) return null;
+  return {
+    draftText,
+    clientId,
+    draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION,
+    baseDraftUpdatedAt: (synced ? synced.updatedAt : fallbackUpdatedAt) || null,
+  };
 }

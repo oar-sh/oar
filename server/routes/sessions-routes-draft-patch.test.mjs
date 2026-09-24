@@ -9,9 +9,11 @@ import { createSessionWorkerRegistry } from '../services/session-worker-registry
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 
 // Route-level coverage for PATCH /api/conversation/:id/draft's version check.
-// An explicit `baseDraftUpdatedAt: null` means "this client has seen no draft"
-// and must conflict with a versioned server draft; only an absent field (a
-// legacy client) skips the check.
+// From a client that declares the versioned protocol (draftSyncVersion: 2),
+// an explicit `baseDraftUpdatedAt: null` means "this client has seen no draft"
+// and must conflict with a versioned server draft. Older tabs send that same
+// explicit null after every keystroke, so without the marker (or with no base
+// at all) the save stays unconditional.
 
 function createMockApp() {
   const routes = new Map();
@@ -132,7 +134,7 @@ test('an explicit null base conflicts with a versioned server draft and leaves i
   const { patchDraft, insertConversation, readDraft, emitted } = setup();
   insertConversation('conv-null-base', { draftText: 'typed on the phone', draftUpdatedAt: SERVER_VERSION });
 
-  const response = await patchDraft('conv-null-base', { draftText: '', clientId: 'laptop', baseDraftUpdatedAt: null });
+  const response = await patchDraft('conv-null-base', { draftText: '', clientId: 'laptop', draftSyncVersion: 2, baseDraftUpdatedAt: null });
 
   assert.equal(response.status, 409);
   assert.equal(response.body.code, 'draft-version-conflict');
@@ -147,7 +149,7 @@ test('the snake_case null base is conflict-checked the same way', async () => {
   const { patchDraft, insertConversation } = setup();
   insertConversation('conv-snake', { draftText: 'kept', draftUpdatedAt: SERVER_VERSION });
 
-  const response = await patchDraft('conv-snake', { draftText: 'x', base_draft_updated_at: null });
+  const response = await patchDraft('conv-snake', { draftText: 'x', draftSyncVersion: 2, base_draft_updated_at: null });
 
   assert.equal(response.status, 409);
 });
@@ -156,7 +158,7 @@ test('an explicit null base saves when the server has never versioned a draft', 
   const { patchDraft, insertConversation, readDraft } = setup();
   insertConversation('conv-fresh');
 
-  const response = await patchDraft('conv-fresh', { draftText: 'first words', clientId: 'laptop', baseDraftUpdatedAt: null });
+  const response = await patchDraft('conv-fresh', { draftText: 'first words', clientId: 'laptop', draftSyncVersion: 2, baseDraftUpdatedAt: null });
 
   assert.equal(response.status, 200);
   assert.equal(response.body.ok, true);
@@ -174,6 +176,32 @@ test('a matching base saves; a stale base conflicts', async () => {
   const current = await patchDraft('conv-versioned', { draftText: 'v2', baseDraftUpdatedAt: SERVER_VERSION });
   assert.equal(current.status, 200);
   assert.equal(readDraft('conv-versioned').draft_text, 'v2');
+});
+
+test('an old tab\'s request shape (explicit null base, no protocol marker) still saves unconditionally', async () => {
+  const { patchDraft, insertConversation, readDraft } = setup();
+  insertConversation('conv-old-tab', { draftText: 'server text', draftUpdatedAt: SERVER_VERSION });
+
+  // Exactly what pre-versioning clients send: JSON keeps the null.
+  const response = await patchDraft('conv-old-tab', JSON.parse(JSON.stringify({
+    draftText: 'typed in an old tab',
+    clientId: 'old-tab',
+    baseDraftUpdatedAt: null,
+  })));
+
+  assert.equal(response.status, 200, 'an old tab must not be 409ed into reverting its typing');
+  assert.equal(readDraft('conv-old-tab').draft_text, 'typed in an old tab');
+});
+
+test('an old tab\'s non-null base is still version-checked, as before', async () => {
+  const { patchDraft, insertConversation } = setup();
+  insertConversation('conv-old-stale', { draftText: 'server text', draftUpdatedAt: SERVER_VERSION });
+
+  const response = await patchDraft('conv-old-stale', {
+    draftText: 'stale', clientId: 'old-tab', baseDraftUpdatedAt: '2026-09-24T10:00:00.000Z',
+  });
+
+  assert.equal(response.status, 409);
 });
 
 test('an absent base (legacy client) still saves unconditionally', async () => {

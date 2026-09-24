@@ -1420,6 +1420,252 @@ test('draft sync: a conflict against an unchanged composer silently adopts the s
   resetComposer('');
 });
 
+function latestToastAction() {
+  const actions = getById('relay-toast').children.filter((child) => child.className === 'relay-toast-action');
+  return actions.at(-1) || null;
+}
+
+function conflictPayload(text, version, attachments = []) {
+  return { ok: false, conflict: true, code: 'draft-version-conflict', draftText: text, draftAttachments: attachments, draftUpdatedAt: version };
+}
+
+test('draft sync: Restore is a swap that can be undone', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'base text', SERVER_DRAFT_V1);
+  let patchCount = 0;
+  fetchHandler = async (url, opts) => {
+    if (!url.includes(`/api/conversation/${convId}/draft`)) throw new Error(`unexpected fetch: ${url}`);
+    patchCount += 1;
+    if (patchCount === 1) return conflictPayload('phone text', SERVER_DRAFT_V2);
+    const body = JSON.parse(opts.body);
+    return { ok: true, draftText: body.draftText, draftAttachments: [], draftUpdatedAt: new Date(Date.now() + patchCount * 1000).toISOString() };
+  };
+  getById('msg-input').value = 'laptop text';
+  await view.flushConversationDraft(convId);
+
+  latestToastAction().listeners.click[0]();
+  await settle();
+  assert.equal(getById('msg-input').value, 'phone text');
+  const undo = latestToastAction();
+  assert.equal(undo.textContent, 'Undo', 'the restore offers its own reversal');
+  undo.listeners.click[0]();
+  await settle();
+  assert.equal(getById('msg-input').value, 'laptop text', 'Undo brings the winning edit back');
+  assert.equal(draftPatches(convId).at(-1).draftText, 'laptop text', 'and saves it');
+  resetComposer('');
+});
+
+test('draft sync: an attachment-only losing draft is still offered back', async () => {
+  const convId = nextId('conv-sync');
+  const laptopShot = { sha256: 'a'.repeat(64), name: 'laptop.png', type: 'image/png', size: 10 };
+  conversations[convId] = { id: convId, title: 'Sync' };
+  setCurrentConv(convId);
+  resetComposer('');
+  view.hydrateConversationDraft(convId, { draftText: 'caption', draftAttachments: [laptopShot], draftUpdatedAt: SERVER_DRAFT_V1 });
+  const phoneShot = [{ sha256: 'c'.repeat(64), name: 'phone.png', type: 'image/png', size: 10 }];
+  getById('relay-toast').children = [];
+  let patchCount = 0;
+  fetchHandler = async (url, opts) => {
+    patchCount += 1;
+    if (patchCount === 1) return conflictPayload('caption', SERVER_DRAFT_V2, phoneShot);
+    const body = JSON.parse(opts.body);
+    return { ok: true, draftText: body.draftText, draftAttachments: body.draftAttachments ?? [], draftUpdatedAt: new Date(Date.now() + 5000).toISOString() };
+  };
+  // The laptop removes its screenshot while the phone swapped in another one.
+  store.selectedAttachments.length = 0;
+  await view.persistComposerAttachments();
+
+  const restore = latestToastAction();
+  assert.ok(restore, 'the phone\'s screenshot can be restored');
+  restore.listeners.click[0]();
+  await settle();
+  assert.deepEqual(
+    draftPatches(convId).at(-1).draftAttachments.map((row) => row.sha256),
+    [phoneShot[0].sha256],
+    'Restore saves the losing attachments too',
+  );
+  resetComposer('');
+});
+
+test('draft sync: a plain notice over the Restore toast hands the toast back', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'base', SERVER_DRAFT_V1);
+  getById('relay-toast').children = [];
+  let patchCount = 0;
+  fetchHandler = async (url, opts) => {
+    patchCount += 1;
+    if (patchCount === 1) return conflictPayload('theirs', SERVER_DRAFT_V2);
+    return { ok: true, draftText: JSON.parse(opts.body).draftText, draftAttachments: [], draftUpdatedAt: new Date(Date.now() + 5000).toISOString() };
+  };
+  getById('msg-input').value = 'mine';
+  await view.flushConversationDraft(convId);
+  const toast = getById('relay-toast');
+  assert.ok(toast.classList.contains('has-action'));
+
+  store.showTransientRelayNotice('Something unrelated happened.', 1500);
+  assert.ok(!toast.classList.contains('has-action'), 'the plain notice covers the toast');
+  await new Promise((resolve) => setTimeout(resolve, 1600));
+  assert.ok(toast.classList.contains('has-action'), 'the Restore toast comes back afterwards');
+  latestToastAction().listeners.click[0]();
+  await settle();
+  assert.equal(getById('msg-input').value, 'theirs', 'and still restores the losing draft');
+  resetComposer('');
+});
+
+test('draft sync: a refresh after a failed save never reverts the unsaved edit, and the edit is re-saved', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'saved text', SERVER_DRAFT_V1);
+  let online = false;
+  fetchHandler = async (url, opts) => {
+    if (!online) throw new Error('relay restarting');
+    return { ok: true, draftText: JSON.parse(opts.body).draftText, draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V2 };
+  };
+  fetchLog.length = 0;
+
+  // The blur flush dies with the relay.
+  getById('msg-input').value = 'saved text plus an unsaved edit';
+  await view.flushConversationDraft(convId);
+  online = true;
+
+  // Reconnect/foreground refresh: the same, older server draft comes back.
+  view.hydrateConversationDraft(convId, {
+    draftText: 'saved text',
+    draftAttachments: [],
+    draftUpdatedAt: SERVER_DRAFT_V1,
+    draftUpdatedByClientId: 'other-device',
+  });
+  assert.equal(getById('msg-input').value, 'saved text plus an unsaved edit', 'the edit is not reverted');
+
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const retried = draftPatches(convId).at(-1);
+  assert.equal(retried.draftText, 'saved text plus an unsaved edit', 'the edit is saved once the relay is back');
+  assert.equal(retried.baseDraftUpdatedAt, SERVER_DRAFT_V1);
+  resetComposer('');
+});
+
+test('draft sync: a conversation switch empties the composer and holds saves until the new draft lands', async () => {
+  const convA = nextId('conv-switch-a');
+  const convB = nextId('conv-switch-b');
+  openWithServerDraft(convA, 'draft of A', SERVER_DRAFT_V1);
+  conversations[convB] = { id: convB, title: 'B' };
+  view.hydrateConversationDraft(convB, { draftText: 'draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
+  fetchHandler = async (url) => { throw new Error(`unexpected fetch: ${url}`); };
+  fetchLog.length = 0;
+  const input = getById('msg-input');
+  document.activeElement = input;
+
+  // What openConversation does after flushing A, then a programmatic switch
+  // (push notification, compaction) while the composer keeps focus.
+  view.beginConversationDraftSwitch(convB);
+  setCurrentConv(convB);
+  assert.equal(input.value, '', 'A\'s text is gone from the composer');
+  await view.flushConversationDraft(convB);
+  view.syncComposerAfterUserEdit();
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepEqual(draftPatches(convB), [], 'nothing is saved under B before B\'s draft arrives');
+
+  view.hydrateConversationDraft(convB, { draftText: 'draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
+  assert.equal(input.value, 'draft of B', 'the focused composer takes B\'s draft');
+  document.activeElement = null;
+  resetComposer('');
+});
+
+test('draft sync: typing into a just-switched composer before its draft lands keeps the typing and offers the draft back', async () => {
+  const convB = nextId('conv-switch-b');
+  conversations[convB] = { id: convB, title: 'B' };
+  setCurrentConv(convB);
+  resetComposer('');
+  getById('relay-toast').children = [];
+  fetchHandler = async (url, opts) => ({ ok: true, draftText: JSON.parse(opts.body).draftText, draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V2 });
+  fetchLog.length = 0;
+
+  view.beginConversationDraftSwitch(convB);
+  getById('msg-input').value = 'typed right away';
+  view.hydrateConversationDraft(convB, { draftText: 'saved draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
+
+  assert.equal(getById('msg-input').value, 'typed right away');
+  assert.ok(latestToastAction(), 'B\'s saved draft is offered back');
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const saved = draftPatches(convB).at(-1);
+  assert.equal(saved.draftText, 'typed right away');
+  assert.equal(saved.baseDraftUpdatedAt, SERVER_DRAFT_V1, 'based on the draft it replaces');
+  resetComposer('');
+});
+
+test('draft sync: a remote draft deferred while typing is surfaced when the typing is undone', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'shared', SERVER_DRAFT_V1);
+  const input = getById('msg-input');
+  let patchCount = 0;
+  fetchHandler = async (url, opts) => {
+    patchCount += 1;
+    // Every save of this client was based on V1; the server holds V2.
+    const body = JSON.parse(opts.body);
+    if (body.baseDraftUpdatedAt === SERVER_DRAFT_V1) return conflictPayload('phone edit', SERVER_DRAFT_V2);
+    return { ok: true, draftText: body.draftText, draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V2 };
+  };
+  fetchLog.length = 0;
+
+  // Mid-typing, the phone's draft arrives and is deferred…
+  input.value = 'shared + typing';
+  view.applyIncomingConversationDraftUpdate({
+    conversationId: convId, draftText: 'phone edit', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V2, senderClientId: 'phone',
+  });
+  assert.equal(input.value, 'shared + typing');
+  // …then the typing is undone back to the synced text before any save ran.
+  input.value = 'shared';
+  await view.flushConversationDraft(convId);
+
+  assert.ok(draftPatches(convId).length >= 1, 'the undo is not treated as a no-op against the stale base');
+  assert.equal(input.value, 'phone edit', 'the phone\'s draft is shown instead of silently kept away');
+  resetComposer('');
+});
+
+test('draft sync: a second lost race schedules a retry instead of leaving the edit unsaved', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, 'base', SERVER_DRAFT_V1);
+  const V3 = '2026-09-24T09:07:00.000Z';
+  let patchCount = 0;
+  fetchHandler = async (url, opts) => {
+    patchCount += 1;
+    const body = JSON.parse(opts.body);
+    if (patchCount === 1) return conflictPayload('phone 1', SERVER_DRAFT_V2);
+    if (patchCount === 2) return conflictPayload('phone 2', V3);
+    if (body.baseDraftUpdatedAt !== V3) return conflictPayload('phone 2', V3);
+    return { ok: true, draftText: body.draftText, draftAttachments: [], draftUpdatedAt: '2026-09-24T09:09:00.000Z' };
+  };
+  fetchLog.length = 0;
+
+  getById('msg-input').value = 'laptop edit';
+  await view.flushConversationDraft(convId);
+  await new Promise((resolve) => setTimeout(resolve, 700));
+
+  const last = draftPatches(convId).at(-1);
+  assert.equal(last.draftText, 'laptop edit', 'the edit is eventually saved');
+  assert.equal(last.baseDraftUpdatedAt, V3);
+  assert.equal(conversations[convId].draftUpdatedAt, '2026-09-24T09:09:00.000Z');
+  resetComposer('');
+});
+
+test('draft sync: the post-send save keeps text typed while the send was in flight', async () => {
+  const convId = nextId('conv-draft');
+  const runningId = primeQueuedSend(convId, 'first message');
+  const post = deferred();
+  stubQueuedSendFetches(convId, post.promise);
+
+  const sendPromise = view.sendMessage();
+  await settle();
+  getById('msg-input').value = 'next message, typed during the send';
+  post.resolve({ conversationId: convId, messageId: nextId('srv') });
+  await sendPromise;
+
+  const cleared = draftPatches(convId).at(-1);
+  assert.equal(cleared.draftText, 'next message, typed during the send', 'the post-send save does not wipe the new typing');
+  assert.equal(getById('msg-input').value, 'next message, typed during the send');
+  view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
+  resetComposer('');
+});
+
 test('renderMessages re-renders when only a message\'s workflowRuns change', () => {
   const convId = nextId('conv-wr');
   conversations[convId] = { id: convId, title: 'WR' };

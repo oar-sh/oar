@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  DRAFT_SYNC_PROTOCOL_VERSION,
   draftAttachmentsKey,
+  draftFlushRequestBody,
   forgetSyncedDraft,
   getSyncedDraft,
   isDraftSaveNoop,
@@ -63,26 +65,59 @@ test('resolveDraftConflict: converged, adopt, keep-local', () => {
   );
 });
 
-test('an unmodified composer adopts incoming drafts even while focused', () => {
+test('an unmodified composer adopts incoming drafts', () => {
+  assert.equal(shouldApplyIncomingDraftToComposer({ inputText: 'old', incomingText: 'new', syncedText: 'old' }), true);
   assert.equal(shouldApplyIncomingDraftToComposer({
-    isFocused: true, inputText: 'old', incomingText: 'new', syncedText: 'old',
-  }), true);
+    inputText: '', incomingText: 'from the phone', syncedText: '',
+  }), true, 'an idle, empty composer takes the other device\'s draft');
   assert.equal(shouldApplyIncomingDraftToComposer({
-    isFocused: true, inputText: '', incomingText: 'from the phone', syncedText: '',
-  }), true, 'an idle, empty, focused composer takes the other device\'s draft');
+    inputText: 'same', incomingText: 'same', syncedText: 'old',
+  }), true, 'an incoming draft equal to the composer is always accepted');
+  assert.equal(shouldApplyIncomingDraftToComposer({
+    inputText: 'anything', incomingText: 'new', syncedText: null,
+  }), true, 'nothing synced yet: no local edit to protect');
 });
 
-test('a modified composer keeps its text while focused or while its own save is pending', () => {
-  assert.equal(shouldApplyIncomingDraftToComposer({
-    isFocused: true, inputText: 'typing', incomingText: 'new', syncedText: 'old',
-  }), false);
-  assert.equal(shouldApplyIncomingDraftToComposer({
-    isFocused: false, inputText: 'typing', incomingText: 'new', syncedText: 'old', savePending: true,
-  }), false);
-  assert.equal(shouldApplyIncomingDraftToComposer({
-    isFocused: false, inputText: 'other conversation text', incomingText: 'new', syncedText: null,
-  }), true, 'an unfocused composer with nothing pending takes the draft (conversation switch)');
-  assert.equal(shouldApplyIncomingDraftToComposer({
-    isFocused: true, inputText: 'same', incomingText: 'same', syncedText: 'old',
-  }), true, 'an incoming draft equal to the composer is always accepted');
+test('a modified composer never adopts, whatever the incoming version', () => {
+  assert.equal(shouldApplyIncomingDraftToComposer({ inputText: 'typing', incomingText: 'new', syncedText: 'old' }), false);
+  assert.equal(
+    shouldApplyIncomingDraftToComposer({ inputText: 'unsaved edit', incomingText: 'old', syncedText: 'old' }),
+    false,
+    'the same server draft coming back (a refresh after a failed flush) never reverts the edit',
+  );
 });
+
+test('a save is not a no-op once a newer server draft is known', () => {
+  const synced = { text: 'hello', attachmentsKey: '', updatedAt: '2026-09-24T09:00:00.000Z' };
+  assert.equal(isDraftSaveNoop({ synced, text: 'hello', knownUpdatedAt: synced.updatedAt }), true);
+  assert.equal(
+    isDraftSaveNoop({ synced, text: 'hello', knownUpdatedAt: '2026-09-24T08:00:00.000Z' }),
+    true,
+    'an older known version changes nothing',
+  );
+  assert.equal(
+    isDraftSaveNoop({ synced, text: 'hello', knownUpdatedAt: '2026-09-24T09:05:00.000Z' }),
+    false,
+    'a deferred remote draft forces the save so its version check surfaces it',
+  );
+});
+
+test('draftFlushRequestBody queues only unsaved text, with the synced base and the protocol marker', () => {
+  const synced = { text: 'saved', attachmentsKey: '', updatedAt: '2026-09-24T09:00:00.000Z' };
+  assert.equal(draftFlushRequestBody({ inputText: 'saved', synced, fallbackText: 'x', clientId: 'c1' }), null);
+  assert.deepEqual(
+    draftFlushRequestBody({ inputText: 'saved and more', synced, fallbackText: 'saved and more', clientId: 'c1' }),
+    {
+      draftText: 'saved and more',
+      clientId: 'c1',
+      draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION,
+      baseDraftUpdatedAt: synced.updatedAt,
+    },
+    'compared with the synced draft, not the local text that tracks every keystroke',
+  );
+  assert.deepEqual(
+    draftFlushRequestBody({ inputText: 'x', synced: null, fallbackText: '', fallbackUpdatedAt: null, clientId: 'c1' }),
+    { draftText: 'x', clientId: 'c1', draftSyncVersion: DRAFT_SYNC_PROTOCOL_VERSION, baseDraftUpdatedAt: null },
+  );
+});
+

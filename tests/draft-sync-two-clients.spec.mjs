@@ -74,6 +74,31 @@ test("an idle, focused device never overwrites the draft typed on another device
   }
 });
 
+test("a programmatic switch while the composer is focused never saves one conversation's text into another", async ({ browser, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const conversationA = await createConversation(request, headers, "draft sync switch source");
+  const conversationB = await createConversation(request, headers, "draft sync switch target");
+
+  const device = await openDevice(browser, token, conversationA);
+  try {
+    await device.page.fill("#msg-input", "only meant for A");
+    await expect.poll(() => readDraftText(conversationA), { timeout: 10_000 }).toBe("only meant for A");
+
+    // What a push-notification tap or a compaction redirect does: switch
+    // without the composer ever losing focus, then the user leaves it.
+    await device.page.evaluate((id) => window.openConversation(id), conversationB);
+    await expect(device.page.locator("#msg-input")).toHaveValue("");
+    await device.page.evaluate(() => document.getElementById("msg-input").blur());
+    await device.page.waitForTimeout(1_500);
+
+    expect(readDraftText(conversationB)).toBe("");
+    expect(readDraftText(conversationA)).toBe("only meant for A");
+  } finally {
+    await device.context.close();
+  }
+});
+
 test("a simultaneous edit keeps the newest keystroke and offers the other text back", async ({ browser, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
@@ -113,6 +138,7 @@ test("a simultaneous edit keeps the newest keystroke and offers the other text b
     await expect.poll(() => readDraftText(conversationId), { timeout: 10_000 }).toBe("typed on device B");
     const restore = deviceB.page.locator("#relay-toast .relay-toast-action");
     await expect(restore).toBeVisible();
+    await expect(restore).toHaveText("Restore");
     await expect(deviceB.page.locator("#relay-toast")).toContainText("another device");
     expect(deviceB.draftPatches.at(-1)?.draftText).toBe("typed on device B");
 

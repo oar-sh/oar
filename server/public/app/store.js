@@ -1211,10 +1211,16 @@ export function setModelBanner(message) {
 }
 
 let transientNoticeSeq = 0;
+// The action notice on screen (or covered by a plain one), so a plain notice
+// that covers it hands the toast back afterwards instead of dropping the
+// action for good.
+let activeActionNotice = null;
 
 /**
  * `action` ({ actionLabel, onAction }) adds one button to the toast; the
  * toast then takes pointer input and hides as soon as the button is used.
+ * A plain notice shown over an action notice hands the toast back to it when
+ * it hides, for whatever time the action notice had left.
  */
 export function showTransientRelayNotice(message, ms = 4000, action = null) {
   const text = String(message || '').trim();
@@ -1231,16 +1237,31 @@ export function showTransientRelayNotice(message, ms = 4000, action = null) {
     }, Math.max(1500, Number(ms) || 4000));
     return;
   }
+  const durationMs = Math.max(1500, Number(ms) || 4000);
   const noticeId = String(++transientNoticeSeq);
+  const actionLabel = String(action?.actionLabel || '').trim();
+  const hasAction = !!actionLabel && typeof action?.onAction === 'function';
+  const covered = !hasAction && activeActionNotice && activeActionNotice.expiresAt > Date.now()
+    ? activeActionNotice
+    : null;
+  if (hasAction) {
+    activeActionNotice = { noticeId, message: text, action, expiresAt: Date.now() + durationMs };
+  }
   const hide = () => {
     if (toast.dataset.noticeId !== noticeId) return;
     toast.textContent = '';
     toast.classList.remove('visible', 'has-action');
+    if (hasAction) {
+      if (activeActionNotice?.noticeId === noticeId) activeActionNotice = null;
+      return;
+    }
+    if (covered && activeActionNotice === covered) {
+      const remainingMs = covered.expiresAt - Date.now();
+      if (remainingMs > 0) showTransientRelayNotice(covered.message, Math.max(4000, remainingMs), covered.action);
+    }
   };
   toast.dataset.noticeId = noticeId;
   toast.textContent = text;
-  const actionLabel = String(action?.actionLabel || '').trim();
-  const hasAction = !!actionLabel && typeof action?.onAction === 'function';
   if (hasAction) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -1254,7 +1275,7 @@ export function showTransientRelayNotice(message, ms = 4000, action = null) {
   }
   toast.classList.toggle('has-action', hasAction);
   toast.classList.add('visible');
-  setTimeout(hide, Math.max(1500, Number(ms) || 4000));
+  setTimeout(hide, durationMs);
 }
 
 export function syncViewportMetrics() {

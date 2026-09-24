@@ -3858,12 +3858,16 @@ export function registerSessionsRoutes(app, deps) {
     if (!existing || String(existing.status || '').trim() === 'deleted') {
       return res.status(404).json({ error: 'Conversation not found' });
     }
-    // Only an absent field skips the check (legacy clients). An explicit null
-    // means "I have seen no draft" and conflicts with any versioned draft.
+    // A null base means "I have seen no draft" and conflicts with any versioned
+    // draft — but only from clients that declare the versioned protocol. Older
+    // tabs also send an explicit null (after every keystroke), and a 409 there
+    // would revert their typing, so for them null stays unconditional.
     const baseDraftUpdatedAtValue = req.body?.baseDraftUpdatedAt !== undefined
       ? req.body.baseDraftUpdatedAt
       : req.body?.base_draft_updated_at;
-    const comparesDraftVersion = baseDraftUpdatedAtValue !== undefined;
+    const speaksVersionedDraftProtocol = Number(req.body?.draftSyncVersion) >= 2;
+    const comparesDraftVersion = baseDraftUpdatedAtValue !== undefined
+      && (baseDraftUpdatedAtValue !== null || speaksVersionedDraftProtocol);
     const normalizedBaseDraftUpdatedAt = normalizeOptionalIsoTimestamp(baseDraftUpdatedAtValue);
     const suppliedBaseTimestamp = String(baseDraftUpdatedAtValue ?? '').trim();
     if (comparesDraftVersion && suppliedBaseTimestamp && !normalizedBaseDraftUpdatedAt) {
