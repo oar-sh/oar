@@ -150,9 +150,10 @@ function bootRelayRoutes() {
   // The runner's api(method, path, body): dispatch into the captured real
   // handlers with the same bridge identity header the live worker sends;
   // makeApi surfaces non-2xx as a rejection like the worker's HTTP client does.
-  const api = makeApi(captureRoutes(deps), { headers: { 'x-relay-session-id': CONV } });
+  const captured = captureRoutes(deps);
+  const api = makeApi(captured, { headers: { 'x-relay-session-id': CONV } });
 
-  return { db, stmts, deps, api, emitted };
+  return { db, stmts, deps, api, emitted, captured };
 }
 
 // The worker loop's delivery leg, via the same exported helpers the real loop
@@ -638,8 +639,14 @@ test('a steer pending when its turn finishes is marked consumed, and no recovery
   await settled(runner);
 });
 
-test('a consumed steer that gets its own replayed turn still settles with its answer', async (t) => {
+test('a consumed steer that gets its own replayed turn is un-marked and settles with its answer', async (t) => {
   const { db, stmts, deps, api } = bootRelayRoutes();
+  // Owned by this worker session, as with session-worker routing on.
+  const ownedDelivery = () => {
+    const message = dequeueForWorker({ db, stmts, deps });
+    db.prepare(`UPDATE queue SET owner_sdk_session_id = ? WHERE id = ?`).run(CONV, message.id);
+    return message;
+  };
   const cwd = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'claude-routes-consumed-own-'));
   t.after(() => { fsSync.rmSync(cwd, { recursive: true, force: true }); });
 
@@ -649,7 +656,7 @@ test('a consumed steer that gets its own replayed turn still settles with its an
     api, sdkSessionId: CONV, cwd, startClaudeSessionImpl: () => turn, relocateTranscriptImpl: noopRelocate,
     lifecyclePollMs: 10, steeredFoldGraceMs: 60_000,
   });
-  const first = runner.handlePendingPayload({ message: dequeueForWorker({ db, stmts, deps }) });
+  const first = runner.handlePendingPayload({ message: ownedDelivery() });
   turn.emit(initMessage('native-c-2'));
   turn.emit(userReplay('first'));
   turn.emit(assistantText('working'));
@@ -657,14 +664,17 @@ test('a consumed steer that gets its own replayed turn still settles with its an
   const steerId = (await api('POST', '/api/message', {
     clientId: 'client-c-2', conversationId: CONV, text: 'queued steer', model: MODEL, relayMode: 'agent',
   })).messageId;
-  const second = runner.handlePendingPayload({ message: dequeueForWorker({ db, stmts, deps }) });
+  const second = runner.handlePendingPayload({ message: ownedDelivery() });
   await waitFor(() => runner._getProcess()?.pendingDelivered?.length === 1, { label: 'steer pushed' });
   turn.emit(resultMessage('first answer', 'native-c-2'));
   assert.equal(await first, true);
   assert.ok(stmts.findQById.get(steerId).consumed_at);
 
-  // Replayed within the grace as its own turn: answered normally.
+  // Replayed within the grace as its own turn: an ordinary in-flight row
+  // again (a worker death now must not fail it with "check the reply above"),
+  // and answered normally.
   turn.emit(userReplay('queued steer'));
+  await waitFor(() => stmts.findQById.get(steerId).consumed_at === null, { label: 'the consumed mark cleared on attach' });
   turn.emit(resultMessage('the steer’s own answer', 'native-c-2'));
   assert.equal(await second, true);
   const row = stmts.findQById.get(steerId);
@@ -679,6 +689,18 @@ test('the heartbeat fails the settle-failed rows a worker hands over', async () 
   await api('POST', '/api/message', { clientId: 'client-sf-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent' });
   const delivered = dequeueForWorker({ db, stmts, deps });
   const terminalError = buildSteerSettleFailure(delivered, { variant: 'stopped' });
+
+  // Unowned, or owned by another worker: never failed on this worker's word.
+  const unowned = await api('POST', '/api/heartbeat', {
+    activeQueueMessageIds: [delivered.id],
+    settleFailed: [{ id: delivered.id, attemptId: delivered.attemptId, terminalError }],
+  });
+  assert.equal(unowned.settleFailedHandled, undefined);
+  assert.equal(stmts.findQById.get(delivered.id).status, 'processing');
+  db.prepare(`UPDATE queue SET owner_sdk_session_id = 'someone-else' WHERE id = ?`).run(delivered.id);
+  await api('POST', '/api/heartbeat', { settleFailed: [{ id: delivered.id, attemptId: delivered.attemptId, terminalError }] });
+  assert.equal(stmts.findQById.get(delivered.id).status, 'processing');
+  db.prepare(`UPDATE queue SET owner_sdk_session_id = ? WHERE id = ?`).run(CONV, delivered.id);
 
   const stale = await api('POST', '/api/heartbeat', {
     activeQueueMessageIds: [delivered.id],
@@ -696,6 +718,60 @@ test('the heartbeat fails the settle-failed rows a worker hands over', async () 
   assert.equal(row.status, 'failed');
   assert.match(row.response, /just before you stopped the turn/, 'the worker’s path-accurate wording is kept');
   assert.match(row.response, /relay\.steer-settle-failed/);
+});
+
+test('/api/queue-consumed only lets the owning worker mark or clear, fenced on the attempt', async () => {
+  const { db, stmts, deps, api, captured } = bootRelayRoutes();
+  await api('POST', '/api/message', { clientId: 'client-qc-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent' });
+  const delivered = dequeueForWorker({ db, stmts, deps });
+  const consumedAt = () => stmts.findQById.get(delivered.id).consumed_at;
+  const entries = [{ id: delivered.id, attemptId: delivered.attemptId }];
+
+  // Anonymous callers (no worker identity) are refused outright.
+  const anonymous = makeApi(captured);
+  await assert.rejects(() => anonymous('POST', '/api/queue-consumed', { conversationId: CONV, entries }), /403/);
+
+  db.prepare(`UPDATE queue SET owner_sdk_session_id = 'someone-else' WHERE id = ?`).run(delivered.id);
+  assert.equal((await api('POST', '/api/queue-consumed', { conversationId: CONV, entries })).changed, 0, 'not the owner');
+  db.prepare(`UPDATE queue SET owner_sdk_session_id = ? WHERE id = ?`).run(CONV, delivered.id);
+  assert.equal((await api('POST', '/api/queue-consumed', {
+    conversationId: CONV, entries: [{ id: delivered.id, attemptId: 'attempt-stale' }],
+  })).changed, 0, 'a superseded attempt');
+  assert.equal(consumedAt(), null);
+
+  assert.equal((await api('POST', '/api/queue-consumed', { conversationId: CONV, entries })).changed, 1);
+  assert.ok(consumedAt());
+  assert.equal((await api('POST', '/api/queue-consumed', { conversationId: CONV, entries, consumed: false })).changed, 1);
+  assert.equal(consumedAt(), null, 'replayed as its own turn: an ordinary in-flight row again');
+});
+
+test('a superseded attempt’s late error result cannot mark steers consumed', async () => {
+  const { db, stmts, deps, api } = bootRelayRoutes();
+  await api('POST', '/api/message', { clientId: 'client-st-1', conversationId: CONV, text: 'host', model: MODEL, relayMode: 'agent' });
+  const host = dequeueForWorker({ db, stmts, deps });
+  await api('POST', '/api/message', { clientId: 'client-st-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent' });
+  const steer = dequeueForWorker({ db, stmts, deps });
+
+  await assert.rejects(() => api('POST', '/api/response', {
+    messageId: host.id,
+    conversationId: CONV,
+    text: 'Claude turn failed (error_during_execution).',
+    terminalError: { code: 'error_during_execution', stableCode: 'claude.error_during_execution', message: 'failed' },
+    consumedSteerIds: [{ id: steer.id, attemptId: steer.attemptId }],
+    attemptId: 'attempt-superseded',
+  }), /409/);
+  assert.equal(stmts.findQById.get(steer.id).consumed_at, null, 'nothing marked outside the fenced write');
+
+  await api('POST', '/api/response', {
+    messageId: host.id,
+    conversationId: CONV,
+    text: 'Claude turn failed (error_during_execution).',
+    terminalError: { code: 'error_during_execution', stableCode: 'claude.error_during_execution', message: 'failed' },
+    consumedSteerIds: [{ id: steer.id, attemptId: steer.attemptId }],
+    attemptId: host.attemptId,
+  });
+  assert.equal(stmts.findQById.get(host.id).status, 'failed');
+  assert.ok(stmts.findQById.get(steer.id).consumed_at, 'the current attempt’s errored turn does mark it');
 });
 
 // ---------------------------------------------------------------------------

@@ -226,9 +226,13 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     const workflowRuns = presetWorkflowRuns !== undefined
       ? presetWorkflowRuns
       : drainWorkflowRuns({ terminal: Boolean(terminalError) });
-    const consumed = Array.isArray(consumedSteerIds)
-      ? consumedSteerIds.map((id) => String(id || '').trim()).filter(Boolean)
-      : [];
+    // Entries are { id, attemptId } (the relay fences each mark on its
+    // attempt) or bare ids.
+    const consumed = (Array.isArray(consumedSteerIds) ? consumedSteerIds : [])
+      .map((entry) => (entry && typeof entry === 'object'
+        ? { id: String(entry.id || '').trim(), attemptId: entry.attemptId || null }
+        : { id: String(entry || '').trim(), attemptId: null }))
+      .filter((entry) => entry.id);
     try {
       await api('POST', '/api/response', {
         messageId: message.id,

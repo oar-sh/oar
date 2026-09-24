@@ -1363,7 +1363,7 @@ test('Stop with steers in flight settles them as stopped, not merged, and never 
   // Marked consumed on the relay the moment the stopped turn ended, so a
   // worker death before the settle cannot get them re-run.
   const consumed = stub.calls.find((call) => call.routePath === '/api/queue-consumed');
-  assert.deepEqual(consumed.body.messageIds, ['q-2', 'q-3']);
+  assert.deepEqual(consumed.body.entries.map((entry) => entry.id), ['q-2', 'q-3']);
   turn.endInput();
   await settled(runner);
 });
@@ -1552,12 +1552,108 @@ test('a background task continuation after Stop is not killed by the guard', asy
   turn.emit(initMessage('native-1'));
   turn.emit(assistantText('the agent finished'));
   turn.emit(resultMessage('the agent finished', 'native-1'));
-  await waitFor(
-    () => stub.calls.find((call) => call.routePath === '/api/response' && ['q-2', 'cont-1'].includes(call.body.messageId)),
-    { label: 'the continuation turn published' },
+  const contResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the continuation published on its own row' },
   );
+  assert.equal(contResponse.body.text, 'the agent finished');
   assert.equal(turn.interrupts, 1, 'the continuation was not interrupted');
-  await second;
+  // The stopped steer does not swallow the task's report; it still settles
+  // as stopped.
+  assert.equal(await second, true);
+  const steer = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(steer.body.kind, 'stopped');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a continuation already due when the user stops is neither killed nor given to the stopped steer', async () => {
+  // The task settled BEFORE the Stop: its continuation may already be queued
+  // in the CLI, so the next bare init is ambiguous — the guard stands down.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 500,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(assistantText('working'));
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer A' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pushed' });
+  await getAbort()();
+  turn.emit({ ...resultMessage('', 'native-1'), is_interrupt: true });
+  assert.equal(await first, true);
+
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('the agent finished'));
+  turn.emit(resultMessage('the agent finished', 'native-1'));
+  const contResponse = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'the due continuation published on its own row' },
+  );
+  assert.equal(contResponse.body.text, 'the agent finished');
+  assert.equal(turn.interrupts, 1);
+  assert.equal(await second, true);
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2').body.kind, 'stopped');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the Stop guard still catches the follow-up when finalizing the stopped turn is slow', async () => {
+  // The follow-up init is only processed once the stopped turn's finalize
+  // returns; with the /usage control request (10 s timeout) and relay POSTs in
+  // front of it, a window anchored at the Stop could lapse first — and the
+  // follow-up re-ran the interrupted tool on the stopped steer's row.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    controlPoller,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    stopFollowUpWindowMs: 100,
+    readPlanUsageImpl: () => new Promise((resolve) => setTimeout(() => resolve(null), 400)),
+  });
+
+  const [second] = await stopTurnWithSteers(runner, turn, getAbort, ['and then X']);
+  emitFollowUpTurn(turn);
+  await waitFor(() => turn.interrupts === 2, { label: 'the follow-up is interrupted despite the slow finalize', timeoutMs: 1_000 });
+  assert.equal(await second, true);
+  const responses = stub.calls.filter((call) => call.routePath === '/api/response');
+  assert.deepEqual(responses.map((call) => call.body.messageId), ['q-2']);
+  assert.equal(responses[0].body.kind, 'stopped');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('while a follow-up is suppressed, a background subagent’s frames are still observed', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub, startImpl: () => turn, controlPoller, steeredFoldGraceMs: 30, lifecyclePollMs: 10, stopFollowUpWindowMs: 500,
+  });
+  const [second] = await stopTurnWithSteers(runner, turn, getAbort, ['steer A']);
+  turn.emit(initMessage('native-1'));
+  await waitFor(() => turn.interrupts === 2, { label: 'suppressing' });
+  // A background subagent spawning a pinned-model agent mid-suppression.
+  turn.emit({
+    type: 'assistant',
+    parent_tool_use_id: 'toolu-parent',
+    message: { content: [{ type: 'tool_use', id: 'toolu-sub', name: 'Task', input: { model: 'claude-haiku-5' } }] },
+  });
+  await waitFor(() => runner._getProcess().subagentSpawns.get('toolu-sub') === 'claude-haiku-5', { label: 'spawn recorded' });
+  turn.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '', num_turns: 1, duration_api_ms: 5 });
+  assert.equal(await second, true);
   turn.endInput();
   await settled(runner);
 });

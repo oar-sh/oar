@@ -569,14 +569,17 @@ export function createClaudeSessionRunner({
    * Best-effort: the worker's own settle still owns these rows while it lives;
    * the mark only protects them when it does not.
    */
-  function markConsumed(conversationId, ids = []) {
-    const messageIds = ids.map((id) => String(id || '').trim()).filter(Boolean);
-    if (!messageIds.length) return;
+  function markConsumed(conversationId, entries = [], { consumed = true } = {}) {
+    const rows = entries
+      .map((entry) => ({ id: String(entry?.id || '').trim(), attemptId: entry?.attemptId || null }))
+      .filter((entry) => entry.id);
+    if (!rows.length) return;
     api('POST', '/api/queue-consumed', {
       conversationId: String(conversationId || sdkSessionId || ''),
-      messageIds,
+      entries: rows,
+      ...(consumed ? {} : { consumed: false }),
     }).catch((error) => {
-      dbg('consumed mark failed', messageIds.join(','), error?.message || String(error));
+      dbg('consumed mark failed', rows.map((entry) => entry.id).join(','), error?.message || String(error));
     });
   }
 
@@ -699,6 +702,13 @@ export function createClaudeSessionRunner({
   function attachDeliveredContext(index = 0) {
     const [entry] = proc.pendingDelivered.splice(index, 1);
     entry.ctx.deliveredEntry = entry;
+    // A steer marked consumed by the turn it was pushed into, now replayed as
+    // a turn of its own: from here it is an ordinary in-flight row, and a
+    // worker death mid-turn must not fail it with "check the reply above".
+    if (entry.consumedMarked) {
+      entry.consumedMarked = false;
+      markConsumed(entry.ctx.message?.conversationId, [entry.ctx.message], { consumed: false });
+    }
     activateContext(entry.ctx);
     return entry.ctx;
   }
@@ -1094,10 +1104,37 @@ export function createClaudeSessionRunner({
     // Only while this turn is still the active one: a continuation finalizing
     // late from its registration drain (see the finished-continuation path in
     // resolveContext) no longer owns the steers pending behind a newer turn.
-    const consumedSteerIds = (proc?.activeCtx === ctx ? proc.pendingDelivered : [])
-      .filter((entry) => entry.steered)
-      .map((entry) => String(entry.ctx.message?.id || '').trim())
-      .filter(Boolean);
+    const consumedEntries = (proc?.activeCtx === ctx ? proc.pendingDelivered : []).filter((entry) => entry.steered);
+    for (const entry of consumedEntries) entry.consumedMarked = true;
+    const consumedSteerIds = consumedEntries
+      .map((entry) => ({ id: String(entry.ctx.message?.id || '').trim(), attemptId: entry.ctx.message?.attemptId || null }))
+      .filter((entry) => entry.id);
+
+    if (ctx.interrupted || proc?.aborted) {
+      // A stopped turn closes FIRST and publishes after, off the stream loop:
+      // the CLI opens its follow-up turn for any pushed steers right after
+      // the interrupt, and the Stop guard can only kill that turn at its init
+      // if the loop reaches the init promptly — the usage reads (an
+      // experimental control request with a 10 s timeout) and relay POSTs
+      // would otherwise sit in front of it. Same shape as the per-turn
+      // runner's abort path otherwise: surface what streamed, let the
+      // server-side abort control own the queue row's fate.
+      closeContext(ctx, true);
+      markConsumed(ctx.message?.conversationId, consumedSteerIds);
+      void (async () => {
+        await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
+        const [contextUsage, planUsage] = await Promise.all([
+          readContextUsageImpl(turnRef, dbg),
+          readPlanUsageImpl(turnRef, dbg),
+        ]);
+        ctx.state.contextUsage = contextUsage;
+        ctx.state.planUsage = planUsage;
+        await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model: procModel, sdkSessionId });
+        await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId });
+      })().catch((error) => dbg('stopped-turn publish failed', error?.message || String(error)));
+      return;
+    }
+
     // The control transport is alive for the process's whole life now, but
     // the snapshot still belongs to this turn's finalize so the composer
     // indicator updates with each reply.
@@ -1111,12 +1148,7 @@ export function createClaudeSessionRunner({
     await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model: procModel, sdkSessionId });
     await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId });
 
-    if (ctx.interrupted || proc?.aborted) {
-      // Same shape as the per-turn runner's abort path: surface what streamed,
-      // let the server-side abort control own the queue row's fate.
-      await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
-      markConsumed(ctx.message?.conversationId, consumedSteerIds);
-    } else if (ctx.state.result?.isError) {
+    if (ctx.state.result?.isError) {
       await publisher.publishErrorResult({ message: ctx.message, state: ctx.state, responseModel, consumedSteerIds });
     } else {
       await publisher.publishCompletedTurn({
@@ -1177,6 +1209,13 @@ export function createClaudeSessionRunner({
   }
 
   function closeContext(ctx, handled) {
+    // The Stop guard's window runs from the stopped turn's END: the CLI opens
+    // its follow-up right after the interrupted result, and anything slow in
+    // between must not eat the window.
+    if (ctx.interrupted && proc?.stopFollowUp && !proc.stopFollowUp.anchored) {
+      proc.stopFollowUp.anchored = true;
+      proc.stopFollowUp.until = Date.now() + stopFollowUpWindowMs;
+    }
     detachActiveContext(ctx);
     ctx.resolveDone?.(handled);
     evaluateLifecycle();
@@ -1201,7 +1240,7 @@ export function createClaudeSessionRunner({
     const delivered = ctx.kind === 'delivered' && Boolean(ctx.message?.id);
     if (delivered) {
       claimSettling(ctx.message, 'handoff');
-      markConsumed(ctx.message.conversationId, [ctx.message.id]);
+      markConsumed(ctx.message.conversationId, [ctx.message]);
     }
     detachActiveContext(ctx);
     if (ctx.kind === 'continuation' && !ctx.registered) {
@@ -1284,9 +1323,17 @@ export function createClaudeSessionRunner({
       // The CLI re-opens a turn for the queued steers right after the
       // interrupt — re-running the stopped tool call — so the Stop would not
       // stick. Arm the guard that interrupts those follow-up turns (see
-      // maybeSuppressStopFollowUp).
-      const now = Date.now();
-      proc.stopFollowUp = { settleSeq: proc.taskSettleSeq, until: now + stopFollowUpWindowMs, remaining: stoppedSteers };
+      // maybeSuppressStopFollowUp). The window opens when the stopped turn
+      // closes (closeContext anchors it). A task that settled before the Stop
+      // may have its continuation queued in the CLI already: then the next
+      // turn is ambiguous and the guard only stands down (it is never killed).
+      proc.stopFollowUp = {
+        settleSeq: proc.taskSettleSeq,
+        until: Number.POSITIVE_INFINITY,
+        anchored: false,
+        remaining: stoppedSteers,
+        standDown: isContinuationImminent(),
+      };
     }
     syncDeliveryReadiness();
     try {
@@ -1987,22 +2034,30 @@ export function createClaudeSessionRunner({
   }
 
   /**
-   * The Stop guard is armed and the stream is at a point where a turn the CLI
-   * opens by itself can only be the follow-up for the stopped steers: no turn
-   * is active, everything still pending was stopped with the turn (a message
-   * delivered after the Stop is held, never pushed — and pushing one disarms
-   * the guard), and no background task has settled since the Stop (its
-   * continuation would open the same bare-init way, and must run).
+   * A turn the CLI opens by itself right now would follow the Stop: the
+   * guard is live, no turn is active, and everything still pending was
+   * stopped with the turn (a message delivered after the Stop is held, never
+   * pushed — and pushing one disarms the guard).
    */
-  function isStopFollowUpArmed(now = Date.now()) {
+  function isStopFollowUpPosition(now = Date.now()) {
     const guard = proc?.stopFollowUp;
     if (!guard || guard.remaining <= 0 || now >= guard.until) return false;
     if (proc.activeCtx) return false;
-    if (!proc.pendingDelivered.length || !proc.pendingDelivered.every((entry) => entry.stoppedWithTurn)) return false;
+    return proc.pendingDelivered.length > 0 && proc.pendingDelivered.every((entry) => entry.stoppedWithTurn);
+  }
+
+  /**
+   * ...and that turn can only be the follow-up for the stopped steers: no
+   * background task has settled since the Stop, and none was about to
+   * continue when it happened (either one's continuation opens the same
+   * bare-init way, and must run).
+   */
+  function isStopFollowUpArmed(now = Date.now()) {
+    if (!isStopFollowUpPosition(now)) return false;
+    const guard = proc.stopFollowUp;
     // A counter, not the settle timestamps: a settle in the Stop's own
     // millisecond must still count as after it.
-    if (proc.taskSettleSeq !== guard.settleSeq) return false;
-    return true;
+    return !guard.standDown && proc.taskSettleSeq === guard.settleSeq;
   }
 
   function isStopFollowUpPending(now = Date.now()) {
@@ -2016,14 +2071,18 @@ export function createClaudeSessionRunner({
    * init ends it with an error result and no model output (SDK probe
    * 2026-09-24). Everything that turn emits is swallowed — its error result
    * must not settle a stopped steer as a failed turn — except process-level
-   * system frames (task bookkeeping). Returns 'swallow', 'observe-only', or
-   * null for a message the stream should handle normally.
+   * frames (task bookkeeping, background subagents' streams). Returns
+   * 'swallow', 'observe-only', 'continuation' (the guard stood down: the turn
+   * is a task's continuation and must open as one rather than attach to a
+   * stopped steer's row), or null for a message to handle normally.
    */
   function maybeSuppressStopFollowUp(sdkMessage) {
     const type = String(sdkMessage?.type || '');
     const subtype = String(sdkMessage?.subtype || '');
     if (proc.suppressingTurn) {
-      if (type === 'result' && !sdkMessage?.parent_tool_use_id) {
+      // A background subagent's frames belong to a live task, not the turn.
+      if (sdkMessage?.parent_tool_use_id) return 'observe-only';
+      if (type === 'result') {
         proc.suppressingTurn = false;
         // Several stopped steers may come back as several turns: the next
         // one gets its own window from this one's end.
@@ -2033,7 +2092,13 @@ export function createClaudeSessionRunner({
       }
       return type === 'system' && subtype !== 'init' ? 'observe-only' : 'swallow';
     }
-    if (type !== 'system' || subtype !== 'init' || !isStopFollowUpArmed()) return null;
+    if (type !== 'system' || subtype !== 'init' || !isStopFollowUpPosition()) return null;
+    if (!isStopFollowUpArmed()) {
+      // Stood down for a task continuation: spent, and the turn is the task's.
+      proc.stopFollowUp = null;
+      dbg('stop guard stood down for a task continuation');
+      return 'continuation';
+    }
     proc.suppressingTurn = true;
     proc.stopFollowUp.remaining -= 1;
     dbg('interrupting the CLI follow-up turn for steers the user stopped');
@@ -2055,6 +2120,9 @@ export function createClaudeSessionRunner({
     if (suppressed === 'swallow') return;
     observeProcessLevel(sdkMessage);
     if (suppressed === 'observe-only') return;
+    // Its traffic opens a continuation of its own instead of attaching to the
+    // stopped steer waiting in pendingDelivered (which still settles stopped).
+    if (suppressed === 'continuation') proc.lastBoundary = 'self-opened';
     const ctx = resolveContext(sdkMessage);
     if (proc.handoffSettling) {
       // An absorbed-steering handoff just settled the previous context;
@@ -2313,7 +2381,6 @@ export function createClaudeSessionRunner({
       releaseSettling(id);
     }
   }
-
 
   function reapStalePendingDelivered(now) {
     if (!proc || !proc.pendingDelivered.length) return;

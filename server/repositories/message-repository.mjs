@@ -369,10 +369,25 @@ export function createMessageRepository(db) {
           WHERE id = ? AND status = 'processing' AND consumed_at IS NULL
         `),
         // See the queue.consumed_at migration: at-most-once rows.
+        // Fenced like every other worker write: the row must be processing in
+        // this conversation, owned by the same worker session (NULL-safe, for
+        // routing-disabled installs), and — when the caller names one — still
+        // on the attempt it was pushed under.
         markQueueConsumed: db.prepare(`
           UPDATE queue
-          SET consumed_at = COALESCE(consumed_at, ?)
-          WHERE id = ? AND conversation_id = ? AND status = 'processing'
+          SET consumed_at = COALESCE(consumed_at, @at)
+          WHERE id = @id AND conversation_id = @conversationId AND status = 'processing'
+            AND NULLIF(owner_sdk_session_id, '') IS @owner
+            AND (@attemptId IS NULL OR attempt_id = @attemptId)
+        `),
+        // A consumed steer the CLI then replayed as a turn of its own is an
+        // ordinary in-flight row again.
+        clearQueueConsumed: db.prepare(`
+          UPDATE queue
+          SET consumed_at = NULL
+          WHERE id = @id AND conversation_id = @conversationId AND status = 'processing'
+            AND NULLIF(owner_sdk_session_id, '') IS @owner
+            AND (@attemptId IS NULL OR attempt_id = @attemptId)
         `),
         listProcessingOwnerSessionIds: db.prepare(`
           SELECT DISTINCT NULLIF(owner_sdk_session_id, '') AS sdk_session_id

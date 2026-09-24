@@ -59,5 +59,5 @@ test('consumed steer ids ride the response that finishes their turn', async () =
     responseModel: 'claude-sonnet-5',
     consumedSteerIds: ['q-2', '', 'q-3'],
   });
-  assert.deepEqual(bodies[0].consumedSteerIds, ['q-2', 'q-3']);
+  assert.deepEqual(bodies[0].consumedSteerIds, [{ id: 'q-2', attemptId: null }, { id: 'q-3', attemptId: null }]);
 });

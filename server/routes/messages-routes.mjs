@@ -1998,6 +1998,8 @@ export function registerMessagesRoutes(app, deps) {
     markWorkerError = true,
     executedProvider = null,
     attemptId = null,
+    // Extra writes that must commit only with the (fenced) failure itself.
+    withinTransaction = null,
   }) {
     const now = new Date().toISOString();
     const responseId = uuidv4();
@@ -2013,6 +2015,7 @@ export function registerMessagesRoutes(app, deps) {
         ? stmts.setFailedFenced.run(JSON.stringify(failureRecord), messageId, fencedAttemptId)
         : stmts.setFailed.run(JSON.stringify(failureRecord), messageId);
       if (result.changes === 0) return false;
+      if (typeof withinTransaction === 'function') withinTransaction(now);
       stmts.setQueueResponseMessageId?.run(responseId, messageId);
       stmts.insertMsg.run(
         responseId,
@@ -2160,6 +2163,20 @@ export function registerMessagesRoutes(app, deps) {
       console.warn(`[${ts()}] FAILED    ${String(queueRow.id).slice(0, 8)} reason=${reason} code=${STEER_SETTLE_FAILED_STABLE_CODE} (consumed; never re-run)`);
     }
     return failed;
+  }
+
+  function normalizeConsumedSteerEntries(raw) {
+    const seen = new Set();
+    return (Array.isArray(raw) ? raw : [])
+      .map((entry) => (entry && typeof entry === 'object'
+        ? { id: String(entry.id || '').trim(), attemptId: String(entry.attemptId || '').trim() || null }
+        : { id: String(entry || '').trim(), attemptId: null }))
+      .filter((entry) => {
+        if (!entry.id || seen.has(entry.id)) return false;
+        seen.add(entry.id);
+        return true;
+      })
+      .slice(0, 100);
   }
 
   function cancelPendingRelayQuestionsForMessage(messageId) {
@@ -4824,6 +4841,7 @@ export function registerMessagesRoutes(app, deps) {
       // retry budget (e.g. its writes keep failing): the relay fails them
       // itself with the worker's terminal error, never requeueing them.
       const settleFailedEntries = Array.isArray(req.body?.settleFailed) ? req.body.settleFailed.slice(0, 50) : [];
+      const requesterConversationForSettle = String(requester?.conversationId || '').trim() || null;
       for (const entry of settleFailedEntries) {
         const id = String(entry?.id || '').trim();
         const row = id ? stmts.findQById.get(id) : null;
@@ -4831,8 +4849,11 @@ export function registerMessagesRoutes(app, deps) {
           if (id) settleFailedHandled.push(id);
           continue;
         }
-        const owner = normalizeSessionWorkerId(row.owner_sdk_session_id);
-        if (owner && owner !== requesterSessionId) continue;
+        // Only the worker that owns the row may have it failed, and only in a
+        // conversation that worker serves.
+        if (normalizeSessionWorkerId(row.owner_sdk_session_id) !== requesterSessionId) continue;
+        const rowSession = normalizeSessionWorkerId(stmts.getRuntimeSessionByConversation?.get(row.conversation_id)?.sdk_session_id);
+        if (rowSession !== requesterSessionId && String(row.conversation_id) !== String(requesterConversationForSettle || '')) continue;
         const attemptId = String(entry?.attemptId || '').trim() || null;
         if (attemptId && String(row.attempt_id || '') !== attemptId) {
           settleFailedHandled.push(id);
@@ -4872,15 +4893,27 @@ export function registerMessagesRoutes(app, deps) {
   // fails them terminally instead of re-running them.
   app.post('/api/queue-consumed', auth, (req, res) => {
     touchCli();
+    const requesterSessionId = normalizeSessionWorkerId(readBridgeIdentity(req)?.sessionId);
+    if (!requesterSessionId) return res.status(403).json({ error: 'Worker identity required' });
     const conversationId = String(req.body?.conversationId || '').trim();
-    const ids = [...new Set((Array.isArray(req.body?.messageIds) ? req.body.messageIds : [])
-      .map((id) => String(id || '').trim())
-      .filter(Boolean))].slice(0, 100);
-    if (!conversationId || !ids.length) return res.status(400).json({ error: 'Missing conversationId or messageIds' });
-    const now = new Date().toISOString();
-    let marked = 0;
-    for (const id of ids) marked += Number(stmts.markQueueConsumed?.run(now, id, conversationId)?.changes || 0);
-    res.json({ ok: true, marked });
+    const entries = normalizeConsumedSteerEntries(req.body?.entries);
+    if (!conversationId || !entries.length) return res.status(400).json({ error: 'Missing conversationId or entries' });
+    // `consumed: false` un-marks a steer the CLI then replayed as a turn of
+    // its own. Either way only the owning worker, on the row's current
+    // attempt, may touch the mark.
+    const statement = req.body?.consumed === false ? stmts.clearQueueConsumed : stmts.markQueueConsumed;
+    const at = new Date().toISOString();
+    let changed = 0;
+    for (const entry of entries) {
+      changed += Number(statement?.run({
+        at,
+        id: entry.id,
+        conversationId,
+        owner: requesterSessionId,
+        attemptId: entry.attemptId,
+      })?.changes || 0);
+    }
+    res.json({ ok: true, changed });
   });
 
   // POST /api/grok-native-session — Grok worker persists the ACP session id so
@@ -6186,13 +6219,22 @@ export function registerMessagesRoutes(app, deps) {
     // Steers pushed into the turn this response finishes and not yet settled:
     // the CLI has taken their prompts, so they are marked consumed together
     // with this commit and no recovery path may ever re-run them.
-    const consumedSteerIds = [...new Set(
-      (Array.isArray(req.body.consumedSteerIds) ? req.body.consumedSteerIds : [])
-        .map((id) => String(id || '').trim())
-        .filter((id) => id && id !== String(messageId || '').trim()),
-    )].slice(0, 100);
+    const consumedSteerEntries = normalizeConsumedSteerEntries(req.body.consumedSteerIds)
+      .filter((entry) => entry.id !== String(messageId || '').trim());
+    // Runs inside the response's fenced write (both the success and the
+    // terminal-failure transaction), so a superseded attempt's late publish
+    // can never mark rows; the steers must share the finishing row's owner.
     const markSteersConsumed = (conversationIdForMark, atIso) => {
-      for (const id of consumedSteerIds) stmts.markQueueConsumed?.run(atIso, id, conversationIdForMark);
+      const owner = normalizeSessionWorkerId(q?.owner_sdk_session_id);
+      for (const entry of consumedSteerEntries) {
+        stmts.markQueueConsumed?.run({
+          at: atIso,
+          id: entry.id,
+          conversationId: conversationIdForMark,
+          owner,
+          attemptId: entry.attemptId,
+        });
+      }
     };
     const trimmedText = String(text || '').trim();
     const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
@@ -6275,8 +6317,6 @@ export function registerMessagesRoutes(app, deps) {
         console.warn(`[${ts()}] CONVERSATION MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} responderConv=${terminalCrossConversation.responderConversationId?.slice(0, 8)} — terminal failure posted by another conversation's worker`);
       }
       const failureText = buildTerminalFailureTextForChat(terminalFailure, trimmedText);
-      // An errored turn still took the steers pushed into it.
-      markSteersConsumed(targetConversationId, new Date().toISOString());
       const failed = failQueueMessage({
         queueRow: q,
         messageId,
@@ -6297,6 +6337,8 @@ export function registerMessagesRoutes(app, deps) {
           failedAt: new Date().toISOString(),
         },
         attemptId: claimedAttemptId,
+        // An errored turn still took the steers pushed into it.
+        withinTransaction: (atIso) => markSteersConsumed(targetConversationId, atIso),
       });
       if (!failed) {
         const currentRow = stmts.findQById?.get(messageId) || null;
@@ -7239,6 +7281,11 @@ export function registerMessagesRoutes(app, deps) {
       console.log(`[${ts()}] CONTINUATION DROPPED ${messageId?.slice(0,8)} reason=requeue`);
       return res.json({ ok: true, dropped: 'continuation' });
     }
+    if (q && q.status === 'processing' && q.consumed_at) {
+      // The CLI already took this prompt: any requeue class would run it again.
+      failConsumedQueueRow(q, { reason: 'requeue', attemptId: claimedAttemptId });
+      return res.json({ ok: true, terminal: true, code: STEER_SETTLE_FAILED_STABLE_CODE });
+    }
     if (q && q.status === 'processing' && String(req.body?.code || '').trim() === 'relay.provider-mismatch') {
       // A routing refusal, not a delivery failure: the legacy relay handed
       // back a turn that belongs to a session worker. No retry increment and
@@ -7271,11 +7318,6 @@ export function registerMessagesRoutes(app, deps) {
         console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=steering-held retry=${Number(q.retry_count || 0)}`);
       }
       return res.json({ ok: true, held: true });
-    }
-    if (q && q.status === 'processing' && q.consumed_at) {
-      // The CLI already took this prompt: a requeue would run it again.
-      failConsumedQueueRow(q, { reason: 'requeue', attemptId: claimedAttemptId });
-      return res.json({ ok: true, terminal: true, code: STEER_SETTLE_FAILED_STABLE_CODE });
     }
     if (q && q.status === 'processing') {
       const retryCount = Number(q.retry_count || 0) + 1;

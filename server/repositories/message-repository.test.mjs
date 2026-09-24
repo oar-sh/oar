@@ -319,8 +319,16 @@ test('recovery statements never put a consumed row back to pending, and surface 
   `);
   insert.run('consumed', 'steer');
   insert.run('plain', 'turn');
-  assert.equal(repo.markQueueConsumed.run('2026-09-24T10:01:00.000Z', 'consumed', 'conv-1').changes, 1);
-  assert.equal(repo.markQueueConsumed.run('2026-09-24T10:02:00.000Z', 'consumed', 'other-conv').changes, 0, 'scoped to its conversation');
+  const mark = (overrides) => repo.markQueueConsumed.run({
+    at: '2026-09-24T10:01:00.000Z', id: 'consumed', conversationId: 'conv-1', owner: 'sdk-1', attemptId: null, ...overrides,
+  }).changes;
+  db.prepare(`UPDATE queue SET attempt_id = 'attempt-1' WHERE id = 'consumed'`).run();
+  assert.equal(mark({ conversationId: 'other-conv' }), 0, 'scoped to its conversation');
+  assert.equal(mark({ owner: 'sdk-other' }), 0, 'only the owning worker session');
+  assert.equal(mark({ owner: null }), 0, 'an owned row is not markable anonymously');
+  assert.equal(mark({ attemptId: 'attempt-stale' }), 0, 'fenced on the attempt');
+  assert.equal(mark({ attemptId: 'attempt-1' }), 1);
+  assert.equal(mark({ at: '2026-09-24T10:02:00.000Z' }), 1);
   assert.equal(repo.findQById.get('consumed').consumed_at, '2026-09-24T10:01:00.000Z', 'first mark wins');
 
   const later = '2026-09-24T11:00:00.000Z';
@@ -333,6 +341,11 @@ test('recovery statements never put a consumed row back to pending, and surface 
   repo.recoverStale.run(later, later);
   assert.equal(repo.findQById.get('consumed').status, 'processing', 'never requeued by recovery');
   assert.equal(repo.findQById.get('plain').status, 'pending', 'ordinary rows still recover');
+
+  // Replayed as its own turn: the owner clears the mark.
+  assert.equal(repo.clearQueueConsumed.run({ id: 'consumed', conversationId: 'conv-1', owner: 'sdk-other', attemptId: null }).changes, 0);
+  assert.equal(repo.clearQueueConsumed.run({ id: 'consumed', conversationId: 'conv-1', owner: 'sdk-1', attemptId: 'attempt-1' }).changes, 1);
+  assert.equal(repo.findQById.get('consumed').consumed_at, null);
 });
 
 test('claim ordering: legacy-relay dequeue also keeps expired-backoff rows in send order', () => {
