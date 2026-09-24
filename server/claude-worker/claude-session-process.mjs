@@ -34,6 +34,7 @@ import {
 } from './claude-turn-publisher.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
+import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
 
 /**
  * Which system-prompt append a relay mode gets (claude-sdk-adapter's
@@ -48,11 +49,7 @@ function modeAppendClass(relayMode) {
   return mode === 'ask' || mode === 'autopilot' ? mode : 'none';
 }
 
-/**
- * The settle stub of a message steered into a turn the user stopped. Stamped
- * kind='stopped' — the stable handle the client keys its Resend on.
- */
-export const STEER_STOPPED_TEXT = '_(Stopped with the turn — not answered.)_';
+export { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT };
 
 /** Task types that run a model of their own (vs. bash/monitor/workflow). */
 const AGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
@@ -2378,19 +2375,19 @@ export function createClaudeSessionRunner({
     controlPoller?.stop?.(ctx.controlState);
     const model = ctx.state.responseModel || proc?.model || null;
     // No streamed text of its own — the answer lives on the turn it was folded
-    // into, and kind='absorbed' renders it as merged rather than as a
-    // standalone unanswered turn. A steer pushed into a turn the user then
-    // stopped was never answered: kind='stopped' says so (and the client
-    // offers to resend it) instead of claiming the stopped reply handled it.
+    // into, and kind='folded' renders it as a compact marker on its own
+    // message (never 'absorbed': that says the reply continues through the
+    // NEXT message, and mis-merged the next ordinary turn). A steer pushed
+    // into a turn the user then stopped was never answered: kind='stopped'
+    // says so (and the client offers to resend it) instead of claiming the
+    // stopped reply handled it.
     const stopped = entry.stoppedWithTurn === true;
-    const text = stopped
-      ? STEER_STOPPED_TEXT
-      : '_(Handled together with the previous reply — this message was steered into that turn.)_';
+    const text = stopped ? STEER_STOPPED_TEXT : STEER_FOLDED_TEXT;
     try {
       await publishSettleMarker(ctx.message, {
         text,
         model,
-        kind: stopped ? 'stopped' : 'absorbed',
+        kind: stopped ? 'stopped' : 'folded',
         variant: stopped ? 'stopped' : 'folded',
       });
     } finally {

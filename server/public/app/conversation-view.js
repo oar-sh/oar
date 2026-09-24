@@ -85,7 +85,7 @@ import {
   relayActivityEntryText,
 } from './activity-replay-state.mjs';
 import { SEPARATOR_CLASS, syncSeparatorRail, syncTranscriptSeparators } from './transcript-separators.mjs';
-import { ABSORBED_MSG_CLASS, syncSteeredTurnMerge } from './steered-turn-merge.mjs';
+import { ABSORBED_MSG_CLASS, STEER_MARKER_CLASS_BY_KIND, syncSteeredTurnMerge } from './steered-turn-merge.mjs';
 import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
@@ -1216,9 +1216,16 @@ function createMessageNode(msg, msgId = null, force = false) {
   // A steering absorption: this reply continues through the next (steered)
   // user message. The class feeds syncSteeredTurnMerge, which joins the trio
   // into one visual flow.
-  if (msg.role === 'assistant' && String(msg?.kind || '').trim() === 'absorbed') {
+  const messageKind = String(msg?.kind || '').trim();
+  if (msg.role === 'assistant' && messageKind === 'absorbed') {
     div.classList.add(ABSORBED_MSG_CLASS);
   }
+  // The settle marker of a steer the CLI consumed without a turn of its own:
+  // folded into (and answered by) the turn above, or cut off unanswered by a
+  // Stop. Compact, attached to its own user message, never merging forward.
+  const steerMarkerClass = msg.role === 'assistant' ? STEER_MARKER_CLASS_BY_KIND[messageKind] : null;
+  if (steerMarkerClass) div.classList.add(steerMarkerClass);
+  const isStoppedSteer = msg.role === 'assistant' && messageKind === 'stopped';
   // A turn answered by a different provider than the conversation is bound to
   // (e.g. the Copilot relay answering a Cursor conversation) must be visible,
   // not silent: it ran on another plan than the header indicates.
@@ -1323,9 +1330,14 @@ function createMessageNode(msg, msgId = null, force = false) {
   const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
     : '';
+  const resendState = isStoppedSteer && msgId ? stoppedSteerResends.get(msgId) : null;
+  const resendLabel = resendState?.status === 'sent' ? 'Resent' : (resendState ? 'Resending…' : 'Resend');
+  const stoppedSteerActionsHtml = (!IS_SHARED_VIEW && isStoppedSteer && msgId)
+    ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn" data-action="resend-stopped-steer" data-message-id="${escHtml(msgId)}" title="Send this message again as a new turn"${resendState ? ' disabled' : ''}>${resendLabel}</button></div>`
+    : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}${stoppedSteerActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -1360,6 +1372,14 @@ function createMessageNode(msg, msgId = null, force = false) {
   }
   div.querySelectorAll('pre code').forEach((b) => hljs.highlightElement(b));
   attachCodeCopyButtons(div);
+  // What a Resend of this message would send, kept on the node itself so it
+  // lives exactly as long as the row is on screen.
+  if (msg.role === 'user') {
+    div[RESEND_PAYLOAD_KEY] = {
+      text: String(msg.text || ''),
+      attachments: attachmentReferencesForResend(attachments),
+    };
+  }
   return div;
 }
 
@@ -2460,6 +2480,148 @@ export function clearBubbleCancelState(messageId) {
   bubbleCancelInFlight.delete(id);
 }
 
+// Resend of a steer the user's Stop cut off unanswered (kind='stopped').
+// Keyed by the marker row: one Resend per marker per page life — a second tap
+// while the first is in flight, or after it landed, does nothing. The relay's
+// duplicate guard backs this across reloads (a second Resend of the same text
+// collides with the first).
+const stoppedSteerResends = new Map();
+const RESEND_PAYLOAD_KEY = '__relayResendPayload';
+
+function attachmentReferencesForResend(attachments) {
+  return (Array.isArray(attachments) ? attachments : [])
+    .map((attachment) => {
+      const sha256 = String(attachment?.sha256 || '').trim().toLowerCase();
+      if (!sha256) return null;
+      return {
+        sha256,
+        name: String(attachment?.name || '').trim() || undefined,
+        type: String(attachment?.type || '').trim() || undefined,
+      };
+    })
+    .filter(Boolean);
+}
+
+// The user message a stopped marker settles: its source id when the payload
+// carried one, else the nearest user row above (a marker is rendered directly
+// under its own message).
+function findStoppedSteerSource(markerNode) {
+  const el = getMessagesElement();
+  if (!el || !markerNode) return null;
+  const sourceId = String(markerNode.dataset.sourceMessageId || '').trim();
+  if (sourceId) {
+    const byId = el.querySelector(`.msg.user[data-message-id="${CSS.escape(sourceId)}"]`);
+    if (byId) return byId;
+  }
+  for (let prev = markerNode.previousElementSibling; prev; prev = prev.previousElementSibling) {
+    if (prev.classList?.contains(SEPARATOR_CLASS)) return null;
+    if (prev.classList?.contains('msg') && prev.classList.contains('user')) return prev;
+  }
+  return null;
+}
+
+function syncStoppedSteerResendButton(markerId) {
+  const btn = document.querySelector(`.bubble-action-btn[data-message-id="${CSS.escape(markerId)}"][data-action="resend-stopped-steer"]`);
+  if (!btn) return;
+  const state = stoppedSteerResends.get(markerId);
+  btn.disabled = !!state;
+  btn.textContent = state?.status === 'sent' ? 'Resent' : (state ? 'Resending…' : 'Resend');
+}
+
+async function resendStoppedSteer(conversationId, markerId) {
+  const conversationKey = String(conversationId || '').trim();
+  const id = String(markerId || '').trim();
+  if (!conversationKey || !id || stoppedSteerResends.has(id)) return;
+  const markerNode = getMessagesElement()?.querySelector(`.msg.assistant[data-message-id="${CSS.escape(id)}"]`);
+  const sourceNode = findStoppedSteerSource(markerNode);
+  const payload = sourceNode?.[RESEND_PAYLOAD_KEY] || null;
+  const text = String(payload?.text || '').trim();
+  const attachments = Array.isArray(payload?.attachments) ? payload.attachments : [];
+  if (!text && !attachments.length) {
+    showTransientRelayNotice('The original message is not loaded — scroll up to it, then try Resend again.');
+    return;
+  }
+  // Claimed before the first await: this is what makes a double tap a no-op.
+  stoppedSteerResends.set(id, { status: 'sending' });
+  syncStoppedSteerResendButton(id);
+  const clientMessageId = generateId();
+  let sent = false;
+  let bubbleAppended = false;
+  const dropOptimisticBubble = () => {
+    clearPendingUserMessage(clientMessageId);
+    pendingUserMessageIds.delete(clientMessageId);
+    seenMessageIds.delete(clientMessageId);
+    if (bubbleAppended) document.querySelector(`.msg[data-message-id="${CSS.escape(clientMessageId)}"]`)?.remove();
+  };
+  try {
+    if (!(await validateSelectedConversationBeforeSend(conversationKey))) return;
+    const selectedModel = document.getElementById('model-select')?.value || '';
+    const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+    const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
+    const selectedMode = document.getElementById('mode-select')?.value || 'agent';
+    if (!selectedReasoningEffort) {
+      showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
+      return;
+    }
+    trackPendingUserMessage(clientMessageId, conversationKey, text, { attachments });
+    pendingUserMessageIds.add(clientMessageId);
+    if (isCurrentConversation(conversationKey)) {
+      appendMessage({
+        role: 'user',
+        text,
+        model: selectedModel,
+        mode: selectedMode,
+        timestamp: new Date().toISOString(),
+        attachments,
+      }, true, clientMessageId, true);
+      bubbleAppended = true;
+    }
+    const r = await sendMessageApi({
+      messageId: clientMessageId,
+      clientId: CLIENT_ID,
+      text,
+      model: selectedModel,
+      reasoningEffort: selectedReasoningEffort,
+      contextTier: selectedContextTier,
+      relayMode: selectedMode,
+      conversationId: conversationKey,
+      attachments,
+      resendOfMessageId: String(sourceNode?.dataset?.messageId || '').trim() || undefined,
+    });
+    if (!r) {
+      if (!hasSendEchoArrived(clientMessageId)) {
+        dropOptimisticBubble();
+        showTransientRelayNotice('Could not resend the message. Please try again.');
+        return;
+      }
+      sent = true;
+      return;
+    }
+    if (r.duplicate) {
+      dropOptimisticBubble();
+      // Already sent (a Resend from another tab or device): nothing to retry.
+      sent = true;
+      showTransientRelayNotice('That message was already sent again.');
+      return;
+    }
+    sent = true;
+    if (cliOnline && isCurrentConversation(conversationKey) && !getActiveTurnForConversation(conversationKey)?.messageId) {
+      showThinking(r.messageId || null);
+    }
+  } catch (error) {
+    if (!hasSendEchoArrived(clientMessageId)) {
+      dropOptimisticBubble();
+      showTransientRelayNotice(error?.message || 'Could not resend the message.');
+    } else {
+      sent = true;
+    }
+  } finally {
+    if (sent) stoppedSteerResends.set(id, { status: 'sent' });
+    else stoppedSteerResends.delete(id);
+    syncStoppedSteerResendButton(id);
+  }
+}
+
 async function cancelQueuedTurnByMessageId(conversationId, messageId) {
   const conversationKey = String(conversationId || '').trim();
   const targetMessageId = String(messageId || '').trim();
@@ -2663,6 +2825,12 @@ function handleBubbleActionClick(event) {
     event.preventDefault();
     event.stopPropagation();
     void cancelQueuedTurnByMessageId(currentConvId, messageId);
+  }
+
+  if (action === 'resend-stopped-steer' && messageId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void resendStoppedSteer(currentConvId, messageId);
   }
 
   if (action === 'stop-subagent' && subagentRunId) {

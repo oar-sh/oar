@@ -4969,6 +4969,7 @@ function failRecoveredRowTerminally(row, reason, { failureRecord = null, failure
       null,
       requestedModel ? 'user' : 'auto',
     );
+    stmts.setMessageSourceId?.run(row.id, responseId);
     stmts.linkActivityToResponse?.run(responseId, row.id);
     stmts.linkStreamEventsToResponse?.run(responseId, row.id);
     stmts.linkThoughtsToResponse?.run(responseId, row.id);

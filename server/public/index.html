@@ -2607,18 +2607,27 @@
     background: rgba(63, 185, 80, 0.12); color: var(--relay-tone-online);
     border-radius: 6px; padding: 0 6px; font-size: var(--fs-meta-sm);
   }
-  /* Mid-turn steering. Two shapes reach here: the CLI usually FOLDS a steered
-     message into the running turn and answers everything with one reply, then
-     the steered row settles as a compact merged note (kind='absorbed'); more
-     rarely the turn is handed off and the steered message carries the
-     continuing reply. The absorbed row is a marker, not a real answer, so it
-     renders muted and compact — and never claims a continuation it cannot
-     guarantee. steered-turn-merge.mjs adds the adjacency classes. */
-  .msg.assistant.msg-absorbed .msg-bubble {
+  /* Mid-turn steering. The CLI usually FOLDS a steered message into the
+     running turn and answers everything with one reply; the steered row then
+     settles as a compact marker under its own message (kind='folded'). More
+     rarely the turn is handed off: the interrupted reply settles as
+     kind='absorbed' and the steered message carries the continuing reply. A
+     steer cut off by Stop settles as kind='stopped' with a Resend button.
+     Markers are notes, not answers, so they render muted and compact.
+     steered-turn-merge.mjs adds the adjacency classes. */
+  .msg.assistant.msg-absorbed .msg-bubble,
+  .msg.assistant.msg-folded .msg-bubble,
+  .msg.assistant.msg-steer-stopped .msg-bubble {
     font-size: var(--fs-meta-md); color: var(--muted); font-style: italic;
     padding: 6px 12px; opacity: 0.85;
   }
   .msg.assistant.msg-absorbed { margin-top: -4px; }
+  /* Attached to the steered message above it (the transcript gap is 12px). */
+  .msg.assistant.msg-folded,
+  .msg.assistant.msg-steer-stopped { margin-top: -8px; }
+  .msg.assistant.msg-folded .msg-label,
+  .msg.assistant.msg-steer-stopped .msg-label { display: none; }
+  .msg.assistant.msg-steer-stopped .msg-bubble-actions { font-style: normal; }
   .msg.user.msg-steered .msg-bubble { border-style: dashed; }
   .msg.user.msg-steered .msg-label::after { content: ' · steered mid-turn'; }
   .msg.assistant.msg-steered-continuation { margin-top: -2px; }

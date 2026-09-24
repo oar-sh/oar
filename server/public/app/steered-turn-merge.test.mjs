@@ -13,6 +13,8 @@ globalThis.Node = dom.window.Node;
 const {
   syncSteeredTurnMerge,
   ABSORBED_MSG_CLASS,
+  FOLDED_MSG_CLASS,
+  STEER_STOPPED_MSG_CLASS,
   STEERED_MSG_CLASS,
   STEERED_CONTINUATION_CLASS,
 } = await import('./steered-turn-merge.mjs');
@@ -24,10 +26,12 @@ function container() {
   return el;
 }
 
-function addMsg(el, { role, absorbed = false } = {}) {
+function addMsg(el, { role, absorbed = false, folded = false, stopped = false } = {}) {
   const node = document.createElement('div');
   node.className = `msg ${role}`;
   if (absorbed) node.classList.add(ABSORBED_MSG_CLASS);
+  if (folded) node.classList.add(FOLDED_MSG_CLASS);
+  if (stopped) node.classList.add(STEER_STOPPED_MSG_CLASS);
   el.appendChild(node);
   return node;
 }
@@ -107,22 +111,61 @@ test('a healed pair split across a history-page boundary classes on the later pa
   assert.equal(steered.classList.contains(STEERED_MSG_CLASS), true);
 });
 
-test('the fold shape (multi-steer) renders per-message markers, no trio classes', () => {
-  // Multi-steering fold: several user rows sent mid-turn, ONE real answer on
-  // the original row, then one absorbed stub per steered row. Each stub is its
-  // own compact marker; none of the user rows form a replay-handoff trio (the
-  // row above each is a user row or the real answer, never an absorbed reply
-  // directly above a steered user).
+test('the fold shape (multi-steer): each steer is marked by its own stub, nothing merges forward', () => {
+  // Multi-steering fold, in reload order (each reply anchors under its own
+  // prompt): the turn's one answer under q1, then each steered row with its
+  // folded stub right below it.
   const el = container();
   addMsg(el, { role: 'user' });                     // q1
-  const q2 = addMsg(el, { role: 'user' });          // steered
-  const q3 = addMsg(el, { role: 'user' });          // steered
   const answer = addMsg(el, { role: 'assistant' }); // the turn's one result
-  addMsg(el, { role: 'assistant', absorbed: true }); // q2's merge stub
-  addMsg(el, { role: 'assistant', absorbed: true }); // q3's merge stub
+  const q2 = addMsg(el, { role: 'user' });
+  const q2Stub = addMsg(el, { role: 'assistant', folded: true });
+  const q3 = addMsg(el, { role: 'user' });
+  const q3Stub = addMsg(el, { role: 'assistant', folded: true });
 
-  assert.equal(syncSteeredTurnMerge(el), 0, 'no classes to add or remove');
-  assert.equal(q2.classList.contains(STEERED_MSG_CLASS), false);
-  assert.equal(q3.classList.contains(STEERED_MSG_CLASS), false);
+  assert.equal(syncSteeredTurnMerge(el), 2, 'only the two steered rows are classed');
+  assert.equal(q2.classList.contains(STEERED_MSG_CLASS), true);
+  assert.equal(q3.classList.contains(STEERED_MSG_CLASS), true);
   assert.equal(answer.classList.contains(STEERED_CONTINUATION_CLASS), false);
+  assert.equal(q2Stub.classList.contains(STEERED_CONTINUATION_CLASS), false, 'a marker is not a continuing reply');
+  assert.equal(q3Stub.classList.contains(STEERED_CONTINUATION_CLASS), false);
+});
+
+test('the next ordinary message after a fold is a normal turn', () => {
+  // The 0.9.2 bug: the fold stub was kind='absorbed', so the NEXT message was
+  // styled steered and its reply merged into a finished turn.
+  const el = container();
+  addMsg(el, { role: 'user' });
+  addMsg(el, { role: 'assistant' });
+  addMsg(el, { role: 'user' });
+  addMsg(el, { role: 'assistant', folded: true });
+  const c = addMsg(el, { role: 'user' });
+  const cReply = addMsg(el, { role: 'assistant' });
+
+  syncSteeredTurnMerge(el);
+  assert.equal(c.classList.contains(STEERED_MSG_CLASS), false);
+  assert.equal(cReply.classList.contains(STEERED_CONTINUATION_CLASS), false);
+});
+
+test('a steer cut off by Stop is marked steered and its marker never merges forward', () => {
+  const el = container();
+  addMsg(el, { role: 'user' });
+  addMsg(el, { role: 'assistant' });
+  const steered = addMsg(el, { role: 'user' });
+  const stoppedStub = addMsg(el, { role: 'assistant', stopped: true });
+  const next = addMsg(el, { role: 'user' });
+
+  syncSteeredTurnMerge(el);
+  assert.equal(steered.classList.contains(STEERED_MSG_CLASS), true);
+  assert.equal(stoppedStub.classList.contains(STEERED_CONTINUATION_CLASS), false);
+  assert.equal(next.classList.contains(STEERED_MSG_CLASS), false);
+});
+
+test('a marker across a separator does not claim the user row above it', () => {
+  const el = container();
+  const user = addMsg(el, { role: 'user' });
+  addSeparator(el);
+  addMsg(el, { role: 'assistant', folded: true });
+  syncSteeredTurnMerge(el);
+  assert.equal(user.classList.contains(STEERED_MSG_CLASS), false);
 });

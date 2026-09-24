@@ -1752,8 +1752,10 @@ export function buildConversationMessages({
   const normalizedDbMessages = Array.isArray(dbMessages)
     ? dbMessages.map((message) => {
         const id = String(message?.id || '').trim();
+        // The queue's link is pruned with old rows; the message's own column
+        // keeps it, so a reload still anchors the reply under its prompt.
         const sourceMessageId = message?.role === 'assistant'
-          ? (responseMessageToSourceId.get(id) || undefined)
+          ? (responseMessageToSourceId.get(id) || String(message?.source_message_id || '').trim() || undefined)
           : undefined;
         // A user row's queue entry shares its id; assistant rows reach the same
         // entry through the response mapping. Both need it for the effort tag.
@@ -1782,8 +1784,9 @@ export function buildConversationMessages({
           sourceMessageId,
           executedProvider: message?.executed_provider || message?.executedProvider || undefined,
           // 'continuation' badges a self-started turn; 'absorbed' marks a
-          // reply that continues through the next (steered) user message.
-          // Without this the live-appended badge/merge vanished on reload.
+          // reply that continues through the next (steered) user message;
+          // 'folded'/'stopped' are a steer's settle markers. Without this the
+          // live-appended badge/merge/marker vanished on reload.
           kind: message?.kind || undefined,
         };
       })

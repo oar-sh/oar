@@ -1031,10 +1031,11 @@ test('a steered message the CLI folds into the turn (no replay) settles as merge
   assert.notEqual(firstResponse.body.absorbed, true);
 
   // After the short fold grace the steered row settles as merged — done with
-  // absorbed:true, NOT a watchdog failure.
+  // kind='folded', NOT a watchdog failure.
   assert.equal(await second, true);
   const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
-  assert.equal(secondResponse.body.absorbed, true);
+  assert.equal(secondResponse.body.kind, 'folded');
+  assert.notEqual(secondResponse.body.absorbed, true, 'a fold never claims the reply continues onward');
   assert.match(secondResponse.body.text, /Handled together with the previous reply/);
   assert.equal(
     stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'q-2'),
@@ -1086,7 +1087,7 @@ test('multiple messages steered into one turn all settle as merged, in push orde
   assert.equal(firstResponse.body.text, 'did everything at once');
   for (const id of ['q-2', 'q-3', 'q-4']) {
     const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === id);
-    assert.equal(response.body.absorbed, true, `${id} settles as merged`);
+    assert.equal(response.body.kind, 'folded', `${id} settles as merged`);
     assert.match(response.body.text, /Handled together with the previous reply/);
   }
   // Push order is settle order: q-2's merge publishes before q-4's.
@@ -1169,7 +1170,7 @@ test('a folded steer whose marker cannot be saved retries, then fails terminally
   const markerAttempts = stub.calls.filter((call) => call.routePath === '/api/response'
     && call.body.messageId === 'q-2' && !call.body.terminalError);
   assert.equal(markerAttempts.length, 4, 'one attempt plus one per retry delay');
-  assert.ok(markerAttempts.every((call) => call.body.absorbed === true && call.body.attemptId === 'attempt-2'));
+  assert.ok(markerAttempts.every((call) => call.body.kind === 'folded' && call.body.attemptId === 'attempt-2'));
   const terminal = stub.calls.find((call) => call.routePath === '/api/response'
     && call.body.messageId === 'q-2' && call.body.terminalError);
   assert.equal(terminal.body.terminalError.stableCode, 'relay.steer-settle-failed');
@@ -1834,7 +1835,7 @@ test('a steer the CLI queues instead of folding attaches to its own turn; the re
 
   assert.equal(await second, true);
   const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
-  assert.equal(secondResponse.body.absorbed, true, 'the folded steer settles as merged');
+  assert.equal(secondResponse.body.kind, 'folded', 'the folded steer settles as merged');
   assert.equal(runner._getProcess().pendingDelivered.length, 0);
   turn.endInput();
   await settled(runner);
@@ -1917,7 +1918,7 @@ test('a folded steer settles as merged even while a background task is still run
   // The fold reaper must settle q-2 as merged despite the live task.
   assert.equal(await second, true);
   const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
-  assert.equal(secondResponse.body.absorbed, true);
+  assert.equal(secondResponse.body.kind, 'folded');
   assert.match(secondResponse.body.text, /Handled together with the previous reply/);
   assert.equal(runner._getProcess().pendingDelivered.length, 0, 'nothing left stuck in pendingDelivered');
   turn.emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
@@ -2051,7 +2052,7 @@ test('a steered message carries its image attachment into the folded turn', asyn
   assert.equal(await first, true);
   assert.equal(await second, true);
   const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
-  assert.equal(secondResponse.body.absorbed, true);
+  assert.equal(secondResponse.body.kind, 'folded');
   turn.endInput();
   await settled(runner);
 });

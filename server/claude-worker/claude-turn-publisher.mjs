@@ -193,8 +193,9 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
    * Returns the outcome: 'published' (the relay took it), 'stale' (another
    * attempt owns the row), 'failed' (not taken and NOT requeued), or
    * 'requeued'. A `kind` marks a row whose prompt the CLI already consumed —
-   * 'absorbed' (the reply continues through the next, steered message) or
-   * 'stopped' (steered into a turn the user stopped) — and such a row is never
+   * 'absorbed' (the reply continues through the next, steered message),
+   * 'folded' (answered by the turn it was steered into) or 'stopped' (steered
+   * into a turn the user stopped) — and such a row is never
    * requeued, since re-delivery would run the prompt a second time; the
    * caller owns retrying it. `requeueOnFailure: false` opts any other publish
    * into the same contract.
@@ -244,8 +245,9 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         ...(Array.isArray(workflowRuns) && workflowRuns.length ? { workflowRuns } : {}),
         ...(terminalError ? { terminalError } : {}),
         // The relay stamps the assistant message's kind from these: 'absorbed'
-        // renders as merged into the next (steered) user message, 'stopped' as
-        // a steer the user's Stop cut off unanswered.
+        // renders as merged into the next (steered) user message, 'folded' as
+        // a compact marker on its own message, 'stopped' as a steer the
+        // user's Stop cut off unanswered.
         ...(responseKind === 'absorbed' ? { absorbed: true } : {}),
         ...(responseKind && responseKind !== 'absorbed' ? { kind: responseKind } : {}),
         ...(consumed.length ? { consumedSteerIds: consumed } : {}),

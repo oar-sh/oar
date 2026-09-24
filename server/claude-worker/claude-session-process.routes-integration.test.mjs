@@ -10,6 +10,7 @@ import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildSteerSettleFailure, STEER_SETTLE_FAILED_TEXT } from './claude-turn-publisher.mjs';
 import { failSettlingRowsOnShutdown } from './claude-worker-link-wiring.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
+import { STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import {
   noopRelocate,
   waitFor,
@@ -551,8 +552,108 @@ test('steers cut off by Stop persist kind=stopped and reload with it', async (t)
     responseMessageToSourceId: new Map([[row2.response_message_id, msg2Id]]),
   });
   assert.equal(reloaded.find((message) => message.id === row2.response_message_id)?.kind, 'stopped');
+  assert.equal(stub.source_message_id, msg2Id, 'the marker keeps its prompt link beyond the queue');
+  assert.equal(live.payload.message.sourceMessageId, msg2Id, 'the live append names its prompt, as a reload does');
+
+  // Resend: the same text is normally a duplicate of the original for ten
+  // minutes; naming the stopped original exempts it — once.
+  const plainRepeat = await api('POST', '/api/message', {
+    clientId: 'client-stop-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent',
+  });
+  assert.equal(plainRepeat.duplicate, true, 'without the resend link it is still a duplicate');
+  const resent = await api('POST', '/api/message', {
+    clientId: 'client-stop-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent',
+    resendOfMessageId: msg2Id,
+  });
+  assert.notEqual(resent.duplicate, true, 'a Resend of the stopped steer is accepted');
+  assert.equal(stmts.findQById.get(resent.messageId).status, 'pending');
+  const resentAgain = await api('POST', '/api/message', {
+    clientId: 'client-stop-1', conversationId: CONV, text: 'steer', model: MODEL, relayMode: 'agent',
+    resendOfMessageId: msg2Id,
+  });
+  assert.equal(resentAgain.duplicate, true, 'a second Resend collides with the first');
   turn.endInput();
   await settled(runner);
+});
+
+test('a resend link to a message that was not stopped does not bypass the duplicate guard', async () => {
+  const { stmts, api } = bootRelayRoutes();
+  const original = await api('POST', '/api/message', {
+    clientId: 'client-resend-2', conversationId: CONV, text: 'answered already', model: MODEL, relayMode: 'agent',
+  });
+  assert.equal(stmts.findQById.get(original.messageId).status, 'pending');
+  const repeat = await api('POST', '/api/message', {
+    clientId: 'client-resend-2', conversationId: CONV, text: 'answered already', model: MODEL, relayMode: 'agent',
+    resendOfMessageId: original.messageId,
+  });
+  assert.equal(repeat.duplicate, true);
+});
+
+test('a folded steer persists kind=folded, and reloads anchored to its prompt after the queue row is pruned', async (t) => {
+  const { db, stmts, deps, api } = bootRelayRoutes();
+  const cwd = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'claude-routes-folded-'));
+  t.after(() => { fsSync.rmSync(cwd, { recursive: true, force: true }); });
+
+  const msg1Id = (await api('POST', '/api/message', {
+    clientId: 'client-fold-1', conversationId: CONV, text: 'first', model: MODEL, relayMode: 'agent',
+  })).messageId;
+  const delivered1 = dequeueForWorker({ db, stmts, deps });
+  const turn = scriptedTurn();
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: CONV,
+    cwd,
+    startClaudeSessionImpl: () => turn,
+    relocateTranscriptImpl: noopRelocate,
+    lifecyclePollMs: 10,
+    steeredFoldGraceMs: 30,
+  });
+  const first = runner.handlePendingPayload({ message: delivered1 });
+  turn.emit(initMessage('native-fold-1'));
+  turn.emit(userReplay('first'));
+  turn.emit(assistantText('working'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'turn 1 is live' });
+  const msg2Id = (await api('POST', '/api/message', {
+    clientId: 'client-fold-1', conversationId: CONV, text: 'and this too', model: MODEL, relayMode: 'agent',
+  })).messageId;
+  const second = runner.handlePendingPayload({ message: dequeueForWorker({ db, stmts, deps }) });
+  await waitFor(() => runner._getProcess()?.pendingDelivered?.length === 1, { label: 'the steer is pushed' });
+  // The CLI folds the steer into the turn: one result, no replay.
+  turn.emit(resultMessage('did both', 'native-fold-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  const stub = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(stmts.findQById.get(msg2Id).response_message_id);
+  assert.equal(stub.kind, 'folded', 'a fold is never stamped absorbed');
+  assert.equal(stub.source_message_id, msg2Id);
+
+  // The queue keeps only the newest finished rows; once these are pruned the
+  // message column alone must anchor each reply under its prompt.
+  db.prepare(`DELETE FROM queue`).run();
+  const reloaded = buildConversationMessages({ dbMessages: stmts.getMessages.all(CONV) });
+  assert.equal(reloaded.find((message) => message.id === stub.id)?.sourceMessageId, msg2Id);
+  const answer = reloaded.find((message) => message.role === 'assistant' && message.text === 'did both');
+  assert.equal(answer?.sourceMessageId, msg1Id);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a fold stub from a worker still on the old kind is stored as folded', async () => {
+  const { db, stmts, deps, api } = bootRelayRoutes();
+  const msgId = (await api('POST', '/api/message', {
+    clientId: 'client-fold-legacy', conversationId: CONV, text: 'steered earlier', model: MODEL, relayMode: 'agent',
+  })).messageId;
+  const delivered = dequeueForWorker({ db, stmts, deps });
+  await api('POST', '/api/response', {
+    messageId: msgId,
+    conversationId: CONV,
+    text: STEER_FOLDED_TEXT,
+    model: MODEL,
+    absorbed: true,
+    attemptId: delivered.attemptId,
+  });
+  const stub = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(stmts.findQById.get(msgId).response_message_id);
+  assert.equal(stub.kind, 'folded');
 });
 
 test('a steer-settle failure fails the row terminally with the resend-only-if-unanswered wording', async () => {

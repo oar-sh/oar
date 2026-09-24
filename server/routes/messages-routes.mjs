@@ -36,6 +36,7 @@ import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mj
 import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning-effort.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
+import { STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
@@ -184,12 +185,18 @@ function findRecentDuplicateUserMessage({
   text = '',
   now = Date.now(),
   windowMs = DUPLICATE_USER_MESSAGE_WINDOW_MS,
+  // A message the user deliberately sends again (Resend of a steer a Stop
+  // cut off) is not a duplicate of its own original.
+  exemptMessageId = null,
 } = {}) {
   const fingerprint = normalizeDuplicateMessageText(text);
   if (!fingerprint) return null;
   const maxAgeMs = Math.max(60_000, Number(windowMs) || DUPLICATE_USER_MESSAGE_WINDOW_MS);
+  const exemptId = String(exemptMessageId || '').trim();
+  const isExempt = (row) => !!exemptId && String(row?.id || '').trim() === exemptId;
 
   for (const row of Array.isArray(recentUserMessages) ? recentUserMessages : []) {
+    if (isExempt(row)) continue;
     const rowText = normalizeDuplicateMessageText(row?.text || '');
     if (!rowText || rowText !== fingerprint) continue;
     const rowTime = Date.parse(row?.timestamp || '');
@@ -200,6 +207,7 @@ function findRecentDuplicateUserMessage({
   }
 
   for (const row of Array.isArray(recentQueueRows) ? recentQueueRows : []) {
+    if (isExempt(row)) continue;
     const rowText = normalizeDuplicateMessageText(row?.text || '');
     if (!rowText || rowText !== fingerprint) continue;
     const rowTime = Date.parse(row?.timestamp || '');
@@ -2031,6 +2039,7 @@ export function registerMessagesRoutes(app, deps) {
         modelActual,
         modelOrigin,
       );
+      stmts.setMessageSourceId?.run(messageId, responseId);
       // Provenance travels with terminal failures too — the original hijack
       // incident's signature was stolen turns dying on 402, which exited
       // exactly here with no executed_provider recorded.
@@ -3915,6 +3924,25 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  // The original of a Resend: only a user message whose own settle marker says
+  // a Stop cut it off unanswered (kind='stopped') — anything else gets the
+  // ordinary duplicate guard. A second Resend still collides with the first.
+  function resolveStoppedSteerResendOrigin(conversationId, rawMessageId) {
+    const messageId = String(rawMessageId || '').trim();
+    if (!messageId || !conversationId) return null;
+    try {
+      const row = db.prepare(`
+        SELECT 1 FROM messages
+        WHERE conversation_id = ? AND role = 'assistant' AND kind = 'stopped'
+          AND (source_message_id = ? OR id IN (SELECT response_message_id FROM queue WHERE id = ?))
+        LIMIT 1
+      `).get(conversationId, messageId, messageId);
+      return row ? messageId : null;
+    } catch {
+      return null;
+    }
+  }
+
   // POST /api/message — browser sends a message
   app.post('/api/message', auth, async (req, res) => {
     const {
@@ -4423,6 +4451,7 @@ export function registerMessagesRoutes(app, deps) {
         recentUserMessages,
         recentQueueRows,
         text: trimmedText,
+        exemptMessageId: resolveStoppedSteerResendOrigin(conversationId, req.body.resendOfMessageId),
       });
       if (duplicateMessage) {
         return res.json({
@@ -6208,6 +6237,8 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  const SETTLED_STEER_KINDS = new Set(['folded', 'stopped']);
+
   // POST /api/response — CLI submits response
   app.post('/api/response', auth, async (req, res) => {
     touchCli();
@@ -6216,12 +6247,19 @@ export function registerMessagesRoutes(app, deps) {
     // pushed mid-turn was picked up, and the turn continues on that message's
     // own row. Stamped as kind='absorbed' so the transcript renders the two
     // turns as one merged flow.
-    const absorbed = req.body.absorbed === true;
-    // A message steered into a turn the user then stopped: settled unanswered
-    // (never re-run — the CLI saw it) and stamped kind='stopped' so the client
-    // can offer to resend it.
-    const stoppedSteer = !absorbed && String(req.body.kind || '').trim() === 'stopped';
-    const settledKind = absorbed ? 'absorbed' : (stoppedSteer ? 'stopped' : null);
+    // A worker not yet respawned onto 0.9.3 still stamps its fold stubs
+    // absorbed:true; the stub text identifies them, and 'absorbed' on a fold
+    // would mis-merge the next ordinary message.
+    const staleFoldStub = req.body.absorbed === true && String(text || '').trim() === STEER_FOLDED_TEXT;
+    const absorbed = req.body.absorbed === true && !staleFoldStub;
+    // The other settle stubs of a consumed steer (never re-run — the CLI saw
+    // it): 'folded' was answered by the turn it was steered into and renders
+    // as a marker on its own message; 'stopped' was steered into a turn the
+    // user then stopped, so it went unanswered and the client offers Resend.
+    const requestedKind = staleFoldStub ? 'folded' : String(req.body.kind || '').trim();
+    const settledKind = absorbed
+      ? 'absorbed'
+      : (SETTLED_STEER_KINDS.has(requestedKind) ? requestedKind : null);
     // Steers pushed into the turn this response finishes and not yet settled:
     // the CLI has taken their prompts, so they are marked consumed together
     // with this commit and no recovery path may ever re-run them.
@@ -6467,6 +6505,7 @@ export function registerMessagesRoutes(app, deps) {
         explicitModel,
         modelOrigin,
       );
+      stmts.setMessageSourceId?.run(messageId, responseId);
       if (String(q?.kind || '') === 'continuation') {
         stmts.setMessageKind?.run('continuation', responseId);
       } else if (settledKind) {
@@ -6698,6 +6737,9 @@ export function registerMessagesRoutes(app, deps) {
       messageId: responseId,
       message: {
         role: 'assistant',
+        // In the message too, as on reload: a stopped marker's Resend finds
+        // its original through it.
+        sourceMessageId: messageId,
         text: resolvedText,
         attachments: emittedImageAttachments.length ? emittedImageAttachments : undefined,
         model: resolvedAssistantModel,

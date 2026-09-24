@@ -7,6 +7,8 @@ export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
     const queueHasImageOperationId = db.prepare(`PRAGMA table_info(queue)`).all()
         .some((column) => column.name === 'image_operation_id');
+    const messagesHaveSourceId = db.prepare(`PRAGMA table_info(messages)`).all()
+        .some((column) => column.name === 'source_message_id');
     const insertQueueSql = queueHasImageOperationId
         ? `INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, model_variant_id, reasoning_effort, context_tier, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at, image_operation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?, ?)`
         : `INSERT INTO queue (id, conversation_id, runtime_session_id, is_new_conversation, model, model_variant_id, reasoning_effort, context_tier, relay_mode, text, attachments, status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id, owner_assigned_at, owner_lease_expires_at, owner_last_claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, ?, ?)`;
@@ -17,7 +19,7 @@ export function createMessageRepository(db) {
         getMessageByConversation: db.prepare(`SELECT * FROM messages WHERE id = ? AND conversation_id = ? LIMIT 1`),
         setMessageShareVisibility: shareVisibility.setMessageShareVisibility,
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
-        getRecentMessagesDesc: db.prepare(`SELECT role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
+        getRecentMessagesDesc: db.prepare(`SELECT id, role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
         insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
         // Provenance is derived from the authenticated responder identity at
         // /api/response time, never from the response payload.
@@ -117,6 +119,11 @@ export function createMessageRepository(db) {
         // response resolves to the row its operation id already created.
         findQByContinuationOp: db.prepare(`SELECT * FROM queue WHERE continuation_op_id = ?`),
         setMessageKind: db.prepare(`UPDATE messages SET kind = ? WHERE id = ?`),
+        // The durable answer→prompt link (the queue's copy is pruned), so a
+        // reload still anchors the reply under the message it answers.
+        setMessageSourceId: messagesHaveSourceId
+            ? db.prepare(`UPDATE messages SET source_message_id = ? WHERE id = ?`)
+            : null,
         // Quiet teardown for a continuation whose worker died: there is no
         // user to answer, so it fails without the terminal-failure ceremony.
         dropStaleContinuation: db.prepare(`UPDATE queue SET status = 'failed', processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status = 'processing' AND kind = 'continuation'`),

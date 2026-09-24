@@ -9,6 +9,7 @@
 // final schema either way.
 import { rebuildRecentWorkspaceRootsTable } from './migrations/0002-recent-workspace-roots-path-key.mjs';
 import { ensurePushSubscriptionsTable } from './migrations/0003-push-subscriptions.mjs';
+import { migrateSteerSettleMarkers } from './migrations/0004-steer-settle-markers.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -689,6 +690,12 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_owner_pending ON queue(status, own
 db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_parked_release ON queue(status, parked_transaction_id, parked_target_session_id, parked_at, timestamp)`);
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_continuation_op ON queue(continuation_op_id) WHERE continuation_op_id IS NOT NULL`);
 migrateImageConversationSchema(db);
+// After the queue's response_message_id exists: the source-link backfill
+// reads it.
+const steerSettleMarkersMigration = migrateSteerSettleMarkers(db);
+if (steerSettleMarkersMigration.foldStubsRekinded) {
+  console.log(`[steering] re-kinded ${steerSettleMarkersMigration.foldStubsRekinded} fold stub(s) as 'folded'`);
+}
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
 if (runtimeSessionColumns.length) {
