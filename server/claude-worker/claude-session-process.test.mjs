@@ -813,6 +813,60 @@ test('a delivered message queued behind a continuation keeps its own reply', asy
   await settled(runner);
 });
 
+test('a replay landing while a finished continuation still registers keeps the continuation answer', async () => {
+  // The continuation's turn ENDED (its result is buffered) but its row is
+  // still being registered, so it is still activeCtx. A delivered message's
+  // replay landing then used to be read as an absorption: handoffAbsorbedTurn
+  // discarded the continuation and its buffered answer. The answer now
+  // publishes on the continuation row first and the message gets its own turn.
+  let releaseRegistration = null;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': () => new Promise((resolve) => {
+        releaseRegistration = () => resolve({ messageId: 'cont-1', attemptId: 'attempt-cont-1' });
+      }),
+    },
+  });
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'job' }]));
+  turn.emit(resultMessage('dispatched', 'native-1'));
+  assert.equal(await first, true);
+
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(taskNotificationMessage('agent-1'));
+  turn.emit(taskNotificationReplay());
+  turn.emit(assistantText('the agent found the bug'));
+  turn.emit(resultMessage('the agent found the bug', 'native-1'));
+  await waitFor(() => releaseRegistration && runner._getProcess().activeCtx?.resultBuffered, { label: 'continuation finished, still registering' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'status?' } });
+  await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'q-2 pushed' });
+  turn.emit(userReplay('status?'));
+  await tick(20);
+  releaseRegistration();
+  turn.emit(assistantText('here is the status'));
+  turn.emit(resultMessage('here is the status', 'native-1'));
+  assert.equal(await second, true);
+
+  const responseFor = (id) => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === id);
+  await waitFor(() => responseFor('cont-1'), { label: 'the continuation answer published' });
+  assert.equal(responseFor('cont-1').body.text, 'the agent found the bug');
+  assert.equal(responseFor('q-2').body.text, 'here is the status');
+  assert.notEqual(responseFor('q-2').body.absorbed, true, 'q-2 is its own turn, not an absorption');
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/requeue' && call.body.messageId === 'cont-1'), undefined,
+    'the continuation row was not dropped');
+  // The continuation published before the delivered turn did.
+  const order = stub.calls.filter((call) => call.routePath === '/api/response').map((call) => call.body.messageId);
+  assert.ok(order.indexOf('cont-1') < order.indexOf('q-2'));
+  turn.endInput();
+  await settled(runner);
+});
+
 test('a message absorbed into a running continuation completes on that turn result', async () => {
   // The 2026-08-18 deadlock (conv f93135ac row 962c36b1): the CLI dequeued a
   // pushed message INTO the running background-continuation turn (its replay

@@ -570,6 +570,7 @@ export function createClaudeSessionRunner({
       discarded: false,
       registered: kind === 'delivered',
       bufferedActions: [],
+      resultBuffered: false,
       controlState: null,
       finalized: false,
       resolveDone: null,
@@ -812,6 +813,22 @@ export function createClaudeSessionRunner({
         if (absorbed >= 0) {
           const outgoing = proc.activeCtx;
           const restored = outgoing.adoptedFromCompaction;
+          // A continuation whose turn already ENDED — its result is buffered,
+          // only waiting on its row's registration — was not interrupted by
+          // this replay: the replay opens the delivered message's own turn.
+          // Handing off would discard the continuation and its buffered
+          // answer with it. Let the registration publish that answer on the
+          // continuation row first; the delivered message gets a fresh turn.
+          const finishedContinuation = !restored
+            && outgoing.kind === 'continuation'
+            && !outgoing.registered
+            && !outgoing.discarded
+            && outgoing.resultBuffered === true;
+          if (finishedContinuation) {
+            detachActiveContext(outgoing);
+            proc.handoffSettling = waitForContextRegistration(outgoing);
+            return attachDeliveredContext(absorbed);
+          }
           if (restored) {
             // The outgoing context was only PROVISIONALLY adopted and has
             // published nothing. Settling it as an absorbed turn would tell
@@ -986,6 +1003,9 @@ export function createClaudeSessionRunner({
     }
     if (!ctx.registered) {
       ctx.bufferedActions.push(action);
+      // Kept as a flag, not read off the buffer: the registration drain
+      // splices batches out of it while they publish.
+      if (action.channel === 'result') ctx.resultBuffered = true;
       return;
     }
     await publisher.dispatchAction(ctx.message, action, ctx.state);
