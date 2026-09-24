@@ -58,7 +58,12 @@ import {
   conversationProviderIndicatorLabel,
 } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
-import { normalizeConversationFilter, filterConversations, drainRemainingPages } from './conversation-list-filter.mjs';
+import {
+  normalizeConversationFilter,
+  filterConversations,
+  drainRemainingPages,
+  describeFilterMatchCount,
+} from './conversation-list-filter.mjs';
 
 const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
 const PROCESSING_DOT_INTERVAL_MS = 1000;
@@ -81,6 +86,7 @@ let processingDotTimer = null;
 let lastConvListHtml = '';
 let conversationListFilterText = '';
 let conversationFilterDrainActive = false;
+let conversationFilterGeneration = 0;
 let openConversationVersion = 0;
 let newConversationInFlight = false;
 
@@ -1178,30 +1184,59 @@ export function initConversationListLazyLoading() {
 // A title filter has to search conversations that only exist on unloaded pages,
 // so an active filter drains the remaining pages in the background. Each page
 // re-renders via applyPage, so matches appear as they load.
+// A filter change aborts the running drain and starts a fresh one, so the new
+// filter gets a full retry budget.
 async function drainConversationListForFilter() {
   if (conversationFilterDrainActive) return;
   conversationFilterDrainActive = true;
+  const generation = conversationFilterGeneration;
   renderConvList();
   try {
     await drainRemainingPages(
       conversationListLoader,
-      () => !!normalizeConversationFilter(conversationListFilterText),
+      () => generation === conversationFilterGeneration
+        && !!normalizeConversationFilter(conversationListFilterText),
     );
   } finally {
     conversationFilterDrainActive = false;
-    // The "Searching older conversations…" footer keys off the drain flag.
-    renderConvList();
+    const filterActive = !!normalizeConversationFilter(conversationListFilterText);
+    if (filterActive && generation !== conversationFilterGeneration) {
+      void drainConversationListForFilter();
+    } else {
+      // The "Searching older conversations…" footer keys off the drain flag.
+      renderConvList();
+      if (filterActive) announceConversationFilterResults();
+    }
   }
+}
+
+// Announced only when the (debounced) filter applies and when its drain ends,
+// not on every page render, so screen readers are not flooded while typing.
+function announceConversationFilterResults() {
+  const status = document.getElementById('conv-filter-status');
+  if (!status) return;
+  const activeFilter = normalizeConversationFilter(conversationListFilterText);
+  if (!activeFilter) {
+    status.textContent = '';
+    return;
+  }
+  const count = filterConversations(Object.values(conversations), activeFilter).length;
+  const searching = conversationFilterDrainActive && conversationListLoader.getState().hasMore;
+  status.textContent = searching
+    ? `${describeFilterMatchCount(count)} so far, searching older conversations`
+    : describeFilterMatchCount(count);
 }
 
 function setConversationListFilter(text) {
   const next = String(text ?? '');
   if (next === conversationListFilterText) return;
   conversationListFilterText = next;
+  conversationFilterGeneration += 1;
   const list = getConversationListElement();
   if (list) list.scrollTop = 0;
   renderConvList();
   if (normalizeConversationFilter(next)) void drainConversationListForFilter();
+  announceConversationFilterResults();
 }
 
 export function initConversationFilter() {

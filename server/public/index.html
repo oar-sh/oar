@@ -520,8 +520,10 @@
     border-radius: 8px;
     background: var(--bg2);
     color: var(--text);
-    padding: 0 32px 0 10px;
-    font-size: var(--fs-meta-md);
+    padding: 0 38px 0 10px;
+    /* iOS Safari zooms the page on focus for inputs under 16px, and the
+       mobile root font is 12-14px, so 1rem alone is not enough. */
+    font-size: max(16px, 1rem);
   }
   #conv-filter-input:focus {
     outline: none;
@@ -530,10 +532,10 @@
   #conv-filter-clear {
     position: absolute;
     top: 50%;
-    right: 22px;
+    right: 20px;
     transform: translateY(-50%);
-    width: 22px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -550,6 +552,17 @@
   /* The display rule above outranks the UA [hidden] rule, same trap as the
      other [hidden] overrides in this file. */
   #conv-filter-clear[hidden] { display: none; }
+  #conv-filter-status {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
 
   #new-conv-btn {
     margin: 0; padding: 10px 14px; background: var(--accent); color: #000;
@@ -4473,7 +4486,7 @@
     #new-conv-btn { padding: 9px 12px; border-radius: 8px; font-size: var(--fs-meta-md); }
     #status-btn { min-width: 72px; padding: 9px 10px; font-size: var(--fs-meta-md); }
     #conv-filter-row { padding: 8px 12px; }
-    #conv-filter-clear { right: 18px; }
+    #conv-filter-clear { right: 16px; }
     #conv-list { padding: 0 5px 8px; }
     .conv-item { padding: 6px 11px; border-radius: 8px; }
     .conv-title {
@@ -5004,6 +5017,7 @@
     <div id="conv-filter-row">
       <input id="conv-filter-input" type="text" placeholder="Filter conversations…" autocomplete="off" spellcheck="false" aria-label="Filter conversations by title">
       <button id="conv-filter-clear" type="button" title="Clear filter" aria-label="Clear filter" hidden>×</button>
+      <div id="conv-filter-status" role="status" aria-live="polite"></div>
     </div>
     <div id="conv-list"></div>
   </div>
