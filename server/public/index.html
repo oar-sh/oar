@@ -1467,12 +1467,23 @@
     width: 100%; max-width: 100%; box-sizing: border-box;
     min-width: 0;
   }
+  /* Sticky inside the scroller: Stop on the live bubble is the only way to
+     stop a turn, and a long turn must stay stoppable without scrolling back
+     up. It sticks within its own bubble only, so it never rides over the
+     messages steered in below it. The bubble's background keeps streamed
+     text from showing through; `top` cancels #messages' padding-top (sticky
+     insets start at the padding edge), so nothing scrolls visibly above it. */
   .thinking-bubble-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
     margin-bottom: 4px;
+    position: sticky;
+    top: -20px;
+    z-index: 2;
+    background: var(--bot-bg);
+    padding: 4px 0;
   }
   .thinking-bubble-header:empty { display: none; margin-bottom: 0; }
   .bubble-action-btn {
@@ -4493,7 +4504,7 @@
       font-size: var(--fs-meta-md);
       min-height: 36px;
     }
-    .thinking-bubble-header { margin-bottom: 6px; }
+    .thinking-bubble-header { margin-bottom: 6px; top: -12px; }
     .sidebar-header { padding: var(--sidebar-header-top-pad-mobile) 12px 12px; gap: 8px; }
     #new-conv-btn { padding: 9px 12px; border-radius: 8px; font-size: var(--fs-meta-md); }
     #status-btn { min-width: 72px; padding: 9px 10px; font-size: var(--fs-meta-md); }
