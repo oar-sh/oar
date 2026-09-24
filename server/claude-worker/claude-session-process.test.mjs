@@ -1632,6 +1632,9 @@ test('a stopped row stays reported to the heartbeat until the interrupt and its 
   await tick(80);
   assert.deepEqual(ids(), ['q-1'], 'still reported while the interrupt has not resolved');
   assert.equal(runner.getActiveQueueMessageIds()[0].attemptId, 'attempt-1');
+  // A crash or SIGTERM now fails it the way the abort ack would — never a
+  // requeue, which would re-run the prompt the user stopped.
+  assert.equal(runner.getActiveQueueMessageIds()[0].terminalError?.stableCode, 'relay.turn-aborted');
 
   releaseInterrupt();
   await aborting;

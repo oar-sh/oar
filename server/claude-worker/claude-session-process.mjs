@@ -33,6 +33,7 @@ import {
   isStaleAttemptError,
 } from './claude-turn-publisher.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 
 /**
  * Which system-prompt append a relay mode gets (claude-sdk-adapter's
@@ -546,10 +547,20 @@ export function createClaudeSessionRunner({
     const live = proc
       ? [proc.activeCtx?.message, ...proc.pendingDelivered.map((entry) => entry.ctx.message)]
       : [];
-    const entries = [...live, ...[...lingeringStopped.values()].map((entry) => entry.message)].map((message) => ({
+    const entries = live.map((message) => ({
       id: String(message?.id || '').trim(),
       attemptId: message?.attemptId || null,
     }));
+    // A stopped row whose abort ack has not landed yet: the crash guard (and
+    // SIGTERM) must fail it the way the ack would, never requeue it — that
+    // would re-run a prompt the user explicitly stopped.
+    for (const { message } of lingeringStopped.values()) {
+      entries.push({
+        id: String(message?.id || '').trim(),
+        attemptId: message?.attemptId || null,
+        terminalError: buildRelayStopFailure(),
+      });
+    }
     for (const { message, variant } of settlingMessages.values()) {
       entries.push({
         id: String(message?.id || '').trim(),

@@ -8,6 +8,8 @@ import Database from 'better-sqlite3';
 
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildSteerSettleFailure, STEER_SETTLE_FAILED_TEXT } from './claude-turn-publisher.mjs';
+import { failSettlingRowsOnShutdown } from './claude-worker-link-wiring.mjs';
+import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import {
   noopRelocate,
   waitFor,
@@ -774,6 +776,25 @@ test('a superseded attempt’s late error result cannot mark steers consumed', a
   });
   assert.equal(stmts.findQById.get(host.id).status, 'failed');
   assert.ok(stmts.findQById.get(steer.id).consumed_at, 'the current attempt’s errored turn does mark it');
+});
+
+test('a worker dying before its abort ack lands fails the stopped row with the Stop wording, never requeues it', async () => {
+  const { db, stmts, deps, api } = bootRelayRoutes();
+  await api('POST', '/api/message', { clientId: 'client-stop-crash', conversationId: CONV, text: 'long task', model: MODEL, relayMode: 'agent' });
+  const delivered = dequeueForWorker({ db, stmts, deps });
+  // Exactly what the crash guard / SIGTERM send for a lingering stopped row.
+  const entry = { id: delivered.id, attemptId: delivered.attemptId, terminalError: buildRelayStopFailure() };
+  const calls = [];
+  await failSettlingRowsOnShutdown({
+    api: async (method, routePath, body) => { calls.push(body); return api(method, routePath, body); },
+    runner: { getActiveQueueMessageIds: () => [entry] },
+  });
+  assert.equal(calls.length, 1);
+  const row = stmts.findQById.get(delivered.id);
+  assert.equal(row.status, 'failed', 'not pending: the stopped prompt is never re-run');
+  assert.equal(Number(row.retry_count || 0), 0);
+  assert.match(row.response, /stopped from the relay UI before completion/);
+  assert.match(row.response, /relay\.turn-aborted/);
 });
 
 // ---------------------------------------------------------------------------

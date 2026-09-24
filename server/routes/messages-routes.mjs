@@ -21,6 +21,7 @@ import {
   STEER_SETTLE_FAILED_CODE,
   STEER_SETTLE_FAILED_STABLE_CODE,
 } from '../../shared/steer-settle-failure.mjs';
+import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
 import {
   fetchUsageSummaryPromise,
@@ -2473,15 +2474,7 @@ export function registerMessagesRoutes(app, deps) {
   }
 
   function buildRelayStopFailurePayload() {
-    return {
-      kind: 'turn-aborted',
-      error: 'turn-aborted',
-      code: 'turn-aborted',
-      stableCode: 'relay.turn-aborted',
-      message: 'System note: This turn was stopped from the relay UI before completion.',
-      guidance: 'Send a new message to continue when you are ready.',
-      failedAt: new Date().toISOString(),
-    };
+    return buildRelayStopFailure();
   }
 
   function settleRelayAbortControlsForQueueMessage(queueMessageId, { ok = true, note = null, error = null } = {}) {
