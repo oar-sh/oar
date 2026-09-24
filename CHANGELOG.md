@@ -42,6 +42,9 @@ All notable changes to OAR are documented here. The format follows
   which makes **Claude Opus 5.5** (`claude-opus-5-5`, plus its 1M-context
   variant) discoverable. Model discovery runs the SDK's bundled CLI, so
   `claude update` alone never surfaces a new Claude model.
+- `@github/copilot-sdk` 1.0.14: typed message provenance (human vs. system vs.
+  agent senders), a `fast` auto-routing tier, a `managedSettings.clearCache`
+  RPC, and streaming-throughput fixes.
 
 ### Fixed
 
