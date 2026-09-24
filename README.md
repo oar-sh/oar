@@ -348,10 +348,14 @@ What Claude conversations support:
 - Question cards, thinking/thought streams, live reply streaming, and nested subagent bubbles
 - **Mid-turn steering** — messages sent while a turn runs are pushed into the live turn (any number
   of them, Claude Code parity) instead of waiting behind it; each folded message keeps a compact
-  *merged* marker in the transcript. The composer button reads **Steer** during a live turn and
-  disables while the turn is waiting on a question card or compacting
-- **Stop** to abort the running turn — on the reply bubble; queued messages carry their own **Cancel**
-  until they are picked up
+  *merged* marker in the transcript. The composer button reads **Steer** during a live turn; while
+  the turn waits on a question card or plan approval, or is compacting, it reads **Queue** instead:
+  the message waits (cancellable) and steers in once the card is answered or compaction ends, so a
+  question card is never bypassed
+- **Stop** to abort the running turn — on the reply bubble, whose header stays pinned while a long
+  reply scrolls; queued messages carry their own **Cancel** until they are picked up. Steered
+  messages cut off by a Stop are marked *Stopped with the turn — not answered* with a one-tap
+  **Resend**
 - Background tasks that outlive the reply that started them: the composer's task panel lists them live with their own **Stop**, and an **Ultracode** workflow folds out into a tree of its phases and agents (state, model, tokens). When the workflow finishes, the summarizing reply keeps a collapsed *Finished background task* card holding the final tree, which survives reloads
 - Session continuity across worker restarts — the native Agent SDK session id is stored and resumed
 - Real context-window metrics, reported after each turn

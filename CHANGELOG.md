@@ -15,19 +15,29 @@ All notable changes to OAR are documented here. The format follows
 - A **conversation title filter** above the sidebar list. Case-insensitive,
   clears with × or Escape, and automatically loads older pages while active so
   it searches every conversation, not just the loaded ones.
+- **Resend** on a steered message that was cut off by **Stop**: the marker
+  reads *Stopped with the turn — not answered* and one tap sends the original
+  text and attachments again. Each original can be resent once (again only if
+  that Resend was cancelled or failed), and the button reads **Resent** on
+  every device and after reloads.
+- The running reply's **Stop** header stays pinned at the top of the chat
+  while a long reply scrolls, so it is always in reach on a phone.
 
 ### Changed
 
 - The composer's send button no longer turns into **Stop** while a turn runs.
-  It reads **Steer** when a Claude turn is live and text is drafted, stays
-  disabled on an empty composer, and disables with an explanation while
-  steering is held (open question card, plan approval, compaction). Stopping
-  now lives where the work is: the running reply's bubble carries **Stop**, and
-  queued messages carry **Cancel** until they are picked up.
-- Queued messages are claimed strictly in send order. Previously a message that
-  had been through a delivery retry was ranked behind every newer message for
-  as long as new ones kept arriving — it could starve for minutes in an active
-  conversation.
+  It reads **Steer** when a Claude turn is live and text is drafted, and stays
+  disabled on an empty composer. While steering is held (open question card or
+  plan approval, compaction) it stays enabled and reads **Queue**, with the
+  reason in its tooltip: the message waits as an ordinary pending bubble (with
+  **Cancel**) and steers into the turn once the card is answered or the
+  compaction ends. Stopping lives where the work is: the running reply's bubble
+  carries **Stop**, and queued messages carry **Cancel** until they are picked
+  up.
+- Queued messages are claimed strictly in send order, including messages that
+  went through a delivery retry. Previously a retried message could starve
+  behind newer ones for minutes in an active conversation, or run after them
+  so replies arrived out of order.
 - `@anthropic-ai/claude-agent-sdk` 0.3.281 (bundled Claude Code 2.1.281),
   which makes **Claude Opus 5.5** (`claude-opus-5-5`, plus its 1M-context
   variant) discoverable. Model discovery runs the SDK's bundled CLI, so
@@ -40,6 +50,46 @@ All notable changes to OAR are documented here. The format follows
   a full idle that never came, keeping every later message stuck behind it.
   Background tasks no longer block the settle; delivery watchdogs share the
   same rule.
+- **Drafts no longer get overwritten across devices.** The draft version check
+  never actually ran, so an idle device re-saved its stale (usually empty)
+  composer over another device's draft every few seconds. Saves are now
+  version-checked and happen only on real edits; a device you are not typing
+  on picks up the other's draft, and when two devices edit at once the newest
+  keystroke wins and the other text is offered back with **Restore** (and
+  **Undo**).
+- Other ways to lose a draft are fixed too: text typed or attachments added
+  while a send was in flight, switching conversations mid-send or before the
+  next draft loaded, reopening the open conversation (which dropped its draft
+  attachments), a failed send overwriting what was typed meanwhile, and drafts
+  over 20,000 characters re-saving in a loop (the saved part is now cut
+  cleanly, and the composer says the rest is not saved).
+- A steered message could run twice: Claude had already answered it, but the
+  relay's recovery (or a worker crash or restart) delivered it again. Steered
+  messages are now handled at most once: if the outcome cannot be recorded, the
+  message ends with an error telling you to check the reply above rather than
+  being run again.
+- A message sent while a question card was open or the conversation was
+  compacting could stall for many seconds, or be pushed past the open card.
+  Question cards are never bypassed or dropped by steering: such messages wait
+  and steer in once the card is answered.
+- **Stop now really stops** when steered messages were already pushed into the
+  turn. The Claude CLI otherwise opened a follow-up turn for them that re-ran
+  the stopped tool call; those messages now show *Stopped with the turn — not
+  answered* with **Resend** instead of claiming they were handled. A stopped
+  message is also no longer re-run if its worker dies right after the Stop.
+- After a reload, a message sent after a folded steer is no longer styled as
+  steered with its reply merged into the previous turn, and older replies stay
+  anchored under their own messages.
+- The live reply bubble no longer carries over into another conversation or
+  drops below later steered messages, and the live bubble and **Stop** follow
+  the turn that is actually producing output. A finished background task's
+  answer is no longer lost when a queued message takes over the turn.
+- A screenshot-only send no longer vanishes from the transcript before its
+  message lands.
+- Sidebar filter: keeps searching older pages while the list is busy loading,
+  matches accented titles regardless of how they were typed, no longer zooms
+  the page on iOS, and announces the match count once to screen readers
+  (saying when only loaded conversations were searched).
 
 ## [0.9.2] — 2026-09-13
 

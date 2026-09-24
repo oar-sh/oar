@@ -212,6 +212,10 @@ a real process, or touches `server/data`.
 The suite is expected to be green on every platform. A failure after your change is a
 regression — fix it before moving on.
 
+The hygiene guard's test-file rules walk the working tree on disk (not `git ls-files`), so
+leftover agent worktrees under `.claude/worktrees/` get scanned too and can fail `npm test` in
+the main checkout. Remove them (`git worktree remove …`) before running the suite there.
+
 To run a subset, match `*.test.mjs` explicitly — pointing the runner at a directory makes it
 try to execute the implementation modules alongside the tests, which fails:
 
