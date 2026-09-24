@@ -947,7 +947,9 @@ export function normalizePreferredReasoningEffort(value) {
   return String(value || '').trim().toLowerCase();
 }
 
-const MAX_CONVERSATION_DRAFT_LENGTH = 20_000;
+// The web client caps what it saves at the same length (MAX_DRAFT_TEXT_LENGTH
+// in public/app/conversation-draft-sync.mjs); a test pins them together.
+export const MAX_CONVERSATION_DRAFT_LENGTH = 20_000;
 
 function normalizeConversationDraftText(value, { maxLength = MAX_CONVERSATION_DRAFT_LENGTH } = {}) {
   const text = String(value ?? '');

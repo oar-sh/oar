@@ -1543,55 +1543,6 @@ test('draft sync: a refresh after a failed save never reverts the unsaved edit, 
   resetComposer('');
 });
 
-test('draft sync: a conversation switch empties the composer and holds saves until the new draft lands', async () => {
-  const convA = nextId('conv-switch-a');
-  const convB = nextId('conv-switch-b');
-  openWithServerDraft(convA, 'draft of A', SERVER_DRAFT_V1);
-  conversations[convB] = { id: convB, title: 'B' };
-  view.hydrateConversationDraft(convB, { draftText: 'draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
-  fetchHandler = async (url) => { throw new Error(`unexpected fetch: ${url}`); };
-  fetchLog.length = 0;
-  const input = getById('msg-input');
-  document.activeElement = input;
-
-  // What openConversation does after flushing A, then a programmatic switch
-  // (push notification, compaction) while the composer keeps focus.
-  view.beginConversationDraftSwitch(convB);
-  setCurrentConv(convB);
-  assert.equal(input.value, '', 'A\'s text is gone from the composer');
-  await view.flushConversationDraft(convB);
-  view.syncComposerAfterUserEdit();
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  assert.deepEqual(draftPatches(convB), [], 'nothing is saved under B before B\'s draft arrives');
-
-  view.hydrateConversationDraft(convB, { draftText: 'draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
-  assert.equal(input.value, 'draft of B', 'the focused composer takes B\'s draft');
-  document.activeElement = null;
-  resetComposer('');
-});
-
-test('draft sync: typing into a just-switched composer before its draft lands keeps the typing and offers the draft back', async () => {
-  const convB = nextId('conv-switch-b');
-  conversations[convB] = { id: convB, title: 'B' };
-  setCurrentConv(convB);
-  resetComposer('');
-  getById('relay-toast').children = [];
-  fetchHandler = async (url, opts) => ({ ok: true, draftText: JSON.parse(opts.body).draftText, draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V2 });
-  fetchLog.length = 0;
-
-  view.beginConversationDraftSwitch(convB);
-  getById('msg-input').value = 'typed right away';
-  view.hydrateConversationDraft(convB, { draftText: 'saved draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
-
-  assert.equal(getById('msg-input').value, 'typed right away');
-  assert.ok(latestToastAction(), 'B\'s saved draft is offered back');
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  const saved = draftPatches(convB).at(-1);
-  assert.equal(saved.draftText, 'typed right away');
-  assert.equal(saved.baseDraftUpdatedAt, SERVER_DRAFT_V1, 'based on the draft it replaces');
-  resetComposer('');
-});
-
 test('draft sync: a remote draft deferred while typing is surfaced when the typing is undone', async () => {
   const convId = nextId('conv-sync');
   openWithServerDraft(convId, 'shared', SERVER_DRAFT_V1);
@@ -1647,21 +1598,174 @@ test('draft sync: a second lost race schedules a retry instead of leaving the ed
   resetComposer('');
 });
 
-test('draft sync: the post-send save keeps text typed while the send was in flight', async () => {
+// A fake relay that enforces the draft protocol the way sessions-routes does
+// (versioned saves conflict-check their base, null included) and clears the
+// draft inside POST /api/message the way messages-routes does. `onMessage`
+// lets a test hold the send in flight.
+function createVersionedDraftServer(convId, { text = '', attachments = [], updatedAt = null, onMessage = null } = {}) {
+  let clock = Date.parse('2026-09-24T12:00:00.000Z');
+  const nextVersion = () => new Date(clock += 1000).toISOString();
+  const server = { text, attachments, updatedAt, saves: [] };
+  server.handler = async (url, opts = {}) => {
+    if (url.includes(`/api/conversation/${convId}?`)) return validationPayload('sess-v', '/root-v', 'V');
+    if (url.includes('/api/message')) {
+      const result = onMessage ? await onMessage() : { conversationId: convId, messageId: nextId('srv') };
+      server.text = '';
+      server.attachments = [];
+      server.updatedAt = nextVersion();
+      return result;
+    }
+    if (url.includes(`/api/conversation/${convId}/draft`)) {
+      const body = JSON.parse(opts.body);
+      server.saves.push(body);
+      const checks = body.baseDraftUpdatedAt !== undefined && (body.baseDraftUpdatedAt !== null || body.draftSyncVersion >= 2);
+      if (checks && (body.baseDraftUpdatedAt || null) !== (server.updatedAt || null)) {
+        return conflictPayload(server.text, server.updatedAt, server.attachments);
+      }
+      server.text = String(body.draftText || '').trim() ? String(body.draftText).slice(0, 20_000) : '';
+      if (body.draftAttachments !== undefined) server.attachments = body.draftAttachments || [];
+      server.updatedAt = nextVersion();
+      return { ok: true, draftText: server.text, draftAttachments: server.attachments, draftUpdatedAt: server.updatedAt };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  return server;
+}
+
+function typeIntoComposer(text) {
+  getById('msg-input').value = text;
+  view.syncComposerAfterUserEdit();
+}
+
+test('draft sync: a switch shows the next conversation\'s cached draft, never the previous one\'s text', async () => {
+  const convA = nextId('conv-switch-a');
+  const convB = nextId('conv-switch-b');
+  openWithServerDraft(convA, 'draft of A', SERVER_DRAFT_V1);
+  conversations[convB] = { id: convB, title: 'B', draftText: 'draft of B', draftUpdatedAt: SERVER_DRAFT_V1 };
+  fetchHandler = async (url) => { throw new Error(`unexpected fetch: ${url}`); };
+  fetchLog.length = 0;
+  const input = getById('msg-input');
+  document.activeElement = input;
+
+  // What openConversation does once A is flushed; a programmatic switch
+  // (push notification, compaction) keeps the composer focused.
+  setCurrentConv(convB);
+  view.beginConversationDraftSwitch(convB);
+  assert.equal(input.value, 'draft of B', 'A\'s text is replaced by B\'s known draft');
+  await view.flushConversationDraft(convB);
+  assert.deepEqual(draftPatches(convB), [], 'the blur flush of B\'s own draft is a no-op');
+
+  view.hydrateConversationDraft(convB, { draftText: 'draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
+  assert.equal(input.value, 'draft of B');
+  document.activeElement = null;
+  resetComposer('');
+});
+
+test('draft sync: when the switched-to conversation fails to load, typing cannot silently overwrite its real draft', async () => {
+  const convB = nextId('conv-switch-b');
+  // The cached list entry is behind: the phone saved a newer draft since.
+  conversations[convB] = { id: convB, title: 'B', draftText: 'cached draft of B', draftUpdatedAt: SERVER_DRAFT_V1 };
+  const server = createVersionedDraftServer(convB, { text: 'newer draft from the phone', updatedAt: SERVER_DRAFT_V2 });
+  fetchHandler = server.handler;
+  getById('relay-toast').children = [];
+  setCurrentConv(convB);
+  resetComposer('text of the previous conversation');
+
+  view.beginConversationDraftSwitch(convB);
+  assert.equal(getById('msg-input').value, 'cached draft of B', 'the composer is never left empty');
+  // loadConversation(B) returned null: no hydrate ever arrives.
+  typeIntoComposer('cached draft of B, edited');
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await settle();
+
+  assert.equal(server.saves[0].baseDraftUpdatedAt, SERVER_DRAFT_V1, 'the edit is based on the draft that was shown');
+  assert.equal(server.text, 'cached draft of B, edited', 'the newest edit wins through the conflict');
+  assert.ok(latestToastAction(), 'and the phone\'s draft is offered back rather than lost');
+  resetComposer('');
+});
+
+test('draft sync: typing into a just-switched composer before the load lands is kept and re-saved', async () => {
+  const convB = nextId('conv-switch-b');
+  conversations[convB] = { id: convB, title: 'B', draftText: 'saved draft of B', draftUpdatedAt: SERVER_DRAFT_V1 };
+  const server = createVersionedDraftServer(convB, { text: 'saved draft of B', updatedAt: SERVER_DRAFT_V1 });
+  fetchHandler = server.handler;
+  setCurrentConv(convB);
+  resetComposer('');
+
+  view.beginConversationDraftSwitch(convB);
+  getById('msg-input').value = 'saved draft of B + typed right away';
+  view.hydrateConversationDraft(convB, { draftText: 'saved draft of B', draftAttachments: [], draftUpdatedAt: SERVER_DRAFT_V1 });
+  assert.equal(getById('msg-input').value, 'saved draft of B + typed right away', 'the load does not revert the typing');
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await settle();
+  assert.equal(server.text, 'saved draft of B + typed right away');
+  resetComposer('');
+});
+
+test('draft sync: a refresh keeps composer attachments the user changed, and re-saves them with the text', async () => {
+  const convId = nextId('conv-sync');
+  const shotA = { sha256: 'a'.repeat(64), name: 'a.png', type: 'image/png', size: 10 };
+  const shotB = { sha256: 'b'.repeat(64), name: 'b.png', type: 'image/png', size: 10 };
+  conversations[convId] = { id: convId, title: 'Att' };
+  setCurrentConv(convId);
+  resetComposer('');
+  const server = createVersionedDraftServer(convId, { text: 'caption', attachments: [shotA], updatedAt: SERVER_DRAFT_V1 });
+  view.hydrateConversationDraft(convId, { draftText: 'caption', draftAttachments: [shotA], draftUpdatedAt: SERVER_DRAFT_V1 });
+  // The relay is down: the attachment change fails to save.
+  fetchHandler = async () => { throw new Error('relay restarting'); };
+  store.selectedAttachments.push({ ...shotB, uploadState: 'uploaded', uploaded: shotB });
+  await view.persistComposerAttachments();
+  fetchHandler = server.handler;
+
+  view.hydrateConversationDraft(convId, { draftText: 'caption', draftAttachments: [shotA], draftUpdatedAt: SERVER_DRAFT_V1 });
+  assert.deepEqual(store.selectedAttachments.map((att) => att.sha256 || att.uploaded?.sha256), [shotA.sha256, shotB.sha256], 'the refresh does not drop the new attachment');
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await settle();
+  assert.deepEqual(server.attachments.map((row) => row.sha256), [shotA.sha256, shotB.sha256], 'the re-save carries the attachments');
+  resetComposer('');
+  store.selectedAttachments.length = 0;
+});
+
+test('draft sync: a draft longer than the server limit settles instead of re-saving on every refresh', async () => {
+  const convId = nextId('conv-sync');
+  openWithServerDraft(convId, '', SERVER_DRAFT_V1);
+  const server = createVersionedDraftServer(convId, { text: '', updatedAt: SERVER_DRAFT_V1 });
+  fetchHandler = server.handler;
+  const longText = 'x'.repeat(20_500);
+
+  typeIntoComposer(longText);
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await settle();
+  assert.equal(server.saves.length, 1);
+  assert.equal(server.saves[0].draftText.length, 20_000, 'only the part the server keeps is sent');
+
+  for (let i = 0; i < 3; i += 1) {
+    view.hydrateConversationDraft(convId, { draftText: server.text, draftAttachments: [], draftUpdatedAt: server.updatedAt });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(server.saves.length, 1, 'the truncated echo counts as synced: no re-save loop');
+  assert.equal(getById('msg-input').value.length, 20_500, 'the composer itself is not cut down');
+  resetComposer('');
+});
+
+test('draft sync: text typed through the input handler while a send is in flight survives the send', async () => {
   const convId = nextId('conv-draft');
   const runningId = primeQueuedSend(convId, 'first message');
   const post = deferred();
-  stubQueuedSendFetches(convId, post.promise);
+  const server = createVersionedDraftServer(convId, { text: 'first message', updatedAt: PRE_SEND_DRAFT_AT, onMessage: () => post.promise });
+  view.hydrateConversationDraft(convId, { draftText: 'first message', draftAttachments: [], draftUpdatedAt: PRE_SEND_DRAFT_AT });
+  fetchHandler = server.handler;
 
   const sendPromise = view.sendMessage();
   await settle();
-  getById('msg-input').value = 'next message, typed during the send';
+  typeIntoComposer('next message, typed during the send');
+  await new Promise((resolve) => setTimeout(resolve, 600));
   post.resolve({ conversationId: convId, messageId: nextId('srv') });
   await sendPromise;
+  await settle();
 
-  const cleared = draftPatches(convId).at(-1);
-  assert.equal(cleared.draftText, 'next message, typed during the send', 'the post-send save does not wipe the new typing');
-  assert.equal(getById('msg-input').value, 'next message, typed during the send');
+  assert.equal(getById('msg-input').value, 'next message, typed during the send', 'the composer keeps the new typing');
+  assert.equal(server.text, 'next message, typed during the send', 'and it is the saved draft');
   view.applyConversationTurnStatus({ conversationId: convId, messageId: runningId, status: 'done' });
   resetComposer('');
 });

@@ -6,7 +6,8 @@ import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
-import { registerSessionsRoutes } from './sessions-routes.mjs';
+import { MAX_CONVERSATION_DRAFT_LENGTH, registerSessionsRoutes } from './sessions-routes.mjs';
+import { MAX_DRAFT_TEXT_LENGTH, draftTextForSync } from '../public/app/conversation-draft-sync.mjs';
 
 // Route-level coverage for PATCH /api/conversation/:id/draft's version check.
 // From a client that declares the versioned protocol (draftSyncVersion: 2),
@@ -202,6 +203,22 @@ test('an old tab\'s non-null base is still version-checked, as before', async ()
   });
 
   assert.equal(response.status, 409);
+});
+
+test('the web client caps drafts at exactly the server\'s truncation length', () => {
+  assert.equal(MAX_DRAFT_TEXT_LENGTH, MAX_CONVERSATION_DRAFT_LENGTH);
+});
+
+test('a draft over the limit is stored truncated to exactly what the client compares against', async () => {
+  const { patchDraft, insertConversation, readDraft } = setup();
+  insertConversation('conv-long');
+  const longText = 'y'.repeat(MAX_CONVERSATION_DRAFT_LENGTH + 250);
+
+  const response = await patchDraft('conv-long', { draftText: longText, draftSyncVersion: 2, baseDraftUpdatedAt: null });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.draftText, draftTextForSync(longText));
+  assert.equal(readDraft('conv-long').draft_text.length, MAX_CONVERSATION_DRAFT_LENGTH);
 });
 
 test('an absent base (legacy client) still saves unconditionally', async () => {

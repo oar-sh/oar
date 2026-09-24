@@ -12,6 +12,17 @@ import { normalizeDraftTimestampMs } from './conversation-draft-timestamp-utils.
 // keeps it), and for them null has to keep meaning "unconditional".
 export const DRAFT_SYNC_PROTOCOL_VERSION = 2;
 
+// Must equal the server's MAX_CONVERSATION_DRAFT_LENGTH (a test pins it). The
+// server truncates longer drafts, so the client saves and compares only this
+// prefix; otherwise a long composer never matches its acknowledged draft and
+// is re-saved on every refresh. The composer itself (and the message) is not
+// limited — only what survives as a draft.
+export const MAX_DRAFT_TEXT_LENGTH = 20_000;
+
+export function draftTextForSync(text) {
+  return String(text || '').slice(0, MAX_DRAFT_TEXT_LENGTH);
+}
+
 const syncedDraftsByConversation = new Map();
 
 function conversationKey(conversationId) {
@@ -91,22 +102,30 @@ export function resolveDraftConflict({
 }
 
 /**
- * Whether an incoming remote draft may replace the composer text of the
- * conversation on screen. Only an unmodified composer (text still equal to the
- * last synced draft) adopts it, focused or not. A modified one never does —
- * not even for an equal or newer version: its edit is unsaved (a failed flush
- * leaves exactly this state), and the caller re-saves it so the version check
- * decides. With nothing synced yet there is no local edit to protect.
+ * Whether an incoming remote draft may replace the composer of the
+ * conversation on screen. Only an unmodified composer (text and attachments
+ * still equal to the last synced draft) adopts it, focused or not. A modified
+ * one never does — not even for an equal or newer version: its edit is unsaved
+ * (a failed flush leaves exactly this state), and the caller re-saves it so the
+ * version check decides. An upload still in flight counts as a modification.
+ * With nothing synced yet there is no saved edit to protect.
+ * Attachment keys are null when unknown and then do not take part.
  */
 export function shouldApplyIncomingDraftToComposer({
   inputText = '',
   incomingText = '',
   syncedText = null,
+  inputAttachmentsKey = null,
+  incomingAttachmentsKey = null,
+  syncedAttachmentsKey = null,
+  attachmentsUploading = false,
 } = {}) {
-  const current = String(inputText || '');
-  if (current === String(incomingText || '')) return true;
+  if (attachmentsUploading) return false;
+  const current = draftTextForSync(inputText);
+  const sameAttachments = (other) => inputAttachmentsKey === null || other === null || inputAttachmentsKey === other;
+  if (current === String(incomingText || '') && sameAttachments(incomingAttachmentsKey)) return true;
   if (syncedText === null) return true;
-  return current === syncedText;
+  return current === syncedText && sameAttachments(syncedAttachmentsKey);
 }
 
 /**
@@ -121,8 +140,8 @@ export function draftFlushRequestBody({
   fallbackUpdatedAt = null,
   clientId = null,
 } = {}) {
-  const draftText = String(inputText || '');
-  const serverText = synced ? synced.text : String(fallbackText || '');
+  const draftText = draftTextForSync(inputText);
+  const serverText = synced ? synced.text : draftTextForSync(fallbackText);
   if (draftText === serverText) return null;
   return {
     draftText,

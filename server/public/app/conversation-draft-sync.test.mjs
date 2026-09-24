@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   DRAFT_SYNC_PROTOCOL_VERSION,
+  MAX_DRAFT_TEXT_LENGTH,
+  draftTextForSync,
   draftAttachmentsKey,
   draftFlushRequestBody,
   forgetSyncedDraft,
@@ -84,6 +86,23 @@ test('a modified composer never adopts, whatever the incoming version', () => {
     shouldApplyIncomingDraftToComposer({ inputText: 'unsaved edit', incomingText: 'old', syncedText: 'old' }),
     false,
     'the same server draft coming back (a refresh after a failed flush) never reverts the edit',
+  );
+});
+
+test('changed or uploading attachments make the composer modified', () => {
+  const base = { inputText: 'same', incomingText: 'new', syncedText: 'same' };
+  assert.equal(shouldApplyIncomingDraftToComposer({ ...base, inputAttachmentsKey: `${SHA_A},${SHA_B}`, syncedAttachmentsKey: SHA_A }), false);
+  assert.equal(shouldApplyIncomingDraftToComposer({ ...base, inputAttachmentsKey: SHA_A, syncedAttachmentsKey: SHA_A }), true);
+  assert.equal(shouldApplyIncomingDraftToComposer({ ...base, attachmentsUploading: true }), false, 'an upload in flight is never wiped');
+});
+
+test('drafts are compared and saved only up to the server\'s length limit', () => {
+  const long = 'z'.repeat(MAX_DRAFT_TEXT_LENGTH + 10);
+  assert.equal(draftTextForSync(long).length, MAX_DRAFT_TEXT_LENGTH);
+  assert.equal(
+    shouldApplyIncomingDraftToComposer({ inputText: long, incomingText: 'other', syncedText: draftTextForSync(long) }),
+    true,
+    'a long composer whose truncated echo was acknowledged counts as unmodified',
   );
 });
 

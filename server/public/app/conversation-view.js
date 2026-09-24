@@ -64,7 +64,6 @@ import { openSettingsModal } from './settings-modal.js';
 import {
   serializeDraftAttachments,
   hydrateDraftAttachments,
-  mergeDraftAttachmentUpdate,
   draftAttachmentsEqual,
 } from './composer-attachment-cache.mjs';
 import { renderRelayQuestions } from './ask-user-view.js';
@@ -93,6 +92,8 @@ import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
 import {
   DRAFT_SYNC_PROTOCOL_VERSION,
+  MAX_DRAFT_TEXT_LENGTH,
+  draftTextForSync,
   draftAttachmentsKey,
   getSyncedDraft,
   isDraftSaveNoop,
@@ -515,14 +516,29 @@ export function syncComposerButtonState() {
 }
 
 // The composer's input handler: the user edited the text, so the draft is
-// saved (debounced) as well as the button refreshed.
+// saved (debounced) as well as the button refreshed. While a send owns the
+// draft nothing is saved: the send transaction clears the draft
+// unconditionally after any such save, and the send's own post-send save
+// carries whatever the composer holds by then.
 export function syncComposerAfterUserEdit() {
   syncSendButtonState();
-  if (isAwaitingDraftHydrate(currentConvId)) return;
-  void scheduleConversationDraftSave({
-    conversationId: currentConvId,
-    draftText: document.getElementById('msg-input')?.value || '',
-  });
+  const text = document.getElementById('msg-input')?.value || '';
+  warnOnceIfDraftTooLong(text);
+  if (isDraftOwnedByPendingSend(currentConvId)) return;
+  void scheduleConversationDraftSave({ conversationId: currentConvId, draftText: text });
+}
+
+let draftLengthWarningShown = false;
+
+function warnOnceIfDraftTooLong(text) {
+  const tooLong = String(text || '').length > MAX_DRAFT_TEXT_LENGTH;
+  if (tooLong && !draftLengthWarningShown) {
+    showTransientRelayNotice(
+      `Drafts are saved up to ${MAX_DRAFT_TEXT_LENGTH.toLocaleString('en-US')} characters; the rest stays only in this tab until you send.`,
+      7000,
+    );
+  }
+  draftLengthWarningShown = tooLong;
 }
 
 export function isSendInFlight() {
@@ -547,35 +563,30 @@ function isDraftSavePending(conversationId) {
   return draftSaveTimerByConversation.has(id) || draftSavePromiseByConversation.has(id);
 }
 
-// Conversation whose composer was just emptied by a switch and whose draft has
-// not arrived yet. Until it does, text in the composer cannot be told apart
-// from the previous conversation's, so edits are not saved.
-let draftHydrateAwaitedConversationId = '';
-
-function isAwaitingDraftHydrate(conversationId) {
-  const id = String(conversationId || '').trim();
-  return !!id && id === draftHydrateAwaitedConversationId;
-}
-
 /**
- * Called by openConversation after the previous conversation's draft was
- * flushed and before the next one loads: empties the composer (which still
- * holds the previous conversation's, or the blank new-chat view's, text) so
- * no later blur, keystroke or flush can save that text under the next
- * conversation.
+ * Called by openConversation once the composer belongs to the next
+ * conversation (after the previous draft was flushed): replaces the previous
+ * conversation's text with the next one's cached draft, so no blur, keystroke
+ * or flush can save the old text under the new conversation — and so a load
+ * that fails still leaves that conversation's known draft on screen rather
+ * than an empty composer a keystroke would save over it. The load's hydrate
+ * then reconciles against it like any other incoming draft.
  */
 export function beginConversationDraftSwitch(nextConversationId) {
-  draftHydrateAwaitedConversationId = String(nextConversationId || '').trim();
+  const id = String(nextConversationId || '').trim();
+  const cached = id ? conversations[id] : null;
+  const text = String(cached?.draftText || '');
+  const attachments = Array.isArray(cached?.draftAttachments) ? cached.draftAttachments : [];
+  if (cached && !getSyncedDraft(id)) {
+    recordSyncedDraft(id, { text: draftTextForSync(text), attachments, updatedAt: cached.draftUpdatedAt || null });
+  }
+  if (attachments.length) setComposerAttachments(hydrateDraftAttachments(attachments));
   const input = document.getElementById('msg-input');
-  if (input && input.value) {
-    input.value = '';
+  if (input && input.value !== text) {
+    input.value = text;
     autoResize(input);
   }
-}
-
-/** The switched-to conversation failed to load: stop holding its saves back. */
-export function abandonConversationDraftSwitch(conversationId) {
-  if (isAwaitingDraftHydrate(conversationId)) draftHydrateAwaitedConversationId = '';
+  syncSendButtonState();
 }
 
 // Omitted version fields keep their current values: a local edit changes the
@@ -613,13 +624,22 @@ function upsertConversationDraftState(conversationId, {
  */
 export function persistComposerAttachments() {
   const id = String(currentConvId || '').trim();
-  if (!id || isAwaitingDraftHydrate(id)) return null;
+  // A send owns the draft: its post-send save picks the attachments up.
+  if (!id || isDraftOwnedByPendingSend(id)) return null;
   return scheduleConversationDraftSave({
     conversationId: id,
     draftText: document.getElementById('msg-input')?.value || '',
     draftAttachments: serializeDraftAttachments(selectedAttachments),
     immediate: true,
   });
+}
+
+function saveComposerIfUnsynced(conversationId) {
+  const synced = getSyncedDraft(conversationId);
+  const text = draftTextForSync(document.getElementById('msg-input')?.value || '');
+  const attachments = serializeDraftAttachments(selectedAttachments);
+  if (synced && synced.text === text && (synced.attachmentsKey === null || synced.attachmentsKey === draftAttachmentsKey(attachments))) return;
+  void scheduleConversationDraftSave({ conversationId, draftText: text, draftAttachments: attachments });
 }
 
 function isDraftVersionConflict(response) {
@@ -670,7 +690,7 @@ function applyDraftToComposer(conversationId, text, draftAttachments = undefined
     if (!draftAttachmentsEqual(selectedAttachments, hydrated)) setComposerAttachments(hydrated);
   }
   const input = document.getElementById('msg-input');
-  if (input && input.value !== text) {
+  if (input && draftTextForSync(input.value) !== text) {
     input.value = text;
     autoResize(input);
   }
@@ -751,7 +771,7 @@ async function resolveDraftSaveConflict(id, { text, draftAttachments, synced, co
   const serverText = String(conflict.draftText || '');
   const serverAttachments = Array.isArray(conflict.draftAttachments) ? conflict.draftAttachments : undefined;
   const viewing = isCurrentConversation(id);
-  const localText = viewing ? String(document.getElementById('msg-input')?.value ?? text) : text;
+  const localText = viewing ? draftTextForSync(document.getElementById('msg-input')?.value ?? text) : text;
   const localAttachments = draftAttachments === undefined
     ? undefined
     : (viewing ? serializeDraftAttachments(selectedAttachments) : draftAttachments);
@@ -841,7 +861,7 @@ async function scheduleConversationDraftSave({
 } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
-  const text = String(draftText || '');
+  const text = draftTextForSync(draftText);
   upsertConversationDraftState(id, { draftText: text, draftAttachments });
   clearDraftTimerForConversation(id);
   if (immediate) {
@@ -858,7 +878,7 @@ async function scheduleConversationDraftSave({
 
 export async function flushConversationDraft(conversationId = currentConvId) {
   const id = String(conversationId || '').trim();
-  if (!id || isAwaitingDraftHydrate(id)) return null;
+  if (!id || isDraftOwnedByPendingSend(id)) return null;
   const input = document.getElementById('msg-input');
   const draftText = String((id === String(currentConvId || '').trim() && input) ? input.value : (conversations[id]?.draftText || ''));
   return scheduleConversationDraftSave({
@@ -869,37 +889,39 @@ export async function flushConversationDraft(conversationId = currentConvId) {
 }
 
 // Shared tail of both incoming-draft paths (conversation load/poll and the
-// cross-client broadcast) for the conversation on screen.
+// cross-client broadcast) for the conversation on screen. `incoming.attachments`
+// is undefined when the update did not carry attachments.
 function reconcileIncomingComposerDraft(id, incoming) {
   const input = document.getElementById('msg-input');
   if (!input) return;
-  if (isAwaitingDraftHydrate(id)) {
-    draftHydrateAwaitedConversationId = '';
-    if (input.value && input.value !== incoming.text) {
-      // Typed into the just-opened composer before its draft arrived: the
-      // typing is the newest edit, and the server draft it displaces is kept
-      // for restore.
-      recordSyncedDraft(id, incoming);
-      keepLosingDraft(id, { text: incoming.text, attachments: incoming.attachments });
-      void scheduleConversationDraftSave({ conversationId: id, draftText: input.value });
-      syncSendButtonState();
-      return;
-    }
-  } else if (!shouldApplyIncomingDraftToComposer({
+  const synced = getSyncedDraft(id);
+  const composerAttachments = serializeDraftAttachments(selectedAttachments);
+  if (!shouldApplyIncomingDraftToComposer({
     inputText: input.value,
     incomingText: incoming.text,
-    syncedText: getSyncedDraft(id)?.text ?? null,
+    syncedText: synced ? synced.text : null,
+    inputAttachmentsKey: draftAttachmentsKey(composerAttachments),
+    incomingAttachmentsKey: draftAttachmentsKey(incoming.attachments),
+    syncedAttachmentsKey: synced ? synced.attachmentsKey : null,
+    attachmentsUploading: hasUploadingAttachments(selectedAttachments),
   })) {
-    // An unsaved local edit (typing, or a flush that failed). Re-save it so
-    // the version check decides: the same version saves, a newer one conflicts.
+    // An unsaved local edit (typing, an attachment change, or a flush that
+    // failed). Re-save it, attachments included, so the version check
+    // decides: the same version saves, a newer one conflicts.
     if (!isDraftSavePending(id)) {
-      void scheduleConversationDraftSave({ conversationId: id, draftText: input.value });
+      void scheduleConversationDraftSave({ conversationId: id, draftText: input.value, draftAttachments: composerAttachments });
     }
     syncSendButtonState();
     return;
   }
   recordSyncedDraft(id, incoming);
-  if (input.value !== incoming.text) {
+  if (Array.isArray(incoming.attachments)) {
+    const hydrated = hydrateDraftAttachments(incoming.attachments);
+    if (!draftAttachmentsEqual(selectedAttachments, hydrated)) setComposerAttachments(hydrated);
+  }
+  // A composer longer than the draft limit matches its truncated echo; it must
+  // not be cut down to it.
+  if (draftTextForSync(input.value) !== incoming.text) {
     input.value = incoming.text;
     autoResize(input);
   }
@@ -920,11 +942,7 @@ export function hydrateConversationDraft(conversationId, {
   const normalizedAttachments = Array.isArray(draftAttachments) ? draftAttachments : [];
   const existingMs = normalizeDraftTimestampMs(conversations[id]?.draftUpdatedAt);
   const incomingMs = normalizeDraftTimestampMs(draftUpdatedAt);
-  if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) {
-    // The conversation's own load still ends the switch hold.
-    abandonConversationDraftSwitch(id);
-    return;
-  }
+  if (isIncomingDraftTimestampStale({ existingMs, incomingMs })) return;
   upsertConversationDraftState(id, {
     draftText: normalizedDraftText,
     draftAttachments: normalizedAttachments,
@@ -935,10 +953,6 @@ export function hydrateConversationDraft(conversationId, {
   if (String(currentConvId || '').trim() !== id) {
     if (!isDraftSavePending(id)) recordSyncedDraft(id, syncedDraft);
     return;
-  }
-  // Restore the composer's pending attachments for the conversation being opened.
-  if (!draftAttachmentsEqual(selectedAttachments, hydrateDraftAttachments(normalizedAttachments))) {
-    setComposerAttachments(hydrateDraftAttachments(normalizedAttachments));
   }
   reconcileIncomingComposerDraft(id, syncedDraft);
 }
@@ -971,16 +985,6 @@ export function applyIncomingConversationDraftUpdate({
   if (String(currentConvId || '').trim() !== id) {
     if (!isDraftSavePending(id)) recordSyncedDraft(id, syncedDraft);
     return;
-  }
-  if (draftAttachments !== undefined) {
-    const merged = mergeDraftAttachmentUpdate({
-      existing: selectedAttachments,
-      incoming: hydrateDraftAttachments(Array.isArray(draftAttachments) ? draftAttachments : []),
-      existingUpdatedAt: conversations[id]?.draftUpdatedAt || null,
-      incomingUpdatedAt: draftUpdatedAt,
-      isLocalEcho: senderClientId === CLIENT_ID,
-    });
-    if (merged.changed) setComposerAttachments(merged.attachments);
   }
   reconcileIncomingComposerDraft(id, syncedDraft);
 }
@@ -3271,6 +3275,9 @@ export async function sendMessage() {
     // Every exit path has settled the draft by now: cleared it (success),
     // restored the composer text (offline/failure), or never touched it.
     if (targetConversationId) sendOwnedDraftConversations.delete(targetConversationId);
+    // Edits made after the post-send save were held back while the send owned
+    // the draft; save them now.
+    if (targetConversationId && isCurrentConversation(targetConversationId)) saveComposerIfUnsynced(targetConversationId);
   }
 }
 
