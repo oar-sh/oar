@@ -22,8 +22,16 @@ All notable changes to OAR are documented here. The format follows
   every device and after reloads.
 - The running reply's **Stop** header stays pinned at the top of the chat
   while a long reply scrolls, so it is always in reach on a phone.
+- Background subagents in the task panel show the **model they actually run
+  on** (e.g. *Opus 5.5*) beside their kind pill, and the **command they are
+  running right now** with its tool emoji (e.g. *🔧 Tool (Bash): npm test*),
+  cropped to the row — instead of *using Bash · opus*.
 
 ### Changed
+
+- The background task panel scrolls when it holds more tasks than fit,
+  instead of growing past the window — in phone landscape too, where the
+  composer now always stays on screen.
 
 - The composer's send button no longer turns into **Stop** while a turn runs.
   It reads **Steer** when a Claude turn is live and text is drafted, and stays
