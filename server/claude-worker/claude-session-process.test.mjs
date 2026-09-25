@@ -4525,6 +4525,50 @@ test('a subagent\'s own frames supply its real model and its current tool call',
   await settled(runner);
 });
 
+test('subagent frames publish only on a change to a live background task, and prose clears the tool call', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+  const publishes = () => stub.calls.filter((call) => call.routePath === '/api/background-tasks').length;
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  // A foreground subagent's frames: no live task owns the parent id, so
+  // nothing publishes (there is no background set to update).
+  turn.emit({
+    type: 'assistant',
+    parent_tool_use_id: 'toolu-foreground',
+    message: { model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 2_200));
+  assert.equal(publishes(), 0, 'foreground subagent frames never publish');
+
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'bg job' }]));
+  turn.emit({ type: 'system', subtype: 'task_started', task_id: 'agent-1', tool_use_id: 'toolu-bg', task_type: 'local_agent', description: 'bg job' });
+  const frame = (content) => ({ type: 'assistant', parent_tool_use_id: 'toolu-bg', message: { model: 'claude-opus-5-5', content } });
+  turn.emit(frame([{ type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'npm test' } }]));
+  const withCall = await waitFor(() => stub.calls.findLast(
+    (call) => call.routePath === '/api/background-tasks' && call.body.tasks?.[0]?.lastToolCall,
+  ), { label: 'tool call publish' });
+  assert.equal(withCall.body.tasks[0].lastToolCall, 'Tool (Bash): npm test');
+  const settledCount = publishes();
+  // An identical frame (thinking only) changes nothing and publishes nothing.
+  turn.emit(frame([{ type: 'thinking', thinking: 'hm' }]));
+  await new Promise((resolve) => setTimeout(resolve, 2_200));
+  assert.equal(publishes(), settledCount, 'an unchanged frame does not republish');
+  // The subagent starts writing its answer: the stale command is cleared.
+  turn.emit(frame([{ type: 'text', text: 'All tests pass.' }]));
+  const cleared = await waitFor(() => {
+    const last = stub.calls.findLast((call) => call.routePath === '/api/background-tasks');
+    return last && publishes() > settledCount && last.body.tasks?.[0]?.lastToolCall === null ? last : null;
+  }, { label: 'cleared tool call publish' });
+  assert.equal(cleared.body.tasks[0].model, 'claude-opus-5-5');
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('an abort control interrupts the turn but keeps the process alive', async () => {
   const stub = makeApiStub();
   const turn = scriptedTurn();

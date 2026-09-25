@@ -1793,22 +1793,32 @@ export function createClaudeSessionRunner({
     const parentId = String(sdkMessage?.parent_tool_use_id || '').trim();
     if (!parentId) return;
     const entry = proc.subagentActivity.get(parentId) || {};
+    const before = `${entry.model || ''}\n${entry.lastToolCall || ''}`;
     const model = String(sdkMessage?.message?.model || '').trim();
     if (model && model !== '<synthetic>') entry.model = model;
     const blocks = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
     for (const block of blocks) {
-      if (block?.type !== 'tool_use') continue;
-      const toolName = displayToolName(block.name) || 'tool';
-      const summary = summarizeToolInput(toolName, block.input).replace(/\s+/g, ' ').trim();
-      entry.lastToolCall = (summary ? `Tool (${toolName}): ${summary}` : `Tool (${toolName})`)
-        .slice(0, MAX_TASK_TOOL_CALL_CHARS);
+      if (block?.type === 'tool_use') {
+        const toolName = displayToolName(block.name) || 'tool';
+        const summary = summarizeToolInput(toolName, block.input).replace(/\s+/g, ' ').trim();
+        entry.lastToolCall = (summary ? `Tool (${toolName}): ${summary}` : `Tool (${toolName})`)
+          .slice(0, MAX_TASK_TOOL_CALL_CHARS);
+      } else if (block?.type === 'text' && String(block.text || '').trim()) {
+        // Writing prose means the last tool call is over; the panel falls
+        // back to the SDK's progress summary instead of a stale command.
+        entry.lastToolCall = null;
+      }
     }
     proc.subagentActivity.delete(parentId);
     proc.subagentActivity.set(parentId, entry);
     while (proc.subagentActivity.size > 100) {
       proc.subagentActivity.delete(proc.subagentActivity.keys().next().value);
     }
-    if (entry.model || entry.lastToolCall) publishBackgroundTasks({ throttled: true });
+    // Foreground subagents stream the same frames; only a change on a live
+    // background task is worth a publish (and a panel re-render).
+    if (before === `${entry.model || ''}\n${entry.lastToolCall || ''}`) return;
+    const ownsLiveTask = [...proc.liveTasks.values()].some((task) => task.toolUseId === parentId);
+    if (ownsLiveTask) publishBackgroundTasks({ throttled: true });
   }
 
   // Between-turn notices carried into the next activated context, as either a
