@@ -42,9 +42,10 @@ All notable changes to OAR are documented here. The format follows
   hidden note telling the model to handle them in addition to the request it
   is working on. In testing, a model that received a steer before its first
   output answered only the new message and dropped the original request.
-- A queued Copilot message that the runtime has not started yet keeps its
-  **Cancel**: cancelling pulls it back out of the runtime's queue, so it is
-  never answered.
+- The newest message you steered into a running Copilot turn keeps its
+  **Cancel** until the runtime picks it up: cancelling pulls it back out of the
+  runtime, so it is never answered. (Copilot's queue can only give back its
+  newest waiting message, so older ones lose Cancel once pushed, as on Claude.)
 - **Background tasks for Copilot conversations** now match Claude's: background
   agents the model spawns and detached shells appear in the task panel as they
   run, with the agent's kind, the model it runs on, the command it is running

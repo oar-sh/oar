@@ -393,3 +393,159 @@ test('the steering snapshot names the row whose run is live, and ownership follo
   assert.equal(await second, true);
   assert.deepEqual(runner.getActiveQueueMessageIds(), []);
 });
+
+// ------------------------------------------- un-steer, steering lane (live) --
+//
+// Live check 2026-09-25: immediate sends wait in the runtime's steering lane,
+// which has no ids (`pendingItems` reports only their text), so the queued-lane
+// path above never triggered. Only the newest waiting one can be removed —
+// `queue.removeMostRecent` (fake-provider probe, runtime 1.0.88).
+
+/** Two steers pushed and waiting (not yet injected) in the steering lane. */
+async function twoWaitingSteers() {
+  const made = await openLiveTurn({ scripts: [() => [], () => []] });
+  const { client, runner } = made;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', attemptId: 'a-2', text: 'first steer' } });
+  await waitFor(() => client.session.sends.length === 2, { label: 'q-2 pushed' });
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', attemptId: 'a-3', text: 'second steer' } });
+  await waitFor(() => client.session.sends.length === 3, { label: 'q-3 pushed' });
+  client.session.steeringLane = [
+    { messageId: client.session.idOfSend(1), text: 'first steer' },
+    { messageId: client.session.idOfSend(2), text: 'second steer' },
+  ];
+  client.session.emit({ type: 'pending_messages.modified', data: {} });
+  await waitFor(() => runner.steeringState().cancellableIds.length > 0, { label: 'snapshot refreshed' });
+  return { ...made, second, third };
+}
+
+test('only the newest waiting steer is cancellable, and Cancel removes it with removeMostRecent', async () => {
+  const { stub, client, runner, first, second, third } = await twoWaitingSteers();
+  assert.deepEqual(runner.steeringState().cancellableIds, ['q-3'], 'the older waiting steer cannot be recalled');
+  assert.equal(await runner.cancelPushedMessage('q-2'), false, 'not the newest: refused');
+  assert.deepEqual(client.session.removedSteering, []);
+
+  assert.equal(await runner.cancelPushedMessage('q-3'), true);
+  assert.deepEqual(client.session.removedSteering, [client.session.idOfSend(2)]);
+  assert.deepEqual(stub.bodiesFor('/api/queue-cancelled'), [{ conversationId: 'conv-1', messageId: 'q-3', attemptId: 'a-3' }]);
+  assert.equal(await third, true);
+  // Now q-2 is the newest waiting one.
+  client.session.emit({ type: 'pending_messages.modified', data: {} });
+  await waitFor(() => runner.steeringState().cancellableIds.includes('q-2'), { label: 'q-2 now recallable' });
+
+  // q-2 runs after all; nothing is ever answered for q-3.
+  client.session.steeringLane = [];
+  client.session.emit(userMessage(client.session.idOfSend(1), 'queued', 'first steer'));
+  client.session.emit(assistantText('m9', 'answer to the first steer'));
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(responsesFor(stub, 'q-2')[0].text, 'answer to the first steer');
+  assert.equal(responsesFor(stub, 'q-3').length, 0);
+});
+
+test('a steer the runtime takes while the remove is in flight settles normally, never as cancelled', async () => {
+  const { stub, client, runner, first, second, third } = await twoWaitingSteers();
+  // The runtime folds q-3 in before answering the remove request.
+  client.session.onRemoveMostRecent = (session) => {
+    session.emit(userMessage(session.idOfSend(2), 'steering', 'second steer'));
+    return { removed: true };
+  };
+  assert.equal(await runner.cancelPushedMessage('q-3'), false);
+  assert.equal(stub.bodiesFor('/api/queue-cancelled').length, 0);
+  client.session.onRemoveMostRecent = null;
+  client.session.steeringLane = [];
+  client.session.emit(userMessage(client.session.idOfSend(1), 'steering', 'first steer'));
+  client.session.emit(assistantText('m9', 'handled both'));
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(await third, true);
+  assert.equal(responsesFor(stub, 'q-3')[0].kind, 'folded');
+});
+
+test('a newer steer is never blocked by an un-steer, and never overtaken by its remove request', async () => {
+  const { client, runner, first } = await twoWaitingSteers();
+  let finishRemove = () => {};
+  client.session.onRemoveMostRecent = (session) => new Promise((resolve) => {
+    finishRemove = () => { session.removedSteering.push(session.steeringLane.pop().messageId); resolve({ removed: true }); };
+  });
+  const cancelling = runner.cancelPushedMessage('q-3');
+  await waitFor(() => client.session.callLog.includes('removeMostRecent'), { label: 'remove issued' });
+  // The remove is still unanswered: a new steer goes out anyway, after it.
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4', text: 'third steer' } });
+  await waitFor(() => client.session.sends.length === 4, { label: 'q-4 sent without waiting' });
+  const order = client.session.callLog.filter((call) => call === 'removeMostRecent' || call === 'send').slice(-2);
+  assert.deepEqual(order, ['removeMostRecent', 'send']);
+  finishRemove();
+  assert.equal(await cancelling, true);
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  await fourth;
+});
+
+test('while a steer send is still unanswered, no newest-recall is offered or attempted', async () => {
+  // The runtime may already count the in-flight message as its newest waiting
+  // one while this worker cannot name it yet: removeMostRecent would take it.
+  const { client, runner, first } = await twoWaitingSteers();
+  assert.deepEqual(runner.steeringState().cancellableIds, ['q-3']);
+  let resolveSend = () => {};
+  const realSend = client.session.send.bind(client.session);
+  client.session.send = (options) => new Promise((resolve) => { resolveSend = () => resolve(realSend(options)); });
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4', text: 'third steer' } });
+  await waitFor(() => runner._getState().activeEntries.some((entry) => entry.id === 'q-4'), { label: 'q-4 send in flight' });
+  assert.deepEqual(runner.steeringState().cancellableIds, [], 'nothing is offered while a send is unanswered');
+  assert.equal(await runner.cancelPushedMessage('q-3'), false);
+  assert.equal(client.session.callLog.includes('removeMostRecent'), false, 'no remove was attempted');
+  resolveSend();
+  await waitFor(() => client.session.sends.length === 4, { label: 'q-4 named' });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  await fourth;
+});
+
+test('two un-steers at once run one after the other, each against a fresh read', async () => {
+  const { stub, client, runner, first, second, third } = await twoWaitingSteers();
+  const both = await Promise.all([runner.cancelPushedMessage('q-3'), runner.cancelPushedMessage('q-2')]);
+  // q-3 (newest) goes first; then q-2 is the newest waiting one and goes too.
+  assert.deepEqual(both, [true, true]);
+  assert.deepEqual(client.session.removedSteering, [client.session.idOfSend(2), client.session.idOfSend(1)]);
+  assert.deepEqual(stub.bodiesFor('/api/queue-cancelled').map((body) => body.messageId), ['q-3', 'q-2']);
+  assert.equal(await second, true);
+  assert.equal(await third, true);
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+});
+
+test('a runtime without removeMostRecent never offers a newest-recall', async () => {
+  const { client, runner, first } = await twoWaitingSteers();
+  delete client.session.rpc.queue.removeMostRecent;
+  client.session.emit({ type: 'pending_messages.modified', data: {} });
+  await runner.whenQueueLaneRefreshed();
+  await waitFor(() => runner.steeringState().cancellableIds.length === 0, { label: 'nothing offered' });
+  assert.equal(await runner.cancelPushedMessage('q-3'), false);
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+});
+
+test('the worker is told at once when a message becomes, and stops being, cancellable', async () => {
+  let changes = 0;
+  const made = await openLiveTurn({ scripts: [() => [], () => []], onCancellableChange: () => { changes += 1; } });
+  const { client, runner, first } = made;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'first steer' } });
+  await waitFor(() => client.session.sends.length === 2, { label: 'q-2 pushed' });
+  client.session.steeringLane = [{ messageId: client.session.idOfSend(1), text: 'first steer' }];
+  client.session.emit({ type: 'pending_messages.modified', data: {} });
+  await waitFor(() => changes === 1, { label: 'became cancellable' });
+  // Same state again: no repeat notification.
+  client.session.emit({ type: 'pending_messages.modified', data: {} });
+  await runner.whenQueueLaneRefreshed();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(changes, 1);
+  // The runtime takes it: no longer cancellable.
+  client.session.steeringLane = [];
+  client.session.emit(userMessage(client.session.idOfSend(1), 'steering', 'first steer'));
+  await waitFor(() => changes === 2, { label: 'stopped being cancellable' });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+});

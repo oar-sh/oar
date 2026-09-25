@@ -93,6 +93,9 @@ async function main() {
   // while a question card is open is held in the relay queue and steers into
   // the resumed turn one round trip after the answer.
   const linkBridge = createRunnerLinkBridge();
+  // Late-bound: the heartbeat controller is built after the runner.
+  let heartbeat = null;
+  let cancellablePulseTimer = null;
   const turnRunner = createCopilotSdkSessionRunner({
     api,
     sdkSessionId,
@@ -106,12 +109,22 @@ async function main() {
     modelSwitchTimeoutMs: readOptionalMs('COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS'),
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     onDeliveryReadinessChange: (ready) => linkBridge.onDeliveryReadinessChange(ready),
+    // A message became (or stopped being) cancellable: report it now rather
+    // than on the next 10 s heartbeat. Coalesced to one pulse per 300 ms.
+    onCancellableChange: () => {
+      if (cancellablePulseTimer) return;
+      cancellablePulseTimer = setTimeout(() => {
+        cancellablePulseTimer = null;
+        void heartbeat?.pulseHeartbeat?.();
+      }, 300);
+      cancellablePulseTimer.unref?.();
+    },
     canHandBackHeldDelivery: () => linkBridge.canHandBackHeldDelivery(),
     dbg,
   });
 
   let heartbeatTimer = null;
-  const heartbeat = createHeartbeatController({
+  heartbeat = createHeartbeatController({
     api,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,

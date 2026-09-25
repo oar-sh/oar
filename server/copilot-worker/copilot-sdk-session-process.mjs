@@ -332,6 +332,11 @@ export function createCopilotSdkSessionRunner({
   // delivery is then pushed the legacy way instead of being handed back into
   // a retry-and-backoff requeue.
   canHandBackHeldDelivery = () => true,
+  // Called when the set of recallable (un-steerable) rows changes. The worker
+  // wires it to an immediate heartbeat: the client's Cancel appears from the
+  // heartbeat snapshot, and a 10 s wait would often outlast the window in
+  // which the runtime still holds the message (live check 2026-09-25).
+  onCancellableChange = () => {},
   dbg = () => {},
 } = {}) {
   let client = null;
@@ -398,6 +403,31 @@ export function createCopilotSdkSessionRunner({
   // runtime message id → stable queue item id. What un-steer needs, and what
   // decides which pushed rows the client may still cancel.
   let queuedLane = new Map();
+  // The rest of the last queue snapshot: how many immediate messages wait in
+  // the runtime's steering lane (entries not yet folded into the running
+  // turn), and how many items the queued lane holds. The steering lane has no
+  // ids — only its newest entry can be removed (`queue.removeMostRecent`,
+  // LIFO across both lanes; probe 2026-09-25) — so these decide whether our
+  // newest steer is still recallable.
+  let waitingSteers = 0;
+  let queuedItemCount = 0;
+  // Guards for the LIFO recall (removeMostRecent takes the runtime's NEWEST
+  // waiting message, whoever sent it):
+  //  - `steerSendsInFlight`: steer sends whose `send()` has not resolved yet.
+  //    The runtime may already count such a message while this worker cannot
+  //    yet name it, so no "newest" recall is attempted while any is in flight.
+  //  - `steerSendSeq`: send order across every owned turn, so "our newest
+  //    unconsumed steer" is decided by when it was sent, not by which turn
+  //    object happens to hold it.
+  //  - `unsteerChain`: un-steers run one at a time (each re-reads the queue).
+  // Steer sends never wait on an un-steer; the recall check and its remove
+  // request run in the same tick, so no send can be issued between them.
+  let steerSendsInFlight = 0;
+  let lastCancellableSignature = '';
+  let steerSendSeq = 0;
+  let unsteerChain = Promise.resolve();
+  /** How long an un-steer may wait on the runtime before it gives up. */
+  const UNSTEER_TIMEOUT_MS = 5_000;
   let queueLaneTimer = null;
   let queueLaneRefreshChain = Promise.resolve();
   // Whether the session's `rpc.queue` / `rpc.interruptMainTurn` / `rpc.tasks`
@@ -1440,9 +1470,52 @@ export function createCopilotSdkSessionRunner({
       }
       if (session !== target) return;
       queuedLane = next;
+      queuedItemCount = Array.isArray(snapshot?.items) ? snapshot.items.length : 0;
+      const steering = Array.isArray(snapshot?.steeringMessages) ? snapshot.steeringMessages.length : 0;
+      const inFlight = Number(snapshot?.inFlightSteeringCount) || 0;
+      waitingSteers = Math.max(0, steering - inFlight);
     } catch (error) {
       dbg('queue.pendingItems failed', error?.message || String(error));
     }
+    noteCancellableChange();
+  }
+
+  /** Tell the worker when the recallable set changed (see onCancellableChange). */
+  function noteCancellableChange() {
+    const signature = cancellableIds().join(',');
+    if (signature === lastCancellableSignature) return;
+    lastCancellableSignature = signature;
+    try {
+      onCancellableChange();
+    } catch (error) {
+      dbg('cancellable listener failed', error?.message || String(error));
+    }
+  }
+
+  /** Our pushed steers the runtime has not started on yet, in send order. */
+  function unconsumedSteers() {
+    const list = [];
+    for (const entry of ownedEntries()) {
+      if (entry.role === 'steer' && !entry.consumed && !entry.settled && entry.runtimeId) list.push(entry);
+    }
+    return list.sort((a, b) => (a.sendSeq || 0) - (b.sendSeq || 0));
+  }
+
+  /**
+   * How `entry` can still be pulled back out of the runtime, or null: by its
+   * stable id when it sits in the queued lane, or with removeMostRecent when
+   * it is the runtime's newest waiting message (our newest unconsumed steer,
+   * at least one steer waiting, nothing in the queued lane that a LIFO remove
+   * would take instead).
+   */
+  function recallMethodFor(entry) {
+    if (!entry || entry.role !== 'steer' || entry.consumed || entry.settled || !entry.runtimeId) return null;
+    const itemId = queuedLane.get(entry.runtimeId);
+    if (itemId) return { kind: 'queued', itemId };
+    if (typeof session?.rpc?.queue?.removeMostRecent !== 'function') return null;
+    if (steerSendsInFlight > 0 || queuedItemCount > 0 || waitingSteers < 1) return null;
+    const pending = unconsumedSteers();
+    return pending.length && pending[pending.length - 1] === entry ? { kind: 'newest' } : null;
   }
 
   /** Probe the experimental RPC surfaces once per session. */
@@ -2021,6 +2094,9 @@ export function createCopilotSdkSessionRunner({
     pendingActivities = [];
     compactingSince = 0;
     queuedLane = new Map();
+    waitingSteers = 0;
+    queuedItemCount = 0;
+    steerSendsInFlight = 0;
     sessionRpc = { queue: false, interruptMainTurn: false, tasks: false };
     askUserOverrideRejected = false;
     syncDeliveryReadiness();
@@ -2400,6 +2476,7 @@ export function createCopilotSdkSessionRunner({
    */
   async function adoptSegment(turn, entry, { index, delivery, interactionId }) {
     entry.consumed = true;
+    noteCancellableChange();
     entry.delivery = delivery || null;
     entry.interactionId = interactionId || null;
     const running = turn.currentOwner || turn.primaryEntry;
@@ -2637,10 +2714,12 @@ export function createCopilotSdkSessionRunner({
       ? pending.filter((entry) => entry.role === 'steer' && !entry.consumed && !entry.foldedInto)
       : [];
     if (turn.aborted || result?.aborted) {
-      // Belt and braces for the targeted interrupt: any prompt of ours still
-      // sitting in the runtime's queued lane is pulled out before its row is
-      // marked stopped, so the runtime cannot run a prompt whose row says it
-      // was not answered.
+      // Belt and braces: `interruptMainTurn({flushQueued:false})` and
+      // `abort()` both empty the runtime's steering AND queued lanes
+      // (probe-verified 2026-09-25), so nothing pushed runs after a Stop. Any
+      // prompt of ours still listed in the queued lane is removed by id anyway
+      // before its row is marked stopped. (The id-less steering lane cannot be
+      // targeted, and needs no help.)
       await clearOwnedQueuedItems(pending.filter((entry) => !entry.consumed && entry.runtimeId));
     }
     // The stopped row first: settling it before the live row's cascade means
@@ -3141,6 +3220,9 @@ export function createCopilotSdkSessionRunner({
     const entry = createEntry(turn, message, 'steer');
     dbg('steering a mid-turn delivery into the running turn', message.id);
     let runtimeId;
+    // Counted until send() names the message (see `steerSendsInFlight`).
+    steerSendsInFlight += 1;
+    entry.sendSeq = ++steerSendSeq;
     try {
       runtimeId = await session.send({
         prompt,
@@ -3155,11 +3237,13 @@ export function createCopilotSdkSessionRunner({
       entry.settled = true;
       entry.released = true;
       entry.resolveDone(true);
+      steerSendsInFlight = Math.max(0, steerSendsInFlight - 1);
       dbg('steering send failed, requeuing the row', message.id, error?.message || String(error));
       await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
       return true;
     }
     assignRuntimeId(turn, entry, runtimeId);
+    steerSendsInFlight = Math.max(0, steerSendsInFlight - 1);
     // Same commit-after-send rule as `runTurn` (audit #32): a steered prompt
     // whose send failed never delivered its guidance, so the retry must
     // include it again.
@@ -3242,12 +3326,15 @@ export function createCopilotSdkSessionRunner({
     for (const turn of publishingTurns) yield* turn.entries;
   }
 
-  /** Pushed rows the client may still cancel: unconsumed, in the runtime's queued lane. */
+  /**
+   * Pushed rows the client may still cancel: unconsumed and recallable — in
+   * practice the newest waiting steer (immediate sends wait in the runtime's
+   * id-less steering lane), or any row that sits in the queued lane.
+   */
   function cancellableIds() {
     const ids = [];
-    for (const entry of ownedEntries()) {
-      if (entry.role !== 'steer' || entry.consumed || entry.settled) continue;
-      if (!entry.runtimeId || !queuedLane.has(entry.runtimeId)) continue;
+    for (const entry of unconsumedSteers()) {
+      if (!recallMethodFor(entry)) continue;
       const id = String(entry.message?.id || '').trim();
       if (id && !ids.includes(id)) ids.push(id);
     }
@@ -3278,10 +3365,46 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * Un-steer (decision 8): pull a pushed-but-unconsumed row back out of the
-   * runtime's queued lane and cancel it. A prompt the runtime already took
-   * (`consumed`) cannot be recalled; the control is then a no-op and the row
-   * settles through its normal path.
+   * Re-read the queue, and — only if the prompt is still recallable at that
+   * instant — issue its remove request in the same tick as the check, so no
+   * steer send can be issued in between (JSON-RPC keeps request order).
+   */
+  async function recallPushedPrompt(entry, id) {
+    // Only the READ is bounded: a runtime that will not answer it gets no
+    // remove at all. Once a remove is sent it is seen through to its answer —
+    // giving up on it could leave the prompt removed and the row uncancelled.
+    const fresh = await withTimeout(refreshQueueLane().then(() => true), UNSTEER_TIMEOUT_MS, false);
+    if (!fresh) {
+      dbg('un-steer refused: the runtime did not answer the queue read in time', id);
+      return false;
+    }
+    const target = session;
+    const method = recallMethodFor(entry);
+    if (!target || !method) {
+      dbg('un-steer refused: the runtime no longer holds this prompt as recallable', id);
+      return false;
+    }
+    const request = method.kind === 'queued'
+      ? target.rpc.queue.removeAt({ id: method.itemId })
+      : target.rpc.queue.removeMostRecent();
+    return (await request)?.removed === true;
+  }
+
+  function withTimeout(promise, ms, fallback) {
+    let timer = null;
+    return Promise.race([
+      promise,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); timer.unref?.(); }),
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Un-steer (decision 8, narrowed 2026-09-25 after the live check): pull a
+   * pushed-but-unconsumed row back out of the runtime and cancel it. Immediate
+   * sends wait in the runtime's id-less steering lane, so only the NEWEST
+   * waiting one is recallable (`queue.removeMostRecent`); a row in the queued
+   * lane goes by its stable id. A prompt the runtime already took cannot be
+   * recalled; the control is then a no-op and the row settles normally.
    */
   async function cancelPushedMessage(messageId) {
     const id = String(messageId || '').trim();
@@ -3295,19 +3418,21 @@ export function createCopilotSdkSessionRunner({
       return false;
     }
     if (!session || !sessionRpc.queue) return false;
-    await refreshQueueLane();
-    const itemId = queuedLane.get(entry.runtimeId);
-    if (!itemId) {
-      dbg('un-steer refused: prompt no longer in the queued lane', id);
+    // One un-steer at a time; each re-reads the queue (that read is bounded —
+    // see recallPushedPrompt). Steer sends never wait on this chain.
+    const run = unsteerChain.then(() => recallPushedPrompt(entry, id));
+    unsteerChain = run.catch(() => false);
+    const removed = await run.catch((error) => {
+      dbg('un-steer failed', id, error?.message || String(error));
+      return false;
+    });
+    if (!removed) return false;
+    // Folded in anyway between the check and the remove (its user.message
+    // arrived): the model saw it, so it settles through its normal path.
+    if (entry.consumed || entry.settled) {
+      dbg('un-steer raced the runtime taking the prompt; leaving it to settle normally', id);
       return false;
     }
-    let removed = false;
-    try {
-      removed = (await session.rpc.queue.removeAt({ id: itemId }))?.removed === true;
-    } catch (error) {
-      dbg('queue.removeAt failed', id, error?.message || String(error));
-    }
-    if (!removed) return false;
     entry.cancelled = true;
     entry.settled = true;
     dbg('un-steered a pushed prompt', id);

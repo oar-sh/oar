@@ -127,6 +127,16 @@ export function createFakeCopilotSession({
     // mutates it (or passes `queueItems`) to model the runtime's queued lane.
     queueItems: Array.isArray(queueItems) ? queueItems : [],
     removedQueueItems: [],
+    // The runtime's steering lane (runtime 1.0.88 shape): immediate sends
+    // waiting to be injected, oldest first, WITHOUT ids — `pendingItems`
+    // reports only their text — and how many leading ones are already folded
+    // into the running turn. `removeMostRecent` pops the newest (LIFO across
+    // both lanes). Tests push `{ messageId, text }` here to model a wait.
+    steeringLane: [],
+    inFlightSteeringCount: 0,
+    removedSteering: [],
+    // Order of queue/send calls, for tests that pin request ordering.
+    callLog: [],
     // What `rpc.tasks.list()` answers; a test mutates it to model the runtime's
     // task registry moving (running → idle/completed/cancelled).
     taskList: Array.isArray(taskList) ? taskList : [],
@@ -145,6 +155,7 @@ export function createFakeCopilotSession({
     },
     async send(options) {
       session.sends.push(options);
+      session.callLog.push('send');
       nextMessageId += 1;
       const messageId = `fake-message-id-${nextMessageId}`;
       session.sentIds.push(messageId);
@@ -209,7 +220,24 @@ export function createFakeCopilotSession({
         pendingCalls: 0,
         async pendingItems() {
           session.rpc.queue.pendingCalls += 1;
-          return { items: session.queueItems.map((item) => ({ kind: 'message', ...item })), steeringMessages: [] };
+          return {
+            items: session.queueItems.map((item) => ({ kind: 'message', ...item })),
+            steeringMessages: session.steeringLane.map((entry) => entry.text),
+            inFlightSteeringCount: session.inFlightSteeringCount,
+          };
+        },
+        async removeMostRecent() {
+          session.callLog.push('removeMostRecent');
+          if (session.onRemoveMostRecent) return session.onRemoveMostRecent(session);
+          if (session.queueItems.length) {
+            session.removedQueueItems.push(session.queueItems.pop().id);
+            return { removed: true };
+          }
+          if (session.steeringLane.length > session.inFlightSteeringCount) {
+            session.removedSteering.push(session.steeringLane.pop().messageId);
+            return { removed: true };
+          }
+          return { removed: false };
         },
         async removeAt({ id }) {
           const before = session.queueItems.length;
