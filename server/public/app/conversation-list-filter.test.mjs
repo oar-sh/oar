@@ -10,7 +10,7 @@ import {
 
 test('normalizeConversationFilter trims and lowercases', () => {
   assert.equal(normalizeConversationFilter('  Vault  '), 'vault');
-  assert.equal(normalizeConversationFilter('MRL.CX'), 'mrl.cx');
+  assert.equal(normalizeConversationFilter('EXAMPLE.COM'), 'example.com');
   assert.equal(normalizeConversationFilter(''), '');
   assert.equal(normalizeConversationFilter('   '), '');
   assert.equal(normalizeConversationFilter(null), '');
