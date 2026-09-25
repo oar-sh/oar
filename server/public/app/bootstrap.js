@@ -88,7 +88,7 @@ import {
   loadRelayQuestions,
   getPendingQuestionCountsByConversation,
 } from './ask-user-view.js';
-import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayQuestionMultiSelect, submitRelayStructuredAnswer, onRelayQuestionDraftInput, onRelayQuestionMultiSelectChange, handleRelayQuestionKey } from './ask-user-view.js';
+import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayQuestionMultiSelect, submitRelayStructuredAnswer, onRelayQuestionDraftInput, onRelayQuestionMultiSelectChange, setRelayQuestionMultiMode, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, submitRelayBoardAction } from './relay-board-view.js';
 import {
   restoreInFlightThinking,
@@ -4385,6 +4385,7 @@ window.submitRelayQuestionMultiSelect = submitRelayQuestionMultiSelect;
 window.submitRelayStructuredAnswer = submitRelayStructuredAnswer;
 window.onRelayQuestionDraftInput = onRelayQuestionDraftInput;
 window.onRelayQuestionMultiSelectChange = onRelayQuestionMultiSelectChange;
+window.setRelayQuestionMultiMode = setRelayQuestionMultiMode;
 window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.submitRelayBoardAction = submitRelayBoardAction;

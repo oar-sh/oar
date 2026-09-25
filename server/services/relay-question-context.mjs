@@ -34,6 +34,10 @@ export function sanitizeRelayQuestionContext(rawContext, {
   // answers are allowed (Claude's AskUserQuestion `multiSelect`, or the
   // Copilot worker's wording heuristic). Only an explicit `true` is kept.
   if (rawContext.multiSelect === true) context.multiSelect = true;
+  // Providers whose ask tool cannot always say so (Copilot) mark their choice
+  // cards with this: the card then offers a "Select several" switch, so the
+  // user can pick several answers even when the model did not flag it.
+  if (rawContext.allowMultiSelect === true) context.allowMultiSelect = true;
   // Claude's short question label ("Workers", "Visibility").
   if (typeof rawContext.header === 'string' && rawContext.header.trim()) {
     context.header = rawContext.header.trim().slice(0, 120);

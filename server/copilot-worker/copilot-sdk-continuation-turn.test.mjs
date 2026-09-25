@@ -374,6 +374,9 @@ test('a user message delivered during a continuation gets its own row and its ow
   const delivery = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'what time is it?' } });
   await waitFor(() => client.session.sends.length === 2, { label: 'steered send' });
   assert.equal(client.session.sends[1].mode, 'immediate');
+  // No steer note: the running work is the runtime's own follow-up, not a
+  // request of the user's to keep going with (shared/steer-note.mjs).
+  assert.equal(/Sent while you were still working/.test(client.session.sends[1].prompt), false);
 
   // The runtime picks the steered prompt up as a run of its own
   // (`delivery:"queued"`): a new `user.message` naming the id send() resolved,

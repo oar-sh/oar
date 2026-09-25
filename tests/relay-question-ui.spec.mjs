@@ -248,6 +248,81 @@ test("renders a multi-select question card with checkmarks and answers with ever
   }
 });
 
+test("a Copilot choice card offers Select several: one-click by default, checkmarks once switched on", async ({ page, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  const questionPrompt = `Playwright toggle question ${stamp}: Which environments?`;
+  let conversationId = "";
+  let messageId = "";
+  let questionId = "";
+
+  try {
+    const queued = await request.post("/api/message", {
+      headers,
+      data: { text: `Playwright toggle seed ${stamp}`, relayMode: "autopilot", model: "gpt-5.4-mini", reasoningEffort: "high" },
+    });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "");
+    messageId = String(queuedBody?.messageId || "");
+    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    expect(String(pendingBody?.message?.id || "")).toBe(messageId);
+
+    // What the Copilot worker's bridge posts for a question neither the model
+    // nor the wording flagged as multi-select: the switch hint only.
+    const created = await request.post("/api/relay-question", {
+      headers,
+      data: {
+        queueId: messageId,
+        messageId,
+        conversationId,
+        mode: "autopilot",
+        prompt: questionPrompt,
+        choices: ["staging", "production", "preview"],
+        allowFreeform: true,
+        timeout_ms: 120000,
+        context: { source: "onUserInputRequest", rationale: "Verifying the Select several switch.", allowMultiSelect: true },
+      },
+    });
+    expect(created.ok()).toBeTruthy();
+    questionId = String((await created.json())?.question?.id || "");
+    expect(questionId).toBeTruthy();
+
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    const pendingBanner = page.locator("#pending-question-banner");
+    await expect(pendingBanner).toBeVisible();
+    await pendingBanner.click();
+
+    const questionCard = page.locator(".relay-question-container", { hasText: questionPrompt });
+    await expect(questionCard).toBeVisible();
+    // Untouched: one-click buttons, and the switch is off.
+    await expect(questionCard.getByRole("button", { name: "staging" })).toBeVisible();
+    const toggle = questionCard.getByLabel("Select several");
+    await expect(toggle).not.toBeChecked();
+    // Switched on: checkmarks and one "Reply with selection".
+    await toggle.check();
+    await expect(questionCard.getByRole("button", { name: "staging" })).toHaveCount(0);
+    await questionCard.getByLabel("staging").check();
+    await questionCard.getByLabel("preview").check();
+    await questionCard.getByRole("button", { name: "Reply with selection" }).click();
+    await expect(questionCard).not.toBeVisible({ timeout: 10000 });
+
+    const stateBody = await (await request.get(`/api/relay-question/${questionId}`, { headers })).json();
+    expect(String(stateBody?.question?.status || "")).toBe("answered");
+    expect(String(stateBody?.question?.answer || "")).toBe("staging, preview");
+  } finally {
+    if (messageId && conversationId) {
+      await request.post("/api/response", {
+        headers,
+        data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", reasoningEffort: "high", mode: "autopilot" },
+      }).catch(() => {});
+      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
+    }
+  }
+});
+
 test("shrinks image attachment frames to the rendered image width", async ({ page, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };

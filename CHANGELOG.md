@@ -38,6 +38,10 @@ All notable changes to OAR are documented here. The format follows
   ends only the reply — background agents the turn started keep running under
   their own Stop — and messages pushed just before the Stop settle as *Stopped
   with the turn — not answered* with **Resend**, exactly as on Claude.
+- Messages steered into a running turn (Claude and Copilot) carry a short
+  hidden note telling the model to handle them in addition to the request it
+  is working on. In testing, a model that received a steer before its first
+  output answered only the new message and dropped the original request.
 - A queued Copilot message that the runtime has not started yet keeps its
   **Cancel**: cancelling pulls it back out of the runtime's queue, so it is
   never answered.
@@ -50,10 +54,14 @@ All notable changes to OAR are documented here. The format follows
   relay's *Background task timeout* slider now governs Copilot tasks too
   (expiry stops them instead of silently forgetting them).
 - **Multi-select question cards.** A question that allows several answers
-  (Claude's `multiSelect`, or a Copilot question worded "select all that
-  apply") renders checkmarks instead of one-shot buttons, plus one **Reply
-  with selection** button; the reply lists every ticked choice and whatever
-  you typed in addition. Previously the first click answered the whole card.
+  renders checkmarks instead of one-shot buttons, plus one **Reply with
+  selection** button; the reply lists every ticked choice and whatever you
+  typed in addition. Previously the first click answered the whole card.
+  Claude cards follow Claude's own `multiSelect` flag. Copilot models get the
+  relay's own `ask_user` tool, which adds a `multi_select` field to the
+  runtime's (the built-in has no way to say "pick several"); a question worded
+  "select all that apply" counts too, and every Copilot choice card has a
+  **Select several** switch for the cases a model forgets to flag.
 
 ### Changed
 

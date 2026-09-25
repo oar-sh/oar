@@ -32,6 +32,12 @@ test('the multi-select flag and the question header survive, so the card can ren
   assert.equal(sanitizeRelayQuestionContext({ header: 'x'.repeat(500) }).header.length, 120);
 });
 
+test('the "Select several" switch hint survives, only as a real boolean true', () => {
+  assert.equal(sanitizeRelayQuestionContext({ source: 's', allowMultiSelect: true }).allowMultiSelect, true);
+  assert.equal('allowMultiSelect' in sanitizeRelayQuestionContext({ source: 's', allowMultiSelect: 'yes' }), false);
+  assert.equal('allowMultiSelect' in sanitizeRelayQuestionContext({ source: 's', allowMultiSelect: false }), false);
+});
+
 test('unknown keys are dropped and an empty or invalid context is null', () => {
   assert.deepEqual(sanitizeRelayQuestionContext({ source: 's', requestId: 'r1', html: '<b>' }), { source: 's' });
   assert.equal(sanitizeRelayQuestionContext({}), null);

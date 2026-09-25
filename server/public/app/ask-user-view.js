@@ -10,7 +10,7 @@ import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion, answe
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
-import { composeMultiSelectAnswer, isMultiSelectQuestion } from './question-multi-select.mjs';
+import { composeMultiSelectAnswer, isMultiSelectQuestion, offersMultiSelectToggle } from './question-multi-select.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
 
 let relayQuestionRenderHash = '';
@@ -19,6 +19,13 @@ const relayQuestionStructuredDrafts = new Map();
 // Ticked choices of a multi-select card (question id → Set of labels), kept
 // across re-renders until the card is answered.
 const relayQuestionMultiDrafts = new Map();
+// The "Select several" switch position per card (question id → boolean) on
+// cards that offer it (Copilot); absent = the provider's flag decides.
+const relayQuestionMultiMode = new Map();
+
+function multiModeFor(question) {
+  return question ? relayQuestionMultiMode.get(question.id) : undefined;
+}
 const RELAY_QUESTION_AUTO_SCROLL_THRESHOLD_PX = 80;
 
 function distanceFromBottom(el) {
@@ -102,6 +109,14 @@ export async function loadRelayQuestions(conversationId) {
     const question = next.get(questionId);
     if (!question || question.status !== 'pending') {
       relayQuestionStructuredDrafts.delete(questionId);
+    }
+  }
+  // Multi-select ticks and the "Select several" switch position die with the
+  // card, whoever settled it (this device, another one, a timeout).
+  for (const draftMap of [relayQuestionMultiDrafts, relayQuestionMultiMode]) {
+    for (const questionId of draftMap.keys()) {
+      const question = next.get(questionId);
+      if (!question || question.status !== 'pending') draftMap.delete(questionId);
     }
   }
   relayQuestions.clear();
@@ -219,7 +234,7 @@ export function renderRelayQuestions() {
       answeredAt: q.answeredAt || '',
       createdAt: q.createdAt || '',
       choices: Array.isArray(q.choices) ? q.choices : [],
-      multiSelect: isMultiSelectQuestion(q),
+      multiSelect: isMultiSelectQuestion(q, multiModeFor(q)),
       schema: q.requestSchema || null,
     }))
   );
@@ -259,8 +274,13 @@ export function renderRelayQuestions() {
       const choices = Array.isArray(question.choices) ? question.choices : [];
       // A multi-select card (the provider said several may be picked) offers
       // checkmarks and ONE Reply; ticking never answers by itself.
-      const multiSelect = isMultiSelectQuestion(question);
+      const multiSelect = isMultiSelectQuestion(question, multiModeFor(question));
       const ticked = relayQuestionMultiDrafts.get(question.id) || new Set();
+      // Copilot cards: a switch between one-click answers and checkmarks,
+      // pre-set from the model's flag or the question's wording.
+      const toggleHtml = question.status === 'pending' && offersMultiSelectToggle(question)
+        ? `<label class="relay-question-multi-toggle"><input type="checkbox" data-relay-focus-key="multi-toggle"${multiSelect ? ' checked' : ''} onchange="setRelayQuestionMultiMode('${question.id}', this.checked)"> Select several</label>`
+        : '';
       let choiceHtml = '';
       if (choices.length && question.status === 'pending' && multiSelect) {
         choiceHtml = `<div class="relay-question-choices relay-question-multi" id="relay-question-multi-${question.id}">${
@@ -286,7 +306,7 @@ export function renderRelayQuestions() {
             <button class="relay-question-submit" onclick="${multiSelect ? 'submitRelayQuestionMultiSelect' : 'submitRelayQuestionAnswer'}('${question.id}')">${multiSelect ? 'Reply with selection' : 'Reply'}</button>
           </div>`
         : '';
-      interactiveHtml = `${choiceHtml}${replyHtml}`;
+      interactiveHtml = `${choiceHtml}${toggleHtml}${replyHtml}`;
     }
 
     const answeredHtml = question.status === 'answered' && question.answer
@@ -509,6 +529,17 @@ function tickedMultiSelectLabels(questionId) {
     .map((el) => String(el.getAttribute('data-choice-value') || ''));
 }
 
+/**
+ * The "Select several" switch: flip the card between one-click answers and
+ * checkmarks. Ticks made so far are kept, and the card re-renders in place.
+ */
+export function setRelayQuestionMultiMode(questionId, enabled) {
+  const id = String(questionId || '');
+  if (!id) return;
+  relayQuestionMultiMode.set(id, enabled === true);
+  renderRelayQuestions();
+}
+
 export function onRelayQuestionMultiSelectChange(questionId, label, checked) {
   const id = String(questionId || '');
   const set = relayQuestionMultiDrafts.get(id) || new Set();
@@ -549,7 +580,8 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
   const input = document.getElementById(`relay-question-input-${questionId}`);
   // Ctrl/Cmd+Enter in a multi-select card's text field sends the ticked
   // choices along with the typed text, exactly like its Reply button.
-  const composed = presetAnswer == null && isMultiSelectQuestion(relayQuestions.get(questionId) || null)
+  const pendingQuestion = relayQuestions.get(questionId) || null;
+  const composed = presetAnswer == null && isMultiSelectQuestion(pendingQuestion, multiModeFor(pendingQuestion))
     ? composeMultiSelectAnswer(tickedMultiSelectLabels(questionId), input?.value || '')
     : null;
   const answer = String(presetAnswer != null ? presetAnswer : (composed ?? (input?.value || ''))).trim();
@@ -576,6 +608,7 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
     relayQuestionDrafts.delete(questionId);
     relayQuestionStructuredDrafts.delete(questionId);
     relayQuestionMultiDrafts.delete(questionId);
+    relayQuestionMultiMode.delete(questionId);
     relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();

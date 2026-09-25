@@ -1161,6 +1161,10 @@ test('a delivery mid-turn is steered in; run as its own turn (delivery:queued) i
   assert.equal(client.session.sends.length, 2);
   assert.equal(client.session.sends[1].mode, 'immediate');
   assert.match(client.session.sends[1].prompt, /actually, do it this way/);
+  // Only the steer carries the hidden note (shared/steer-note.mjs), right
+  // before the user's own text; the turn-opening prompt does not.
+  assert.match(client.session.sends[1].prompt, /Sent while you were still working on my previous message[\s\S]*\n\nactually, do it this way$/);
+  assert.equal(/Sent while you were still working/.test(client.session.sends[0].prompt), false);
 
   // Each row is answered with the text of ITS OWN run.
   const responses = stub.bodiesFor('/api/response');

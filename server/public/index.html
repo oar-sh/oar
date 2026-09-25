@@ -4357,6 +4357,24 @@
     border-color: var(--accent);
     background: rgba(88, 166, 255, 0.12);
   }
+  /* The "Select several" switch on Copilot choice cards. */
+  .relay-question-multi-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    font-size: var(--fs-meta-sm);
+    color: var(--muted, var(--text));
+    cursor: pointer;
+    user-select: none;
+  }
+  .relay-question-multi-toggle input[type="checkbox"] {
+    margin: 0;
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
   .relay-question-reply {
     display: flex;
     gap: 8px;

@@ -890,6 +890,11 @@ test('a message absorbed into a running continuation completes on that turn resu
   turn.emit(assistantText('checking what the agent produced'));
   const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'quick question' } });
   await tick(20);
+  // Pushed into a continuation: no hidden steer note — the running work is
+  // the CLI's own follow-up, not a request of the user's to keep going with.
+  const pushedText = JSON.stringify(turn.pushed.at(-1));
+  assert.match(pushedText, /quick question/);
+  assert.equal(/Sent while you were still working/.test(pushedText), false);
   // ...and the CLI dequeues the pushed message into the SAME turn (steering):
   // replay mid-turn, then the turn's single result.
   turn.emit(userReplay('quick question'));

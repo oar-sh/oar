@@ -12,6 +12,8 @@ When using ask_user, ALWAYS include a `choices` array with 2-6 answer options so
 At runtime, inject the question and choices from a random item in your quiz pool.
 Only omit choices when the question genuinely requires freeform text input (e.g., "What is your name?").
 
+When the user may pick several of the choices (they are not mutually exclusive), set `"multi_select": true` if your ask_user tool offers that field; otherwise begin the question with "Select all that apply:". Either way, expect an answer that lists several choices separated by ", ".
+
 In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.
 
 For relay restarts in extension-managed mode, require explicit user permission first, then use the authenticated localhost API `POST /api/relay/shutdown`. Do not restart by killing processes or using respawn scripts.

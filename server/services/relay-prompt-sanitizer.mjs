@@ -135,6 +135,16 @@ const MEDIA_EMBED_BLOCK_PATTERN = new RegExp(
   'gi',
 );
 
+// A steered message's hidden note (shared/steer-note.mjs) leads the prompt the
+// runtime stored, right after any mode marker. Matched by its stable opening
+// words, because the browser copy of this module cannot import shared/.
+const STEER_NOTE_PATTERN = /^\s*\[Sent while you were still working on my previous message\.[^\]\n]*\]\s*/;
+
+function stripLeadingSteerNote(text) {
+  const stripped = String(text || '').replace(STEER_NOTE_PATTERN, '');
+  return stripped.trim() ? stripped.trim() : String(text || '').trim();
+}
+
 export function stripRelayPromptContext(text, relayMode = '', attachments = []) {
   const value = stripAttachmentPromptArtifacts(text)
     .replace(MEDIA_EMBED_BLOCK_PATTERN, '')
@@ -143,7 +153,7 @@ export function stripRelayPromptContext(text, relayMode = '', attachments = []) 
   const patterns = buildPromptPrefixPatterns(relayMode);
   for (const pattern of patterns) {
     const stripped = value.replace(pattern, '').trim();
-    if (stripped && stripped !== value) return stripped;
+    if (stripped && stripped !== value) return stripLeadingSteerNote(stripped);
   }
-  return value;
+  return stripLeadingSteerNote(value);
 }

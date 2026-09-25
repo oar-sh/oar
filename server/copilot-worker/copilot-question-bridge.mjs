@@ -224,21 +224,29 @@ export function createCopilotQuestionBridge({
     // `allowFreeform` is only meaningful alongside choices; with none, the card
     // must accept free text or it cannot be answered.
     const allowFreeform = choices.length ? request?.allowFreeform !== false : true;
-    // Copilot's `ask_user` has no multi-select flag (unlike Claude's
-    // AskUserQuestion), so "select all that apply" questions arrive as plain
-    // choice lists. The card offers checkmarks when the wording says several
-    // may be picked; the answer comes back as the labels joined with ", ",
-    // which the runtime accepts as a freeform reply.
-    const multiSelect = looksLikeMultiSelectQuestion(question, choices);
+    // Multi-select, in order of trust: the model's own flag (the relay's
+    // `ask_user` tool has `multi_select`; the runtime's built-in one has no
+    // such field), then the wording ("select all that apply"). Either way
+    // every Copilot choice card also offers the "Select several" switch
+    // (`allowMultiSelect`), because a model can forget to say so. The answer
+    // comes back as the labels joined with ", ", which the model reads as a
+    // freeform reply.
+    // A request that demands exactly one of the offered choices
+    // (`allowFreeform: false`) gets neither: a joined answer would be outside
+    // the set the runtime asked for.
+    const canPickSeveral = choices.length >= 2 && allowFreeform;
+    const multiSelect = canPickSeveral
+      && (request?.multiSelect === true || looksLikeMultiSelectQuestion(question, choices));
     const result = await ask({
       prompt: question || 'Copilot asked for input to continue this turn.',
       choices,
       allowFreeform,
-      source: 'onUserInputRequest',
+      source: String(request?.source || '').trim() || 'onUserInputRequest',
       rationale: 'Copilot requested clarification to continue this turn.',
       extra: {
         requestId: String(request?.requestId || '') || undefined,
         ...(multiSelect ? { multiSelect: true } : {}),
+        ...(canPickSeveral ? { allowMultiSelect: true } : {}),
       },
     }, { signal });
     const answer = String(result?.answer ?? '');

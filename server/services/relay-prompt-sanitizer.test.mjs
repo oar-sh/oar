@@ -36,3 +36,13 @@ test('stripRelayPromptContext drops the injected media-embed guidance block verb
   const output = stripRelayPromptContext(input, 'agent');
   assert.equal(output, 'hello');
 });
+
+test('a steered message\'s hidden note is stripped, with or without a mode marker before it', () => {
+  const note = '[Sent while you were still working on my previous message. If that request is not finished yet, finish it too; do not drop it unless this message says so.]';
+  assert.equal(stripRelayPromptContext(`${note}\n\nalso do X`), 'also do X');
+  assert.equal(stripRelayPromptContext(`[Relay mode: agent] ${note}\n\nalso do X`, 'agent'), 'also do X');
+  // A note on its own (an attachment-only steer) is not turned into nothing.
+  assert.equal(stripRelayPromptContext(note), note);
+  // Text that merely quotes it later is left alone.
+  assert.equal(stripRelayPromptContext(`see ${note}`), `see ${note}`);
+});

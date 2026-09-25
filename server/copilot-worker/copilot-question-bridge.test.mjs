@@ -117,6 +117,25 @@ test('a "select all that apply" question is flagged multi-select for the card; a
   const single = makeRelay({ answerWith: 'prod' });
   await makeBridge(single).askUserInput({ requestId: 'r2', question: 'Which environment?', choices: ['prod', 'staging'] });
   assert.equal('multiSelect' in single.created().context, false);
+  // Every Copilot choice card still offers the "Select several" switch.
+  assert.equal(single.created().context.allowMultiSelect, true);
+});
+
+test('the model\'s own multi_select flag wins over the wording; a one-choice card gets neither hint', async () => {
+  const flagged = makeRelay({ answerWith: 'a, b' });
+  await makeBridge(flagged).askUserInput({ question: 'Which ones?', choices: ['a', 'b', 'c'], multiSelect: true, source: 'relay-ask-user-tool' });
+  assert.equal(flagged.created().context.multiSelect, true);
+  assert.equal(flagged.created().context.source, 'relay-ask-user-tool');
+
+  const exact = makeRelay({ answerWith: 'a' });
+  await makeBridge(exact).askUserInput({ question: 'Select all that apply', choices: ['a', 'b'], allowFreeform: false });
+  assert.equal('multiSelect' in exact.created().context, false, 'an exact-choice request stays single');
+  assert.equal('allowMultiSelect' in exact.created().context, false);
+
+  const one = makeRelay({ answerWith: 'ok' });
+  await makeBridge(one).askUserInput({ question: 'Select all that apply', choices: ['ok'], multiSelect: true });
+  assert.equal('multiSelect' in one.created().context, false);
+  assert.equal('allowMultiSelect' in one.created().context, false);
 });
 
 test('a question with no choices always allows free text', async () => {

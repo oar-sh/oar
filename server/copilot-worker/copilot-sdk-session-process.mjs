@@ -77,6 +77,14 @@ import {
 } from './copilot-model-switch.mjs';
 import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 import {
+  RELAY_ASK_USER_TOOL_DESCRIPTION,
+  RELAY_ASK_USER_TOOL_NAME,
+  RELAY_ASK_USER_TOOL_PARAMETERS,
+  formatAskUserToolResult,
+  isToolOverrideRejection,
+  parseAskUserToolArguments,
+} from './copilot-ask-user-tool.mjs';
+import {
   EXIT_PLAN_BOARD_POSTED_FEEDBACK,
   EXIT_PLAN_NO_BOARD_FEEDBACK,
   buildCopilotPlanReadyBoardPayload,
@@ -94,6 +102,7 @@ import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/
 import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { buildSteerSettleFailure } from '../../shared/steer-settle-failure.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
+import { withSteerNote } from '../../shared/steer-note.mjs';
 
 // How long the runtime may sit with no session activity before the worker
 // closes it. The worker process itself stays up and reconnects lazily on the
@@ -307,6 +316,10 @@ export function createCopilotSdkSessionRunner({
   maxTerminalSettleAttempts = DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS,
   queueLaneRefreshMs = DEFAULT_QUEUE_LANE_REFRESH_MS,
   orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS,
+  // Register the relay's own `ask_user` (with `multi_select`) over the
+  // runtime's built-in one. A runtime that refuses the override falls back
+  // to the built-in for the rest of this worker's life.
+  relayAskUserTool = true,
   taskRefreshMs = DEFAULT_TASK_REFRESH_MS,
   taskPublishThrottleMs = DEFAULT_TASK_PUBLISH_THROTTLE_MS,
   // Called with `true`/`false` whenever the runner flips between accepting
@@ -392,6 +405,9 @@ export function createCopilotSdkSessionRunner({
   // and every one of these is @experimental); a missing surface degrades to
   // the previous behaviour, never to an error.
   let sessionRpc = { queue: false, interruptMainTurn: false, tasks: false };
+  // Set once a runtime refused the relay's `ask_user` override: every later
+  // session is built without it (the built-in + wording heuristic remain).
+  let askUserOverrideRejected = false;
   // The runtime's background task registry as last read from
   // `rpc.tasks.list()` (id → TaskInfo), and what the event stream adds per
   // agent that the registry does not carry: the live tool call, a running
@@ -1542,6 +1558,81 @@ export function createCopilotSdkSessionRunner({
     }
   }
 
+  /**
+   * The relay's `ask_user` tool: same name and fields as the runtime's
+   * built-in, plus `multi_select`. The handler runs under exactly the same
+   * human-gating as the built-in path (`onUserInputRequest`): the stall
+   * watchdog is held, steering is held (a question card is open), and a card
+   * raised the moment a continuation opens waits for its row. It never
+   * throws: a failed card answers in-band so the model can carry on.
+   */
+  function buildRelayAskUserTool() {
+    return {
+      name: RELAY_ASK_USER_TOOL_NAME,
+      description: RELAY_ASK_USER_TOOL_DESCRIPTION,
+      parameters: RELAY_ASK_USER_TOOL_PARAMETERS,
+      overridesBuiltInTool: true,
+      // The built-in asks no permission either: asking a question is not an action.
+      skipPermission: true,
+      defer: 'never',
+      handler: async (args, invocation) => {
+        const { question, choices, multiSelect } = parseAskUserToolArguments(args);
+        try {
+          const result = await whileAwaitingHuman(async () => {
+            await awaitInteractiveRow();
+            // Cancelled by either side: the turn (Stop, teardown) or the
+            // runtime itself (a subagent cancelled via tasks.cancel, a
+            // disconnect) — a card nobody will read must not hold steering.
+            const signal = combineSignals(activeTurn?.abortController?.signal, invocation?.signal);
+            return questionBridge.askUserInput(
+              { question, choices, allowFreeform: true, multiSelect, source: 'relay-ask-user-tool' },
+              { signal },
+            );
+          });
+          return formatAskUserToolResult({
+            answer: result?.answer,
+            wasFreeform: result?.wasFreeform !== false,
+            timedOut: result?.timedOut === true,
+          });
+        } catch (error) {
+          dbg('relay ask_user failed', error?.message || String(error));
+          return USER_INPUT_UNSUPPORTED_ANSWER;
+        }
+      },
+    };
+  }
+
+  /** One signal that aborts when any of the given ones does (nulls ignored). */
+  function combineSignals(...signals) {
+    const live = signals.filter((signal) => signal && typeof signal.aborted === 'boolean');
+    if (live.length <= 1) return live[0] || null;
+    if (typeof AbortSignal.any === 'function') return AbortSignal.any(live);
+    const controller = new AbortController();
+    for (const signal of live) {
+      if (signal.aborted) { controller.abort(); break; }
+      signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+    return controller.signal;
+  }
+
+  /**
+   * Open a session, retrying once without the relay's `ask_user` when the
+   * runtime refuses the override (an older runtime). The refusal is
+   * remembered until the runtime is stopped — the next runtime (possibly
+   * auto-updated under the relay) gets another try.
+   */
+  async function openSession(open, config) {
+    try {
+      return await open(config);
+    } catch (error) {
+      if (!config?.tools?.length || !isToolOverrideRejection(error) || isSessionNotFoundError(error)) throw error;
+      dbg('the runtime refused the relay ask_user override; using its built-in ask_user', error?.message || String(error));
+      askUserOverrideRejected = true;
+      const { tools: _tools, ...withoutTools } = config;
+      return open(withoutTools);
+    }
+  }
+
   function buildSessionConfig(model, relayMode, reasoningEffort = null) {
     // Built once per session, not per request. Reads the mode off the LIVE turn
     // rather than closing over the one the session was built with, because one
@@ -1596,6 +1687,10 @@ export function createCopilotSdkSessionRunner({
       // The runtime's own defaults, pinned. See DEFAULT_INFINITE_SESSION_CONFIG.
       ...(infiniteSessionConfig ? { infiniteSessions: { ...infiniteSessionConfig } } : {}),
       onEvent: routeEvent,
+      // The relay's `ask_user` (see copilot-ask-user-tool.mjs): the built-in's
+      // fields plus `multi_select`, so a model can declare a multi-select
+      // question instead of the relay guessing from its wording.
+      ...(relayAskUserTool && !askUserOverrideRejected ? { tools: [buildRelayAskUserTool()] } : {}),
       // Permission policy follows the conversation's relay mode: agent and
       // autopilot auto-approve, plan denies non-read tools with feedback, and
       // ask asks the human through a relay question card. The handler reads the
@@ -1840,7 +1935,7 @@ export function createCopilotSdkSessionRunner({
       // exists and the NEXT reconnect must resume it.
       let resumed = false;
       try {
-        session = await client.resumeSession(sdkSessionId, config);
+        session = await openSession((cfg) => client.resumeSession(sdkSessionId, cfg), config);
         resumed = true;
         dbg(`resumed copilot session ${sdkSessionId.slice(0, 8)}`);
       } catch (error) {
@@ -1854,7 +1949,7 @@ export function createCopilotSdkSessionRunner({
           throw error;
         }
         dbg('copilot session state not found, creating', error?.message || String(error));
-        session = await client.createSession(config);
+        session = await openSession((cfg) => client.createSession(cfg), config);
         dbg(`created copilot session ${sdkSessionId.slice(0, 8)}`);
       }
       // Which experimental surfaces THIS runtime has (it auto-updates under
@@ -1927,6 +2022,7 @@ export function createCopilotSdkSessionRunner({
     compactingSince = 0;
     queuedLane = new Map();
     sessionRpc = { queue: false, interruptMainTurn: false, tasks: false };
+    askUserOverrideRejected = false;
     syncDeliveryReadiness();
     if (!closingSession && !closingClient) return;
     dbg(`stopping the copilot runtime (${reason})`);
@@ -3029,7 +3125,12 @@ export function createCopilotSdkSessionRunner({
     // A real relay round trip on the first turn of a mode — long enough for the
     // turn to finish underneath us.
     const context = await buildRelayContextPrefix(message).catch(() => null);
-    const prompt = withRelayContext(context?.prefix, body);
+    // The hidden steer note (shared/steer-note.mjs): a steer that lands before
+    // the model's first output otherwise tempts it to answer only the newest
+    // message and drop the request it was working on (burn-in 2026-09-25).
+    // Not in a continuation: there the running work is the runtime's own
+    // follow-up, not a request of the user's to keep going with.
+    const prompt = withRelayContext(context?.prefix, turn.kind === 'continuation' ? body : withSteerNote(body));
     // Re-checked AFTER the awaits and before anything is sent or registered.
     // Nothing has been sent yet, so handing the row back to the normal path is
     // free.
