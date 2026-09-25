@@ -1,6 +1,6 @@
 # SDK Feature Tracker
 
-Updated: 2026-09-24
+Updated: 2026-09-25
 Scope: `server/` + `server/claude-worker/` + `.github/extensions/web-relay/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
@@ -67,6 +67,20 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-09-25: **Post-audit follow-ups.** Background-task panel: subagent rows show the API model the agent
+  really runs on (from its `parent_tool_use_id` frames, not the spawn alias) beside the kind pill and the
+  live tool call with the transcript's emoji (`recordSubagentActivity` → `model` + `lastToolCall`, published
+  only on a change to a live task); the panel body (previews + tasks) scrolls under a landscape-safe cap
+  (`clamp(64px, 100dvh - 296px, min(45vh, 420px))`). Phone landscape keeps the portrait text size
+  (`text-size-adjust: 100%`, height-based root clamp). The transcript keeps its reading position through
+  rotations / resizes / the keyboard (`server/public/app/transcript-viewport-anchor.mjs`: at-bottom or
+  top-row + hidden share, re-applied on every resize step; the font-scale change reuses it). Claude worker:
+  a settings change between turns (`setModel` / `setPermissionMode` / `applyFlagSettings`) makes the CLI
+  re-init before the push, which used to route the answer to a continuation row and strand the delivered
+  message — now expected (`settingsReinitExpected`, see [claude-sdk.md](claude-sdk.md)). A test fixture
+  carrying a personal domain was replaced (the hygiene guard does not cover domains). Copilot SDK worker
+  rows corrected (steering is continuation-only today) and a Claude-parity handover for steering +
+  background handling was drafted (local plan `copilot-sdk-steering-background-parity.md`).
 - 2026-09-24: **Steering audit fix wave** (pre-0.9.3). Claude steering: messages sent during a hold
   (question card / plan approval, compaction) are handed back to the queue (`steering-held` requeue
   class, `worker.unready`) and steer in when the hold ends — the composer reads **Queue** instead of
