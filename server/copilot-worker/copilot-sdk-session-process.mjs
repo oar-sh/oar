@@ -89,6 +89,9 @@ import {
 } from './copilot-prompt-context.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/model-descriptors.mjs';
+import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
+import { buildSteerSettleFailure } from '../../shared/steer-settle-failure.mjs';
+import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
 
 // How long the runtime may sit with no session activity before the worker
 // closes it. The worker process itself stays up and reconnects lazily on the
@@ -132,6 +135,32 @@ const DEFAULT_CONTINUATION_RETRY_DELAY_MS = 500;
 const CONTINUATION_REGISTRATION_TIMEOUT_MS = 10_000;
 /** Cap on activity lines carried between turns, so a chatty runtime cannot grow them. */
 const MAX_PENDING_ACTIVITIES = 20;
+/**
+ * Backstop for the compaction hold: `session.compaction_start` without a
+ * matching `_complete` (a runtime that died mid-compaction and was resumed)
+ * must not hold steering forever. Sized far above any plausible compaction,
+ * like the Claude worker's `compactionStaleMs`.
+ */
+const DEFAULT_COMPACTION_STALE_MS = 10 * 60_000;
+/**
+ * Backoff between attempts to save a consumed steer's settle marker (~31 s in
+ * all); after the last one the row fails terminally instead. Same ladder as
+ * the Claude worker, because it protects the same invariant: a prompt the
+ * runtime already consumed is never re-run.
+ */
+const DEFAULT_SETTLE_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000, 8_000, 8_000]);
+const DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS = 5;
+/** Debounce for re-reading the runtime's queued lane after `pending_messages.modified`. */
+const DEFAULT_QUEUE_LANE_REFRESH_MS = 150;
+/**
+ * How long a pushed prompt the runtime had not started when the turn's idle
+ * arrived is kept unsettled, waiting for the runtime to open its run. The
+ * drain's idle can race a send that resolved a moment earlier; the runtime
+ * then starts the prompt right away (`immediate` when idle) and its
+ * `user.message` adopts the row as a turn of its own. Same value as the
+ * Claude worker's fold grace, for the same reason.
+ */
+const DEFAULT_ORPHAN_GRACE_MS = 2_000;
 
 /**
  * Appended to the partial answer when the RUNTIME interrupted the turn on its
@@ -145,14 +174,18 @@ export const RUNTIME_INTERRUPTED_NOTE =
 
 /**
  * Published to a steered queue row whose prompt the runtime accepted but never
- * opened work on before the interaction ended. The prompt is still queued
- * INSIDE the runtime, so it will be answered at the start of the next turn —
- * requeuing the row would run it twice. Mirrors the Claude worker's
- * handed-off-context note, which exists for the same reason.
+ * opened work on before the interaction ended normally. The prompt is still
+ * queued INSIDE the runtime, so it will be answered at the start of the next
+ * turn — requeuing the row would run it twice. With `mode: "immediate"` the
+ * runtime drains every pushed prompt before it idles, so this is a defensive
+ * fallback rather than a routine outcome.
  */
 export const STEERED_ROW_MERGED_NOTE =
   '_(This message was delivered while the previous turn was still running; the reply continues in '
   + 'the next turn.)_';
+
+/** The provider name in the at-most-once settle failure wording. */
+const SETTLE_AGENT_LABEL = 'Copilot';
 
 /**
  * The `trigger` reported to `POST /api/continuation-turn`, matching the value
@@ -220,15 +253,16 @@ export function createCopilotSdkSessionRunner({
   resolveProviderConfigImpl = resolveCopilotProviderConfig,
   // Threading seam for `MessageOptions.mode` ("enqueue" | "immediate").
   //
-  // A BYOK probe against runtime 1.0.82 ran a mid-turn send three ways —
-  // "enqueue", "immediate" and unset — and all three behaved IDENTICALLY: the
-  // send resolves in ~2ms with a message id, the prompt is queued
-  // (`pending_messages.modified`), the in-flight model call runs to completion
-  // untouched, and the prompt is picked up at the NEXT model-call boundary with
-  // its own `user.message`. Neither mode interrupts anything. "enqueue" is the
-  // documented default and preserves FIFO order, which is what the relay queue
-  // contract wants, so it is what this sends. See §5 of the plan doc.
-  resolveSendModeImpl = () => 'enqueue',
+  // "immediate", always (fake-provider probe against runtime 1.0.88,
+  // 2026-09-25). Mid-turn it is a real steer: injected at the next tool
+  // boundary as `user.message{delivery:"steering"}` (or, when the model is
+  // mid-stream, moved to the FRONT of the queue and run right after as
+  // `delivery:"queued"`). When the main loop is idle both modes start a run at
+  // once — except that an "enqueue" message sent while a background agent or
+  // an attached shell keeps `session.idle` deferred sits FROZEN until that
+  // work ends, while an "immediate" one runs immediately. So immediate is the
+  // only mode that never strands a message behind background work.
+  resolveSendModeImpl = () => 'immediate',
   // Interactive surfaces. Tests inject a fake bridge; nothing here reaches the
   // relay without one.
   createQuestionBridgeImpl = createCopilotQuestionBridge,
@@ -259,6 +293,21 @@ export function createCopilotSdkSessionRunner({
   // How long a settled continuation waits for its row before giving up on it.
   // Must outlast the registration's own retries; a test shortens it.
   continuationRegistrationTimeoutMs = CONTINUATION_REGISTRATION_TIMEOUT_MS,
+  compactionStaleMs = DEFAULT_COMPACTION_STALE_MS,
+  settleRetryDelaysMs = DEFAULT_SETTLE_RETRY_DELAYS_MS,
+  maxTerminalSettleAttempts = DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS,
+  queueLaneRefreshMs = DEFAULT_QUEUE_LANE_REFRESH_MS,
+  orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS,
+  // Called with `true`/`false` whenever the runner flips between accepting
+  // deliveries and holding them (see isDeliveryHeld). The worker wires it to
+  // the socket link: a hold withdraws the relay's readiness, and its end
+  // re-arms it at once so a held message steers into the resumed turn.
+  onDeliveryReadinessChange = () => {},
+  // False while the connected relay does not understand the `steering-held`
+  // hand-back (a worker updated on disk before the relay restarted): a held
+  // delivery is then pushed the legacy way instead of being handed back into
+  // a retry-and-backoff requeue.
+  canHandBackHeldDelivery = () => true,
   dbg = () => {},
 } = {}) {
   let client = null;
@@ -303,12 +352,35 @@ export function createCopilotSdkSessionRunner({
   let starting = null;
   let disposed = false;
   let detachRuntimeExit = () => {};
-  // Prompts this worker sent that the runtime accepted but had not started work
-  // on when the interaction ended. They stay in the runtime's pending queue and
-  // are picked up FIRST in the next interaction, ahead of that turn's own
-  // prompt — so the next turn's segments are shifted by this many, and without
-  // it the primary row would be answered with a leftover prompt's reply.
-  let carriedPrompts = 0;
+  // A compaction in progress (`session.compaction_start` seen, no `_complete`
+  // yet). Holds steering: a message pushed now would land inside the
+  // compaction's replay. `compactingSince` backs the stale cap.
+  let compactingSince = 0;
+  // The last readiness value reported to `onDeliveryReadinessChange`, so the
+  // link only hears about flips.
+  let lastReportedDeliveryReady = null;
+  // Rows whose prompt the runtime consumed and whose settle marker is being
+  // saved (id → { message, variant }). Reported by the heartbeat WITH a
+  // terminal error until the publish lands, so recovery can never re-run them
+  // (see publishSettleMarker).
+  const settlingMessages = new Map();
+  // Settle markers that could not be posted even terminally; the heartbeat
+  // hands them to the relay to fail (id → terminalError).
+  const settleFailedTerminals = new Map();
+  // Per-row chains of `/api/queue-consumed` POSTs, so a mark and a later
+  // un-mark for the same row reach the relay in order.
+  const consumedMarkChains = new Map();
+  // The runtime's queued lane as last read from `rpc.queue.pendingItems`:
+  // runtime message id → stable queue item id. What un-steer needs, and what
+  // decides which pushed rows the client may still cancel.
+  let queuedLane = new Map();
+  let queueLaneTimer = null;
+  let queueLaneRefreshChain = Promise.resolve();
+  // Whether the session's `rpc.queue` / `rpc.interruptMainTurn` are present.
+  // Probed per session (the runtime auto-updates under the relay and every
+  // one of these is @experimental); a missing surface degrades to today's
+  // behaviour, never to an error.
+  let sessionRpc = { queue: false, interruptMainTurn: false };
   // Blocking handlers currently waiting on a human (`ask_user`, an ask-mode
   // tool approval). The runtime emits NO events while blocked in one, and the
   // question timeout is 8 hours against a 120s stall ceiling — so without this
@@ -347,6 +419,8 @@ export function createCopilotSdkSessionRunner({
 
   async function whileAwaitingHuman(run) {
     pendingHumanRequests += 1;
+    // An open card holds steering: the relay's readiness is withdrawn at once.
+    syncDeliveryReadiness();
     try {
       return await run();
     } finally {
@@ -354,6 +428,9 @@ export function createCopilotSdkSessionRunner({
       // The clock restarts from the answer, not from before the wait.
       touch();
       activeTurn?.armStall?.();
+      // The answer re-arms the relay immediately, so a message queued while
+      // the card was open steers into the resumed turn within one round trip.
+      syncDeliveryReadiness();
     }
   }
 
@@ -537,19 +614,88 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * Publish an action, or hold it if the turn has no queue row yet.
+   * Publish an action onto the row that owns the runtime's current run, or
+   * hold it if the turn has no queue row yet.
    *
    * The single gate every producer goes through. A continuation's row is
    * created asynchronously, and a POST carrying `messageId: null` is not merely
    * useless — the relay's activity/stream routes key on it, so it would be
    * attributed to nothing at all.
+   *
+   * One turn can answer several rows in sequence (the primary, then a message
+   * pushed mid-turn that the runtime ran as its own `delivery:"queued"` run).
+   * Root-level traffic — stream, thoughts, activity, subagent lanes — goes to
+   * whichever row owns the run in progress (`turn.currentOwner`); the stream
+   * text is re-cut to that row's own segments so a second run's prose never
+   * appears under the first row.
    */
   async function emitAction(turn, action) {
     if (!turn.registered) {
       turn.bufferedActions.push(action);
       return;
     }
-    await dispatchAction(turn.message, action, turn.state);
+    await dispatchOwned(turn, action);
+  }
+
+  async function dispatchOwned(turn, action) {
+    const owner = turn.currentOwner || turn.primaryEntry;
+    if (!owner || owner.settled) {
+      // Nothing left to publish into (every row this turn owned has settled);
+      // the text still lands in the runtime's own transcript.
+      return;
+    }
+    if (action.channel === 'stream' && !action.payload?.subagentRunId) {
+      // Re-cut to the owner's own segments, and gated against what THAT row
+      // last received (the normalizer gated against the whole interaction).
+      const text = textFor(turn, owner);
+      if (!shouldEmitStreamUpdate(text, owner.state.lastStreamedText)) return;
+      await dispatchAction(owner.message, { channel: 'stream', payload: { ...action.payload, text } }, owner.state);
+      return;
+    }
+    await dispatchAction(owner.message, action, owner.state);
+  }
+
+  /**
+   * Which row a normalizer segment's text belongs to. A segment nobody
+   * claimed (text produced before any prompt boundary — the answer to a
+   * prompt carried over from a previous interaction, or a turn the runtime
+   * answered without echoing a `user.message` at all) belongs to the next
+   * claimed segment's row, failing that to the turn's own row.
+   */
+  function segmentOwner(turn, index) {
+    const owners = turn.segmentOwners;
+    if (owners[index]) return owners[index];
+    for (let j = index + 1; j < owners.length; j += 1) {
+      if (owners[j]) return owners[j];
+    }
+    return turn.primaryEntry;
+  }
+
+  function textFor(turn, entry, segmentTexts = null) {
+    const count = Math.max(turn.normalizer.promptCount(), turn.segmentOwners.length);
+    const parts = [];
+    for (let index = 0; index < count; index += 1) {
+      if (segmentOwner(turn, index) !== entry) continue;
+      const text = String(segmentTexts?.[index] ?? turn.normalizer.segmentText(index) ?? '');
+      if (text.trim()) parts.push(text);
+    }
+    return parts.join('\n\n');
+  }
+
+  /**
+   * The final reply text for `entry`: its segments, with the task-completion
+   * summary taking precedence on the last one (the normalizer's
+   * `result.segmentTexts` already applies that rule; before this the runner
+   * read `segmentText` directly and lost the summary — the "Cha…" fragment
+   * case of 2026-09-12). A turn that opened no segment at all falls back to
+   * the whole composed text for its own row, which is strictly better than
+   * publishing nothing.
+   */
+  function finalTextFor(turn, entry, result) {
+    const segmentTexts = Array.isArray(result?.segmentTexts) ? result.segmentTexts : null;
+    const text = textFor(turn, entry, segmentTexts).trim();
+    if (text || entry !== turn.primaryEntry) return text;
+    return String(result?.text || entry.state.lastStreamedText || '').trim();
   }
 
   async function publishFinalStream(message, text) {
@@ -563,26 +709,54 @@ export function createCopilotSdkSessionRunner({
     }).catch(() => {});
   }
 
-  async function publishResponse(message, { text, model, terminalError = null, modelOrigin }) {
-    await api('POST', '/api/response', {
-      messageId: message.id,
-      conversationId: message.conversationId,
-      text: String(text || ''),
-      model: model || null,
-      modelOrigin: modelOrigin
-        || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
-      ...(terminalError ? { terminalError } : {}),
-      ...attemptFields(message),
-    }).catch(async (error) => {
+  /**
+   * Publish a row's outcome. Returns 'published' | 'stale' | 'failed' |
+   * 'requeued' so the settle paths can tell a landed marker from a lost one.
+   *
+   * `kind` ('folded' | 'stopped') stamps the settle stubs of a steered row the
+   * runtime consumed without answering on its own row; `consumedSteerIds`
+   * names the steers folded into the turn this response finishes, so the
+   * relay marks them consumed in the same fenced write. A response carrying a
+   * kind is never requeued on failure (the prompt was consumed — re-running it
+   * is the one thing that must not happen); `requeueOnFailure: false` opts an
+   * ordinary response out of the requeue too.
+   */
+  async function publishResponse(message, {
+    text, model, terminalError = null, modelOrigin, kind = null, consumedSteerIds = null,
+    requeueOnFailure = true,
+  }) {
+    const consumed = Array.isArray(consumedSteerIds)
+      ? consumedSteerIds
+        .map((entry) => ({ id: String(entry?.id || '').trim(), attemptId: entry?.attemptId || null }))
+        .filter((entry) => entry.id)
+      : [];
+    try {
+      await api('POST', '/api/response', {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        text: String(text || ''),
+        model: model || null,
+        modelOrigin: modelOrigin
+          || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
+        ...(terminalError ? { terminalError } : {}),
+        ...(kind ? { kind } : {}),
+        ...(consumed.length ? { consumedSteerIds: consumed } : {}),
+        ...attemptFields(message),
+      });
+      return 'published';
+    } catch (error) {
       // A stale_attempt 409 means the row already moved on to another attempt
       // (requeued and re-delivered); the requeue would 409 the same way, and
       // the newer attempt owes the row its answer — drop this one.
       if (isStaleAttemptError(error)) {
         dbg('response refused as stale_attempt; dropping', message.id);
-        return;
+        return 'stale';
       }
-      await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
-    });
+      if (kind || !requeueOnFailure) return 'failed';
+      const requeued = await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) })
+        .then(() => true, () => false);
+      return requeued ? 'requeued' : 'failed';
+    }
   }
 
   function terminalErrorRecord(message, classified) {
@@ -594,6 +768,117 @@ export function createCopilotSdkSessionRunner({
       failedAt: new Date().toISOString(),
       queueMessageId: String(message.id || '') || null,
     };
+  }
+
+  // ------------------------------------------------- at-most-once settling --
+
+  /**
+   * Claim a consumed row as settling — synchronously, BEFORE anything stops
+   * reporting it as live, so no heartbeat can see it unowned. `variant` picks
+   * the terminal wording should its settle never land.
+   */
+  function claimSettling(message, variant = 'folded') {
+    const id = String(message?.id || '').trim();
+    if (id && !settlingMessages.has(id)) settlingMessages.set(id, { message, variant });
+  }
+
+  /** Release a settled row — unless it was handed to the relay to fail. */
+  function releaseSettling(id) {
+    const key = String(id || '').trim();
+    if (!settleFailedTerminals.has(key)) settlingMessages.delete(key);
+  }
+
+  /**
+   * Mark rows whose prompt the runtime has folded into a running turn as
+   * consumed on the relay (the moment `user.message{delivery:"steering"}`
+   * confirms it). Best-effort: the worker's own settle still owns these rows
+   * while it lives; the mark only protects them when it does not — a crash
+   * before the settle marker lands must fail the row, never re-run it.
+   */
+  function markConsumed(conversationId, entries = [], { consumed = true } = {}) {
+    const rows = entries
+      .map((entry) => ({ id: String(entry?.id || '').trim(), attemptId: entry?.attemptId || null }))
+      .filter((entry) => entry.id);
+    if (!rows.length) return Promise.resolve();
+    const previous = Promise.allSettled(rows.map((row) => consumedMarkChains.get(row.id)).filter(Boolean));
+    const post = previous.then(() => api('POST', '/api/queue-consumed', {
+      conversationId: String(conversationId || sdkSessionId || ''),
+      entries: rows,
+      ...(consumed ? {} : { consumed: false }),
+    })).catch((error) => {
+      dbg('consumed mark failed', rows.map((entry) => entry.id).join(','), error?.message || String(error));
+    });
+    for (const row of rows) consumedMarkChains.set(row.id, post);
+    post.then(() => {
+      for (const row of rows) if (consumedMarkChains.get(row.id) === post) consumedMarkChains.delete(row.id);
+    });
+    return post;
+  }
+
+  /** Heartbeat payload: rows whose terminal failure the relay must post. */
+  function getSettleFailed() {
+    return [...settleFailedTerminals.entries()].map(([id, terminalError]) => ({
+      id,
+      attemptId: settlingMessages.get(id)?.message?.attemptId || null,
+      terminalError,
+    }));
+  }
+
+  function acknowledgeSettleFailed(ids = []) {
+    for (const id of ids) {
+      const key = String(id || '').trim();
+      if (!settleFailedTerminals.delete(key)) continue;
+      settlingMessages.delete(key);
+    }
+  }
+
+  const sleep = (ms) => new Promise((resolve) => { const t = setTimeout(resolve, ms); t.unref?.(); });
+
+  /**
+   * Save the settle marker of a steered message the runtime already consumed
+   * — at most once. The row stays in `settlingMessages`, and so in every
+   * heartbeat, until the relay commits the marker. A marker that cannot be
+   * saved within the retry budget ends as a terminal failure — never a
+   * requeue — and if even that cannot be posted, the heartbeat hands the row
+   * to the relay to fail. Ported from the Claude worker; same guarantees.
+   */
+  async function publishSettleMarker(message, { text, model, kind, variant = 'folded' }) {
+    const id = String(message?.id || '').trim();
+    if (!id) return;
+    claimSettling(message, variant);
+    try {
+      for (let attempt = 0; ; attempt += 1) {
+        const outcome = await publishResponse(message, { text, model, kind });
+        if (outcome !== 'failed') return;
+        if (attempt >= settleRetryDelaysMs.length) break;
+        await sleep(settleRetryDelaysMs[attempt]);
+      }
+      dbg('settle marker could not be saved; failing the row terminally', id);
+      const terminalError = buildSteerSettleFailure(message, { variant, agentLabel: SETTLE_AGENT_LABEL });
+      const retryMs = Math.max(100, Number(settleRetryDelaysMs.at(-1)) || 0);
+      for (let attempt = 0; attempt < Math.max(1, maxTerminalSettleAttempts); attempt += 1) {
+        if (attempt) await sleep(retryMs);
+        const outcome = await publishResponse(message, {
+          text: terminalError.message,
+          model,
+          terminalError,
+          requeueOnFailure: false,
+        });
+        if (outcome !== 'failed') return;
+        // Second channel: the requeue route fails a row outright when handed
+        // a terminal error.
+        const failedViaRequeue = await api('POST', '/api/requeue', {
+          messageId: id,
+          terminalError,
+          ...attemptFields(message),
+        }).then(() => true, (error) => isStaleAttemptError(error));
+        if (failedViaRequeue) return;
+      }
+      dbg('terminal settle could not be posted; handing it to the heartbeat', id);
+      settleFailedTerminals.set(id, terminalError);
+    } finally {
+      releaseSettling(id);
+    }
   }
 
   /**
@@ -732,15 +1017,31 @@ export function createCopilotSdkSessionRunner({
     }
     touch();
     observeBackgroundShells(event);
-    // Keeps the confirmed-model tracking truthful for switches this worker did
-    // not ask for, and resolves the bounded wait on a deferred switch's drain.
-    // Behind the replay gate on purpose: a historical `session.model_change`
-    // must not confirm a pending switch.
-    modelSwitch.observeEvent(event);
-    // A LIVE model change moves the catalog's currentModel; replays cannot get
-    // here (the gate above), so this cannot re-publish days-old state.
-    if (event?.type === 'session.model_change') publishModelSnapshot('model-change');
+    observeCompaction(event);
+    observeQueueLane(event);
+    // A background subagent's spawn emits a SESSION-level
+    // `session.model_change{source:"agent"}` for the subagent's own model
+    // (live-probed on 1.0.88). It is not the main thread's model: feeding it
+    // to the switcher would confirm a pending switch with the wrong model and
+    // move the catalog's currentModel.
+    const agentModelChange = event?.type === 'session.model_change'
+      && String(event?.data?.source || '').trim().toLowerCase() === 'agent';
+    if (!agentModelChange) {
+      // Keeps the confirmed-model tracking truthful for switches this worker
+      // did not ask for, and resolves the bounded wait on a deferred switch's
+      // drain. Behind the replay gate on purpose: a historical
+      // `session.model_change` must not confirm a pending switch.
+      modelSwitch.observeEvent(event);
+      // A LIVE model change moves the catalog's currentModel; replays cannot
+      // get here (the gate above), so this cannot re-publish days-old state.
+      if (event?.type === 'session.model_change') publishModelSnapshot('model-change');
+    }
     let turn = activeTurn;
+    if (!turn) {
+      // A prompt this worker pushed whose run the runtime opened after its
+      // turn had already settled is that row's own turn, not a continuation.
+      turn = adoptOrphanedRun(event);
+    }
     if (!turn) {
       // The runtime started work with no row open. Anything that is not the
       // START of work (terminators, connection bookkeeping) stays a no-op:
@@ -786,6 +1087,82 @@ export function createCopilotSdkSessionRunner({
     }));
     api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks })
       .catch((error) => dbg('background task publish failed', error?.message || String(error)));
+  }
+
+  /**
+   * The compaction hold. A message pushed while the runtime is compacting
+   * would be injected into the compaction's replay, so steering is held from
+   * `session.compaction_start` to `_complete` (the runtime queues messages
+   * sent during a compaction itself, but holding them relay-side keeps the
+   * bubble cancellable and the composer truthful — the Claude rule).
+   */
+  function observeCompaction(event) {
+    const type = String(event?.type || '');
+    if (event?.agentId) return;
+    if (type === 'session.compaction_start') {
+      compactingSince = Date.now();
+      syncDeliveryReadiness();
+    } else if (type === 'session.compaction_complete') {
+      compactingSince = 0;
+      syncDeliveryReadiness();
+    }
+  }
+
+  function isCompacting() {
+    if (!compactingSince) return false;
+    if (Date.now() - compactingSince < compactionStaleMs) return true;
+    dbg('compaction hold went stale; releasing it');
+    compactingSince = 0;
+    return false;
+  }
+
+  /**
+   * Keep `queuedLane` current. `pending_messages.modified` carries no payload
+   * (it only says "the queue changed"), so it schedules a debounced
+   * `rpc.queue.pendingItems()` read. What matters here is which pushed rows
+   * are still in the QUEUED lane: those the runtime has not consumed and the
+   * client may still cancel (`cancellableIds` on the steering snapshot).
+   */
+  function observeQueueLane(event) {
+    if (String(event?.type || '') !== 'pending_messages.modified') return;
+    scheduleQueueLaneRefresh();
+  }
+
+  function scheduleQueueLaneRefresh() {
+    if (!sessionRpc.queue || queueLaneTimer) return;
+    queueLaneTimer = setTimeout(() => {
+      queueLaneTimer = null;
+      queueLaneRefreshChain = queueLaneRefreshChain.then(() => refreshQueueLane()).catch(() => {});
+    }, queueLaneRefreshMs);
+    queueLaneTimer.unref?.();
+  }
+
+  async function refreshQueueLane() {
+    const target = session;
+    if (!target || !sessionRpc.queue) return;
+    try {
+      const snapshot = await target.rpc.queue.pendingItems();
+      const next = new Map();
+      for (const item of Array.isArray(snapshot?.items) ? snapshot.items : []) {
+        const runtimeId = String(item?.messageId || '').trim();
+        const itemId = String(item?.id || '').trim();
+        if (runtimeId && itemId) next.set(runtimeId, itemId);
+      }
+      if (session !== target) return;
+      queuedLane = next;
+    } catch (error) {
+      dbg('queue.pendingItems failed', error?.message || String(error));
+    }
+  }
+
+  /** Probe the experimental RPC surfaces once per session. */
+  function probeSessionRpc(target) {
+    sessionRpc = {
+      queue: typeof target?.rpc?.queue?.pendingItems === 'function'
+        && typeof target?.rpc?.queue?.removeAt === 'function',
+      interruptMainTurn: typeof target?.rpc?.interruptMainTurn === 'function',
+    };
+    dbg(`copilot session rpc surfaces: queue=${sessionRpc.queue} interruptMainTurn=${sessionRpc.interruptMainTurn}`);
   }
 
   function observeBackgroundShells(event) {
@@ -835,9 +1212,13 @@ export function createCopilotSdkSessionRunner({
     // — but it is guarded anyway: re-routing INTO a settled turn would recurse
     // through this function forever, so it is treated as "no owner".
     if (!turn || turn.settled) {
-      // Same rule as `routeEvent`: only the start of work opens a row.
-      if (!isContinuationOpeningEvent(event)) return;
-      turn = openContinuationTurn();
+      // Same rules as `routeEvent`: a pushed prompt's late run is its own
+      // turn; otherwise only the start of work opens a row.
+      turn = adoptOrphanedRun(event);
+      if (!turn) {
+        if (!isContinuationOpeningEvent(event)) return;
+        turn = openContinuationTurn();
+      }
     }
     await handleTurnEvent(turn, event);
   }
@@ -854,6 +1235,12 @@ export function createCopilotSdkSessionRunner({
     } catch (error) {
       dbg('normalize failed', String(event?.type || ''), error?.message || String(error));
       return;
+    }
+    // The prompt boundary: the runtime has started work on a prompt. Decides
+    // which row owns the segment the normalizer just opened, and settles the
+    // previous run's row when this one is a new run (see noteUserMessage).
+    if (String(event?.type || '') === 'user.message' && !event?.agentId) {
+      await noteUserMessage(turn, event);
     }
     for (const action of actions) {
       if (action.channel === 'result') {
@@ -874,7 +1261,7 @@ export function createCopilotSdkSessionRunner({
     while (turn.bufferedActions.length) {
       const batch = turn.bufferedActions.splice(0);
       for (const action of batch) {
-        await dispatchAction(turn.message, action, turn.state).catch(() => {});
+        await dispatchOwned(turn, action).catch(() => {});
       }
     }
   }
@@ -1070,8 +1457,8 @@ export function createCopilotSdkSessionRunner({
     dbg('copilot runtime exited', detail);
     const turn = activeTurn;
     if (turn && !turn.settled) {
-      // handlePendingPayload's catch tears the runtime down and publishes the
-      // failure record.
+      // driveTurn tears the runtime down and publishes the failure record
+      // onto every row the turn owns.
       turn.fail(new Error(`the Copilot runtime exited before the turn completed (${detail})`));
       return;
     }
@@ -1194,6 +1581,10 @@ export function createCopilotSdkSessionRunner({
         session = await client.createSession(config);
         dbg(`created copilot session ${sdkSessionId.slice(0, 8)}`);
       }
+      // Which experimental surfaces THIS runtime has (it auto-updates under
+      // the relay): decides un-steer and the targeted Stop for the session.
+      probeSessionRpc(session);
+      scheduleQueueLaneRefresh();
       if (resumed && !byokProvider) {
         // A resumed HOSTED session keeps whatever model it was created with —
         // `config.model` is not guaranteed to be honoured on resume — so the
@@ -1249,6 +1640,10 @@ export function createCopilotSdkSessionRunner({
     replayGate.reset();
     continuationDueSince = 0;
     pendingActivities = [];
+    compactingSince = 0;
+    queuedLane = new Map();
+    sessionRpc = { queue: false, interruptMainTurn: false };
+    syncDeliveryReadiness();
     if (!closingSession && !closingClient) return;
     dbg(`stopping the copilot runtime (${reason})`);
     try { await closingSession?.disconnect?.(); } catch (error) {
@@ -1339,18 +1734,73 @@ export function createCopilotSdkSessionRunner({
     return String(message?.providerModel || '').trim() || defaultModel;
   }
 
-  function createTurn(message, { kind = 'delivered' } = {}) {
+  /**
+   * A queue row this turn owes an answer.
+   *
+   * `role`: 'primary' (the delivered row that opened the turn), 'steer' (a row
+   * delivered mid-turn and pushed into the same runtime interaction) or
+   * 'self' (the synthetic row of a self-initiated turn). An entry is owned —
+   * heartbeat-claimed, crash-guard-requeued — from creation until `released`.
+   */
+  function createEntry(turn, message, role) {
+    const entry = {
+      turn,
+      message,
+      role,
+      // The id `send()` resolved; the key `user.message.messageId` matches.
+      runtimeId: null,
+      // A root `user.message` named this entry: the runtime has taken the
+      // prompt. `delivery` is the runtime's own word for how.
+      consumed: false,
+      delivery: null,
+      interactionId: null,
+      // The entry whose run absorbed this one (`delivery:"steering"`).
+      foldedInto: null,
+      consumedMarked: false,
+      // Its outcome was decided and its publishes started / it landed.
+      settled: false,
+      released: false,
+      cancelled: false,
+      // `lastStreamedText` is what this row last received on /api/stream —
+      // the stream gate and the abort/error fallback text both read it.
+      state: { lastStreamedText: '' },
+    };
+    entry.done = new Promise((resolve) => { entry.resolveDone = resolve; });
+    turn.entries.push(entry);
+    return entry;
+  }
+
+  function assignRuntimeId(turn, entry, runtimeId) {
+    const id = String(runtimeId || '').trim();
+    entry.runtimeId = id || null;
+    if (!id) return;
+    turn.pushed.set(id, entry);
+    // The runtime can start work on a prompt before the send() that pushed it
+    // has resolved with its id. The boundary was remembered; reconcile it now,
+    // on the dispatch chain so it orders after the events already captured.
+    const unclaimed = turn.unclaimedUserMessages.get(id);
+    if (!unclaimed) return;
+    turn.unclaimedUserMessages.delete(id);
+    dispatchChain = dispatchChain
+      .then(() => adoptSegment(turn, entry, unclaimed))
+      .catch((error) => { dbg('late prompt-boundary reconcile failed', error?.message || String(error)); });
+  }
+
+  function createTurn(message, { kind = 'delivered', adoptEntry = null } = {}) {
     const continuation = kind === 'continuation';
     const turn = {
       // 'delivered' (a queue row arrived) | 'continuation' (the runtime started
       // work by itself and this worker minted a synthetic row for it).
       kind,
       message,
+      model: '',
       normalizer: createNormalizerImpl(),
-      state: { lastStreamedText: '' },
       result: null,
+      failure: null,
       settled: false,
       aborted: false,
+      // The row the user pressed Stop on (from the abort control), when known.
+      abortedRowId: null,
       stallTimer: null,
       planBoardPosted: false,
       // Set when a mutating tool was actually approved and run this turn.
@@ -1365,45 +1815,46 @@ export function createCopilotSdkSessionRunner({
       // rather than failing the worker.
       discarded: false,
       controlState: null,
-      // How many prompts have been SENT into this interaction. The runtime
-      // consumes queued prompts in order, and opens one `user.message` segment
-      // per prompt as it picks each up, so send order IS segment order.
-      //
-      // Deliberately not derived from the normalizer's live segment count: at
-      // the moment a steering send happens the runtime may not have opened the
-      // previous prompt's segment yet, and the steered row would then be
-      // attributed the PREVIOUS prompt's answer.
-      //
-      // Starts at 1, not 0: this turn's own prompt is always its first, and
-      // counting it here rather than after `send()` resolves closes the race
-      // where a steering delivery lands between the two. A continuation sent no
-      // prompt at all, so it starts at 0.
-      promptsSent: continuation ? 0 : 1,
-      // The segment this turn's OWN reply lands in. For a delivered turn that
-      // is where its prompt is picked up — non-zero when a previous interaction
-      // left prompts queued inside the runtime, which are consumed first. A
-      // continuation has no `user.message` of its own, so the normalizer's
-      // implicit first segment is its own.
-      baseSegment: continuation ? 0 : carriedPrompts,
-      // The segment the NEXT prompt steered into this interaction will be
-      // answered in. Tracked explicitly rather than derived, because the two
-      // kinds differ: a delivered turn's own prompt occupies `baseSegment`, so
-      // the next is `baseSegment + 1`; a continuation occupies segment 0
-      // without having sent anything, so the first steered prompt opens
-      // segment 1. Getting this wrong cross-publishes the continuation's reply
-      // into the user's row.
-      nextSegmentIndex: continuation ? 1 : carriedPrompts + 1,
-      // The lowest segment index any prompt SENT by this turn can occupy — the
-      // floor for the carried-prompt arithmetic when the interaction ends.
-      firstSentSegment: continuation ? 1 : carriedPrompts,
       // Cancels any relay question card this turn is blocked on, so an aborted
       // turn does not leave a human answering into the void.
       abortController: new AbortController(),
-      // Queue rows delivered mid-turn and steered into this interaction. Each
-      // one is owed a response by THIS turn — the runtime answers them all
-      // under a single `session.idle`, so nothing else will settle them.
-      steeredRows: [],
+      // Every row this turn owes an answer, in push order.
+      entries: [],
+      // runtime message id → entry, for the `user.message` acknowledgement.
+      pushed: new Map(),
+      // Normalizer segment index → the entry whose row the segment's text
+      // belongs to. A `delivery:"steering"` prompt's segment belongs to the
+      // run it was folded into; a `queued`/`idle` one starts its own run.
+      segmentOwners: [],
+      // The entry whose run the runtime is working on right now.
+      currentOwner: null,
+      primaryEntry: null,
+      // Early settles (a previous run's row, published when the next run
+      // opened) run off the event dispatch chain; driveTurn awaits them
+      // before releasing ownership.
+      settlePromises: [],
+      // False until the turn-opening send() has resolved: the delivery hold.
+      primarySent: continuation,
+      // Root `user.message`s whose id no pushed entry knew yet (the event beat
+      // the send() resolution): runtime id → boundary, reconciled by
+      // assignRuntimeId.
+      unclaimedUserMessages: new Map(),
     };
+    if (adoptEntry) {
+      // A pushed row whose run the runtime opened after the turn it was pushed
+      // into had already settled: it becomes the primary of a turn of its own.
+      adoptEntry.turn = turn;
+      turn.entries.push(adoptEntry);
+      turn.primaryEntry = adoptEntry;
+      if (adoptEntry.runtimeId) turn.pushed.set(adoptEntry.runtimeId, adoptEntry);
+      turn.primarySent = true;
+    } else {
+      turn.primaryEntry = createEntry(turn, message, continuation ? 'self' : 'primary');
+    }
+    turn.currentOwner = turn.primaryEntry;
+    if (continuation) turn.segmentOwners[0] = turn.primaryEntry;
+    turn.primaryReady = new Promise((resolve) => { turn.resolvePrimaryReady = resolve; });
+    if (turn.primarySent) turn.resolvePrimaryReady();
     if (continuation) {
       // The single in-flight registration for this turn's synthetic row, and
       // the signal that abandons it. One promise, stored ON the turn, so the
@@ -1425,18 +1876,19 @@ export function createCopilotSdkSessionRunner({
       turn.rejectDone = reject;
     });
     // The stall watchdog and the runtime-exit observer can reject `turn.done`
-    // before `runTurn` reaches its `await` — an unhandled rejection that the
-    // worker crash guard would escalate into a whole-worker failure. This
-    // handler exists only to mark the promise as handled; the real await path
-    // still sees the rejection.
+    // before anything awaits it — an unhandled rejection that the worker crash
+    // guard would escalate into a whole-worker failure. This handler exists
+    // only to mark the promise as handled; driveTurn still sees the rejection.
     turn.done.catch(() => {});
     turn.settle = () => {
       if (turn.settled) return;
       turn.settled = true;
       turn.disarmStall();
       // The terminal event releases the event stream at once — see
-      // `beginPublishing`. The queue row stays owned until the publish lands.
+      // `beginPublishing`. The queue rows stay owned until the publishes land.
       beginPublishing(turn);
+      turn.resolvePrimaryReady();
+      syncDeliveryReadiness();
       turn.resolveDone();
     };
     turn.fail = (error) => {
@@ -1444,6 +1896,8 @@ export function createCopilotSdkSessionRunner({
       turn.settled = true;
       turn.disarmStall();
       beginPublishing(turn);
+      turn.resolvePrimaryReady();
+      syncDeliveryReadiness();
       turn.rejectDone(error);
     };
     turn.disarmStall = () => {
@@ -1472,44 +1926,388 @@ export function createCopilotSdkSessionRunner({
     return turn;
   }
 
+  // ----------------------------------------------------- prompt boundaries --
+
+  function claimSegment(turn, index, owner) {
+    // Leading unowned segments (text the runtime produced before any prompt
+    // boundary, e.g. the answer to a prompt carried over from a previous
+    // interaction) go to the first owner: that is where the merged note sent
+    // the reader.
+    for (let j = 0; j <= index; j += 1) {
+      if (!turn.segmentOwners[j]) turn.segmentOwners[j] = owner;
+    }
+  }
+
+  /**
+   * A root `user.message` arrived: the runtime started work on a prompt. Called
+   * on the dispatch chain right after the normalizer opened the prompt's
+   * segment, so `promptCount() - 1` is that segment.
+   */
+  async function noteUserMessage(turn, event) {
+    const data = event?.data && typeof event.data === 'object' ? event.data : {};
+    const index = Math.max(0, turn.normalizer.promptCount() - 1);
+    const runtimeId = String(data.messageId || '').trim();
+    const boundary = {
+      index,
+      delivery: String(data.delivery || '').trim().toLowerCase(),
+      interactionId: String(data.interactionId || '').trim(),
+    };
+    const entry = runtimeId ? turn.pushed.get(runtimeId) : null;
+    if (entry) {
+      await adoptSegment(turn, entry, boundary);
+      return;
+    }
+    // Not one of ours (yet): a prompt the runtime injected itself (an autopilot
+    // nudge, a carried-over prompt from a previous interaction), or a pushed
+    // prompt whose send() has not resolved with its id. Its text belongs to
+    // the run in progress until proven otherwise.
+    if (runtimeId && !turn.unclaimedUserMessages.has(runtimeId)) turn.unclaimedUserMessages.set(runtimeId, boundary);
+    claimSegment(turn, index, turn.currentOwner || turn.primaryEntry);
+  }
+
+  /**
+   * Bind a prompt boundary to the entry it names.
+   *
+   * `delivery:"steering"`: the runtime folded the prompt into the run already
+   * in progress — the reply that follows belongs to that run's row, and this
+   * row will settle with the fold marker (Claude's `folded`). The relay is
+   * told the prompt is consumed at once, so a crash between now and the
+   * marker fails the row instead of re-running it.
+   *
+   * Anything else (`queued`, `idle`, unknown): the prompt starts its own run
+   * on the same interaction. The previous run is over — nothing more will be
+   * produced for its row, so it is settled right away rather than at the
+   * drain's end, exactly as a Claude context finalizes when the CLI opens the
+   * next one.
+   */
+  async function adoptSegment(turn, entry, { index, delivery, interactionId }) {
+    entry.consumed = true;
+    entry.delivery = delivery || null;
+    entry.interactionId = interactionId || null;
+    const running = turn.currentOwner || turn.primaryEntry;
+    if (delivery === 'steering' && running && running !== entry && !running.settled) {
+      entry.foldedInto = running;
+      turn.segmentOwners[index] = running;
+      claimSegment(turn, index, running);
+      if (entry.role === 'steer' && !entry.consumedMarked) {
+        entry.consumedMarked = true;
+        void markConsumed(entry.message.conversationId, [entry.message]);
+      }
+      dbg('steered prompt folded into the running turn', entry.message.id, `→ ${running.message.id || '(continuation)'}`);
+      return;
+    }
+    turn.segmentOwners[index] = entry;
+    claimSegment(turn, index, entry);
+    if (running === entry) return;
+    turn.currentOwner = entry;
+    if (running && !running.settled) {
+      dbg('pushed prompt runs as its own turn; settling the previous run', entry.message.id, `after ${running.message.id || '(continuation)'}`);
+      // Off the dispatch chain: a slow relay must not stall the events of
+      // the run that just opened (or its terminator) behind this publish.
+      turn.settlePromises.push(settleEntry(turn, running, { type: 'completed' }));
+    }
+  }
+
+  // -------------------------------------------------------------- settling --
+
+  /**
+   * Decide and publish one row's outcome. Idempotent per entry. A run owner's
+   * settle also settles the steers folded into its run (they were answered by
+   * its reply), in push order, after the reply itself.
+   */
+  async function settleEntry(turn, entry, outcome) {
+    if (entry.settled) return;
+    entry.settled = true;
+    const model = turn.result?.model || turn.normalizer.model || turn.model || null;
+    const folded = turn.entries.filter((other) => other !== entry && !other.settled && other.foldedInto === entry);
+    try {
+      switch (outcome.type) {
+        case 'completed': {
+          const text = finalTextFor(turn, entry, turn.result);
+          const published = text || EMPTY_TURN_COMPLETION_NOTE;
+          if (entry.role !== 'steer' && shouldPostPlanBoard({
+            relayMode: entry.message.relayMode,
+            finalText: text,
+            alreadyPosted: turn.planBoardPosted,
+            acted: turn.acted === true,
+          })) {
+            await publishPlanBoard(turn, text, 'plan-mode-fallback');
+          }
+          await publishFinalStream(entry.message, published);
+          await publishResponse(entry.message, {
+            text: published,
+            model,
+            consumedSteerIds: folded.map((other) => other.message),
+          });
+          break;
+        }
+        case 'aborted-by-user': {
+          // The queue row's fate belongs to the server-side abort control,
+          // exactly as in the Claude and Cursor workers. Publishing a response
+          // here would double-settle the row.
+          await publishFinalStream(entry.message, finalTextFor(turn, entry, turn.result));
+          break;
+        }
+        case 'runtime-interrupted': {
+          const own = finalTextFor(turn, entry, turn.result);
+          const text = own ? `${own}\n\n${RUNTIME_INTERRUPTED_NOTE}` : RUNTIME_INTERRUPTED_NOTE;
+          await publishFinalStream(entry.message, text);
+          await publishResponse(entry.message, { text, model, consumedSteerIds: folded.map((other) => other.message) });
+          break;
+        }
+        case 'error': {
+          const { classified } = outcome;
+          await publishFinalStream(entry.message, entry.state.lastStreamedText);
+          await publishResponse(entry.message, {
+            text: classified.text,
+            model,
+            terminalError: terminalErrorRecord(entry.message, classified),
+            consumedSteerIds: folded.map((other) => other.message),
+          });
+          break;
+        }
+        case 'folded':
+          await publishSettleMarker(entry.message, { text: STEER_FOLDED_TEXT, model, kind: 'folded', variant: 'folded' });
+          break;
+        case 'stopped':
+          await publishSettleMarker(entry.message, { text: STEER_STOPPED_TEXT, model, kind: 'stopped', variant: 'stopped' });
+          break;
+        case 'merged-note':
+          // Accepted by the runtime, never started: still queued inside it, so
+          // it will be answered at the start of the next interaction — a
+          // requeue would run it twice.
+          await publishFinalStream(entry.message, STEERED_ROW_MERGED_NOTE);
+          await publishResponse(entry.message, { text: STEERED_ROW_MERGED_NOTE, model });
+          break;
+        case 'cancelled':
+        case 'discarded':
+        default:
+          break;
+      }
+    } catch (error) {
+      dbg('settle publish failed', entry.message?.id || '(no id)', outcome.type, error?.message || String(error));
+    } finally {
+      entry.released = true;
+      entry.resolveDone(true);
+    }
+    for (const other of folded) {
+      const foldOutcome = outcome.type === 'completed' || outcome.type === 'merged-note'
+        ? { type: 'folded' }
+        : outcome.type === 'error' ? outcome : { type: 'stopped' };
+      await settleEntry(turn, other, foldOutcome);
+    }
+  }
+
+  /** Remove our unconsumed prompts from the runtime's queued lane (best effort). */
+  async function clearOwnedQueuedItems(entries) {
+    if (!entries.length || !session || !sessionRpc.queue) return;
+    await refreshQueueLane();
+    for (const entry of entries) {
+      const itemId = queuedLane.get(entry.runtimeId);
+      if (!itemId) continue;
+      try {
+        await session.rpc.queue.removeAt({ id: itemId });
+        dbg('removed a stopped prompt from the runtime queue', entry.message.id);
+      } catch (error) {
+        dbg('queue.removeAt after Stop failed', entry.message.id, error?.message || String(error));
+      }
+    }
+  }
+
+  /**
+   * Hold pushed-but-unstarted prompts for the orphan grace, then return the
+   * ones the runtime still did not open (an opened one was adopted meanwhile
+   * and belongs to a turn of its own now).
+   */
+  async function settleAfterOrphanGrace(turn, orphans) {
+    if (!orphans.length) return [];
+    if (orphanGraceMs > 0) {
+      dbg('pushed prompts not started at idle; waiting for the runtime to open them', orphans.map((entry) => entry.message.id).join(','));
+      await sleep(orphanGraceMs);
+    }
+    return orphans.filter((entry) => entry.turn === turn && !entry.settled);
+  }
+
+  /**
+   * Publish everything a finished turn still owes, per row.
+   *
+   * Shared by both turn kinds: the runtime does not distinguish a turn it
+   * started from one it was asked for, so neither does the reporting.
+   */
+  async function finishTurn(turn) {
+    const result = turn.result;
+    const failure = turn.failure;
+    // Capture only. The POST fires from driveTurn's `finally`, after the rows
+    // have been published.
+    captureTurnUsage(turn.primaryEntry.message, result);
+
+    const pending = turn.entries.filter((entry) => !entry.settled && entry.turn === turn);
+    if (!pending.length) return;
+
+    if (failure) {
+      const classified = classifyCopilotTurnException(failure);
+      dbg('copilot turn failed', turn.message?.id || '(continuation)', classified.detail);
+      for (const entry of pending) {
+        if (entry.settled) continue;
+        await settleEntry(turn, entry, { type: 'error', classified });
+      }
+      return;
+    }
+    if (result?.isError) {
+      const classified = classifyCopilotSessionError(result.errorData || { message: result.errorMessage });
+      dbg('turn failed', turn.message?.id || '(continuation)', classified.stableCode);
+      for (const entry of pending) {
+        if (entry.settled) continue;
+        await settleEntry(turn, entry, { type: 'error', classified });
+      }
+      return;
+    }
+
+    const live = turn.currentOwner || turn.primaryEntry;
+    // The row the user pressed Stop on. Normally the live one; the relay's
+    // live-turn picker can also land on another row this turn owns, in which
+    // case THAT row is left to the relay's abort control and the live row
+    // keeps its partial reply.
+    const stopped = turn.aborted
+      ? (turn.abortedRowId && pending.find((entry) => String(entry.message?.id || '') === turn.abortedRowId)) || live
+      : null;
+    const settleOne = async (entry) => {
+      // A row that moved to a turn of its own (adoptOrphanedRun) is not ours.
+      if (entry.turn !== turn || entry.settled) return;
+      const ownsRun = entry === live || (!entry.foldedInto && entry.consumed);
+      if (turn.aborted) {
+        // A user Stop. The stopped row is settled server-side; every other
+        // row pushed into the interaction went unanswered — the runtime
+        // clears both its lanes on an interrupt — and says so, with Resend.
+        if (entry === stopped) {
+          dbg('turn aborted', entry.message.id);
+          await settleEntry(turn, entry, { type: 'aborted-by-user' });
+        } else if (ownsRun) {
+          await settleEntry(turn, entry, { type: 'completed' });
+        } else {
+          await settleEntry(turn, entry, { type: 'stopped' });
+        }
+        return;
+      }
+      if (result?.aborted) {
+        // The runtime interrupted the turn on its own. Nothing server-side is
+        // waiting to settle these rows.
+        if (entry === live) {
+          dbg('turn interrupted by the runtime', entry.message.id);
+          await settleEntry(turn, entry, { type: 'runtime-interrupted' });
+        } else if (ownsRun) {
+          await settleEntry(turn, entry, { type: 'completed' });
+        } else {
+          await settleEntry(turn, entry, { type: 'stopped' });
+        }
+        return;
+      }
+      if (ownsRun) {
+        await settleEntry(turn, entry, { type: 'completed' });
+      } else if (entry.foldedInto) {
+        await settleEntry(turn, entry, { type: 'folded' });
+      } else {
+        await settleEntry(turn, entry, { type: 'merged-note' });
+      }
+    };
+    // A normal end with pushed prompts the runtime never started: the runtime
+    // gets a moment to open their runs (adoptOrphanedRun takes them) before
+    // they are noted as carried over — AFTER the rows whose replies are
+    // complete have been published, so a finished answer never waits on the
+    // grace. Not on a Stop (the runtime cleared them) and not on an error.
+    const orphans = (!turn.aborted && !result?.aborted)
+      ? pending.filter((entry) => entry.role === 'steer' && !entry.consumed && !entry.foldedInto)
+      : [];
+    if (turn.aborted || result?.aborted) {
+      // Belt and braces for the targeted interrupt: any prompt of ours still
+      // sitting in the runtime's queued lane is pulled out before its row is
+      // marked stopped, so the runtime cannot run a prompt whose row says it
+      // was not answered.
+      await clearOwnedQueuedItems(pending.filter((entry) => !entry.consumed && entry.runtimeId));
+    }
+    // The stopped row first: settling it before the live row's cascade means
+    // the cascade (which settles the steers folded into a run) cannot touch
+    // the row the relay's abort control owns.
+    const ordered = stopped ? [stopped, ...pending.filter((entry) => entry !== stopped)] : pending;
+    for (const entry of ordered) {
+      if (!orphans.includes(entry)) await settleOne(entry);
+    }
+    for (const entry of await settleAfterOrphanGrace(turn, orphans)) {
+      await settleOne(entry);
+    }
+  }
+
+  // ------------------------------------------------------------ lifecycle --
+
+  /**
+   * Interrupt the turn the user stopped. `interruptMainTurn` (when the
+   * runtime has it) stops the main agent loop and nothing else: background
+   * agents and promoted shells keep running under their own Stop, exactly
+   * like the Claude worker's targeted interrupt. `session.abort()` — the
+   * fallback — also cancels every background agent and clears both message
+   * lanes. Either way the runtime answers with an aborted idle event, which
+   * settles the turn through the normal terminator.
+   */
+  async function interruptTurn(turn, control) {
+    turn.aborted = true;
+    turn.abortedRowId = String(control?.queueMessageId || '').trim() || null;
+    // While `ensureSession` is still connecting there is no session to abort
+    // and this would be a silent no-op; `runTurn` re-checks `turn.aborted`
+    // once the session exists and settles there instead.
+    if (!session) return;
+    if (sessionRpc.interruptMainTurn) {
+      try {
+        const outcome = await session.rpc.interruptMainTurn({ flushQueued: false });
+        if (outcome?.interrupted === false) {
+          // Nothing was processing: no aborted idle will come. The turn is
+          // over as far as the runtime is concerned.
+          dbg('interruptMainTurn found no main turn in flight; settling locally', turn.message?.id || '');
+          turn.settle();
+        }
+        return;
+      } catch (error) {
+        dbg('interruptMainTurn failed; falling back to abort()', error?.message || String(error));
+      }
+    }
+    await session.abort?.();
+  }
+
+  /**
+   * Start a delivered turn: bring the session up, send the prompt, and hand
+   * the turn's lifecycle to `driveTurn`. Resolves when THIS row has settled —
+   * which can be before the turn ends, when a message pushed later ran as its
+   * own run and this one's reply was already complete.
+   */
   async function runTurn(turn) {
     const { message } = turn;
+    const entry = turn.primaryEntry;
     const model = resolvePerTurnModel(message);
     // The dequeued row's reasoning effort (audit #9). Normalisation happens in
     // the switcher: `none`/absent mean "the model's default".
     const effort = message?.reasoningEffort ?? null;
     const relayMode = message?.relayMode || 'agent';
     lastRelayMode = relayMode;
+    turn.model = model;
     // Set before the session is touched: the heartbeat's owner-recovery guard
     // reads the active ids, so a cold-start delivery must already own its row.
     activeTurn = turn;
-
-    const controlState = controlPoller?.start?.({
-      queueMessageId: message.id,
-      onAbortTurn: async () => {
-        turn.aborted = true;
-        // While `ensureSession` is still connecting there is no session to
-        // abort and this would be a silent no-op; `runTurn` re-checks
-        // `turn.aborted` once the session exists and settles there instead.
-        if (!session) return;
-        // The runtime answers an abort with `abort` → `agent.interrupted` →
-        // `assistant.turn_end` → `session.idle{aborted:true}`, which settles
-        // the turn through the normal terminator; this only asks for it.
-        await session.abort?.();
-      },
-    });
-
+    // The delivery hold begins: nothing steers in until the prompt is sent.
+    syncDeliveryReadiness();
+    // Session-wide, not per row: the client's Stop targets whichever of this
+    // turn's rows is live, and the relay only hands out controls for rows
+    // this worker owns.
+    turn.controlState = controlPoller?.start?.({
+      queueMessageId: '',
+      onAbortTurn: (control) => interruptTurn(turn, control),
+    }) || null;
+    turn.drive = driveTurn(turn);
     try {
       await ensureSession(model, effort, relayMode);
       if (turn.aborted) {
         // The abort landed while the session was still being built. Nothing
-        // was sent, so there is no runtime turn to interrupt — ask anyway (a
-        // queued prompt from a previous delivery could still be running) and
-        // settle locally rather than sending a prompt the user just cancelled.
+        // was sent, so there is no runtime turn to interrupt — settle locally
+        // rather than sending a prompt the user just cancelled.
         dbg('turn aborted before send', message.id);
-        try { await session?.abort?.(); } catch (error) {
-          dbg('abort during session setup failed', error?.message || String(error));
-        }
         turn.settle();
       } else {
         turn.armStall();
@@ -1522,26 +2320,140 @@ export function createCopilotSdkSessionRunner({
         // `mode` and `attachments` are FIELDS of the single MessageOptions
         // argument — `send()` takes no second parameter, so passing options
         // positionally drops them silently.
-        await session.send({
+        const sending = session.send({
           prompt,
           ...(attachments?.length ? { attachments } : {}),
           ...(sendMode ? { mode: sendMode } : {}),
           agentMode: copilotAgentModeForRelayMode(relayMode),
         });
-        // Committed only now that `send()` accepted the prompt (audit #32): a
-        // failed send means the runtime never READ the mode guidance, and
-        // committing before it would make the same-mode retry omit it.
-        context?.commit();
-        // `send()` resolves once the runtime accepted the prompt — it is NOT
-        // the turn's completion; the event stream is.
-        await turn.done;
+        // A send that never resolves (a wedged runtime) must not hold this
+        // delivery hostage once the watchdog has failed the turn: the id is
+        // still recorded if it ever arrives, but the wait ends with the turn.
+        const settledFirst = Symbol('turn-settled');
+        const runtimeId = await Promise.race([
+          sending,
+          turn.done.then(() => settledFirst, () => settledFirst),
+        ]);
+        if (runtimeId === settledFirst) {
+          sending.then((id) => assignRuntimeId(turn, entry, id)).catch(() => {});
+        } else {
+          assignRuntimeId(turn, entry, runtimeId);
+          // Committed only now that `send()` accepted the prompt (audit #32): a
+          // failed send means the runtime never READ the mode guidance, and
+          // committing before it would make the same-mode retry omit it.
+          context?.commit();
+          // The runtime has the prompt: the delivery hold ends and later
+          // deliveries steer into this turn.
+          turn.primarySent = true;
+          turn.resolvePrimaryReady();
+          syncDeliveryReadiness();
+        }
       }
-    } finally {
-      controlPoller?.stop?.(controlState);
-      await quiesceTurn(turn);
+    } catch (error) {
+      // A failure that killed the session (or came from starting it) leaves a
+      // handle nothing else can use; drop it so the next delivery rebuilds and
+      // resumes rather than sending into a dead runtime. An UNCONFIRMED MODEL
+      // SWITCH is the exception: the session is healthy and merely still on
+      // its previous model, and tearing the runtime down over it would kill
+      // any live background work for a selection problem the user fixes by
+      // picking another model.
+      if (!isModelSwitchUnconfirmedError(error)) {
+        await stopRuntime('turn-failure').catch(() => {});
+      }
+      turn.fail(error);
     }
+    // `send()` resolving is NOT the turn's completion; the event stream is.
+    await awaitEntry(turn, entry);
+    return true;
+  }
 
-    return finishTurn(turn, model);
+  /**
+   * Wait for a row's settle. A row's settle is not necessarily the turn's
+   * end: a prompt pushed later may still be running on the same interaction,
+   * and this delivery must not wait for it. But when the turn IS over, wait
+   * for its wrap-up too (ownership release, usage ingest), so a caller that
+   * awaited the delivery sees a quiescent runner — the contract every test
+   * and the crash guard rely on. `driveTurn` never rejects.
+   */
+  async function awaitEntry(turn, entry) {
+    await entry.done;
+    if (turn.settled && turn.drive) await turn.drive.catch(() => {});
+  }
+
+  /**
+   * Run a turn from its first event to its last publish.
+   *
+   * Row ownership is released only after every publish has landed: a
+   * heartbeat firing inside the publish window with no active ids would tell
+   * the relay this worker owns nothing, and the still-`processing` rows would
+   * be recovered underneath it. (The EVENT stream was already released at the
+   * terminator — see `beginPublishing` — so the runtime's next self-initiated
+   * turn can open while this one is still writing.)
+   */
+  async function driveTurn(turn) {
+    try {
+      await turn.done;
+    } catch (error) {
+      turn.failure = turn.failure || error;
+    }
+    try {
+      await quiesceTurn(turn);
+      if (turn.failure && turn.kind === 'delivered' && !isModelSwitchUnconfirmedError(turn.failure) && session) {
+        // A stall or a runtime death mid-turn (a setup failure already tore
+        // the runtime down in runTurn).
+        await stopRuntime('turn-failure').catch(() => {});
+      }
+      if (turn.kind === 'continuation') {
+        // Nothing can be published before the row exists. The buffer is
+        // drained by the registration itself; this only covers actions that
+        // arrived during the drain.
+        await awaitContinuationRow(turn);
+        // The invariant is the id, not the flag: registration can also give up
+        // by throwing, or by taking longer than `awaitContinuationRow` waits,
+        // and publishing against `messageId: null` would attribute the whole
+        // turn to nothing at all.
+        if (!turn.message.id) {
+          if (!turn.discarded) abandonContinuationRegistration(turn, 'no relay row at publish time');
+          dbg('continuation output dropped (no relay row)');
+          const classified = classifyCopilotTurnException(
+            turn.failure || new Error('the relay refused a continuation row for this turn'),
+          );
+          for (const entry of turn.entries) {
+            if (entry.settled || entry.turn !== turn) continue;
+            // The steering path is still waiting on any row it handed us, and
+            // it has no row of its own to fall back to.
+            await settleEntry(turn, entry, entry.role === 'self' ? { type: 'discarded' } : { type: 'error', classified });
+          }
+          return;
+        }
+        await flushBufferedActions(turn);
+      }
+      await finishTurn(turn);
+    } catch (error) {
+      dbg('turn publish failed', error?.message || String(error));
+    } finally {
+      // Early settles still in flight must land before the rows stop being
+      // reported (settleEntry never rejects, but this is the ordering guard).
+      await Promise.allSettled(turn.settlePromises);
+      controlPoller?.stop?.(turn.controlState);
+      turn.controlState = null;
+      // Every path through the turn — published, failed, aborted, threw — has
+      // finished by here. Anything still unresolved is released so no caller
+      // waits forever; its row is left to the relay's recovery.
+      for (const entry of turn.entries) {
+        if (entry.turn !== turn || entry.released) continue;
+        entry.settled = true;
+        entry.released = true;
+        entry.resolveDone(true);
+      }
+      // Released only once every publish for this turn's rows has landed.
+      releaseTurnOwnership(turn);
+      touch();
+      syncDeliveryReadiness();
+      // The ingest is advisory, never awaited, and must never be able to
+      // delay a reply that is already written.
+      postTurnUsage();
+    }
   }
 
   /**
@@ -1561,111 +2473,6 @@ export function createCopilotSdkSessionRunner({
     // closes strays when it produces a terminal result; these are the paths
     // that never produced one.
     await closeStraySubagentRuns(turn).catch(() => {});
-  }
-
-  /**
-   * Publish a finished turn's outcome onto its queue row (and every row steered
-   * into it).
-   *
-   * Shared by both turn kinds. A continuation reaches it through
-   * `driveContinuation` instead of `runTurn`, but the outcomes are identical:
-   * the runtime does not distinguish a turn it started from one it was asked
-   * for, so neither does the reporting.
-   */
-  async function finishTurn(turn, model) {
-    const { message } = turn;
-    const result = turn.result;
-    const responseModel = result?.model || turn.normalizer.model || model || null;
-    // Capture only. The POST fires from `handlePendingPayload`'s `finally`,
-    // after this row has been published.
-    captureTurnUsage(message, result);
-
-    // Whatever this interaction did not get to stays queued in the runtime and
-    // shifts the NEXT interaction's segments: the prompts this turn sent occupy
-    // `[firstSentSegment, nextSegmentIndex)`, and the ones the runtime never
-    // opened a segment for are still in its pending queue.
-    //
-    // The `max` against `firstSentSegment` is what makes this correct for a
-    // continuation, which occupies segment 0 without having sent anything: a
-    // continuation that opened no segment at all (an empty self-initiated turn)
-    // would otherwise report one carried prompt and shift the next real turn's
-    // answer by one.
-    const segmentsOpened = turn.normalizer.promptCount();
-    carriedPrompts = Math.max(0, turn.nextSegmentIndex - Math.max(turn.firstSentSegment, segmentsOpened));
-
-    // This row's own reply. Falls back to the whole composed text when the
-    // runtime opened no segment at all (an empty or immediately-failed turn),
-    // which is strictly better than publishing nothing.
-    const ownText = String(
-      turn.normalizer.segmentText(turn.baseSegment) || result?.text || turn.state.lastStreamedText || '',
-    ).trim();
-
-    // A user-initiated abort publishes the partial text and nothing else: the
-    // queue row's fate belongs to the server-side abort control, exactly as in
-    // the Claude and Cursor workers. Publishing a response here would
-    // double-settle the row.
-    if (turn.aborted) {
-      dbg('turn aborted', message.id);
-      // This row's segment only: the steered rows publish their own, and
-      // publishing the composed text here would show their replies twice.
-      await publishFinalStream(message, ownText);
-      // A steered row is NOT covered by the abort control (which knows only
-      // about the row the user aborted), so it still has to be settled here or
-      // it holds `processing` forever behind a renewing lease.
-      await settleSteeredRows(turn, result, responseModel);
-      return true;
-    }
-
-    // The runtime aborted on its own (`result.aborted` with no relay-side
-    // abort control in flight). Nothing server-side is waiting to settle this
-    // row, so returning here would leave it pending until the delivery
-    // watchdog fails it with a misleading "Relay timeout" — the row has to be
-    // settled with a record that says what actually happened.
-    if (result?.aborted) {
-      dbg('turn interrupted by the runtime', message.id);
-      const text = ownText ? `${ownText}\n\n${RUNTIME_INTERRUPTED_NOTE}` : RUNTIME_INTERRUPTED_NOTE;
-      await publishFinalStream(message, text);
-      await publishResponse(message, { text, model: responseModel });
-      await settleSteeredRows(turn, result, responseModel);
-      return true;
-    }
-
-    if (result?.isError) {
-      const classified = classifyCopilotSessionError(result.errorData || { message: result.errorMessage });
-      dbg('turn failed', message.id, classified.stableCode);
-      await publishFinalStream(message, turn.state.lastStreamedText);
-      await publishResponse(message, {
-        text: classified.text,
-        model: responseModel,
-        terminalError: terminalErrorRecord(message, classified),
-      });
-      // The steered rows failed with it — they were being answered by the same
-      // interaction. They get the same terminal record so each row says why.
-      await settleSteeredRows(turn, result, responseModel, classified);
-      return true;
-    }
-
-    // The turn produced a plan but never called exit-plan-mode (or the runtime
-    // build has no such hook). Same text-shape fallback the siblings use, and
-    // it must go out BEFORE the response: `/api/relay-board` 409s once the
-    // queue row leaves `processing`.
-    if (shouldPostPlanBoard({
-      relayMode: message.relayMode,
-      finalText: ownText,
-      alreadyPosted: turn.planBoardPosted,
-      acted: turn.acted === true,
-    })) {
-      await publishPlanBoard(turn, ownText, 'plan-mode-fallback');
-    }
-
-    // A terminal, non-error turn with no prose is COMPLETE, not a failed
-    // delivery — requeuing re-runs deterministically empty work until the
-    // retry cap fails the row with a misleading "Relay timeout".
-    const publishedText = ownText || EMPTY_TURN_COMPLETION_NOTE;
-    await publishFinalStream(message, publishedText);
-    await publishResponse(message, { text: publishedText, model: responseModel });
-    await settleSteeredRows(turn, result, responseModel);
-    return true;
   }
 
   // ----------------------------------------------------------- continuation --
@@ -1704,6 +2511,7 @@ export function createCopilotSdkSessionRunner({
       }
     }
     dbg('opening a continuation turn for runtime-initiated work');
+    syncDeliveryReadiness();
     // Both are fire-and-forget by design (the SDK's event callback is
     // synchronous and cannot await a turn), so both must swallow: an unhandled
     // rejection here would reach the worker crash guard and take the whole
@@ -1721,10 +2529,47 @@ export function createCopilotSdkSessionRunner({
       }
       abandonContinuationRegistration(turn, 'registration threw');
     });
-    driveContinuation(turn).catch((error) => {
+    turn.drive = driveTurn(turn);
+    turn.drive.catch((error) => {
       dbg('continuation driver threw', error?.message || String(error));
     });
     return turn;
+  }
+
+  /**
+   * A pushed row whose run the runtime opened AFTER the turn it was pushed
+   * into had settled (the drain's idle raced the send). It is not a
+   * self-initiated turn — it is that row's own turn, and its reply belongs on
+   * that row. Returns the new turn, or null when the id is not one of ours.
+   */
+  function adoptOrphanedRun(event) {
+    if (String(event?.type || '') !== 'user.message' || event?.agentId) return null;
+    const runtimeId = String(event?.data?.messageId || '').trim();
+    if (!runtimeId) return null;
+    for (const previous of publishingTurns) {
+      const entry = previous.pushed.get(runtimeId);
+      if (!entry || entry.consumed || entry.settled) continue;
+      previous.entries = previous.entries.filter((other) => other !== entry);
+      previous.pushed.delete(runtimeId);
+      // From here the entry belongs to the new turn (`entry.turn`); the old
+      // turn's settle passes skip rows that moved away.
+      const turn = createTurn(entry.message, { kind: 'delivered', adoptEntry: entry });
+      turn.model = resolvePerTurnModel(entry.message);
+      activeTurn = turn;
+      turn.armStall();
+      turn.controlState = controlPoller?.start?.({
+        queueMessageId: '',
+        onAbortTurn: (control) => interruptTurn(turn, control),
+      }) || null;
+      dbg('a pushed prompt opened its own run after its turn settled; adopting it', entry.message.id);
+      syncDeliveryReadiness();
+      turn.drive = driveTurn(turn);
+      turn.drive.catch((error) => {
+        dbg('adopted turn driver threw', error?.message || String(error));
+      });
+      return turn;
+    }
+    return null;
   }
 
   /**
@@ -1813,12 +2658,8 @@ export function createCopilotSdkSessionRunner({
     // Only now is there a row to abort, so this is where the control poller can
     // start.
     turn.controlState = controlPoller?.start?.({
-      queueMessageId: turn.message.id,
-      onAbortTurn: async () => {
-        turn.aborted = true;
-        if (!session) return;
-        await session.abort?.();
-      },
+      queueMessageId: '',
+      onAbortTurn: (control) => interruptTurn(turn, control),
     }) || null;
     await flushBufferedActions(turn);
     turn.registered = true;
@@ -1846,121 +2687,20 @@ export function createCopilotSdkSessionRunner({
     }
   }
 
-  /**
-   * Run a continuation to its terminator and publish it, mirroring
-   * `handlePendingPayload`'s outer shape.
-   *
-   * Row ownership is released only after every publish has landed, exactly as
-   * for a delivered turn: a heartbeat firing inside the publish window with no
-   * active ids would tell the relay this worker owns nothing, and the
-   * still-`processing` synthetic row would be recovered underneath it. (The
-   * EVENT stream was already released at the terminator — see
-   * `beginPublishing` — so the runtime's next self-initiated turn can open
-   * while this one is still writing.)
-   */
-  async function driveContinuation(turn) {
-    let failure = null;
-    try {
-      await turn.done;
-    } catch (error) {
-      failure = error;
-    }
-    try {
-      await quiesceTurn(turn);
-      // Nothing can be published before the row exists. The buffer is drained
-      // by the registration itself; this only covers actions that arrived
-      // during the drain.
-      await awaitContinuationRow(turn);
-      // The invariant is the id, not the flag: registration can also give up by
-      // throwing, or by taking longer than `awaitContinuationRow` waits, and
-      // publishing against `messageId: null` would attribute the whole turn to
-      // nothing at all.
-      if (!turn.message.id) {
-        if (!turn.discarded) abandonContinuationRegistration(turn, 'no relay row at publish time');
-        dbg('continuation output dropped (no relay row)');
-        // The steering path is still waiting on any row it handed us, and it
-        // has no row of its own to fall back to.
-        await settleSteeredRows(turn, null, null, classifyCopilotTurnException(
-          failure || new Error('the relay refused a continuation row for this turn'),
-        )).catch(() => {});
-        return;
-      }
-      await flushBufferedActions(turn);
-      if (failure) {
-        const classified = classifyCopilotTurnException(failure);
-        dbg('continuation turn failed', turn.message.id, classified.detail);
-        await publishResponse(turn.message, {
-          text: classified.text,
-          model: null,
-          terminalError: terminalErrorRecord(turn.message, classified),
-        });
-        await settleSteeredRows(turn, null, null, classified).catch(() => {});
-        return;
-      }
-      await finishTurn(turn, '');
-    } catch (error) {
-      dbg('continuation publish failed', error?.message || String(error));
-    } finally {
-      controlPoller?.stop?.(turn.controlState);
-      turn.controlState = null;
-      releaseTurnOwnership(turn);
-      touch();
-      // A continuation spends real quota (the live capture burned a premium
-      // request on `read_bash` + the reply), so its numbers ride the same
-      // fire-and-forget ingest as a delivered turn's.
-      postTurnUsage();
-    }
-  }
+  // --------------------------------------------------------------- steering --
 
   /**
-   * Settle every queue row that was steered into this interaction.
+   * A delivery arrived while a turn was already running: push it into the
+   * same runtime interaction as a steer.
    *
-   * The runtime answers the original prompt AND every prompt queued behind it
-   * under ONE `session.idle` (live-verified — see the plan doc §5), so no
-   * second turn will ever settle these rows. Each one is answered with the text
-   * of ITS OWN prompt segment, which the normalizer separates using the
-   * `user.message` events that mark where the runtime picked each prompt up.
+   * `mode: "immediate"` makes it a real steer — injected at the next tool
+   * boundary (`delivery:"steering"`, folded into the running reply), or run
+   * as its own turn right after when the model is mid-stream
+   * (`delivery:"queued"`). Either way the row is owned by this turn and
+   * settled by it (see adoptSegment / finishTurn); nothing else will.
    *
-   * A row whose prompt the runtime accepted but never started work on has no
-   * segment. It is NOT requeued: the prompt is still sitting in the runtime's
-   * pending queue and will be answered at the start of the next turn, so
-   * redelivering it would run the same prompt twice. It gets a note instead —
-   * the same trade the Claude worker makes for a handed-off context.
-   */
-  async function settleSteeredRows(turn, result, responseModel, classified = null) {
-    if (!turn.steeredRows.length) return;
-    for (const steered of turn.steeredRows) {
-      const { message: steeredMessage, segmentIndex } = steered;
-      let text = String(turn.normalizer.segmentText(segmentIndex) || '').trim();
-      if (classified) {
-        text = classified.text;
-      } else if (!text) {
-        text = STEERED_ROW_MERGED_NOTE;
-      }
-      await publishFinalStream(steeredMessage, text);
-      await publishResponse(steeredMessage, {
-        text,
-        model: responseModel,
-        ...(classified ? { terminalError: terminalErrorRecord(steeredMessage, classified) } : {}),
-      });
-      steered.settle?.();
-    }
-    turn.steeredRows.length = 0;
-  }
-
-  /**
-   * A delivery arrived while a turn was already running.
-   *
-   * The relay's worker socket is single-flight — it will not deliver a second
-   * row until `onDeliver` resolves — so this is not the normal path. It is
-   * reachable on a socket reconnect that redelivers, and it is the path a
-   * future relay change would take, so it steers rather than corrupting the
-   * turn: the prompt is queued into the SAME interaction (which is all
-   * `mode: "enqueue"` can do — it cannot interrupt an in-flight model call),
-   * and the row is adopted so the interaction's terminator settles it too.
-   *
-   * The row is registered BEFORE the send so a failure between the two cannot
-   * leave a row nobody owns.
+   * The entry is registered BEFORE the send so a failure between the two
+   * cannot leave a row nobody owns.
    */
   async function steerIntoActiveTurn(turn, message) {
     const { prompt: body, attachments } = buildMessageOptionsImpl(message);
@@ -1969,61 +2709,242 @@ export function createCopilotSdkSessionRunner({
     const context = await buildRelayContextPrefix(message).catch(() => null);
     const prompt = withRelayContext(context?.prefix, body);
     // Re-checked AFTER the awaits and before anything is sent or registered.
-    // `settleSteeredRows` has already run if the turn settled during them, so a
-    // row pushed now would never be settled and its caller would wait forever —
-    // wedging the single-flight delivery socket. Nothing has been sent yet, so
-    // handing the row back to the normal path is free.
+    // Nothing has been sent yet, so handing the row back to the normal path is
+    // free.
     if (turn.settled) {
       dbg('turn settled while steering was preparing; running it as a fresh turn', message.id);
       return NOT_STEERED;
     }
-    // Prompts are consumed in the order they were sent, and each opens its own
-    // `user.message` segment as it is picked up, so this prompt's send position
-    // (after any prompts carried over from a previous interaction, and after
-    // whatever the interaction itself occupies) is its segment index.
-    const segmentIndex = turn.nextSegmentIndex;
-    turn.nextSegmentIndex += 1;
-    turn.promptsSent += 1;
-    const steered = { message, segmentIndex };
-    steered.done = new Promise((resolve) => { steered.settle = resolve; });
-    turn.steeredRows.push(steered);
-    dbg('steering a mid-turn delivery into the running turn', message.id, `segment=${segmentIndex}`);
+    const entry = createEntry(turn, message, 'steer');
+    dbg('steering a mid-turn delivery into the running turn', message.id);
+    let runtimeId;
     try {
-      await session.send({
+      runtimeId = await session.send({
         prompt,
         ...(attachments?.length ? { attachments } : {}),
-        mode: 'enqueue',
+        mode: 'immediate',
         agentMode: copilotAgentModeForRelayMode(message?.relayMode || 'agent'),
       });
     } catch (error) {
       // The prompt never reached the runtime, so nothing will answer it and the
       // row is safe to requeue — unlike an accepted one.
-      turn.steeredRows = turn.steeredRows.filter((entry) => entry !== steered);
+      turn.entries = turn.entries.filter((other) => other !== entry);
+      entry.settled = true;
+      entry.released = true;
+      entry.resolveDone(true);
       dbg('steering send failed, requeuing the row', message.id, error?.message || String(error));
       await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
       return true;
     }
+    assignRuntimeId(turn, entry, runtimeId);
     // Same commit-after-send rule as `runTurn` (audit #32): a steered prompt
     // whose send failed never delivered its guidance, so the retry must
     // include it again.
     context?.commit();
-    // Resolves when the interaction settles this row in `settleSteeredRows`.
-    await steered.done;
+    scheduleQueueLaneRefresh();
+    // Resolves when the interaction settles this row.
+    await awaitEntry(turn, entry);
+    return true;
+  }
+
+  // ------------------------------------------------------------------ gate --
+
+  /**
+   * Whether a message delivered now would steer into the live turn. False
+   * while: no session / no live turn; the turn-opening prompt has not been
+   * sent yet (the delivery hold — a second send before the first would invert
+   * the runs); a question card, ask-mode approval or elicitation is open (the
+   * relay must not push past a card); a compaction is running.
+   */
+  function canAcceptSteering() {
+    if (disposed || !session) return false;
+    const turn = activeTurn;
+    if (!turn || turn.settled || turn.aborted) return false;
+    if (!turn.primarySent) return false;
+    if (pendingHumanRequests > 0) return false;
+    if (isCompacting()) return false;
+    return true;
+  }
+
+  /**
+   * The one steering gate. A delivery arriving now is held — handed back to
+   * the queue instead of pushed — when a turn is live (or a human request /
+   * compaction is open) and it cannot accept a steer. The socket link consults
+   * this for its readiness too, idle or mid-delivery.
+   */
+  function isDeliveryHeld() {
+    if (disposed) return false;
+    const turn = activeTurn;
+    const live = Boolean(turn && !turn.settled);
+    if (!live && pendingHumanRequests === 0 && !isCompacting()) return false;
+    return !canAcceptSteering();
+  }
+
+  function syncDeliveryReadiness() {
+    const ready = !isDeliveryHeld();
+    if (ready === lastReportedDeliveryReady) return;
+    lastReportedDeliveryReady = ready;
+    try {
+      onDeliveryReadinessChange(ready);
+    } catch (error) {
+      dbg('delivery readiness listener failed', error?.message || String(error));
+    }
+  }
+
+  /**
+   * Give a held delivery back to the queue with no retry penalty. The relay
+   * re-delivers it once this worker signals ready again, i.e. when the hold
+   * ends — the message then steers into the resumed turn. Pushing it into the
+   * hold instead would bypass the question card or land inside a compaction.
+   */
+  async function handBackHeldDelivery(message) {
+    dbg('steering held; handing the delivery back to the queue', message.id || '(no id)');
+    if (!message.id) return false;
+    await api('POST', '/api/requeue', {
+      messageId: message.id,
+      class: 'steering-held',
+      ...attemptFields(message),
+    }).catch((error) => {
+      if (isStaleAttemptError(error)) {
+        dbg('steering-held hand-back refused as stale_attempt', message.id);
+        return;
+      }
+      dbg('steering-held hand-back failed', message.id, error?.message || String(error));
+    });
+    return false;
+  }
+
+  function* ownedEntries() {
+    if (activeTurn) yield* activeTurn.entries;
+    for (const turn of publishingTurns) yield* turn.entries;
+  }
+
+  /** Pushed rows the client may still cancel: unconsumed, in the runtime's queued lane. */
+  function cancellableIds() {
+    const ids = [];
+    for (const entry of ownedEntries()) {
+      if (entry.role !== 'steer' || entry.consumed || entry.settled) continue;
+      if (!entry.runtimeId || !queuedLane.has(entry.runtimeId)) continue;
+      const id = String(entry.message?.id || '').trim();
+      if (id && !ids.includes(id)) ids.push(id);
+    }
+    return ids;
+  }
+
+  /**
+   * Composer-facing steering snapshot, published on the heartbeat: whether a
+   * turn is live, whether a message typed now would steer into it, and — when
+   * it would not — why. `supported` is how the client learns this Copilot
+   * conversation steers at all (its provider type alone cannot tell an SDK
+   * worker from the extension engine); `cancellableIds` are the pushed rows
+   * that may still be pulled back out of the runtime (decision 8).
+   */
+  function steeringState() {
+    const turn = activeTurn;
+    const turnActive = Boolean(turn && !turn.settled);
+    const canSteer = canAcceptSteering();
+    let holdReason = null;
+    if (turnActive && !canSteer) {
+      if (pendingHumanRequests > 0) holdReason = 'question';
+      else if (isCompacting()) holdReason = 'compaction';
+      else if (!turn.primarySent) holdReason = 'delivery';
+      else holdReason = 'other';
+    }
+    const messageId = String(turn?.currentOwner?.message?.id || turn?.message?.id || '').trim() || null;
+    return { turnActive, canSteer, holdReason, messageId, supported: true, cancellableIds: cancellableIds() };
+  }
+
+  /**
+   * Un-steer (decision 8): pull a pushed-but-unconsumed row back out of the
+   * runtime's queued lane and cancel it. A prompt the runtime already took
+   * (`consumed`) cannot be recalled; the control is then a no-op and the row
+   * settles through its normal path.
+   */
+  async function cancelPushedMessage(messageId) {
+    const id = String(messageId || '').trim();
+    if (!id) return false;
+    let entry = null;
+    for (const candidate of ownedEntries()) {
+      if (String(candidate.message?.id || '') === id) { entry = candidate; break; }
+    }
+    if (!entry || entry.consumed || entry.settled || !entry.runtimeId) {
+      dbg('un-steer refused: row not cancellable', id, entry ? `consumed=${entry.consumed} settled=${entry.settled}` : 'unknown row');
+      return false;
+    }
+    if (!session || !sessionRpc.queue) return false;
+    await refreshQueueLane();
+    const itemId = queuedLane.get(entry.runtimeId);
+    if (!itemId) {
+      dbg('un-steer refused: prompt no longer in the queued lane', id);
+      return false;
+    }
+    let removed = false;
+    try {
+      removed = (await session.rpc.queue.removeAt({ id: itemId }))?.removed === true;
+    } catch (error) {
+      dbg('queue.removeAt failed', id, error?.message || String(error));
+    }
+    if (!removed) return false;
+    entry.cancelled = true;
+    entry.settled = true;
+    dbg('un-steered a pushed prompt', id);
+    // The prompt is gone from the runtime; the row must end cancelled and
+    // never be re-delivered. It stays owned (settling, with the terminal
+    // wording the crash guard would send) until the relay acknowledges the
+    // cancel; if the relay never does, the heartbeat hands it over to fail.
+    claimSettling(entry.message, 'cancelled');
+    const cancelBody = {
+      conversationId: entry.message.conversationId,
+      messageId: id,
+      ...attemptFields(entry.message),
+    };
+    let acknowledged = false;
+    for (let attempt = 0; ; attempt += 1) {
+      acknowledged = await api('POST', '/api/queue-cancelled', cancelBody).then(() => true, (error) => {
+        dbg('queue-cancelled publish failed', id, error?.message || String(error));
+        // The row already left `processing` (answered, recovered, or already
+        // cancelled): nothing left for this worker to do.
+        return Number(error?.status) === 404 || Number(error?.status) === 409;
+      });
+      if (acknowledged || attempt >= settleRetryDelaysMs.length) break;
+      await sleep(settleRetryDelaysMs[attempt]);
+    }
+    if (!acknowledged) {
+      dbg('queue-cancelled could not be posted; handing the row to the heartbeat', id);
+      settleFailedTerminals.set(id, buildSteerSettleFailure(entry.message, { variant: 'cancelled', agentLabel: SETTLE_AGENT_LABEL }));
+    }
+    releaseSettling(id);
+    entry.released = true;
+    entry.resolveDone(true);
+    const turn = entry.turn;
+    if (turn) {
+      turn.entries = turn.entries.filter((other) => other !== entry);
+      turn.pushed.delete(entry.runtimeId);
+    }
+    scheduleQueueLaneRefresh();
     return true;
   }
 
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
+    // Held (a card is open, a compaction is running, the turn-opening prompt
+    // is not sent yet): hand the row back with no retry penalty; the relay
+    // re-delivers it when the hold ends. An older relay (the worker updated on
+    // disk before the relay restarted) treats the hand-back as a failed
+    // delivery — retry, backoff, worker marked errored — so against one the
+    // message is pushed the legacy way.
+    if (isDeliveryHeld() && canHandBackHeldDelivery() !== false) return handBackHeldDelivery(message);
+    // Legacy path only: never send a second prompt before the turn-opening one
+    // (it would invert the runs), and never start a second turn beside one
+    // that is still connecting.
+    if (activeTurn && !activeTurn.settled && !activeTurn.primarySent) {
+      await activeTurn.primaryReady;
+    }
     // A delivery that lands while a turn is running is steered into it rather
     // than starting a second one: the runtime has a single conversation and a
     // concurrent `send` would interleave into the same interaction anyway —
     // this way the row is owned and settled instead of orphaned.
-    //
-    // Deliberately OUTSIDE the try/finally below: that `finally` clears
-    // `activeTurn`, and a steered call returns while the turn it was steered
-    // into is still publishing. Clearing there would tell the heartbeat this
-    // worker owns nothing and the relay would recover the live row.
     if (activeTurn && !activeTurn.settled && session) {
       const turn = activeTurn;
       try {
@@ -2040,75 +2961,30 @@ export function createCopilotSdkSessionRunner({
         return true;
       }
     }
-    // Created here rather than inside `runTurn` so the catch and finally below
-    // act on THIS turn by identity: under split ownership, `activeTurn` may
-    // already belong to a newer turn (a continuation the runtime opened while
-    // this one was publishing) by the time they run.
     const turn = createTurn(message);
-    try {
-      return await runTurn(turn);
-    } catch (error) {
-      const classified = classifyCopilotTurnException(error);
-      dbg('copilot turn failed', message.id, classified.detail);
-      // A failure that killed the session (or came from starting it) leaves a
-      // handle nothing else can use; drop it so the next delivery rebuilds and
-      // resumes rather than sending into a dead runtime. An UNCONFIRMED MODEL
-      // SWITCH is the exception: the session is healthy and merely still on
-      // its previous model, and tearing the runtime down over it would kill
-      // any live detached shells for a selection problem the user fixes by
-      // picking another model.
-      if (!isModelSwitchUnconfirmedError(error)) {
-        await stopRuntime('turn-failure').catch(() => {});
-      }
-      await publishResponse(message, {
-        text: classified.text,
-        model: null,
-        terminalError: terminalErrorRecord(message, classified),
-      });
-      // Rows steered into the turn that just threw are owed a response too —
-      // and, more urgently, `steerIntoActiveTurn` is still awaiting their
-      // settle. Skipping this would wedge that caller (and its queue row)
-      // forever behind a heartbeat that keeps renewing the lease.
-      await settleSteeredRows(turn, null, null, classified).catch(() => {});
-      await closeStraySubagentRuns(turn).catch(() => {});
-      return true;
-    } finally {
-      // Released only once every publish for this row has landed. A heartbeat
-      // that fired during the publish window with the row unowned would tell
-      // the relay this worker owns nothing, and the still-processing row would
-      // be recovered (`owner-heartbeat-idle`) and re-delivered — a duplicate
-      // execution racing the response that was already on its way.
-      releaseTurnOwnership(turn);
-      touch();
-      // Every path through the turn — published, failed, aborted, threw — has
-      // finished by here, which is the only safe place for the ingest: it is
-      // advisory, it is not awaited, and it must never be able to delay a reply
-      // that is already written.
-      postTurnUsage();
-    }
+    return runTurn(turn);
   }
 
   // --------------------------------------------------------------- teardown --
 
   function getActiveQueueMessageId() {
-    if (activeTurn) return String(activeTurn.message?.id || '');
-    // A settled turn still publishing owns its row every bit as much: the
-    // heartbeat's owner-recovery guard must keep seeing it until the publish
-    // lands, or the relay recovers the row underneath the response in flight.
-    for (const turn of publishingTurns) {
-      const id = String(turn.message?.id || '');
-      if (id) return id;
+    const live = activeTurn?.currentOwner;
+    if (live && !live.released && live.message?.id) return String(live.message.id);
+    for (const entry of ownedEntries()) {
+      const id = String(entry.message?.id || '');
+      if (id && !entry.released) return id;
     }
     return '';
   }
 
   /**
-   * Every row this worker owns — the running turn's own plus any steered into
-   * it, and the same for every settled turn still publishing — as
-   * `{ id, attemptId }` entries. A steered row missing from it would be
-   * recovered mid-flight as `owner-heartbeat-mismatch` and re-delivered while
-   * the runtime was still answering it; a publishing row missing from it would
-   * be recovered as `owner-heartbeat-idle` while its response was on the wire.
+   * Every row this worker owns — the running turn's rows and the same for
+   * every settled turn still publishing — as `{ id, attemptId }` entries; a
+   * consumed row whose settle marker is still being saved carries the
+   * terminal failure the crash guard must send instead of a requeue, because
+   * its prompt must never run twice. A row missing from this list would be
+   * recovered mid-flight and re-delivered while the runtime was still
+   * answering it.
    *
    * Both the heartbeat (lease renewal) and the crash guard (requeue-on-exit)
    * read this: the crash guard takes the entries whole so its requeues stay
@@ -2117,24 +2993,36 @@ export function createCopilotSdkSessionRunner({
    */
   function getActiveQueueMessageIds() {
     const entries = [];
-    const push = (message) => {
-      const id = String(message?.id || '');
-      if (!id || entries.some((entry) => entry.id === id)) return;
-      entries.push({ id, attemptId: message?.attemptId || null });
+    const byId = new Map();
+    const push = (message, terminalError = null) => {
+      const id = String(message?.id || '').trim();
+      if (!id) return;
+      const existing = byId.get(id);
+      if (existing) {
+        if (terminalError && !existing.terminalError) existing.terminalError = terminalError;
+        return;
+      }
+      const entry = { id, attemptId: message?.attemptId || null, ...(terminalError ? { terminalError } : {}) };
+      byId.set(id, entry);
+      entries.push(entry);
     };
-    const collect = (turn) => {
-      if (!turn) return;
-      push(turn.message);
-      for (const steered of turn.steeredRows || []) push(steered.message);
-    };
-    collect(activeTurn);
-    for (const turn of publishingTurns) collect(turn);
+    for (const entry of ownedEntries()) {
+      if (entry.released) continue;
+      push(entry.message);
+    }
+    for (const { message, variant } of settlingMessages.values()) {
+      push(message, buildSteerSettleFailure(message, { variant, agentLabel: SETTLE_AGENT_LABEL }));
+    }
     return entries;
   }
 
   async function dispose() {
     disposed = true;
     stopLifecycleTimer();
+    if (queueLaneTimer) {
+      clearTimeout(queueLaneTimer);
+      queueLaneTimer = null;
+    }
     // A question card left `pending` would sit in the UI inviting an answer
     // that nothing is left to read. Time them out before the socket goes.
     await questionBridge.cancelPendingQuestions?.().catch?.(() => {});
@@ -2145,6 +3033,14 @@ export function createCopilotSdkSessionRunner({
     handlePendingPayload,
     getActiveQueueMessageId,
     getActiveQueueMessageIds,
+    // The delivery gate (the socket link's probes) and the composer snapshot
+    // (the heartbeat's).
+    canAcceptSteering,
+    isDeliveryHeld,
+    steeringState,
+    getSettleFailed,
+    acknowledgeSettleFailed,
+    cancelPushedMessage,
     // "Active" spans both ownerships: a settled turn still publishing must
     // keep the worker's idle/shutdown gates closed just like a running one.
     isTurnActive: () => !!activeTurn || publishingTurns.size > 0,
@@ -2157,6 +3053,8 @@ export function createCopilotSdkSessionRunner({
     whenUsagePosted: () => usagePostChain,
     // The in-flight model-catalog snapshot POST — the same kind of seam.
     whenModelSnapshotPosted: () => modelSnapshotChain,
+    // The in-flight queued-lane read — same kind of seam.
+    whenQueueLaneRefreshed: () => queueLaneRefreshChain,
     // Test seams / observability.
     _getState: () => ({
       hasClient: !!client,
@@ -2172,6 +3070,20 @@ export function createCopilotSdkSessionRunner({
       publishingTurnCount: publishingTurns.size,
       backgroundShells: backgroundShells.live(),
       continuationDueSince,
+      compacting: isCompacting(),
+      pendingHumanRequests,
+      sessionRpc: { ...sessionRpc },
+      activeEntries: activeTurn
+        ? activeTurn.entries.map((entry) => ({
+            id: entry.message?.id || null,
+            role: entry.role,
+            runtimeId: entry.runtimeId,
+            consumed: entry.consumed,
+            delivery: entry.delivery,
+            settled: entry.settled,
+            foldedInto: entry.foldedInto?.message?.id || null,
+          }))
+        : [],
     }),
     _evaluateLifecycle: evaluateLifecycle,
   };

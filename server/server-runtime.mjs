@@ -25,7 +25,7 @@ import {
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
-import { buildSteerSettleFailure } from '../shared/steer-settle-failure.mjs';
+import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
 import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { applySchema } from './db-schema.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
@@ -4987,11 +4987,13 @@ function failRecoveredRowTerminally(row, reason, { failureRecord = null, failure
   console.warn(`${runtimeLogPrefix()}${failureRecord ? 'CONSUMED FAILED' : 'RECOVERY LIMIT'} ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
 }
 
-// A row whose prompt the Claude CLI already consumed (queue.consumed_at) is
-// at-most-once: recovery must never requeue it — a re-delivery would run the
-// prompt twice — so it fails terminally with the steer-settle wording.
+// A row whose prompt the worker's runtime already consumed (queue.consumed_at)
+// is at-most-once: recovery must never requeue it — a re-delivery would run the
+// prompt twice — so it fails terminally with the steer-settle wording, naming
+// the provider's runtime the way the workers' own settle wording does.
 function failConsumedRowTerminally(row, reason) {
-  const failureRecord = buildSteerSettleFailure(row);
+  const providerType = stmts.getRuntimeSessionByConversation?.get?.(row?.conversation_id)?.provider_type;
+  const failureRecord = buildSteerSettleFailure(row, { agentLabel: steerAgentLabelForProvider(providerType) });
   failRecoveredRowTerminally(row, reason, {
     failureRecord: { ...failureRecord, error: 'terminal-error', reason: String(reason || 'recovery') },
     failureText: `${failureRecord.message} Error code: ${failureRecord.stableCode}. ${failureRecord.guidance}`,

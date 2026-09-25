@@ -23,6 +23,7 @@
 // question array. Composing the waiter instead of copying it keeps one
 // implementation of the abort semantics.
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { looksLikeMultiSelectQuestion } from '../../shared/question-multi-select.mjs';
 import {
   DEFAULT_QUESTION_TIMEOUT_MS,
   QUESTION_TIMEOUT_CONTINUATION_TEXT,
@@ -223,13 +224,22 @@ export function createCopilotQuestionBridge({
     // `allowFreeform` is only meaningful alongside choices; with none, the card
     // must accept free text or it cannot be answered.
     const allowFreeform = choices.length ? request?.allowFreeform !== false : true;
+    // Copilot's `ask_user` has no multi-select flag (unlike Claude's
+    // AskUserQuestion), so "select all that apply" questions arrive as plain
+    // choice lists. The card offers checkmarks when the wording says several
+    // may be picked; the answer comes back as the labels joined with ", ",
+    // which the runtime accepts as a freeform reply.
+    const multiSelect = looksLikeMultiSelectQuestion(question, choices);
     const result = await ask({
       prompt: question || 'Copilot asked for input to continue this turn.',
       choices,
       allowFreeform,
       source: 'onUserInputRequest',
       rationale: 'Copilot requested clarification to continue this turn.',
-      extra: { requestId: String(request?.requestId || '') || undefined },
+      extra: {
+        requestId: String(request?.requestId || '') || undefined,
+        ...(multiSelect ? { multiSelect: true } : {}),
+      },
     }, { signal });
     const answer = String(result?.answer ?? '');
     return {

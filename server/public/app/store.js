@@ -911,6 +911,14 @@ function normalizeWorkerStateEntry(worker) {
           // The turn the snapshot describes — lets the composer drop a hold
           // that belongs to a previous turn (the heartbeat lags ~10s).
           messageId: String(rawSteering.messageId || '').trim() || null,
+          // The worker advertises mid-turn steering itself (the Copilot SDK
+          // worker); the composer gate is provider rule OR this flag.
+          supported: rawSteering.supported === true,
+          // Pushed-but-unconsumed rows the worker can still pull back out of
+          // its runtime: their bubbles keep Cancel while listed here.
+          cancellableIds: Array.isArray(rawSteering.cancellableIds)
+            ? rawSteering.cancellableIds.map((id) => String(id || '').trim()).filter(Boolean)
+            : [],
         }
       : null,
   };
@@ -920,7 +928,7 @@ function buildSessionWorkerStateHash(map) {
   const parts = [];
   for (const [sid, state] of map.entries()) {
     const steering = state.steering
-      ? `${state.steering.turnActive ? 1 : 0}${state.steering.canSteer ? 1 : 0}${state.steering.holdReason || ''}:${state.steering.messageId || ''}`
+      ? `${state.steering.turnActive ? 1 : 0}${state.steering.canSteer ? 1 : 0}${state.steering.supported ? 1 : 0}${state.steering.holdReason || ''}:${state.steering.messageId || ''}:${state.steering.cancellableIds.join(',')}`
       : '';
     parts.push(`${sid}:${state.status}:${state.uiState || ''}:${state.derivedUiState || ''}:${state.workerId || ''}:${state.pid || ''}:${state.updatedAt || ''}:${steering}`);
   }

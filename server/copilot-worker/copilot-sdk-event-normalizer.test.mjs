@@ -317,6 +317,49 @@ test('with steering, the task summary answers only the last prompt segment', () 
   assert.deepEqual(terminal(actions).segmentTexts, ['first answer', 'second answer via summary']);
 });
 
+test('assistant.idle terminates the turn; the deferred session.idle that follows is a no-op', () => {
+  // The main loop is done while a background agent keeps `session.idle`
+  // deferred (runtime 1.0.88). The row must settle on the assistant-level
+  // idle, and the session-level one arriving minutes later must not produce
+  // a second result.
+  const { actions, normalizer } = run([
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: 'spawned it' } },
+    { type: 'assistant.idle', data: {} },
+  ]);
+  assert.equal(terminal(actions).text, 'spawned it');
+  assert.equal(terminal(actions).subtype, 'completed');
+  assert.deepEqual(channels(normalizer.normalize({ type: 'session.idle', data: {} })), []);
+});
+
+test('an aborted assistant.idle carries the abort like session.idle does', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    { type: 'assistant.message', data: { messageId: 'm-1', content: 'half' } },
+    { type: 'abort', data: { reason: 'user_abort' } },
+    { type: 'assistant.idle', data: { aborted: true } },
+  ]);
+  assert.equal(terminal(actions).aborted, true);
+  assert.equal(terminal(actions).subtype, 'aborted');
+});
+
+test('compaction start and completion become activity lines', () => {
+  const start = createCopilotEventNormalizer().normalize({ type: 'session.compaction_start', data: { trigger: 'threshold' } });
+  assert.deepEqual(start.map((a) => [a.channel, a.payload.text]), [['activity', 'Compacting the conversation context…']]);
+  const done = createCopilotEventNormalizer().normalize({
+    type: 'session.compaction_complete',
+    data: { success: true, messagesRemoved: 7, tokensRemoved: 12_400 },
+  });
+  assert.deepEqual(done.map((a) => a.payload.text), ['Context compacted (removed 7 messages, 12k tokens)']);
+  const bare = createCopilotEventNormalizer().normalize({ type: 'session.compaction_complete', data: { success: true } });
+  assert.deepEqual(bare.map((a) => a.payload.text), ['Context compacted']);
+  const failed = createCopilotEventNormalizer().normalize({
+    type: 'session.compaction_complete',
+    data: { success: false, error: 'HTTP 500 from the summarizer' },
+  });
+  assert.deepEqual(failed.map((a) => a.payload.text), ['Context compaction failed: HTTP 500 from the summarizer']);
+});
+
 test('prompt segments split the interaction on user.message boundaries', () => {
   // A steered prompt is answered inside the SAME interaction, so the only way
   // to give its queue row its own reply is to split on the boundaries the

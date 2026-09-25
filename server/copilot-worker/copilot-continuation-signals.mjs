@@ -118,7 +118,17 @@ export const CONTINUATION_OPENING_EVENT_TYPES = Object.freeze([
 
 const OPENING_TYPES = new Set(CONTINUATION_OPENING_EVENT_TYPES);
 
+/**
+ * Only ROOT-agent events open a turn. A background subagent keeps emitting
+ * `agentId`-tagged `tool.execution_start` / `assistant.message` / its own
+ * `user.message` after the turn that spawned it has settled (live-probed on
+ * runtime 1.0.88: the subagent's whole life happens under the main loop's
+ * idle), and none of that is the main agent starting work. The root agent's
+ * follow-up when the subagent finishes (`read_agent` + a reply) carries no
+ * `agentId` and opens the continuation as before.
+ */
 export function isContinuationOpeningEvent(event) {
+  if (String(event?.agentId || '').trim()) return false;
   return OPENING_TYPES.has(String(event?.type || ''));
 }
 

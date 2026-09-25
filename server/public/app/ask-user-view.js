@@ -10,11 +10,15 @@ import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion, answe
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
+import { composeMultiSelectAnswer, isMultiSelectQuestion } from './question-multi-select.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
 
 let relayQuestionRenderHash = '';
 let renderedRelayQuestionIds = new Set();
 const relayQuestionStructuredDrafts = new Map();
+// Ticked choices of a multi-select card (question id → Set of labels), kept
+// across re-renders until the card is answered.
+const relayQuestionMultiDrafts = new Map();
 const RELAY_QUESTION_AUTO_SCROLL_THRESHOLD_PX = 80;
 
 function distanceFromBottom(el) {
@@ -215,6 +219,7 @@ export function renderRelayQuestions() {
       answeredAt: q.answeredAt || '',
       createdAt: q.createdAt || '',
       choices: Array.isArray(q.choices) ? q.choices : [],
+      multiSelect: isMultiSelectQuestion(q),
       schema: q.requestSchema || null,
     }))
   );
@@ -252,21 +257,33 @@ export function renderRelayQuestions() {
       interactiveHtml = renderMultiFieldForm(question);
     } else {
       const choices = Array.isArray(question.choices) ? question.choices : [];
-      const choiceHtml = choices.length
-        ? (question.status === 'pending'
-            ? `<div class="relay-question-choices">${
-                choices.map((choice) => `<button class="relay-question-choice" data-choice="${escHtml(choice)}" data-relay-focus-key="choice-${escHtml(choice)}" onclick="submitRelayQuestionChoice('${question.id}', this.dataset.choice)">${escHtml(choice)}</button>`).join('')
-              }</div>`
-            : `<div class="relay-question-choices">${
-                choices.map((choice) => `<button class="relay-question-choice" disabled>${escHtml(choice)}</button>`).join('')
-              }</div>`)
-        : '';
+      // A multi-select card (the provider said several may be picked) offers
+      // checkmarks and ONE Reply; ticking never answers by itself.
+      const multiSelect = isMultiSelectQuestion(question);
+      const ticked = relayQuestionMultiDrafts.get(question.id) || new Set();
+      let choiceHtml = '';
+      if (choices.length && question.status === 'pending' && multiSelect) {
+        choiceHtml = `<div class="relay-question-choices relay-question-multi" id="relay-question-multi-${question.id}">${
+          choices.map((choice) => `<label class="relay-question-choice relay-question-choice-check"><input type="checkbox" data-choice-value="${escHtml(choice)}" data-relay-focus-key="multi-${escHtml(choice)}"${ticked.has(choice) ? ' checked' : ''} onchange="onRelayQuestionMultiSelectChange('${question.id}', this.dataset.choiceValue, this.checked)"> ${escHtml(choice)}</label>`).join('')
+        }</div>`;
+      } else if (choices.length && question.status === 'pending') {
+        choiceHtml = `<div class="relay-question-choices">${
+          choices.map((choice) => `<button class="relay-question-choice" data-choice="${escHtml(choice)}" data-relay-focus-key="choice-${escHtml(choice)}" onclick="submitRelayQuestionChoice('${question.id}', this.dataset.choice)">${escHtml(choice)}</button>`).join('')
+        }</div>`;
+      } else if (choices.length) {
+        choiceHtml = `<div class="relay-question-choices">${
+          choices.map((choice) => `<button class="relay-question-choice" disabled>${escHtml(choice)}</button>`).join('')
+        }</div>`;
+      }
       const showReplyControls = question.status === 'pending';
       const draftText = String(relayQuestionDrafts.get(question.id) || '');
+      const replyPlaceholder = multiSelect
+        ? 'Add another answer or a note (optional)… (Ctrl/Cmd+Enter to send)'
+        : 'Type a reply… (Ctrl/Cmd+Enter to send)';
       const replyHtml = showReplyControls
         ? `<div class="relay-question-reply">
-            <textarea id="relay-question-input-${question.id}" placeholder="Type a reply… (Ctrl/Cmd+Enter to send)" onkeydown="handleRelayQuestionKey(event, '${question.id}')" oninput="onRelayQuestionDraftInput('${question.id}', this.value)">${escHtml(draftText)}</textarea>
-            <button class="relay-question-submit" onclick="submitRelayQuestionAnswer('${question.id}')">Reply</button>
+            <textarea id="relay-question-input-${question.id}" placeholder="${replyPlaceholder}" onkeydown="handleRelayQuestionKey(event, '${question.id}')" oninput="onRelayQuestionDraftInput('${question.id}', this.value)">${escHtml(draftText)}</textarea>
+            <button class="relay-question-submit" onclick="${multiSelect ? 'submitRelayQuestionMultiSelect' : 'submitRelayQuestionAnswer'}('${question.id}')">${multiSelect ? 'Reply with selection' : 'Reply'}</button>
           </div>`
         : '';
       interactiveHtml = `${choiceHtml}${replyHtml}`;
@@ -484,6 +501,33 @@ export async function submitRelayQuestionChoice(questionId, choice) {
   await submitRelayQuestionAnswer(questionId, choice);
 }
 
+/** Ticked labels of a multi-select card, in the card's own order. */
+function tickedMultiSelectLabels(questionId) {
+  const container = document.getElementById(`relay-question-multi-${questionId}`);
+  if (!container) return [...(relayQuestionMultiDrafts.get(questionId) || [])];
+  return Array.from(container.querySelectorAll('input[type="checkbox"]:checked'))
+    .map((el) => String(el.getAttribute('data-choice-value') || ''));
+}
+
+export function onRelayQuestionMultiSelectChange(questionId, label, checked) {
+  const id = String(questionId || '');
+  const set = relayQuestionMultiDrafts.get(id) || new Set();
+  if (checked) set.add(String(label || ''));
+  else set.delete(String(label || ''));
+  relayQuestionMultiDrafts.set(id, set);
+}
+
+/**
+ * Answer a multi-select card: every ticked choice, plus whatever was typed as
+ * an extra answer, joined the way the provider's own UI would ("A, C").
+ */
+export async function submitRelayQuestionMultiSelect(questionId) {
+  const input = document.getElementById(`relay-question-input-${questionId}`);
+  const answer = composeMultiSelectAnswer(tickedMultiSelectLabels(questionId), input?.value || '');
+  if (!answer) return;
+  await submitRelayQuestionAnswer(questionId, answer);
+}
+
 // Offline fallback: park the answer in the durable outbox so Background Sync
 // (or the next page load) delivers it. A replay against an already-answered
 // or expired question gets a 4xx and is dropped, so this cannot double-answer.
@@ -503,7 +547,12 @@ async function enqueueRelayAnswerForSync(questionId, body) {
 
 export async function submitRelayQuestionAnswer(questionId, presetAnswer = null) {
   const input = document.getElementById(`relay-question-input-${questionId}`);
-  const answer = String(presetAnswer != null ? presetAnswer : (input?.value || '')).trim();
+  // Ctrl/Cmd+Enter in a multi-select card's text field sends the ticked
+  // choices along with the typed text, exactly like its Reply button.
+  const composed = presetAnswer == null && isMultiSelectQuestion(relayQuestions.get(questionId) || null)
+    ? composeMultiSelectAnswer(tickedMultiSelectLabels(questionId), input?.value || '')
+    : null;
+  const answer = String(presetAnswer != null ? presetAnswer : (composed ?? (input?.value || ''))).trim();
   if (!answer) return;
 
   const card = document.querySelector(`.relay-question-container[data-question-id="${questionId}"]`);
@@ -526,6 +575,7 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
     }
     relayQuestionDrafts.delete(questionId);
     relayQuestionStructuredDrafts.delete(questionId);
+    relayQuestionMultiDrafts.delete(questionId);
     relayQuestions.set(questionId, r.question);
     updatePendingQuestionBanner();
     window.renderConvList?.();

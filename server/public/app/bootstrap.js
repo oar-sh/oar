@@ -88,7 +88,7 @@ import {
   loadRelayQuestions,
   getPendingQuestionCountsByConversation,
 } from './ask-user-view.js';
-import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayStructuredAnswer, onRelayQuestionDraftInput, handleRelayQuestionKey } from './ask-user-view.js';
+import { openPendingQuestionFromBanner, submitRelayQuestionChoice, submitRelayQuestionAnswer, submitRelayQuestionMultiSelect, submitRelayStructuredAnswer, onRelayQuestionDraftInput, onRelayQuestionMultiSelectChange, handleRelayQuestionKey } from './ask-user-view.js';
 import { loadRelayBoards, submitRelayBoardAction } from './relay-board-view.js';
 import {
   restoreInFlightThinking,
@@ -101,6 +101,7 @@ import {
   getConversationLoadedMessageCount,
   loadOlderConversationMessages,
   syncComposerButtonState,
+  syncCancellableSteerButtons,
   syncComposerAfterUserEdit,
   isConversationDraftHeldBySend,
   persistComposerAttachments,
@@ -3244,8 +3245,9 @@ async function refreshSessionWorkerStatus() {
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();
     // A worker steering snapshot may have changed; the composer's Steer
-    // button disable state derives from it.
+    // button (gate, hold) and the pushed rows' Cancel controls derive from it.
     syncComposerButtonState();
+    syncCancellableSteerButtons();
   }
   updateCliStatus();
   const nextWorkerState = currentSdkSessionId ? getSessionWorkerState(currentSdkSessionId) : null;
@@ -4379,8 +4381,10 @@ window.confirmRepoBrowserCwdPick = confirmRepoBrowserCwdPick;
 window.toggleEmojiPicker = toggleEmojiPicker;
 window.submitRelayQuestionChoice = submitRelayQuestionChoice;
 window.submitRelayQuestionAnswer = submitRelayQuestionAnswer;
+window.submitRelayQuestionMultiSelect = submitRelayQuestionMultiSelect;
 window.submitRelayStructuredAnswer = submitRelayStructuredAnswer;
 window.onRelayQuestionDraftInput = onRelayQuestionDraftInput;
+window.onRelayQuestionMultiSelectChange = onRelayQuestionMultiSelectChange;
 window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.submitRelayBoardAction = submitRelayBoardAction;

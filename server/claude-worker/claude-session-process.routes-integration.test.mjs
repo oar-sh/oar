@@ -726,7 +726,7 @@ test('a steer-settle failure fails the row terminally with the resend-only-if-un
     messageId: delivered.id,
     conversationId: CONV,
     text: STEER_SETTLE_FAILED_TEXT,
-    terminalError: buildSteerSettleFailure(delivered),
+    terminalError: buildSteerSettleFailure(delivered, { agentLabel: 'Claude' }),
     attemptId: delivered.attemptId,
   });
 

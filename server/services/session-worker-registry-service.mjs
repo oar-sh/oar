@@ -61,6 +61,26 @@ function normalizeStatus(value) {
 }
 
 const STEERING_HOLD_REASONS = new Set(['question', 'compaction', 'adoption', 'delivery', 'other']);
+const STEERING_MESSAGE_ID_MAX_LENGTH = 64;
+const STEERING_CANCELLABLE_IDS_MAX = 50;
+
+// Queue message ids the worker still holds pushed-but-unconsumed (the Copilot
+// SDK's queued lane): trimmed strings only, deduped, capped — a worker cannot
+// grow the status payload without bound.
+function normalizeSteeringCancellableIds(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const ids = [];
+  for (const value of raw) {
+    if (typeof value !== 'string') continue;
+    const id = value.trim();
+    if (!id || id.length > STEERING_MESSAGE_ID_MAX_LENGTH || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= STEERING_CANCELLABLE_IDS_MAX) break;
+  }
+  return ids;
+}
 
 // The worker's composer-facing steering snapshot, published on its heartbeat.
 // Callers follow the registry convention of spreading the existing entry into
@@ -68,15 +88,23 @@ const STEERING_HOLD_REASONS = new Set(['question', 'compaction', 'adoption', 'de
 // Exported so the heartbeat route compares apples to apples: normalizing there
 // with different rules would make an unknown holdReason never converge and
 // re-upsert on every heartbeat.
+//
+// `supported` is the worker's opt-in to mid-turn steering (the client's
+// composer gate — a worker that never sets it keeps "Queue"); the Claude
+// worker's older 4-field snapshot normalizes to supported=false and the client
+// keeps its provider rule for it. `cancellableIds` lists the pushed rows the
+// worker can still pull back out of its runtime (un-steer).
 export function normalizeWorkerSteeringSnapshot(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const holdReason = String(raw.holdReason || '').trim().toLowerCase();
-  const messageId = String(raw.messageId || '').trim().slice(0, 64);
+  const messageId = String(raw.messageId || '').trim().slice(0, STEERING_MESSAGE_ID_MAX_LENGTH);
   return {
     turnActive: raw.turnActive === true,
     canSteer: raw.canSteer === true,
     holdReason: STEERING_HOLD_REASONS.has(holdReason) ? holdReason : null,
     messageId: messageId || null,
+    supported: raw.supported === true,
+    cancellableIds: normalizeSteeringCancellableIds(raw.cancellableIds),
   };
 }
 

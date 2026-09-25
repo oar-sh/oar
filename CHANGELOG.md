@@ -26,8 +26,35 @@ All notable changes to OAR are documented here. The format follows
   on** (e.g. *Opus 5.5*) beside their kind pill, and the **command they are
   running right now** with its tool emoji (e.g. *🔧 Tool (Bash): npm test*),
   cropped to the row — instead of *using Bash · opus*.
+- **Mid-turn steering for Copilot conversations** (SDK engine, hosted and
+  BYOK alike, every Copilot model): a message sent while a turn runs is
+  pushed into the live turn. The runtime folds it in at the next tool boundary
+  (the message settles with the same *merged* marker as on Claude, and the
+  reply continues in the running bubble) or, when the model is mid-sentence,
+  answers it right after on its own bubble. The composer reads **Steer** for
+  these conversations; while a question card, approval, elicitation or a
+  compaction is open it reads **Queue** and the message waits in the queue,
+  cancellable, then steers in one round-trip after the answer. **Stop** now
+  ends only the reply — background agents the turn started keep running under
+  their own Stop — and messages pushed just before the Stop settle as *Stopped
+  with the turn — not answered* with **Resend**, exactly as on Claude.
+- A queued Copilot message that the runtime has not started yet keeps its
+  **Cancel**: cancelling pulls it back out of the runtime's queue, so it is
+  never answered.
+- **Multi-select question cards.** A question that allows several answers
+  (Claude's `multiSelect`, or a Copilot question worded "select all that
+  apply") renders checkmarks instead of one-shot buttons, plus one **Reply
+  with selection** button; the reply lists every ticked choice and whatever
+  you typed in addition. Previously the first click answered the whole card.
 
 ### Changed
+
+- Copilot replies settle when the main agent goes idle rather than when the
+  whole session does, so a background agent the turn spawned no longer keeps
+  the reply's bubble spinning for as long as it runs; the agent's own
+  follow-up arrives as a *continuation* reply, as on Claude. Messages are sent
+  to the Copilot runtime as `immediate` throughout — the only mode that never
+  strands a message behind background work.
 
 - The background task panel scrolls when it holds more tasks than fit,
   instead of growing past the window — in phone landscape too, where the
@@ -62,6 +89,12 @@ All notable changes to OAR are documented here. The format follows
 
 ### Fixed
 
+- A Copilot turn that ended in `task_complete` after streaming a fragment
+  published the fragment as its final reply; the completion summary now takes
+  precedence in the saved reply too, not only in the live stream.
+- A background subagent's own events could open a spurious *continuation*
+  reply after the Copilot turn that spawned it had settled, and its
+  session-level model notice could confuse a pending model switch.
 - Switching the model, mode or effort between turns no longer strands the
   next message: the Claude CLI re-initialises after such a change, and the
   worker took that for a turn it opened on its own, so the reply landed on

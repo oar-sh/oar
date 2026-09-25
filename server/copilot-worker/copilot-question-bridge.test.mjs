@@ -102,6 +102,23 @@ test('ask_user creates a card carrying the question, its choices and the queue r
   assert.equal(created.context.source, 'onUserInputRequest');
 });
 
+test('a "select all that apply" question is flagged multi-select for the card; an ordinary one is not', async () => {
+  const api = makeRelay({ answerWith: 'staging, prod' });
+  const bridge = makeBridge(api);
+  const result = await bridge.askUserInput({
+    requestId: 'r1',
+    question: 'Which environments should I deploy to? Select all that apply.',
+    choices: ['prod', 'staging', 'dev'],
+  });
+  assert.equal(api.created().context.multiSelect, true);
+  // The joined labels come back as a freeform answer, which the runtime accepts.
+  assert.deepEqual(result, { answer: 'staging, prod', wasFreeform: true, timedOut: false });
+
+  const single = makeRelay({ answerWith: 'prod' });
+  await makeBridge(single).askUserInput({ requestId: 'r2', question: 'Which environment?', choices: ['prod', 'staging'] });
+  assert.equal('multiSelect' in single.created().context, false);
+});
+
 test('a question with no choices always allows free text', async () => {
   const api = makeRelay({ answerWith: 'Simon' });
   const bridge = makeBridge(api);

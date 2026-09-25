@@ -373,11 +373,15 @@ test('a user message delivered during a continuation gets its own row and its ow
 
   const delivery = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'what time is it?' } });
   await waitFor(() => client.session.sends.length === 2, { label: 'steered send' });
-  assert.equal(client.session.sends[1].mode, 'enqueue');
+  assert.equal(client.session.sends[1].mode, 'immediate');
 
-  // The runtime picks the steered prompt up: a new `user.message` segment, its
-  // own reply, and ONE `session.idle` closing the whole interaction.
-  client.session.emit({ type: 'user.message', data: { content: 'what time is it?' } });
+  // The runtime picks the steered prompt up as a run of its own
+  // (`delivery:"queued"`): a new `user.message` naming the id send() resolved,
+  // its own reply, and ONE `session.idle` closing the whole interaction.
+  client.session.emit({
+    type: 'user.message',
+    data: { content: 'what time is it?', messageId: client.session.idOfSend(1), delivery: 'queued' },
+  });
   client.session.emit({
     type: 'assistant.message',
     data: { messageId: 'steered-1', model: 'gpt-5.6-luna', content: steeredReply, toolRequests: [] },

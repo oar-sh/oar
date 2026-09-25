@@ -791,7 +791,40 @@ export function createCopilotEventNormalizer() {
         lastEmittedStreamText = text;
         return [{ channel: 'stream', payload: { text, done: false, subagentRunId: null } }];
       }
-      // ---- the one true terminator -----------------------------------------
+      // ---- compaction ------------------------------------------------------
+      //
+      // Surfaced as activity lines so a long pause reads as what it is. The
+      // runner ALSO watches these two events directly for its steering hold
+      // (a message must not be pushed into a compaction's replay).
+      case 'session.compaction_start': {
+        return [activityAction('Compacting the conversation context…')];
+      }
+      case 'session.compaction_complete': {
+        if (data.success === false) {
+          const reason = String(data.error || '').trim();
+          return [activityAction(truncate(reason ? `Context compaction failed: ${reason}` : 'Context compaction failed'))];
+        }
+        const removed = Number(data.messagesRemoved);
+        const tokens = Number(data.tokensRemoved);
+        const parts = [];
+        if (Number.isFinite(removed) && removed > 0) parts.push(`${removed} messages`);
+        if (Number.isFinite(tokens) && tokens > 0) parts.push(`${Math.round(tokens / 1000)}k tokens`);
+        return [activityAction(parts.length ? `Context compacted (removed ${parts.join(', ')})` : 'Context compacted')];
+      }
+      // ---- the terminators ---------------------------------------------------
+      //
+      // `assistant.idle` is "the main agent's processing loop went idle" and
+      // fires even while background agents / attached shells keep the
+      // session-level idle deferred (runtime 1.0.88, live-probed 2026-09-25).
+      // It is the terminator that lets a row settle while a background agent
+      // the turn spawned keeps running under the task panel — exactly the
+      // Claude worker's lingering model. `session.idle` stays the hard
+      // terminator for runtimes that do not emit the assistant-level one and
+      // for the drain's end; `terminalEmitted` makes the second a no-op.
+      case 'assistant.idle': {
+        if (data.aborted === true) aborted = true;
+        return terminalAction({ subtype: aborted ? 'aborted' : 'completed' });
+      }
       case 'session.idle': {
         if (data.aborted === true) aborted = true;
         return terminalAction({ subtype: aborted ? 'aborted' : 'completed' });

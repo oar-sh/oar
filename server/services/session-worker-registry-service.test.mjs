@@ -117,11 +117,14 @@ test('the steering snapshot is normalized, stored, and survives spread-conventio
     ...registry.getWorker('sdk-1'),
     steering: { turnActive: true, canSteer: false, holdReason: 'QUESTION', messageId: 'q-7' },
   });
+  // The Claude worker's 4-field snapshot: no opt-in flag, nothing un-steerable.
   assert.deepEqual(registry.getWorker('sdk-1').steering, {
     turnActive: true,
     canSteer: false,
     holdReason: 'question',
     messageId: 'q-7',
+    supported: false,
+    cancellableIds: [],
   });
 
   // An unrelated update that spreads the existing entry (the registry's
@@ -133,6 +136,8 @@ test('the steering snapshot is normalized, stored, and survives spread-conventio
     canSteer: false,
     holdReason: 'question',
     messageId: 'q-7',
+    supported: false,
+    cancellableIds: [],
   });
 
   // Unknown hold reasons are dropped to null; junk shapes normalize to null.
@@ -145,9 +150,55 @@ test('the steering snapshot is normalized, stored, and survives spread-conventio
   assert.equal(registry.getWorker('sdk-1').steering, null);
 });
 
+test('the Copilot SDK worker snapshot: supported opt-in and the un-steerable id set', () => {
+  const registry = createSessionWorkerRegistry();
+  registry.upsertWorker({ sdkSessionId: 'sdk-1', status: 'processing', pid: 100 });
+  const withSteering = (steering) => {
+    registry.upsertWorker({ ...registry.getWorker('sdk-1'), steering });
+    return registry.getWorker('sdk-1').steering;
+  };
+
+  // supported: strictly boolean true; anything else is not an opt-in.
+  assert.equal(withSteering({ turnActive: true, canSteer: true, supported: true }).supported, true);
+  assert.equal(withSteering({ turnActive: true, canSteer: true, supported: false }).supported, false);
+  assert.equal(withSteering({ turnActive: true, canSteer: true }).supported, false);
+  assert.equal(withSteering({ turnActive: true, canSteer: true, supported: 'true' }).supported, false);
+  assert.equal(withSteering({ turnActive: true, canSteer: true, supported: 1 }).supported, false);
+
+  // cancellableIds: trimmed non-empty strings only, deduped, order kept.
+  assert.deepEqual(
+    withSteering({ turnActive: true, canSteer: true, supported: true, cancellableIds: [' m-2 ', 'm-1', 'm-2', '', 7, null, { id: 'm-3' }, 'm-3'] }).cancellableIds,
+    ['m-2', 'm-1', 'm-3'],
+  );
+  // Over-long ids are dropped (the relay never stores an unbounded token).
+  assert.deepEqual(
+    withSteering({ turnActive: true, canSteer: true, supported: true, cancellableIds: ['x'.repeat(65), 'y'.repeat(64)] }).cancellableIds,
+    ['y'.repeat(64)],
+  );
+  // Capped at 50.
+  const many = Array.from({ length: 80 }, (_, i) => `m-${i}`);
+  const capped = withSteering({ turnActive: true, canSteer: true, supported: true, cancellableIds: many }).cancellableIds;
+  assert.equal(capped.length, 50);
+  assert.deepEqual(capped, many.slice(0, 50));
+  // Missing or junk → [].
+  assert.deepEqual(withSteering({ turnActive: true, canSteer: true, supported: true }).cancellableIds, []);
+  assert.deepEqual(withSteering({ turnActive: true, canSteer: true, supported: true, cancellableIds: 'm-1' }).cancellableIds, []);
+
+  // Cleared with the rest of the snapshot when the worker process is gone.
+  withSteering({ turnActive: true, canSteer: true, supported: true, cancellableIds: ['m-1'] });
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), pid: 200 });
+  assert.equal(registry.getWorker('sdk-1').steering, null, 'pid change clears supported + cancellableIds with the snapshot');
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), steering: { turnActive: true, canSteer: true, supported: true, cancellableIds: ['m-1'] } });
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), status: 'stopped' });
+  assert.equal(registry.getWorker('sdk-1').steering, null, 'worker gone clears it');
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), status: 'processing', steering: { turnActive: true, canSteer: true, supported: true, cancellableIds: ['m-1'] } });
+  assert.equal(registry.clearSteering('sdk-1'), true);
+  assert.equal(registry.getWorker('sdk-1').steering, null, 'explicit clear');
+});
+
 test('a steering snapshot does not outlive the worker process it describes', () => {
   const registry = createSessionWorkerRegistry();
-  const hold = { turnActive: true, canSteer: false, holdReason: 'question', messageId: 'q-7' };
+  const hold = { turnActive: true, canSteer: false, holdReason: 'question', messageId: 'q-7', supported: false, cancellableIds: [] };
   const seed = () => registry.upsertWorker({ sdkSessionId: 'sdk-1', status: 'processing', pid: 100, steering: hold });
 
   // A replacement process (pid change), even through a spreading upsert.

@@ -110,6 +110,17 @@ test('terminators and connection bookkeeping never open a continuation', () => {
   }
 });
 
+test('a background subagent\'s own events never open a continuation', () => {
+  // Live-probed on runtime 1.0.88: a background agent keeps working after the
+  // turn that spawned it settled, and every one of its events — its own
+  // `user.message` included — carries the envelope `agentId`. Only the root
+  // agent's follow-up (no agentId) is the main agent starting work.
+  for (const type of ['user.message', 'assistant.turn_start', 'assistant.message', 'tool.execution_start', 'subagent.started']) {
+    assert.equal(isContinuationOpeningEvent({ type, agentId: 'agent-1' }), false, type);
+    assert.equal(isContinuationOpeningEvent({ type }), true, type);
+  }
+});
+
 // ------------------------------------------------------------- replay gate --
 
 test('a resume replays history through the live callback, and none of it counts as new work', () => {

@@ -4338,6 +4338,25 @@
     color: #000;
     font-weight: 700;
   }
+  /* Multi-select cards: the same pills, with a checkmark instead of one-shot
+     buttons, so several answers can be ticked before one Reply. */
+  .relay-question-choice-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    user-select: none;
+  }
+  .relay-question-choice-check input[type="checkbox"] {
+    margin: 0;
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .relay-question-choice-check:has(input:checked) {
+    border-color: var(--accent);
+    background: rgba(88, 166, 255, 0.12);
+  }
   .relay-question-reply {
     display: flex;
     gap: 8px;

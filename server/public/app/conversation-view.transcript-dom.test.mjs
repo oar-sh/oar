@@ -783,3 +783,194 @@ test('deleting the viewed conversation over the socket clears its live bubble', 
   assert.equal(store.currentConvId, null);
   assert.equal(liveBubble(), null);
 });
+
+// ---------------------------------------------------------------------------
+// Worker-advertised steering (decision 9) and un-steer for the queued lane
+// (decision 8): the composer gate and the pushed rows' Cancel both derive
+// from the session worker's heartbeat steering snapshot on the status payload.
+// ---------------------------------------------------------------------------
+
+// A conversation bound to a session worker, with that worker's steering
+// snapshot installed on the store (as the status poll does).
+function openWorkerConversation(provider, steering) {
+  const conv = openConversation(provider);
+  const sdkSessionId = uid('sess');
+  conversations[conv].sdkSessionId = sdkSessionId;
+  setWorkerSteering(sdkSessionId, steering);
+  return { conv, sdkSessionId };
+}
+
+function setWorkerSteering(sdkSessionId, steering) {
+  return store.setSessionWorkerStatesFromStatusPayload({
+    workers: steering === null
+      ? []
+      : [{ sdkSessionId, status: 'processing', pid: 4242, workerId: `w-${sdkSessionId}`, steering }],
+  });
+}
+
+const cancelButtonOf = (id) => row(id)?.querySelector('.msg-bubble-actions [data-action="cancel-queued"]') || null;
+const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+test('the composer reads Steer for a github conversation whose worker advertises steering, Queue otherwise, Steer for claude regardless', () => {
+  resetView();
+  selectComposerPreferences();
+  const input = document.getElementById('msg-input');
+  const button = document.getElementById('send-btn');
+  let lastTitle = '';
+  const labelFor = (provider, steering) => {
+    const { conv } = openWorkerConversation(provider, steering);
+    view.renderMessages([{ id: 'u1', role: 'user', text: 'running', timestamp: at(0) }], false, { conversationId: conv });
+    view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'processing' });
+    input.value = 'a thought mid-turn';
+    view.syncComposerButtonState();
+    const label = button.textContent;
+    lastTitle = button.title || '';
+    view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
+    input.value = '';
+    return label;
+  };
+
+  // The Copilot SDK worker opted in on its heartbeat.
+  assert.equal(labelFor('github', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: [] }), 'Steer');
+  // A worker that never advertises (the extension path, or an older
+  // snapshot): strictly serial, so the message queues behind the turn.
+  assert.equal(labelFor('github', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1' }), 'Queue');
+  assert.equal(labelFor('github', null), 'Queue');
+  // Claude keeps its provider rule, with or without a worker snapshot.
+  assert.equal(labelFor('claude', null), 'Steer');
+  assert.equal(labelFor('claude', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1' }), 'Steer');
+  // The advertised gate still honours the worker's holds like Claude's does.
+  assert.equal(labelFor('github', { turnActive: true, canSteer: false, holdReason: 'compaction', messageId: 'u1', supported: true, cancellableIds: [] }), 'Queue');
+  assert.match(lastTitle, /compact/i);
+  input.value = '';
+});
+
+test('a pushed row the worker lists as cancellable keeps Cancel; the set is re-synced from the status payload without a rebuild', () => {
+  resetView();
+  const { conv, sdkSessionId } = openWorkerConversation('github', {
+    turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: ['u2'],
+  });
+  view.renderMessages([
+    { id: 'u1', role: 'user', text: 'the live turn', timestamp: at(0) },
+    { id: 'u2', role: 'user', text: 'pushed behind it', timestamp: at(5) },
+    { id: 'u3', role: 'user', text: 'consumed already', timestamp: at(6) },
+  ], false, { conversationId: conv });
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'processing' });
+
+  assert.ok(cancelButtonOf('u2'), 'the un-steerable row renders Cancel');
+  assert.equal(cancelButtonOf('u2').textContent, 'Cancel');
+  assert.equal(cancelButtonOf('u1'), null, 'the live turn has no Cancel (Stop lives on the live bubble)');
+  assert.equal(cancelButtonOf('u3'), null, 'a processing row the worker does not list has none');
+
+  // The worker consumed u2 and pushed u3: the next status payload changes the
+  // hash, and the targeted sync moves the control without re-rendering.
+  assert.equal(setWorkerSteering(sdkSessionId, { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: ['u3'] }), true);
+  view.syncCancellableSteerButtons();
+  assert.equal(cancelButtonOf('u2'), null);
+  assert.ok(cancelButtonOf('u3'));
+  assert.equal(cancelButtonOf('u3').textContent, 'Cancel');
+
+  // A repeat of the same payload is not a change.
+  assert.equal(setWorkerSteering(sdkSessionId, { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: ['u3'] }), false);
+
+  // A pending (not yet claimed) row owns its own Cancel and is left alone by
+  // the sync whatever the worker lists.
+  const pendingId = uid('pending');
+  store.trackPendingUserMessage(pendingId, conv, 'still queued');
+  store.pendingUserMessageIds.add(pendingId);
+  view.appendMessage({ role: 'user', text: 'still queued', timestamp: at(10) }, false, pendingId, true);
+  assert.ok(cancelButtonOf(pendingId));
+  setWorkerSteering(sdkSessionId, { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: [] });
+  view.syncCancellableSteerButtons();
+  assert.ok(cancelButtonOf(pendingId), 'pending Cancel untouched');
+  assert.equal(cancelButtonOf('u3'), null);
+  store.clearPendingUserMessage(pendingId);
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
+});
+
+test('cancelling a pushed row: cancel-requested keeps "Cancelling…" until the worker reports it cancelled', async () => {
+  resetView();
+  const { conv } = openWorkerConversation('github', {
+    turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: ['u2'],
+  });
+  view.renderMessages([
+    { id: 'u1', role: 'user', text: 'the live turn', timestamp: at(0) },
+    { id: 'u2', role: 'user', text: 'pushed behind it', timestamp: at(5) },
+  ], false, { conversationId: conv });
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'processing' });
+  fetchHandler = async (url, { method }) => {
+    if (method === 'POST' && url.endsWith(`/api/conversation/${conv}/cancel-queued-turn`)) {
+      return { ok: true, cancelled: false, acknowledgement: 'cancel-requested', requestedMessageId: 'u2', status: 'processing' };
+    }
+    throw new Error(`unexpected fetch: ${method} ${url}`);
+  };
+
+  cancelButtonOf('u2').click();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  const cancelPost = fetchLog.find((entry) => entry.method === 'POST' && entry.url.endsWith('/cancel-queued-turn'));
+  assert.equal(cancelPost?.body?.messageId, 'u2', 'the existing cancel-queued route is reused');
+  assert.equal(cancelButtonOf('u2').textContent, 'Cancelling…');
+  assert.equal(cancelButtonOf('u2').disabled, true);
+
+  // The worker pulled it out of the runtime: the relay's message_status
+  // 'cancelled' (from /api/queue-cancelled) clears the control.
+  refreshCurrentViewCalls.length = 0;
+  fire('message_status', { conversationId: conv, messageId: 'u2', status: 'cancelled' });
+  assert.equal(cancelButtonOf('u2'), null);
+  assert.equal(refreshCurrentViewCalls.length, 1, 'terminal status reloads the view as for any cancel');
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
+});
+
+test('cancelling a pushed row: the 20 s fallback hands the control back when neither answer arrives', async (t) => {
+  resetView();
+  const { conv, sdkSessionId } = openWorkerConversation('github', {
+    turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: ['u2', 'u3'],
+  });
+  view.renderMessages([
+    { id: 'u1', role: 'user', text: 'the live turn', timestamp: at(0) },
+    { id: 'u2', role: 'user', text: 'pushed behind it', timestamp: at(5) },
+    { id: 'u3', role: 'user', text: 'pushed later', timestamp: at(6) },
+  ], false, { conversationId: conv });
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'processing' });
+  fetchHandler = async (url, { method, body }) => {
+    if (method === 'POST' && url.endsWith(`/api/conversation/${conv}/cancel-queued-turn`)) {
+      return { ok: true, cancelled: false, acknowledgement: 'cancel-requested', requestedMessageId: body.messageId, status: 'processing' };
+    }
+    throw new Error(`unexpected fetch: ${method} ${url}`);
+  };
+
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  cancelButtonOf('u2').click();
+  cancelButtonOf('u3').click();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(cancelButtonOf('u2').textContent, 'Cancelling…');
+  assert.equal(cancelButtonOf('u3').textContent, 'Cancelling…');
+
+  // Meanwhile the worker consumed u3 (dropped from the set) but still lists
+  // u2. The sync leaves both alone while their un-steer is unanswered.
+  setWorkerSteering(sdkSessionId, { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: ['u2'] });
+  view.syncCancellableSteerButtons();
+  assert.equal(cancelButtonOf('u2').textContent, 'Cancelling…');
+  assert.equal(cancelButtonOf('u3').textContent, 'Cancelling…');
+
+  t.mock.timers.tick(19_999);
+  assert.equal(cancelButtonOf('u2').textContent, 'Cancelling…', 'not yet');
+  t.mock.timers.tick(1);
+  assert.equal(cancelButtonOf('u2').textContent, 'Cancel', 'still listed: the control is handed back');
+  assert.equal(cancelButtonOf('u2').disabled, false);
+  assert.equal(cancelButtonOf('u3'), null, 'no longer listed: the control is gone');
+  t.mock.timers.reset();
+
+  // A second tap works again after the fallback.
+  fetchLog.length = 0;
+  cancelButtonOf('u2').click();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(fetchLog.filter((entry) => entry.url.endsWith('/cancel-queued-turn')).length, 1);
+  assert.equal(cancelButtonOf('u2').textContent, 'Cancelling…');
+  fire('message_status', { conversationId: conv, messageId: 'u2', status: 'cancelled' });
+  assert.equal(cancelButtonOf('u2'), null);
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
+});

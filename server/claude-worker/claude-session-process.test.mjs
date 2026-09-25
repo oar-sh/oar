@@ -1852,20 +1852,20 @@ test('steeringState reports the composer-facing snapshot', async () => {
     pendingDeliveredTimeoutMs: 60_000,
   });
 
-  assert.deepEqual(runner.steeringState(), { turnActive: false, canSteer: false, holdReason: null, messageId: null });
+  assert.deepEqual(runner.steeringState(), { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true });
 
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
   turn.emit(initMessage('native-1'));
   turn.emit(userReplay('hello'));
   turn.emit(assistantText('working on it'));
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
-  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1' });
+  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true });
 
   // Steered entries in flight do not hold steering (unbounded), and the
   // snapshot keeps naming the turn they steer into.
   const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer two' } });
   await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pending' });
-  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1' });
+  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true });
 
   turn.emit(resultMessage('done', 'native-1'));
   assert.equal(await first, true);

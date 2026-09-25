@@ -63,7 +63,10 @@ export function createControlPoller({
 
     dbg('abort_turn control received', control.id);
     try {
-      await onAbortTurn();
+      // The control names the row the user stopped. A runner that owns several
+      // rows at once (a turn plus the messages steered into it) needs it to
+      // tell the stopped row from the ones it must settle itself.
+      await onAbortTurn(control);
       await api('POST', `/api/control/${encodeURIComponent(control.id)}/result`, {
         ok: true,
         note: abortAckNote,

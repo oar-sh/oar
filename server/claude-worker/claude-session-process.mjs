@@ -568,7 +568,7 @@ export function createClaudeSessionRunner({
       entries.push({
         id: String(message?.id || '').trim(),
         attemptId: message?.attemptId || null,
-        terminalError: buildSteerSettleFailure(message, { variant }),
+        terminalError: buildSteerSettleFailure(message, { variant, agentLabel: 'Claude' }),
       });
     }
     return entries.filter((entry) => entry.id);
@@ -2491,7 +2491,7 @@ export function createClaudeSessionRunner({
         await sleep(settleRetryDelaysMs[attempt]);
       }
       dbg('settle marker could not be saved; failing the row terminally', id);
-      const terminalError = buildSteerSettleFailure(message, { variant });
+      const terminalError = buildSteerSettleFailure(message, { variant, agentLabel: 'Claude' });
       const retryMs = Math.max(100, Number(settleRetryDelaysMs.at(-1)) || 0);
       for (let attempt = 0; attempt < Math.max(1, maxTerminalSettleAttempts); attempt += 1) {
         if (attempt) await sleep(retryMs);
@@ -3102,7 +3102,7 @@ export function createClaudeSessionRunner({
     // A closing/aborted process is about to die — nothing about its last turn
     // should hold the composer of the worker that replaces it.
     if (!proc || proc.closing || proc.aborted) {
-      return { turnActive: false, canSteer: false, holdReason: null, messageId: null };
+      return { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true };
     }
     const ctx = proc.activeCtx || null;
     const ctxLive = Boolean(ctx && !ctx.finalized && !ctx.discarded && !ctx.interrupted);
@@ -3125,7 +3125,10 @@ export function createClaudeSessionRunner({
     const messageId = String(
       (ctxLive ? ctx.message?.id : '') || openingDelivery?.ctx?.message?.id || '',
     ).trim() || null;
-    return { turnActive, canSteer, holdReason, messageId };
+    // `supported` is the worker-advertised opt-in the client's composer reads
+    // (the same flag the Copilot SDK worker publishes); the provider-name
+    // fallback in the client covers Claude workers not yet respawned.
+    return { turnActive, canSteer, holdReason, messageId, supported: true };
   }
 
   async function handlePendingPayload(pending) {

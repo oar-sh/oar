@@ -12,6 +12,7 @@ import {
   makeFakeQuestionBridge,
   makeRunner,
   promptWithPrefix,
+  tick,
   waitFor,
 } from './copilot-sdk-test-harness.mjs';
 import { USER_INPUT_UNSUPPORTED_ANSWER } from './copilot-sdk-adapter.mjs';
@@ -76,9 +77,10 @@ test('send takes ONE MessageOptions object, prompt and agentMode included', asyn
   assert.equal(client.session.sends.length, 1);
   assert.deepEqual(client.session.sends[0], {
     prompt: promptWithPrefix('hello'),
-    // "enqueue" is the runtime default and the only ordering-preserving mode;
-    // a BYOK probe showed "immediate" does not preempt a running call either.
-    mode: 'enqueue',
+    // "immediate", always: mid-turn it is a real steer, and when the main loop
+    // is idle it starts at once even while background work keeps the
+    // session-level idle deferred ("enqueue" freezes there — probe 2026-09-25).
+    mode: 'immediate',
     agentMode: 'interactive',
   });
 });
@@ -147,10 +149,14 @@ test('an abort publishes the partial text and no response row', async () => {
 
   const pending = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => stub.bodiesFor('/api/stream').length > 0, { label: 'partial text' });
-  await abortTurn();
+  await abortTurn({ queueMessageId: 'q-1' });
   assert.equal(await pending, true);
 
-  assert.equal(client.session.abortCalls, 1);
+  // Stop = the targeted interrupt when the runtime has it: the main turn ends,
+  // background agents and promoted shells keep running under their own Stop.
+  // `session.abort()` would also cancel every background agent.
+  assert.deepEqual(client.session.interruptCalls, [{ flushQueued: false }]);
+  assert.equal(client.session.abortCalls, 0);
   // The queue row's fate belongs to the server-side abort control: publishing
   // a response here would double-settle it.
   assert.equal(stub.bodiesFor('/api/response').length, 0);
@@ -158,6 +164,29 @@ test('an abort publishes the partial text and no response row', async () => {
   const final = lastBodyOf(stub, '/api/stream');
   assert.equal(final.done, true);
   assert.ok(final.text.length > 0, 'the partial answer must survive the abort');
+});
+
+test('a runtime without interruptMainTurn is stopped with session.abort()', async () => {
+  const events = loadFixture('abort-turn');
+  const abortIndex = events.findIndex((event) => event.type === 'abort');
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient({
+    interruptRpc: false,
+    onSend: (session) => session.replay(events.slice(0, abortIndex)),
+    onAbort: (session) => session.replay(events.slice(abortIndex)),
+  });
+  let abortTurn = null;
+  const controlPoller = {
+    start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return { id: 1 }; },
+    stop: () => {},
+  };
+  const { runner } = makeRunner({ stub, client, controlPoller });
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => stub.bodiesFor('/api/stream').length > 0, { label: 'partial text' });
+  await abortTurn({ queueMessageId: 'q-1' });
+  assert.equal(await pending, true);
+  assert.equal(client.session.abortCalls, 1);
+  assert.equal(stub.bodiesFor('/api/response').length, 0);
 });
 
 test('an abort that lands while the session is still connecting is not lost', async () => {
@@ -187,10 +216,12 @@ test('an abort that lands while the session is still connecting is not lost', as
   releaseCreate();
 
   assert.equal(await pending, true);
-  // The prompt is never sent, and the abort is re-applied to the session the
-  // moment it exists.
+  // The prompt is never sent. Nothing of this turn's is running inside the
+  // runtime, so nothing is interrupted either — an abort() here would only
+  // cancel background work the user did not ask to stop.
   assert.equal(client.session.sends.length, 0);
-  assert.equal(client.session.abortCalls, 1);
+  assert.equal(client.session.abortCalls, 0);
+  assert.equal(client.session.interruptCalls.length, 0);
   // Still an abort: the server-side control settles the row, not this worker.
   assert.equal(stub.bodiesFor('/api/response').length, 0);
   assert.equal(lastBodyOf(stub, '/api/stream').done, true);
@@ -833,15 +864,16 @@ test('no mode field is sent when the seam resolves an empty mode', async () => {
   assert.equal('mode' in client.session.sends[0], false);
 });
 
-test('the default send mode is enqueue', async () => {
-  // A BYOK probe against runtime 1.0.82 ran a mid-turn send as "enqueue",
-  // "immediate" and unset: all three behaved identically (queued, picked up at
-  // the next model-call boundary, no interruption). "enqueue" is the documented
-  // default and the only one that guarantees FIFO order, which is what the
-  // relay queue contract wants.
+test('the default send mode is immediate', async () => {
+  // Fake-provider probe against runtime 1.0.88 (2026-09-25): "immediate" is a
+  // real steer mid-turn (delivery:"steering" at the next tool boundary, or
+  // queued to the FRONT and run right after when the model is mid-stream),
+  // and when the main loop is idle it starts at once — while an "enqueue"
+  // message sent behind a running background agent sits frozen until the
+  // session-level idle. Immediate is the only mode that never strands a row.
   const { client, runner } = setup();
   await runner.handlePendingPayload({ message: baseMessage });
-  assert.equal(client.session.sends[0].mode, 'enqueue');
+  assert.equal(client.session.sends[0].mode, 'immediate');
 });
 
 test('the stall watchdog fails a silent turn terminally', async () => {
@@ -874,11 +906,13 @@ test('a stall that fires before anything awaits the turn is not an unhandled rej
 
     const pending = runner.handlePendingPayload({ message: baseMessage });
     await new Promise((resolve) => { setTimeout(resolve, 40); });
-    // The stall rejected the turn, but `send` never resolves so the row is
-    // still held — what matters is that no unhandled rejection escaped.
+    // The stall rejected the turn while `send` was still in flight. What
+    // matters is that no unhandled rejection escaped — and that the row was
+    // failed terminally rather than held behind a send that never resolves.
     assert.equal(rejections.length, 0, `unhandled: ${rejections.map(String).join(', ')}`);
-    assert.equal(runner.isTurnActive(), true);
-    void pending;
+    await waitFor(() => stub.bodiesFor('/api/response').length === 1, { label: 'terminal failure published' });
+    assert.equal(bodyOf(stub, '/api/response').terminalError.stableCode, 'copilot.turn-error');
+    assert.equal(await pending, true);
   } finally {
     process.off('unhandledRejection', onRejection);
   }
@@ -1071,29 +1105,41 @@ test('an agent-mode turn never posts a plan board, however list-shaped', async (
 
 // ----------------------------------------------------------------- steering --
 
-/** A client whose Nth send replays a different slice of the interaction. */
-function steeringClient(perSend) {
+/**
+ * A client whose Nth send replays a different slice of the interaction. A
+ * slice may be a function of the runtime message id that send resolved, so a
+ * scripted `user.message` can echo it the way the real runtime does.
+ */
+function steeringClient(perSend, clientOptions = {}) {
   let sendIndex = 0;
   return createFakeCopilotClient({
-    onSend: (session) => {
-      const events = perSend[sendIndex] || [];
+    ...clientOptions,
+    onSend: (session, _options, messageId) => {
+      const script = perSend[sendIndex] || [];
       sendIndex += 1;
-      session.replay(events);
+      session.replay(typeof script === 'function' ? script(messageId) : script);
     },
   });
 }
 
-test('a delivery mid-turn is steered in, and BOTH rows get their own answer', async () => {
-  // Live-verified against runtime 1.0.82: an enqueued prompt is picked up at
-  // the next model-call boundary and the whole interaction closes with ONE
-  // session.idle. So nothing but this turn will ever settle the steered row.
+/** The runtime's acknowledgement that it started work on a pushed prompt. */
+function userMessage(messageId, delivery, content = '') {
+  return { type: 'user.message', data: { messageId, delivery, content } };
+}
+
+test('a delivery mid-turn is steered in; run as its own turn (delivery:queued) it gets its own answer', async () => {
+  // Probe against runtime 1.0.88: an immediate prompt the runtime cannot inject
+  // (the model is mid-stream) is moved to the FRONT of the queue and run right
+  // after as `user.message{delivery:"queued"}` — a run of its own, on the same
+  // interaction, closed by ONE idle for the whole drain. Its row gets that
+  // run's reply; the primary row settles the moment the new run opens.
   const client = steeringClient([
-    [
-      { type: 'user.message', data: {} },
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
       { type: 'assistant.message', data: { messageId: 'm1', content: 'first answer' } },
     ],
-    [
-      { type: 'user.message', data: {} },
+    (id) => [
+      userMessage(id, 'queued', 'actually, do it this way'),
       { type: 'assistant.message', data: { messageId: 'm2', content: 'second answer' } },
       { type: 'session.idle', data: {} },
     ],
@@ -1113,16 +1159,87 @@ test('a delivery mid-turn is steered in, and BOTH rows get their own answer', as
   // Steered into the SAME session, never a second turn.
   assert.equal(client.sessions.length, 1);
   assert.equal(client.session.sends.length, 2);
-  assert.equal(client.session.sends[1].mode, 'enqueue');
+  assert.equal(client.session.sends[1].mode, 'immediate');
   assert.match(client.session.sends[1].prompt, /actually, do it this way/);
 
-  // Each row is answered with the text of ITS OWN prompt segment.
+  // Each row is answered with the text of ITS OWN run.
   const responses = stub.bodiesFor('/api/response');
   assert.equal(responses.length, 2);
   assert.equal(responses.find((r) => r.messageId === 'q-1').text, 'first answer');
   assert.equal(responses.find((r) => r.messageId === 'q-2').text, 'second answer');
+  assert.equal(responses.find((r) => r.messageId === 'q-2').kind, undefined);
+  // The primary settled BEFORE the steered run's reply — when its run ended.
+  assert.equal(responses[0].messageId, 'q-1');
   // A steered row is never requeued: the runtime already consumed the prompt.
   assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+  // Nothing was folded, so nothing was marked consumed.
+  assert.equal(stub.bodiesFor('/api/queue-consumed').length, 0);
+});
+
+test('a steer the runtime folds into the running turn (delivery:steering) settles as folded', async () => {
+  // Probe against runtime 1.0.88: an immediate prompt sent during a tool call
+  // is injected right after the tool result as `delivery:"steering"`, under
+  // the SAME interaction. The reply that follows belongs to the running row;
+  // the steered row settles with Claude's fold marker and is marked consumed
+  // the moment the runtime takes it.
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'assistant.message', data: { messageId: 'm1', content: 'started work' } },
+    ],
+    (id) => [
+      userMessage(id, 'steering', 'also mention X'),
+      { type: 'assistant.message', data: { messageId: 'm2', content: 'done, and X too' } },
+      { type: 'assistant.idle', data: {} },
+    ],
+  ]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', attemptId: 'a-2', text: 'also mention X' } });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  const responses = stub.bodiesFor('/api/response');
+  const primary = responses.find((r) => r.messageId === 'q-1');
+  const folded = responses.find((r) => r.messageId === 'q-2');
+  // The whole reply — before and after the injection — is the primary's.
+  assert.equal(primary.text, 'started work\n\ndone, and X too');
+  assert.deepEqual(primary.consumedSteerIds, [{ id: 'q-2', attemptId: 'a-2' }]);
+  assert.equal(folded.kind, 'folded');
+  assert.match(folded.text, /steered into that turn/);
+  // Consumed at the acknowledgement, not at the end: a crash in between must
+  // fail the row, never re-run it.
+  assert.deepEqual(stub.bodiesFor('/api/queue-consumed'), [
+    { conversationId: 'conv-1', entries: [{ id: 'q-2', attemptId: 'a-2' }] },
+  ]);
+  // The primary's response landed before the fold marker.
+  assert.ok(responses.indexOf(primary) < responses.indexOf(folded));
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+});
+
+test('the turn settles on assistant.idle while the session-level idle stays deferred', async () => {
+  // A background agent keeps `session.idle` deferred for as long as it runs;
+  // `assistant.idle` says the main loop is done. The row must not wait.
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'assistant.message', data: { messageId: 'm1', content: 'spawned a background agent' } },
+      { type: 'assistant.idle', data: {} },
+    ],
+  ]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(bodyOf(stub, '/api/response').text, 'spawned a background agent');
+  assert.equal(runner.isTurnActive(), false);
+  // The late session-level idle is not an opener: nothing happens.
+  client.session.emit({ type: 'session.idle', data: {} });
+  await tick(5);
+  assert.equal(stub.bodiesFor('/api/continuation-turn').length, 0);
+  assert.equal(stub.bodiesFor('/api/response').length, 1);
 });
 
 test('the heartbeat claims the steered row too, or the relay recovers it mid-flight', async () => {
@@ -1560,11 +1677,12 @@ test('the captured usage carries real spend, not just the premium multiplier', a
 
 // ------------------------------------------------- review regression guards --
 
-test('a prompt left queued in the runtime does not steal the next turn answer', async () => {
+test('a prompt left queued in the runtime is answered on the next row, as its note promised', async () => {
   // A steered prompt the runtime never started stays in its pending queue and
-  // is picked up FIRST next time — opening segment 0 — so the next delivery's
-  // own reply is segment 1. Indexing that row at 0 would publish the previous
-  // message's answer to it and drop its own entirely.
+  // is picked up FIRST next time. Its row was settled with the "reply
+  // continues in the next turn" note, so the next row's reply carries both
+  // answers — the leftover's first, then its own. Nothing is dropped and no
+  // row is answered with someone else's reply alone.
   const client = steeringClient([[], [], []]);
   const stub = makeApiStub();
   const { runner } = makeRunner({ stub, client });
@@ -1591,7 +1709,9 @@ test('a prompt left queued in the runtime does not steal the next turn answer', 
   assert.equal(await third, true);
 
   const q3 = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-3');
-  assert.equal(q3.text, 'answer to q-3');
+  assert.equal(q3.text, 'leftover q-2 answer\n\nanswer to q-3');
+  const q2 = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
+  assert.match(q2.text, /reply continues in the next turn/);
 });
 
 test('a turn settling mid-steer hands the row back instead of wedging the socket', async () => {

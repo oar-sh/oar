@@ -99,26 +99,48 @@ export function makeContinuationApiStub({
  * `modelRpc.{switchTo,setReasoningEffort,list}` override per test, each called
  * as `(params, session)`.
  */
-export function createFakeCopilotSession({ config, onSend = null, onAbort = null, modelRpc = {} }) {
+export function createFakeCopilotSession({
+  config, onSend = null, onAbort = null, modelRpc = {},
+  // The experimental surfaces the parity work leans on. `queueRpc: false` /
+  // `interruptRpc: false` model an older runtime without them (the runner
+  // must degrade, never throw); `queueItems` seeds `pendingItems()`.
+  queueRpc = true, interruptRpc = true, queueItems = null, onInterrupt = null,
+} = {}) {
+  let nextMessageId = 0;
   const session = {
     sessionId: config?.sessionId || 'fake-session',
     config,
     sends: [],
+    // The ids `send()` resolved, in send order — what `user.message.messageId`
+    // must echo for the runner to attribute a prompt to its row.
+    sentIds: [],
     abortCalls: 0,
+    interruptCalls: [],
     setModelCalls: [],
     disconnected: false,
+    // What `rpc.queue.pendingItems()` answers: [{ id, messageId }]. A test
+    // mutates it (or passes `queueItems`) to model the runtime's queued lane.
+    queueItems: Array.isArray(queueItems) ? queueItems : [],
+    removedQueueItems: [],
     emit(event) {
       config?.onEvent?.(event);
     },
     replay(events) {
       for (const event of events) session.emit(event);
     },
+    /** The runtime message id of the Nth send (0-based), for hand-built events. */
+    idOfSend(index) {
+      return session.sentIds[index] || null;
+    },
     async send(options) {
       session.sends.push(options);
+      nextMessageId += 1;
+      const messageId = `fake-message-id-${nextMessageId}`;
+      session.sentIds.push(messageId);
       // Scheduled rather than synchronous so the runner's `await session.send`
       // resolves before the events land, matching the real ordering.
-      setTimeout(() => { onSend?.(session, options); }, 0);
-      return 'fake-message-id';
+      setTimeout(() => { onSend?.(session, options, messageId); }, 0);
+      return messageId;
     },
     async abort() {
       session.abortCalls += 1;
@@ -132,6 +154,32 @@ export function createFakeCopilotSession({ config, onSend = null, onAbort = null
     },
   };
   session.rpc = {
+    ...(interruptRpc ? {
+      async interruptMainTurn(params) {
+        session.interruptCalls.push(params);
+        if (onInterrupt) return onInterrupt(session, params);
+        // Like the runtime: the main turn is torn down and answers with an
+        // aborted idle; nothing else is touched.
+        setTimeout(() => { onAbort?.(session); }, 0);
+        return { interrupted: true };
+      },
+    } : {}),
+    ...(queueRpc ? {
+      queue: {
+        pendingCalls: 0,
+        async pendingItems() {
+          session.rpc.queue.pendingCalls += 1;
+          return { items: session.queueItems.map((item) => ({ kind: 'message', ...item })), steeringMessages: [] };
+        },
+        async removeAt({ id }) {
+          const before = session.queueItems.length;
+          session.queueItems = session.queueItems.filter((item) => item.id !== id);
+          const removed = session.queueItems.length !== before;
+          if (removed) session.removedQueueItems.push(id);
+          return { removed };
+        },
+      },
+    } : {}),
     model: {
       switchToCalls: [],
       effortCalls: [],
@@ -192,6 +240,7 @@ export function createFakeCopilotClient({
   // `rpc.model` behaviour for every session this client mints; see
   // `createFakeCopilotSession`.
   modelRpc = {},
+  ...sessionOptions
 } = {}) {
   const client = {
     stopped: 0,
@@ -203,7 +252,7 @@ export function createFakeCopilotClient({
     async resumeSession(sessionId, config) {
       client.resumeAttempts.push({ sessionId, config });
       if (!client.resumeAvailable) throw makeResumeFailure(client.resumeFailure, sessionId);
-      const session = createFakeCopilotSession({ config, onSend, onAbort, modelRpc });
+      const session = createFakeCopilotSession({ config, onSend, onAbort, modelRpc, ...sessionOptions });
       session.resumed = true;
       client.sessions.push(session);
       // A session that exists once exists forever, so later reconnects resume.
@@ -212,7 +261,7 @@ export function createFakeCopilotClient({
     },
     async createSession(config) {
       client.createAttempts.push(config);
-      const session = createFakeCopilotSession({ config, onSend, onAbort, modelRpc });
+      const session = createFakeCopilotSession({ config, onSend, onAbort, modelRpc, ...sessionOptions });
       client.sessions.push(session);
       client.resumeAvailable = true;
       return session;
@@ -261,6 +310,8 @@ export function makeFakeQuestionBridge({
   // hands back, or null for a card that produced none.
   structuredAnswer = null,
   structuredTimedOut = false,
+  // Awaited before every answer: a test can hold the card open (a promise it
+  // resolves later) to exercise the question hold on steering.
   onAsk = null,
 } = {}) {
   const bridge = {

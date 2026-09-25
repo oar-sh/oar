@@ -161,6 +161,12 @@ const relayStreamStateByMessageId = new Map();
 const relayStreamTextByMessageId = new Map();
 const completedMessageIds = new Set();
 const bubbleCancelInFlight = new Set();
+// Un-steer requests the relay acknowledged with 'cancel-requested': the worker
+// answers asynchronously (message_status 'cancelled', or the row is answered
+// after all). Until then the bubble reads "Cancelling…"; the timer restores
+// the control if neither arrives.
+const UNSTEER_ACK_FALLBACK_MS = 20_000;
+const unsteerFallbackTimers = new Map();
 const shareVisibilityInFlight = new Set();
 const SUBAGENT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'dropped', 'done']);
 let lastRenderedMessageSnapshotKey = '';
@@ -427,14 +433,45 @@ function getActiveTurnForConversation(conversationId) {
   return activeTurnsByConversation.get(conversationKey) || null;
 }
 
+// The session worker id a conversation is bound to. Same hydration shapes
+// validateSelectedConversationBeforeSend handles: camelCase, snake_case, or
+// only the runtime session binding.
+function sdkSessionIdForConversation(conversationId) {
+  const conversation = conversations[String(conversationId || '').trim()] || null;
+  return String(
+    conversation?.sdkSessionId
+    || conversation?.sdk_session_id
+    || conversation?.runtimeSession?.sdkSessionId
+    || conversation?.runtimeSession?.sdk_session_id
+    || '',
+  ).trim();
+}
+
+// The worker-reported steering snapshot for a conversation's session worker
+// (rides the status payload from the worker's heartbeat), or null.
+function workerSteeringForConversation(conversationId) {
+  const sdkSessionId = sdkSessionIdForConversation(conversationId);
+  return sdkSessionId ? (getSessionWorkerState(sdkSessionId)?.steering || null) : null;
+}
+
 // Which conversations deliver a message typed mid-turn INTO the running turn
-// (steering) rather than queueing it behind. Only the Claude worker opts into
-// the mid-turn delivery path today; the others stay strictly serial, so their
+// (steering) rather than queueing it behind. Two ways in: the Claude worker
+// by provider rule, and any session worker that advertises it on its
+// heartbeat steering snapshot (`supported` — the Copilot SDK worker). Workers
+// that do neither (the extension path) stay strictly serial, so their
 // composer keeps saying "Queue".
 function conversationSupportsSteering(conversationId) {
   const conversationKey = String(conversationId || '').trim();
   if (!conversationKey) return false;
-  return String(conversations[conversationKey]?.runtimeProviderType || '').trim().toLowerCase() === 'claude';
+  if (String(conversations[conversationKey]?.runtimeProviderType || '').trim().toLowerCase() === 'claude') return true;
+  return workerSteeringForConversation(conversationKey)?.supported === true;
+}
+
+// Pushed rows the conversation's worker reports it can still pull back out of
+// its runtime (Copilot's queued lane): their bubbles keep Cancel.
+function cancellableSteerIdsForConversation(conversationId) {
+  const ids = workerSteeringForConversation(conversationId)?.cancellableIds;
+  return new Set(Array.isArray(ids) ? ids : []);
 }
 
 // Whether steering into this conversation's live turn is momentarily held,
@@ -451,17 +488,7 @@ function steeringHoldForConversation(conversationId) {
     const pendingQuestions = Number(getPendingQuestionCountsByConversation()?.[conversationKey] || 0);
     if (pendingQuestions > 0) return { held: true, reason: 'question' };
   } catch {}
-  const conversation = conversations[conversationKey] || null;
-  // Same hydration shapes validateSelectedConversationBeforeSend handles:
-  // camelCase, snake_case, or only the runtime session binding.
-  const sdkSessionId = String(
-    conversation?.sdkSessionId
-    || conversation?.sdk_session_id
-    || conversation?.runtimeSession?.sdkSessionId
-    || conversation?.runtimeSession?.sdk_session_id
-    || '',
-  ).trim();
-  const steering = sdkSessionId ? (getSessionWorkerState(sdkSessionId)?.steering || null) : null;
+  const steering = workerSteeringForConversation(conversationKey);
   if (steering && steering.turnActive && !steering.canSteer) {
     // The client's own question knowledge is authoritative both ways: it saw
     // the card answered instantly, while the worker snapshot lags ~10s.
@@ -1304,7 +1331,15 @@ function createMessageNode(msg, msgId = null, force = false) {
     : 'msg-bubble';
 
   const isQueuedUserMessage = msg.role === 'user' && msgId && pendingUserMessageIds.has(msgId);
-  const isCancelInFlight = isQueuedUserMessage && bubbleCancelInFlight.has(msgId);
+  // A row the worker pushed into its runtime but reports as still unconsumed
+  // (Copilot's queued lane, heartbeat `cancellableIds`) keeps Cancel too: the
+  // worker pulls it back out and the row ends cancelled, never answered.
+  const isCancellableSteer = !isQueuedUserMessage
+    && msg.role === 'user'
+    && !!msgId
+    && cancellableSteerIdsForConversation(currentConvId).has(msgId);
+  const showsCancelButton = isQueuedUserMessage || isCancellableSteer;
+  const isCancelInFlight = showsCancelButton && bubbleCancelInFlight.has(msgId);
   const hiddenFromShares = msg?.hiddenFromShares === true;
   const activeTurnMessageId = String(getActiveTurnForConversation(currentConvId)?.messageId || '').trim();
   const sourceMessageId = String(msg?.sourceMessageId || '').trim();
@@ -1328,8 +1363,8 @@ function createMessageNode(msg, msgId = null, force = false) {
       .map((item) => `<button type="button" class="bubble-action-btn" data-action="relay-error-cta" data-cta="${escHtml(item.action)}">${escHtml(item.label)}</button>`)
       .join('')}</div>`
     : '';
-  const userBubbleActionsHtml = (!IS_SHARED_VIEW && isQueuedUserMessage)
-    ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(msgId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Cancelling…' : 'Cancel'}</button></div>`
+  const userBubbleActionsHtml = (!IS_SHARED_VIEW && showsCancelButton)
+    ? buildUserBubbleCancelActionsMarkup(msgId, isCancelInFlight)
     : '';
   // Resent per the relay (any device, survives reloads), or by this page.
   const resendState = isStoppedSteer && msgId
@@ -2448,6 +2483,12 @@ function updateBubbleStopButton(messageId, isStopping) {
   btn.classList.toggle('stopping', isStopping);
 }
 
+// The Cancel control of a user bubble: a pending row's, or a pushed row's the
+// worker can still pull back (both post cancel-queued-turn).
+function buildUserBubbleCancelActionsMarkup(messageId, isCancelling) {
+  return `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn${isCancelling ? ' stopping' : ''}" data-action="cancel-queued" data-message-id="${escHtml(messageId)}"${isCancelling ? ' disabled' : ''}>${isCancelling ? 'Cancelling…' : 'Cancel'}</button></div>`;
+}
+
 function updateUserBubbleCancelButton(messageId, isCancelling) {
   const btn = document.querySelector(`.bubble-action-btn[data-message-id="${messageId}"][data-action="cancel-queued"]`);
   if (!btn) return;
@@ -2463,10 +2504,63 @@ export function removeUserBubbleCancelButton(messageId) {
   if (actionsContainer) actionsContainer.remove();
 }
 
+function clearUnsteerFallbackTimer(messageId) {
+  const timer = unsteerFallbackTimers.get(messageId);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  unsteerFallbackTimers.delete(messageId);
+}
+
 export function clearBubbleCancelState(messageId) {
   const id = String(messageId || '').trim();
   if (!id) return;
   bubbleCancelInFlight.delete(id);
+  clearUnsteerFallbackTimer(id);
+}
+
+// Keeps the Cancel controls of the viewed conversation's pushed rows in step
+// with what its worker reports as still un-steerable. Bubbles are built once
+// (renderMessages skips unchanged payloads), and the worker's set changes on
+// its own clock (the heartbeat), so the status refresh calls this next to the
+// composer sync. Pending rows own their Cancel and are left alone; a row whose
+// un-steer is still being acknowledged keeps its "Cancelling…" until the
+// answer or the fallback arrives.
+export function syncCancellableSteerButtons() {
+  const el = getMessagesElement();
+  if (!el || IS_SHARED_VIEW) return;
+  const cancellableIds = cancellableSteerIdsForConversation(currentConvId);
+  for (const rowNode of el.querySelectorAll('.msg.user[data-message-id]')) {
+    const messageId = String(rowNode.dataset.messageId || '').trim();
+    if (!messageId || pendingUserMessageIds.has(messageId)) continue;
+    const button = rowNode.querySelector('.msg-bubble-actions [data-action="cancel-queued"]');
+    if (cancellableIds.has(messageId)) {
+      if (button) continue;
+      const bubble = rowNode.querySelector('.msg-bubble');
+      if (!bubble) continue;
+      bubble.insertAdjacentHTML('beforeend', buildUserBubbleCancelActionsMarkup(messageId, bubbleCancelInFlight.has(messageId)));
+      continue;
+    }
+    if (button && !bubbleCancelInFlight.has(messageId)) button.closest('.msg-bubble-actions')?.remove();
+  }
+}
+
+// The relay forwarded an un-steer to the worker ('cancel-requested'): the row
+// settles through the socket (message_status 'cancelled' removes the control;
+// an answer after all re-renders it away). If neither lands, hand the control
+// back — as "Cancel" when the worker still lists the row, gone otherwise.
+function armUnsteerFallback(messageId) {
+  clearUnsteerFallbackTimer(messageId);
+  const timer = setTimeout(() => {
+    unsteerFallbackTimers.delete(messageId);
+    bubbleCancelInFlight.delete(messageId);
+    if (cancellableSteerIdsForConversation(currentConvId).has(messageId)) {
+      updateUserBubbleCancelButton(messageId, false);
+    } else {
+      removeUserBubbleCancelButton(messageId);
+    }
+  }, UNSTEER_ACK_FALLBACK_MS);
+  timer?.unref?.();
+  unsteerFallbackTimers.set(messageId, timer);
 }
 
 // Resend of a steer the user's Stop cut off unanswered (kind='stopped').
@@ -2670,6 +2764,14 @@ async function cancelQueuedTurnByMessageId(conversationId, messageId) {
     bubbleCancelInFlight.delete(targetMessageId);
     removeUserBubbleCancelButton(targetMessageId);
     showTransientRelayNotice('Message not found in queue.');
+    return;
+  }
+
+  if (result.acknowledgement === 'cancel-requested') {
+    // The worker pulls the row out of its runtime and settles it through
+    // POST /api/queue-cancelled → message_status 'cancelled'. Keep the
+    // bubble in "Cancelling…" until then (or until the fallback hands it back).
+    armUnsteerFallback(targetMessageId);
     return;
   }
 

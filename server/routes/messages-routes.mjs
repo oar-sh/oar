@@ -18,6 +18,7 @@ import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 import { normalizeWorkerSteeringSnapshot } from '../services/session-worker-registry-service.mjs';
 import {
   buildSteerSettleFailure,
+  steerAgentLabelForProvider,
   STEER_SETTLE_FAILED_CODE,
   STEER_SETTLE_FAILED_STABLE_CODE,
 } from '../../shared/steer-settle-failure.mjs';
@@ -2142,17 +2143,27 @@ export function registerMessagesRoutes(app, deps) {
   // pending — an answer may still be on its way in. A row with NO current
   // attempt (finalized by a legacy responder after a requeue cleared it) makes
   // every attempt-stamped card stale: the empty string matches none of them.
+  // The name the steer-settle wording uses for the runtime that took the
+  // prompt, from the conversation's provider type (the shared mapping the
+  // server runtime's recovery path uses too).
+  function steerSettleAgentLabelForConversation(conversationId) {
+    const id = String(conversationId || '').trim();
+    if (!id) return undefined;
+    return steerAgentLabelForProvider(stmts.getRuntimeSessionByConversation?.get?.(id)?.provider_type);
+  }
+
   /**
-   * Terminal failure for a row whose prompt the Claude CLI already consumed —
-   * a folded or stopped steer whose settle never landed. At-most-once: every
-   * path that would requeue such a row comes here instead, since re-delivery
-   * would run the prompt a second time. `terminalError` lets a worker supply
-   * the path-accurate wording; the default is the fold wording.
+   * Terminal failure for a row whose prompt the worker's runtime already
+   * consumed — a folded or stopped steer whose settle never landed.
+   * At-most-once: every path that would requeue such a row comes here instead,
+   * since re-delivery would run the prompt a second time. `terminalError` lets
+   * a worker supply the path-accurate wording; the default is the fold wording.
    */
   function failConsumedQueueRow(queueRow, { reason = 'recovery', terminalError = null, attemptId = null } = {}) {
+    const agentLabel = steerSettleAgentLabelForConversation(queueRow?.conversation_id);
     const failure = terminalError && typeof terminalError === 'object'
-      ? { ...buildSteerSettleFailure(queueRow), ...terminalError }
-      : buildSteerSettleFailure(queueRow);
+      ? { ...buildSteerSettleFailure(queueRow, { agentLabel }), ...terminalError }
+      : buildSteerSettleFailure(queueRow, { agentLabel });
     const failed = failQueueMessage({
       queueRow,
       messageId: queueRow.id,
@@ -3022,6 +3033,44 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  // The session worker that can still pull a processing row back out of its
+  // runtime: the row's owner first (the worker that claimed it), then the
+  // conversation's bound session. Only a worker whose latest heartbeat lists
+  // the id as cancellable qualifies — the relay never guesses at the runtime's
+  // queue state.
+  function findWorkerHoldingCancellableMessage({ queueRow, conversationId, messageId }) {
+    if (typeof sessionWorkerRegistry?.getWorker !== 'function') return null;
+    const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+    const candidates = [...new Set([
+      normalizeSessionWorkerId(queueRow?.owner_sdk_session_id),
+      normalizeSessionWorkerId(conversation?.sdk_session_id),
+    ].filter(Boolean))];
+    for (const sessionId of candidates) {
+      const worker = sessionWorkerRegistry.getWorker(sessionId);
+      const cancellableIds = Array.isArray(worker?.steering?.cancellableIds) ? worker.steering.cancellableIds : [];
+      if (cancellableIds.includes(messageId)) return worker;
+    }
+    return null;
+  }
+
+  // Asks the owning worker to remove a pushed-but-unconsumed row from its
+  // runtime (`cancel_pushed_message`). True when the control went out over a
+  // live worker socket; the worker then settles the row through
+  // POST /api/queue-cancelled. False (no such worker, id not cancellable, or
+  // the socket is gone) leaves the row on its ordinary path.
+  function requestPushedMessageCancel({ queueRow, conversationId, messageId }) {
+    const worker = findWorkerHoldingCancellableMessage({ queueRow, conversationId, messageId });
+    if (!worker) return false;
+    const sent = sendWorkerControl?.(worker.sdkSessionId, {
+      type: 'cancel_pushed_message',
+      messageId,
+      conversationId,
+    });
+    if (!sent) return false;
+    console.log(`[${ts()}] UNSTEER REQ ${messageId.slice(0, 8)} conv=${conversationId.slice(0, 8)}`);
+    return true;
+  }
+
   app.post('/api/conversation/:conversationId/cancel-queued-turn', auth, (req, res) => {
     const conversationId = String(req.params.conversationId || '').trim();
     const requestedMessageId = String(req.body?.messageId || '').trim();
@@ -3055,6 +3104,19 @@ export function registerMessagesRoutes(app, deps) {
 
     const currentStatus = String(queueRow.status || '').trim().toLowerCase();
     if (currentStatus === 'processing') {
+      // Un-steer: a row the owning worker pushed into its runtime but reports
+      // as still unconsumed (heartbeat `steering.cancellableIds`) can be pulled
+      // back out. The worker answers through POST /api/queue-cancelled once the
+      // runtime confirms the removal; until then the row stays processing.
+      if (requestPushedMessageCancel({ queueRow, conversationId, messageId: requestedMessageId })) {
+        return res.json({
+          ok: true,
+          cancelled: false,
+          acknowledgement: 'cancel-requested',
+          requestedMessageId,
+          status: currentStatus,
+        });
+      }
       return res.json({
         ok: true,
         cancelled: false,
@@ -4907,11 +4969,17 @@ export function registerMessagesRoutes(app, deps) {
       if (steering) {
         const workerForSteering = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
         const stored = workerForSteering?.steering || null;
+        const storedCancellableIds = Array.isArray(stored?.cancellableIds) ? stored.cancellableIds : [];
         const changed = !stored
           || stored.turnActive !== steering.turnActive
           || stored.canSteer !== steering.canSteer
           || (stored.holdReason || null) !== (steering.holdReason || null)
-          || (stored.messageId || null) !== (steering.messageId || null);
+          || (stored.messageId || null) !== (steering.messageId || null)
+          // The Copilot SDK worker's opt-in and its un-steerable set: a flip
+          // in either must reach the status payload (composer gate, bubble
+          // Cancel), so it counts as a change like the hold fields do.
+          || (stored.supported === true) !== (steering.supported === true)
+          || storedCancellableIds.join('\n') !== steering.cancellableIds.join('\n');
         if (workerForSteering && changed) {
           sessionWorkerRegistry?.upsertWorker?.({ ...workerForSteering, steering });
         }
@@ -5006,6 +5074,56 @@ export function registerMessagesRoutes(app, deps) {
       })?.changes || 0);
     }
     res.json({ ok: true, changed });
+  });
+
+  // POST /api/queue-cancelled — the owning worker reports that a pushed but
+  // still unconsumed row was removed from its runtime (an un-steer the user
+  // asked for through cancel-queued-turn → `cancel_pushed_message`). The row
+  // ends exactly like a pending cancel: deleted, its open cards cancelled, no
+  // assistant row, `message_status: cancelled`. Fenced like /api/queue-consumed:
+  // only the row's owner, on the row's current attempt, may settle it.
+  app.post('/api/queue-cancelled', auth, (req, res) => {
+    touchCli();
+    const requesterSessionId = normalizeSessionWorkerId(readBridgeIdentity(req)?.sessionId);
+    if (!requesterSessionId) return res.status(403).json({ error: 'Worker identity required' });
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const messageId = String(req.body?.messageId || '').trim();
+    const attemptId = String(req.body?.attemptId || '').trim() || null;
+    if (!conversationId || !messageId) return res.status(400).json({ error: 'Missing conversationId or messageId' });
+
+    const row = stmts.findQById.get(messageId) || null;
+    if (!row) return res.status(404).json({ error: 'not-found' });
+    if (String(row.conversation_id || '').trim() !== conversationId) {
+      return res.status(409).json({ error: 'conversation-mismatch' });
+    }
+    const status = String(row.status || '').trim().toLowerCase();
+    if (status !== 'processing') return res.status(409).json({ error: 'not-processing', status });
+    if (normalizeSessionWorkerId(row.owner_sdk_session_id) !== requesterSessionId) {
+      return res.status(409).json({ error: 'not-owned' });
+    }
+    const rowAttemptId = String(row.attempt_id || '').trim() || null;
+    if (attemptId && rowAttemptId && attemptId !== rowAttemptId) {
+      console.warn(`[${ts()}] STALE ATTEMPT queue-cancelled ${messageId.slice(0, 8)} attempt=${attemptId.slice(0, 8)} current=${rowAttemptId.slice(0, 8)}`);
+      return res.status(409).json({ error: 'stale_attempt' });
+    }
+
+    // Same transaction shape as the pending cancel above: delete first, so the
+    // question cancel sees no current attempt and flips every pending card of
+    // the row (with foreign keys on, the cascade has already taken them).
+    const cancelPushedTurn = db.transaction(() => {
+      stmts.deleteQueueById.run(messageId);
+      cancelPendingRelayQuestionsForMessage(messageId);
+    });
+    cancelPushedTurn();
+    // A processing row may carry open Stop controls (the live-turn picker can
+    // land on it before it has output); they fail like on a requeue so no
+    // caller waits on a row that no longer exists.
+    settleRelayAbortControlsForQueueMessage(messageId, { ok: false, error: 'queue-cancelled' });
+    settleRelaySubagentAbortControlsForQueueMessage(messageId, { ok: false, error: 'queue-cancelled' });
+
+    io.emit('message_status', { messageId, conversationId, status: 'cancelled' });
+    console.log(`[${ts()}] UNSTEERED ${messageId.slice(0, 8)} conv=${conversationId.slice(0, 8)}`);
+    res.json({ ok: true, cancelled: true });
   });
 
   // POST /api/grok-native-session — Grok worker persists the ACP session id so

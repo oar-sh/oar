@@ -175,6 +175,79 @@ test("renders and answers relay question card in the web UI", async ({ page, req
   }
 });
 
+test("renders a multi-select question card with checkmarks and answers with every ticked choice", async ({ page, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  const questionPrompt = `Playwright multi question ${stamp}: Which controls do you want? Select all that apply.`;
+  let conversationId = "";
+  let messageId = "";
+  let questionId = "";
+
+  try {
+    const queued = await request.post("/api/message", {
+      headers,
+      data: { text: `Playwright multi seed ${stamp}`, relayMode: "autopilot", model: "gpt-5.4-mini", reasoningEffort: "high" },
+    });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "");
+    messageId = String(queuedBody?.messageId || "");
+    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    expect(String(pendingBody?.message?.id || "")).toBe(messageId);
+
+    // What the Claude worker's ask-user bridge posts for `multiSelect: true`
+    // (the Copilot worker infers the same flag from the wording).
+    const created = await request.post("/api/relay-question", {
+      headers,
+      data: {
+        queueId: messageId,
+        messageId,
+        conversationId,
+        mode: "autopilot",
+        prompt: questionPrompt,
+        choices: ["Option A", "Option B", "Option C", "Option D"],
+        allowFreeform: true,
+        timeout_ms: 120000,
+        context: { source: "playwright-e2e", rationale: "Verifying the multi-select card.", multiSelect: true },
+      },
+    });
+    expect(created.ok()).toBeTruthy();
+    questionId = String((await created.json())?.question?.id || "");
+    expect(questionId).toBeTruthy();
+
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    const pendingBanner = page.locator("#pending-question-banner");
+    await expect(pendingBanner).toBeVisible();
+    await pendingBanner.click();
+
+    const questionCard = page.locator(".relay-question-container", { hasText: questionPrompt });
+    await expect(questionCard).toBeVisible();
+    // Checkmarks, not one-shot buttons: ticking does not answer by itself.
+    await expect(questionCard.getByRole("button", { name: "Option A" })).toHaveCount(0);
+    await questionCard.getByLabel("Option A").check();
+    await questionCard.getByLabel("Option C").check();
+    await expect(questionCard).toBeVisible();
+    await questionCard.getByRole("button", { name: "Reply with selection" }).click();
+    await expect(questionCard).not.toBeVisible({ timeout: 10000 });
+
+    const questionState = await request.get(`/api/relay-question/${questionId}`, { headers });
+    expect(questionState.ok()).toBeTruthy();
+    const stateBody = await questionState.json();
+    expect(String(stateBody?.question?.status || "")).toBe("answered");
+    expect(String(stateBody?.question?.answer || "")).toBe("Option A, Option C");
+  } finally {
+    if (messageId && conversationId) {
+      await request.post("/api/response", {
+        headers,
+        data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", reasoningEffort: "high", mode: "autopilot" },
+      }).catch(() => {});
+      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
+    }
+  }
+});
+
 test("shrinks image attachment frames to the rendered image width", async ({ page, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };

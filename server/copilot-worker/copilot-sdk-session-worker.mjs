@@ -4,8 +4,7 @@
 // control polling, activity channels) but executes turns through the Copilot
 // SDK's headless runtime instead of the `copilot` TUI under a PTY.
 //
-// Dormant until phase 3 registers a worker kind for it. Run it by hand against
-// a live relay with:
+// Run it by hand against a live relay with:
 //
 //   COPILOT_WEB_RELAY_CONFIG=server/config.json \
 //   COPILOT_WORKSPACE_ROOT=/path/to/workspace \
@@ -21,6 +20,10 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import {
+  createRunnerLinkBridge,
+  failSettlingRowsOnShutdown,
+} from '../../shared/worker-runtime/runner-link-wiring.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import {
@@ -71,6 +74,11 @@ async function main() {
     abortAckNote: 'copilot session aborted',
     dbg,
   });
+  // The runner reports every flip of its delivery gate; the bridge turns them
+  // into the link's worker.unready / worker.ready frames, so a message queued
+  // while a question card is open is held in the relay queue and steers into
+  // the resumed turn one round trip after the answer.
+  const linkBridge = createRunnerLinkBridge();
   const turnRunner = createCopilotSdkSessionRunner({
     api,
     sdkSessionId,
@@ -94,6 +102,8 @@ async function main() {
       const override = readOptionalMs('COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS');
       return override === undefined ? {} : { getBackgroundTaskTimeoutMs: () => override };
     })(),
+    onDeliveryReadinessChange: (ready) => linkBridge.onDeliveryReadinessChange(ready),
+    canHandBackHeldDelivery: () => linkBridge.canHandBackHeldDelivery(),
     dbg,
   });
 
@@ -110,6 +120,12 @@ async function main() {
     // the crash guard below takes the entries whole so its requeues stay
     // fenced to this attempt.
     getActiveQueueMessageIds: () => turnRunner.getActiveQueueMessageIds().map((entry) => entry.id),
+    // The composer's steering snapshot (Steer / Queue + the hold reason, the
+    // un-steerable rows) and the consumed steers whose settle the runner gave
+    // up on — the relay fails those itself, never re-running them.
+    getSteeringState: () => turnRunner.steeringState(),
+    getSettleFailed: () => turnRunner.getSettleFailed(),
+    onSettleFailedHandled: (ids) => turnRunner.acknowledgeSettleFailed(ids),
   });
 
   const wsLink = createWorkerWebSocketLink({
@@ -119,6 +135,11 @@ async function main() {
     getSessionReady: () => true,
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
+    // Mid-turn steering opt-in: the link keeps signalling readiness while a
+    // delivery is in flight as long as the runner can absorb another message
+    // into the live turn, and withdraws it while the runner holds.
+    getSteeringReady: () => turnRunner.canAcceptSteering(),
+    getDeliveryHeld: () => turnRunner.isDeliveryHeld(),
     onDeliver: async (pending, reason) => {
       dbg('queue.deliver received', `reason=${reason}`, `msgId=${pending?.message?.id || 'none'}`);
       try {
@@ -129,19 +150,31 @@ async function main() {
       }
     },
     onControl: (control) => {
-      // Background-task controls have no Copilot SDK equivalent yet: the
-      // runtime's `session.background_tasks_changed` carries an empty payload
-      // (23 of them fire during a single bash call), so there is no task id to
-      // stop. Logged rather than silently dropped.
-      dbg('worker control ignored (unsupported by the SDK worker)', String(control?.type || '(none)'));
+      const type = String(control?.type || '').trim();
+      if (type === 'cancel_pushed_message') {
+        // Un-steer: pull a pushed-but-unconsumed message back out of the
+        // runtime's queue and cancel its row.
+        void turnRunner.cancelPushedMessage(control?.messageId).catch((error) => {
+          dbg('un-steer failed', error?.message || String(error));
+        });
+        return;
+      }
+      // Background-task controls arrive with phase 3 of the parity plan
+      // (rpc.tasks); until then they are logged rather than silently dropped.
+      dbg('worker control ignored (unsupported by the SDK worker)', type || '(none)');
     },
   });
+  linkBridge.attach(wsLink);
 
   const shutdown = async (signal) => {
     dbg(`shutting down (${signal})`);
     try { wsLink.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
+    // Rows whose prompt the runtime consumed and whose settle marker has not
+    // landed are failed terminally, never left for dead-worker recovery to
+    // requeue (that would run the prompt twice). Bounded.
+    try { await failSettlingRowsOnShutdown({ api, runner: turnRunner }); } catch {}
     // Bounded, like the Cursor worker: stopping the runtime is an RPC, and a
     // hung stop must never make the process ignore the supervisor's SIGTERM.
     try {
