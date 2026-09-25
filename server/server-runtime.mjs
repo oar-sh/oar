@@ -26,6 +26,7 @@ import {
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
+import { sanitizeRelayQuestionContext as sanitizeRelayQuestionContextWith } from './services/relay-question-context.mjs';
 import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { applySchema } from './db-schema.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
@@ -6577,25 +6578,10 @@ function sanitizeRelayQuestionRequest(requestBody) {
   }
 }
 
+// The allow-list lives in services/relay-question-context.mjs (unit-tested);
+// this binds it to the relay's own mode normalizer.
 function sanitizeRelayQuestionContext(rawContext) {
-  if (!rawContext || typeof rawContext !== 'object' || Array.isArray(rawContext)) return null;
-  const context = {};
-  if (typeof rawContext.source === 'string' && rawContext.source.trim()) {
-    context.source = rawContext.source.trim().slice(0, 64);
-  }
-  if (typeof rawContext.rationale === 'string' && rawContext.rationale.trim()) {
-    context.rationale = rawContext.rationale.trim().slice(0, 240);
-  }
-  if (typeof rawContext.queueMessageId === 'string' && rawContext.queueMessageId.trim()) {
-    context.queueMessageId = rawContext.queueMessageId.trim();
-  }
-  if (typeof rawContext.conversationId === 'string' && rawContext.conversationId.trim()) {
-    context.conversationId = rawContext.conversationId.trim();
-  }
-  if (typeof rawContext.relayMode === 'string' && rawContext.relayMode.trim()) {
-    context.relayMode = normalizeRelayMode(rawContext.relayMode) || DEFAULT_RELAY_MODE;
-  }
-  return Object.keys(context).length ? context : null;
+  return sanitizeRelayQuestionContextWith(rawContext, { normalizeRelayMode, defaultRelayMode: DEFAULT_RELAY_MODE });
 }
 
 
