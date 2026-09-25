@@ -4486,6 +4486,45 @@ test('subagent tasks publish model, inheritance, and subagent type', async () =>
   await settled(runner);
 });
 
+test('a subagent\'s own frames supply its real model and its current tool call', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_use', id: 'toolu-opus', name: 'Agent', input: { model: 'opus', prompt: 'fix it' } }] },
+  });
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'yaw fix' }]));
+  turn.emit({ type: 'system', subtype: 'task_started', task_id: 'agent-1', tool_use_id: 'toolu-opus', task_type: 'local_agent', description: 'yaw fix' });
+  // The subagent's frames: the API names the real model, and the tool_use
+  // input carries the command (multi-line input is flattened to one line).
+  turn.emit({
+    type: 'assistant',
+    parent_tool_use_id: 'toolu-opus',
+    message: {
+      model: 'claude-opus-5-5',
+      content: [{ type: 'tool_use', id: 'toolu-ps', name: 'PowerShell', input: { command: 'cd C:\\Users\\dev\\repo\nGet-Content package.json' } }],
+    },
+  });
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'yaw fix' }]));
+  turn.emit(resultMessage('spawned', 'native-1'));
+  assert.equal(await pending, true);
+
+  const publish = await waitFor(() => stub.calls.findLast(
+    (call) => call.routePath === '/api/background-tasks' && call.body.tasks?.[0]?.lastToolCall,
+  ), { label: 'publish carrying the tool call' });
+  const task = publish.body.tasks[0];
+  assert.equal(task.model, 'claude-opus-5-5', 'the observed API model beats the spawn alias');
+  assert.equal(task.modelInherited, false);
+  assert.equal(task.lastToolCall, 'Tool (PowerShell): cd C:\\Users\\dev\\repo Get-Content package.json');
+  turn.endInput();
+  await settled(runner);
+});
+
 test('an abort control interrupts the turn but keeps the process alive', async () => {
   const stub = makeApiStub();
   const turn = scriptedTurn();

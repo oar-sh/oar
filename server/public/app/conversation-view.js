@@ -104,6 +104,7 @@ import {
 import { isChatInteractionHeld, selectionIntersectsNode } from './selection-guard.mjs';
 import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
 import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
+import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
@@ -1446,34 +1447,7 @@ export function decorateActivityText(text) {
     return tokenMasked.replace(/([A-Za-z]:)?(?:[\\/~.]?[\\/])(?:[^\\/\s]+[\\/])+([^\\/\s]+)/g, (_m, _prefix, basename) => basename);
   };
   const sharedSafeValue = IS_SHARED_VIEW ? maskSharedPathSegments(value) : value;
-  if (/^[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u.test(sharedSafeValue)) return sharedSafeValue;
-  if (sharedSafeValue.startsWith('● ')) return `🔄 ${sharedSafeValue.slice(2).trim()}`;
-  if (/^Model selected:/i.test(sharedSafeValue)) return `🧠 ${sharedSafeValue}`;
-  if (/^Search \((glob|grep)\)/i.test(sharedSafeValue)) return `🔍 ${sharedSafeValue}`;
-  if (/^Tool \(ask_user\)/i.test(sharedSafeValue)) return `❓ ${sharedSafeValue}`;
-  if (/^Tool \(view\)/i.test(sharedSafeValue)) return `👀 ${sharedSafeValue}`;
-  if (/^Tool \(apply_patch\)/i.test(sharedSafeValue)) return `🪡 ${sharedSafeValue}`;
-  if (/^Tool \(powershell\)/i.test(sharedSafeValue)) return `🪓 ${sharedSafeValue}`;
-  if (/^Tool \(edit\)/i.test(sharedSafeValue)) return `📝 ${sharedSafeValue}`;
-  if (/^Tool \(read_file\)/i.test(sharedSafeValue)) return `📄 ${sharedSafeValue}`;
-  if (/^Tool \((grep_search|file_search)\)/i.test(sharedSafeValue)) return `🔎 ${sharedSafeValue}`;
-  if (/^Tool \(semantic_search\)/i.test(sharedSafeValue)) return `🧭 ${sharedSafeValue}`;
-  if (/^Tool \(vscode_listCodeUsages\)/i.test(sharedSafeValue)) return `🔗 ${sharedSafeValue}`;
-  if (/^Tool \(vscode_renameSymbol\)/i.test(sharedSafeValue)) return `✏️ ${sharedSafeValue}`;
-  if (/^Tool \(list_dir\)/i.test(sharedSafeValue)) return `📂 ${sharedSafeValue}`;
-  if (/^Tool \(create_directory\)/i.test(sharedSafeValue)) return `📁 ${sharedSafeValue}`;
-  if (/^Tool \((delete|remove)\)/i.test(sharedSafeValue)) return `🗑️ ${sharedSafeValue}`;
-  if (/^Tool \(execution_subagent\)/i.test(sharedSafeValue)) return `🚀 ${sharedSafeValue}`;
-  if (/^Tool \(get_errors\)/i.test(sharedSafeValue)) return `🚨 ${sharedSafeValue}`;
-  if (/^Tool \(debug_[^)]+\)/i.test(sharedSafeValue)) return `🐞 ${sharedSafeValue}`;
-  if (/^Tool \(fetch_webpage\)/i.test(sharedSafeValue)) return `🌐 ${sharedSafeValue}`;
-  if (/^Tool \(github_[^)]+\)/i.test(sharedSafeValue)) return `🐙 ${sharedSafeValue}`;
-  if (/^Tool \(run_in_terminal\)/i.test(sharedSafeValue)) return `🖥️ ${sharedSafeValue}`;
-  if (/^Tool \((create_file|write)\)/i.test(sharedSafeValue)) return `🆕 ${sharedSafeValue}`;
-  if (/^Tool \((bash|shell|terminal)\)/i.test(sharedSafeValue)) return `🔧 ${sharedSafeValue}`;
-  if (/^Tool \((sql|sqlite)\)/i.test(sharedSafeValue)) return `🗄️ ${sharedSafeValue}`;
-  if (/^Tool \(/i.test(sharedSafeValue)) return `🛠️ ${sharedSafeValue}`;
-  return `ℹ️ ${sharedSafeValue}`;
+  return prefixToolActivityEmoji(sharedSafeValue);
 }
 
 export function renderThoughtsMarkup(thoughts) {

@@ -6,8 +6,10 @@ import { buildClaudeUserContent } from './claude-attachments.mjs';
 import {
   compactBoundaryActivityAction,
   createSdkMessageNormalizer,
+  displayToolName,
   formatApiRetryNotice,
   isSubagentToolName,
+  summarizeToolInput,
 } from './sdk-message-normalizer.mjs';
 import { digestFromRunRecord, digestFromJournal } from './workflow-progress-digest.mjs';
 import { createClaudeSessionRootResolver } from '../services/claude-session-root-service.mjs';
@@ -53,6 +55,7 @@ export { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT };
 
 /** Task types that run a model of their own (vs. bash/monitor/workflow). */
 const AGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
+const MAX_TASK_TOOL_CALL_CHARS = 300;
 
 // ---------------------------------------------------------------------------
 // Workflow progress sources (CLI 2.1.226 on-disk formats)
@@ -1462,7 +1465,8 @@ export function createClaudeSessionRunner({
         // the next publish. Bash & co. get no model at all.
         const agentLike = AGENT_TASK_TYPES.has(String(task.taskType || ''));
         const pinnedModel = (task.toolUseId && processRef.subagentSpawns.get(task.toolUseId)) || '';
-        const model = agentLike ? (pinnedModel || processRef.initModel || null) : null;
+        const activity = (task.toolUseId && processRef.subagentActivity.get(task.toolUseId)) || {};
+        const model = agentLike ? (activity.model || pinnedModel || processRef.initModel || null) : null;
         return {
           taskId,
           taskType: task.taskType,
@@ -1470,11 +1474,12 @@ export function createClaudeSessionRunner({
           startedAt: task.startedAt || null,
           summary: task.summary || null,
           lastToolName: task.lastToolName || null,
+          lastToolCall: (agentLike && activity.lastToolCall) || null,
           totalTokens: task.totalTokens ?? null,
           toolUseId: task.toolUseId || null,
           subagentType: task.subagentType || null,
           model,
-          modelInherited: Boolean(model && !pinnedModel),
+          modelInherited: Boolean(model && !pinnedModel && !activity.model),
           // The workflow digest (poller below) rides the same row; the relay
           // sanitizer whitelists and re-clamps it before storing.
           ...(task.workflowProgress ? { workflowProgress: task.workflowProgress } : {}),
@@ -1779,6 +1784,33 @@ export function createClaudeSessionRunner({
     }
   }
 
+  // A subagent's own assistant frames (parent_tool_use_id = the spawning
+  // tool_use id, the same key as task.toolUseId) carry what the task events
+  // never do: the API model that actually answers (a spawn pin is only an
+  // alias like "opus") and the full input of the tool it is calling now.
+  // Single-lined and capped: the panel crops it to its width.
+  function recordSubagentActivity(sdkMessage) {
+    const parentId = String(sdkMessage?.parent_tool_use_id || '').trim();
+    if (!parentId) return;
+    const entry = proc.subagentActivity.get(parentId) || {};
+    const model = String(sdkMessage?.message?.model || '').trim();
+    if (model && model !== '<synthetic>') entry.model = model;
+    const blocks = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
+    for (const block of blocks) {
+      if (block?.type !== 'tool_use') continue;
+      const toolName = displayToolName(block.name) || 'tool';
+      const summary = summarizeToolInput(toolName, block.input).replace(/\s+/g, ' ').trim();
+      entry.lastToolCall = (summary ? `Tool (${toolName}): ${summary}` : `Tool (${toolName})`)
+        .slice(0, MAX_TASK_TOOL_CALL_CHARS);
+    }
+    proc.subagentActivity.delete(parentId);
+    proc.subagentActivity.set(parentId, entry);
+    while (proc.subagentActivity.size > 100) {
+      proc.subagentActivity.delete(proc.subagentActivity.keys().next().value);
+    }
+    if (entry.model || entry.lastToolCall) publishBackgroundTasks({ throttled: true });
+  }
+
   // Between-turn notices carried into the next activated context, as either a
   // plain line or a prepared publisher action (a compaction boundary has to
   // keep the structured metadata the transcript's break row is built from —
@@ -1847,6 +1879,7 @@ export function createClaudeSessionRunner({
     const type = String(sdkMessage?.type || '');
     if (type === 'assistant') {
       recordSubagentSpawns(sdkMessage);
+      recordSubagentActivity(sdkMessage);
       return;
     }
     if (type !== 'system') return;
@@ -2696,6 +2729,7 @@ export function createClaudeSessionRunner({
       // tool_use id → explicitly pinned model of a subagent spawn block; the
       // task panel's model column resolves through this at publish time.
       subagentSpawns: new Map(),
+      subagentActivity: new Map(),
       initModel: '',
       // Set when the CLI reported a session-scoped refusal fallback; the next
       // delivered turn repins the composer's model instead of trusting

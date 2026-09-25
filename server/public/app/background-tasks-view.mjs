@@ -5,6 +5,8 @@
 // `backgroundTasks` on reload; hidden whenever the set is empty.
 
 import { apiFetch } from './api-client.js';
+import { humanizeModelLabel } from './model-selector-options.mjs';
+import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
 import {
   getPreviewsForConversation,
   renderPreviewRowsInto,
@@ -69,11 +71,26 @@ function taskKindLabel(task) {
   return label === 'Subagent' && subagentType ? subagentType : label;
 }
 
-function formatTaskModel(task) {
-  const model = String(task?.model || '').trim();
-  if (!model) return '';
-  const short = model.replace(/^claude-/, '');
-  return task?.modelInherited === true ? `${short} (inherited)` : short;
+// "claude-opus-5-5" → "Opus 5.5". A bare alias ("opus") is what a spawn pin
+// carries until the subagent's first answer names the real model.
+export function formatTaskModelLabel(model) {
+  const value = String(model || '').trim();
+  if (!value) return '';
+  if (/^claude-/i.test(value)) return humanizeModelLabel(value);
+  if (/^[a-z]+(\[[^\]]+\])?$/i.test(value)) return value.charAt(0).toUpperCase() + value.slice(1);
+  return humanizeModelLabel(value);
+}
+
+// Detail line: the live tool call when the worker saw one ("🪓 Tool
+// (PowerShell): cd …", cropped to the row by CSS), else the SDK's progress
+// summary, else the bare tool name.
+export function taskActivityText(task) {
+  const toolCall = String(task?.lastToolCall || '').trim();
+  if (toolCall) return { text: prefixToolActivityEmoji(toolCall), toolCall: true };
+  const summary = String(task?.summary || '').trim();
+  if (summary) return { text: summary, toolCall: false };
+  const lastToolName = String(task?.lastToolName || '').trim();
+  return { text: lastToolName ? `using ${lastToolName}` : '', toolCall: false };
 }
 
 // Compact token counts: "812 tok", "62.2k tok", "1.2M tok". Exported for the
@@ -180,7 +197,7 @@ function buildWorkflowAgentRow(agent) {
   const activityText = state === 'running' && lastToolName ? `— using ${lastToolName}` : '';
 
   const meta = [];
-  const model = String(agent.model ?? '').trim().replace(/^claude-/, '');
+  const model = formatTaskModelLabel(agent.model);
   if (model) meta.push(model);
   const tokens = formatTaskTokens(agent.tokens);
   if (tokens) meta.push(tokens);
@@ -364,16 +381,11 @@ function renderTaskRow(conversationId, task) {
   const key = `${conversationId}:${task.taskId}`;
   const stopping = stopsInFlight.has(key);
   const elapsed = formatElapsed(task.startedAt);
-  // Second line: progress first ("using Bash" prefixed so a bare tool name
-  // can't read as the task's kind), then model. Token usage renders as its
-  // own always-visible element on the row's right side instead of riding
-  // this clampable line, so a long summary can never crowd it out.
-  const summary = String(task.summary || '').trim();
-  const lastToolName = String(task.lastToolName || '').trim();
-  const detail = [
-    summary || (lastToolName ? `using ${lastToolName}` : ''),
-    formatTaskModel(task),
-  ].filter(Boolean).join(' · ');
+  // Token usage and the model render on the row's right side instead of
+  // riding the detail line, so a long tool call can never crowd them out.
+  const activity = taskActivityText(task);
+  const modelLabel = formatTaskModelLabel(task.model);
+  const modelTitle = task.modelInherited === true ? `${task.model} (inherited from the session)` : task.model;
   const tokens = formatTaskTokens(task.totalTokens);
   // Workflow rows with a digest get a fold chevron plus an (initially empty)
   // tree container right below the row; renderBackgroundTasksPanel fills the
@@ -392,10 +404,13 @@ function renderTaskRow(conversationId, task) {
       ${foldButton}<span class="bg-task-icon" title="${escHtml(task.taskType || 'task')}">${taskIcon(task.taskType)}</span>
       <span class="bg-task-main">
         <span class="bg-task-desc">${escHtml(task.description || task.taskId)}</span>
-        ${detail ? `<span class="bg-task-detail">${escHtml(detail)}</span>` : ''}
+        ${activity.text ? `<span class="bg-task-detail${activity.toolCall ? ' bg-task-toolcall' : ''}" title="${escHtml(activity.text)}">${escHtml(activity.text)}</span>` : ''}
       </span>
       <span class="bg-task-side">
-        <span class="bg-task-badge">${escHtml(taskKindLabel(task))}</span>
+        <span class="bg-task-side-head">
+          ${modelLabel ? `<span class="bg-task-model" title="${escHtml(modelTitle)}">${escHtml(modelLabel)}</span>` : ''}
+          <span class="bg-task-badge">${escHtml(taskKindLabel(task))}</span>
+        </span>
         <span class="bg-task-side-status">
           ${tokens ? `<span class="bg-task-tokens">${escHtml(tokens)}</span>` : ''}
           <span class="bg-task-elapsed">${escHtml(elapsed)}</span>

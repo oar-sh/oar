@@ -6934,6 +6934,7 @@ export function registerMessagesRoutes(app, deps) {
         startedAt: Number(task?.startedAt) || null,
         summary: String(task?.summary || '').trim().slice(0, 500) || null,
         lastToolName: String(task?.lastToolName || '').trim() || null,
+        lastToolCall: String(task?.lastToolCall || '').replace(/\s+/g, ' ').trim().slice(0, 300) || null,
         totalTokens: Number.isFinite(Number(task?.totalTokens)) ? Number(task.totalTokens) : null,
         subagentType: String(task?.subagentType || '').trim().slice(0, 120) || null,
         model: String(task?.model || '').trim().slice(0, 120) || null,

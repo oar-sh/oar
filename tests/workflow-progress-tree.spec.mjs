@@ -231,7 +231,7 @@ test.describe("finished background task cards in the transcript", () => {
         "verify:finding-1",
       ]);
       await expect(completedTree.locator(".bg-task-agent-meta").first()).toHaveText(
-        "sonnet-5 · 62.2k tok · 27 tools · 4m20s",
+        "Sonnet 5 · 62.2k tok · 27 tools · 4m20s",
       );
       await expect(completedTree.locator(".bg-task-tree-omitted")).toHaveText("+3 more agents");
 
@@ -356,10 +356,10 @@ test.describe("workflow progress tree in the background-tasks panel", () => {
         "verify:finding-2",
       ]);
       await expect(tree.locator(".bg-task-agent-meta")).toHaveText([
-        "sonnet-5 · 62.2k tok · 27 tools · 4m20s",
-        "sonnet-5 · 48.1k tok · 19 tools · 4m5s",
-        "sonnet-5 · 12.8k tok · 6 tools — using Grep",
-        "sonnet-5",
+        "Sonnet 5 · 62.2k tok · 27 tools · 4m20s",
+        "Sonnet 5 · 48.1k tok · 19 tools · 4m5s",
+        "Sonnet 5 · 12.8k tok · 6 tools — using Grep",
+        "Sonnet 5",
       ]);
 
       // Only the running agent shows a live-activity segment.
@@ -437,6 +437,60 @@ test.describe("workflow progress tree in the background-tasks panel", () => {
       await expect(page.locator(`.bg-task-tree[data-task-id="${ids.bashTaskId}"]`)).toHaveCount(0);
       // The only chevron in the panel belongs to the workflow row.
       await expect(panel.locator(".bg-task-fold")).toHaveCount(1);
+    } finally {
+      await cleanupConversation(request, conversationId);
+    }
+  });
+
+  test("a long task list scrolls inside the panel; subagent rows show model and live tool call", async ({ page, request }) => {
+    const ids = testIds();
+    const seedText = `bg-task-scroll-${ids.workflowTaskId}`;
+    let conversationId = "";
+    try {
+      conversationId = await seedConversation(request, seedText);
+      const now = Date.now();
+      const tasks = Array.from({ length: 12 }, (_, index) => ({
+        taskId: `agent-${ids.workflowTaskId}-${index}`,
+        taskType: "local_agent",
+        subagentType: "general-purpose",
+        description: `Subagent job ${index}`,
+        startedAt: now - 60_000,
+        model: "claude-opus-5-5",
+        lastToolName: "PowerShell",
+        lastToolCall: `Tool (PowerShell): cd C:\\Users\\dev\\repo; Get-Content package.json | Select-String -Pattern '"(test|guards|build|typecheck|lint|format)"' ${"-Context 2 ".repeat(20)}`,
+        totalTokens: 305_000,
+      }));
+      await publishTasks(request, conversationId, tasks);
+      await page.setViewportSize({ width: 1280, height: 720 });
+      await openConversationTasksPanel(page, seedText);
+
+      // The list scrolls inside the panel instead of growing past the window.
+      const list = page.locator("#background-tasks-list");
+      const metrics = await list.evaluate((el) => ({
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+        overflowY: getComputedStyle(el).overflowY,
+      }));
+      expect(metrics.overflowY).toBe("auto");
+      expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
+      const lastRow = page.locator(`.bg-task-row[data-task-id="agent-${ids.workflowTaskId}-11"]`);
+      await lastRow.scrollIntoViewIfNeeded();
+      await expect(lastRow).toBeInViewport();
+      await expect(page.locator("#background-tasks-summary")).toBeInViewport();
+
+      // Model beside the kind pill; the tool call is one cropped line.
+      const row = page.locator(`.bg-task-row[data-task-id="agent-${ids.workflowTaskId}-0"]`);
+      await expect(row.locator(".bg-task-side-head .bg-task-model")).toHaveText("Opus 5.5");
+      await expect(row.locator(".bg-task-side-head .bg-task-badge")).toHaveText("general-purpose");
+      const toolCall = row.locator(".bg-task-detail.bg-task-toolcall");
+      await expect(toolCall).toContainText("🪓 Tool (PowerShell): cd C:\\Users\\dev\\repo;");
+      const crop = await toolCall.evaluate((el) => ({
+        lineHeight: parseFloat(getComputedStyle(el).lineHeight) || 20,
+        height: el.getBoundingClientRect().height,
+        cropped: el.scrollWidth > el.clientWidth,
+      }));
+      expect(crop.cropped).toBe(true);
+      expect(crop.height).toBeLessThan(crop.lineHeight * 1.5);
     } finally {
       await cleanupConversation(request, conversationId);
     }

@@ -101,6 +101,8 @@ const {
   formatTaskTokens,
   workflowRunCardTitle,
   buildWorkflowRunCard,
+  formatTaskModelLabel,
+  taskActivityText,
 } = await import('./background-tasks-view.mjs');
 
 // Normalized digest shape (values lifted from the reference run record in
@@ -163,13 +165,13 @@ test('workflow tree renders logs, phase groups, and two-line agent rows from a d
   assert.equal(collectByClass(doneRow, 'bg-task-agent-label')[0].textContent, 'review:logic');
   assert.equal(
     collectByClass(doneRow, 'bg-task-agent-meta')[0].textContent,
-    'sonnet-5 · 62.2k tok · 27 tools · 4m20s',
+    'Sonnet 5 · 62.2k tok · 27 tools · 4m20s',
   );
   // Null tokens/tools/duration are simply omitted, and queued renders ○.
   const queuedRow = agentRows[2];
   assert.equal(collectByClass(queuedRow, 'bg-task-agent-state')[0].textContent, '○');
   assert.equal(collectByClass(queuedRow, 'bg-task-agent-label')[0].textContent, 'verify:model-id.mjs');
-  assert.equal(collectByClass(queuedRow, 'bg-task-agent-meta')[0].textContent, 'sonnet-5');
+  assert.equal(collectByClass(queuedRow, 'bg-task-agent-meta')[0].textContent, 'Sonnet 5');
   // Grouping: Review header precedes its two agents, Verify precedes the third.
   const order = container.children.map((child) => child.className);
   assert.deepEqual(order, [
@@ -199,7 +201,7 @@ test('the running agent shows its last tool as a muted activity segment on the m
     collectByClass(runningMeta, 'bg-task-agent-activity').length,
     'the activity is the always-visible metrics line\'s last segment',
   );
-  assert.equal(runningMeta.textContent, 'sonnet-5 · 39.1k tok · 17 tools · 1m59s — using Read');
+  assert.equal(runningMeta.textContent, 'Sonnet 5 · 39.1k tok · 17 tools · 1m59s — using Read');
   assert.equal(collectByClass(agentRows[0], 'bg-task-agent-activity').length, 0, 'done agents show no activity');
 });
 
@@ -312,10 +314,54 @@ test('the flat row renders tokens as their own element that a long summary canno
   }]);
 
   assert.match(listEl.innerHTML, /<span class="bg-task-tokens">82\.4k tok<\/span>/);
-  const detail = /<span class="bg-task-detail">([^<]*)<\/span>/.exec(listEl.innerHTML)?.[1] ?? '';
+  const detail = /<span class="bg-task-detail"[^>]*>([^<]*)<\/span>/.exec(listEl.innerHTML)?.[1] ?? '';
   assert.match(detail, /reviewing conversation-view/, 'detail keeps the summary');
-  assert.match(detail, /opus-4-6/, 'detail keeps the model');
-  assert.doesNotMatch(detail, /tok/, 'token usage no longer rides the detail concat');
+  assert.doesNotMatch(detail, /tok|Opus/, 'tokens and model live on the side, not the detail line');
+});
+
+test('the model sits beside the kind pill as a readable version label', () => {
+  setBackgroundTasksConversation('conv-model');
+  setConversationBackgroundTasks('conv-model', [{
+    taskId: 'agent-model',
+    taskType: 'local_agent',
+    subagentType: 'general-purpose',
+    description: 'T-219 client door interaction',
+    startedAt: Date.now(),
+    model: 'claude-opus-5-5',
+  }]);
+  const head = /<span class="bg-task-side-head">([\s\S]*?)<\/span>\s*<span class="bg-task-side-status">/.exec(listEl.innerHTML)?.[1] ?? '';
+  assert.match(head, /<span class="bg-task-model" title="claude-opus-5-5">Opus 5\.5<\/span>\s*<span class="bg-task-badge">general-purpose<\/span>/);
+});
+
+test('a live tool call rides the detail line with its transcript emoji, marked for one-line cropping', () => {
+  setBackgroundTasksConversation('conv-toolcall');
+  setConversationBackgroundTasks('conv-toolcall', [{
+    taskId: 'agent-tool',
+    taskType: 'local_agent',
+    description: 'yaw fix',
+    startedAt: Date.now(),
+    model: 'claude-opus-5-5',
+    lastToolName: 'PowerShell',
+    summary: 'older progress summary',
+    lastToolCall: 'Tool (PowerShell): cd C:\\Users\\dev\\repo; Get-Content package.json | Select-String -Pattern "(test|lint)"',
+  }]);
+  const detail = /<span class="bg-task-detail bg-task-toolcall"[^>]*>([^<]*)<\/span>/.exec(listEl.innerHTML)?.[1] ?? '';
+  assert.match(detail, /^🪓 Tool \(PowerShell\): cd C:\\Users\\dev\\repo; Get-Content package\.json \| Select-String -Pattern &quot;\(test\|lint\)&quot;$/);
+});
+
+test('model labels humanize full ids and capitalize bare spawn aliases', () => {
+  assert.equal(formatTaskModelLabel('claude-opus-5-5'), 'Opus 5.5');
+  assert.equal(formatTaskModelLabel('claude-opus-5-5[1m]'), 'Opus 5.5 [1m]');
+  assert.equal(formatTaskModelLabel('claude-haiku-4-5-20251001'), 'Haiku 4.5');
+  assert.equal(formatTaskModelLabel('opus'), 'Opus');
+  assert.equal(formatTaskModelLabel(''), '');
+});
+
+test('the detail line prefers the tool call, then the summary, then the bare tool name', () => {
+  assert.deepEqual(taskActivityText({ lastToolCall: 'Tool (Bash): npm test', summary: 's', lastToolName: 'Bash' }), { text: '🔧 Tool (Bash): npm test', toolCall: true });
+  assert.deepEqual(taskActivityText({ summary: 'reading files', lastToolName: 'Read' }), { text: 'reading files', toolCall: false });
+  assert.deepEqual(taskActivityText({ lastToolName: 'Read' }), { text: 'using Read', toolCall: false });
+  assert.deepEqual(taskActivityText({}), { text: '', toolCall: false });
 });
 
 // ---------------------------------------------------------------------------

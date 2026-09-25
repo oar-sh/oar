@@ -2522,6 +2522,13 @@
      (badge above tokens/elapsed/Stop) so the badge cannot float mid-row when
      the wrapped description spans two lines. */
   .bg-task-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+  .bg-task-side-head { display: flex; align-items: center; gap: 8px; }
+  .bg-task-model { color: var(--text); font-size: var(--fs-meta-sm); white-space: nowrap; }
+  /* Many tasks must not push the composer off-screen: the list scrolls inside
+     the panel while the summary line stays put. */
+  #background-tasks-list {
+    max-height: min(45vh, 420px); overflow-y: auto; overscroll-behavior: contain;
+  }
   .bg-task-side-status { display: flex; align-items: center; gap: 10px; }
   /* Mobile readability: bounded wrapping instead of single-line ellipsis.
      Long text clamps to two lines so the tail (the part that distinguishes
@@ -2537,6 +2544,19 @@
     background: var(--bg3); white-space: nowrap;
   }
   .bg-task-detail { color: var(--muted); font-size: var(--fs-meta-sm); }
+  /* A live tool call is one line cropped to the row: the command's head is
+     what identifies it, and wrapping would make rows jump on every call. */
+  .bg-task-detail.bg-task-toolcall {
+    display: block; white-space: nowrap; text-overflow: ellipsis; overflow: hidden;
+  }
+  /* A phone row is too narrow for one line to say anything; two clamped lines
+     fit beside the side column's height anyway. */
+  @media (max-width: 680px) {
+    .bg-task-detail.bg-task-toolcall {
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      white-space: normal; overflow-wrap: anywhere;
+    }
+  }
   .bg-task-tokens { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .bg-task-elapsed { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .bg-task-stop {
