@@ -318,6 +318,17 @@
 
   html {
     font-size: var(--font-scale-percent, 100%);
+    /* Mobile browsers otherwise inflate text on rotation. */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+  /* A rotated phone must keep its portrait text size. Portrait scales with
+     the width (3.4vw, phone rule below); landscape scales with the height,
+     which the browser's toolbars shorten by ~14% versus the portrait width,
+     hence 3.9vh. :root outranks the later width-based html rule, which a
+     narrow phone still matches in landscape. */
+  @media (pointer: coarse) and (orientation: landscape) and (max-height: 500px) {
+    :root { font-size: calc(clamp(12px, 3.9vh, 14px) * var(--font-scale, 1)); }
   }
   html, body {
     height: 100%;

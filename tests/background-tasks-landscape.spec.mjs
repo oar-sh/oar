@@ -21,7 +21,7 @@ async function touchSwipe(cdp, x, fromY, toY) {
   await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
 }
 
-test("phone landscape keeps the composer on screen and the task list touch-scrollable", async ({ page, request }) => {
+test("phone landscape keeps portrait text size, the composer on screen, and the task list touch-scrollable", async ({ page, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
   let conversationId = "";
@@ -64,6 +64,11 @@ test("phone landscape keeps the composer on screen and the task list touch-scrol
         clientHeight: list.clientHeight,
       };
     });
+    // Rotating keeps the portrait text size (Pixel 7 portrait root: 14px);
+    // the desktop root (16px) used to apply once the width passed 680px.
+    const rootFontPx = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize));
+    expect(rootFontPx).toBeGreaterThanOrEqual(12);
+    expect(rootFontPx).toBeLessThanOrEqual(14.01);
     expect(layout.inputBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
     expect(layout.sendBottom).toBeLessThanOrEqual(layout.viewportHeight);
     expect(layout.scrollHeight).toBeGreaterThan(layout.clientHeight);
