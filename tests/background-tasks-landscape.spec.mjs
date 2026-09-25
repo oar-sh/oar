@@ -55,7 +55,7 @@ test("phone landscape keeps portrait text size, the composer on screen, and the 
     await expect(panel).toHaveAttribute("open", "");
 
     const layout = await page.evaluate(() => {
-      const list = document.getElementById("background-tasks-list");
+      const list = document.getElementById("background-panel-body");
       return {
         viewportHeight: innerHeight,
         inputBottom: document.getElementById("input-area").getBoundingClientRect().bottom,
@@ -73,7 +73,7 @@ test("phone landscape keeps portrait text size, the composer on screen, and the 
     expect(layout.sendBottom).toBeLessThanOrEqual(layout.viewportHeight);
     expect(layout.scrollHeight).toBeGreaterThan(layout.clientHeight);
 
-    const list = page.locator("#background-tasks-list");
+    const list = page.locator("#background-panel-body");
     const box = await list.boundingBox();
     const cdp = await page.context().newCDPSession(page);
     await touchSwipe(cdp, Math.round(box.x + box.width / 2), Math.round(box.y + box.height - 6), Math.round(box.y + 6));

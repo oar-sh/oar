@@ -465,7 +465,7 @@ test.describe("workflow progress tree in the background-tasks panel", () => {
       await openConversationTasksPanel(page, seedText);
 
       // The list scrolls inside the panel instead of growing past the window.
-      const list = page.locator("#background-tasks-list");
+      const list = page.locator("#background-panel-body");
       const metrics = await list.evaluate((el) => ({
         scrollHeight: el.scrollHeight,
         clientHeight: el.clientHeight,

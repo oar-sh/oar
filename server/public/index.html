@@ -2535,11 +2535,11 @@
   .bg-task-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
   .bg-task-side-head { display: flex; align-items: center; gap: 8px; }
   .bg-task-model { color: var(--text); font-size: var(--fs-meta-sm); white-space: nowrap; }
-  /* Many tasks must not push the composer off-screen: the list scrolls inside
-     the panel while the summary line stays put. The dvh term keeps the whole
+  /* Many tasks or previews must not push the composer off-screen: both lists
+     scroll together inside the panel while the summary line stays put. The dvh term keeps the whole
      composer on screen in phone landscape, where 45vh alone left the input
      row clipped below the fold (header + the rest of the composer take ~296px). */
-  #background-tasks-list {
+  #background-panel-body {
     max-height: clamp(64px, calc(100dvh - 296px), min(45vh, 420px));
     overflow-y: auto; overscroll-behavior: contain;
   }
@@ -5141,8 +5141,10 @@
       <div id="slash-autocomplete-popup" aria-hidden="true" role="listbox"></div>
       <details id="background-tasks-panel" hidden>
         <summary id="background-tasks-summary"></summary>
-        <div id="background-previews-list"></div>
-        <div id="background-tasks-list"></div>
+        <div id="background-panel-body">
+          <div id="background-previews-list"></div>
+          <div id="background-tasks-list"></div>
+        </div>
       </details>
       <div class="input-row">
         <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">
