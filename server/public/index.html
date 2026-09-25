@@ -2525,9 +2525,12 @@
   .bg-task-side-head { display: flex; align-items: center; gap: 8px; }
   .bg-task-model { color: var(--text); font-size: var(--fs-meta-sm); white-space: nowrap; }
   /* Many tasks must not push the composer off-screen: the list scrolls inside
-     the panel while the summary line stays put. */
+     the panel while the summary line stays put. The dvh term keeps the whole
+     composer on screen in phone landscape, where 45vh alone left the input
+     row clipped below the fold (header + the rest of the composer take ~296px). */
   #background-tasks-list {
-    max-height: min(45vh, 420px); overflow-y: auto; overscroll-behavior: contain;
+    max-height: clamp(64px, calc(100dvh - 296px), min(45vh, 420px));
+    overflow-y: auto; overscroll-behavior: contain;
   }
   .bg-task-side-status { display: flex; align-items: center; gap: 10px; }
   /* Mobile readability: bounded wrapping instead of single-line ellipsis.
