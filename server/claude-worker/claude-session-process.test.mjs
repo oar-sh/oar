@@ -5627,3 +5627,49 @@ test('a disable the CLI ignored is honored by the next spawn, not lost', async (
   turn.endInput();
   await settled(runner);
 });
+
+test('a settings re-init before the push still attributes the turn to the delivered message', async () => {
+  // Live incident (conv dad758cd, 2026-09-25): a /model switch between turns
+  // made adaptProcess call setModel, the CLI re-inited BEFORE the message was
+  // pushed, the init read as "the CLI opened a turn of its own", and the whole
+  // answer published on a continuation row while the delivered row sat
+  // unattached with an empty live bubble until the session was killed.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+  turn.setModel = async () => {
+    // What the CLI does (probe, CLI 2.1.281): the control request answers
+    // with a fresh init on the stream while adaptProcess is still awaiting
+    // it — so the init is consumed before the push that follows.
+    turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, model: 'claude-opus-5-5' } });
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-opus-5-5' });
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'after the model switch', model: 'claude-fable-5-1' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('answer on the new model'));
+  turn.emit(resultMessage('answer on the new model', 'native-1'));
+  // Bounded: on regression the delivered row never settles (its answer ran
+  // on a continuation), which would otherwise hang the suite.
+  assert.equal(await Promise.race([
+    second,
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error('delivered turn never settled — was it routed to a continuation?')), 5_000)),
+  ]), true);
+
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.ok(response, 'the delivered message gets its own response');
+  assert.equal(response.body.text, 'answer on the new model');
+  assert.equal(response.body.model, 'claude-fable-5-1');
+  assert.equal(
+    stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length,
+    0,
+    'no continuation row is opened for a settings re-init',
+  );
+  turn.endInput();
+  await settled(runner);
+});

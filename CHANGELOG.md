@@ -62,6 +62,11 @@ All notable changes to OAR are documented here. The format follows
 
 ### Fixed
 
+- Switching the model, mode or effort between turns no longer strands the
+  next message: the Claude CLI re-initialises after such a change, and the
+  worker took that for a turn it opened on its own, so the reply landed on
+  a *continuation* row while the message itself stayed processing with an
+  empty Stop bubble (until the session was killed).
 - A steered message could wedge its conversation indefinitely when a
   long-running (or hung) background task was alive: the merge settle waited for
   a full idle that never came, keeping every later message stuck behind it.

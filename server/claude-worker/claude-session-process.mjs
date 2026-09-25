@@ -489,6 +489,9 @@ export function createClaudeSessionRunner({
   // spawn await in between); counted so a second delivery arriving in that
   // gap is held instead of racing the first into the CLI.
   let admittingDeliveries = 0;
+  // True from adaptProcess's first control request until the delivery it
+  // serves is registered in pendingDelivered (see the init handler).
+  let settingsReinitExpected = false;
   let lastReportedDeliveryReady = true;
   // Rows whose prompt the CLI consumed and whose settle marker is being saved
   // (id → relay message). Runner-level, not per process: a process dying
@@ -1922,7 +1925,14 @@ export function createClaudeSessionRunner({
       // of the async stream consumer), so it is correctly excluded here.
       //
       if (!proc.activeCtx && !proc.pendingDelivered.length) {
-        proc.lastBoundary = 'self-opened';
+        // Not when a settings change is in flight: setModel /
+        // setPermissionMode / applyFlagSettings make the CLI re-init (live
+        // probe, CLI 2.1.281), and adaptProcess issues them BEFORE the
+        // delivery they belong to is registered and pushed. Reading that
+        // init as self-opened routed the whole answer to a continuation row
+        // and stranded the delivered message (conv dad758cd, 2026-09-25,
+        // right after a /model switch).
+        if (!settingsReinitExpected) proc.lastBoundary = 'self-opened';
       } else if (!proc.activeCtx && !firstInit) {
         // A LATER init, with a delivered row waiting, is the CLI opening a turn
         // of its own — the live-verified continuation shape is a bare init with
@@ -3146,6 +3156,7 @@ export function createClaudeSessionRunner({
       // lost — the steered message's own model/mode intent applies from the
       // next turn on, same as Claude Code.
       if (proc && !proc.closing && !proc.aborted && !proc.activeCtx) {
+        settingsReinitExpected = true;
         await adaptProcess(message);
       }
       if (!proc || proc.closing || proc.aborted) {
@@ -3186,6 +3197,8 @@ export function createClaudeSessionRunner({
         // 5-minute watchdog fails it with a bogus "resend" error.
         const steered = Boolean(procRef.activeCtx);
         procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now(), steered });
+        // Registered: from here a later init takes the delivered-row branch.
+        settingsReinitExpected = false;
         try {
           procRef.turn.pushUserMessage(content);
         } catch (pushError) {
@@ -3211,6 +3224,7 @@ export function createClaudeSessionRunner({
       throw new Error('claude session process closed while accepting the message');
     } catch (error) {
       endAdmission();
+      settingsReinitExpected = false;
       const errorText = String(error?.message || error || 'unknown error');
       dbg('claude turn failed', message.id, errorText);
       await publisher.publishTurnException({ message, errorText });
