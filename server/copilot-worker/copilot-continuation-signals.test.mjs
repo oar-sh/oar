@@ -6,6 +6,8 @@ import {
   createReplayGate,
   describeSettledShell,
   isContinuationOpeningEvent,
+  describeSettledAgent,
+  settledAgentFromNotification,
 } from './copilot-continuation-signals.mjs';
 import { loadFixture } from './copilot-sdk-test-harness.mjs';
 
@@ -358,6 +360,24 @@ test('the live capture drives the whole shell lifecycle end to end', () => {
   }
   assert.equal(settled[0].shellId, '1');
   assert.equal(tracker.size(), 0);
+});
+
+test('an agent_idle / agent_completed notification names the settled background agent', () => {
+  const idle = settledAgentFromNotification({
+    type: 'system.notification',
+    data: { kind: { type: 'agent_idle', agentId: 'a-1', agentType: 'general-purpose', displayName: 'bg-probe', description: 'background probe' }, content: 'x' },
+  });
+  assert.deepEqual(idle, { agentId: 'a-1', agentType: 'general-purpose', displayName: 'bg-probe', description: 'background probe', status: 'idle' });
+  assert.equal(describeSettledAgent(idle), 'Background agent bg-probe finished: background probe');
+  const failed = settledAgentFromNotification({
+    type: 'system.notification',
+    data: { kind: { type: 'agent_completed', agentId: 'a-2', agentType: 'explore', status: 'failed' } },
+  });
+  assert.equal(failed.status, 'failed');
+  assert.equal(describeSettledAgent(failed), 'Background agent explore failed');
+  assert.equal(settledAgentFromNotification({ type: 'system.notification', data: { kind: { type: 'shell_completed', shellId: '1' } } }), null);
+  assert.equal(settledAgentFromNotification({ type: 'system.notification', data: { kind: { type: 'agent_idle' } } }), null, 'no agent id, nothing to name');
+  assert.equal(settledAgentFromNotification({ type: 'assistant.idle', data: {} }), null);
 });
 
 test('a settled shell describes itself for the transcript', () => {

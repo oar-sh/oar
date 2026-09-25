@@ -152,17 +152,18 @@ Useful overrides: `COPILOT_WEB_RELAY_CLI_EXECUTABLE` (explicit `copilot` binary 
 spawn), `COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH` (worker script location),
 `COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS` (runtime idle close, default 10 min),
 `COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS` (stall watchdog, default 120 s, `0` disables),
-`COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS` (how long live detached shells alone may hold the
-runtime open, default 30 min, `0` = no limit).
+`COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS` (an emergency override for how long live background
+agents and shells alone may hold the runtime open; `0` = no limit).
 
-That last one is deliberately **not** the relay's *Background task timeout* slider, even though the
-slider's value already rides every delivery payload. The slider governs Claude's background tasks —
-which the composer lists and can stop — and defaults to `0`/unlimited. A Copilot detached shell
-(`bash{mode:"async", detach:true}`) has no relay-side listing and no host-side stop RPC, so consuming
-the slider would make "one forgotten `sleep 99999` pins a runtime subprocess forever" the default,
-with nothing in the UI to reveal it. Stopping the runtime kills its detached children, so the cap is
-a real trade: too low cuts a command short, too high leaks a process. 30 minutes is well past any
-timer a user sits and waits for.
+Without the override the worker follows the relay's *Background task timeout* slider, which rides
+every delivery payload exactly as for the Claude worker (default `0`/unlimited). Since 2026-09-25
+Copilot background agents and detached shells are read from the runtime's task registry
+(`rpc.tasks.list`), listed in the composer's task panel with a working **Stop** (`rpc.tasks.cancel`),
+and on cap expiry they are **cancelled** rather than forgotten — so the slider is a choice the user
+can see and undo, and the old separate 30-minute default is gone. Runtimes without `rpc.tasks` (older
+bundles) fall back to the event-scraped detached-shell tracking: non-stoppable shell cards, and a cap
+expiry that forgets the shell (the runner's `DEFAULT_BACKGROUND_TASK_TIMEOUT_MS`, 30 min, applies only
+when no getter is supplied, i.e. in tests). Stopping the runtime still kills its detached children.
 
 Live testing spends real Copilot quota: **`gpt-5.4-mini` is the only sanctioned model for live
 relay tests**, per the standing live-testing policy, and only with the user's explicit go-ahead.

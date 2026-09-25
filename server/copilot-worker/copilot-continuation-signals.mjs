@@ -54,6 +54,51 @@ export const SHELL_SETTLED_NOTIFICATION_KINDS = Object.freeze([
 /** Tools that address an already-running shell by id. */
 export const SHELL_HANDLE_TOOLS = Object.freeze(['read_bash', 'write_bash', 'stop_bash']);
 
+/**
+ * `system.notification` kinds that mean "a background agent this session
+ * started is done" — `agent_idle` for a multi-turn agent that finished its
+ * prompt and now waits for messages, `agent_completed` for a single-shot one.
+ * Both make the runtime re-invoke the model (`read_agent` + a reply under the
+ * spawning interaction), so both herald a continuation exactly like the shell
+ * kinds do (live-probed on runtime 1.0.88, 2026-09-25).
+ */
+export const AGENT_SETTLED_NOTIFICATION_KINDS = Object.freeze([
+  'agent_completed',
+  'agent_idle',
+]);
+
+/**
+ * The background agent a `system.notification` reports as settled, or null.
+ * `{ agentId, agentType, displayName, description, status }` — `status` is
+ * 'completed' | 'failed' for `agent_completed`, 'idle' for `agent_idle`.
+ */
+export function settledAgentFromNotification(event) {
+  if (String(event?.type || '') !== 'system.notification') return null;
+  const data = eventData(event);
+  const kind = data.kind && typeof data.kind === 'object' ? data.kind : {};
+  const type = String(kind.type || '');
+  if (!AGENT_SETTLED_NOTIFICATION_KINDS.includes(type)) return null;
+  const agentId = String(kind.agentId || '').trim();
+  if (!agentId) return null;
+  return {
+    agentId,
+    agentType: String(kind.agentType || '').trim(),
+    displayName: String(kind.displayName || '').trim(),
+    description: String(kind.description || '').trim(),
+    status: type === 'agent_idle' ? 'idle' : (String(kind.status || '').trim() || 'completed'),
+  };
+}
+
+/** A one-line transcript note for a settled background agent, posted into its continuation. */
+export function describeSettledAgent(agent) {
+  if (!agent?.agentId) return '';
+  const name = agent.displayName || agent.description || agent.agentType || 'agent';
+  const verb = agent.status === 'failed' ? 'failed' : 'finished';
+  return agent.description && agent.description !== name
+    ? `Background agent ${name} ${verb}: ${agent.description}`
+    : `Background agent ${name} ${verb}`;
+}
+
 // `<command started in detached background with shellId: 1>`
 const SHELL_OPENED_RE = /detached\s+(?:background|command)[^<>]*?shellId:\s*([^\s>,]+)/i;
 // `<detached command with shellId: 1 completed with exit code 0>`

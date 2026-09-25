@@ -63,10 +63,12 @@ import { resolveCopilotProviderConfig } from './copilot-byok-provider.mjs';
 import {
   createBackgroundShellTracker,
   createReplayGate,
+  describeSettledAgent,
   describeSettledShell,
   isContinuationOpeningEvent,
+  settledAgentFromNotification,
 } from './copilot-continuation-signals.mjs';
-import { createCopilotEventNormalizer } from './copilot-sdk-event-normalizer.mjs';
+import { createCopilotEventNormalizer, formatToolActivityText } from './copilot-sdk-event-normalizer.mjs';
 import {
   DEFAULT_MODEL_SWITCH_TIMEOUT_MS,
   createCopilotModelSwitcher,
@@ -152,6 +154,13 @@ const DEFAULT_SETTLE_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000
 const DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS = 5;
 /** Debounce for re-reading the runtime's queued lane after `pending_messages.modified`. */
 const DEFAULT_QUEUE_LANE_REFRESH_MS = 150;
+/**
+ * Debounce for re-reading `rpc.tasks.list()` after `session.background_tasks_changed`
+ * (which carries no payload and fires ~20 times per shell call).
+ */
+const DEFAULT_TASK_REFRESH_MS = 250;
+/** Trailing throttle for enrichment-only card updates (a live tool call, tokens). */
+const DEFAULT_TASK_PUBLISH_THROTTLE_MS = 2_000;
 /**
  * How long a pushed prompt the runtime had not started when the turn's idle
  * arrived is kept unsettled, waiting for the runtime to open its run. The
@@ -298,6 +307,8 @@ export function createCopilotSdkSessionRunner({
   maxTerminalSettleAttempts = DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS,
   queueLaneRefreshMs = DEFAULT_QUEUE_LANE_REFRESH_MS,
   orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS,
+  taskRefreshMs = DEFAULT_TASK_REFRESH_MS,
+  taskPublishThrottleMs = DEFAULT_TASK_PUBLISH_THROTTLE_MS,
   // Called with `true`/`false` whenever the runner flips between accepting
   // deliveries and holding them (see isDeliveryHeld). The worker wires it to
   // the socket link: a hold withdraws the relay's readiness, and its end
@@ -376,11 +387,29 @@ export function createCopilotSdkSessionRunner({
   let queuedLane = new Map();
   let queueLaneTimer = null;
   let queueLaneRefreshChain = Promise.resolve();
-  // Whether the session's `rpc.queue` / `rpc.interruptMainTurn` are present.
-  // Probed per session (the runtime auto-updates under the relay and every
-  // one of these is @experimental); a missing surface degrades to today's
-  // behaviour, never to an error.
-  let sessionRpc = { queue: false, interruptMainTurn: false };
+  // Whether the session's `rpc.queue` / `rpc.interruptMainTurn` / `rpc.tasks`
+  // are present. Probed per session (the runtime auto-updates under the relay
+  // and every one of these is @experimental); a missing surface degrades to
+  // the previous behaviour, never to an error.
+  let sessionRpc = { queue: false, interruptMainTurn: false, tasks: false };
+  // The runtime's background task registry as last read from
+  // `rpc.tasks.list()` (id → TaskInfo), and what the event stream adds per
+  // agent that the registry does not carry: the live tool call, a running
+  // token count, the model announced at spawn. Both feed the task panel
+  // cards; the registry alone decides liveness (the lifecycle pin).
+  let backgroundTasks = new Map();
+  const agentDetails = new Map();
+  let taskRefreshTimer = null;
+  let taskRefreshChain = Promise.resolve();
+  let lastTaskRefreshAt = 0;
+  let taskPublishTimer = null;
+  let lastPublishedTasksSignature = '';
+  // Cap expiry is bounded: a task whose cancel the runtime refuses (or that
+  // keeps failing) this many times is abandoned — dropped from the live set so
+  // it stops pinning the runtime — rather than held forever.
+  const taskCancelRefusals = new Map();
+  const abandonedTasks = new Set();
+  const MAX_TASK_CANCEL_REFUSALS = 3;
   // Blocking handlers currently waiting on a human (`ask_user`, an ask-mode
   // tool approval). The runtime emits NO events while blocked in one, and the
   // question timeout is 8 hours against a 120s stall ceiling — so without this
@@ -1017,6 +1046,7 @@ export function createCopilotSdkSessionRunner({
     }
     touch();
     observeBackgroundShells(event);
+    observeBackgroundAgents(event);
     observeCompaction(event);
     observeQueueLane(event);
     // A background subagent's spawn emits a SESSION-level
@@ -1078,16 +1108,260 @@ export function createCopilotSdkSessionRunner({
    * backgroundWorkHoldsRuntime. Advisory: a failed post never disturbs events.
    */
   function publishBackgroundShellTasks() {
-    const tasks = backgroundShells.live().map((shell) => ({
+    publishBackgroundTasks({ immediate: true });
+  }
+
+  /** The panel rows for the shell tracker's set — the path without `rpc.tasks`. */
+  function shellTrackerCards() {
+    return backgroundShells.live().map((shell) => ({
       taskId: shell.shellId,
       taskType: 'local_bash',
       description: shell.description || 'Detached shell',
       startedAt: shell.startedAt || null,
       stoppable: false,
     }));
-    api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks })
-      .catch((error) => dbg('background task publish failed', error?.message || String(error)));
   }
+
+  /**
+   * The panel rows for the runtime's task registry: background agents and
+   * shells still running, each with what the events added. `stoppable` is
+   * true because `rpc.tasks.cancel` is present whenever this path is taken.
+   */
+  function registryCards() {
+    const cards = [];
+    for (const task of backgroundTasks.values()) {
+      if (task.status !== 'running') continue;
+      const startedAt = Date.parse(String(task.startedAt || '')) || null;
+      if (task.type === 'shell') {
+        cards.push({
+          taskId: task.id,
+          taskType: 'local_bash',
+          description: task.description || task.command || 'Background shell',
+          startedAt,
+          stoppable: true,
+          ...(task.progressSummary ? { summary: task.progressSummary } : {}),
+        });
+        continue;
+      }
+      if (task.type !== 'agent') continue;
+      const detail = agentDetails.get(task.id) || {};
+      const model = task.resolvedModel || task.model || detail.model || '';
+      const inherited = !model;
+      cards.push({
+        taskId: task.id,
+        taskType: 'local_agent',
+        description: task.description || task.displayName || detail.displayName || 'Background agent',
+        startedAt: startedAt || detail.startedAt || null,
+        stoppable: true,
+        subagentType: task.agentType || detail.agentType || null,
+        model: model || appliedModel() || defaultModel || null,
+        modelInherited: inherited,
+        ...(detail.lastToolCall ? { lastToolCall: detail.lastToolCall } : {}),
+        ...(Number.isFinite(detail.totalTokens) && detail.totalTokens > 0 ? { totalTokens: detail.totalTokens } : {}),
+        ...(task.progressSummary ? { summary: task.progressSummary } : {}),
+      });
+    }
+    return cards;
+  }
+
+  /**
+   * Mirror the live background work into the relay's task panel (REPLACE
+   * semantics, the same route the Claude worker publishes on). Set changes
+   * publish at once; enrichment-only changes (a tool call, tokens) ride a
+   * trailing throttle. Advisory: a failed post never disturbs events.
+   */
+  function publishBackgroundTasks({ immediate = false } = {}) {
+    const run = () => {
+      if (taskPublishTimer) {
+        clearTimeout(taskPublishTimer);
+        taskPublishTimer = null;
+      }
+      const tasks = sessionRpc.tasks ? registryCards() : shellTrackerCards();
+      const signature = JSON.stringify(tasks);
+      if (signature === lastPublishedTasksSignature) return;
+      lastPublishedTasksSignature = signature;
+      api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks })
+        .catch((error) => dbg('background task publish failed', error?.message || String(error)));
+    };
+    if (immediate || !(taskPublishThrottleMs > 0)) {
+      run();
+      return;
+    }
+    if (taskPublishTimer) return;
+    taskPublishTimer = setTimeout(run, taskPublishThrottleMs);
+    taskPublishTimer.unref?.();
+  }
+
+  // ------------------------------------------------------- background tasks --
+
+  /**
+   * What the event stream knows about background agents that the registry
+   * does not: spawn details, the live tool call, a running token count, and
+   * the completion heralds. `session.background_tasks_changed` itself is
+   * empty and only says "re-read the registry".
+   */
+  function observeBackgroundAgents(event) {
+    const type = String(event?.type || '');
+    const data = event?.data && typeof event.data === 'object' ? event.data : {};
+    const agentId = String(event?.agentId || '').trim();
+    if (type === 'session.background_tasks_changed') {
+      scheduleTaskRefresh();
+      return;
+    }
+    if (type === 'subagent.started' && String(data.executionMode || '').trim().toLowerCase() === 'background' && agentId) {
+      // Kept for the life of the session (a finished agent's late events must
+      // still be recognised as background), bounded so a long session cannot
+      // grow it forever.
+      while (agentDetails.size >= 500) agentDetails.delete(agentDetails.keys().next().value);
+      agentDetails.set(agentId, {
+        displayName: String(data.agentDisplayName || data.agentName || '').trim(),
+        agentType: String(data.agentType || '').trim(),
+        model: String(data.model || '').trim(),
+        lastToolCall: '',
+        totalTokens: 0,
+        startedAt: Date.now(),
+      });
+      scheduleTaskRefresh();
+      return;
+    }
+    const settledAgent = settledAgentFromNotification(event);
+    if (settledAgent) {
+      dbg('background agent settled', settledAgent.agentId, settledAgent.status);
+      // The runtime is about to re-invoke the model off the back of this
+      // (`read_agent` + a reply): pin the runtime for the continuation, and
+      // carry a line into the turn it triggers when no turn is open to take
+      // it. Same shape as a settled shell's herald.
+      continuationDueSince = Date.now();
+      const note = describeSettledAgent(settledAgent);
+      if (note && !activeTurn && pendingActivities.length < MAX_PENDING_ACTIVITIES) pendingActivities.push(note);
+      scheduleTaskRefresh();
+      return;
+    }
+    if (agentId && agentDetails.has(agentId)) {
+      const detail = agentDetails.get(agentId);
+      if (type === 'tool.execution_start') {
+        detail.lastToolCall = formatToolActivityText(data.toolName, data.arguments);
+        publishBackgroundTasks();
+      } else if (type === 'assistant.usage') {
+        const used = (Number(data.inputTokens) || 0) + (Number(data.outputTokens) || 0);
+        if (used > 0) {
+          detail.totalTokens += used;
+          publishBackgroundTasks();
+        }
+      } else if (type === 'subagent.completed' || type === 'subagent.failed') {
+        const total = Number(data.totalTokens);
+        if (Number.isFinite(total) && total > 0) detail.totalTokens = total;
+        scheduleTaskRefresh();
+      }
+    }
+  }
+
+  function scheduleTaskRefresh() {
+    if (!sessionRpc.tasks || taskRefreshTimer) return;
+    taskRefreshTimer = setTimeout(() => {
+      taskRefreshTimer = null;
+      taskRefreshChain = taskRefreshChain.then(() => refreshBackgroundTasks()).catch(() => {});
+    }, taskRefreshMs);
+    taskRefreshTimer.unref?.();
+  }
+
+  /**
+   * Re-read the runtime's task registry. Running agents and shells become
+   * cards (with a progress line when the runtime has one); finished entries
+   * are removed from the runtime's tracking so the registry cannot grow for
+   * the life of the session. A refresh that fails leaves the last read in
+   * place — a stale card beats a vanished one.
+   */
+  async function refreshBackgroundTasks() {
+    const target = session;
+    if (!target || !sessionRpc.tasks) return;
+    lastTaskRefreshAt = Date.now();
+    let listed;
+    try {
+      listed = await target.rpc.tasks.list();
+    } catch (error) {
+      dbg('tasks.list failed', error?.message || String(error));
+      return;
+    }
+    if (session !== target) return;
+    const next = new Map();
+    for (const task of Array.isArray(listed?.tasks) ? listed.tasks : []) {
+      const id = String(task?.id || '').trim();
+      if (!id || abandonedTasks.has(id)) continue;
+      const status = String(task?.status || '').trim().toLowerCase();
+      // Only running tasks are live. 'idle' (a multi-turn agent waiting for
+      // messages) holds nothing and shows nowhere until it is messaged
+      // (roadmap: tasks.sendMessage); finished entries are left to the
+      // runtime's own tracking — removing them here could race the root
+      // agent's `read_agent` follow-up that the completion notification
+      // triggers.
+      if (status === 'running') {
+        next.set(id, { ...task, id, status, progressSummary: backgroundTasks.get(id)?.progressSummary || '' });
+      }
+    }
+    // Progress lines for the live set: the agent's latest intent / last
+    // activity, a shell's last output line. One RPC per live task per refresh
+    // (refreshes are debounced), best effort.
+    if (typeof target.rpc.tasks.getProgress === 'function') {
+      for (const task of next.values()) {
+        try {
+          const progress = (await target.rpc.tasks.getProgress({ id: task.id }))?.progress || null;
+          task.progressSummary = summarizeTaskProgress(progress);
+        } catch { /* a card without a progress line */ }
+      }
+    }
+    if (session !== target) return;
+    const setChanged = next.size !== backgroundTasks.size
+      || [...next.keys()].some((id) => !backgroundTasks.has(id));
+    backgroundTasks = next;
+    publishBackgroundTasks({ immediate: setChanged });
+    // The lifecycle poll (every `lifecyclePollMs`) picks the new set up; a
+    // re-evaluation here would re-schedule a refresh and spin.
+  }
+
+  function summarizeTaskProgress(progress) {
+    if (!progress || typeof progress !== 'object') return '';
+    if (progress.type === 'agent') {
+      const intent = String(progress.latestIntent || '').trim();
+      if (intent) return intent.slice(0, 300);
+      const lines = Array.isArray(progress.recentActivity) ? progress.recentActivity : [];
+      const last = lines.length ? String(lines[lines.length - 1]?.message || '').trim() : '';
+      return last.slice(0, 300);
+    }
+    if (progress.type === 'shell') {
+      const output = String(progress.recentOutput || '').trim();
+      if (!output || output === '(no output yet)') return '';
+      const lines = output.split('\n').map((line) => line.trim()).filter(Boolean);
+      return (lines[lines.length - 1] || '').slice(0, 300);
+    }
+    return '';
+  }
+
+  /** The live tasks from the registry (running agents + shells). */
+  function runningBackgroundTasks() {
+    return [...backgroundTasks.values()].filter((task) => task.status === 'running');
+  }
+
+  /**
+   * Stop one background task (the panel's per-card Stop, or a subagent lane's
+   * Stop for a background agent). Returns whether the runtime cancelled it.
+   */
+  async function stopBackgroundTask(taskId) {
+    const id = String(taskId || '').trim();
+    if (!id || !session || !sessionRpc.tasks) return false;
+    try {
+      const outcome = await session.rpc.tasks.cancel({ id });
+      const cancelled = outcome?.cancelled === true;
+      dbg(cancelled ? 'background task cancelled' : 'background task cancel refused', id);
+      if (cancelled) scheduleTaskRefresh();
+      return cancelled;
+    } catch (error) {
+      dbg('tasks.cancel failed', id, error?.message || String(error));
+      return false;
+    }
+  }
+
+
 
   /**
    * The compaction hold. A message pushed while the runtime is compacting
@@ -1161,8 +1435,10 @@ export function createCopilotSdkSessionRunner({
       queue: typeof target?.rpc?.queue?.pendingItems === 'function'
         && typeof target?.rpc?.queue?.removeAt === 'function',
       interruptMainTurn: typeof target?.rpc?.interruptMainTurn === 'function',
+      tasks: typeof target?.rpc?.tasks?.list === 'function'
+        && typeof target?.rpc?.tasks?.cancel === 'function',
     };
-    dbg(`copilot session rpc surfaces: queue=${sessionRpc.queue} interruptMainTurn=${sessionRpc.interruptMainTurn}`);
+    dbg(`copilot session rpc surfaces: queue=${sessionRpc.queue} interruptMainTurn=${sessionRpc.interruptMainTurn} tasks=${sessionRpc.tasks}`);
   }
 
   function observeBackgroundShells(event) {
@@ -1632,17 +1908,25 @@ export function createCopilotSdkSessionRunner({
     // them: the tracked set is state about a process that no longer exists and
     // must not pin the next one. The replay gate is reset for the same reason —
     // the next connection resumes and arms its own window.
-    if (backgroundShells.size()) {
+    if (backgroundShells.size() || backgroundTasks.size) {
       backgroundShells.reset();
-      // The shells died with the runtime; clear their panel cards too.
-      publishBackgroundShellTasks();
+      // Background agents and shells die with the runtime (live-probed: a
+      // disconnect cancels the agents and drops the shells from the registry);
+      // clear their panel cards too.
+      backgroundTasks = new Map();
+      agentDetails.clear();
+      publishBackgroundTasks({ immediate: true });
+    }
+    if (taskRefreshTimer) {
+      clearTimeout(taskRefreshTimer);
+      taskRefreshTimer = null;
     }
     replayGate.reset();
     continuationDueSince = 0;
     pendingActivities = [];
     compactingSince = 0;
     queuedLane = new Map();
-    sessionRpc = { queue: false, interruptMainTurn: false };
+    sessionRpc = { queue: false, interruptMainTurn: false, tasks: false };
     syncDeliveryReadiness();
     if (!closingSession && !closingClient) return;
     dbg(`stopping the copilot runtime (${reason})`);
@@ -1686,8 +1970,44 @@ export function createCopilotSdkSessionRunner({
       dbg('continuation grace expired with no continuation turn');
       continuationDueSince = 0;
     }
+    if (sessionRpc.tasks) {
+      // The registry is the truth: live agents and shells hold the runtime up
+      // to the cap (the relay's background-task slider, 0 = unlimited), and on
+      // expiry they are CANCELLED — the runtime can stop them now — rather
+      // than forgotten. Bounded: a task whose cancel the runtime refuses a
+      // few times is abandoned instead of pinning the runtime forever. A
+      // re-read once per lifecycle poll catches state the events miss (a
+      // shell that exited after a cancel emits no notification).
+      const capMs = Number(getBackgroundTaskTimeoutMs()) || 0;
+      const live = runningBackgroundTasks();
+      if (!live.length) return false;
+      if (capMs > 0) {
+        for (const task of live) {
+          const startedAt = Date.parse(String(task.startedAt || '')) || agentDetails.get(task.id)?.startedAt || 0;
+          if (!startedAt || now - startedAt < capMs) continue;
+          const refusals = taskCancelRefusals.get(task.id) || 0;
+          if (refusals >= MAX_TASK_CANCEL_REFUSALS) {
+            dbg('background task cap reached and the runtime would not cancel it; abandoning it', task.id);
+            abandonedTasks.add(task.id);
+            backgroundTasks.delete(task.id);
+            publishBackgroundTasks({ immediate: true });
+            continue;
+          }
+          dbg('background task cap reached; cancelling it', task.id, task.description || task.command || '');
+          void stopBackgroundTask(task.id).then((cancelled) => {
+            if (!cancelled) taskCancelRefusals.set(task.id, (taskCancelRefusals.get(task.id) || 0) + 1);
+          });
+        }
+        if (!runningBackgroundTasks().length) return false;
+      }
+      if (now - lastTaskRefreshAt >= lifecyclePollMs) scheduleTaskRefresh();
+      return true;
+    }
     if (!backgroundShells.size()) return false;
-    const capMs = Number(getBackgroundTaskTimeoutMs()) || 0;
+    // Without the registry there is no Stop and no card worth the name, so an
+    // unlimited slider (0) must not mean "a forgotten `sleep 99999` pins the
+    // runtime forever": the old 30-minute default applies on this path.
+    const capMs = Number(getBackgroundTaskTimeoutMs()) || DEFAULT_BACKGROUND_TASK_TIMEOUT_MS;
     let expiredAny = false;
     for (const shell of backgroundShells.expireOlderThan(capMs)) {
       expiredAny = true;
@@ -1794,7 +2114,9 @@ export function createCopilotSdkSessionRunner({
       kind,
       message,
       model: '',
-      normalizer: createNormalizerImpl(),
+      // The runner's cross-turn knowledge of background agents rides in, so a
+      // later turn's normalizer opens no lane for an agent spawned earlier.
+      normalizer: createNormalizerImpl({ isBackgroundAgent: (agentId) => agentDetails.has(agentId) }),
       result: null,
       failure: null,
       settled: false,
@@ -3041,6 +3363,10 @@ export function createCopilotSdkSessionRunner({
     getSettleFailed,
     acknowledgeSettleFailed,
     cancelPushedMessage,
+    // The task panel's per-card Stop (`rpc.tasks.cancel`); also what a
+    // subagent lane's Stop tries — the runtime tracks sync agents in the same
+    // registry and refuses ids it does not know.
+    stopBackgroundTask,
     // "Active" spans both ownerships: a settled turn still publishing must
     // keep the worker's idle/shutdown gates closed just like a running one.
     isTurnActive: () => !!activeTurn || publishingTurns.size > 0,
@@ -3055,6 +3381,12 @@ export function createCopilotSdkSessionRunner({
     whenModelSnapshotPosted: () => modelSnapshotChain,
     // The in-flight queued-lane read — same kind of seam.
     whenQueueLaneRefreshed: () => queueLaneRefreshChain,
+    // The in-flight `rpc.tasks.list()` re-read — same kind of seam. A refresh
+    // that is still debounced counts too, so a caller sees the registry read
+    // that the last event scheduled.
+    whenTasksRefreshed: () => (taskRefreshTimer
+      ? new Promise((resolve) => { setTimeout(resolve, taskRefreshMs + 5); }).then(() => taskRefreshChain)
+      : taskRefreshChain),
     // Test seams / observability.
     _getState: () => ({
       hasClient: !!client,
@@ -3069,6 +3401,7 @@ export function createCopilotSdkSessionRunner({
       // Settled turns whose relay publishes have not all landed yet.
       publishingTurnCount: publishingTurns.size,
       backgroundShells: backgroundShells.live(),
+      backgroundTasks: sessionRpc.tasks ? registryCards() : shellTrackerCards(),
       continuationDueSince,
       compacting: isCompacting(),
       pendingHumanRequests,

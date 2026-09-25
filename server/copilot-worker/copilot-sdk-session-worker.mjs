@@ -72,8 +72,22 @@ async function main() {
     api,
     sdkSessionId,
     abortAckNote: 'copilot session aborted',
+    // A subagent lane's Stop. Lanes are keyed on the envelope agentId, which
+    // is also the runtime's task id, so `rpc.tasks.cancel` is tried; the
+    // runtime refuses ids it does not track (then the control answers "not
+    // supported" and the whole-turn Stop remains). Background agents have no
+    // lane — their Stop is the task panel's. (Late-bound: controls only poll
+    // while a turn is live.)
+    onAbortSubagent: (subagentRunId) => turnRunner.stopBackgroundTask(subagentRunId),
     dbg,
   });
+  // The relay's *Background task timeout* slider (0 = unlimited) rides every
+  // delivery payload, exactly as for the Claude worker: background agents and
+  // shells now have cards and a Stop, so the slider governs them too and a cap
+  // expiry CANCELS them rather than forgetting them. The env var is an
+  // emergency override only.
+  const backgroundTaskTimeoutOverrideMs = readOptionalMs('COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS');
+  let backgroundTaskTimeoutMs = backgroundTaskTimeoutOverrideMs ?? 0;
   // The runner reports every flip of its delivery gate; the bridge turns them
   // into the link's worker.unready / worker.ready frames, so a message queued
   // while a question card is open is held in the relay queue and steers into
@@ -90,18 +104,7 @@ async function main() {
     // How long a deferred model switch may wait for its drain before the
     // explicit selection fails the row (default 10s).
     modelSwitchTimeoutMs: readOptionalMs('COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS'),
-    // How long live detached shells alone may hold the runtime open (0 = no
-    // limit). Deliberately NOT the relay's `background_task_timeout_minutes`
-    // slider that rides every delivery payload: that slider defaults to
-    // 0/unlimited and governs Claude's background tasks, which the composer
-    // lists and can stop. A Copilot detached shell has neither, so consuming it
-    // would make "a forgotten shell pins a runtime forever" the default with
-    // nothing in the UI to reveal it. The runner's own 30-minute cap applies
-    // unless this says otherwise.
-    ...(() => {
-      const override = readOptionalMs('COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS');
-      return override === undefined ? {} : { getBackgroundTaskTimeoutMs: () => override };
-    })(),
+    getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     onDeliveryReadinessChange: (ready) => linkBridge.onDeliveryReadinessChange(ready),
     canHandBackHeldDelivery: () => linkBridge.canHandBackHeldDelivery(),
     dbg,
@@ -142,6 +145,12 @@ async function main() {
     getDeliveryHeld: () => turnRunner.isDeliveryHeld(),
     onDeliver: async (pending, reason) => {
       dbg('queue.deliver received', `reason=${reason}`, `msgId=${pending?.message?.id || 'none'}`);
+      // Slider changes reach a running worker on its next delivery; an
+      // explicit env override pins the value regardless.
+      const deliveredTimeout = Number(pending?.settings?.backgroundTaskTimeoutMs);
+      if (backgroundTaskTimeoutOverrideMs === undefined && Number.isFinite(deliveredTimeout) && deliveredTimeout >= 0) {
+        backgroundTaskTimeoutMs = deliveredTimeout;
+      }
       try {
         return await turnRunner.handlePendingPayload(pending);
       } catch (error) {
@@ -159,8 +168,15 @@ async function main() {
         });
         return;
       }
-      // Background-task controls arrive with phase 3 of the parity plan
-      // (rpc.tasks); until then they are logged rather than silently dropped.
+      if (type === 'stop_background_task') {
+        // The task panel's per-card Stop → rpc.tasks.cancel.
+        const taskId = String(control?.taskId || '').trim();
+        dbg('stop background task control', taskId);
+        void turnRunner.stopBackgroundTask(taskId).catch((error) => {
+          dbg('stop background task failed', error?.message || String(error));
+        });
+        return;
+      }
       dbg('worker control ignored (unsupported by the SDK worker)', type || '(none)');
     },
   });

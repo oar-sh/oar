@@ -41,6 +41,14 @@ All notable changes to OAR are documented here. The format follows
 - A queued Copilot message that the runtime has not started yet keeps its
   **Cancel**: cancelling pulls it back out of the runtime's queue, so it is
   never answered.
+- **Background tasks for Copilot conversations** now match Claude's: background
+  agents the model spawns and detached shells appear in the task panel as they
+  run, with the agent's kind, the model it runs on, the command it is running
+  right now, its token count and a **Stop** that works (the runtime's task
+  registry). A reply no longer waits for a background agent to finish; the
+  agent's result arrives afterwards as its own *continuation* reply, and the
+  relay's *Background task timeout* slider now governs Copilot tasks too
+  (expiry stops them instead of silently forgetting them).
 - **Multi-select question cards.** A question that allows several answers
   (Claude's `multiSelect`, or a Copilot question worded "select all that
   apply") renders checkmarks instead of one-shot buttons, plus one **Reply

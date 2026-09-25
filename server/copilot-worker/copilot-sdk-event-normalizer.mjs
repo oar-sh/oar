@@ -228,7 +228,11 @@ function createUsageAccumulator() {
  * `{ channel, payload }` actions; the session process dispatches them to the
  * relay and treats the first `result` action as the turn's terminator.
  */
-export function createCopilotEventNormalizer() {
+export function createCopilotEventNormalizer({
+  // The runner's answer to "is this agent id a background agent?" — shared
+  // across turns, unlike this normalizer's own `backgroundRuns`.
+  isBackgroundAgent = () => false,
+} = {}) {
   let sessionModel = '';
   let sessionId = '';
   let lastEmittedStreamText = '';
@@ -306,6 +310,13 @@ export function createCopilotEventNormalizer() {
   // runtime tags only one of them.
   const subagentRuns = new Map(); // runId -> { displayName, status, opened }
   const subagentAliases = new Map(); // agentId|toolCallId -> runId
+  // Runs spawned with `executionMode: "background"`: task-panel cards, not
+  // lanes. This normalizer lives for ONE turn while a background agent
+  // outlives it, so the runner's knowledge (`isBackgroundAgent`) is consulted
+  // too — a later turn must not open a lane for an agent spawned earlier.
+  const backgroundRuns = new Set();
+  const isBackgroundRun = (runId, agentId) => backgroundRuns.has(runId)
+    || (!!agentId && isBackgroundAgent(agentId) === true);
 
   /**
    * `useToolCallId` is true only for `subagent.*` lifecycle events, where
@@ -498,23 +509,43 @@ export function createCopilotEventNormalizer() {
       case 'subagent.started': {
         const runId = resolveSubagentRun(event, { useToolCallId: true });
         if (!runId) return [];
+        // A BACKGROUND agent (`executionMode: "background"`) is not a lane in
+        // this reply: it outlives the turn and shows in the task panel as a
+        // stoppable card (the runner reads `rpc.tasks`), and its completion
+        // arrives as a continuation. Opening a lane for it would leave a
+        // bubble spinning after the reply settled — or, if closed at the
+        // terminal, would mark a running agent failed. A one-line note keeps
+        // the transcript honest; its tagged events are dropped below.
+        if (String(data.executionMode || '').trim().toLowerCase() === 'background') {
+          backgroundRuns.add(runId);
+          const name = subagentDisplayName(data);
+          const agentType = String(data.agentType || '').trim();
+          return [activityAction(truncate(
+            `Started background agent: ${name}${agentType && agentType !== name ? ` (${agentType})` : ''} — see the task panel`,
+          ))];
+        }
         return ensureSubagentRun(runId, subagentDisplayName(data));
       }
       case 'subagent.configured':
       case 'subagent.selected': {
-        // `subagent.configured` is UNDOCUMENTED — it appears in no published
-        // schema and a live probe found it between started and completed,
-        // carrying `agentId` but neither `toolCallId` nor a display name. It is
-        // handled rather than ignored so the lane still opens if it ever
-        // arrives first, and it must never clobber the roster's display name
-        // with its own absent one (hence the `||` in ensureSubagentRun).
+        // `subagent.configured` (since documented: `{model, multiTurn, …}`)
+        // arrives between started and completed, carrying `agentId` but
+        // neither `toolCallId` nor a display name. It is handled rather than
+        // ignored so the lane still opens if it ever arrives first, and it
+        // must never clobber the roster's display name with its own absent
+        // one (hence the `||` in ensureSubagentRun). A background agent's
+        // arrives too, and must not open the lane `subagent.started` withheld.
         const runId = resolveSubagentRun(event, { useToolCallId: true });
         if (!runId) return [];
+        if (isBackgroundRun(runId, subagentEventKeys(event).agentId)) return [];
         return ensureSubagentRun(runId, subagentDisplayName(data));
       }
       case 'subagent.completed': {
         const runId = resolveSubagentRun(event, { useToolCallId: true });
         if (!runId) return [];
+        // A background agent finishing inside a later turn is the task panel's
+        // business (the runner watches the same event); no lane to close.
+        if (isBackgroundRun(runId, subagentEventKeys(event).agentId)) return [];
         const actions = closeSubagentRun(runId, 'completed', subagentDisplayName(data));
         const stats = formatSubagentStats(data);
         if (stats) actions.push(activityAction(truncate(`Finished · ${stats}`), runId));
@@ -525,6 +556,11 @@ export function createCopilotEventNormalizer() {
         if (!runId) return [];
         const name = subagentDisplayName(data);
         const reason = String(data.error || '').trim() || 'unknown error';
+        // A background agent's failure still deserves a main-thread line (the
+        // parent agent recovers silently), but there is no lane to close.
+        if (isBackgroundRun(runId, subagentEventKeys(event).agentId)) {
+          return [activityAction(truncate(`Background agent failed (${name}): ${reason}`))];
+        }
         const actions = closeSubagentRun(runId, 'failed', name);
         actions.push(activityAction(truncate(`Subagent failed: ${reason}`), runId));
         // ALSO on the main thread. The parent agent recovers from a failed
@@ -551,6 +587,14 @@ export function createCopilotEventNormalizer() {
     if (isSubagentEvent(event)) {
       const runId = resolveSubagentRun(event);
       if (!runId) return [];
+      // A background agent's traffic belongs to its task card (the runner
+      // tracks its live tool call and tokens from the same events), not to a
+      // lane in this reply — but its model calls still cost real money, so
+      // they count toward the spend of whichever turn is live, as before.
+      if (isBackgroundRun(runId, subagentEventKeys(event).agentId)) {
+        if (type === 'assistant.usage') usage.add(data, { allowModel: false });
+        return [];
+      }
       if (type === 'assistant.message') {
         const content = String(data.content || '');
         if (!content.trim()) return [];

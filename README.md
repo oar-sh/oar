@@ -71,7 +71,7 @@ OAR is still under active development, so expect occasional rough edges and some
 - Nested **subagent bubbles**: each subagent gets its own live bubble with its own thoughts, activity, and streamed text, kept as collapsible sections after the turn finishes
 - **Background task panel** with live per-task state, model, and token use; Claude workflow tasks fold out into a progress tree of phases and agents, and leave a *Finished background task* card in the transcript when they complete
 - Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
-- Web question cards for `ask_user` clarification flows (single-field text and multi-field structured forms)
+- Web question cards for `ask_user` clarification flows (single-field text, multi-select checkmarks when several answers are allowed, and multi-field structured forms)
 - Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
 - **Context usage** modal with a per-category token breakdown of the model's context window, plus a per-conversation **auto-compact window** slider for Claude sessions
 - **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context, and matching dots beside the scrollbar
@@ -316,7 +316,7 @@ Copilot conversations can run on either of two engines, chosen in **⚙️ Setti
 | Engine | What runs | Trade-offs |
 | ------ | --------- | ---------- |
 | **Extension** (default) | The Copilot CLI in a terminal session with the web-relay extension loaded | The engine everything has shipped on. Attach to a live session with the tmux inspector (`tmux attach -t <sdk-session-id>`) |
-| **SDK** (experimental) | A headless Node worker per conversation, driving the CLI's bundled SDK runtime over JSON-RPC | No CLI extension to install or keep in sync — first run needs only a Copilot CLI that is installed and logged in. **No tmux inspector** for those sessions: there is no TUI to attach to |
+| **SDK** (experimental) | A headless Node worker per conversation, driving the CLI's bundled SDK runtime over JSON-RPC | No CLI extension to install or keep in sync — first run needs only a Copilot CLI that is installed and logged in. **No tmux inspector** for those sessions: there is no TUI to attach to. The SDK engine is the one with Claude-parity **mid-turn steering** (Steer / Queue, question cards never bypassed, Stop with Resend), a **Cancel** on queued messages the runtime has not started yet, and the **background task panel** for the agents and detached shells a turn spawns (model, live tool call, tokens, a working Stop) — every Copilot model, hosted or BYOK |
 
 Switching to **SDK** can be refused, and the panel says why in place of the engine description:
 

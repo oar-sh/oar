@@ -105,6 +105,11 @@ export function createFakeCopilotSession({
   // `interruptRpc: false` model an older runtime without them (the runner
   // must degrade, never throw); `queueItems` seeds `pendingItems()`.
   queueRpc = true, interruptRpc = true, queueItems = null, onInterrupt = null,
+  // `rpc.tasks`: `taskList` seeds `tasks.list()` (TaskInfo entries: agents
+  // and shells); `taskProgress` maps id → progress. Off by default so the
+  // suites written against the event-scraped shell tracker keep exercising
+  // that fallback path; the registry tests opt in with `tasksRpc: true`.
+  tasksRpc = false, taskList = null, taskProgress = null,
 } = {}) {
   let nextMessageId = 0;
   const session = {
@@ -122,6 +127,12 @@ export function createFakeCopilotSession({
     // mutates it (or passes `queueItems`) to model the runtime's queued lane.
     queueItems: Array.isArray(queueItems) ? queueItems : [],
     removedQueueItems: [],
+    // What `rpc.tasks.list()` answers; a test mutates it to model the runtime's
+    // task registry moving (running → idle/completed/cancelled).
+    taskList: Array.isArray(taskList) ? taskList : [],
+    taskProgress: taskProgress && typeof taskProgress === 'object' ? taskProgress : {},
+    cancelledTasks: [],
+    removedTasks: [],
     emit(event) {
       config?.onEvent?.(event);
     },
@@ -162,6 +173,35 @@ export function createFakeCopilotSession({
         // aborted idle; nothing else is touched.
         setTimeout(() => { onAbort?.(session); }, 0);
         return { interrupted: true };
+      },
+    } : {}),
+    ...(tasksRpc ? {
+      tasks: {
+        listCalls: 0,
+        async list() {
+          session.rpc.tasks.listCalls += 1;
+          return { tasks: session.taskList.map((task) => ({ ...task })) };
+        },
+        async getProgress({ id }) {
+          return { progress: session.taskProgress[id] || null };
+        },
+        async cancel({ id }) {
+          const task = session.taskList.find((entry) => entry.id === id);
+          if (!task || !['running', 'idle'].includes(task.status)) return { cancelled: false };
+          session.cancelledTasks.push(id);
+          task.status = 'cancelled';
+          task.completedAt = new Date().toISOString();
+          // Like the runtime: the registry changing announces itself.
+          setTimeout(() => session.emit({ type: 'session.background_tasks_changed', data: {} }), 0);
+          return { cancelled: true };
+        },
+        async remove({ id }) {
+          const before = session.taskList.length;
+          session.taskList = session.taskList.filter((entry) => entry.id !== id || ['running', 'idle'].includes(entry.status));
+          const removed = session.taskList.length !== before;
+          if (removed) session.removedTasks.push(id);
+          return { removed };
+        },
       },
     } : {}),
     ...(queueRpc ? {

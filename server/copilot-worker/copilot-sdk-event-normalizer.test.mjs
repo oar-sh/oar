@@ -317,6 +317,42 @@ test('with steering, the task summary answers only the last prompt segment', () 
   assert.deepEqual(terminal(actions).segmentTexts, ['first answer', 'second answer via summary']);
 });
 
+test('a background subagent gets a transcript note, not a lane, and its tagged traffic is dropped', () => {
+  const { actions, normalizer } = run([
+    { type: 'user.message', data: {} },
+    { type: 'subagent.started', agentId: 'bg-1', data: { toolCallId: 'c1', agentName: 'general-purpose', agentDisplayName: 'bg-probe', agentType: 'general-purpose', executionMode: 'background' } },
+    { type: 'tool.execution_start', agentId: 'bg-1', data: { toolCallId: 'c3', toolName: 'bash', arguments: { command: 'sleep 6' } } },
+    { type: 'assistant.message', agentId: 'bg-1', data: { messageId: 'sub-m', content: 'SUB done.' } },
+    { type: 'assistant.message', data: { messageId: 'm1', content: 'spawned' } },
+    { type: 'assistant.idle', data: {} },
+  ]);
+  assert.deepEqual(only(actions, 'subagent'), [], 'no lane for a background agent');
+  const activityTexts = only(actions, 'activity').map((a) => a.payload.text);
+  assert.deepEqual(activityTexts, ['Started background agent: bg-probe (general-purpose) — see the task panel']);
+  assert.equal(terminal(actions).text, 'spawned', 'the agent\'s reply never merges into the main reply');
+  assert.deepEqual(normalizer.activeSubagentRuns(), [], 'nothing to force-close at the terminal');
+  // Its later completion is the task panel's business.
+  assert.deepEqual(normalizer.normalize({ type: 'subagent.completed', agentId: 'bg-1', data: { toolCallId: 'c1', totalTokens: 40 } }), []);
+  // A failure still gets a main-thread line.
+  assert.deepEqual(
+    normalizer.normalize({ type: 'subagent.failed', agentId: 'bg-1', data: { toolCallId: 'c1', agentDisplayName: 'bg-probe', error: 'boom' } }).map((a) => a.payload.text),
+    ['Background agent failed (bg-probe): boom'],
+  );
+});
+
+test('a sync subagent still opens and closes a lane', () => {
+  const { actions } = run([
+    { type: 'user.message', data: {} },
+    { type: 'subagent.started', agentId: 'sync-1', data: { toolCallId: 'c1', agentName: 'explore', agentDisplayName: 'Explorer', executionMode: 'sync' } },
+    { type: 'assistant.message', agentId: 'sync-1', data: { messageId: 'sub-m', content: 'found it' } },
+    { type: 'subagent.completed', agentId: 'sync-1', data: { toolCallId: 'c1' } },
+    { type: 'assistant.message', data: { messageId: 'm1', content: 'done' } },
+    { type: 'session.idle', data: {} },
+  ]);
+  const lane = only(actions, 'subagent').map((a) => a.payload.status);
+  assert.deepEqual(lane, ['running', 'completed']);
+});
+
 test('assistant.idle terminates the turn; the deferred session.idle that follows is a no-op', () => {
   // The main loop is done while a background agent keeps `session.idle`
   // deferred (runtime 1.0.88). The row must settle on the assistant-level
