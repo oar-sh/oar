@@ -32,6 +32,8 @@ All notable changes to OAR are documented here. The format follows
 - The background task panel scrolls when it holds more tasks than fit,
   instead of growing past the window — in phone landscape too, where the
   composer now always stays on screen.
+- Rotating a phone to landscape keeps the portrait text size instead of
+  jumping to the larger desktop size.
 
 - The composer's send button no longer turns into **Stop** while a turn runs.
   It reads **Steer** when a Claude turn is live and text is drafted, and stays
