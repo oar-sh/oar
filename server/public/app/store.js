@@ -1,3 +1,4 @@
+import { resolveNearBottomThresholdPx } from './transcript-viewport-anchor.mjs';
 import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
 import { resolveRelayDotState } from './relay-dot-state.mjs';
 import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
@@ -610,10 +611,7 @@ function resolveMessagesNearBottomThreshold(el, thresholdPx = null) {
   if (Number.isFinite(Number(thresholdPx)) && Number(thresholdPx) >= 0) {
     return Math.trunc(Number(thresholdPx));
   }
-  const viewportHeight = Number(el?.clientHeight || 0);
-  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return 0;
-  const relativeThreshold = Math.floor(viewportHeight * 0.08);
-  return Math.min(48, Math.max(12, relativeThreshold));
+  return resolveNearBottomThresholdPx(el?.clientHeight);
 }
 
 export function isMessagesNearBottom(thresholdPx = null) {

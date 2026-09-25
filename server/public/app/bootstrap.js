@@ -51,6 +51,7 @@ import {
   imageEditTarget,
   hasPendingUserMessageForConversation,
 } from './store.js';
+import { createTranscriptResizeKeeper } from './transcript-viewport-anchor.mjs';
 import {
   verifyExistingSession,
   verifyToken,
@@ -3316,9 +3317,18 @@ function startLiveConversationPolling() {
   }, 900);
 }
 
+const transcriptResizeKeeper = createTranscriptResizeKeeper({
+  getElement: () => document.getElementById('messages'),
+});
+
 function setupViewportTracking() {
   syncViewportMetrics();
-  const update = () => syncViewportMetrics();
+  // After the metrics: --app-height decides the transcript's height, and the
+  // keeper's restore reads the post-resize layout.
+  const update = () => {
+    syncViewportMetrics();
+    transcriptResizeKeeper.handleResize();
+  };
   window.addEventListener('resize', update, { passive: true });
   window.addEventListener('orientationchange', update, { passive: true });
   if (window.visualViewport) {
@@ -3432,6 +3442,7 @@ function initMessageScrollPersistence() {
   if (!el || el.dataset.scrollPersistenceBound === '1') return;
   el.dataset.scrollPersistenceBound = '1';
   el.addEventListener('scroll', () => {
+    transcriptResizeKeeper.recordScroll();
     const convId = String(currentConvId || '').trim();
     if (!convId) return;
     saveConversationScrollTop(convId, el.scrollTop);

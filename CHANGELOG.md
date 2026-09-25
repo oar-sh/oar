@@ -34,6 +34,10 @@ All notable changes to OAR are documented here. The format follows
   composer now always stays on screen.
 - Rotating a phone to landscape keeps the portrait text size instead of
   jumping to the larger desktop size.
+- Rotating a phone (or resizing the window, or opening the keyboard) keeps
+  your place in the transcript: a reader at the end stays at the end, and
+  mid-history the same message stays at the top of the screen. Previously
+  the reflow left you screens above where you were, usually further back.
 
 - The composer's send button no longer turns into **Stop** while a turn runs.
   It reads **Steer** when a Claude turn is live and text is drafted, and stays

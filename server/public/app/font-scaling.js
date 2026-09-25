@@ -1,3 +1,5 @@
+import { captureTranscriptAnchor, restoreTranscriptAnchor } from './transcript-viewport-anchor.mjs';
+
 const FONT_SCALE_STORAGE_KEY = 'copilot_font_scale';
 const FONT_SCALE_MIN = 0.5;
 const FONT_SCALE_MAX = 1.5;
@@ -53,41 +55,6 @@ function normalizeFontScaleSelectValue(raw = '') {
   return clampFontScale(numeric);
 }
 
-function getMessageViewportAnchor() {
-  const container = document.getElementById('messages');
-  if (!container) return null;
-  const containerRect = container.getBoundingClientRect();
-  const messages = Array.from(container.querySelectorAll('.msg[data-message-id]'));
-  for (const message of messages) {
-    const rect = message.getBoundingClientRect();
-    if (rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) continue;
-    const messageId = String(message.dataset.messageId || '').trim();
-    if (!messageId) continue;
-    return {
-      messageId,
-      offsetTop: rect.top - containerRect.top,
-    };
-  }
-  return null;
-}
-
-function restoreMessageViewportAnchor(anchor) {
-  if (!anchor?.messageId) return;
-  const container = document.getElementById('messages');
-  if (!container) return;
-  const messageId = String(anchor.messageId || '').trim();
-  if (!messageId) return;
-  const message = Array.from(container.querySelectorAll('.msg[data-message-id]'))
-    .find((node) => String(node?.dataset?.messageId || '').trim() === messageId);
-  if (!message) return;
-  const containerRect = container.getBoundingClientRect();
-  const rect = message.getBoundingClientRect();
-  const delta = rect.top - containerRect.top - Number(anchor.offsetTop || 0);
-  if (Math.abs(delta) > 0.5) {
-    container.scrollTop += delta;
-  }
-}
-
 export function syncFontScaleSelect() {
   const select = document.getElementById('font-scale-select');
   if (!select) return;
@@ -117,7 +84,7 @@ export function setFontScale(nextScale, { persist = true, preserveMessageAnchor 
     syncFontScaleSelect();
     return normalized;
   }
-  const anchor = preserveMessageAnchor ? getMessageViewportAnchor() : null;
+  const anchor = preserveMessageAnchor ? captureTranscriptAnchor(document.getElementById('messages')) : null;
   fontScaleValue = normalized;
   document.documentElement.style.setProperty('--font-scale', normalized.toFixed(4));
   document.documentElement.style.setProperty('--font-scale-percent', `${Math.round(normalized * 100)}%`);
@@ -125,7 +92,7 @@ export function setFontScale(nextScale, { persist = true, preserveMessageAnchor 
   syncFontScaleSelect();
   if (anchor) {
     requestAnimationFrame(() => {
-      restoreMessageViewportAnchor(anchor);
+      restoreTranscriptAnchor(document.getElementById('messages'), anchor);
     });
   }
   return normalized;
