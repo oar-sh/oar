@@ -10,6 +10,7 @@ import {
   parseBackgroundTaskTimeoutUpdate,
   readBackgroundTaskTimeoutSetting,
 } from './background-task-timeout.mjs';
+import * as browserMirror from '../server/public/app/background-task-timeout-options.mjs';
 
 test('the default is 4 hours — long work survives, forgotten tasks do not live forever', () => {
   assert.equal(DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES, 240);
@@ -17,6 +18,13 @@ test('the default is 4 hours — long work survives, forgotten tasks do not live
   assert.equal(readBackgroundTaskTimeoutSetting(null), 240);
   assert.equal(backgroundTaskTimeoutMinutesToMs(DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES), 4 * 3_600_000);
   assert.equal(formatBackgroundTaskTimeoutLabel(DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES), '4 h');
+});
+
+test('the browser mirror stays identical to the shared module', () => {
+  // server/public is the only served directory, so the settings modal keeps a
+  // copy of the default: the value its slider shows until the relay's own
+  // loads. A stale copy claimed "No limit" while 4 hours was enforced.
+  assert.equal(browserMirror.DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES, DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES);
 });
 
 test('zero and anything below it disables the timeout', () => {

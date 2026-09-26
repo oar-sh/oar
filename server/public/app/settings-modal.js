@@ -33,6 +33,7 @@ import {
   updateFeatureFlagSetting as requestFeatureFlagSetting,
   requestRelayRestart,
 } from './api-client.js';
+import { DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES } from './background-task-timeout-options.mjs';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
@@ -152,9 +153,10 @@ export async function updateTurnCeilingSetting(value) {
   }
 }
 
-// Mirrors shared/background-task-timeout.mjs (the browser cannot import it).
-// Bounds come from the API response; these are just pre-response defaults.
-let backgroundTaskTimeoutMinutes = 0;
+// Starts at the default the relay enforces, so the slider tells the truth while
+// the settings request is in flight or after it failed. Bounds come from the
+// API response.
+let backgroundTaskTimeoutMinutes = DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES;
 let backgroundTaskTimeoutUpdateInFlight = false;
 
 function syncBackgroundTaskTimeoutSlider() {

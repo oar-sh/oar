@@ -8,6 +8,11 @@
 // live tasks stays up until the tasks finish, the user stops them from the
 // composer panel, or the worker/relay goes down. Mirrors
 // shared/turn-ceiling.mjs.
+//
+// The browser mirrors the default in
+// server/public/app/background-task-timeout-options.mjs (only server/public is
+// served), and the slider's static markup in server/public/index.html starts
+// at it; unit tests pin both to this module.
 
 export const BACKGROUND_TASK_TIMEOUT_MIN_MINUTES = 0;
 export const BACKGROUND_TASK_TIMEOUT_MAX_MINUTES = 600;

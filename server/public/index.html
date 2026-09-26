@@ -5411,14 +5411,14 @@
         </div>
         <div class="settings-help" style="margin-top: 6px;">A hard cap on how long one turn may run before the relay requeues it. Turns are already kept alive by worker heartbeats, and a turn waiting on your answer to a question is never cut off — so this only catches a worker that has hung. Set to 0 for no limit.</div>
         <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-          <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">No limit</span></label>
+          <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">4 h</span></label>
           <input
             id="background-task-timeout-slider"
             type="range"
             min="0"
             max="600"
             step="5"
-            value="0"
+            value="240"
             aria-label="Background task timeout in minutes"
             oninput="previewBackgroundTaskTimeoutSetting(this.value)"
             onchange="updateBackgroundTaskTimeoutSetting(this.value)"
