@@ -143,7 +143,7 @@ const STEER_NOTE_PATTERN = /^\s*\[Sent while you were still working on my previo
 // The Claude worker's slash-command guard (shared/slash-command-guard.mjs): a
 // zero-width space in front of a "/x" it delivers as text. trim() keeps it, so
 // it is matched on its own, and only where it guards a "/".
-const SLASH_COMMAND_GUARD_PATTERN = /^​(?=\s*\/)/;
+const SLASH_COMMAND_GUARD_PATTERN = /^\u200B(?=\s*\/)/;
 
 function stripLeadingRelayNotes(text) {
   const stripped = String(text || '').replace(STEER_NOTE_PATTERN, '').replace(SLASH_COMMAND_GUARD_PATTERN, '');

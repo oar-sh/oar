@@ -29,7 +29,7 @@
 // its queue still classifies the text by the leading "/" (e.g. never merges
 // it with other queued prompts) — the guard makes it plain text everywhere.
 
-export const SLASH_COMMAND_GUARD = '​';
+export const SLASH_COMMAND_GUARD = '\u200B';
 
 function readsAsSlashCommand(text) {
   return typeof text === 'string' && text.trim().startsWith('/');
