@@ -267,7 +267,13 @@ test('live background tasks block the delete', async () => {
 });
 
 test('a dead worker\'s leftover rows and tasks do not make a conversation undeletable', async () => {
-  for (const worker of [{ status: 'ready', pid: DEAD_PID }, { status: 'stopped', pid: null }, { status: 'error', pid: null }]) {
+  const deadWorkers = [
+    { status: 'ready', pid: DEAD_PID },
+    { status: 'error', pid: DEAD_PID },
+    { status: 'stopped', pid: null },
+    { status: 'error', pid: null },
+  ];
+  for (const worker of deadWorkers) {
     const { del, events } = setup({
       worker,
       processingCount: 1,
@@ -276,6 +282,27 @@ test('a dead worker\'s leftover rows and tasks do not make a conversation undele
     const response = await del();
     assert.equal(response.statusCode, 200, `worker ${JSON.stringify(worker)}`);
     assert.ok(events.includes('emit:conversation_deleted:conv-1'));
+  }
+});
+
+test('a worker a failed turn marked error still blocks the delete while its process runs', async () => {
+  // A turn that fails marks its still-running worker 'error' until the next
+  // turn; its background tasks, or a turn queued behind, are still live.
+  const cases = [
+    [{ backgroundTasks: { 'conv-1': [{ taskId: 'task-1', taskType: 'local_agent' }] } }, 'background-tasks'],
+    [{ processingCount: 1 }, 'turn-running'],
+  ];
+  for (const [state, reason] of cases) {
+    const { del, events } = setup({
+      worker: { status: 'error', pid: process.pid },
+      processPids: [4242],
+      alivePids: [4242],
+      ...state,
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 409, reason);
+    assert.equal(response.body.reason, reason);
+    assert.deepEqual(events, [], reason);
   }
 });
 

@@ -2333,12 +2333,16 @@ export function registerSessionsRoutes(app, deps) {
    * left behind would otherwise make the conversation undeletable. A session
    * the registry has never seen may still be running a turn, so its
    * processing rows count.
+   *
+   * A worker's pid decides whether it is alive; its status only when it has
+   * none. A turn that fails marks a worker that is still running 'error',
+   * and it stays so until its next turn, background tasks and all.
    */
   function describeConversationActivity(conversationId, workerSessionId) {
     const worker = sessionWorkerRegistry?.getWorker?.(workerSessionId) || null;
-    const workerAlive = !!worker
-      && LIVE_WORKER_STATUSES.has(String(worker.status || '').trim().toLowerCase())
-      && (!worker.pid || isPidAlive(worker.pid));
+    const workerAlive = !!worker && (worker.pid
+      ? isPidAlive(worker.pid)
+      : LIVE_WORKER_STATUSES.has(String(worker.status || '').trim().toLowerCase()));
     const processingCount = Number(countProcessingConversationQueueRows.get(conversationId)?.count || 0);
     const taskKeys = [...new Set([conversationId, workerSessionId])];
     const backgroundTaskCount = taskKeys
