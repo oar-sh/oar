@@ -104,8 +104,12 @@ export function createCopilotQuestionBridge({
     await api('POST', `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
   }
 
-  async function createQuestion({ prompt, choices, allowFreeform, source, rationale, requestedSchema, timeoutMs, extra = {} }) {
-    const activeMsg = typeof getActiveMessage === 'function' ? getActiveMessage() : null;
+  async function createQuestion({ prompt, choices, allowFreeform, source, rationale, requestedSchema, timeoutMs, extra = {} }, owner) {
+    // A caller that knows which row the card belongs to names it (`message`);
+    // by the time the card is created the "active" row can be another one.
+    const activeMsg = owner !== undefined
+      ? owner
+      : (typeof getActiveMessage === 'function' ? getActiveMessage() : null);
     const payload = {
       // The relay 409s ("No active relay turn") unless this queue row is
       // `processing`, which is exactly the state a blocking handler runs in.
@@ -141,13 +145,13 @@ export function createCopilotQuestionBridge({
     return questionId;
   }
 
-  async function ask(spec, { signal } = {}) {
+  async function ask(spec, { signal, message } = {}) {
     // Shutdown already began: nothing will ever poll an answer, so minting a
     // card would only strand it in the UI. Shaped like a timeout so the caller
     // degrades exactly as it does for an unanswered card.
     if (closing) return { answer: QUESTION_TIMEOUT_CONTINUATION_TEXT, timedOut: true };
     const create = (async () => {
-      const questionId = await createQuestion(spec);
+      const questionId = await createQuestion(spec, message);
       if (closing) {
         // The create raced `cancelPendingQuestions` and lost: its card was
         // born after the shutdown snapshot, so it is expired here, at birth —
@@ -189,7 +193,7 @@ export function createCopilotQuestionBridge({
    * comes back with `structuredAnswer: null` — the caller declines in that
    * case, so a half-valid submission can never be forced into a form result.
    */
-  async function askStructured({ prompt, requestedSchema, timeoutMs }, { signal } = {}) {
+  async function askStructured({ prompt, requestedSchema, timeoutMs }, { signal, message } = {}) {
     const result = await ask({
       prompt: String(prompt || '').trim() || 'Copilot needs structured input to continue this turn.',
       choices: [],
@@ -198,7 +202,7 @@ export function createCopilotQuestionBridge({
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
       source: 'onElicitationRequest',
       rationale: 'Copilot requested a structured form answer to continue this turn.',
-    }, { signal });
+    }, { signal, message });
     const structuredAnswer = result?.structuredAnswer && typeof result.structuredAnswer === 'object'
       && !Array.isArray(result.structuredAnswer)
       ? result.structuredAnswer
@@ -218,7 +222,7 @@ export function createCopilotQuestionBridge({
    * silently. A relay that is unreachable therefore degrades to the same
    * in-band note phase 1 always returned, which lets the model continue.
    */
-  async function askUserInput(request, { signal } = {}) {
+  async function askUserInput(request, { signal, message } = {}) {
     const question = String(request?.question || '').trim();
     const choices = normalizeUserInputChoices(request?.choices);
     // `allowFreeform` is only meaningful alongside choices; with none, the card
@@ -248,7 +252,7 @@ export function createCopilotQuestionBridge({
         ...(multiSelect ? { multiSelect: true } : {}),
         ...(canPickSeveral ? { allowMultiSelect: true } : {}),
       },
-    }, { signal });
+    }, { signal, message });
     const answer = String(result?.answer ?? '');
     return {
       answer,
@@ -264,7 +268,7 @@ export function createCopilotQuestionBridge({
    * so a human can type *why* they are refusing and the model receives it as
    * feedback instead of a bare refusal.
    */
-  async function askToolApproval(request, { signal } = {}) {
+  async function askToolApproval(request, { signal, message } = {}) {
     const description = describePermissionRequest(request);
     const result = await ask({
       prompt: `Copilot wants to run:\n\n${description}\n\nApprove this action?`,
@@ -276,7 +280,7 @@ export function createCopilotQuestionBridge({
         requestId: String(request?.requestId || '') || undefined,
         permissionKind: String(request?.kind || '') || undefined,
       },
-    }, { signal });
+    }, { signal, message });
     const answer = String(result?.answer ?? '').trim();
     const approved = !result?.timedOut && answer.toLowerCase() === PERMISSION_APPROVE_CHOICE.toLowerCase();
     // The denial note is composed HERE rather than in the permission handler so

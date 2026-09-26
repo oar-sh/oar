@@ -29,7 +29,9 @@ function setup({ events = loadFixture('happy-turn'), clientOptions = {}, ...over
     onSend: (session) => session.replay(events),
     ...clientOptions,
   });
-  const { runner, started, questionBridge } = makeRunner({ stub, client, ...overrides });
+  // A handler called after the turn settled opens a continuation for its card;
+  // this stub mints no rows, so the registration's retries run at test speed.
+  const { runner, started, questionBridge } = makeRunner({ stub, client, continuationRetryDelayMs: 1, ...overrides });
   return { stub, client, runner, started, questionBridge };
 }
 
@@ -505,6 +507,29 @@ test('a question bridge failure falls back to the local policy instead of throwi
   const decision = await onPermissionRequest({ kind: 'write', fileName: 'a.js' });
   assert.equal(decision.kind, 'reject');
   assert.match(decision.feedback, /ask mode/);
+});
+
+test('between turns the permission policy follows the mode of the last delivered turn', async () => {
+  // A background agent's request arrives with no turn live. The session was
+  // built on the first turn, and its mode must not outlive a mode switch.
+  const bridge = makeFakeQuestionBridge({ approve: true });
+  const { client, runner } = setup({ questionBridge: bridge });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'ask' } });
+  const { onPermissionRequest } = client.createAttempts[0];
+  assert.deepEqual(await onPermissionRequest({ kind: 'write', fileName: 'a.txt' }), { kind: 'approve-once' });
+  assert.equal(bridge.approvalCalls.length, 1, 'an ask-mode conversation asks');
+
+  // …and the other way round: a write is never asked about once the user left ask mode.
+  const quiet = makeFakeQuestionBridge({ approve: false });
+  const other = setup({ questionBridge: quiet });
+  await other.runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
+  await other.runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'agent' } });
+  assert.deepEqual(
+    await other.client.createAttempts[0].onPermissionRequest({ kind: 'write', fileName: 'a.txt' }),
+    { kind: 'approve-once' },
+  );
+  assert.equal(quiet.approvalCalls.length, 0);
 });
 
 test('the relay mode is threaded to the runtime as agentMode', async () => {

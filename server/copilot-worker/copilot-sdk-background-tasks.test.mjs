@@ -15,9 +15,12 @@ import {
   tick,
   waitFor,
 } from './copilot-sdk-test-harness.mjs';
+import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
+import { BACKGROUND_QUESTION_NOTE } from './copilot-sdk-session-process.mjs';
 
 const AGENT_ID = 'e489d2f3-2431-4f95-9b71-f15a327f8c92';
 const userMessage = (messageId, delivery = 'idle') => ({ type: 'user.message', data: { messageId, delivery, content: 'hello' } });
+const responsesFor = (stub, id) => stub.bodiesFor('/api/response').filter((body) => body.messageId === id);
 const startedAtIso = (agoMs = 1_000) => new Date(Date.now() - agoMs).toISOString();
 
 function agentTask(overrides = {}) {
@@ -336,5 +339,189 @@ test('without rpc.tasks an unlimited slider still falls back to the 30-minute sh
   runner._getState().backgroundShells[0].startedAt -= 31 * 60_000;
   runner._evaluateLifecycle();
   assert.equal(runner._getState().backgroundShells.length, 0, 'the 30-minute default applied on the fallback path');
+  await runner.dispose();
+});
+
+// ------------------------------------------ questions from background agents --
+//
+// A background agent can ask the human (ask_user, an ask-mode approval) after
+// the turn that spawned it settled on `assistant.idle`, and a card needs a
+// `processing` row. So a question with no turn live gets a continuation row of
+// its own, and a card raised during a live turn keeps that turn's row open
+// until it is answered.
+
+/**
+ * The relay's question routes for the REAL bridge: a card without a row is
+ * refused with a 409, as `/api/relay-question` does, and every card stays
+ * pending until the test answers it.
+ */
+function questionRelay() {
+  const cards = [];
+  const routeResponses = {
+    '/api/relay-question': (body) => {
+      if (!body?.queueId) {
+        const error = new Error('No active relay turn');
+        error.status = 409;
+        throw error;
+      }
+      const card = { id: `rq-${cards.length + 1}`, body, status: 'pending', answer: null };
+      cards.push(card);
+      return { question: { id: card.id } };
+    },
+  };
+  for (let index = 1; index <= 3; index += 1) {
+    const id = `rq-${index}`;
+    const find = () => cards.find((card) => card.id === id);
+    routeResponses[`/api/relay-question/${id}`] = () => ({ question: { id, status: find().status, answer: find().answer } });
+    routeResponses[`/api/relay-question/${id}/timeout`] = () => {
+      if (find().status === 'pending') find().status = 'timed_out';
+      return {};
+    };
+  }
+  return {
+    cards,
+    stub: makeContinuationApiStub({ routeResponses }),
+    answer(id, text) {
+      const card = cards.find((entry) => entry.id === id);
+      card.status = 'answered';
+      card.answer = text;
+    },
+  };
+}
+
+function setupQuestions(overrides = {}) {
+  const relay = questionRelay();
+  const made = setup({
+    stub: relay.stub,
+    taskList: [agentTask()],
+    createQuestionBridgeImpl: (options) => createCopilotQuestionBridge(options),
+    questionPollMs: 1,
+    ...overrides,
+  });
+  return { ...made, relay };
+}
+
+test('an ask-mode approval from a background agent after the turn settled gets a row of its own and reaches the human', async () => {
+  const { relay, stub, client, runner } = setupQuestions();
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } }), true);
+  assert.equal(runner.isTurnActive(), false, 'q-1 settled on assistant.idle; the agent runs on');
+
+  // The agent wants to write: the runtime calls the handler with no turn open.
+  const decision = client.createAttempts[0].onPermissionRequest({ kind: 'write', fileName: 'notes.md' });
+  await waitFor(() => relay.cards.length === 1, { label: 'card created' });
+  const card = relay.cards[0].body;
+  assert.equal(card.queueId, 'cont-1');
+  assert.equal(card.attemptId, 'attempt-cont-1');
+  assert.equal(card.context.source, 'onPermissionRequest');
+  assert.equal(stub.mintedContinuations[0].body.relayMode, 'ask');
+  relay.answer('rq-1', 'Approve');
+  assert.deepEqual(await decision, { kind: 'approve-once' });
+
+  // Nothing else would ever close a row that exists only for the card.
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'question row settled' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, BACKGROUND_QUESTION_NOTE);
+  assert.equal(responsesFor(stub, 'cont-1')[0].terminalError, undefined);
+  await waitFor(() => runner.isTurnActive() === false, { label: 'row released' });
+  assert.deepEqual(runner.getActiveQueueMessageIds(), []);
+  await runner.dispose();
+});
+
+test('ask_user from a background agent after the turn settled reaches the human, through the relay tool and the built-in', async () => {
+  const { relay, stub, client, runner } = setupQuestions();
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  const config = client.createAttempts[0];
+  const tool = config.tools.find((entry) => entry.name === 'ask_user');
+
+  const viaTool = tool.handler({ question: 'Which env?', choices: ['prod', 'staging'] }, { toolCallId: 'c1' });
+  await waitFor(() => relay.cards.length === 1, { label: 'tool card' });
+  assert.equal(relay.cards[0].body.queueId, 'cont-1');
+  relay.answer('rq-1', 'staging');
+  assert.equal(await viaTool, 'User selected: staging');
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'first question row settled' });
+
+  const viaBuiltIn = config.onUserInputRequest({ requestId: 'r2', question: 'Proceed?', choices: ['yes', 'no'] });
+  await waitFor(() => relay.cards.length === 2, { label: 'built-in card' });
+  assert.equal(relay.cards[1].body.queueId, 'cont-2');
+  relay.answer('rq-2', 'yes');
+  assert.deepEqual(await viaBuiltIn, { answer: 'yes', wasFreeform: false });
+  await waitFor(() => responsesFor(stub, 'cont-2').length === 1, { label: 'second question row settled' });
+  assert.equal(responsesFor(stub, 'cont-2')[0].text, BACKGROUND_QUESTION_NOTE);
+  await runner.dispose();
+});
+
+test('a card a background agent raises during a live turn keeps that row open past assistant.idle until it is answered', async () => {
+  const { relay, stub, client, runner } = setupQuestions({ events: (id) => spawnTurnEvents(id).slice(0, -1) });
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
+
+  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep the old file?', choices: ['yes', 'no'] });
+  await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
+  assert.equal(relay.cards[0].body.queueId, 'q-1');
+
+  // The main loop idles while the agent still waits on the human.
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  await tick(30);
+  assert.equal(relay.cards[0].status, 'pending', 'the card was not timed out');
+  assert.equal(responsesFor(stub, 'q-1').length, 0, 'the row waits for its card');
+  assert.deepEqual(runner.getActiveQueueMessageIds().map((entry) => entry.id), ['q-1'], 'and stays claimed meanwhile');
+  assert.equal(stub.bodiesFor('/api/continuation-turn').length, 0);
+
+  relay.answer('rq-1', 'no');
+  assert.deepEqual(await asked, { answer: 'no', wasFreeform: false });
+  assert.equal(await first, true);
+  assert.equal(responsesFor(stub, 'q-1').length, 1);
+  assert.equal(responsesFor(stub, 'q-1')[0].text, 'Main: spawned.');
+  assert.deepEqual(runner.getActiveQueueMessageIds(), []);
+  await runner.dispose();
+});
+
+test('a Stop while a settled row waits on a background card ends the card and interrupts nothing', async () => {
+  let abortTurn = null;
+  const controlPoller = { start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return {}; }, stop: () => {} };
+  const { relay, stub, client, runner } = setupQuestions({
+    events: (id) => spawnTurnEvents(id).slice(0, -1),
+    controlPoller,
+  });
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
+  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
+  await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  await tick(20);
+
+  await abortTurn({ queueMessageId: 'q-1' });
+  await asked;
+  assert.equal(await first, true);
+  assert.equal(relay.cards[0].status, 'timed_out', 'the card was ended');
+  // The main loop is no longer this row's: a runtime interrupt would hit whatever runs next.
+  assert.deepEqual(client.session.interruptCalls, []);
+  assert.equal(client.session.abortCalls, 0);
+  // Stopped: the relay's abort control settles the row, so no response.
+  assert.equal(responsesFor(stub, 'q-1').length, 0);
+  const finalStream = stub.bodiesFor('/api/stream').filter((body) => body.messageId === 'q-1').at(-1);
+  assert.equal(finalStream.done, true);
+  assert.equal(finalStream.text, 'Main: spawned.');
+  await runner.dispose();
+});
+
+test('root work that starts while a background question is open merges into its row and ends on assistant.idle', async () => {
+  const { relay, stub, client, runner } = setupQuestions();
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Proceed?', choices: ['yes', 'no'] });
+  await waitFor(() => relay.cards.length === 1, { label: 'card' });
+  assert.equal(relay.cards[0].body.queueId, 'cont-1');
+
+  // The root agent starts work of its own while the card is still open.
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm5', content: 'Root follow-up while you decide.' } });
+  await tick(10);
+  relay.answer('rq-1', 'yes');
+  assert.deepEqual(await asked, { answer: 'yes', wasFreeform: false });
+  await tick(20);
+  assert.equal(responsesFor(stub, 'cont-1').length, 0, 'root work keeps the row open until its own terminator');
+
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation settled' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'Root follow-up while you decide.');
+  assert.equal(stub.bodiesFor('/api/continuation-turn').length, 1, 'one row for the question and the work');
   await runner.dispose();
 });

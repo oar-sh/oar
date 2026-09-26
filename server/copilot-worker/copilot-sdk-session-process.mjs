@@ -202,6 +202,14 @@ export const STEERED_ROW_MERGED_NOTE =
   '_(This message was delivered while the previous turn was still running; the reply continues in '
   + 'the next turn.)_';
 
+/**
+ * The reply of a continuation row opened only so a background task's question
+ * had a row to hang its card off (see `ensureInteractiveTurn`). The runtime
+ * produced no root work for it, so nothing else would ever answer the row.
+ */
+export const BACKGROUND_QUESTION_NOTE =
+  'System note: a background task asked for input here; it carries on in the background.';
+
 /** The provider name in the at-most-once settle failure wording. */
 const SETTLE_AGENT_LABEL = 'Copilot';
 
@@ -492,14 +500,49 @@ export function createCopilotSdkSessionRunner({
   // plan-board gating behaving the same either side of a background wait.
   let lastRelayMode = 'agent';
 
+  /**
+   * The turn a human request belongs to, opened on demand when none is live.
+   *
+   * A card needs a `processing` row (`/api/relay-question` 409s otherwise),
+   * and a background agent can ask long after the turn that spawned it settled
+   * on `assistant.idle`. Nothing else opens a row for that question, so it
+   * gets a continuation of its own — the Claude worker opens one before an
+   * off-turn `AskUserQuestion` for the same reason. `humanOrigin`: unless root
+   * work joins it, it closes itself once its last card is done.
+   */
+  function ensureInteractiveTurn() {
+    if (activeTurn || !session || disposed) return activeTurn;
+    const turn = openContinuationTurn();
+    turn.humanOrigin = true;
+    return turn;
+  }
+
   async function whileAwaitingHuman(run) {
+    // Captured once: the card belongs to this turn's row even when another
+    // turn owns the event stream by the time it is created or answered.
+    const turn = ensureInteractiveTurn();
     pendingHumanRequests += 1;
+    if (turn) {
+      if (turn.humanRequests === 0) turn.humansIdle = new Promise((resolve) => { turn.resolveHumansIdle = resolve; });
+      turn.humanRequests += 1;
+    }
     // An open card holds steering: the relay's readiness is withdrawn at once.
     syncDeliveryReadiness();
     try {
-      return await run();
+      return await run(turn);
     } finally {
       pendingHumanRequests -= 1;
+      if (turn) {
+        turn.humanRequests -= 1;
+        if (turn.humanRequests === 0) {
+          turn.resolveHumansIdle();
+          // A row opened only for questions: no terminator is coming for it.
+          if (turn.humanOrigin && !turn.rootWork && !turn.settled) {
+            turn.result = { subtype: 'completed', text: BACKGROUND_QUESTION_NOTE };
+            turn.settle();
+          }
+        }
+      }
       // The clock restarts from the answer, not from before the wait.
       touch();
       activeTurn?.armStall?.();
@@ -510,20 +553,19 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * Hold an interactive callback until the active turn's queue row exists.
+   * Hold an interactive callback until its turn's queue row exists.
    *
    * A continuation becomes the active turn synchronously but gets its row
    * asynchronously, and the runtime can block on `user_input.requested` (or an
    * ask-mode approval) in that gap — the question bridge would then see no
-   * active message and degrade to an unsupported answer / local rejection for
-   * a card that was milliseconds from having a real row id. Bounded by the
+   * row and degrade to an unsupported answer / local rejection for a card
+   * that was milliseconds from having a real row id. Bounded by the
    * registration timeout (the registration itself can hang on a dead relay);
    * on expiry — or on a registration that gave up (`rowReady` → false) — the
    * caller proceeds and degrades exactly as before. Delivered turns are
    * registered from birth and skip straight through.
    */
-  async function awaitInteractiveRow() {
-    const turn = activeTurn;
+  async function awaitInteractiveRow(turn) {
     if (!turn || turn.registered || !turn.rowReady) return;
     let timer = null;
     await Promise.race([
@@ -1594,6 +1636,9 @@ export function createCopilotSdkSessionRunner({
       return;
     }
     turn.armStall?.();
+    // Root work ends on the runtime's own terminator, so a question-only
+    // continuation it joins no longer closes itself (whileAwaitingHuman).
+    if (isContinuationOpeningEvent(event)) turn.rootWork = true;
     let actions = [];
     try {
       actions = turn.normalizer.normalize(event);
@@ -1651,15 +1696,15 @@ export function createCopilotSdkSessionRunner({
       handler: async (args, invocation) => {
         const { question, choices, multiSelect } = parseAskUserToolArguments(args);
         try {
-          const result = await whileAwaitingHuman(async () => {
-            await awaitInteractiveRow();
+          const result = await whileAwaitingHuman(async (turn) => {
+            await awaitInteractiveRow(turn);
             // Cancelled by either side: the turn (Stop, teardown) or the
             // runtime itself (a subagent cancelled via tasks.cancel, a
             // disconnect) — a card nobody will read must not hold steering.
-            const signal = combineSignals(activeTurn?.abortController?.signal, invocation?.signal);
+            const signal = combineSignals(turn?.abortController?.signal, invocation?.signal);
             return questionBridge.askUserInput(
               { question, choices, allowFreeform: true, multiSelect, source: 'relay-ask-user-tool' },
-              { signal },
+              { signal, message: turn?.message },
             );
           });
           return formatAskUserToolResult({
@@ -1706,22 +1751,29 @@ export function createCopilotSdkSessionRunner({
     }
   }
 
-  function buildSessionConfig(model, relayMode, reasoningEffort = null) {
+  function buildSessionConfig(model, reasoningEffort = null) {
     // Built once per session, not per request. Reads the mode off the LIVE turn
     // rather than closing over the one the session was built with, because one
     // session serves every turn and the user can switch modes between them.
+    // With no turn live (a background agent's request) it is the mode of the
+    // last delivered turn, as for a continuation.
     const decidePermission = createCopilotPermissionHandler({
       // Only the ask-mode branch actually blocks on a human; wrapping it keeps
-      // the stall watchdog off a turn where someone is deciding.
+      // the stall watchdog off a turn where someone is deciding, and only
+      // there can an approval open a row of its own.
       bridge: {
-        askToolApproval: (permissionRequest, options) => whileAwaitingHuman(async () => {
+        askToolApproval: (permissionRequest, options) => whileAwaitingHuman(async (turn) => {
           // An ask-mode approval raised the moment a continuation opens must
           // wait for the row its card will hang off — see `awaitInteractiveRow`.
-          await awaitInteractiveRow();
-          return questionBridge.askToolApproval(permissionRequest, options);
+          await awaitInteractiveRow(turn);
+          return questionBridge.askToolApproval(permissionRequest, {
+            ...options,
+            signal: turn?.abortController?.signal || options?.signal || null,
+            message: turn?.message,
+          });
         }),
       },
-      getRelayMode: () => activeTurn?.message?.relayMode || relayMode,
+      getRelayMode: () => activeTurn?.message?.relayMode || lastRelayMode,
       // An aborted turn must not leave the human staring at a card whose answer
       // nothing will read; the bridge times the card out instead.
       getSignal: () => activeTurn?.abortController?.signal || null,
@@ -1787,12 +1839,13 @@ export function createCopilotSdkSessionRunner({
       // the deserializer is strict, so it is always a real boolean.
       onUserInputRequest: async (request) => {
         try {
-          const { answer, wasFreeform } = await whileAwaitingHuman(async () => {
+          const { answer, wasFreeform } = await whileAwaitingHuman(async (turn) => {
             // Same gate as the approval path: an `ask_user` fired straight
             // after a continuation opened must get the row, not a null id.
-            await awaitInteractiveRow();
+            await awaitInteractiveRow(turn);
             return questionBridge.askUserInput(request, {
-              signal: activeTurn?.abortController?.signal || null,
+              signal: turn?.abortController?.signal || null,
+              message: turn?.message,
             });
           });
           return { answer, wasFreeform };
@@ -1846,12 +1899,12 @@ export function createCopilotSdkSessionRunner({
       const source = String(request?.elicitationSource || '').trim();
       const message = String(request?.message || '').trim()
         || 'Copilot needs structured input to continue this turn.';
-      const result = await whileAwaitingHuman(async () => {
-        await awaitInteractiveRow();
+      const result = await whileAwaitingHuman(async (turn) => {
+        await awaitInteractiveRow(turn);
         return questionBridge.askStructured({
           prompt: source ? `${message}\n\n(Requested by ${source}.)` : message,
           requestedSchema: schema,
-        }, { signal: activeTurn?.abortController?.signal || null });
+        }, { signal: turn?.abortController?.signal || null, message: turn?.message });
       });
       const content = result?.structuredAnswer;
       if (result?.timedOut || !content || typeof content !== 'object' || Array.isArray(content)) {
@@ -1957,7 +2010,7 @@ export function createCopilotSdkSessionRunner({
    * rebuilt config. Nothing is lost either way: the relay session id IS the
    * SDK session id, so the rebuild takes the ordinary resume path.
    */
-  async function applySelection(model, effort, relayMode) {
+  async function applySelection(model, effort) {
     if (!byokProvider) {
       await modelSwitch.apply(session, { model, effort, byok: false });
       return session;
@@ -1971,7 +2024,7 @@ export function createCopilotSdkSessionRunner({
     } else {
       dbg('BYOK ceilings differ for the target model; rebuilding the session', model);
     }
-    return rebuildByokSession(model, effort, relayMode);
+    return rebuildByokSession(model, effort);
   }
 
   /**
@@ -1983,7 +2036,7 @@ export function createCopilotSdkSessionRunner({
    * `SessionConfig.model`), so this path never re-enters the RPC attempt —
    * which is also what makes it terminate: RPC refusal → rebuild → done.
    */
-  async function rebuildByokSession(model, effort, relayMode) {
+  async function rebuildByokSession(model, effort) {
     dbg('rebuilding the copilot session for a BYOK model/effort switch', model);
     const closing = session;
     session = null;
@@ -1993,13 +2046,13 @@ export function createCopilotSdkSessionRunner({
     try { await closing?.disconnect?.(); } catch (error) {
       dbg('session disconnect before model switch failed', error?.message || String(error));
     }
-    return ensureSession(model, effort, relayMode);
+    return ensureSession(model, effort);
   }
 
-  async function ensureSession(model, effort, relayMode) {
+  async function ensureSession(model, effort) {
     await ensureClient();
     if (!session) {
-      const config = buildSessionConfig(model, relayMode, effort);
+      const config = buildSessionConfig(model, effort);
       // Resume first, always. On a brand-new conversation this costs one
       // failed RPC; on every other path (worker restart, idle shutdown,
       // relay restart) it is the difference between continuing the
@@ -2060,7 +2113,7 @@ export function createCopilotSdkSessionRunner({
       publishModelSnapshot(resumed ? 'session-resume' : 'session-start');
       return session;
     }
-    return applySelection(model, effort, relayMode);
+    return applySelection(model, effort);
   }
 
   async function stopRuntime(reason) {
@@ -2090,6 +2143,9 @@ export function createCopilotSdkSessionRunner({
       taskRefreshTimer = null;
     }
     replayGate.reset();
+    // A settled turn waiting on a card (driveTurn) would wait for an answer
+    // nothing can take any more: the agent that asked died with the runtime.
+    for (const turn of publishingTurns) turn.abortController.abort();
     continuationDueSince = 0;
     pendingActivities = [];
     compactingSince = 0;
@@ -2312,6 +2368,15 @@ export function createCopilotSdkSessionRunner({
       // Cancels any relay question card this turn is blocked on, so an aborted
       // turn does not leave a human answering into the void.
       abortController: new AbortController(),
+      // Cards (questions, ask-mode approvals, elicitations) open on this
+      // turn's row; `humansIdle` resolves when the last one is done. A turn
+      // that settles with one still open publishes only after it (driveTurn).
+      humanRequests: 0,
+      humansIdle: null,
+      // Opened by `ensureInteractiveTurn` for a question rather than by the
+      // runtime, and whether root work has joined it since.
+      humanOrigin: false,
+      rootWork: false,
       // Every row this turn owes an answer, in push order.
       entries: [],
       // runtime message id → entry, for the `user.message` acknowledgement.
@@ -2746,6 +2811,17 @@ export function createCopilotSdkSessionRunner({
    * settles the turn through the normal terminator.
    */
   async function interruptTurn(turn, control) {
+    if (turn.settled) {
+      // Its run is over and the main loop may already belong to the next
+      // turn, so nothing is interrupted. While it waits on a card (driveTurn)
+      // the Stop ends the cards, and the row settles as stopped.
+      if (turn.humanRequests > 0) {
+        turn.aborted = true;
+        turn.abortedRowId = String(control?.queueMessageId || '').trim() || null;
+        turn.abortController.abort();
+      }
+      return;
+    }
     turn.aborted = true;
     turn.abortedRowId = String(control?.queueMessageId || '').trim() || null;
     // While `ensureSession` is still connecting there is no session to abort
@@ -2799,7 +2875,7 @@ export function createCopilotSdkSessionRunner({
     }) || null;
     turn.drive = driveTurn(turn);
     try {
-      await ensureSession(model, effort, relayMode);
+      await ensureSession(model, effort);
       if (turn.aborted) {
         // The abort landed while the session was still being built. Nothing
         // was sent, so there is no runtime turn to interrupt — settle locally
@@ -2893,6 +2969,13 @@ export function createCopilotSdkSessionRunner({
     } catch (error) {
       turn.failure = turn.failure || error;
     }
+    // A card still open on this row — a background agent asking while the
+    // main loop went idle (a root question cannot get here: the loop is
+    // blocked on its handler) — keeps the row processing until it is done:
+    // the relay opens cards only on a processing row, and `/api/response`
+    // cancels the ones still open. The event stream is already released
+    // (`beginPublishing`), so new root work opens a turn of its own meanwhile.
+    if (!turn.aborted && !turn.failure && turn.humanRequests > 0) await turn.humansIdle;
     try {
       await quiesceTurn(turn);
       if (turn.failure && turn.kind === 'delivered' && !isModelSwitchUnconfirmedError(turn.failure) && session) {
