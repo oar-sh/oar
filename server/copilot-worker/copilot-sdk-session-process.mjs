@@ -265,6 +265,22 @@ function isStaleAttemptError(error) {
   return detail.includes('stale_attempt');
 }
 
+/**
+ * Whether publishing `action` makes its row worth keeping (`entry.showedWork`).
+ * A bookkeeping line only tracks background work the task card already shows,
+ * and so does a line carried in from between turns (a shell or agent the card
+ * showed finishing) — unless it reports a failure. The card lists running
+ * tasks only, so a failed agent's card vanishes exactly like a finished one's,
+ * and a `subagent.failed` between turns reaches no row: that line is the
+ * failure's only trace. It renders only through its row's response, so
+ * dropping the row would drop the failure with it.
+ */
+function showsWork(action) {
+  if (action.channel === 'init') return false;
+  if (action.carried) return action.reportsFailure === true;
+  return !action.bookkeeping;
+}
+
 export function createCopilotSdkSessionRunner({
   api,
   sdkSessionId,
@@ -520,10 +536,11 @@ export function createCopilotSdkSessionRunner({
   // continuation opening, or by the grace expiring on a runtime that decided it
   // had nothing to say.
   let continuationDueSince = 0;
-  // Transcript lines produced between turns (a settled shell's notification).
-  // They belong to the turn they trigger, so they are carried into it rather
-  // than dropped — the same trade the Claude worker's `pendingActivities`
-  // makes.
+  // Transcript lines produced between turns (a settled shell's or background
+  // agent's notification), as `{ text, reportsFailure }`. They belong to the
+  // turn they trigger, so they are carried into it rather than dropped — the
+  // same trade the Claude worker's `pendingActivities` makes. A line that
+  // reports a failure keeps the row it lands on (see `showsWork`).
   let pendingActivities = [];
   // The relay mode of the last delivered turn. A self-initiated turn has no
   // delivery to read a mode off, and it is a continuation OF that turn's work,
@@ -793,7 +810,7 @@ export function createCopilotSdkSessionRunner({
       // the text still lands in the runtime's own transcript.
       return;
     }
-    if (action.channel !== 'init' && !action.carried && !action.bookkeeping) owner.showedWork = true;
+    if (showsWork(action)) owner.showedWork = true;
     if (action.channel === 'stream' && !action.payload?.subagentRunId) {
       // Re-cut to the owner's own segments, and gated against what THAT row
       // last received (the normalizer gated against the whole interaction).
@@ -1355,7 +1372,9 @@ export function createCopilotSdkSessionRunner({
       // it. Same shape as a settled shell's herald.
       continuationDueSince = Date.now();
       const note = describeSettledAgent(settledAgent);
-      if (note && !activeTurn && pendingActivities.length < MAX_PENDING_ACTIVITIES) pendingActivities.push(note);
+      if (note && !activeTurn && pendingActivities.length < MAX_PENDING_ACTIVITIES) {
+        pendingActivities.push({ text: note, reportsFailure: settledAgent.status === 'failed' });
+      }
       scheduleTaskRefresh();
       return;
     }
@@ -1641,7 +1660,7 @@ export function createCopilotSdkSessionRunner({
       // closed to new lines, so the note belongs to the continuation this
       // notification is about to trigger.
       if (note && !activeTurn && pendingActivities.length < MAX_PENDING_ACTIVITIES) {
-        pendingActivities.push(note);
+        pendingActivities.push({ text: note, reportsFailure: false });
       }
     }
     // Only the runtime's own `system.notification` heralds a continuation. A
@@ -2357,9 +2376,11 @@ export function createCopilotSdkSessionRunner({
       settled: false,
       released: false,
       cancelled: false,
-      // Something of the run's own (a tool line, a thought, a lane) was
-      // published on this row — not counting the lines carried in from
-      // between turns. Decides whether an empty continuation may vanish.
+      // Something worth keeping was published on this row: the run's own
+      // work (a tool line, a thought, a lane), or a carried-in line that
+      // reports a failure — not bookkeeping, and not the other lines carried
+      // in from between turns (`showsWork`). Decides whether an empty
+      // continuation may vanish.
       showedWork: false,
       // `lastStreamedText` is what this row last received on /api/stream —
       // the stream gate and the abort/error fallback text both read it.
@@ -2634,9 +2655,11 @@ export function createCopilotSdkSessionRunner({
    * Whether a completed row with no text has nothing to show at all: the
    * runtime opened it by itself (typically right after a background agent
    * finished), its run published no tool line, thought or lane, no card was
-   * raised on it, and no user message was folded into it. Such a row would
-   * only ever read "the turn completed without a text reply", and the task
-   * card already showed the agent finishing (live, gpt-5.6-luna, 2026-09-26).
+   * raised on it, no user message was folded into it, and nothing carried in
+   * reported a failure. Such a row would only ever read "the turn completed
+   * without a text reply", and the task card already showed the agent
+   * finishing (live, gpt-5.6-luna, 2026-09-26). A failed agent's card is gone
+   * by then, so the row carrying its failure line is kept (`showsWork`).
    * Every delivered row keeps the note — somebody asked something there.
    */
   function settlesSilently(turn, entry, folded) {
@@ -3246,11 +3269,11 @@ export function createCopilotSdkSessionRunner({
     // The gap this pin covers has closed.
     continuationDueSince = 0;
     turn.armStall();
-    // Lines produced between turns (a settled shell's notification) belong to
-    // the turn they triggered.
+    // Lines produced between turns (a settled shell's or background agent's
+    // notification) belong to the turn they triggered.
     if (pendingActivities.length) {
-      for (const text of pendingActivities.splice(0)) {
-        turn.bufferedActions.push({ channel: 'activity', payload: { text, subagentRunId: null }, carried: true });
+      for (const { text, reportsFailure } of pendingActivities.splice(0)) {
+        turn.bufferedActions.push({ channel: 'activity', payload: { text, subagentRunId: null }, carried: true, reportsFailure });
       }
     }
     dbg('opening a continuation turn for runtime-initiated work');

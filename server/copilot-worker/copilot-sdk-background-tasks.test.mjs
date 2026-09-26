@@ -350,14 +350,14 @@ test('without rpc.tasks an unlimited slider still falls back to the 30-minute sh
 // Its row would only ever say "the turn completed without a text reply"; the
 // task card already showed the agent finishing, so that row settles silently.
 
-/** The runtime's completion notification for the background agent. */
-function agentCompleted(client) {
-  client.session.taskList[0].status = 'completed';
+/** The runtime's completion notification for the background agent (`status`: 'completed' | 'failed'). */
+function agentCompleted(client, status = 'completed') {
+  client.session.taskList[0].status = status;
   client.session.emit({
     type: 'system.notification',
     data: {
-      kind: { type: 'agent_completed', agentId: AGENT_ID, agentType: 'general-purpose', displayName: 'bg-probe', description: 'background probe', status: 'completed' },
-      content: '<system_notification>\nAgent "bg-probe" (general-purpose) has completed.\n</system_notification>',
+      kind: { type: 'agent_completed', agentId: AGENT_ID, agentType: 'general-purpose', displayName: 'bg-probe', description: 'background probe', status },
+      content: `<system_notification>\nAgent "bg-probe" (general-purpose) has ${status}.\n</system_notification>`,
     },
   });
 }
@@ -432,6 +432,37 @@ test('a runtime-opened continuation whose only lines are bookkeeping settles sil
   await waitFor(() => stub.bodiesFor('/api/requeue').length === 1, { label: 'continuation row torn down' });
   assert.deepEqual(stub.bodiesFor('/api/requeue')[0], { messageId: 'cont-1', attemptId: 'attempt-cont-1' });
   assert.equal(responsesFor(stub, 'cont-1').length, 0);
+  await waitFor(() => runner.isTurnActive() === false, { label: 'continuation released' });
+  await runner.dispose();
+});
+
+// Unlike the "finished" note above, a failed agent's note is the only trace of
+// the failure: the panel lists running tasks only, and a `subagent.failed`
+// between turns reaches no row. An activity line renders only through its
+// row's response, so dropping the row would drop the failure with it.
+test('a runtime-opened continuation carrying a failed background agent keeps its row, even with only bookkeeping', async () => {
+  const stub = makeContinuationApiStub({ routeResponses: { '/api/requeue': () => ({ ok: true, dropped: 'continuation' }) } });
+  const { client, runner } = setup({ stub, taskList: [agentTask()] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  agentCompleted(client, 'failed');
+  runtimeFollowUp(client, [
+    { type: 'tool.execution_start', data: { toolCallId: 'r1', toolName: 'read_agent', arguments: { agent_id: AGENT_ID } } },
+    { type: 'tool.execution_complete', data: { toolCallId: 'r1', success: true, result: { content: 'Agent failed.' } } },
+  ]);
+  await waitFor(
+    () => responsesFor(stub, 'cont-1').length + stub.bodiesFor('/api/requeue').length > 0,
+    { label: 'continuation settled' },
+  );
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), [], 'the row is not torn down');
+  assert.equal(responsesFor(stub, 'cont-1').length, 1);
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, EMPTY_TURN_COMPLETION_NOTE);
+  // The failure line lands on the row ahead of the response that renders it.
+  const rowCalls = stub.calls.filter((call) => call.body?.messageId === 'cont-1');
+  const failureAt = rowCalls.findIndex((call) => call.routePath === '/api/activity'
+    && call.body.text === 'Background agent bg-probe failed: background probe');
+  const responseAt = rowCalls.findIndex((call) => call.routePath === '/api/response');
+  assert.ok(failureAt >= 0 && failureAt < responseAt, rowCalls.map((call) => call.routePath).join(' | '));
   await waitFor(() => runner.isTurnActive() === false, { label: 'continuation released' });
   await runner.dispose();
 });
