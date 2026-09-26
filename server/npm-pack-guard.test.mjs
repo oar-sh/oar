@@ -21,6 +21,8 @@ const FORBIDDEN = [
   { name: 'database', pattern: /\.db(-wal|-shm)?$/ },
   { name: 'env file', pattern: /(^|\/)\.env/ },
   { name: 'test file', pattern: /\.(test|spec)\.mjs$/ },
+  { name: 'test harness', pattern: /-test-harness\.mjs$/ },
+  { name: 'test fixture', pattern: /(^|\/)fixtures\// },
   { name: 'server data', pattern: /^server\/(data|logs)\// },
   { name: 'upload payload', pattern: /^server\/uploads\/(?!README\.md$|image_input\.md$)./ },
   { name: 'repo test tree', pattern: /^tests\// },
