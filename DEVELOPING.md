@@ -156,7 +156,7 @@ spawn), `COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH` (worker script location),
 agents and shells alone may hold the runtime open; `0` = no limit).
 
 Without the override the worker follows the relay's *Background task timeout* slider, which rides
-every delivery payload exactly as for the Claude worker (default `0`/unlimited). Since 2026-09-25
+every delivery payload exactly as for the Claude worker (default 4 h; `0` = unlimited). Since 2026-09-25
 Copilot background agents and detached shells are read from the runtime's task registry
 (`rpc.tasks.list`), listed in the composer's task panel with a working **Stop** (`rpc.tasks.cancel`),
 and on cap expiry they are **cancelled** rather than forgotten — so the slider is a choice the user

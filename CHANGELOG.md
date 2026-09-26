@@ -79,6 +79,10 @@ All notable changes to OAR are documented here. The format follows
 - The background task panel scrolls when it holds more tasks than fit,
   instead of growing past the window — in phone landscape too, where the
   composer now always stays on screen.
+- The **Background task timeout** setting defaults to **4 hours** instead of
+  no limit, for Claude and Copilot alike: long-running work still finishes,
+  but a forgotten shell or agent no longer keeps its session alive forever.
+  A value you already chose (including *No limit*) is kept.
 - Rotating a phone to landscape keeps the portrait text size instead of
   jumping to the larger desktop size, and opening the on-screen keyboard
   no longer shrinks it.

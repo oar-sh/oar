@@ -11,10 +11,12 @@ import {
   readBackgroundTaskTimeoutSetting,
 } from './background-task-timeout.mjs';
 
-test('the default is unlimited — background tasks are not cut off out of the box', () => {
-  assert.equal(DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES, 0);
-  assert.equal(readBackgroundTaskTimeoutSetting(''), 0);
-  assert.equal(readBackgroundTaskTimeoutSetting(null), 0);
+test('the default is 4 hours — long work survives, forgotten tasks do not live forever', () => {
+  assert.equal(DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES, 240);
+  assert.equal(readBackgroundTaskTimeoutSetting(''), 240);
+  assert.equal(readBackgroundTaskTimeoutSetting(null), 240);
+  assert.equal(backgroundTaskTimeoutMinutesToMs(DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES), 4 * 3_600_000);
+  assert.equal(formatBackgroundTaskTimeoutLabel(DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES), '4 h');
 });
 
 test('zero and anything below it disables the timeout', () => {
@@ -47,6 +49,7 @@ test('labels read the way the slider should display them', () => {
 });
 
 test('a stored explicit value survives a round trip', () => {
+  // An explicit 0 is still "no limit", not "unset".
   assert.equal(readBackgroundTaskTimeoutSetting('0'), 0);
   assert.equal(readBackgroundTaskTimeoutSetting('120'), 120);
 });

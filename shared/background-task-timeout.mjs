@@ -2,14 +2,17 @@
 // persistent Claude CLI process alive, shared so the settings slider and the
 // worker enforcing it agree on bounds and formatting.
 //
-// 0 means no limit — the default: a process holding live tasks stays up until
-// the tasks finish, the user stops them from the composer panel, or the
-// worker/relay goes down. Mirrors shared/turn-ceiling.mjs.
+// The default is 4 hours: long enough for real long-running work to finish,
+// short enough that a forgotten shell or agent does not keep its runtime
+// alive indefinitely. 0 (chosen explicitly) means no limit: a process holding
+// live tasks stays up until the tasks finish, the user stops them from the
+// composer panel, or the worker/relay goes down. Mirrors
+// shared/turn-ceiling.mjs.
 
 export const BACKGROUND_TASK_TIMEOUT_MIN_MINUTES = 0;
 export const BACKGROUND_TASK_TIMEOUT_MAX_MINUTES = 600;
 export const BACKGROUND_TASK_TIMEOUT_STEP_MINUTES = 5;
-export const DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES = 0;
+export const DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES = 240;
 
 /** 0 disables the timeout entirely (unlimited). */
 export function normalizeBackgroundTaskTimeoutMinutes(value, fallback = DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES) {
