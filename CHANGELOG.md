@@ -73,8 +73,10 @@ All notable changes to OAR are documented here. The format follows
   that asks a question, or in ask mode asks to run something, after the reply
   settled gets its card on a row of its own; approvals follow the
   conversation's current mode, not the one the session started in. A
-  follow-up turn that ends with nothing to show (no text, no tool activity)
-  no longer leaves an empty "completed without a text reply" row. Messages
+  follow-up turn that ends with nothing to show (no text, and no activity
+  beyond the background agent's own bookkeeping, such as its granted
+  permissions) no longer leaves an empty "completed without a text reply"
+  row. Messages
   are sent to the Copilot runtime as `immediate` throughout — the only mode
   that never strands a message behind background work.
 
