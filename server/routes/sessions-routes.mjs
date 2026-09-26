@@ -2345,11 +2345,12 @@ export function registerSessionsRoutes(app, deps) {
       : LIVE_WORKER_STATUSES.has(String(worker.status || '').trim().toLowerCase()));
     const processingCount = Number(countProcessingConversationQueueRows.get(conversationId)?.count || 0);
     const taskKeys = [...new Set([conversationId, workerSessionId])];
-    const backgroundTaskCount = taskKeys
-      .reduce((sum, key) => sum + (backgroundTaskStore?.get?.(key) || []).length, 0);
+    const liveTasks = workerAlive ? taskKeys.flatMap((key) => backgroundTaskStore?.get?.(key) || []) : [];
     return {
       turnRunning: processingCount > 0 && (workerAlive || !worker),
-      backgroundTaskCount: workerAlive ? backgroundTaskCount : 0,
+      backgroundTaskCount: liveTasks.length,
+      // Tasks the panel shows no Stop button for (Copilot detached shells).
+      unstoppableTaskCount: liveTasks.filter((task) => task?.stoppable === false).length,
     };
   }
 
@@ -4469,7 +4470,11 @@ export function registerSessionsRoutes(app, deps) {
           ok: false,
           error: 'conversation-active',
           reason: 'background-tasks',
-          message: 'Background tasks are still running in this conversation. Stop them in the task panel, then delete it.',
+          // Kill session stops the session's worker, and the delete counts no
+          // tasks for a conversation whose worker is gone.
+          message: activity.unstoppableTaskCount > 0
+            ? 'Background tasks are still running in this conversation, and some have no Stop button. Use Kill session in its ⋯ menu, then delete it.'
+            : 'Background tasks are still running in this conversation. Stop them in the task panel, then delete it.',
         },
       };
     }

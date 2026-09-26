@@ -257,12 +257,32 @@ test('a running turn blocks the delete, and nothing is touched', async () => {
 test('live background tasks block the delete', async () => {
   const { del, events } = setup({
     worker: { status: 'ready', pid: process.pid },
-    backgroundTasks: { 'conv-1': [{ taskId: 'task-1', taskType: 'local_agent' }] },
+    backgroundTasks: { 'conv-1': [{ taskId: 'task-1', taskType: 'local_agent', stoppable: true }] },
   });
   const response = await del();
   assert.equal(response.statusCode, 409);
   assert.equal(response.body.reason, 'background-tasks');
-  assert.match(response.body.message, /task panel/);
+  assert.match(response.body.message, /Stop them in the task panel/);
+  assert.deepEqual(events, []);
+});
+
+test('background tasks without a Stop button are refused with a way that works', async () => {
+  // Copilot detached shells are published stoppable: false, and the task
+  // panel shows no Stop button for them.
+  const { del, events } = setup({
+    worker: { status: 'ready', pid: process.pid },
+    backgroundTasks: {
+      'conv-1': [
+        { taskId: 'task-1', taskType: 'local_agent', stoppable: true },
+        { taskId: 'shell-1', taskType: 'local_bash', stoppable: false },
+      ],
+    },
+  });
+  const response = await del();
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.body.reason, 'background-tasks');
+  assert.match(response.body.message, /Kill session/);
+  assert.doesNotMatch(response.body.message, /task panel/);
   assert.deepEqual(events, []);
 });
 
