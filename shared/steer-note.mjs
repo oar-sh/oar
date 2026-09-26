@@ -19,6 +19,18 @@
 export const STEERED_MESSAGE_NOTE = '[Sent while you were still working on my previous message. '
   + 'If that request is not finished yet, finish it too; do not drop it unless this message says so.]';
 
+// The note LEADS the user's text, inside the same text block, and that
+// position is load-bearing beyond the replay's shape. The Claude CLI runs a
+// prompt as a slash command when the string, or its LAST text block trimmed,
+// starts with "/" — and one dequeued mid-turn is deferred to a turn of its
+// own, whose output the relay would misattribute. The relay itself runs only
+// /compact and /preview as commands (any other "/x" is confirmed as text
+// first), so a steered "/cmd …" must reach the model as plain text folded
+// into the running turn, which the leading note guarantees. Appended, the
+// prompt would still start with "/" and run as a command whose arguments
+// include the note; as a separate leading block, the last block would still
+// start with "/".
+
 /** Prefix a plain-text prompt with the steer note. */
 export function withSteerNote(text) {
   const body = String(text ?? '');

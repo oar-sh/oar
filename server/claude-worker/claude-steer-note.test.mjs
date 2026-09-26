@@ -63,3 +63,42 @@ test('only a steered push carries the note, and its note-echoing replay attaches
   turn.endInput();
   await settled(runner);
 });
+
+test('a steered "/cmd" is pushed as plain text behind the note and folds into the running turn', async () => {
+  // The relay runs only /compact and /preview as commands; any other "/x" the
+  // user confirmed as text steers like a message. The CLI treats a prompt
+  // whose last text block starts with "/" as a slash command and would defer
+  // it to a turn of its own mid-turn — the leading note is what keeps it text.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: '/review this' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'the steer was pushed' });
+  const pushedText = textOf(turn.pushed[1]);
+  assert.equal(pushedText, withSteerNote('/review this'));
+  assert.equal(pushedText.trim().startsWith('/'), false);
+  const textBlocks = turn.pushed[1].filter((block) => block?.type === 'text');
+  assert.equal(textBlocks.at(-1).text.trim().startsWith('/'), false, 'no text block the CLI would read as a command');
+
+  // The CLI folds it into the running turn: one result, no replay of its own.
+  turn.emit(resultMessage('reviewed as part of the first request', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  const secondResponse = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(secondResponse.body.kind, 'folded');
+  turn.endInput();
+  await settled(runner);
+});

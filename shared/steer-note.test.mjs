@@ -25,6 +25,23 @@ test('content blocks get the note in their first text block, keeping the block s
   assert.equal(withSteerNoteContent('plain'), `${STEERED_MESSAGE_NOTE}\n\nplain`);
 });
 
+test('a steered "/cmd" no longer reads as a slash command: the note leads the text the CLI inspects', () => {
+  // The Claude CLI runs a prompt as a slash command when the string, or its
+  // LAST text block trimmed, starts with "/". Steered, "/x" must be plain text
+  // folded into the running turn, which is what the composer promised.
+  assert.equal(withSteerNote('/review this')[0], '[');
+  assert.equal(withSteerNoteContent('/review this')[0], '[');
+  const [block] = withSteerNoteContent([{ type: 'text', text: '/x' }]);
+  assert.equal(block.text[0], '[');
+  assert.equal(block.text.trim().startsWith('/'), false);
+  // With an image the note still sits in the one text block, so no text block
+  // is left starting with "/".
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } };
+  const noted = withSteerNoteContent([{ type: 'text', text: '/describe' }, image]);
+  const textBlocks = noted.filter((entry) => entry.type === 'text');
+  assert.equal(textBlocks.at(-1).text.trim().startsWith('/'), false);
+});
+
 test('stripping the note gives back exactly the user text, and leaves other text alone', () => {
   assert.equal(stripSteerNote(withSteerNote('also do X')), 'also do X');
   assert.equal(stripSteerNote(withSteerNote('')), '');
