@@ -96,7 +96,7 @@ All notable changes to OAR are documented here. The format follows
   went through a delivery retry. Previously a retried message could starve
   behind newer ones for minutes in an active conversation, or run after them
   so replies arrived out of order.
-- `@anthropic-ai/claude-agent-sdk` 0.3.281 (bundled Claude Code 2.1.281),
+- `@anthropic-ai/claude-agent-sdk` 0.3.283 (bundled Claude Code 2.1.283),
   which makes **Claude Opus 5.5** (`claude-opus-5-5`, plus its 1M-context
   variant) discoverable. Model discovery runs the SDK's bundled CLI, so
   `claude update` alone never surfaces a new Claude model.
