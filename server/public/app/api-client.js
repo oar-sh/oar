@@ -655,10 +655,30 @@ export async function searchMessages(options = {}) {
   return apiFetch(`/api/search/messages?${params.toString()}`);
 }
 
+// Raw fetch instead of apiFetch: a refused delete (the conversation is still
+// working, or its session would not stop) must surface the server's reason.
+// The long timeout covers stopping the session and deleting its CLI session.
 export async function deleteConversation(id) {
   const convId = String(id || '').trim();
-  if (!convId) return null;
-  return apiFetch(`/api/conversation/${convId}`, { method: 'DELETE' });
+  if (!convId || !areNetworkRequestsEnabled()) return null;
+  const url = `/api/conversation/${encodeURIComponent(convId)}`;
+  try {
+    const response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) return { ...(payload || {}), ok: false, status: response.status };
+    noteFetchSuccess();
+    return payload || { ok: true };
+  } catch (error) {
+    noteFetchFailure(url, error);
+    return null;
+  }
 }
 
 export async function updateMessageShareVisibility(conversationId, messageId, hiddenFromShares) {

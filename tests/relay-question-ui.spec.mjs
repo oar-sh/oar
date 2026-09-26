@@ -460,6 +460,10 @@ test("does not retarget workspace root from chat cd commands", async ({ request 
   }
 });
 
+// The relay deletes a conversation at once and removes its Copilot CLI session
+// through its own runtime. The isolated harness has no Copilot runtime to reach
+// (HOME and LOCALAPPDATA are redirected), which exercises the fallback: the CLI
+// session goes on the SDK delete queue for a CLI-side consumer.
 test("bridges web delete requests to SDK session delete queue", async ({ request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
@@ -503,6 +507,11 @@ test("bridges web delete requests to SDK session delete queue", async ({ request
     expect(deleted.ok()).toBeTruthy();
     const deletedBody = await deleted.json();
     expect(Boolean(deletedBody?.ok)).toBeTruthy();
+    expect(deletedBody?.cliSessionDeleted).toBe(false);
+
+    // Gone at once — the queued (never-started) message went with it.
+    const missingConversation = await request.get(`/api/conversation/${conversationId}`, { headers });
+    expect(missingConversation.status()).toBe(404);
 
     const pendingRow = readSdkDeleteRequest(sdkSessionId);
     expect(String(pendingRow?.sdk_session_id || "")).toBe(sdkSessionId);
@@ -516,9 +525,7 @@ test("bridges web delete requests to SDK session delete queue", async ({ request
       },
     });
     expect(completed.ok()).toBeTruthy();
-
-    const missingConversation = await request.get(`/api/conversation/${conversationId}`, { headers });
-    expect(missingConversation.status()).toBe(404);
+    expect(readSdkDeleteRequest(sdkSessionId)).toBeUndefined();
   } finally {
     if (relayPaused) {
       await request.post("/api/relay/resume", { headers }).catch(() => {});
@@ -533,6 +540,64 @@ test("bridges web delete requests to SDK session delete queue", async ({ request
         ok: true,
       },
     }).catch(() => {});
+  }
+});
+
+test("refuses to delete a conversation while its turn is running, and deletes it once the turn is done", async ({ page, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  let conversationId = "";
+  let messageId = "";
+  let answered = false;
+
+  try {
+    const queued = await request.post("/api/message", {
+      headers,
+      data: { text: `delete-while-running-${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
+    });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "");
+    messageId = String(queuedBody?.messageId || "");
+    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    expect(String(pendingBody?.message?.id || "")).toBe(messageId);
+
+    const refused = await request.delete(`/api/conversation/${conversationId}`, { headers });
+    expect(refused.status()).toBe(409);
+    const refusedBody = await refused.json();
+    expect(refusedBody.error).toBe("conversation-active");
+    expect(refusedBody.reason).toBe("turn-running");
+    expect((await request.get(`/api/conversation/${conversationId}`, { headers })).ok()).toBeTruthy();
+
+    // The sidebar's delete shows the relay's reason instead of silently doing nothing.
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.locator(`[onclick*="deleteConv(event,'${conversationId}')"]`).click();
+    await expect(page.getByText("This conversation is still working on a reply")).toBeVisible();
+
+    const response = await request.post("/api/response", {
+      headers,
+      data: { messageId, conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" },
+    });
+    expect(response.ok()).toBeTruthy();
+    answered = true;
+
+    const deleted = await request.delete(`/api/conversation/${conversationId}`, { headers });
+    expect(deleted.ok()).toBeTruthy();
+    expect((await request.get(`/api/conversation/${conversationId}`, { headers })).status()).toBe(404);
+    conversationId = "";
+  } finally {
+    if (conversationId) {
+      if (!answered && messageId) {
+        await request.post("/api/response", {
+          headers,
+          data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" },
+        }).catch(() => {});
+      }
+      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
+    }
   }
 });
 

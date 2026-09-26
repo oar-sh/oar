@@ -329,6 +329,22 @@ export function createSdkSessionImportService({
     return activeRun;
   }
 
+  /**
+   * Remove a Copilot session from the runtime's own store, for a conversation
+   * deleted in the relay. Goes through the SDK rather than the session-state
+   * folder so the runtime's bookkeeping stays consistent. Throws when the
+   * runtime cannot do it; the caller decides what that means.
+   */
+  async function deleteSession(sdkSessionId) {
+    const sid = text(sdkSessionId);
+    if (!sid) throw new Error('Missing session id');
+    const client = await getRuntime();
+    if (typeof client?.client?.deleteSession !== 'function') {
+      throw new Error('deleteSession() is unavailable in this Copilot runtime');
+    }
+    await client.client.deleteSession(sid);
+  }
+
   async function refreshConversation(conversation) {
     const sdkSessionId = text(conversation?.sdk_session_id || conversation?.sdkSessionId || conversation?.id);
     if (!sdkSessionId || isTombstoned(sdkSessionId)) {
@@ -343,6 +359,7 @@ export function createSdkSessionImportService({
     runStartupImport,
     importSession,
     refreshConversation,
+    deleteSession,
     async dispose() {
       // Flag first: getRuntime() must refuse before the client goes away, or a
       // concurrent import observes runtime = null and creates a replacement

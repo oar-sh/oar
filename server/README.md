@@ -773,7 +773,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/search/messages` | Search message text across all conversations (`q`, `limit`, `offset`) |
 | PATCH | `/api/conversation/:id` | Update a conversation title |
 | POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
-| DELETE | `/api/conversation/:id` | Delete a conversation |
+| DELETE | `/api/conversation/:id` | Delete a conversation: stops its session worker, deletes its CLI session, removes its rows. `409 conversation-active` (`reason: turn-running` / `background-tasks`) while it is still working; `409 worker-stop-failed` when its worker survives the stop (nothing deleted) |
 | GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |
 | POST | `/api/sdk-session-delete/result` | (CLI relay) Report SDK session delete result |
 | POST | `/api/session-sync` | (CLI relay) Sync conversation↔SDK binding and optionally confirm orchestrator rebind completion |

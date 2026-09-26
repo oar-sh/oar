@@ -121,6 +121,14 @@ All notable changes to OAR are documented here. The format follows
 
 ### Fixed
 
+- **Deleting a conversation no longer leaves its session running.** Its
+  worker used to keep running (about 40 MB each, holding its workspace
+  folder) until the relay restarted, and Claude and Copilot SDK
+  conversations never had their CLI session removed. Delete now stops the
+  worker first, removes the CLI session (Copilot through the SDK, Claude by
+  deleting that session's transcript) and the conversation at once. A
+  conversation that is still working, with a running turn or live background
+  tasks, is not deleted: the sidebar says why, so you can stop it first.
 - A message starting with "/" (other than the relay's own `/compact` and
   `/preview`) that reached a Claude conversation between turns ran as a Claude
   CLI command instead: Claude never saw the text, and the next reply was

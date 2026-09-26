@@ -1286,6 +1286,10 @@ export async function deleteConv(e, id) {
   if (!confirm('Delete this conversation?')) return;
   const result = await deleteConversationApi(id);
   if (!result) return;
+  if (result.ok === false) {
+    showTransientRelayNotice(String(result.message || '').trim() || 'This conversation could not be deleted.', 6000);
+    return;
+  }
   delete conversations[id];
   renderConvList();
   if (currentConvId === id) {

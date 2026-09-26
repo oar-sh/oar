@@ -79,7 +79,7 @@ OAR is still under active development, so expect occasional rough edges and some
 - **Image conversations** (OpenAI BYOK): generate images in chat and iterate on a generated image with *Edit this image*
 - **Share** a conversation by link, with per-message *Hide from shares* control
 - Conversation history stored in local SQLite
-- Conversation delete requests are relayed to Copilot CLI SDK `deleteSession()` so web deletes can remove resumable CLI sessions
+- Deleting a conversation stops its session worker and removes its CLI session too (Copilot through the SDK's `deleteSession()`, Claude by deleting that session's transcript); a conversation that is still working (a running turn or live background tasks) is refused until it is stopped
 - Conversation **compact** workflow (`/compact`) to continue with summary carry-over
 - Workspace + drives browser with file preview, raw file access, and sticky hidden/heavy filters
 - **Git changes** modal: branch + ahead/behind info, pull, and a per-file diff viewer with *Changes only* / *Full file* modes

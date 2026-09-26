@@ -2133,9 +2133,9 @@ export function registerSessionsRoutes(app, deps) {
     }
   }
 
-  const SDK_DELETE_WAIT_TIMEOUT_MS = 12_000;
-  const SDK_DELETE_POLL_MS = 200;
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
+  const CLI_SESSION_DELETE_TIMEOUT_MS = 10_000;
+  const LIVE_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
   const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = ? WHERE id = ?`);
   const getActiveQueueForMessage = db.prepare(`
     SELECT id
@@ -2163,6 +2163,20 @@ export function registerSessionsRoutes(app, deps) {
     FROM queue
     WHERE conversation_id = ?
       AND status IN ('pending', 'processing', 'parked')
+  `);
+  const countProcessingConversationQueueRows = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM queue
+    WHERE conversation_id = ?
+      AND status = 'processing'
+  `);
+  const findOtherLiveConversationForSdkSession = db.prepare(`
+    SELECT id
+    FROM conversations
+    WHERE sdk_session_id = ?
+      AND id != ?
+      AND status != 'deleted'
+    LIMIT 1
   `);
   const getConversationUsageSnapshotAggregate = db.prepare(`
     SELECT
@@ -2226,10 +2240,6 @@ export function registerSessionsRoutes(app, deps) {
   // sdkSessionId, plus a coalescer so a duplicated request replays one result.
   const sessionLaunchMutex = createKeyedMutex();
   const relaunchCoalescer = createRelaunchCoalescer({ windowMs: RELAUNCH_COALESCE_WINDOW_MS });
-
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
 
   // Layer every enabled provider's models onto the base Copilot catalog.
   function buildModelCatalogWithProviders(modelState, openAISettings = getOpenAIProviderSettings()) {
@@ -2313,16 +2323,97 @@ export function registerSessionsRoutes(app, deps) {
     return true;
   }
 
-  async function waitForSdkDeleteCompletion(sdkSessionId, timeoutMs = SDK_DELETE_WAIT_TIMEOUT_MS) {
-    const sid = String(sdkSessionId || '').trim();
-    if (!sid) return { completed: false };
-    const startedAt = Date.now();
-    while ((Date.now() - startedAt) < timeoutMs) {
-      const row = stmts.getSdkDeleteRequestBySessionId.get(sid);
-      if (!row) return { completed: true };
-      await sleep(SDK_DELETE_POLL_MS);
+  /**
+   * Whether a conversation is still working, which blocks deleting it: a turn
+   * is running (including one waiting on a question card or an approval) or
+   * background tasks are live. Both only count while the session's worker is
+   * alive: a dead worker runs nothing, and the processing rows or task set it
+   * left behind would otherwise make the conversation undeletable. A session
+   * the registry has never seen may still be running a turn, so its
+   * processing rows count.
+   */
+  function describeConversationActivity(conversationId, workerSessionId) {
+    const worker = sessionWorkerRegistry?.getWorker?.(workerSessionId) || null;
+    const workerAlive = !!worker
+      && LIVE_WORKER_STATUSES.has(String(worker.status || '').trim().toLowerCase())
+      && (!worker.pid || isPidAlive(worker.pid));
+    const processingCount = Number(countProcessingConversationQueueRows.get(conversationId)?.count || 0);
+    const taskKeys = [...new Set([conversationId, workerSessionId])];
+    const backgroundTaskCount = taskKeys
+      .reduce((sum, key) => sum + (backgroundTaskStore?.get?.(key) || []).length, 0);
+    return {
+      turnRunning: processingCount > 0 && (workerAlive || !worker),
+      backgroundTaskCount: workerAlive ? backgroundTaskCount : 0,
+    };
+  }
+
+  function withDeadline(promise, timeoutMs, label) {
+    let timer = null;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * The Claude CLI's footprint for one session: its transcript
+   * (`<projectDir>/<nativeSessionId>.jsonl`) and the per-session folder beside
+   * it. Nothing else in the project folder is touched — it holds every other
+   * session of that workspace and the project memory.
+   */
+  function deleteClaudeCliSession({ conversation, runtimeSession }) {
+    const nativeSessionId = String(runtimeSession?.claude_native_session_id || '').trim();
+    if (!nativeSessionId || typeof resolveClaudeSessionRoot !== 'function') return { deleted: null };
+    const anchors = resolveClaudeSessionRoot({
+      claudeNativeSessionId: nativeSessionId,
+      workspaceRootPath: String(
+        conversation?.runtime_workspace_root_path || conversation?.configured_workspace_root_path || '',
+      ).trim(),
+    });
+    if (!anchors?.projectDirPath) return { deleted: null };
+    const projectDir = path.resolve(anchors.projectDirPath);
+    const targets = [anchors.transcriptPath, anchors.sessionRootExists ? anchors.sessionRootPath : '']
+      .filter(Boolean)
+      .map((target) => path.resolve(target))
+      .filter((target) => path.dirname(target) === projectDir
+        && [nativeSessionId, `${nativeSessionId}.jsonl`].includes(path.basename(target)));
+    for (const target of targets) fs.rmSync(target, { recursive: true, force: true });
+    return { deleted: targets.length > 0 };
+  }
+
+  /**
+   * The Copilot session, through the runtime's own deleteSession(). When that
+   * fails the request goes on the SDK delete queue, which a CLI-side consumer
+   * (the extension engine) still works off.
+   */
+  async function deleteCopilotCliSession({ sdkSessionId, conversationId }) {
+    if (typeof sdkSessionImportService?.deleteSession !== 'function') return { deleted: null };
+    try {
+      await withDeadline(
+        sdkSessionImportService.deleteSession(sdkSessionId),
+        CLI_SESSION_DELETE_TIMEOUT_MS,
+        'Copilot deleteSession()',
+      );
+      return { deleted: true };
+    } catch (error) {
+      console.warn(`[delete] Copilot session ${shortId(sdkSessionId)} was not deleted: ${error?.message || error}`);
+      enqueueSdkDeleteRequest(sdkSessionId, conversationId);
+      return { deleted: false, queued: true };
     }
-    return { completed: false };
+  }
+
+  /** The conversation's CLI-side session, per provider; null where the relay keeps none. */
+  async function deleteCliSession({ conversation, conversationId, sdkSessionId, runtimeSession }) {
+    const provider = String(runtimeSession?.provider_type || '').trim().toLowerCase();
+    if (provider === 'claude') return deleteClaudeCliSession({ conversation, runtimeSession });
+    if (!sdkSessionId) return { deleted: null };
+    if (!provider || provider === 'github' || provider === 'openai') {
+      return deleteCopilotCliSession({ sdkSessionId, conversationId });
+    }
+    return { deleted: null };
   }
 
   function finalizeDeletedConversationsForSdkSession(sdkSessionId) {
@@ -4312,41 +4403,119 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     try {
-      const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
-      if (!sdkSessionId) {
-        stmts.markDeletedSdkSession.run(id, new Date().toISOString());
-        cleanupGeneratedImagesForConversation({
-          conversationId: id,
-          sdkSessionId: null,
-          messageRows: stmts.getMessages?.all?.(id) || [],
-          parseAttachments,
-          hydrateAttachment,
-          resolveSessionStateRoot,
-        });
-        const orphanedUploads = collectOrphanedUploadsFromConversation(id);
-        hardDeleteConversationRows(id);
-        deleteOrphanedUploads(orphanedUploads);
-        io.emit('conversation_deleted', { conversationId: id });
-        return res.json({ ok: true });
-      }
-
-      markConversationDeleted.run(new Date().toISOString(), id);
-      stmts.markDeletedSdkSession.run(sdkSessionId, new Date().toISOString());
-      if (sdkSessionId !== id) {
-        // Also tombstone the conversation id itself for legacy/synthetic sdk id fallback paths.
-        stmts.markDeletedSdkSession.run(id, new Date().toISOString());
-      }
-      enqueueSdkDeleteRequest(sdkSessionId, id);
-      const awaited = await waitForSdkDeleteCompletion(sdkSessionId);
-      if (awaited.completed) return res.json({ ok: true });
-
-      io.emit('conversation_delete_pending', { conversationId: id });
-      return res.json({ ok: true, pending: true });
+      // Session workers are keyed by the SDK session id, which is the
+      // conversation id until a session is bound. Serialized with launches and
+      // relaunches of that session, and with a second delete of it.
+      const workerSessionId = String(existing.sdk_session_id || '').trim() || id;
+      const outcome = await sessionLaunchMutex.runExclusive(
+        workerSessionId,
+        () => deleteConversationNow(id),
+      );
+      return res.status(outcome.statusCode).json(outcome.body);
     } catch (error) {
       console.warn(`[archive] Delete failed for ${id}: ${error?.message || error}`);
       return res.status(500).json({ error: 'Failed to delete conversation' });
     }
   });
+
+  /** DELETE /api/conversation/:id under its session's lock; see the route. */
+  async function deleteConversationNow(id) {
+    const existing = stmts.getConvAnyStatus.get(id);
+    if (!existing) return { statusCode: 200, body: { ok: true, alreadyDeleted: true } };
+    const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
+    const workerSessionId = sdkSessionId || id;
+
+    const activity = describeConversationActivity(id, workerSessionId);
+    if (activity.turnRunning) {
+      return {
+        statusCode: 409,
+        body: {
+          ok: false,
+          error: 'conversation-active',
+          reason: 'turn-running',
+          message: 'This conversation is still working on a reply. Stop it, then delete it.',
+        },
+      };
+    }
+    if (activity.backgroundTaskCount > 0) {
+      return {
+        statusCode: 409,
+        body: {
+          ok: false,
+          error: 'conversation-active',
+          reason: 'background-tasks',
+          message: 'Background tasks are still running in this conversation. Stop them in the task panel, then delete it.',
+        },
+      };
+    }
+
+    // A worker and CLI session that another live conversation still uses
+    // stay; only this conversation's own data goes.
+    const sharedWithConversationId = sdkSessionId
+      ? String(findOtherLiveConversationForSdkSession.get(sdkSessionId, id)?.id || '').trim() || null
+      : null;
+
+    // An idle worker is stopped before anything is deleted: the route used to
+    // leave it running (and holding its workspace) until the relay restarted.
+    // Nothing is touched when it will not die.
+    let workerStopped = false;
+    if (!sharedWithConversationId) {
+      const stopped = await stopIdleWorkspaceRootSession({
+        sdkSessionId: workerSessionId,
+        worker: sessionWorkerRegistry?.getWorker?.(workerSessionId) || null,
+        sessionWorkerSupervisor,
+        sessionWorkerRegistry,
+        sessionWorkerProcessInspector,
+        stopOverrides: sessionWorkerStopOverrides,
+      });
+      if (!stopped.ok) {
+        return {
+          statusCode: 409,
+          body: {
+            ok: false,
+            error: 'worker-stop-failed',
+            message: "Couldn't stop this conversation's session, so nothing was deleted. Try again in a moment.",
+            remainingPids: stopped.remainingPids || [],
+          },
+        };
+      }
+      workerStopped = (stopped.stoppedPids || []).length > 0;
+      // Re-armed after the stop, which can outlast the kill block's grace
+      // window: nothing may respawn a worker for the rows deleted below.
+      sessionWorkerSupervisor?.markKilled?.(workerSessionId);
+      for (const key of new Set([id, workerSessionId])) backgroundTaskStore?.replace?.(key, []);
+    }
+
+    const deletedAt = new Date().toISOString();
+    markConversationDeleted.run(deletedAt, id);
+    // Tombstones keep the SDK session importer from bringing it back.
+    stmts.markDeletedSdkSession.run(sdkSessionId || id, deletedAt);
+    if (sdkSessionId && sdkSessionId !== id) stmts.markDeletedSdkSession.run(id, deletedAt);
+
+    const cliSession = sharedWithConversationId
+      ? { deleted: null }
+      : await deleteCliSession({
+        conversation: existing,
+        conversationId: id,
+        sdkSessionId,
+        runtimeSession: stmts.getRuntimeSessionByConversation?.get?.(id) || null,
+      });
+
+    cleanupGeneratedImagesForConversation({
+      conversationId: id,
+      sdkSessionId,
+      messageRows: stmts.getMessages?.all?.(id) || [],
+      parseAttachments,
+      hydrateAttachment,
+      resolveSessionStateRoot,
+    });
+    const orphanedUploads = collectOrphanedUploadsFromConversation(id);
+    hardDeleteConversationRows(id);
+    deleteOrphanedUploads(orphanedUploads);
+    if (sdkSessionId && !cliSession.queued) stmts.deleteSdkDeleteRequest?.run?.(sdkSessionId);
+    io.emit('conversation_deleted', { conversationId: id });
+    return { statusCode: 200, body: { ok: true, workerStopped, cliSessionDeleted: cliSession.deleted } };
+  }
 
   // POST /api/conversation/:id/archive — archive conversation
   app.post('/api/conversation/:id/archive', auth, async (req, res) => {
