@@ -72,7 +72,9 @@ All notable changes to OAR are documented here. The format follows
   follow-up arrives as a *continuation* reply, as on Claude. A background agent
   that asks a question, or in ask mode asks to run something, after the reply
   settled gets its card on a row of its own; approvals follow the
-  conversation's current mode, not the one the session started in. Messages
+  conversation's current mode, not the one the session started in. A
+  follow-up turn that ends with nothing to show (no text, no tool activity)
+  no longer leaves an empty "completed without a text reply" row. Messages
   are sent to the Copilot runtime as `immediate` throughout — the only mode
   that never strands a message behind background work.
 
@@ -117,6 +119,11 @@ All notable changes to OAR are documented here. The format follows
 
 ### Fixed
 
+- A message starting with "/" (other than the relay's own `/compact` and
+  `/preview`) that reached a Claude conversation between turns ran as a Claude
+  CLI command instead: Claude never saw the text, and the next reply was
+  pinned to that message. It now reaches Claude as the text you typed, as the
+  composer's "send again to send as text" promises.
 - A Copilot turn that ended in `task_complete` after streaming a fragment
   published the fragment as its final reply; the completion summary now takes
   precedence in the saved reply too, not only in the live stream.
