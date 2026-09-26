@@ -38,6 +38,8 @@ function makeHarness({
   sessionMetadata = {},
   hasRelayExecutionSignal = undefined,
   resumeGates = {},
+  // Runs inside each runtime start: may wait on a gate or throw.
+  beforeCreateClient = null,
 } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
@@ -45,9 +47,13 @@ function makeHarness({
   const resumed = [];
   const resumeConfigs = [];
   const disconnected = [];
+  const deletedSessions = [];
   let clientCreations = 0;
   let clientDisposals = 0;
   const client = {
+    async deleteSession(sessionId) {
+      deletedSessions.push(sessionId);
+    },
     async listSessions() {
       return Object.keys(eventsBySession).map((sessionId) => ({
         sessionId,
@@ -74,6 +80,7 @@ function makeHarness({
     stmts,
     createClient: async () => {
       clientCreations += 1;
+      await beforeCreateClient?.();
       return { client, async dispose() { clientDisposals += 1; } };
     },
     parseSessionEventsToMessages: (events) => events.map((event) => ({ id: event.id, role: event.role, text: event.text })),
@@ -88,6 +95,7 @@ function makeHarness({
     resumed,
     resumeConfigs,
     disconnected,
+    deletedSessions,
     replaced,
     eventsBySession,
     sessionMetadata,
@@ -497,4 +505,58 @@ test('shutdown during a multi-session import stops the sweep and never recreates
   assert.equal(postShutdownSweep.failed, 1);
   assert.match(String(postShutdownSweep.error), /shutting down/);
   assert.equal(counters.clientCreations, 1);
+});
+
+test('callers that arrive while the runtime starts share that one start', async () => {
+  // A delete during the startup import, and deletes side by side, each used
+  // to start a runtime of their own; only the last one was ever disposed.
+  let releaseStart;
+  const startGate = new Promise((resolve) => { releaseStart = resolve; });
+  const { service, counters, deletedSessions, resumed } = makeHarness({
+    eventsBySession: { listed: [{ id: 'm1', role: 'user', text: 'listed' }] },
+    beforeCreateClient: () => startGate,
+  });
+
+  const sweep = service.runStartupImport();
+  const deletes = [service.deleteSession('gone-1'), service.deleteSession('gone-2')];
+  releaseStart();
+  const [summary] = await Promise.all([sweep, ...deletes]);
+
+  assert.equal(summary.new, 1);
+  assert.deepEqual(resumed, ['listed']);
+  assert.deepEqual([...deletedSessions].sort(), ['gone-1', 'gone-2']);
+  assert.equal(counters.clientCreations, 1);
+  await service.dispose();
+  assert.equal(counters.clientDisposals, 1);
+});
+
+test('a runtime start that fails is not kept, so the next call starts again', async () => {
+  const starts = ['fail', 'ok'];
+  const { service, counters, deletedSessions } = makeHarness({
+    beforeCreateClient: async () => {
+      if (starts.shift() === 'fail') throw new Error('runtime unavailable');
+    },
+  });
+
+  const outcomes = await Promise.allSettled([service.deleteSession('first'), service.deleteSession('second')]);
+  assert.deepEqual(outcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
+  assert.equal(counters.clientCreations, 1);
+
+  await service.deleteSession('third');
+  assert.equal(counters.clientCreations, 2);
+  assert.deepEqual(deletedSessions, ['third']);
+});
+
+test('a runtime still starting at shutdown is disposed once it is up', async () => {
+  let releaseStart;
+  const startGate = new Promise((resolve) => { releaseStart = resolve; });
+  const { service, counters } = makeHarness({ beforeCreateClient: () => startGate });
+
+  const pendingDelete = service.deleteSession('late');
+  const disposal = service.dispose();
+  releaseStart();
+  await Promise.allSettled([pendingDelete, disposal]);
+
+  assert.equal(counters.clientCreations, 1);
+  assert.equal(counters.clientDisposals, 1);
 });

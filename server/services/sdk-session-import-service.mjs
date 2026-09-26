@@ -77,7 +77,7 @@ export function createSdkSessionImportService({
   logger = console,
 } = {}) {
   if (!db || !stmts || typeof createClient !== 'function') throw new Error('SDK session importer requires database, statements, and a client factory');
-  let runtime = null;
+  let runtimeCreation = null;
   let activeRun = null;
   let closing = false;
   const countConversationMessages = db.prepare(`
@@ -149,8 +149,18 @@ export function createSdkSessionImportService({
     // Refusing after dispose() is what stops a mid-shutdown import from
     // resurrecting a fresh SDK client the server would never tear down.
     if (closing) throw new Error('SDK session importer is shutting down');
-    if (!runtime) runtime = await createClient();
-    return runtime;
+    // Callers share the start in flight: parallel deletes, or a delete during
+    // the startup import, each started a runtime of their own, and only the
+    // last one was ever disposed. A start that fails is dropped, so the next
+    // call tries again.
+    if (!runtimeCreation) {
+      const creation = Promise.resolve().then(() => createClient());
+      runtimeCreation = creation;
+      creation.catch(() => {
+        if (runtimeCreation === creation) runtimeCreation = null;
+      });
+    }
+    return runtimeCreation;
   }
 
   function isTombstoned(sdkSessionId) {
@@ -375,12 +385,14 @@ export function createSdkSessionImportService({
     isImportedOnly,
     async dispose() {
       // Flag first: getRuntime() must refuse before the client goes away, or a
-      // concurrent import observes runtime = null and creates a replacement
-      // while the server is exiting.
+      // concurrent import finds no runtime and starts a replacement while the
+      // server is exiting.
       closing = true;
       try { await activeRun; } catch {}
-      const current = runtime;
-      runtime = null;
+      // A start still in flight is waited for, so its runtime is disposed too.
+      const creation = runtimeCreation;
+      runtimeCreation = null;
+      const current = await creation?.catch(() => null);
       await current?.dispose?.();
     },
   };
