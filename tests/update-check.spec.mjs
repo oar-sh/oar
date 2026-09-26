@@ -126,9 +126,13 @@ test.describe.serial("opt-in update checks", () => {
 
   test("a second check rides the ETag and still reports availability", async ({ page }) => {
     await loadApp(page);
+    // The card is still visible from the first check, so it cannot signal that
+    // the second one has reached the manifest server.
+    const requestsBefore = manifestRequests.length;
     await page.locator("#update-check-now-btn").click();
+    await expect.poll(() => manifestRequests.length).toBeGreaterThan(requestsBefore);
+    expect(manifestRequests[manifestRequests.length - 1], "If-None-Match was sent").toBe('"m1"');
     await expect(page.locator("#update-available-card")).toBeVisible();
-    expect(manifestRequests[manifestRequests.length - 1]).toBe('"m1"', "If-None-Match was sent");
   });
 
   test("dismissal hides the card per version and survives reload", async ({ page, request }) => {
