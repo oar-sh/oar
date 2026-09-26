@@ -692,10 +692,11 @@ globalThis.io = () => ({
   connect() {},
 });
 const refreshCurrentViewCalls = [];
+let sessionWorkerStatusRefreshes = 0;
 const { connectSocket } = await import('./socket-handlers.js');
 await connectSocket({
   refreshCurrentView: async () => { refreshCurrentViewCalls.push(store.currentConvId); },
-  refreshSessionWorkerStatus: async () => {},
+  refreshSessionWorkerStatus: async () => { sessionWorkerStatusRefreshes += 1; },
   refreshModelCatalog: async () => {},
   updateModelCatalogState: () => {},
   applyConversationWorkspaceRootUpdate: () => {},
@@ -842,7 +843,6 @@ test('the composer reads Steer exactly when the conversation\'s worker advertise
   // snapshot): strictly serial, so the message queues behind the turn.
   assert.equal(labelFor('github', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1' }), 'Queue');
   assert.equal(labelFor('github', null), 'Queue');
-  // Claude keeps its provider rule, with or without a worker snapshot.
   // The provider name alone no longer decides: a Claude conversation steers
   // because its worker advertises it, like any other.
   assert.equal(labelFor('claude', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true }), 'Steer');
@@ -852,6 +852,65 @@ test('the composer reads Steer exactly when the conversation\'s worker advertise
   assert.equal(labelFor('github', { turnActive: true, canSteer: false, holdReason: 'compaction', messageId: 'u1', supported: true, cancellableIds: [] }), 'Queue');
   assert.match(lastTitle, /compact/i);
   input.value = '';
+});
+
+test('a broadcast steering snapshot flips the composer to Steer without waiting for a status poll', () => {
+  resetView();
+  selectComposerPreferences();
+  const input = document.getElementById('msg-input');
+  const button = document.getElementById('send-btn');
+  // The worker is known but has not reported a snapshot yet (it just spawned).
+  const { conv, sdkSessionId } = openWorkerConversation('claude', null);
+  store.setSessionWorkerStatesFromStatusPayload({
+    workers: [{ sdkSessionId, status: 'ready', pid: 4242, workerId: `w-${sdkSessionId}`, steering: null }],
+  });
+  view.renderMessages([{ id: 'u1', role: 'user', text: 'running', timestamp: at(0) }], false, { conversationId: conv });
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'processing' });
+  input.value = 'a thought mid-turn';
+  view.syncComposerButtonState();
+  assert.equal(button.textContent, 'Queue');
+
+  const refreshesBefore = sessionWorkerStatusRefreshes;
+  fire('session_worker_steering', {
+    sdkSessionId,
+    steering: { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: [] },
+  });
+  assert.equal(button.textContent, 'Steer', 'the label follows the broadcast, no poll in between');
+  assert.equal(sessionWorkerStatusRefreshes, refreshesBefore, 'a known worker is patched, not re-fetched');
+
+  // A hold arrives the same way.
+  fire('session_worker_steering', {
+    sdkSessionId,
+    steering: { turnActive: true, canSteer: false, holdReason: 'compaction', messageId: 'u1', supported: true, cancellableIds: [] },
+  });
+  assert.equal(button.textContent, 'Queue');
+  assert.match(button.title, /compact/i);
+
+  // A worker the client has not seen yet: the whole status is fetched instead.
+  fire('session_worker_steering', {
+    sdkSessionId: uid('sess-unknown'),
+    steering: { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, cancellableIds: [] },
+  });
+  assert.equal(sessionWorkerStatusRefreshes, refreshesBefore + 1);
+
+  view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
+  input.value = '';
+});
+
+test('a conversation binding to its session refreshes the worker status', async () => {
+  // Its worker's snapshot is keyed on the session id the binding just named.
+  const conv = uid('conv-bound');
+  conversations[conv] = { id: conv, title: 'Bound elsewhere', runtimeProviderType: 'github' };
+  const previousFetchHandler = fetchHandler;
+  fetchHandler = async () => null;
+  try {
+    const refreshesBefore = sessionWorkerStatusRefreshes;
+    await fire('conversation_session_bound', { conversationId: conv, sdkSessionId: uid('sess-bound'), runtimeSessionId: uid('rs') });
+    assert.equal(sessionWorkerStatusRefreshes, refreshesBefore + 1);
+  } finally {
+    fetchHandler = previousFetchHandler;
+    delete conversations[conv];
+  }
 });
 
 test('a pushed row the worker lists as cancellable keeps Cancel; the set is re-synced from the status payload without a rebuild', () => {

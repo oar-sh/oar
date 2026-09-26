@@ -35,10 +35,10 @@ export function deriveComposerControlState({
   sendInFlight = false,
   modelMetadataBlocked = false,
   attachmentsUploading = false,
-  // The conversation's provider delivers a message typed during a live turn
-  // INTO that turn (mid-turn steering, currently the Claude worker) rather than
-  // queueing it behind — so the control says "Steer", not "Queue". Providers
-  // that still serialize keep the queue wording.
+  // The conversation's session worker delivers a message typed during a live
+  // turn INTO that turn (mid-turn steering, advertised on its heartbeat
+  // snapshot) rather than queueing it behind — so the control says "Steer",
+  // not "Queue". Workers that do not advertise it keep the queue wording.
   steeringSupported = false,
   // The worker reports steering as momentarily held (open question card or
   // plan approval, compaction, post-compaction adoption). A send stays allowed

@@ -95,7 +95,6 @@ async function main() {
   const linkBridge = createRunnerLinkBridge();
   // Late-bound: the heartbeat controller is built after the runner.
   let heartbeat = null;
-  let cancellablePulseTimer = null;
   const turnRunner = createCopilotSdkSessionRunner({
     api,
     sdkSessionId,
@@ -110,15 +109,8 @@ async function main() {
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     onDeliveryReadinessChange: (ready) => linkBridge.onDeliveryReadinessChange(ready),
     // A message became (or stopped being) cancellable: report it now rather
-    // than on the next 10 s heartbeat. Coalesced to one pulse per 300 ms.
-    onCancellableChange: () => {
-      if (cancellablePulseTimer) return;
-      cancellablePulseTimer = setTimeout(() => {
-        cancellablePulseTimer = null;
-        void heartbeat?.pulseHeartbeat?.();
-      }, 300);
-      cancellablePulseTimer.unref?.();
-    },
+    // than on the next 10 s heartbeat (coalesced by the controller).
+    onCancellableChange: () => heartbeat?.requestPulse(),
     canHandBackHeldDelivery: () => linkBridge.canHandBackHeldDelivery(),
     dbg,
   });
@@ -156,6 +148,9 @@ async function main() {
     // into the live turn, and withdraws it while the runner holds.
     getSteeringReady: () => turnRunner.canAcceptSteering(),
     getDeliveryHeld: () => turnRunner.isDeliveryHeld(),
+    // A relay that just (re)started knows nothing of this worker until it
+    // heartbeats; the composer's steering snapshot rides that beat.
+    onServerHello: () => heartbeat.requestPulse(),
     onDeliver: async (pending, reason) => {
       dbg('queue.deliver received', `reason=${reason}`, `msgId=${pending?.message?.id || 'none'}`);
       // Slider changes reach a running worker on its next delivery; an

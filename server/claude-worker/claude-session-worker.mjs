@@ -84,6 +84,8 @@ async function main() {
     dbg,
   });
   const linkBridge = createRunnerLinkBridge();
+  // Late-bound: the heartbeat controller is built after the runner.
+  let heartbeat = null;
   const turnRunner = createClaudeSessionRunner({
     api,
     sdkSessionId,
@@ -104,13 +106,19 @@ async function main() {
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     getAutoCompactWindow: () => autoCompactWindow,
     getThinking: () => thinking,
-    onDeliveryReadinessChange: (ready) => linkBridge.onDeliveryReadinessChange(ready),
+    // A readiness flip is a hold starting or ending (question card,
+    // compaction, a turn-opening delivery): the steering snapshot changed
+    // with it, so it goes out now rather than on the next 10 s heartbeat.
+    onDeliveryReadinessChange: (ready) => {
+      linkBridge.onDeliveryReadinessChange(ready);
+      heartbeat?.requestPulse();
+    },
     canHandBackHeldDelivery: () => linkBridge.canHandBackHeldDelivery(),
     dbg,
   });
 
   let heartbeatTimer = null;
-  const heartbeat = createHeartbeatController({
+  heartbeat = createHeartbeatController({
     api,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,
@@ -122,8 +130,9 @@ async function main() {
     // the crash guard below takes the entries whole so its requeues stay
     // fenced to this attempt.
     getActiveQueueMessageIds: () => turnRunner.getActiveQueueMessageIds().map((entry) => entry.id),
-    // Composer steering snapshot; ~10s worst-case latency is fine because the
-    // client covers the instant case (open question card) from its own state.
+    // Composer steering snapshot. Holds reach the relay within a pulse window
+    // (onDeliveryReadinessChange above) and a relay that just came up gets it
+    // on its first hello; the periodic beat only backstops the rest.
     getSteeringState: () => turnRunner.steeringState(),
     // Consumed rows the runner could not fail itself; the relay fails them.
     getSettleFailed: () => turnRunner.getSettleFailed(),
@@ -144,6 +153,9 @@ async function main() {
     // A hold (open question card, compaction, adoption) suppresses readiness
     // even between deliveries — a delivery drawn into it is only handed back.
     getDeliveryHeld: () => turnRunner.isDeliveryHeld(),
+    // A relay that just (re)started knows nothing of this worker until it
+    // heartbeats; the composer's steering snapshot rides that beat.
+    onServerHello: () => heartbeat.requestPulse(),
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
     onDeliver: async (pending, reason) => {

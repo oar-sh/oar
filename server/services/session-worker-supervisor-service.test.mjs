@@ -80,6 +80,39 @@ test('two concurrent ensureWorker calls spawn only once', async () => {
   assert.equal(b.ok, true);
 });
 
+test('a steering snapshot the new worker sends while it spawns survives the ready update', async () => {
+  // The worker heartbeats as soon as it boots — before spawnWorker resolves —
+  // and the ready update used to be built from the 'starting' copy of the
+  // entry, whose empty snapshot overwrote the one just stored. The composer
+  // then read "Queue" until the next change-bearing heartbeat.
+  const registry = createSessionWorkerRegistry();
+  const steering = { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, cancellableIds: [] };
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    isPidAlive: () => true,
+    spawnWorker: async (sessionId) => {
+      // What the heartbeat route does for the new process: adopt its pid,
+      // then store its snapshot.
+      registry.upsertWorker({ ...registry.getWorker(sessionId), pid: 6060 });
+      registry.upsertWorker({ ...registry.getWorker(sessionId), steering });
+      return { workerId: 'worker-spawn-beat', pid: 6060 };
+    },
+  });
+
+  const result = await supervisor.ensureWorker('spawn-beat');
+  assert.equal(result.ok, true);
+  assert.deepEqual(registry.getWorker('spawn-beat').steering, steering);
+  assert.deepEqual(result.worker.steering, steering);
+
+  // Later supervisor updates keep it too; only the registry's own rule (the
+  // process gone or replaced) clears it.
+  supervisor.markProcessing('spawn-beat', 1);
+  supervisor.markIdle('spawn-beat', 0);
+  assert.deepEqual(registry.getWorker('spawn-beat').steering, steering);
+  supervisor.markError('spawn-beat', 'queue-failed:test');
+  assert.equal(registry.getWorker('spawn-beat').steering, null);
+});
+
 test('supervisor marks stale pid when known launched pid is dead and work is pending', async () => {
   const registry = createSessionWorkerRegistry();
   const supervisor = createSessionWorkerSupervisor({

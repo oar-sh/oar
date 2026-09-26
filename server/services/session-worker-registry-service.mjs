@@ -89,11 +89,11 @@ function normalizeSteeringCancellableIds(raw) {
 // with different rules would make an unknown holdReason never converge and
 // re-upsert on every heartbeat.
 //
-// `supported` is the worker's opt-in to mid-turn steering (the client's
-// composer gate — a worker that never sets it keeps "Queue"); the Claude
-// worker's older 4-field snapshot normalizes to supported=false and the client
-// keeps its provider rule for it. `cancellableIds` lists the pushed rows the
-// worker can still pull back out of its runtime (un-steer).
+// `supported` is the worker's opt-in to mid-turn steering and the client
+// composer's only steering gate: a worker that never sets it — the extension
+// path, or a Claude worker old enough to send the 4-field snapshot — keeps
+// "Queue". `cancellableIds` lists the pushed rows the worker can still pull
+// back out of its runtime (un-steer).
 export function normalizeWorkerSteeringSnapshot(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const holdReason = String(raw.holdReason || '').trim().toLowerCase();

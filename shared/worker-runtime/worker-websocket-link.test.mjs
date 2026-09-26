@@ -496,6 +496,63 @@ test("the link records what the relay advertises and forgets it on reconnect", a
   link.stop();
 });
 
+test("the relay's first hello on each connection is reported, its acks are not", async () => {
+  FakeWebSocket.instances = [];
+  const hellos = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-hello",
+    onServerHello: (reason) => hellos.push(reason),
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+    setTimeoutImpl: (fn) => { fn(); return {}; },
+    clearTimeoutImpl: () => {},
+  });
+  link.start();
+  const first = FakeWebSocket.instances[0];
+  first.open();
+  assert.deepEqual(hellos, [], "an open socket alone is not a hello");
+  first.receive({ type: "server.hello", reason: "connected" });
+  assert.deepEqual(hellos, ["connected"]);
+  // The relay acks every worker.hello, which the link re-sends on each idle
+  // readiness refresh: those must not fire it again.
+  first.receive({ type: "server.hello", reason: "ack" });
+  assert.deepEqual(hellos, ["connected"]);
+
+  // A reconnect — possibly to a restarted relay that knows nothing of this
+  // worker — reports again.
+  first.close();
+  const second = FakeWebSocket.instances[1];
+  assert.ok(second, "the link reconnected");
+  second.open();
+  second.receive({ type: "server.hello", reason: "connected" });
+  assert.deepEqual(hellos, ["connected", "connected"]);
+  link.stop();
+});
+
+test("a throwing hello hook does not stop the link from recording capabilities", async () => {
+  FakeWebSocket.instances = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-hello-throw",
+    onServerHello: () => { throw new Error("hook failed"); },
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+    setTimeoutImpl: () => ({}),
+    clearTimeoutImpl: () => {},
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.receive({ type: "server.hello", reason: "connected", capabilities: ["steering-held"] });
+  assert.equal(link.serverSupports("steering-held"), true);
+  link.stop();
+});
+
 test("throwing steering and hold probes fail closed on readiness", async () => {
   FakeWebSocket.instances = [];
   const link = createWorkerWebSocketLink({

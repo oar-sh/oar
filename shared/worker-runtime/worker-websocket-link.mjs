@@ -59,6 +59,11 @@ export function createWorkerWebSocketLink({
   // signals readiness — idle or not — and tells the server so with
   // worker.unready, because a delivery landing in a hold is handed back.
   getDeliveryHeld = null,
+  // Called with the hello's reason once per connection, on the relay's first
+  // server.hello: from then on the relay (possibly a restarted one that knows
+  // nothing of this worker) has the socket. Later hellos only ack the
+  // worker.hello every idle readiness refresh re-sends, and are not reported.
+  onServerHello = () => {},
   getSessionId = () => null,
   getPid = () => null,
   minBackoffMs = 1000,
@@ -306,6 +311,7 @@ export function createWorkerWebSocketLink({
     }
     const url = toWebSocketUrl(serverUrl, token, getSessionId, getPid);
     ws = new WebSocketImpl(url);
+    let serverHelloSeen = false;
     ws.addEventListener("open", () => {
       const openedAt = getNowMs();
       reconnectAttempt = 0;
@@ -332,6 +338,14 @@ export function createWorkerWebSocketLink({
       }
       if (payload?.type === "server.hello") {
         serverCapabilities = new Set(Array.isArray(payload.capabilities) ? payload.capabilities.map(String) : []);
+        if (!serverHelloSeen) {
+          serverHelloSeen = true;
+          try {
+            onServerHello(String(payload.reason || "server-hello"));
+          } catch (error) {
+            dbg("worker ws hello handler failed", error?.message || String(error));
+          }
+        }
         void notifyReady(String(payload.reason || "server-hello"));
         return;
       }

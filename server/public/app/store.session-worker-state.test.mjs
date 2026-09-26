@@ -20,7 +20,11 @@ globalThis.document = {
 };
 globalThis.sessionStorage = { getItem() { return ''; }, setItem() {} };
 
-const { setSessionWorkerStatesFromStatusPayload, getSessionWorkerState } = await import('./store.js');
+const {
+  setSessionWorkerStatesFromStatusPayload,
+  getSessionWorkerState,
+  applySessionWorkerSteering,
+} = await import('./store.js');
 
 const worker = (steering, extra = {}) => ({ sdkSessionId: 'sess-1', status: 'processing', pid: 4242, workerId: 'w-1', updatedAt: '2026-09-25T10:00:00.000Z', steering, ...extra });
 
@@ -62,4 +66,33 @@ test('the change hash covers supported and cancellableIds, so a flip in either c
   assert.equal(setSessionWorkerStatesFromStatusPayload({ workers: [worker({ ...base, cancellableIds: [], supported: false })] }), true, 'the opt-in flipped');
   assert.equal(setSessionWorkerStatesFromStatusPayload({ workers: [worker({ ...base, cancellableIds: [], supported: false })] }), false);
   assert.equal(getSessionWorkerState('sess-1').steering.supported, false);
+});
+
+test('a broadcast snapshot patches the known entry in place and takes part in the change hash', () => {
+  setSessionWorkerStatesFromStatusPayload({ workers: [worker(null), { ...worker(null), sdkSessionId: 'sess-2' }] });
+  const snapshot = { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, cancellableIds: [' u2 '] };
+
+  assert.equal(applySessionWorkerSteering('sess-1', snapshot), true);
+  assert.deepEqual(getSessionWorkerState('sess-1').steering, { ...snapshot, cancellableIds: ['u2'] });
+  // Everything else on the entry, and every other entry, is untouched.
+  assert.equal(getSessionWorkerState('sess-1').pid, 4242);
+  assert.equal(getSessionWorkerState('sess-1').status, 'processing');
+  assert.equal(getSessionWorkerState('sess-2').steering, null);
+
+  assert.equal(applySessionWorkerSteering('sess-1', { ...snapshot }), false, 'the same snapshot again is no change');
+  // The next poll carrying the same state is no change either: the hash moved
+  // with the patch.
+  assert.equal(setSessionWorkerStatesFromStatusPayload({ workers: [
+    worker({ ...snapshot }),
+    { ...worker(null), sdkSessionId: 'sess-2' },
+  ] }), false);
+
+  assert.equal(applySessionWorkerSteering('sess-1', null), true, 'a cleared snapshot is a change');
+  assert.equal(getSessionWorkerState('sess-1').steering, null);
+
+  // An entry the client has not seen yet cannot be patched: the caller
+  // refreshes the whole status instead.
+  assert.equal(applySessionWorkerSteering('sess-unknown', snapshot), null);
+  assert.equal(getSessionWorkerState('sess-unknown'), null);
+  assert.equal(applySessionWorkerSteering('', snapshot), null);
 });

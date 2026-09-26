@@ -4982,6 +4982,10 @@ export function registerMessagesRoutes(app, deps) {
           || storedCancellableIds.join('\n') !== steering.cancellableIds.join('\n');
         if (workerForSteering && changed) {
           sessionWorkerRegistry?.upsertWorker?.({ ...workerForSteering, steering });
+          // Pushed rather than left for the clients' status poll: the
+          // composer's Steer/Queue label and the pushed rows' Cancel read it,
+          // and the poll would add up to 4 s to a heartbeat that already lags.
+          io.emit('session_worker_steering', { sdkSessionId: requesterSessionId, steering });
         }
       }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);

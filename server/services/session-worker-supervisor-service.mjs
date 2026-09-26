@@ -482,10 +482,16 @@ export function createSessionWorkerSupervisor({
     if (current && !isTransitionAllowed(current.status, requestedStatus)) {
       return current;
     }
+    // The steering snapshot is the worker's to set (its heartbeat) and the
+    // registry's to clear (process gone or replaced). Callers build nextState
+    // from an older copy of the entry — ensureWorker from the 'starting' one,
+    // taken before the new process heartbeated — so passing theirs through
+    // would overwrite the snapshot the worker sent in the meantime.
+    const { steering: _staleSteering, ...patch } = nextState;
     const next = registry.upsertWorker({
       ...(current || {}),
       sdkSessionId: sessionId,
-      ...nextState,
+      ...patch,
       status: requestedStatus,
       updatedAt: nowIso(),
     });

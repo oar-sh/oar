@@ -29,6 +29,7 @@ import {
   clearSubagentCancelInFlight,
   setConversationWatcherCount,
   setUpdateState,
+  applySessionWorkerSteering,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
@@ -66,6 +67,8 @@ import {
   removeUserBubbleCancelButton,
   updateSubagentBubbleFromStatus,
   markSubagentStopUnsupported,
+  syncComposerButtonState,
+  syncCancellableSteerButtons,
 } from './conversation-view.js';
 import { loadRepoBrowserTree, refreshRepoBrowserIfWorkspaceOpen } from './attachments-view.js';
 import { clearMessageSearchRuntimeState } from './message-search-view.js';
@@ -627,10 +630,26 @@ export async function connectSocket(overrideDeps) {
         runtimeSessionId: String(runtimeSessionId || conversations[id].runtimeSessionId || '').trim() || null,
       };
     }
+    // The composer reads the worker's steering snapshot under the session id
+    // just bound; fetch it now rather than on the next status poll.
+    refreshSessionWorkerStatus().catch(() => {});
     await refreshConversations();
     if (currentConvId === id) {
       await openConversation(id);
     }
+  });
+  // A worker's steering snapshot changed (its heartbeat): the composer's
+  // Steer/Queue label and the pushed rows' Cancel follow it at once instead of
+  // on the next status poll.
+  socket.on('session_worker_steering', ({ sdkSessionId, steering } = {}) => {
+    const changed = applySessionWorkerSteering(sdkSessionId, steering);
+    if (changed === null) {
+      refreshSessionWorkerStatus().catch(() => {});
+      return;
+    }
+    if (!changed) return;
+    syncComposerButtonState();
+    syncCancellableSteerButtons();
   });
   socket.on('message_status', ({ messageId, conversationId, status }) => {
     const normalizedStatus = String(status || '').trim().toLowerCase();

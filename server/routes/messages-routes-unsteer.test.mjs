@@ -248,6 +248,28 @@ test('the heartbeat persists supported and cancellableIds flips, and quiet heart
   });
 });
 
+test('a changed steering snapshot is broadcast at once; an unchanged one is not', async () => {
+  // The client would otherwise only see it on its next status poll (4 s),
+  // after a heartbeat that already lags the change by up to 10 s.
+  const fx = boot();
+  seedWorker(fx);
+  const beat = (steering) => fx.post('/api/heartbeat', { steering }, fx.asWorker());
+  const broadcasts = () => fx.emitted.filter((entry) => entry.event === 'session_worker_steering');
+  const snapshot = { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, cancellableIds: [] };
+
+  await beat(snapshot);
+  assert.deepEqual(broadcasts().map((entry) => entry.payload), [{ sdkSessionId: CONV, steering: snapshot }]);
+
+  await beat({ ...snapshot });
+  assert.equal(broadcasts().length, 1, 'a quiet heartbeat broadcasts nothing');
+
+  await beat({ ...snapshot, turnActive: true, holdReason: 'question', messageId: 'q-1' });
+  assert.equal(broadcasts().length, 2);
+  assert.deepEqual(broadcasts()[1].payload.steering, {
+    ...snapshot, turnActive: true, holdReason: 'question', messageId: 'q-1',
+  });
+});
+
 // ---------------------------------------------------------------------------
 // cancel-queued-turn on a processing row
 // ---------------------------------------------------------------------------

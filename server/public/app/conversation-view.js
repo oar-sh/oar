@@ -3554,6 +3554,12 @@ export async function sendMessage() {
         title: titleSeed.slice(0, 60),
         updatedAt: new Date().toISOString(),
         messageCount: 1,
+        // The session the relay routed this first message to: the id its
+        // worker is launched, registered and heartbeats under, so the
+        // composer reads that worker's steering snapshot before the list
+        // catches up. A binding that names another id (the placeholder
+        // rekey) replaces it via conversation_session_bound.
+        sdkSessionId: r.ownerSessionId || null,
         runtimeSessionId: r.runtimeSessionId || null,
         runtimeProviderType: r.runtimeProviderType || 'github',
         runtimeProviderModel: r.runtimeProviderModel || null,

@@ -887,12 +887,33 @@ export function resolveConversationUiState({ conversation = null, workerState = 
   return fallbackUiState || 'offline';
 }
 
+// Composer steering snapshot from the worker's heartbeat: whether a typed
+// message would steer into the live turn, and why not when it wouldn't.
+function normalizeWorkerSteering(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    turnActive: raw.turnActive === true,
+    canSteer: raw.canSteer === true,
+    holdReason: String(raw.holdReason || '').trim() || null,
+    // The turn the snapshot describes — lets the composer drop a hold that
+    // belongs to a previous turn (the heartbeat lags ~10s).
+    messageId: String(raw.messageId || '').trim() || null,
+    // The worker's own opt-in to mid-turn steering (both SDK workers send
+    // it); the composer's only steering gate — no provider rule backs it up.
+    supported: raw.supported === true,
+    // Pushed-but-unconsumed rows the worker can still pull back out of its
+    // runtime: their bubbles keep Cancel while listed here.
+    cancellableIds: Array.isArray(raw.cancellableIds)
+      ? raw.cancellableIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : [],
+  };
+}
+
 function normalizeWorkerStateEntry(worker) {
   const sdkSessionId = normalizeWorkerSessionId(worker?.sdkSessionId);
   if (!sdkSessionId) return null;
   const explicitUiState = normalizeUiState(worker?.uiState || worker?.ui_state);
   const derivedUiState = normalizeUiStateFromStatus(worker?.status);
-  const rawSteering = worker?.steering && typeof worker.steering === 'object' ? worker.steering : null;
   return {
     sdkSessionId,
     status: normalizeWorkerStatus(worker?.status),
@@ -901,26 +922,7 @@ function normalizeWorkerStateEntry(worker) {
     workerId: String(worker?.workerId || '').trim() || null,
     pid: Number.isInteger(Number(worker?.pid)) ? Number(worker.pid) : null,
     updatedAt: String(worker?.updatedAt || '').trim() || null,
-    // Composer steering snapshot from the worker's heartbeat: whether a typed
-    // message would steer into the live turn, and why not when it wouldn't.
-    steering: rawSteering
-      ? {
-          turnActive: rawSteering.turnActive === true,
-          canSteer: rawSteering.canSteer === true,
-          holdReason: String(rawSteering.holdReason || '').trim() || null,
-          // The turn the snapshot describes — lets the composer drop a hold
-          // that belongs to a previous turn (the heartbeat lags ~10s).
-          messageId: String(rawSteering.messageId || '').trim() || null,
-          // The worker advertises mid-turn steering itself (the Copilot SDK
-          // worker); the composer gate is provider rule OR this flag.
-          supported: rawSteering.supported === true,
-          // Pushed-but-unconsumed rows the worker can still pull back out of
-          // its runtime: their bubbles keep Cancel while listed here.
-          cancellableIds: Array.isArray(rawSteering.cancellableIds)
-            ? rawSteering.cancellableIds.map((id) => String(id || '').trim()).filter(Boolean)
-            : [],
-        }
-      : null,
+    steering: normalizeWorkerSteering(worker?.steering),
   };
 }
 
@@ -945,6 +947,26 @@ export function setSessionWorkerStatesFromStatusPayload(payload) {
     if (!normalized) continue;
     next.set(normalized.sdkSessionId, normalized);
   }
+  const nextHash = buildSessionWorkerStateHash(next);
+  if (nextHash === sessionWorkerStateHash) return false;
+  sessionWorkerStateHash = nextHash;
+  sessionWorkerStates = next;
+  return true;
+}
+
+/**
+ * Apply one worker's steering snapshot as the relay broadcasts it
+ * (`session_worker_steering`), ahead of the next status poll. Only an entry
+ * the client already knows is patched — the snapshot alone carries none of
+ * the entry's other fields. Returns null for an unknown session (the caller
+ * refreshes the whole status instead), otherwise whether anything changed.
+ */
+export function applySessionWorkerSteering(sdkSessionId, steering) {
+  const sid = normalizeWorkerSessionId(sdkSessionId);
+  const existing = sid ? sessionWorkerStates.get(sid) : null;
+  if (!existing) return null;
+  const next = new Map(sessionWorkerStates);
+  next.set(sid, { ...existing, steering: normalizeWorkerSteering(steering) });
   const nextHash = buildSessionWorkerStateHash(next);
   if (nextHash === sessionWorkerStateHash) return false;
   sessionWorkerStateHash = nextHash;

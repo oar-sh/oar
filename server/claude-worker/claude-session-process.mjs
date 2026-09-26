@@ -3162,8 +3162,8 @@ export function createClaudeSessionRunner({
       (ctxLive ? ctx.message?.id : '') || openingDelivery?.ctx?.message?.id || '',
     ).trim() || null;
     // `supported` is the worker-advertised opt-in the client's composer reads
-    // (the same flag the Copilot SDK worker publishes); the provider-name
-    // fallback in the client covers Claude workers not yet respawned.
+    // (the same flag the Copilot SDK worker publishes) — its only steering
+    // gate, so every snapshot carries it, idle ones included.
     return { turnActive, canSteer, holdReason, messageId, supported: true };
   }
 

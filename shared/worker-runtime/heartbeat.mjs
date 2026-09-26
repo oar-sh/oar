@@ -19,7 +19,15 @@ export function createHeartbeatController({
   // `settleFailedHandled`, which `onSettleFailedHandled` receives.
   getSettleFailed,
   onSettleFailedHandled = () => {},
+  // requestPulse's window: one turn transition can flip the steering
+  // snapshot several times in quick succession, and each flip only needs to
+  // reach the relay once.
+  pulseCoalesceMs = 300,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
 }) {
+  let requestedPulseTimer = null;
+
   async function pulseHeartbeat() {
     if (!getSessionReady()) return false;
     try {
@@ -57,6 +65,21 @@ export function createHeartbeatController({
     }
   }
 
+  /**
+   * An out-of-cycle pulse for state the relay should see before the next
+   * periodic one (the composer's steering snapshot, a relay that just came
+   * up). Requests inside one window share a single pulse, sent at its end so
+   * it carries the settled state.
+   */
+  function requestPulse() {
+    if (requestedPulseTimer) return;
+    requestedPulseTimer = setTimeoutImpl(() => {
+      requestedPulseTimer = null;
+      void pulseHeartbeat();
+    }, pulseCoalesceMs);
+    requestedPulseTimer?.unref?.();
+  }
+
   function startHeartbeat() {
     if (getHeartbeatTimer()) return;
     void pulseHeartbeat();
@@ -67,6 +90,10 @@ export function createHeartbeatController({
   }
 
   function stopHeartbeat() {
+    if (requestedPulseTimer) {
+      clearTimeoutImpl(requestedPulseTimer);
+      requestedPulseTimer = null;
+    }
     const timer = getHeartbeatTimer();
     if (!timer) return;
     clearInterval(timer);
@@ -75,6 +102,7 @@ export function createHeartbeatController({
 
   return {
     pulseHeartbeat,
+    requestPulse,
     startHeartbeat,
     stopHeartbeat,
   };
