@@ -94,6 +94,47 @@ export function restoreTranscriptAnchor(el, anchor) {
   return Number(el.scrollTop || 0) !== before;
 }
 
+const KEYBOARD_INPUT_TYPES = new Set(['', 'text', 'search', 'email', 'url', 'tel', 'number', 'password']);
+
+/**
+ * The focused field inside the transcript that has the on-screen keyboard
+ * open (a question card's reply box or form input), or null.
+ */
+export function focusedTranscriptTextField(el, active = globalThis.document?.activeElement) {
+  if (!el || !active || active === el) return null;
+  if (typeof el.contains !== 'function' || !el.contains(active)) return null;
+  const tag = String(active.tagName || '').toUpperCase();
+  if (tag === 'TEXTAREA') return active;
+  if (tag === 'INPUT') {
+    return KEYBOARD_INPUT_TYPES.has(String(active.type ?? '').toLowerCase()) ? active : null;
+  }
+  return active.isContentEditable === true ? active : null;
+}
+
+/**
+ * Scrolls the transcript just enough to show the field whole, top-aligned
+ * when it is taller than the viewport. Arithmetic on scrollTop rather than
+ * scrollIntoView, which would scroll the page root too. Returns true when
+ * scrollTop changed.
+ */
+export function revealFieldInTranscript(el, field, { marginPx = 8 } = {}) {
+  if (!el || typeof field?.getBoundingClientRect !== 'function') return false;
+  const before = Number(el.scrollTop || 0);
+  const container = el.getBoundingClientRect();
+  const rect = field.getBoundingClientRect();
+  const viewTop = container.top + marginPx;
+  const viewBottom = container.bottom - marginPx;
+  let delta = 0;
+  if (rect.top < viewTop || rect.bottom - rect.top > viewBottom - viewTop) {
+    delta = rect.top - viewTop;
+  } else if (rect.bottom > viewBottom) {
+    delta = rect.bottom - viewBottom;
+  }
+  if (Math.abs(delta) <= 0.5) return false;
+  el.scrollTop = before + delta;
+  return Number(el.scrollTop || 0) !== before;
+}
+
 /**
  * Tracks the position across resize storms. Scroll events commit the
  * reader's position; a resize re-applies the last committed position and
@@ -102,6 +143,10 @@ export function restoreTranscriptAnchor(el, anchor) {
  * a phone resizes in several steps (browser chrome animates), so the window
  * extends with every step and the position is re-applied once more when it
  * closes.
+ *
+ * The browser's reveal of a focused field when the keyboard shrinks the
+ * viewport is one of those ignored scrolls, so every re-apply reveals the
+ * focused transcript field again itself.
  */
 export function createTranscriptResizeKeeper({
   getElement,
@@ -110,6 +155,8 @@ export function createTranscriptResizeKeeper({
   clearTimer = (id) => clearTimeout(id),
   capture = captureTranscriptAnchor,
   restore = restoreTranscriptAnchor,
+  getFocusedField = focusedTranscriptTextField,
+  reveal = revealFieldInTranscript,
 } = {}) {
   let committed = null;
   let settleTimer = null;
@@ -127,10 +174,18 @@ export function createTranscriptResizeKeeper({
     return Boolean(next);
   }
 
+  function apply(el) {
+    const restored = committed ? restore(el, committed) : false;
+    let field = null;
+    try { field = getFocusedField(el); } catch { field = null; }
+    const revealed = field ? reveal(el, field) : false;
+    return restored || revealed;
+  }
+
   function endSettle() {
     settleTimer = null;
     const el = element();
-    if (el && committed) restore(el, committed);
+    if (el) apply(el);
   }
 
   function handleResize() {
@@ -143,7 +198,7 @@ export function createTranscriptResizeKeeper({
     }
     if (settleTimer !== null) clearTimer(settleTimer);
     settleTimer = setTimer(endSettle, settleMs);
-    return committed ? restore(el, committed) : false;
+    return apply(el);
   }
 
   return {

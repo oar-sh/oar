@@ -82,6 +82,8 @@ All notable changes to OAR are documented here. The format follows
   your place in the transcript: a reader at the end stays at the end, and
   mid-history the same message stays at the top of the screen. Previously
   the reflow left you screens above where you were, usually further back.
+  A question card's reply box you are typing in stays in view when the
+  keyboard opens.
 
 - The composer's send button no longer turns into **Stop** while a turn runs.
   It reads **Steer** when a Claude turn is live and text is drafted, and stays

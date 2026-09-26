@@ -90,6 +90,21 @@ function readTranscriptPosition(page) {
   });
 }
 
+function readFieldPlacement(page, selector) {
+  return page.evaluate((fieldSelector) => {
+    const el = document.getElementById("messages");
+    const box = el.getBoundingClientRect();
+    const field = document.querySelector(fieldSelector).getBoundingClientRect();
+    return {
+      visible: field.top >= box.top - 1 && field.bottom <= box.bottom + 1,
+      fieldTop: Math.round(field.top - box.top),
+      fieldBottom: Math.round(field.bottom - box.top),
+      clientHeight: el.clientHeight,
+      distanceFromBottom: Math.round(el.scrollHeight - el.clientHeight - el.scrollTop),
+    };
+  }, selector);
+}
+
 async function rotateTo(page, size) {
   await page.setViewportSize(size);
   // The keeper settles 500ms after the last resize event.
@@ -141,6 +156,96 @@ test("rotating keeps a reader at the end at the end, and mid-history on the same
     expect(portraitMidBack.topMessageId).toBe(portraitMid.topMessageId);
     expect(Math.abs(portraitMidBack.topHiddenShare - portraitMid.topHiddenShare)).toBeLessThan(0.05);
   } finally {
+    if (conversationId) {
+      await request.delete(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers }).catch(() => {});
+    }
+  }
+});
+
+// Android resizes the layout for the keyboard (interactive-widget=
+// resizes-content), so the keyboard is a resize the keeper re-pins through.
+// A focused question-card reply box must stay in view, not be restored away
+// to where the reader was before the keyboard opened. Playwright cannot open
+// a keyboard; shrinking the viewport is the same resize.
+test("the keyboard opening keeps a focused question-card reply box in view", async ({ page, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const keyboardOpen = { width: PORTRAIT.width, height: PORTRAIT.height - 300 };
+  let conversationId = "";
+  let messageId = "";
+  try {
+    conversationId = await seedLongConversation(request, headers, 4);
+    const queued = await request.post("/api/message", {
+      headers,
+      data: { text: "Question with cards", relayMode: "agent", model: "gpt-5.4-mini", conversationId },
+    });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    messageId = String(queuedBody.messageId || "");
+    await dequeue(request, headers, messageId, String(queuedBody.ownerSessionId || ""));
+    const questionIds = [];
+    for (let index = 0; index < 3; index += 1) {
+      const created = await request.post("/api/relay-question", {
+        headers,
+        data: {
+          queueId: messageId,
+          messageId,
+          conversationId,
+          mode: "agent",
+          prompt: `Card ${index}: which option should the build use?`,
+          choices: ["Option A", "Option B"],
+          allowFreeform: true,
+          timeout_ms: 120000,
+        },
+      });
+      expect(created.ok()).toBeTruthy();
+      questionIds.push(String((await created.json())?.question?.id || ""));
+    }
+
+    await page.addInitScript((id) => localStorage.setItem("copilot_last_conv", id), conversationId);
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await expect(page.locator("#messages .relay-question-container")).toHaveCount(3);
+    const replyBox = `#relay-question-input-${questionIds[0]}`;
+
+    // The first card's reply box 70% down the transcript, well short of the end.
+    await page.evaluate((selector) => {
+      const el = document.getElementById("messages");
+      const field = document.querySelector(selector).getBoundingClientRect();
+      el.scrollTop += field.bottom - el.getBoundingClientRect().top - el.clientHeight * 0.7;
+    }, replyBox);
+    await page.waitForTimeout(300);
+    const before = await readFieldPlacement(page, replyBox);
+    expect(before.visible).toBe(true);
+    expect(before.distanceFromBottom).toBeGreaterThan(48);
+    // ...and below where the transcript will end once the keyboard is up.
+    expect(before.fieldBottom).toBeGreaterThan(before.clientHeight - 300);
+
+    await page.evaluate((selector) => document.querySelector(selector).focus({ preventScroll: true }), replyBox);
+    await page.waitForTimeout(300);
+    await rotateTo(page, keyboardOpen);
+    const typing = await readFieldPlacement(page, replyBox);
+    expect(typing.clientHeight).toBeLessThan(before.clientHeight);
+    expect(typing.visible, `reply box at ${typing.fieldTop}–${typing.fieldBottom} of ${typing.clientHeight}`).toBe(true);
+
+    await rotateTo(page, PORTRAIT);
+    expect((await readFieldPlacement(page, replyBox)).visible).toBe(true);
+
+    // The composer is outside the transcript: a reader at the end stays pinned.
+    await page.evaluate(() => { const el = document.getElementById("messages"); el.scrollTop = el.scrollHeight; });
+    await page.waitForTimeout(300);
+    await page.locator("#msg-input").focus();
+    await rotateTo(page, keyboardOpen);
+    expect((await readTranscriptPosition(page)).distanceFromBottom).toBeLessThanOrEqual(1);
+    await rotateTo(page, PORTRAIT);
+    expect((await readTranscriptPosition(page)).distanceFromBottom).toBeLessThanOrEqual(1);
+  } finally {
+    if (messageId && conversationId) {
+      await request.post("/api/response", {
+        headers,
+        data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" },
+      }).catch(() => {});
+    }
     if (conversationId) {
       await request.delete(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers }).catch(() => {});
     }

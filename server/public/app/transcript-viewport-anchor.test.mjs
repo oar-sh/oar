@@ -4,8 +4,10 @@ import assert from 'node:assert/strict';
 import {
   captureTranscriptAnchor,
   createTranscriptResizeKeeper,
+  focusedTranscriptTextField,
   resolveNearBottomThresholdPx,
   restoreTranscriptAnchor,
+  revealFieldInTranscript,
 } from './transcript-viewport-anchor.mjs';
 
 // A scroller whose rows are stacked blocks of the given heights. Rotation is
@@ -18,6 +20,7 @@ function makeScroller({ rowHeights, clientHeight, scrollTop = 0, top = 100 }) {
     rowHeights: [...rowHeights],
     get scrollHeight() { return this.rowHeights.reduce((sum, h) => sum + h, 0); },
     getBoundingClientRect() { return { top, bottom: top + this.clientHeight }; },
+    contains(node) { return node?.insideTranscript === true; },
     querySelectorAll() {
       let offset = 0;
       return this.rowHeights.map((height, index) => {
@@ -45,6 +48,26 @@ function makeScroller({ rowHeights, clientHeight, scrollTop = 0, top = 100 }) {
       return true;
     },
   });
+}
+
+// A field laid out at a fixed content offset inside the scroller (a question
+// card's reply box), positioned like the rows.
+function makeField(el, { contentTop, height = 40, tagName = 'TEXTAREA', type, inside = true, top = 100 }) {
+  return {
+    tagName,
+    type,
+    insideTranscript: inside,
+    getBoundingClientRect: () => ({
+      top: top + contentTop - el.scrollTop,
+      bottom: top + contentTop + height - el.scrollTop,
+    }),
+  };
+}
+
+function isFullyVisible(el, field) {
+  const container = el.getBoundingClientRect();
+  const rect = field.getBoundingClientRect();
+  return rect.top >= container.top && rect.bottom <= container.bottom;
 }
 
 const PORTRAIT = { rowHeights: Array(20).fill(300), clientHeight: 600 };
@@ -181,4 +204,98 @@ test('a resize before any scroll uses the current position as the anchor', () =>
   // the keeper can only do better once it has seen a scroll.
   keeper.handleResize();
   assert.equal(keeper.committedAnchor().messageId, 'm16');
+});
+
+function makeKeeperWithTimers(el, field) {
+  const timers = [];
+  const keeper = createTranscriptResizeKeeper({
+    getElement: () => el,
+    setTimer: (fn) => { timers.push(fn); return timers.length; },
+    clearTimer: (id) => { timers[id - 1] = null; },
+    getFocusedField: (scroller) => focusedTranscriptTextField(scroller, field),
+  });
+  const fireSettle = () => timers.filter(Boolean).forEach((fn) => fn());
+  return { keeper, fireSettle };
+}
+
+test('the keyboard opening keeps a focused question field in view mid-transcript', () => {
+  // Anchor row m6, far from the end; the reply box sits in the lower half.
+  const el = makeScroller({ ...PORTRAIT, scrollTop: 2060 });
+  const field = makeField(el, { contentTop: 2510 });
+  const { keeper, fireSettle } = makeKeeperWithTimers(el, field);
+  keeper.recordScroll();
+  assert.ok(isFullyVisible(el, field));
+
+  // Android with resizes-content: the keyboard halves the transcript and the
+  // browser scrolls the focused field into view before the resize fires.
+  el.clientHeight = 300;
+  el.scrollTop = 2550 - 300 + 20;
+  keeper.handleResize();
+  assert.ok(isFullyVisible(el, field), 'still in view after the restore');
+
+  fireSettle();
+  assert.ok(isFullyVisible(el, field), 'still in view once the settle window closes');
+});
+
+test('the keyboard opening at the end keeps a field in an upper card in view', () => {
+  const el = makeScroller({ ...PORTRAIT, scrollTop: 5400 });
+  const field = makeField(el, { contentTop: 5500 });
+  const { keeper, fireSettle } = makeKeeperWithTimers(el, field);
+  keeper.recordScroll();
+  assert.equal(keeper.committedAnchor().atBottom, true);
+
+  el.clientHeight = 300;
+  keeper.handleResize();
+  assert.ok(isFullyVisible(el, field), 'the end pin must not push the field off the top');
+  fireSettle();
+  assert.ok(isFullyVisible(el, field));
+});
+
+test('with no focused transcript field the end pin behaves as before', () => {
+  const el = makeScroller({ ...PORTRAIT, scrollTop: 5400 });
+  // Focus outside the transcript (the composer) is not revealed.
+  const composer = makeField(el, { contentTop: 5500, inside: false });
+  const { keeper, fireSettle } = makeKeeperWithTimers(el, composer);
+  keeper.recordScroll();
+  el.clientHeight = 300;
+  keeper.handleResize();
+  fireSettle();
+  assert.equal(el.scrollTop, el.scrollHeight - el.clientHeight);
+});
+
+test('only keyboard fields inside the transcript count as focused', () => {
+  const el = makeScroller({ ...PORTRAIT });
+  const field = (props) => makeField(el, { contentTop: 0, ...props });
+  assert.ok(focusedTranscriptTextField(el, field({ tagName: 'TEXTAREA' })));
+  for (const type of ['', 'text', 'search', 'email', 'url', 'tel', 'number', 'password']) {
+    assert.ok(focusedTranscriptTextField(el, field({ tagName: 'INPUT', type })), `input type "${type}"`);
+  }
+  for (const type of ['checkbox', 'radio', 'button', 'submit', 'range']) {
+    assert.equal(focusedTranscriptTextField(el, field({ tagName: 'INPUT', type })), null, `input type "${type}"`);
+  }
+  assert.equal(focusedTranscriptTextField(el, field({ tagName: 'SELECT' })), null);
+  assert.equal(focusedTranscriptTextField(el, field({ tagName: 'BUTTON' })), null);
+  assert.ok(focusedTranscriptTextField(el, { ...field({ tagName: 'DIV' }), isContentEditable: true }));
+  assert.equal(focusedTranscriptTextField(el, field({ tagName: 'TEXTAREA', inside: false })), null);
+  assert.equal(focusedTranscriptTextField(el, el), null);
+  assert.equal(focusedTranscriptTextField(el, null), null);
+});
+
+test('reveal scrolls the least distance that shows the field whole', () => {
+  // Viewport shows content 1000–1600; the reveal keeps an 8px margin.
+  const below = makeScroller({ ...PORTRAIT, scrollTop: 1000 });
+  assert.equal(revealFieldInTranscript(below, makeField(below, { contentTop: 1700 })), true);
+  assert.equal(below.scrollTop, 1740 - 600 + 8, 'bottom-aligned');
+
+  const above = makeScroller({ ...PORTRAIT, scrollTop: 1000 });
+  assert.equal(revealFieldInTranscript(above, makeField(above, { contentTop: 900 })), true);
+  assert.equal(above.scrollTop, 900 - 8, 'top-aligned');
+
+  const visible = makeScroller({ ...PORTRAIT, scrollTop: 1000 });
+  assert.equal(revealFieldInTranscript(visible, makeField(visible, { contentTop: 1200 })), false);
+  assert.equal(visible.scrollTop, 1000);
+
+  const tall = makeScroller({ ...PORTRAIT, scrollTop: 1000 });
+  assert.equal(revealFieldInTranscript(tall, makeField(tall, { contentTop: 1300, height: 900 })), true);
+  assert.equal(tall.scrollTop, 1300 - 8, 'taller than the viewport: top-aligned');
 });
