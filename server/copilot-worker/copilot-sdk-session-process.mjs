@@ -793,7 +793,7 @@ export function createCopilotSdkSessionRunner({
       // the text still lands in the runtime's own transcript.
       return;
     }
-    if (action.channel !== 'init' && !action.carried) owner.showedWork = true;
+    if (action.channel !== 'init' && !action.carried && !action.bookkeeping) owner.showedWork = true;
     if (action.channel === 'stream' && !action.payload?.subagentRunId) {
       // Re-cut to the owner's own segments, and gated against what THAT row
       // last received (the normalizer gated against the whole interaction).

@@ -403,14 +403,51 @@ test('a runtime-opened continuation whose only work was a tool call keeps its ro
 
   agentCompleted(client);
   runtimeFollowUp(client, [
-    { type: 'tool.execution_start', data: { toolCallId: 'r1', toolName: 'read_agent', arguments: { agent_id: AGENT_ID } } },
-    { type: 'tool.execution_complete', data: { toolCallId: 'r1', success: true, result: { content: 'SUB done.' } } },
+    { type: 'tool.execution_start', data: { toolCallId: 'p1', toolName: 'powershell', arguments: { command: 'Get-ChildItem' } } },
+    { type: 'tool.execution_complete', data: { toolCallId: 'p1', success: true, result: { content: 'a.txt' } } },
   ]);
   await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation published' });
   assert.equal(responsesFor(stub, 'cont-1')[0].text, EMPTY_TURN_COMPLETION_NOTE);
   assert.deepEqual(stub.bodiesFor('/api/requeue'), []);
   const activities = stub.bodiesFor('/api/activity').filter((body) => body.messageId === 'cont-1').map((body) => body.text);
-  assert.ok(activities.some((text) => text.startsWith('Tool (read_agent)')), activities.join(' | '));
+  assert.ok(activities.some((text) => text.startsWith('Tool (powershell)')), activities.join(' | '));
+  await runner.dispose();
+});
+
+// The most common empty row live (gpt-5.6-luna, 2026-09-26) carried only the
+// background agent's granted permission, or the main agent's read_agent poll
+// of it: bookkeeping the task card already covers.
+test('a runtime-opened continuation whose only lines are bookkeeping settles silently', async () => {
+  const stub = makeContinuationApiStub({ routeResponses: { '/api/requeue': () => ({ ok: true, dropped: 'continuation' }) } });
+  const { client, runner } = setup({ stub, taskList: [agentTask()] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  agentCompleted(client);
+  runtimeFollowUp(client, [
+    { type: 'permission.requested', data: { requestId: 'perm-1', permissionRequest: { kind: 'shell', fullCommandText: 'Start-Sleep -Seconds 20' } } },
+    { type: 'permission.completed', data: { requestId: 'perm-1', result: { kind: 'approved' } } },
+    { type: 'tool.execution_start', data: { toolCallId: 'r1', toolName: 'read_agent', arguments: { agent_id: AGENT_ID } } },
+    { type: 'tool.execution_complete', data: { toolCallId: 'r1', success: true, result: { content: 'SUB done.' } } },
+  ]);
+  await waitFor(() => stub.bodiesFor('/api/requeue').length === 1, { label: 'continuation row torn down' });
+  assert.deepEqual(stub.bodiesFor('/api/requeue')[0], { messageId: 'cont-1', attemptId: 'attempt-cont-1' });
+  assert.equal(responsesFor(stub, 'cont-1').length, 0);
+  await waitFor(() => runner.isTurnActive() === false, { label: 'continuation released' });
+  await runner.dispose();
+});
+
+test('a denied permission is news: a runtime-opened continuation showing one keeps its row', async () => {
+  const { stub, client, runner } = setup({ taskList: [agentTask()] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  agentCompleted(client);
+  runtimeFollowUp(client, [
+    { type: 'permission.requested', data: { requestId: 'perm-2', permissionRequest: { kind: 'shell', fullCommandText: 'Remove-Item build' } } },
+    { type: 'permission.completed', data: { requestId: 'perm-2', result: { kind: 'denied-by-rules' } } },
+  ]);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation published' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, EMPTY_TURN_COMPLETION_NOTE);
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), []);
   await runner.dispose();
 });
 

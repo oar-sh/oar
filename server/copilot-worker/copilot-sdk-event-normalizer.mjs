@@ -444,6 +444,17 @@ export function createCopilotEventNormalizer({
   }
 
   /**
+   * A line that only tracks background work: the main agent polling its
+   * background agent (`read_agent`), or a permission granted for a tool call
+   * (the call's own line, when it is the main agent's, is the real work). It
+   * still shows on the row; it just does not make a runtime-opened row worth
+   * keeping on its own (the task card covers the background agent).
+   */
+  function bookkeepingActivityAction(text) {
+    return { ...activityAction(text), bookkeeping: true };
+  }
+
+  /**
    * Build the single terminal `result` action for this turn. Guarded so a
    * `session.error` arriving after a `session.idle` (or a second error) cannot
    * publish a second response for the same queue row.
@@ -762,7 +773,8 @@ export function createCopilotEventNormalizer({
           lastEmittedStreamText = text;
           return [{ channel: 'stream', payload: { text, done: false, subagentRunId: null } }];
         }
-        return [activityAction(formatToolActivityText(toolName, data.arguments))];
+        const toolLine = formatToolActivityText(toolName, data.arguments);
+        return [toolName === 'read_agent' ? bookkeepingActivityAction(toolLine) : activityAction(toolLine)];
       }
       case 'tool.execution_complete': {
         // There is no `tool.*_failed` event type — failure is `success: false`
@@ -787,9 +799,9 @@ export function createCopilotEventNormalizer({
         const summary = permissionRequests.get(requestId) || '';
         permissionRequests.delete(requestId);
         const kind = String(data.result?.kind || 'unknown').trim();
-        return [activityAction(truncate(summary
-          ? `Permission ${kind}: ${summary}`
-          : `Permission ${kind}`))];
+        const line = truncate(summary ? `Permission ${kind}: ${summary}` : `Permission ${kind}`);
+        // A denial is news; a grant is bookkeeping for the call it unblocked.
+        return [kind.startsWith('approved') ? bookkeepingActivityAction(line) : activityAction(line)];
       }
       case 'user_input.requested': {
         // The question is forwarded to the relay as a question card; this row
