@@ -77,7 +77,8 @@ All notable changes to OAR are documented here. The format follows
   instead of growing past the window — in phone landscape too, where the
   composer now always stays on screen.
 - Rotating a phone to landscape keeps the portrait text size instead of
-  jumping to the larger desktop size.
+  jumping to the larger desktop size, and opening the on-screen keyboard
+  no longer shrinks it.
 - Rotating a phone (or resizing the window, or opening the keyboard) keeps
   your place in the transcript: a reader at the end stays at the end, and
   mid-history the same message stays at the top of the screen. Previously

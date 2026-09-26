@@ -1297,7 +1297,18 @@ export function showTransientRelayNotice(message, ms = 4000, action = null) {
   setTimeout(hide, durationMs);
 }
 
+// The screen's short side sizes phone-landscape text (index.html); unlike
+// the viewport, the on-screen keyboard never changes it. Refreshed here for
+// foldables, whose screen changes when they unfold.
+function syncScreenShortSide() {
+  const shortSide = Math.min(Number(window.screen?.width) || 0, Number(window.screen?.height) || 0);
+  if (!shortSide) return;
+  document.documentElement.style.setProperty('--screen-short-side', `${shortSide}px`);
+  document.documentElement.toggleAttribute('data-phone-screen', shortSide <= 500);
+}
+
 export function syncViewportMetrics() {
+  syncScreenShortSide();
   const layoutHeight = window.innerHeight || document.documentElement.clientHeight || 0;
   const layoutWidth = window.innerWidth || document.documentElement.clientWidth || 0;
   const vv = window.visualViewport;

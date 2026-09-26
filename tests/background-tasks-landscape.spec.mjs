@@ -85,3 +85,42 @@ test("phone landscape keeps portrait text size, the composer on screen, and the 
     }
   }
 });
+
+// Android resizes the layout for the keyboard (interactive-widget=
+// resizes-content). Playwright cannot open a keyboard; shrinking the
+// viewport while the emulated screen stays put is the same resize.
+const readRootFontPx = (page) => page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize));
+
+// Chromium's mobile emulation ignores the `screen` option and reports the
+// viewport as the screen, shrinking it with the viewport; a real phone's
+// screen never changes when the keyboard opens. Pin it to the device's.
+async function openApp(page, screenSize) {
+  await page.addInitScript(({ width, height }) => {
+    for (const [key, value] of Object.entries({ width, height, availWidth: width, availHeight: height })) {
+      Object.defineProperty(window.screen, key, { get: () => value, configurable: true });
+    }
+  }, screenSize);
+  await page.goto(`/?token=${encodeURIComponent(relayToken())}`);
+  await page.waitForLoadState("networkidle");
+}
+
+test("the keyboard opening leaves phone-landscape text size alone", async ({ page }) => {
+  await openApp(page, pixelLandscape.screen);
+  const { width } = page.viewportSize();
+  const before = await readRootFontPx(page);
+  expect(before).toBeCloseTo(14, 1);
+  await page.setViewportSize({ width, height: 150 });
+  expect(await readRootFontPx(page)).toBe(before);
+});
+
+test.describe("portrait phone", () => {
+  test.use({ viewport: { width: 390, height: 664 }, isMobile: true, hasTouch: true });
+
+  test("the keyboard leaves the text size alone even when the page turns wider than tall", async ({ page }) => {
+    await openApp(page, { width: 390, height: 844 });
+    const before = await readRootFontPx(page);
+    expect(before).toBeCloseTo(390 * 0.034, 1);
+    await page.setViewportSize({ width: 390, height: 300 });
+    expect(await readRootFontPx(page)).toBe(before);
+  });
+});
