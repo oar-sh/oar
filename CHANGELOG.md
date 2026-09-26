@@ -69,9 +69,12 @@ All notable changes to OAR are documented here. The format follows
 - Copilot replies settle when the main agent goes idle rather than when the
   whole session does, so a background agent the turn spawned no longer keeps
   the reply's bubble spinning for as long as it runs; the agent's own
-  follow-up arrives as a *continuation* reply, as on Claude. Messages are sent
-  to the Copilot runtime as `immediate` throughout — the only mode that never
-  strands a message behind background work.
+  follow-up arrives as a *continuation* reply, as on Claude. A background agent
+  that asks a question, or in ask mode asks to run something, after the reply
+  settled gets its card on a row of its own; approvals follow the
+  conversation's current mode, not the one the session started in. Messages
+  are sent to the Copilot runtime as `immediate` throughout — the only mode
+  that never strands a message behind background work.
 
 - The background task panel scrolls when it holds more tasks than fit,
   instead of growing past the window — in phone landscape too, where the
