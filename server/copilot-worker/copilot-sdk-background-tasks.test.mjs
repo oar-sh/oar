@@ -17,6 +17,7 @@ import {
 } from './copilot-sdk-test-harness.mjs';
 import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 import { BACKGROUND_QUESTION_NOTE } from './copilot-sdk-session-process.mjs';
+import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 
 const AGENT_ID = 'e489d2f3-2431-4f95-9b71-f15a327f8c92';
 const userMessage = (messageId, delivery = 'idle') => ({ type: 'user.message', data: { messageId, delivery, content: 'hello' } });
@@ -339,6 +340,121 @@ test('without rpc.tasks an unlimited slider still falls back to the 30-minute sh
   runner._getState().backgroundShells[0].startedAt -= 31 * 60_000;
   runner._evaluateLifecycle();
   assert.equal(runner._getState().backgroundShells.length, 0, 'the 30-minute default applied on the fallback path');
+  await runner.dispose();
+});
+
+// ---------------------------------- continuations with nothing to show ------
+//
+// When a background agent finishes, the runtime often opens a follow-up turn
+// that produces no text and runs no tool (live, gpt-5.6-luna, 2026-09-26).
+// Its row would only ever say "the turn completed without a text reply"; the
+// task card already showed the agent finishing, so that row settles silently.
+
+/** The runtime's completion notification for the background agent. */
+function agentCompleted(client) {
+  client.session.taskList[0].status = 'completed';
+  client.session.emit({
+    type: 'system.notification',
+    data: {
+      kind: { type: 'agent_completed', agentId: AGENT_ID, agentType: 'general-purpose', displayName: 'bg-probe', description: 'background probe', status: 'completed' },
+      content: '<system_notification>\nAgent "bg-probe" (general-purpose) has completed.\n</system_notification>',
+    },
+  });
+}
+
+/** A follow-up turn the runtime opens by itself: `events` between its start and its idle. */
+function runtimeFollowUp(client, events = []) {
+  client.session.emit({ type: 'assistant.turn_start', data: { turnId: '0', interactionId: 'i-follow-up' } });
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'f0', content: '', toolRequests: [] } });
+  for (const event of events) client.session.emit(event);
+  client.session.emit({ type: 'assistant.idle', data: {} });
+}
+
+test('a runtime-opened continuation with no text and no tool activity settles silently', async () => {
+  let releaseDrop;
+  const dropGate = new Promise((resolve) => { releaseDrop = resolve; });
+  const stub = makeContinuationApiStub({ routeResponses: { '/api/requeue': () => dropGate } });
+  const { client, runner } = setup({ stub, taskList: [agentTask()] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  agentCompleted(client);
+  runtimeFollowUp(client);
+  await waitFor(() => stub.bodiesFor('/api/requeue').length === 1, { label: 'continuation row torn down' });
+
+  // Torn down through the requeue route's continuation branch (the relay drops
+  // a processing continuation quietly), fenced to the attempt it was minted
+  // under — no response, no note streamed into the row.
+  assert.deepEqual(stub.bodiesFor('/api/requeue')[0], { messageId: 'cont-1', attemptId: 'attempt-cont-1' });
+  assert.equal(responsesFor(stub, 'cont-1').length, 0);
+  assert.equal(stub.bodiesFor('/api/stream').filter((body) => body.messageId === 'cont-1').length, 0);
+  // Still claimed while the teardown is in flight, released once it lands.
+  assert.deepEqual(runner.getActiveQueueMessageIds(), [{ id: 'cont-1', attemptId: 'attempt-cont-1' }]);
+  releaseDrop({ ok: true, dropped: 'continuation' });
+  await waitFor(() => runner.isTurnActive() === false, { label: 'continuation released' });
+  assert.deepEqual(runner.getActiveQueueMessageIds(), []);
+  assert.equal(runner.canAcceptSteering(), false);
+  assert.equal(runner.isDeliveryHeld(), false);
+  await runner.dispose();
+});
+
+test('a runtime-opened continuation whose only work was a tool call keeps its row', async () => {
+  const { stub, client, runner } = setup({ taskList: [agentTask()] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  agentCompleted(client);
+  runtimeFollowUp(client, [
+    { type: 'tool.execution_start', data: { toolCallId: 'r1', toolName: 'read_agent', arguments: { agent_id: AGENT_ID } } },
+    { type: 'tool.execution_complete', data: { toolCallId: 'r1', success: true, result: { content: 'SUB done.' } } },
+  ]);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation published' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, EMPTY_TURN_COMPLETION_NOTE);
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), []);
+  const activities = stub.bodiesFor('/api/activity').filter((body) => body.messageId === 'cont-1').map((body) => body.text);
+  assert.ok(activities.some((text) => text.startsWith('Tool (read_agent)')), activities.join(' | '));
+  await runner.dispose();
+});
+
+test('a runtime-opened continuation with text keeps its row', async () => {
+  const { stub, client, runner } = setup({ taskList: [agentTask()] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  agentCompleted(client);
+  runtimeFollowUp(client, [{ type: 'assistant.message', data: { messageId: 'f1', content: 'The agent finished.' } }]);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation published' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'The agent finished.');
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), []);
+  await runner.dispose();
+});
+
+test('a delivered message whose turn ends with no text still gets the note', async () => {
+  const { stub, runner } = setup({
+    events: (id) => [userMessage(id), { type: 'assistant.message', data: { messageId: 'm0', content: '' } }, { type: 'assistant.idle', data: {} }],
+  });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(responsesFor(stub, 'q-1')[0].text, EMPTY_TURN_COMPLETION_NOTE);
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), []);
+  await runner.dispose();
+});
+
+test('an empty continuation a user message was folded into keeps its row for that message', async () => {
+  const { stub, client, runner } = setup({ taskList: [agentTask()] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  agentCompleted(client);
+  client.session.emit({ type: 'assistant.turn_start', data: { turnId: '0', interactionId: 'i-follow-up' } });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'continuation row registered' });
+  const steered = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'status?' } });
+  await waitFor(() => client.session.sends.length === 2, { label: 'steered send' });
+  client.session.emit({ type: 'user.message', data: { content: 'status?', messageId: client.session.idOfSend(1), delivery: 'steering' } });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await steered, true);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation published' });
+  // The steered row settles as folded into the continuation's reply, so that
+  // reply must exist for the user's message to point at.
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, EMPTY_TURN_COMPLETION_NOTE);
+  assert.deepEqual(responsesFor(stub, 'cont-1')[0].consumedSteerIds, [{ id: 'q-2', attemptId: null }]);
+  assert.equal(responsesFor(stub, 'q-2')[0].kind, 'folded');
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), []);
   await runner.dispose();
 });
 

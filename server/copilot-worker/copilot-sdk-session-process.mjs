@@ -532,6 +532,7 @@ export function createCopilotSdkSessionRunner({
     if (turn) {
       if (turn.humanRequests === 0) turn.humansIdle = new Promise((resolve) => { turn.resolveHumansIdle = resolve; });
       turn.humanRequests += 1;
+      turn.askedHuman = true;
     }
     // An open card holds steering: the relay's readiness is withdrawn at once.
     syncDeliveryReadiness();
@@ -768,6 +769,7 @@ export function createCopilotSdkSessionRunner({
       // the text still lands in the runtime's own transcript.
       return;
     }
+    if (action.channel !== 'init' && !action.carried) owner.showedWork = true;
     if (action.channel === 'stream' && !action.payload?.subagentRunId) {
       // Re-cut to the owner's own segments, and gated against what THAT row
       // last received (the normalizer gated against the whole interaction).
@@ -2316,6 +2318,10 @@ export function createCopilotSdkSessionRunner({
       settled: false,
       released: false,
       cancelled: false,
+      // Something of the run's own (a tool line, a thought, a lane) was
+      // published on this row — not counting the lines carried in from
+      // between turns. Decides whether an empty continuation may vanish.
+      showedWork: false,
       // `lastStreamedText` is what this row last received on /api/stream —
       // the stream gate and the abort/error fallback text both read it.
       state: { lastStreamedText: '' },
@@ -2380,6 +2386,8 @@ export function createCopilotSdkSessionRunner({
       // that settles with one still open publishes only after it (driveTurn).
       humanRequests: 0,
       humansIdle: null,
+      // Whether any card was ever raised on this turn's row.
+      askedHuman: false,
       // Opened by `ensureInteractiveTurn` for a question rather than by the
       // runtime, and whether root work has joined it since.
       humanOrigin: false,
@@ -2584,6 +2592,38 @@ export function createCopilotSdkSessionRunner({
   // -------------------------------------------------------------- settling --
 
   /**
+   * Whether a completed row with no text has nothing to show at all: the
+   * runtime opened it by itself (typically right after a background agent
+   * finished), its run published no tool line, thought or lane, no card was
+   * raised on it, and no user message was folded into it. Such a row would
+   * only ever read "the turn completed without a text reply", and the task
+   * card already showed the agent finishing (live, gpt-5.6-luna, 2026-09-26).
+   * Every delivered row keeps the note — somebody asked something there.
+   */
+  function settlesSilently(turn, entry, folded) {
+    return turn.kind === 'continuation'
+      && entry.role === 'self'
+      && !turn.humanOrigin
+      && !turn.askedHuman
+      && !turn.planBoardPosted
+      && !entry.showedWork
+      && !folded.length
+      && Boolean(entry.message?.id);
+  }
+
+  /**
+   * Settle a silent continuation by tearing its row down: the requeue route's
+   * continuation branch drops a processing continuation without an answer
+   * (`dropped: 'continuation'`), the same teardown a dead worker's rows get.
+   * A lost request leaves the row to that same stale-continuation recovery.
+   */
+  async function dropSilentContinuation(entry) {
+    dbg('continuation ended with nothing to show; dropping its row', entry.message.id);
+    await api('POST', '/api/requeue', { messageId: entry.message.id, ...attemptFields(entry.message) })
+      .catch((error) => { dbg('silent continuation drop failed', entry.message.id, error?.message || String(error)); });
+  }
+
+  /**
    * Decide and publish one row's outcome. Idempotent per entry. A run owner's
    * settle also settles the steers folded into its run (they were answered by
    * its reply), in push order, after the reply itself.
@@ -2597,6 +2637,10 @@ export function createCopilotSdkSessionRunner({
       switch (outcome.type) {
         case 'completed': {
           const text = finalTextFor(turn, entry, turn.result);
+          if (!text && settlesSilently(turn, entry, folded)) {
+            await dropSilentContinuation(entry);
+            break;
+          }
           const published = text || EMPTY_TURN_COMPLETION_NOTE;
           if (entry.role !== 'steer' && shouldPostPlanBoard({
             relayMode: entry.message.relayMode,
@@ -3167,7 +3211,7 @@ export function createCopilotSdkSessionRunner({
     // the turn they triggered.
     if (pendingActivities.length) {
       for (const text of pendingActivities.splice(0)) {
-        turn.bufferedActions.push({ channel: 'activity', payload: { text, subagentRunId: null } });
+        turn.bufferedActions.push({ channel: 'activity', payload: { text, subagentRunId: null }, carried: true });
       }
     }
     dbg('opening a continuation turn for runtime-initiated work');
