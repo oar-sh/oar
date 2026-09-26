@@ -107,7 +107,12 @@ async function main() {
     // explicit selection fails the row (default 10s).
     modelSwitchTimeoutMs: readOptionalMs('COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS'),
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
-    onDeliveryReadinessChange: (ready) => linkBridge.onDeliveryReadinessChange(ready),
+    // A readiness flip is a hold starting or ending (question card, approval,
+    // compaction): the composer's steering snapshot changed with it.
+    onDeliveryReadinessChange: (ready) => {
+      linkBridge.onDeliveryReadinessChange(ready);
+      heartbeat?.requestPulse();
+    },
     // A message became (or stopped being) cancellable: report it now rather
     // than on the next 10 s heartbeat (coalesced by the controller).
     onCancellableChange: () => heartbeat?.requestPulse(),
