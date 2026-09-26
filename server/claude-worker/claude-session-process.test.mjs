@@ -7,6 +7,7 @@ import nodePathModule from 'node:path';
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildClaudePlanReadyBoardPayload } from './claude-turn-publisher.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
+import { SLASH_COMMAND_GUARD } from '../../shared/slash-command-guard.mjs';
 import {
   noopRelocate,
   tick,
@@ -768,6 +769,83 @@ test('a second user message reuses the live process instead of respawning', asyn
     ['q-1', 'first answer'],
     ['q-2', 'second answer'],
   ]);
+  turn.endInput();
+  await settled(runner);
+});
+
+// A "/x" the relay delivers is text the user chose to send as text (the
+// composer's warn-once guard; the API takes it as-is). The Claude CLI runs a
+// prompt whose last text block, trimmed, starts with "/" as a slash command —
+// live on 2026-09-26 "/help what is 3 + 4?" ran as the CLI's /help between
+// turns, the model never saw it, and the next turn's reply landed on its row.
+const pushedTextOf = (content) => (Array.isArray(content)
+  ? content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n')
+  : String(content));
+const lastTextBlockReadsAsCommand = (content) => {
+  const blocks = Array.isArray(content) ? content : [{ type: 'text', text: content }];
+  const last = blocks.at(-1);
+  return last?.type === 'text' && String(last.text).trim().startsWith('/');
+};
+
+test('a "/x" delivered between turns reaches the CLI as text behind the guard, and its echo attaches to its row', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  // First turn of a fresh process.
+  const first = runner.handlePendingPayload({
+    message: { ...baseMessage, text: '/help what is 3 + 4? Answer in words.' },
+  });
+  await waitFor(() => turn.pushed.length === 1, { label: 'first push' });
+  assert.equal(pushedTextOf(turn.pushed[0]), `${SLASH_COMMAND_GUARD}/help what is 3 + 4? Answer in words.`);
+  assert.equal(lastTextBlockReadsAsCommand(turn.pushed[0]), false, 'the CLI must not read it as a command');
+  // The CLI echoes the prompt exactly as pushed — guard included.
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay(pushedTextOf(turn.pushed[0])));
+  turn.emit(assistantText('Seven.'));
+  turn.emit(resultMessage('Seven.', 'native-1'));
+  assert.equal(await first, true);
+
+  // Between turns, on the live process.
+  const second = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', text: '/help what is 10 - 2? Answer in words.' },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  assert.equal(pushedTextOf(turn.pushed[1]), `${SLASH_COMMAND_GUARD}/help what is 10 - 2? Answer in words.`);
+  assert.equal(lastTextBlockReadsAsCommand(turn.pushed[1]), false);
+  turn.emit(userReplay(pushedTextOf(turn.pushed[1])));
+  turn.emit(assistantText('Eight.'));
+  turn.emit(resultMessage('Eight.', 'native-1'));
+  assert.equal(await second, true);
+
+  const responses = stub.calls.filter((call) => call.routePath === '/api/response');
+  assert.deepEqual(responses.map((call) => [call.body.messageId, call.body.text]), [
+    ['q-1', 'Seven.'],
+    ['q-2', 'Eight.'],
+  ]);
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/continuation-turn'), false,
+    'no echo was mistaken for a turn the CLI opened by itself');
+  // The guard is for the CLI only: nothing the worker hands back carries it.
+  assert.equal(JSON.stringify(stub.calls).includes(SLASH_COMMAND_GUARD), false);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('plain text and a mid-text "/" are pushed untouched', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, text: 'open C:/git/x and the /tmp dir' } });
+  await waitFor(() => turn.pushed.length === 1, { label: 'first push' });
+  assert.deepEqual(turn.pushed[0], [{ type: 'text', text: 'open C:/git/x and the /tmp dir' }]);
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('open C:/git/x and the /tmp dir'));
+  turn.emit(assistantText('done'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await first, true);
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.equal(response.body.text, 'done');
   turn.endInput();
   await settled(runner);
 });

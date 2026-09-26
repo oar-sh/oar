@@ -38,6 +38,11 @@ import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { stripSteerNote, withSteerNoteContent } from '../../shared/steer-note.mjs';
+import {
+  stripSlashCommandGuard,
+  stripSlashCommandGuardContent,
+  withSlashCommandGuardContent,
+} from '../../shared/slash-command-guard.mjs';
 
 /**
  * Which system-prompt append a relay mode gets (claude-sdk-adapter's
@@ -278,15 +283,16 @@ function contentText(content) {
 function turnOpeningUserSignature(sdkMessage) {
   if (sdkMessage?.type !== 'user' || sdkMessage?.parent_tool_use_id) return null;
   const content = sdkMessage?.message?.content;
-  // A steered push carries the hidden steer note; every comparison is against
-  // the user's own text, so the note is stripped here, once, for all of them.
-  if (typeof content === 'string') return stripSteerNote(content);
+  // A steered push carries the hidden steer note, and a "/x" the slash-command
+  // guard (shared/slash-command-guard.mjs); every comparison is against the
+  // user's own text, so both are stripped here, once, for all of them.
+  if (typeof content === 'string') return stripSteerNote(stripSlashCommandGuard(content));
   if (!Array.isArray(content)) return null;
   if (content.some((block) => block?.type === 'tool_result')) return null;
   // Unlike turnOpeningUserText this keeps '' — an attachment-only message
   // replays with an empty text block, and the absorbed-steering match must
   // still recognize it (expectedText is '' for those too).
-  return stripSteerNote(contentText(content));
+  return stripSteerNote(contentText(stripSlashCommandGuardContent(content)));
 }
 
 function turnOpeningUserText(sdkMessage) {
@@ -3240,9 +3246,16 @@ export function createClaudeSessionRunner({
         // any comparison, so matching works whether or not the CLI echoes it.
         // Not into a continuation: there the running work is the CLI's own
         // follow-up to a background task, not a request of the user's.
-        const pushedContent = steered && procRef.activeCtx?.kind !== 'continuation'
+        // Whatever is left starting with "/" — a "/x" delivered between turns,
+        // on a first turn, or into a continuation — gets the slash-command
+        // guard, or the CLI would run it as a command instead of handing the
+        // model the text the user sent (shared/slash-command-guard.mjs). A
+        // noted steer no longer starts with "/" and is pushed as noted. The
+        // replay signatures strip the guard too, so expectedText stays the
+        // user's own text here as well.
+        const pushedContent = withSlashCommandGuardContent(steered && procRef.activeCtx?.kind !== 'continuation'
           ? withSteerNoteContent(content)
-          : content;
+          : content);
         procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now(), steered });
         // Registered: from here a later init takes the delivered-row branch.
         settingsReinitsOwed = 0;

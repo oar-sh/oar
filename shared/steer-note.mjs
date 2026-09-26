@@ -29,7 +29,9 @@ export const STEERED_MESSAGE_NOTE = '[Sent while you were still working on my pr
 // into the running turn, which the leading note guarantees. Appended, the
 // prompt would still start with "/" and run as a command whose arguments
 // include the note; as a separate leading block, the last block would still
-// start with "/".
+// start with "/". A "/x" that is not steered (or is pushed into a continuation,
+// which gets no note) is kept text by the Claude worker's slash-command guard
+// instead (shared/slash-command-guard.mjs).
 
 /** Prefix a plain-text prompt with the steer note. */
 export function withSteerNote(text) {

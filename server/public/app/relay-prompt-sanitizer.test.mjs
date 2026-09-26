@@ -38,3 +38,13 @@ test('a steered message\'s hidden note is stripped, with or without a mode marke
   // Text that merely quotes it later is left alone.
   assert.equal(stripRelayPromptContext(`see ${note}`), `see ${note}`);
 });
+
+test('the slash-command guard the Claude worker puts in front of a "/x" is stripped', async () => {
+  // The browser copy cannot import shared/, so it matches the guard itself;
+  // this pins it to the same character the worker sends.
+  const { SLASH_COMMAND_GUARD, withSlashCommandGuard } = await import('../../../shared/slash-command-guard.mjs');
+  assert.equal(stripRelayPromptContext(withSlashCommandGuard('/help what is 3 + 4?')), '/help what is 3 + 4?');
+  assert.equal(stripRelayPromptContext(`[Relay mode: agent] ${SLASH_COMMAND_GUARD}/x`, 'agent'), '/x');
+  assert.equal(stripRelayPromptContext(`${SLASH_COMMAND_GUARD}hello`), `${SLASH_COMMAND_GUARD}hello`);
+  assert.equal(stripRelayPromptContext('/review this'), '/review this');
+});

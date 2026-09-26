@@ -140,8 +140,13 @@ const MEDIA_EMBED_BLOCK_PATTERN = new RegExp(
 // words, because the browser copy of this module cannot import shared/.
 const STEER_NOTE_PATTERN = /^\s*\[Sent while you were still working on my previous message\.[^\]\n]*\]\s*/;
 
-function stripLeadingSteerNote(text) {
-  const stripped = String(text || '').replace(STEER_NOTE_PATTERN, '');
+// The Claude worker's slash-command guard (shared/slash-command-guard.mjs): a
+// zero-width space in front of a "/x" it delivers as text. trim() keeps it, so
+// it is matched on its own, and only where it guards a "/".
+const SLASH_COMMAND_GUARD_PATTERN = /^​(?=\s*\/)/;
+
+function stripLeadingRelayNotes(text) {
+  const stripped = String(text || '').replace(STEER_NOTE_PATTERN, '').replace(SLASH_COMMAND_GUARD_PATTERN, '');
   return stripped.trim() ? stripped.trim() : String(text || '').trim();
 }
 
@@ -153,7 +158,7 @@ export function stripRelayPromptContext(text, relayMode = '', attachments = []) 
   const patterns = buildPromptPrefixPatterns(relayMode);
   for (const pattern of patterns) {
     const stripped = value.replace(pattern, '').trim();
-    if (stripped && stripped !== value) return stripLeadingSteerNote(stripped);
+    if (stripped && stripped !== value) return stripLeadingRelayNotes(stripped);
   }
-  return stripLeadingSteerNote(value);
+  return stripLeadingRelayNotes(value);
 }
