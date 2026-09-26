@@ -455,15 +455,16 @@ function workerSteeringForConversation(conversationId) {
 }
 
 // Which conversations deliver a message typed mid-turn INTO the running turn
-// (steering) rather than queueing it behind. Two ways in: the Claude worker
-// by provider rule, and any session worker that advertises it on its
-// heartbeat steering snapshot (`supported` — the Copilot SDK worker). Workers
-// that do neither (the extension path) stay strictly serial, so their
-// composer keeps saying "Queue".
+// (steering) rather than queueing it behind: exactly those whose session
+// worker advertises it on its heartbeat steering snapshot (`supported` — the
+// Claude and Copilot SDK workers both do). One rule for every provider; the
+// provider name is not consulted (the name-based Claude rule was retired
+// 2026-09-26 once every live Claude worker advertised the flag). Workers that
+// do not advertise (the extension path, Cursor, Grok) stay strictly serial,
+// so their composer keeps saying "Queue".
 function conversationSupportsSteering(conversationId) {
   const conversationKey = String(conversationId || '').trim();
   if (!conversationKey) return false;
-  if (String(conversations[conversationKey]?.runtimeProviderType || '').trim().toLowerCase() === 'claude') return true;
   return workerSteeringForConversation(conversationKey)?.supported === true;
 }
 

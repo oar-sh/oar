@@ -6,7 +6,9 @@ import { relayToken, relayDbPath } from "./e2e-env.mjs";
 // stay usable and say what a send does now ("Queue" — it steers in after the
 // answer), and the live bubble's Stop must stay reachable on a phone however
 // long the turn gets. The isolated server never spawns a CLI, so the turn is
-// a dequeued row and the Claude binding is written straight into its DB.
+// a dequeued row, the Claude binding is written straight into its DB, and the
+// worker's part — the heartbeat that advertises steering and reports the
+// hold — is posted by the spec itself with the worker's identity headers.
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -64,6 +66,16 @@ test("a held Claude turn offers Queue with the reason, and its Stop stays in vie
     });
     expect(synced.ok()).toBeTruthy();
     bindConversationToClaude(conversationId);
+    // What the Claude worker's heartbeat reports while a card is open: it
+    // steers (`supported`), and steering is held for the question.
+    const beat = await request.post("/api/heartbeat", {
+      headers: { ...headers, "x-relay-session-id": `pw-sid-held-${stamp}`, "x-relay-conversation-id": conversationId },
+      data: {
+        activeQueueMessageIds: [messageId],
+        steering: { turnActive: true, canSteer: false, holdReason: "question", messageId, supported: true, cancellableIds: [] },
+      },
+    });
+    expect(beat.ok()).toBeTruthy();
 
     const created = await request.post("/api/relay-question", {
       headers,

@@ -621,7 +621,13 @@ test('the empty state is not shown while a pending bubble is on screen', () => {
 
 test('while a question card holds steering the button reads Queue, and sending it posts', async () => {
   resetView();
+  // A Claude conversation steers because its worker advertises it. The
+  // session id is the one the send harness binds the conversation to.
   const conv = openConversation('claude');
+  conversations[conv].sdkSessionId = 'sess-dom';
+  setWorkerSteering('sess-dom', {
+    turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true, cancellableIds: [],
+  });
   selectComposerPreferences();
   view.renderMessages([{ id: 'u1', role: 'user', text: 'running', timestamp: at(0) }], false, { conversationId: conv });
   view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'processing' });
@@ -811,7 +817,7 @@ function setWorkerSteering(sdkSessionId, steering) {
 const cancelButtonOf = (id) => row(id)?.querySelector('.msg-bubble-actions [data-action="cancel-queued"]') || null;
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
 
-test('the composer reads Steer for a github conversation whose worker advertises steering, Queue otherwise, Steer for claude regardless', () => {
+test('the composer reads Steer exactly when the conversation\'s worker advertises steering, whatever the provider', () => {
   resetView();
   selectComposerPreferences();
   const input = document.getElementById('msg-input');
@@ -837,8 +843,11 @@ test('the composer reads Steer for a github conversation whose worker advertises
   assert.equal(labelFor('github', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1' }), 'Queue');
   assert.equal(labelFor('github', null), 'Queue');
   // Claude keeps its provider rule, with or without a worker snapshot.
-  assert.equal(labelFor('claude', null), 'Steer');
-  assert.equal(labelFor('claude', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1' }), 'Steer');
+  // The provider name alone no longer decides: a Claude conversation steers
+  // because its worker advertises it, like any other.
+  assert.equal(labelFor('claude', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1', supported: true }), 'Steer');
+  assert.equal(labelFor('claude', { turnActive: true, canSteer: true, holdReason: null, messageId: 'u1' }), 'Queue');
+  assert.equal(labelFor('claude', null), 'Queue');
   // The advertised gate still honours the worker's holds like Claude's does.
   assert.equal(labelFor('github', { turnActive: true, canSteer: false, holdReason: 'compaction', messageId: 'u1', supported: true, cancellableIds: [] }), 'Queue');
   assert.match(lastTitle, /compact/i);
