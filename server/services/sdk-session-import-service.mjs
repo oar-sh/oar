@@ -345,6 +345,18 @@ export function createSdkSessionImportService({
     await client.client.deleteSession(sid);
   }
 
+  /**
+   * Whether the relay only imported this session and never ran it: the ledger
+   * says the importer brought it in, and no queued turn or relay worker says
+   * the relay has run it since. Continuing an imported conversation does not
+   * touch the ledger, so that evidence is checked here too, and it flips the
+   * ledger to 'relay' for good, as it does on import.
+   */
+  function isImportedOnly(sdkSessionId) {
+    const sid = text(sdkSessionId);
+    return !!sid && !relayOwnsSession(sid);
+  }
+
   async function refreshConversation(conversation) {
     const sdkSessionId = text(conversation?.sdk_session_id || conversation?.sdkSessionId || conversation?.id);
     if (!sdkSessionId || isTombstoned(sdkSessionId)) {
@@ -360,6 +372,7 @@ export function createSdkSessionImportService({
     importSession,
     refreshConversation,
     deleteSession,
+    isImportedOnly,
     async dispose() {
       // Flag first: getRuntime() must refuse before the client goes away, or a
       // concurrent import observes runtime = null and creates a replacement

@@ -331,6 +331,44 @@ test('a live worker signal marks the session relay-owned', async () => {
   assert.deepEqual(resumed, ['worked']);
 });
 
+test('a session counts as imported-only until the relay runs it', async () => {
+  // Deleting an imported-only conversation must leave its CLI session alone.
+  // Continuing it in the relay writes nothing to the ledger, so the answer
+  // has to come from the same evidence the import guard reads.
+  const liveWorkers = new Set();
+  const { db, service } = makeHarness({
+    eventsBySession: {
+      untouched: [{ id: 'm1', role: 'user', text: 'from the terminal' }],
+      continued: [{ id: 'm2', role: 'user', text: 'from the terminal' }],
+      launched: [{ id: 'm3', role: 'user', text: 'from the terminal' }],
+    },
+    hasRelayExecutionSignal: (sdkSessionId) => liveWorkers.has(sdkSessionId),
+  });
+  await service.runStartupImport();
+
+  assert.equal(service.isImportedOnly('untouched'), true);
+  assert.deepEqual(importOrigin(db, 'untouched'), { status: 'completed', origin: 'imported' });
+
+  // A turn the relay queued, even one long finished, and the ledger flips
+  // for good: pruning the row does not hand the session back.
+  db.prepare(`
+    INSERT INTO queue (id, conversation_id, status, owner_sdk_session_id, text, timestamp)
+    VALUES ('q-1', 'continued', 'done', 'continued', 'go on', '2026-07-12T10:00:00.000Z')
+  `).run();
+  assert.equal(service.isImportedOnly('continued'), false);
+  assert.deepEqual(importOrigin(db, 'continued'), { status: 'completed', origin: 'relay' });
+  db.prepare(`DELETE FROM queue WHERE id = 'q-1'`).run();
+  assert.equal(service.isImportedOnly('continued'), false);
+
+  // A worker the relay started for it, before any turn.
+  liveWorkers.add('launched');
+  assert.equal(service.isImportedOnly('launched'), false);
+
+  // A conversation the relay created has no ledger row.
+  assert.equal(service.isImportedOnly('relay-born'), false);
+  assert.equal(service.isImportedOnly(''), false);
+});
+
 test('a turn queued while the import reads events aborts the overwrite', async () => {
   const { db, service, replaced, eventsBySession } = makeHarness({
     eventsBySession: { raced: [{ id: 'm1', role: 'user', text: 'imported' }] },

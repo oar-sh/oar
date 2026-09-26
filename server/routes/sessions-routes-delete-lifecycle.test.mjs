@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import Database from 'better-sqlite3';
 
 import { registerSessionsRoutes } from './sessions-routes.mjs';
+import { applySchema } from '../db-schema.mjs';
+import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { claudeProjectDirSlug, createClaudeSessionRootResolver } from '../services/claude-session-root-service.mjs';
+import { createSdkSessionImportService } from '../services/sdk-session-import-service.mjs';
 
 // DELETE /api/conversation/:id — a conversation that is still working cannot
 // be deleted; an idle one has its worker stopped first, then its CLI session
@@ -84,6 +88,8 @@ function setup(state = {}) {
     runtime_workspace_root_path: state.workspaceRootPath || '',
     ...(state.conversation || {}),
   };
+  const workerSessionId = conversation.sdk_session_id || conversation.id;
+  let registeredWorker = state.worker || null;
   const deps = {
     auth: (_req, _res, next) => next(),
     io: { emit(name, payload) { events.push(`emit:${name}:${payload?.conversationId || ''}`); } },
@@ -156,8 +162,11 @@ function setup(state = {}) {
       resetHealth() {},
     },
     sessionWorkerRegistry: {
-      getWorker: (sid) => (sid === (conversation.sdk_session_id || conversation.id) ? state.worker || null : null),
-      removeWorker: (sid) => events.push(`registry-removed:${sid}`),
+      getWorker: (sid) => (sid === workerSessionId ? registeredWorker : null),
+      removeWorker: (sid) => {
+        if (sid === workerSessionId) registeredWorker = null;
+        events.push(`registry-removed:${sid}`);
+      },
     },
     sessionWorkerProcessInspector: {
       findProcessesForSession: () => (state.processPids || []).map((processId) => ({ processId })),
@@ -185,6 +194,7 @@ function setup(state = {}) {
     isSha256: () => false,
     uploadPathForSha: () => '',
   };
+  if (typeof state.importer === 'function') deps.sdkSessionImportService = state.importer(deps);
   const app = createMockApp();
   registerSessionsRoutes(app, deps);
   const del = () => callRoute(app.routes.get('DELETE /api/conversation/:id'), { params: { id: 'conv-1' }, headers: {}, body: {} });
@@ -192,6 +202,33 @@ function setup(state = {}) {
 }
 
 const deletedRows = (events) => events.filter((event) => event.startsWith('sql:DELETE'));
+
+/**
+ * The real SDK session importer, over its own ledger in which `sdkSessionId`
+ * was imported from the Copilot CLI. Wired as server-runtime wires it: a
+ * worker in the relay's registry means the relay has run the session.
+ */
+function importedFromCli(sdkSessionId) {
+  const db = new Database(':memory:');
+  applySchema(db);
+  db.prepare(`
+    INSERT INTO sdk_session_imports (sdk_session_id, conversation_id, status, updated_at, origin)
+    VALUES (?, ?, 'completed', '2026-07-01T10:00:00.000Z', 'imported')
+  `).run(sdkSessionId, sdkSessionId);
+  const deletedSessions = [];
+  const client = { async deleteSession(sid) { deletedSessions.push(sid); } };
+  return {
+    deletedSessions,
+    origin: () => db.prepare(`SELECT origin FROM sdk_session_imports WHERE sdk_session_id = ?`).get(sdkSessionId)?.origin,
+    makeService: (deps) => createSdkSessionImportService({
+      db,
+      stmts: createSessionRepository(db),
+      createClient: async () => ({ client, async dispose() {} }),
+      hasRelayExecutionSignal: (sid) => !!deps.sessionWorkerRegistry.getWorker(sid),
+      logger: { info() {} },
+    }),
+  };
+}
 
 async function withTmpDir(run) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-delete-lifecycle-'));
@@ -466,6 +503,60 @@ test('a session id that is not a plain folder name is never joined into a path',
     assert.equal(response.body.cliSessionDeleted, null);
     assert.equal(fs.existsSync(outside), true);
     assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
+  });
+});
+
+test('a conversation only imported from the Copilot CLI is hidden, and its CLI session and processes are left alone', async () => {
+  // The importer names the conversation after its session. The relay never
+  // ran it, so the process the scan finds is its user's own terminal.
+  await withTmpDir(async (stateRoot) => {
+    const sessionDir = path.join(stateRoot, 'conv-1');
+    fs.mkdirSync(sessionDir);
+    const importer = importedFromCli('conv-1');
+    const { del, events } = setup({
+      conversation: { sdk_session_id: 'conv-1' },
+      sessionStateRoot: stateRoot,
+      runtimeSession: { provider_type: 'github' },
+      processPids: [4242],
+      alivePids: [4242],
+      importer: importer.makeService,
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.body, { ok: true, workerStopped: false, cliSessionDeleted: null });
+    assert.ok(!events.some((event) => /^(kill|mark-killed|registry-removed|tasks-cleared):/.test(event)), events.join(' | '));
+    assert.deepEqual(importer.deletedSessions, []);
+    assert.equal(fs.existsSync(sessionDir), true);
+    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
+    // Hidden, and tombstoned so the importer does not bring it back.
+    assert.ok(events.includes('tombstone:conv-1'));
+    assert.ok(events.includes('sql:DELETE FROM conversations'));
+    assert.ok(events.includes('emit:conversation_deleted:conv-1'));
+    assert.equal(importer.origin(), 'imported');
+  });
+});
+
+test('an imported conversation the relay has since run is deleted like one it started', async () => {
+  // Continuing it wrote nothing to the ledger: the relay's worker is the
+  // evidence, and it is read before the stop drops it from the registry.
+  await withTmpDir(async (stateRoot) => {
+    fs.mkdirSync(path.join(stateRoot, 'conv-1'));
+    const importer = importedFromCli('conv-1');
+    const { del, events } = setup({
+      conversation: { sdk_session_id: 'conv-1' },
+      sessionStateRoot: stateRoot,
+      runtimeSession: { provider_type: 'github' },
+      worker: { status: 'ready', pid: 4242 },
+      processPids: [4242],
+      alivePids: [4242],
+      importer: importer.makeService,
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.body, { ok: true, workerStopped: true, cliSessionDeleted: true });
+    assert.ok(events.includes('kill:4242'), events.join(' | '));
+    assert.deepEqual(importer.deletedSessions, ['conv-1']);
+    assert.equal(importer.origin(), 'relay');
   });
 });
 

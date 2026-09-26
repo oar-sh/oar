@@ -4475,12 +4475,19 @@ export function registerSessionsRoutes(app, deps) {
     const sharedWithConversationId = sdkSessionId
       ? String(findOtherLiveConversationForSdkSession.get(sdkSessionId, id)?.id || '').trim() || null
       : null;
+    // A Copilot session the relay only imported, and never ran, belongs to
+    // whoever started it in the CLI. Deleting the conversation hides and
+    // tombstones it, and nothing more: the relay started no process for it
+    // (the process scan would find that user's own `copilot --resume`), and
+    // its CLI session stays. Asked before the stop, which removes the registry
+    // entry that shows the relay has run it.
+    const importedOnly = !!sdkSessionId && sdkSessionImportService?.isImportedOnly?.(sdkSessionId) === true;
 
     // An idle worker is stopped before anything is deleted: the route used to
     // leave it running (and holding its workspace) until the relay restarted.
     // Nothing is touched when it will not die.
     let workerStopped = false;
-    if (!sharedWithConversationId) {
+    if (!sharedWithConversationId && !importedOnly) {
       const stopped = await stopIdleWorkspaceRootSession({
         sdkSessionId: workerSessionId,
         worker: sessionWorkerRegistry?.getWorker?.(workerSessionId) || null,
@@ -4513,7 +4520,7 @@ export function registerSessionsRoutes(app, deps) {
     stmts.markDeletedSdkSession.run(sdkSessionId || id, deletedAt);
     if (sdkSessionId && sdkSessionId !== id) stmts.markDeletedSdkSession.run(id, deletedAt);
 
-    const cliSession = sharedWithConversationId
+    const cliSession = sharedWithConversationId || importedOnly
       ? { deleted: null }
       : await deleteCliSession({
         conversation: existing,
