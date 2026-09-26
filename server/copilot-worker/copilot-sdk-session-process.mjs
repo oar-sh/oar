@@ -99,6 +99,7 @@ import {
 } from './copilot-prompt-context.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/model-descriptors.mjs';
+import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { buildSteerSettleFailure } from '../../shared/steer-settle-failure.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
@@ -163,6 +164,12 @@ const DEFAULT_SETTLE_RETRY_DELAYS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000
 const DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS = 5;
 /** Debounce for re-reading the runtime's queued lane after `pending_messages.modified`. */
 const DEFAULT_QUEUE_LANE_REFRESH_MS = 150;
+/**
+ * How long a Stop's acknowledgement is held back for the reply of the row it
+ * named when that row's early settle is still publishing (see interruptTurn).
+ * Bounded: an unresponsive relay must not hold the Stop itself.
+ */
+const STOPPED_ROW_PUBLISH_WAIT_MS = 5_000;
 /**
  * Debounce for re-reading `rpc.tasks.list()` after `session.background_tasks_changed`
  * (which carries no payload and fires ~20 times per shell call).
@@ -2608,6 +2615,31 @@ export function createCopilotSdkSessionRunner({
           await publishFinalStream(entry.message, finalTextFor(turn, entry, turn.result));
           break;
         }
+        case 'user-stopped': {
+          // The run a Stop cut short while naming another row. The abort ack
+          // fails only the row it names, so this one is failed here — as
+          // stopped, never requeued: a requeue would re-run a prompt the user
+          // stopped (the Claude worker's lingering-stopped rule). Claimed
+          // first, so a crash meanwhile fails it rather than re-running it.
+          const id = String(entry.message.id || '');
+          const terminalError = buildRelayStopFailure();
+          claimSettling(entry.message, 'stopped');
+          try {
+            await publishFinalStream(entry.message, finalTextFor(turn, entry, turn.result));
+            const outcome = await publishResponse(entry.message, {
+              text: terminalError.message,
+              model,
+              terminalError,
+              requeueOnFailure: false,
+              consumedSteerIds: folded.map((other) => other.message),
+            });
+            // Not even the stop landed: the heartbeat hands it to the relay to fail.
+            if (outcome === 'failed' && id) settleFailedTerminals.set(id, terminalError);
+          } finally {
+            releaseSettling(id);
+          }
+          break;
+        }
         case 'runtime-interrupted': {
           const own = finalTextFor(turn, entry, turn.result);
           const text = own ? `${own}\n\n${RUNTIME_INTERRUPTED_NOTE}` : RUNTIME_INTERRUPTED_NOTE;
@@ -2727,10 +2759,14 @@ export function createCopilotSdkSessionRunner({
     // The row the user pressed Stop on. Normally the live one; the relay's
     // live-turn picker can also land on another row this turn owns, in which
     // case THAT row is left to the relay's abort control and the live row
-    // keeps its partial reply.
-    const stopped = turn.aborted
-      ? (turn.abortedRowId && pending.find((entry) => String(entry.message?.id || '') === turn.abortedRowId)) || live
+    // keeps its partial reply. A Stop naming a row that is no longer pending
+    // (its early settle already published, or it is no row of this turn's)
+    // still cut the live run short — and nobody else will settle that row.
+    const namedPending = turn.aborted && turn.abortedRowId
+      ? pending.find((entry) => String(entry.message?.id || '') === turn.abortedRowId) || null
       : null;
+    const stopped = turn.aborted ? namedPending || (turn.abortedRowId ? null : live) : null;
+    const cutRun = turn.aborted && !stopped && !live.settled ? live : null;
     const settleOne = async (entry) => {
       // A row that moved to a turn of its own (adoptOrphanedRun) is not ours.
       if (entry.turn !== turn || entry.settled) return;
@@ -2742,6 +2778,9 @@ export function createCopilotSdkSessionRunner({
         if (entry === stopped) {
           dbg('turn aborted', entry.message.id);
           await settleEntry(turn, entry, { type: 'aborted-by-user' });
+        } else if (entry === cutRun) {
+          dbg('turn aborted by a Stop that named another row', entry.message.id, `named ${turn.abortedRowId}`);
+          await settleEntry(turn, entry, { type: 'user-stopped' });
         } else if (ownsRun) {
           await settleEntry(turn, entry, { type: 'completed' });
         } else {
@@ -2789,8 +2828,10 @@ export function createCopilotSdkSessionRunner({
     }
     // The stopped row first: settling it before the live row's cascade means
     // the cascade (which settles the steers folded into a run) cannot touch
-    // the row the relay's abort control owns.
-    const ordered = stopped ? [stopped, ...pending.filter((entry) => entry !== stopped)] : pending;
+    // the row the relay's abort control owns. A cut run goes first too, so
+    // the steers folded into it settle through its cascade, after its stop.
+    const first = stopped || cutRun;
+    const ordered = first ? [first, ...pending.filter((entry) => entry !== first)] : pending;
     for (const entry of ordered) {
       if (!orphans.includes(entry)) await settleOne(entry);
     }
@@ -2802,6 +2843,39 @@ export function createCopilotSdkSessionRunner({
   // ------------------------------------------------------------ lifecycle --
 
   /**
+   * The turn a Stop is for. Every turn's control poller runs until its
+   * `driveTurn` finishes, so a turn that is still publishing can claim a Stop
+   * meant for another: the Stop goes to the turn owning the row it names, and
+   * one naming no owned row goes to the turn that is running.
+   */
+  function stopTarget(turn, control) {
+    const rowId = String(control?.queueMessageId || '').trim();
+    if (rowId) {
+      for (const candidate of [activeTurn, ...publishingTurns]) {
+        if (candidate?.entries.some((entry) => !entry.released && String(entry.message?.id || '') === rowId)) {
+          return candidate;
+        }
+      }
+    }
+    return turn.settled && activeTurn ? activeTurn : turn;
+  }
+
+  /**
+   * Handle a Stop for `turn`. When the row it names settled early and its
+   * reply is still publishing, the Stop resolves only once that reply has
+   * landed: the relay's ack then fails the named row, which is a no-op on a
+   * completed one but would overwrite a reply still in flight.
+   */
+  async function interruptTurn(turn, control) {
+    const rowId = String(control?.queueMessageId || '').trim() || null;
+    const publishing = rowId
+      ? turn.entries.find((entry) => String(entry.message?.id || '') === rowId && entry.settled && !entry.released)
+      : null;
+    await interruptRun(turn, rowId);
+    if (publishing) await withTimeout(publishing.done, STOPPED_ROW_PUBLISH_WAIT_MS, false);
+  }
+
+  /**
    * Interrupt the turn the user stopped. `interruptMainTurn` (when the
    * runtime has it) stops the main agent loop and nothing else: background
    * agents and promoted shells keep running under their own Stop, exactly
@@ -2810,20 +2884,20 @@ export function createCopilotSdkSessionRunner({
    * lanes. Either way the runtime answers with an aborted idle event, which
    * settles the turn through the normal terminator.
    */
-  async function interruptTurn(turn, control) {
+  async function interruptRun(turn, rowId) {
     if (turn.settled) {
       // Its run is over and the main loop may already belong to the next
       // turn, so nothing is interrupted. While it waits on a card (driveTurn)
       // the Stop ends the cards, and the row settles as stopped.
       if (turn.humanRequests > 0) {
         turn.aborted = true;
-        turn.abortedRowId = String(control?.queueMessageId || '').trim() || null;
+        turn.abortedRowId = rowId;
         turn.abortController.abort();
       }
       return;
     }
     turn.aborted = true;
-    turn.abortedRowId = String(control?.queueMessageId || '').trim() || null;
+    turn.abortedRowId = rowId;
     // While `ensureSession` is still connecting there is no session to abort
     // and this would be a silent no-op; `runTurn` re-checks `turn.aborted`
     // once the session exists and settles there instead.
@@ -2871,7 +2945,7 @@ export function createCopilotSdkSessionRunner({
     // this worker owns.
     turn.controlState = controlPoller?.start?.({
       queueMessageId: '',
-      onAbortTurn: (control) => interruptTurn(turn, control),
+      onAbortTurn: (control) => interruptTurn(stopTarget(turn, control), control),
     }) || null;
     turn.drive = driveTurn(turn);
     try {
@@ -3139,7 +3213,7 @@ export function createCopilotSdkSessionRunner({
       turn.armStall();
       turn.controlState = controlPoller?.start?.({
         queueMessageId: '',
-        onAbortTurn: (control) => interruptTurn(turn, control),
+        onAbortTurn: (control) => interruptTurn(stopTarget(turn, control), control),
       }) || null;
       dbg('a pushed prompt opened its own run after its turn settled; adopting it', entry.message.id);
       syncDeliveryReadiness();
@@ -3239,7 +3313,7 @@ export function createCopilotSdkSessionRunner({
     // start.
     turn.controlState = controlPoller?.start?.({
       queueMessageId: '',
-      onAbortTurn: (control) => interruptTurn(turn, control),
+      onAbortTurn: (control) => interruptTurn(stopTarget(turn, control), control),
     }) || null;
     await flushBufferedActions(turn);
     turn.registered = true;

@@ -504,6 +504,35 @@ test('a Stop while a settled row waits on a background card ends the card and in
   await runner.dispose();
 });
 
+test('a Stop naming a row that waits on a background card ends that card, even when a newer turn claims it', async () => {
+  const pollers = [];
+  const controlPoller = { start: ({ onAbortTurn }) => { pollers.push(onAbortTurn); return {}; }, stop: () => {} };
+  const { relay, stub, client, runner } = setupQuestions({
+    events: (id) => spawnTurnEvents(id).slice(0, -1),
+    controlPoller,
+  });
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
+  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
+  await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  // Root work of its own opens a continuation, whose poller is the newest.
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm7', content: 'Meanwhile, root work.' } });
+  await waitFor(() => pollers.length === 2, { label: 'continuation poller' });
+
+  await pollers[1]({ queueMessageId: 'q-1' });
+  await waitFor(() => relay.cards[0].status === 'timed_out', { label: 'the card was ended' });
+  await asked;
+  assert.equal(await first, true);
+  assert.equal(responsesFor(stub, 'q-1').length, 0, 'stopped: the abort control settles it');
+  assert.deepEqual(client.session.interruptCalls, [], 'the continuation was not interrupted');
+  assert.equal(runner._getState().activeTurnKind, 'continuation');
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation settled' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'Meanwhile, root work.');
+  await runner.dispose();
+});
+
 test('root work that starts while a background question is open merges into its row and ends on assistant.idle', async () => {
   const { relay, stub, client, runner } = setupQuestions();
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);

@@ -16,6 +16,7 @@ import {
   tick,
   waitFor,
 } from './copilot-sdk-test-harness.mjs';
+import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 
 const userMessage = (messageId, delivery, content = '') => ({ type: 'user.message', data: { messageId, delivery, content } });
 const assistantText = (messageId, content) => ({ type: 'assistant.message', data: { messageId, content } });
@@ -231,6 +232,92 @@ test('Stop with steers in flight: the stopped row is left to the relay, every ot
   assert.deepEqual(stub.bodiesFor('/api/queue-consumed'), [
     { conversationId: 'conv-1', entries: [{ id: 'q-2', attemptId: 'a-2' }] },
   ]);
+});
+
+const abortedIdle = (session) => session.replay([
+  { type: 'abort', data: { reason: 'user_abort' } },
+  { type: 'assistant.idle', data: { aborted: true } },
+]);
+
+test('Stop naming a row whose early settle is still publishing stops the run that is live, and never requeues it', async () => {
+  let abortTurn = null;
+  const controlPoller = { start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return { id: 1 }; }, stop: () => {} };
+  const order = [];
+  let releaseFirst = () => {};
+  const firstResponse = new Promise((resolve) => { releaseFirst = resolve; });
+  let releaseSecond = () => {};
+  const secondResponse = new Promise((resolve) => { releaseSecond = resolve; });
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': (body) => {
+        if (body.messageId === 'q-1') return firstResponse.then(() => { order.push('q-1 response landed'); return {}; });
+        if (body.messageId === 'q-2') return secondResponse;
+        return {};
+      },
+    },
+  });
+  const client = scriptedClient([
+    (id) => [userMessage(id, 'idle', 'hello'), assistantText('m1', 'first answer')],
+    // q-2 runs as a run of its own, so q-1's complete reply settles early.
+    (id) => [userMessage(id, 'queued', 'second'), assistantText('m2', 'second, partly')],
+  ], { onAbort: abortedIdle });
+  const { runner, first } = await openLiveTurn({ stub, client, controlPoller });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', attemptId: 'a-2', text: 'second' } });
+  await waitFor(() => responsesFor(stub, 'q-1').length === 1, { label: 'q-1 settled early, its response in flight' });
+
+  // The relay's live-row picker still names q-1.
+  const stopping = abortTurn({ queueMessageId: 'q-1' }).then(() => order.push('abort resolved'));
+  await waitFor(() => responsesFor(stub, 'q-2').length === 1, { label: 'q-2 settled' });
+  // A crash while the stop is publishing must fail q-2, not re-run it.
+  assert.ok(runner.getActiveQueueMessageIds().find((entry) => entry.id === 'q-2')?.terminalError);
+  releaseSecond({});
+  releaseFirst();
+  await stopping;
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  // The ack fails the row it names; q-1's reply is on the relay before it.
+  assert.deepEqual(order, ['q-1 response landed', 'abort resolved']);
+  assert.equal(responsesFor(stub, 'q-1')[0].text, 'first answer');
+  const stopped = responsesFor(stub, 'q-2')[0];
+  assert.equal(stopped.terminalError.code, buildRelayStopFailure().code);
+  assert.deepEqual(stub.bodiesFor('/api/requeue'), []);
+  const finalStream = stub.bodiesFor('/api/stream').filter((body) => body.messageId === 'q-2').at(-1);
+  assert.equal(finalStream.done, true);
+  assert.match(finalStream.text, /second, partly/);
+});
+
+test('a Stop claimed by a turn that is still publishing stops the turn that is running', async () => {
+  const pollers = [];
+  const controlPoller = { start: ({ onAbortTurn }) => { pollers.push(onAbortTurn); return { id: pollers.length }; }, stop: () => {} };
+  let releaseFirst = () => {};
+  const firstResponse = new Promise((resolve) => { releaseFirst = resolve; });
+  const stub = makeApiStub({ routeResponses: { '/api/response': (body) => (body.messageId === 'q-1' ? firstResponse : {}) } });
+  const client = scriptedClient([
+    (id) => [userMessage(id, 'idle', 'hello'), assistantText('m1', 'first answer'), { type: 'assistant.idle', data: {} }],
+    (id) => [userMessage(id, 'idle', 'second'), assistantText('m2', 'second, partly')],
+  ], { onAbort: abortedIdle });
+  const { runner } = makeRunner({ stub, client, controlPoller });
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => responsesFor(stub, 'q-1').length === 1, { label: 'q-1 publishing' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second' } });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-2 live' });
+  assert.equal(pollers.length, 2);
+
+  // q-1's poller runs until its publish is done, and claims the Stop for q-2.
+  await pollers[0]({ queueMessageId: 'q-2' });
+  await waitFor(() => client.session.interruptCalls.length === 1, { label: 'the running turn was interrupted' });
+  assert.equal(await second, true);
+  assert.deepEqual(client.session.interruptCalls, [{ flushQueued: false }]);
+  // A user Stop, not a runtime interrupt: the relay's abort control settles q-2.
+  assert.equal(responsesFor(stub, 'q-2').length, 0);
+  const finalStream = stub.bodiesFor('/api/stream').filter((body) => body.messageId === 'q-2').at(-1);
+  assert.equal(finalStream.done, true);
+  assert.equal(finalStream.text, 'second, partly');
+
+  releaseFirst({});
+  assert.equal(await first, true);
+  assert.equal(responsesFor(stub, 'q-1')[0].text, 'first answer');
 });
 
 // --------------------------------------------------------------- un-steer --
