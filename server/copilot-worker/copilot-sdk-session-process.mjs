@@ -437,10 +437,34 @@ export function createCopilotSdkSessionRunner({
   //  - `unsteerChain`: un-steers run one at a time (each re-reads the queue).
   // Steer sends never wait on an un-steer; the recall check and its remove
   // request run in the same tick, so no send can be issued between them.
+  //
+  // What else removeMostRecent can take (live probe, runtime 1.0.85,
+  // 2026-09-26): only user-facing sends. The runtime's own notifications
+  // (agent_idle / agent_completed / shell_completed) never show in either
+  // lane — with one pending and nothing of ours queued the remove answered
+  // `removed:false`, and the notification was still delivered after a remove
+  // that took our steer. A `source:"system"` send is hidden from pendingItems
+  // and skipped (the remove took the OLDER user steer; the system one still
+  // ran). An `agent-*`-sourced send is listed and removable, but the
+  // runtime's inter-agent prompts never passed through the main lanes. So the
+  // read-then-remove window cannot drop a runtime message; what it can still
+  // hit is a message another client of the session pushed in that window,
+  // which the two guards below detect:
+  //  - `recallWatches`: runtime id → { taken } for a recall in progress. A
+  //    root `user.message` naming it sets `taken` from the event callback
+  //    itself — the SDK dispatches a notification before it resolves a later
+  //    RPC answer, whereas `entry.consumed` is set on the dispatch chain and
+  //    can lag behind a slow publish.
+  //  - `recalledRuntimeIds`: runtime id → row id of every prompt pulled back
+  //    and cancelled. One must never run; if it does, the remove took
+  //    another message and the row was cancelled wrongly — logged loudly.
   let steerSendsInFlight = 0;
   let lastCancellableSignature = '';
   let steerSendSeq = 0;
   let unsteerChain = Promise.resolve();
+  const recallWatches = new Map();
+  const recalledRuntimeIds = new Map();
+  const MAX_RECALLED_RUNTIME_IDS = 200;
   /** How long an un-steer may wait on the runtime before it gives up. */
   const UNSTEER_TIMEOUT_MS = 5_000;
   let queueLaneTimer = null;
@@ -1142,6 +1166,7 @@ export function createCopilotSdkSessionRunner({
       return;
     }
     touch();
+    observeRecalls(event);
     observeBackgroundShells(event);
     observeBackgroundAgents(event);
     observeCompaction(event);
@@ -1497,6 +1522,20 @@ export function createCopilotSdkSessionRunner({
   function observeQueueLane(event) {
     if (String(event?.type || '') !== 'pending_messages.modified') return;
     scheduleQueueLaneRefresh();
+  }
+
+  /** Un-steer's synchronous view of the runtime taking a prompt (see `recallWatches`). */
+  function observeRecalls(event) {
+    if (String(event?.type || '') !== 'user.message' || event?.agentId) return;
+    const runtimeId = String(event?.data?.messageId || '').trim();
+    if (!runtimeId) return;
+    const watch = recallWatches.get(runtimeId);
+    if (watch) watch.taken = true;
+    const recalledRow = recalledRuntimeIds.get(runtimeId);
+    if (recalledRow) {
+      dbg('UN-STEER MISMATCH: a prompt recalled and cancelled is running after all; the remove took another message',
+        recalledRow, runtimeId);
+    }
   }
 
   function scheduleQueueLaneRefresh() {
@@ -3590,24 +3629,41 @@ export function createCopilotSdkSessionRunner({
    * steer send can be issued in between (JSON-RPC keeps request order).
    */
   async function recallPushedPrompt(entry, id) {
-    // Only the READ is bounded: a runtime that will not answer it gets no
-    // remove at all. Once a remove is sent it is seen through to its answer —
-    // giving up on it could leave the prompt removed and the row uncancelled.
-    const fresh = await withTimeout(refreshQueueLane().then(() => true), UNSTEER_TIMEOUT_MS, false);
-    if (!fresh) {
-      dbg('un-steer refused: the runtime did not answer the queue read in time', id);
-      return false;
+    // Watched from before the read, so a fold that lands during the read or
+    // the remove is seen however far behind the dispatch chain runs.
+    const watch = { taken: false };
+    recallWatches.set(entry.runtimeId, watch);
+    try {
+      // Only the READ is bounded: a runtime that will not answer it gets no
+      // remove at all. Once a remove is sent it is seen through to its answer —
+      // giving up on it could leave the prompt removed and the row uncancelled.
+      const fresh = await withTimeout(refreshQueueLane().then(() => true), UNSTEER_TIMEOUT_MS, false);
+      if (!fresh) {
+        dbg('un-steer refused: the runtime did not answer the queue read in time', id);
+        return false;
+      }
+      const target = session;
+      const method = watch.taken ? null : recallMethodFor(entry);
+      if (!target || !method) {
+        dbg('un-steer refused: the runtime no longer holds this prompt as recallable', id);
+        return false;
+      }
+      const request = method.kind === 'queued'
+        ? target.rpc.queue.removeAt({ id: method.itemId })
+        : target.rpc.queue.removeMostRecent();
+      const removed = (await request)?.removed === true;
+      if (removed && (watch.taken || entry.consumed || entry.settled)) {
+        // The runtime took this prompt before it processed the remove, so
+        // what was removed is some other waiting message — another client's,
+        // never a runtime notification (see `recallWatches`). It cannot be put
+        // back; this row settles through its normal path.
+        dbg('UN-STEER MISMATCH: the runtime took the prompt before the remove; the remove took another message', id, method.kind);
+        return false;
+      }
+      return removed;
+    } finally {
+      if (recallWatches.get(entry.runtimeId) === watch) recallWatches.delete(entry.runtimeId);
     }
-    const target = session;
-    const method = recallMethodFor(entry);
-    if (!target || !method) {
-      dbg('un-steer refused: the runtime no longer holds this prompt as recallable', id);
-      return false;
-    }
-    const request = method.kind === 'queued'
-      ? target.rpc.queue.removeAt({ id: method.itemId })
-      : target.rpc.queue.removeMostRecent();
-    return (await request)?.removed === true;
   }
 
   function withTimeout(promise, ms, fallback) {
@@ -3647,14 +3703,16 @@ export function createCopilotSdkSessionRunner({
       return false;
     });
     if (!removed) return false;
-    // Folded in anyway between the check and the remove (its user.message
-    // arrived): the model saw it, so it settles through its normal path.
+    // Settled meanwhile by its turn's end, or taken since the answer (the
+    // remove then took another message): it keeps its normal outcome.
     if (entry.consumed || entry.settled) {
-      dbg('un-steer raced the runtime taking the prompt; leaving it to settle normally', id);
+      dbg('un-steer raced the runtime taking the prompt or the row settling; leaving it to settle normally', id);
       return false;
     }
     entry.cancelled = true;
     entry.settled = true;
+    while (recalledRuntimeIds.size >= MAX_RECALLED_RUNTIME_IDS) recalledRuntimeIds.delete(recalledRuntimeIds.keys().next().value);
+    recalledRuntimeIds.set(entry.runtimeId, id);
     dbg('un-steered a pushed prompt', id);
     // The prompt is gone from the runtime; the row must end cancelled and
     // never be re-delivered. It stays owned (settling, with the terminal

@@ -550,6 +550,74 @@ test('a steer the runtime takes while the remove is in flight settles normally, 
   assert.equal(responsesFor(stub, 'q-3')[0].kind, 'folded');
 });
 
+test('a steer taken while the remove is in flight is not cancelled even when earlier events are still publishing', async () => {
+  // The fold's `user.message` reaches the runner before the remove's answer,
+  // but its dispatch-chain link waits behind a slow activity publish — so
+  // `entry.consumed` is still false when the answer arrives. `removed: true`
+  // then means the remove took some other client's newer message, not ours.
+  let releaseActivity = () => {};
+  const activityGate = new Promise((resolve) => { releaseActivity = resolve; });
+  const stub = makeApiStub({ routeResponses: { '/api/activity': () => activityGate } });
+  const logs = [];
+  const made = await openLiveTurn({ stub, scripts: [() => [], () => []], dbg: (...parts) => logs.push(parts.join(' ')) });
+  const { client, runner, first } = made;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', attemptId: 'a-2', text: 'first steer' } });
+  await waitFor(() => client.session.sends.length === 2, { label: 'q-2 pushed' });
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', attemptId: 'a-3', text: 'second steer' } });
+  await waitFor(() => client.session.sends.length === 3, { label: 'q-3 pushed' });
+  client.session.steeringLane = [
+    { messageId: client.session.idOfSend(1), text: 'first steer' },
+    { messageId: client.session.idOfSend(2), text: 'second steer' },
+  ];
+  client.session.emit({ type: 'pending_messages.modified', data: {} });
+  await waitFor(() => runner.steeringState().cancellableIds.includes('q-3'), { label: 'q-3 recallable' });
+
+  // A tool line whose publish hangs: every later event queues behind it.
+  client.session.emit({ type: 'tool.execution_start', data: { toolCallId: 't1', toolName: 'powershell', arguments: { command: 'Start-Sleep 20' } } });
+  await waitFor(() => stub.bodiesFor('/api/activity').length === 1, { label: 'activity publish in flight' });
+  client.session.onRemoveMostRecent = (session) => {
+    // Both steers fold in, then another client's message is the newest waiting one.
+    session.emit(userMessage(session.idOfSend(1), 'steering', 'first steer'));
+    session.emit(userMessage(session.idOfSend(2), 'steering', 'second steer'));
+    return { removed: true };
+  };
+  assert.equal(await runner.cancelPushedMessage('q-3'), false);
+  assert.equal(stub.bodiesFor('/api/queue-cancelled').length, 0, 'the row was not cancelled');
+  assert.ok(logs.some((line) => line.includes('UN-STEER MISMATCH')), logs.join('\n'));
+
+  client.session.onRemoveMostRecent = null;
+  client.session.steeringLane = [];
+  releaseActivity({});
+  client.session.emit(assistantText('m9', 'handled both'));
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(await third, true);
+  assert.equal(responsesFor(stub, 'q-3')[0].kind, 'folded');
+});
+
+test('a recalled prompt that runs after all is logged loudly', async () => {
+  const logs = [];
+  const made = await openLiveTurn({ scripts: [() => [], () => []], dbg: (...parts) => logs.push(parts.join(' ')) });
+  const { client, runner, first } = made;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', attemptId: 'a-2', text: 'first steer' } });
+  await waitFor(() => client.session.sends.length === 2, { label: 'q-2 pushed' });
+  client.session.steeringLane = [{ messageId: client.session.idOfSend(1), text: 'first steer' }];
+  client.session.emit({ type: 'pending_messages.modified', data: {} });
+  await waitFor(() => runner.steeringState().cancellableIds.includes('q-2'), { label: 'q-2 recallable' });
+  // The remove answers `removed: true` but took something else (another
+  // client's message pushed in the window); q-2's prompt is still queued.
+  client.session.onRemoveMostRecent = () => ({ removed: true });
+  assert.equal(await runner.cancelPushedMessage('q-2'), true);
+  assert.equal(await second, true);
+  assert.equal(logs.some((line) => line.includes('UN-STEER MISMATCH')), false);
+
+  client.session.emit(userMessage(client.session.idOfSend(1), 'steering', 'first steer'));
+  await waitFor(() => logs.some((line) => line.includes('UN-STEER MISMATCH') && line.includes('q-2')), { label: 'mismatch logged' });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+});
+
 test('a newer steer is never blocked by an un-steer, and never overtaken by its remove request', async () => {
   const { client, runner, first } = await twoWaitingSteers();
   let finishRemove = () => {};
