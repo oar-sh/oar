@@ -367,9 +367,11 @@ test('a user message delivered during a continuation gets its own row and its ow
   const { stub, client, runner } = setup();
   await runner.handlePendingPayload({ message: baseMessage });
 
-  // Open the continuation but do not let it terminate yet.
+  // Open the continuation but do not let it terminate yet. Steering waits for
+  // its row (until then a delivery is handed back).
   fireTimer(client, TIMER_CONTINUATION.slice(0, -1));
   await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'continuation row registered' });
 
   const delivery = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'what time is it?' } });
   await waitFor(() => client.session.sends.length === 2, { label: 'steered send' });
@@ -412,6 +414,7 @@ test('a delivery during a continuation never wedges the delivery socket', async 
   await runner.handlePendingPayload({ message: baseMessage });
   fireTimer(client, TIMER_CONTINUATION.slice(0, -1));
   await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'continuation row registered' });
 
   const delivery = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
   await waitFor(() => client.session.sends.length === 2, { label: 'steered send' });
@@ -777,6 +780,133 @@ test('an ask-mode approval raised before the continuation row exists waits for i
 
   client.session.emit({ type: 'session.idle', data: {} });
   await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation response' });
+  await runner.dispose();
+});
+
+// ------------------------------------ steering vs an unregistered row ------
+
+/** A continuation's opening work, produced while its row is still being minted. */
+function openContinuationWork(client) {
+  client.session.replay([
+    TIMER_CONTINUATION[0],
+    TIMER_CONTINUATION[2],
+    TIMER_CONTINUATION[4],
+    TIMER_CONTINUATION[5],
+    { type: 'assistant.message', data: { messageId: 'c1', model: 'gpt-5.6-luna', content: 'continuation reply', toolRequests: [] } },
+  ]);
+}
+
+/** q-2's own run, picked up by the runtime after the continuation's reply. */
+function answerSteer(client) {
+  client.session.emit({ type: 'user.message', data: { content: 'what now?', messageId: client.session.idOfSend(1), delivery: 'queued' } });
+  client.session.emit({ type: 'assistant.message', data: { messageId: 's1', model: 'gpt-5.6-luna', content: 'user answer', toolRequests: [] } });
+  client.session.emit({ type: 'session.idle', data: {} });
+}
+
+const PUBLISH_ROUTES = new Set(['/api/response', '/api/stream', '/api/activity', '/api/thought', '/api/subagent-run']);
+
+test('a delivery while a continuation has no row yet is held, and steers in once the row exists', async () => {
+  const stub = delayedRegistrationStub({ delayMs: 80 });
+  const readiness = [];
+  const { client, runner } = setup({ stub, onDeliveryReadinessChange: (ready) => readiness.push(ready) });
+  await runner.handlePendingPayload({ message: baseMessage });
+  const before = readiness.length;
+
+  openContinuationWork(client);
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+  const held = runner.steeringState();
+  assert.equal(held.turnActive, true);
+  assert.equal(held.canSteer, false);
+  assert.equal(held.holdReason, 'delivery');
+  assert.equal(runner.isDeliveryHeld(), true);
+
+  const second = { ...baseMessage, id: 'q-2', attemptId: 'a-2', text: 'what now?' };
+  assert.equal(await runner.handlePendingPayload({ message: second }), false);
+  assert.deepEqual(bodiesFor(stub, '/api/requeue'), [{ messageId: 'q-2', class: 'steering-held', attemptId: 'a-2' }]);
+  assert.equal(client.session.sends.length, 1, 'nothing was pushed into the unregistered turn');
+
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'row registered' });
+  assert.deepEqual(readiness.slice(before), [false, true], 'held while the row was minted, re-armed once it existed');
+
+  const redelivered = runner.handlePendingPayload({ message: second });
+  await waitFor(() => client.session.sends.length === 2, { label: 'steered in' });
+  answerSteer(client);
+  assert.equal(await redelivered, true);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation response' });
+
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'continuation reply');
+  assert.equal(responsesFor(stub, 'q-2')[0].text, 'user answer');
+  assert.equal(stub.calls.some((call) => PUBLISH_ROUTES.has(call.routePath) && !call.body?.messageId), false);
+  const toolLines = bodiesFor(stub, '/api/activity').filter((body) => /read_bash|Read shell output/i.test(body.text));
+  assert.ok(toolLines.length > 0);
+  assert.deepEqual([...new Set(toolLines.map((body) => body.messageId))], ['cont-1']);
+  await runner.dispose();
+});
+
+test('against a relay without the hand-back, a delivery waits for the continuation row before it is pushed', async () => {
+  const stub = delayedRegistrationStub({ delayMs: 80 });
+  const { client, runner } = setup({ stub, canHandBackHeldDelivery: () => false });
+  await runner.handlePendingPayload({ message: baseMessage });
+  openContinuationWork(client);
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'what now?' } });
+  await tick(30);
+  assert.equal(client.session.sends.length, 1, 'not pushed before the row exists');
+  await waitFor(() => client.session.sends.length === 2, { label: 'pushed once registered' });
+  answerSteer(client);
+  assert.equal(await second, true);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation response' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'continuation reply');
+  assert.equal(responsesFor(stub, 'q-2')[0].text, 'user answer');
+  assert.equal(stub.calls.some((call) => PUBLISH_ROUTES.has(call.routePath) && !call.body?.messageId), false);
+  await runner.dispose();
+});
+
+test('a steer pushed before the continuation row exists settles that row only once it does', async () => {
+  // The legacy wait ran out (a slow relay): the steer's run opens while the
+  // continuation still has no row, and its reply must not publish to none.
+  const stub = delayedRegistrationStub({ delayMs: 80 });
+  const { client, runner } = setup({ stub, canHandBackHeldDelivery: () => false, continuationRegistrationTimeoutMs: 20 });
+  await runner.handlePendingPayload({ message: baseMessage });
+  openContinuationWork(client);
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'what now?' } });
+  await waitFor(() => client.session.sends.length === 2, { label: 'pushed after the wait ran out' });
+  client.session.emit({ type: 'user.message', data: { content: 'what now?', messageId: client.session.idOfSend(1), delivery: 'queued' } });
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation settled once its row existed' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'continuation reply');
+  client.session.emit({ type: 'assistant.message', data: { messageId: 's1', model: 'gpt-5.6-luna', content: 'user answer', toolRequests: [] } });
+  client.session.emit({ type: 'session.idle', data: {} });
+  assert.equal(await second, true);
+  assert.equal(responsesFor(stub, 'q-2')[0].text, 'user answer');
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/response' && !call.body?.messageId), false);
+  await runner.dispose();
+});
+
+test('a continuation whose registration gives up releases the delivery hold', async () => {
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': () => new Promise((resolve) => { setTimeout(() => resolve({ ok: true }), 20); }),
+    },
+  });
+  const readiness = [];
+  const { client, runner } = setup({ stub, onDeliveryReadinessChange: (ready) => readiness.push(ready) });
+  await runner.handlePendingPayload({ message: baseMessage });
+  const before = readiness.length;
+  openContinuationWork(client);
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+  assert.equal(runner.steeringState().holdReason, 'delivery');
+
+  await waitFor(() => bodiesFor(stub, '/api/continuation-turn').length === 3 && runner.canAcceptSteering() === true, {
+    label: 'registration gave up',
+  });
+  assert.equal(runner.isDeliveryHeld(), false);
+  assert.equal(runner.steeringState().holdReason, null);
+  assert.deepEqual(readiness.slice(before), [false, true]);
+  client.session.emit({ type: 'session.idle', data: {} });
+  await waitFor(() => runner.isTurnActive() === false, { label: 'continuation over' });
   await runner.dispose();
 });
 

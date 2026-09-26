@@ -2571,7 +2571,13 @@ export function createCopilotSdkSessionRunner({
       dbg('pushed prompt runs as its own turn; settling the previous run', entry.message.id, `after ${running.message.id || '(continuation)'}`);
       // Off the dispatch chain: a slow relay must not stall the events of
       // the run that just opened (or its terminator) behind this publish.
-      turn.settlePromises.push(settleEntry(turn, running, { type: 'completed' }));
+      // A continuation whose row is not minted yet (a steer pushed past the
+      // hold after its wait ran out) settles once the row exists — publishing
+      // now would name no row — or is discarded with it.
+      const settled = running.message?.id || !turn.rowReady
+        ? settleEntry(turn, running, { type: 'completed' })
+        : turn.rowReady.then((ready) => settleEntry(turn, running, { type: ready ? 'completed' : 'discarded' }));
+      turn.settlePromises.push(settled);
     }
   }
 
@@ -3179,6 +3185,7 @@ export function createCopilotSdkSessionRunner({
         // has somewhere to go.
         turn.registered = true;
         turn.resolveRowReady?.(true);
+        syncDeliveryReadiness();
         return;
       }
       abandonContinuationRegistration(turn, 'registration threw');
@@ -3237,8 +3244,10 @@ export function createCopilotSdkSessionRunner({
     turn.discarded = true;
     turn.bufferedActions = [];
     turn.registrationAbort?.abort?.();
-    // Interactive handlers stop waiting and take their degraded path.
+    // Interactive handlers stop waiting and take their degraded path, and the
+    // delivery hold that waited for the row ends.
     turn.resolveRowReady?.(false);
+    syncDeliveryReadiness();
     dbg('continuation registration abandoned:', reason);
   }
 
@@ -3318,6 +3327,8 @@ export function createCopilotSdkSessionRunner({
     await flushBufferedActions(turn);
     turn.registered = true;
     turn.resolveRowReady?.(true);
+    // The row exists: the delivery hold it imposed ends (canAcceptSteering).
+    syncDeliveryReadiness();
   }
 
   /**
@@ -3416,18 +3427,26 @@ export function createCopilotSdkSessionRunner({
   /**
    * Whether a message delivered now would steer into the live turn. False
    * while: no session / no live turn; the turn-opening prompt has not been
-   * sent yet (the delivery hold — a second send before the first would invert
-   * the runs); a question card, ask-mode approval or elicitation is open (the
-   * relay must not push past a card); a compaction is running.
+   * sent yet, or a continuation's row does not exist yet (the delivery hold —
+   * a second send before the first would invert the runs, and a steer's run
+   * would settle the continuation's reply against no row while its buffered
+   * output flushed into the steered one); a question card, ask-mode approval
+   * or elicitation is open (the relay must not push past a card); a
+   * compaction is running.
    */
   function canAcceptSteering() {
     if (disposed || !session) return false;
     const turn = activeTurn;
     if (!turn || turn.settled || turn.aborted) return false;
-    if (!turn.primarySent) return false;
+    if (!turn.primarySent || awaitingRow(turn)) return false;
     if (pendingHumanRequests > 0) return false;
     if (isCompacting()) return false;
     return true;
+  }
+
+  /** A continuation whose synthetic row is still being minted (and not given up on). */
+  function awaitingRow(turn) {
+    return turn.kind === 'continuation' && !turn.registered && !turn.discarded;
   }
 
   /**
@@ -3514,7 +3533,7 @@ export function createCopilotSdkSessionRunner({
     if (turnActive && !canSteer) {
       if (pendingHumanRequests > 0) holdReason = 'question';
       else if (isCompacting()) holdReason = 'compaction';
-      else if (!turn.primarySent) holdReason = 'delivery';
+      else if (!turn.primarySent || awaitingRow(turn)) holdReason = 'delivery';
       else holdReason = 'other';
     }
     const messageId = String(turn?.currentOwner?.message?.id || turn?.message?.id || '').trim() || null;
@@ -3645,6 +3664,11 @@ export function createCopilotSdkSessionRunner({
     // that is still connecting.
     if (activeTurn && !activeTurn.settled && !activeTurn.primarySent) {
       await activeTurn.primaryReady;
+    }
+    // Nor steer into a continuation before its row exists (canAcceptSteering);
+    // bounded like the registration itself, which can hang on a dead relay.
+    if (activeTurn && !activeTurn.settled && awaitingRow(activeTurn)) {
+      await withTimeout(activeTurn.rowReady, continuationRegistrationTimeoutMs, false);
     }
     // A delivery that lands while a turn is running is steered into it rather
     // than starting a second one: the runtime has a single conversation and a
