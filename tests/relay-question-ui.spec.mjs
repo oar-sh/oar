@@ -1,7 +1,8 @@
+import fs from "fs";
 import path from "path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
-import { relayToken, relayBaseUrl, relayDbPath } from "./e2e-env.mjs";
+import { relayToken, relayBaseUrl, relayDataDir, relayDbPath } from "./e2e-env.mjs";
 
 function relayOrigin() {
   return new URL(relayBaseUrl()).origin;
@@ -22,6 +23,33 @@ function readSdkDeleteRequest(sdkSessionId) {
   } finally {
     db.close();
   }
+}
+
+// The test relay's Copilot session folder for `sdkSessionId`: its session-state
+// root is COPILOT_SESSION_STATE_DIR (tests/relay-server-harness.mjs).
+function copilotSessionFolder(sdkSessionId) {
+  return path.join(path.dirname(relayDataDir()), "session-state", sdkSessionId);
+}
+
+// A conversation bound to `sdkSessionId` with one queued, never-started
+// message; the relay is paused so nothing starts it before the delete.
+async function seedConversationForSdkSession(request, headers, { sdkSessionId, text }) {
+  const queued = await request.post("/api/message", {
+    headers,
+    data: { text, relayMode: "autopilot", model: "gpt-5.4-mini" },
+  });
+  expect(queued.ok()).toBeTruthy();
+  const queuedBody = await queued.json();
+  const conversationId = String(queuedBody?.conversationId || "");
+  expect(conversationId).toBeTruthy();
+  expect(String(queuedBody?.messageId || "")).toBeTruthy();
+
+  const synced = await request.post("/api/session-sync", {
+    headers,
+    data: { sdk_session_id: sdkSessionId, conversation_id: conversationId },
+  });
+  expect(synced.ok()).toBeTruthy();
+  return conversationId;
 }
 
 function makeInlineSvgDataUrl(width, height, fill = "#4ade80") {
@@ -469,34 +497,18 @@ test("bridges web delete requests to SDK session delete queue", async ({ request
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
   const sdkSessionId = `playwright-sdk-delete-${stamp}`;
+  const sessionFolder = copilotSessionFolder(sdkSessionId);
   let conversationId = "";
-  let messageId = "";
   let relayPaused = false;
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: `sdk-delete-bridge-seed-${stamp}`,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
+    conversationId = await seedConversationForSdkSession(request, headers, {
+      sdkSessionId,
+      text: `sdk-delete-bridge-seed-${stamp}`,
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
-    conversationId = String(queuedBody?.conversationId || "");
-    messageId = String(queuedBody?.messageId || "");
-    expect(conversationId).toBeTruthy();
-    expect(messageId).toBeTruthy();
-
-    const synced = await request.post("/api/session-sync", {
-      headers,
-      data: {
-        sdk_session_id: sdkSessionId,
-        conversation_id: conversationId,
-      },
-    });
-    expect(synced.ok()).toBeTruthy();
+    // The session has run before, so there is a CLI session on disk to delete.
+    fs.mkdirSync(sessionFolder, { recursive: true });
+    fs.writeFileSync(path.join(sessionFolder, "events.jsonl"), "{}\n");
 
     const paused = await request.post("/api/relay/pause", { headers });
     expect(paused.ok()).toBeTruthy();
@@ -508,6 +520,8 @@ test("bridges web delete requests to SDK session delete queue", async ({ request
     const deletedBody = await deleted.json();
     expect(Boolean(deletedBody?.ok)).toBeTruthy();
     expect(deletedBody?.cliSessionDeleted).toBe(false);
+    // Left for the queue's consumer, which deletes it through the CLI.
+    expect(fs.existsSync(sessionFolder)).toBe(true);
 
     // Gone at once — the queued (never-started) message went with it.
     const missingConversation = await request.get(`/api/conversation/${conversationId}`, { headers });
@@ -539,6 +553,50 @@ test("bridges web delete requests to SDK session delete queue", async ({ request
         sdk_session_id: sdkSessionId,
         ok: true,
       },
+    }).catch(() => {});
+    fs.rmSync(sessionFolder, { recursive: true, force: true });
+  }
+});
+
+// A conversation deleted before its first turn has no CLI session on disk, so
+// there is nothing to hand to the runtime and nothing to queue.
+test("deletes a Copilot conversation that never ran a turn without queueing a CLI session delete", async ({ request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  const sdkSessionId = `playwright-sdk-untouched-${stamp}`;
+  let conversationId = "";
+  let relayPaused = false;
+
+  try {
+    conversationId = await seedConversationForSdkSession(request, headers, {
+      sdkSessionId,
+      text: `sdk-delete-untouched-seed-${stamp}`,
+    });
+    expect(fs.existsSync(copilotSessionFolder(sdkSessionId))).toBe(false);
+
+    const paused = await request.post("/api/relay/pause", { headers });
+    expect(paused.ok()).toBeTruthy();
+    relayPaused = true;
+
+    const deleted = await request.delete(`/api/conversation/${conversationId}`, { headers });
+    expect(deleted.ok()).toBeTruthy();
+    const deletedBody = await deleted.json();
+    expect(Boolean(deletedBody?.ok)).toBeTruthy();
+    expect(deletedBody?.cliSessionDeleted).toBeNull();
+    expect((await request.get(`/api/conversation/${conversationId}`, { headers })).status()).toBe(404);
+    expect(readSdkDeleteRequest(sdkSessionId)).toBeUndefined();
+    conversationId = "";
+  } finally {
+    if (relayPaused) {
+      await request.post("/api/relay/resume", { headers }).catch(() => {});
+    }
+    if (conversationId) {
+      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
+    }
+    await request.post("/api/sdk-session-delete/result", {
+      headers,
+      data: { sdk_session_id: sdkSessionId, ok: true },
     }).catch(() => {});
   }
 });

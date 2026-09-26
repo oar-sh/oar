@@ -2136,6 +2136,8 @@ export function registerSessionsRoutes(app, deps) {
   const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
   const CLI_SESSION_DELETE_TIMEOUT_MS = 10_000;
   const LIVE_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
+  // A session id that is safe to join into a path under the session-state root.
+  const SESSION_FOLDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
   const markConversationDeleted = db.prepare(`UPDATE conversations SET status = 'deleted', updated_at = ? WHERE id = ?`);
   const getActiveQueueForMessage = db.prepare(`
     SELECT id
@@ -2390,6 +2392,11 @@ export function registerSessionsRoutes(app, deps) {
    * (the extension engine) still works off.
    */
   async function deleteCopilotCliSession({ sdkSessionId, conversationId }) {
+    const stateRoot = String(resolveSessionStateRoot?.() || '').trim();
+    const sessionDir = stateRoot && SESSION_FOLDER_ID_PATTERN.test(sdkSessionId) ? path.join(stateRoot, sdkSessionId) : '';
+    // A conversation deleted before its first turn has no session on disk yet
+    // (the runtime would answer "Session file not found").
+    if (sessionDir && !fs.existsSync(sessionDir)) return { deleted: null };
     if (typeof sdkSessionImportService?.deleteSession !== 'function') return { deleted: null };
     try {
       await withDeadline(
@@ -2399,7 +2406,14 @@ export function registerSessionsRoutes(app, deps) {
       );
       return { deleted: true };
     } catch (error) {
-      console.warn(`[delete] Copilot session ${shortId(sdkSessionId)} was not deleted: ${error?.message || error}`);
+      const reason = String(error?.message || error);
+      if (/Session file not found/i.test(reason)) {
+        // The runtime keeps no session for it, only this session's own
+        // folder (a run that never wrote its session file): nothing to retry.
+        if (sessionDir) fs.rmSync(sessionDir, { recursive: true, force: true });
+        return { deleted: sessionDir ? true : null };
+      }
+      console.warn(`[delete] Copilot session ${shortId(sdkSessionId)} was not deleted: ${reason}`);
       enqueueSdkDeleteRequest(sdkSessionId, conversationId);
       return { deleted: false, queued: true };
     }
@@ -2408,12 +2422,19 @@ export function registerSessionsRoutes(app, deps) {
   /** The conversation's CLI-side session, per provider; null where the relay keeps none. */
   async function deleteCliSession({ conversation, conversationId, sdkSessionId, runtimeSession }) {
     const provider = String(runtimeSession?.provider_type || '').trim().toLowerCase();
-    if (provider === 'claude') return deleteClaudeCliSession({ conversation, runtimeSession });
-    if (!sdkSessionId) return { deleted: null };
-    if (!provider || provider === 'github' || provider === 'openai') {
-      return deleteCopilotCliSession({ sdkSessionId, conversationId });
+    try {
+      if (provider === 'claude') return deleteClaudeCliSession({ conversation, runtimeSession });
+      if (!sdkSessionId) return { deleted: null };
+      if (!provider || provider === 'github' || provider === 'openai') {
+        return await deleteCopilotCliSession({ sdkSessionId, conversationId });
+      }
+      return { deleted: null };
+    } catch (error) {
+      // The conversation is already tombstoned: a file the OS will not let go
+      // of must not leave it half deleted.
+      console.warn(`[delete] CLI session of ${shortId(conversationId)} was not deleted: ${error?.message || error}`);
+      return { deleted: false };
     }
-    return { deleted: null };
   }
 
   function finalizeDeletedConversationsForSdkSession(sdkSessionId) {

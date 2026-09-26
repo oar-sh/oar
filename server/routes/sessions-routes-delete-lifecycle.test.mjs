@@ -177,7 +177,7 @@ function setup(state = {}) {
     },
     sdkSessionImportService: state.sdkSessionImportService || null,
     resolveClaudeSessionRoot: state.resolveClaudeSessionRoot || null,
-    resolveSessionStateRoot: () => path.join(os.tmpdir(), 'oar-delete-lifecycle-state'),
+    resolveSessionStateRoot: () => state.sessionStateRoot || path.join(os.tmpdir(), 'oar-delete-lifecycle-state'),
     markSharedViewerPresence: () => ({ ok: true, watcherCount: 0 }),
     getSharedWatcherCount: () => 0,
     statusEventService: { recordSharedAccess: () => ({ event: null }) },
@@ -192,6 +192,15 @@ function setup(state = {}) {
 }
 
 const deletedRows = (events) => events.filter((event) => event.startsWith('sql:DELETE'));
+
+async function withTmpDir(run) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-delete-lifecycle-'));
+  try {
+    return await run(tmp);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
 
 test('a running turn blocks the delete, and nothing is touched', async () => {
   const { del, events } = setup({
@@ -336,31 +345,128 @@ test('a Claude conversation loses its transcript and session folder, and only th
   }
 });
 
-test('a Copilot conversation\'s session is deleted through the runtime', async () => {
-  const deleted = [];
+test('a CLI session that cannot be removed does not leave the conversation half deleted', async () => {
   const { del, events } = setup({
-    runtimeSession: { provider_type: 'github' },
-    sdkSessionImportService: { deleteSession: async (sid) => { deleted.push(sid); } },
-  });
-  const response = await del();
-  assert.equal(response.statusCode, 200);
-  assert.equal(response.body.cliSessionDeleted, true);
-  assert.deepEqual(deleted, ['sdk-1']);
-  assert.ok(events.includes('cleared-sdk-delete:sdk-1'));
-  assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
-});
-
-test('a Copilot session the runtime cannot delete goes on the SDK delete queue, and the conversation is still deleted', async () => {
-  const { del, events } = setup({
-    runtimeSession: { provider_type: 'github' },
-    sdkSessionImportService: { deleteSession: async () => { throw new Error('runtime unavailable'); } },
+    conversation: { sdk_session_id: 'conv-1' },
+    runtimeSession: { provider_type: 'claude', claude_native_session_id: 'native-abc' },
+    resolveClaudeSessionRoot: () => { throw new Error('EBUSY: resource busy or locked'); },
   });
   const response = await del();
   assert.equal(response.statusCode, 200);
   assert.equal(response.body.cliSessionDeleted, false);
-  assert.ok(events.includes('queued-sdk-delete:sdk-1:conv-1'));
-  assert.ok(!events.includes('cleared-sdk-delete:sdk-1'));
   assert.ok(events.includes('sql:DELETE FROM conversations'));
+  assert.ok(events.includes('emit:conversation_deleted:conv-1'));
+});
+
+test('a Copilot conversation\'s session is deleted through the runtime', async () => {
+  await withTmpDir(async (stateRoot) => {
+    fs.mkdirSync(path.join(stateRoot, 'sdk-1'));
+    const deleted = [];
+    const { del, events } = setup({
+      sessionStateRoot: stateRoot,
+      runtimeSession: { provider_type: 'github' },
+      sdkSessionImportService: {
+        deleteSession: async (sid) => {
+          deleted.push(sid);
+          fs.rmSync(path.join(stateRoot, sid), { recursive: true });
+        },
+      },
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.cliSessionDeleted, true);
+    assert.deepEqual(deleted, ['sdk-1']);
+    assert.ok(events.includes('cleared-sdk-delete:sdk-1'));
+    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
+  });
+});
+
+test('a Copilot conversation deleted before its first turn has no CLI session to delete', async () => {
+  await withTmpDir(async (stateRoot) => {
+    const deleted = [];
+    const { del, events } = setup({
+      sessionStateRoot: stateRoot,
+      runtimeSession: { provider_type: 'github' },
+      sdkSessionImportService: { deleteSession: async (sid) => { deleted.push(sid); } },
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.cliSessionDeleted, null);
+    // Asking would only get "Session file not found" back.
+    assert.deepEqual(deleted, []);
+    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
+    assert.ok(events.includes('sql:DELETE FROM conversations'));
+  });
+});
+
+test('a session folder the runtime keeps no session file for is removed directly', async () => {
+  await withTmpDir(async (stateRoot) => {
+    const sessionDir = path.join(stateRoot, 'sdk-1');
+    const otherSessionDir = path.join(stateRoot, 'sdk-2');
+    fs.mkdirSync(path.join(sessionDir, 'files'), { recursive: true });
+    fs.mkdirSync(otherSessionDir);
+    const { del, events } = setup({
+      sessionStateRoot: stateRoot,
+      runtimeSession: { provider_type: 'github' },
+      sdkSessionImportService: {
+        deleteSession: async (sid) => { throw new Error(`Failed to delete session ${sid}: Session file not found for ${sid}`); },
+      },
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.cliSessionDeleted, true);
+    assert.equal(fs.existsSync(sessionDir), false);
+    assert.equal(fs.existsSync(otherSessionDir), true, 'another session stays');
+    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
+  });
+});
+
+test('a Copilot session the runtime cannot delete goes on the SDK delete queue, and the conversation is still deleted', async () => {
+  // A runtime that is itself "not found" is no answer about the session.
+  const failures = [
+    'runtime unavailable',
+    'Copilot SDK runtime not found (a compatible version). Install Copilot CLI or configure sdkPath and cliPath.',
+  ];
+  for (const failure of failures) {
+    await withTmpDir(async (stateRoot) => {
+      const sessionDir = path.join(stateRoot, 'sdk-1');
+      fs.mkdirSync(sessionDir);
+      const { del, events } = setup({
+        sessionStateRoot: stateRoot,
+        runtimeSession: { provider_type: 'github' },
+        sdkSessionImportService: { deleteSession: async () => { throw new Error(failure); } },
+      });
+      const response = await del();
+      assert.equal(response.statusCode, 200, failure);
+      assert.equal(response.body.cliSessionDeleted, false, failure);
+      assert.ok(events.includes('queued-sdk-delete:sdk-1:conv-1'), failure);
+      assert.ok(!events.includes('cleared-sdk-delete:sdk-1'), failure);
+      assert.ok(events.includes('sql:DELETE FROM conversations'), failure);
+      assert.equal(fs.existsSync(sessionDir), true, `left for the queue: ${failure}`);
+    });
+  }
+});
+
+test('a session id that is not a plain folder name is never joined into a path', async () => {
+  await withTmpDir(async (tmp) => {
+    const stateRoot = path.join(tmp, 'session-state');
+    const outside = path.join(tmp, 'outside');
+    fs.mkdirSync(stateRoot);
+    fs.mkdirSync(outside);
+    const { del, events } = setup({
+      sessionStateRoot: stateRoot,
+      conversation: { sdk_session_id: '../outside' },
+      runtimeSession: { provider_type: 'github' },
+      sdkSessionImportService: {
+        deleteSession: async (sid) => { throw new Error(`Session file not found for ${sid}`); },
+      },
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.cliSessionDeleted, null);
+    assert.equal(fs.existsSync(outside), true);
+    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
+  });
 });
 
 test('a session another live conversation shares keeps its worker and CLI session', async () => {
