@@ -492,9 +492,21 @@ export function createClaudeSessionRunner({
   // spawn await in between); counted so a second delivery arriving in that
   // gap is held instead of racing the first into the CLI.
   let admittingDeliveries = 0;
-  // True from adaptProcess's first control request until the delivery it
-  // serves is registered in pendingDelivered (see the init handler).
-  let settingsReinitExpected = false;
+  // Settings re-inits (see the init handler). The window opens at
+  // adaptProcess's first control request — never when nothing changes — and
+  // closes when the delivery it serves is registered in pendingDelivered; the
+  // count is how many bare inits inside it are our own. A count, not a flag:
+  // a continuation the CLI opens inside the same window inits the same way,
+  // and ignoring every init there swallowed its boundary and swapped its
+  // answer with the delivered one. Over-counting (a request that never
+  // re-inits) only degrades to that. Some CLI paths merely mark the init
+  // stale and re-init when the pushed input is dequeued; that init lands
+  // after the window, in the delivered-row branch. Known gap: when that
+  // happens AND a continuation inits inside the window, the continuation's
+  // init is taken for ours and its answer attaches to the delivered row —
+  // the same misattribution as a continuation whose init follows the push.
+  let settingsReinitsOwed = 0;
+  let settingsWindowOpen = false;
   let lastReportedDeliveryReady = true;
   // Rows whose prompt the CLI consumed and whose settle marker is being saved
   // (id → relay message). Runner-level, not per process: a process dying
@@ -1256,6 +1268,7 @@ export function createClaudeSessionRunner({
     if (proc && proc.activeCtx === ctx) {
       proc.activeCtx = null;
       proc.lastBoundary = null;
+      proc.settleSeqAtTurnEnd = proc.taskSettleSeq;
     }
   }
 
@@ -1928,14 +1941,20 @@ export function createClaudeSessionRunner({
       // of the async stream consumer), so it is correctly excluded here.
       //
       if (!proc.activeCtx && !proc.pendingDelivered.length) {
-        // Not when a settings change is in flight: setModel /
+        // Not a re-init a settings change caused: setModel /
         // setPermissionMode / applyFlagSettings make the CLI re-init (live
         // probe, CLI 2.1.281), and adaptProcess issues them BEFORE the
         // delivery they belong to is registered and pushed. Reading that
         // init as self-opened routed the whole answer to a continuation row
         // and stranded the delivered message (conv dad758cd, 2026-09-25,
-        // right after a /model switch).
-        if (!settingsReinitExpected) proc.lastBoundary = 'self-opened';
+        // right after a /model switch). Inside that window an init beyond the
+        // ones owed is a continuation only if a task settled since the last
+        // turn ended — a stray extra re-init must not strand the delivery the
+        // same way.
+        if (settingsReinitsOwed > 0) settingsReinitsOwed -= 1;
+        else if (!settingsWindowOpen || proc.taskSettleSeq !== proc.settleSeqAtTurnEnd) {
+          proc.lastBoundary = 'self-opened';
+        }
       } else if (!proc.activeCtx && !firstInit) {
         // A LATER init, with a delivered row waiting, is the CLI opening a turn
         // of its own — the live-verified continuation shape is a bare init with
@@ -2783,6 +2802,9 @@ export function createClaudeSessionRunner({
       taskSettledAt: 0,
       // Bumped by every task-settle signal; the Stop guard compares it.
       taskSettleSeq: 0,
+      // taskSettleSeq when the last turn ended: a settle since then is what
+      // makes an unowed init inside a settings window a continuation.
+      settleSeqAtTurnEnd: 0,
       lastApiRetryAt: 0,
       tasksExpired: false,
       tasksExpiredAt: 0,
@@ -2899,6 +2921,11 @@ export function createClaudeSessionRunner({
     return processRef;
   }
 
+  function expectSettingsReinit() {
+    settingsReinitsOwed += 1;
+    settingsWindowOpen = true;
+  }
+
   async function adaptProcess(message) {
     const relayMode = message.relayMode || 'agent';
     const model = resolvePerTurnModel(message);
@@ -2924,6 +2951,7 @@ export function createClaudeSessionRunner({
 
     const permissionMode = permissionModeForRelayMode(relayMode);
     if (permissionMode !== proc.permissionMode) {
+      expectSettingsReinit();
       await Promise.resolve(proc.turn.setPermissionMode?.(permissionMode)).catch((error) => {
         dbg('setPermissionMode failed', error?.message || String(error));
       });
@@ -2942,6 +2970,7 @@ export function createClaudeSessionRunner({
     // (model '') keeps whatever the CLI chose.
     const repinAfterFallback = Boolean(proc.modelFallback) && Boolean(model);
     if (model !== proc.model || repinAfterFallback) {
+      expectSettingsReinit();
       await Promise.resolve(proc.turn.setModel?.(model || undefined)).catch((error) => {
         dbg('setModel failed', error?.message || String(error));
       });
@@ -2953,6 +2982,7 @@ export function createClaudeSessionRunner({
       // session-scoped ultracode/enableWorkflows flags (with the effort pinned
       // to the xhigh the flag implies); every other change clears those flags
       // alongside the new effortLevel.
+      expectSettingsReinit();
       await Promise.resolve(proc.turn.applyFlagSettings?.(claudeUltracodeFlagSettings(effort))).catch((error) => {
         dbg('applyFlagSettings effort failed', error?.message || String(error));
       });
@@ -2963,6 +2993,7 @@ export function createClaudeSessionRunner({
     // be pushed too or clearing the slider would never take effect.
     const autoCompactWindow = normalizeAutoCompactWindow(getAutoCompactWindow());
     if (autoCompactWindow !== proc.autoCompactWindow) {
+      expectSettingsReinit();
       await Promise.resolve(proc.turn.applyFlagSettings?.(claudeAutoCompactFlagSettings(autoCompactWindow))).catch((error) => {
         dbg('applyFlagSettings autoCompactWindow failed', error?.message || String(error));
       });
@@ -2980,6 +3011,7 @@ export function createClaudeSessionRunner({
         // Enabling applies live. The display MUST be re-sent afterwards, in
         // this order: a session spawned with thinking off carries no display
         // mode, so enabling without it yields visible-but-empty thinking.
+        expectSettingsReinit();
         await Promise.resolve(proc.turn.applyFlagSettings?.(claudeThinkingFlagSettings(true))).catch((error) => {
           dbg('applyFlagSettings thinkingEnabled failed', error?.message || String(error));
         });
@@ -2997,6 +3029,7 @@ export function createClaudeSessionRunner({
       }
     }
     if (thinkingDisplay !== proc.thinkingDisplay || reassertDisplay) {
+      expectSettingsReinit();
       await applyThinkingDisplay(proc.turn, thinkingDisplay, { budget: proc.thinkingBudget, dbg });
       proc.thinkingDisplay = thinkingDisplay;
     }
@@ -3162,7 +3195,6 @@ export function createClaudeSessionRunner({
       // lost — the steered message's own model/mode intent applies from the
       // next turn on, same as Claude Code.
       if (proc && !proc.closing && !proc.aborted && !proc.activeCtx) {
-        settingsReinitExpected = true;
         await adaptProcess(message);
       }
       if (!proc || proc.closing || proc.aborted) {
@@ -3213,7 +3245,8 @@ export function createClaudeSessionRunner({
           : content;
         procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now(), steered });
         // Registered: from here a later init takes the delivered-row branch.
-        settingsReinitExpected = false;
+        settingsReinitsOwed = 0;
+        settingsWindowOpen = false;
         try {
           procRef.turn.pushUserMessage(pushedContent);
         } catch (pushError) {
@@ -3239,7 +3272,8 @@ export function createClaudeSessionRunner({
       throw new Error('claude session process closed while accepting the message');
     } catch (error) {
       endAdmission();
-      settingsReinitExpected = false;
+      settingsReinitsOwed = 0;
+      settingsWindowOpen = false;
       const errorText = String(error?.message || error || 'unknown error');
       dbg('claude turn failed', message.id, errorText);
       await publisher.publishTurnException({ message, errorText });

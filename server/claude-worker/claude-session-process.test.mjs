@@ -5678,3 +5678,125 @@ test('a settings re-init before the push still attributes the turn to the delive
   turn.endInput();
   await settled(runner);
 });
+
+/**
+ * q-1 starts a background task and ends; the task settles between turns. The
+ * returned turn's setModel runs `onSetModel` (the CLI's answer to the control
+ * request) and then gives the stream consumer time to drain it, so every init
+ * it emits is consumed before the push that follows.
+ */
+async function settledTaskBeforeModelSwitch({ onSetModel, settle = true }) {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+  turn.setModel = async () => {
+    onSetModel(turn);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+  turn.applyFlagSettings = async () => {
+    turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, model: 'claude-opus-5-5' } });
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-opus-5-5' });
+  turn.emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'e2e suite' }]));
+  turn.emit(resultMessage('Started; I will be notified.', 'native-1'));
+  assert.equal(await first, true);
+  if (settle) {
+    turn.emit(backgroundTasksMessage([]));
+    turn.emit(taskNotificationMessage('bash-1'));
+  }
+  return { stub, turn, runner };
+}
+
+function boundedSettle(promise, label) {
+  return Promise.race([
+    promise,
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`${label} never settled`)), 5_000)),
+  ]);
+}
+
+test('a continuation opening inside a settings change keeps its own answer', async () => {
+  // Regression from the settings-re-init fix: a task settled between turns,
+  // and the CLI answered the next delivery's setModel with its re-init AND
+  // opened the continuation's turn before the push. Ignoring every bare init
+  // while a settings change was in flight swallowed the continuation's
+  // boundary, so its answer attached to the delivered row and the user's own
+  // answer then published on a synthetic continuation row.
+  const { stub, turn, runner } = await settledTaskBeforeModelSwitch({
+    onSetModel: (t) => {
+      t.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+      t.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+    },
+  });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'after the model switch', model: 'claude-fable-5-1' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('continuation answer'));
+  turn.emit(resultMessage('continuation answer', 'native-1'));
+  // Whichever row it lands on, the first answer publishes before the CLI's
+  // next turn starts (that turn is a model round-trip away).
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.text === 'continuation answer'),
+    { label: 'first answer published' },
+  );
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+  turn.emit(assistantText('user answer'));
+  turn.emit(resultMessage('user answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+
+  const continuation = await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  assert.equal(continuation.body.text, 'continuation answer');
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(response.body.text, 'user answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a settings re-init after a task settled between turns still belongs to the delivery', async () => {
+  // The dad758cd shape with a settle in front of it: the CLI folds the
+  // notification into the user's turn, so the only bare init is the one the
+  // setModel caused. A settle alone must not turn it into a continuation.
+  const { stub, turn, runner } = await settledTaskBeforeModelSwitch({
+    onSetModel: (t) => t.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' }),
+  });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'after the model switch', model: 'claude-fable-5-1' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('user answer'));
+  turn.emit(resultMessage('user answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(response.body.text, 'user answer');
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('one re-init per settings request is expected, not only the first', async () => {
+  // Model and effort both change: setModel and applyFlagSettings each make
+  // the CLI re-init. With no task settled, neither may open a continuation.
+  const { stub, turn, runner } = await settledTaskBeforeModelSwitch({
+    settle: false,
+    onSetModel: (t) => t.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' }),
+  });
+
+  const second = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', text: 'after the switch', model: 'claude-fable-5-1', reasoningEffort: 'high' },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('user answer'));
+  turn.emit(resultMessage('user answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(response.body.text, 'user answer');
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length, 0);
+  turn.endInput();
+  await settled(runner);
+});
