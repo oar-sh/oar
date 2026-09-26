@@ -139,7 +139,7 @@ test('the model\'s own multi_select flag wins over the wording; a one-choice car
 });
 
 test('a question with no choices always allows free text', async () => {
-  const api = makeRelay({ answerWith: 'Simon' });
+  const api = makeRelay({ answerWith: 'Alex' });
   const bridge = makeBridge(api);
 
   const result = await bridge.askUserInput({ question: 'what is your name?', choices: null, allowFreeform: false });
@@ -148,7 +148,7 @@ test('a question with no choices always allows free text', async () => {
   // request's own flag is overridden rather than obeyed.
   assert.equal(api.created().allowFreeform, true);
   assert.equal(result.wasFreeform, true);
-  assert.equal(result.answer, 'Simon');
+  assert.equal(result.answer, 'Alex');
 });
 
 test('an unanswered card returns the continuation text and says it timed out', async () => {

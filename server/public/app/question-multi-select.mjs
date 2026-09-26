@@ -9,7 +9,7 @@
 //    wording ("select all that apply").
 //  - `allowMultiSelect: true` — the provider cannot always tell (Copilot), so
 //    the card offers a "Select several" switch. Claude cards never carry it:
-//    they follow Claude's flag strictly (Simon, 2026-09-25).
+//    they follow Claude's flag strictly (maintainer decision, 2026-09-25).
 // A multi-select card offers checkmarks and one "Reply with selection"; the
 // answer is the selected labels joined with ", " — plus whatever the user
 // typed as an extra answer — which is Claude's own multi-select answer format.

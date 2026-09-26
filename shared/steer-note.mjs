@@ -9,7 +9,7 @@
 // the user says otherwise. Only the model sees it: the relay stores and shows
 // the user's own text.
 //
-// Shared by the Claude and Copilot SDK workers (Simon, 2026-09-25: both).
+// Shared by the Claude and Copilot SDK workers (maintainer decision, 2026-09-25: both).
 
 // Worded to stay true whether the runtime folds the message into the running
 // turn or runs it as a turn of its own after that one finished: "if not

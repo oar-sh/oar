@@ -2,7 +2,7 @@ import { tokenLabel } from './context-tier-options.mjs';
 
 /**
  * The composer placeholder, decided by the MODEL FAMILY of the current
- * selection (Simon's rule: the hint names who answers, whatever runtime serves
+ * selection (maintainer's rule: the hint names who answers, whatever runtime serves
  * it — claude-* through Cursor's catalog still reads "Message Claude…").
  * Provider only breaks ties: Auto/empty follows the conversation's bound
  * provider, unknown families on the OpenAI BYOK provider read OpenAI, and

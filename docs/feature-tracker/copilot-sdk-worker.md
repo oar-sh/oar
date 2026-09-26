@@ -12,7 +12,7 @@ remains the default and is untouched; this file tracks the SDK engine only.
 **Status:** implemented (phases 0–4), **burn-in in progress**. **Default engine is SDK** as of
 2026-09-07 (hardening Phase 6): an unset `copilot_engine` reads as `sdk` when the relay can run
 it, falling back to `extension` when no Copilot CLI resolves or session-worker routing is off —
-the same guard the save path enforces. Both of Simon's relays run `sdk` by explicit setting.
+the same guard the save path enforces. Both maintainer relays run `sdk` by explicit setting.
 Burn-in finding #2 (self-initiated turns were dropped; live session `10a1a9ad`, 2026-08-31) is fixed
 worker-side, and `/api/continuation-turn` accepts `github`/`openai` alongside `claude`
 (`CONTINUATION_PROVIDER_TYPES`, `server/routes/messages-routes.mjs`), so self-initiated turns are
