@@ -94,7 +94,8 @@ All notable changes to OAR are documented here. The format follows
   **Cancel**) and steers into the turn once the card is answered or the
   compaction ends. Stopping lives where the work is: the running reply's bubble
   carries **Stop**, and queued messages carry **Cancel** until they are picked
-  up.
+  up. The label follows the worker within about a second, including right
+  after a worker starts or the relay restarts.
 - Queued messages are claimed strictly in send order, including messages that
   went through a delivery retry. Previously a retried message could starve
   behind newer ones for minutes in an active conversation, or run after them
@@ -119,7 +120,9 @@ All notable changes to OAR are documented here. The format follows
   next message: the Claude CLI re-initialises after such a change, and the
   worker took that for a turn it opened on its own, so the reply landed on
   a *continuation* row while the message itself stayed processing with an
-  empty Stop bubble (until the session was killed).
+  empty Stop bubble (until the session was killed). A background task's reply
+  that arrives during such a switch still gets its own row instead of
+  trading places with the message's reply.
 - A steered message could wedge its conversation indefinitely when a
   long-running (or hung) background task was alive: the merge settle waited for
   a full idle that never came, keeping every later message stuck behind it.
