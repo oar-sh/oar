@@ -1507,6 +1507,39 @@
     padding: 4px 0;
   }
   .thinking-bubble-header:empty { display: none; margin-bottom: 0; }
+  /* Follow buttons (thinking-follow.js): 💭 thoughts, 📃 answer, 🛠️ tools.
+     Chips on the right of the header, Stop stays left; the armed one gets
+     the accent ring. */
+  .thinking-follow-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    margin-left: auto; /* right edge even when there is no Stop button */
+  }
+  .thinking-follow-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 30px;
+    height: 26px;
+    padding: 0 6px;
+    font-size: var(--fs-meta-md);
+    line-height: 1;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+  }
+  .thinking-follow-btn:hover { background: rgba(127, 127, 127, 0.12); }
+  .thinking-follow-btn.active,
+  .thinking-follow-btn[aria-pressed="true"] {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+  }
   .bubble-action-btn {
     display: inline-flex;
     align-items: center;

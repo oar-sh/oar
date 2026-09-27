@@ -45,6 +45,8 @@ import {
   imageEditTarget,
   setImageEditTarget as setStoredImageEditTarget,
   getSessionWorkerState,
+  openSummaryModal,
+  closeSummaryModal,
 } from './store.js';
 import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
@@ -102,6 +104,16 @@ import {
   shouldApplyIncomingDraftToComposer,
 } from './conversation-draft-sync.mjs';
 import { isChatInteractionHeld, selectionIntersectsNode } from './selection-guard.mjs';
+import {
+  applyThinkingFollow,
+  getThinkingFollowMode,
+  initThinkingFollow,
+  observeThinkingBubble,
+  renderThinkingFollowButtonsHtml,
+  syncThinkingFollowButtons,
+  toggleThinkingFollowMode,
+  unobserveThinkingBubble,
+} from './thinking-follow.js';
 import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
 import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
@@ -1699,10 +1711,14 @@ export function showThinking(messageId = null, autoScroll = true) {
       stopBtn.classList.toggle('stopping', stopping);
     }
     anchorThinkingBubble(existing, nextMessageId || existing.dataset.messageId);
-    if (autoScroll) scrollBottom();
+    syncThinkingFollowButtons(existing, getThinkingFollowMode());
+    observeThinkingBubble(existing);
+    if (getThinkingFollowMode()) applyThinkingFollow();
+    else if (autoScroll) scrollBottom();
     return;
   }
   existing?.remove();
+  unobserveThinkingBubble();
   const div = document.createElement('div');
   div.className = 'msg assistant';
   div.id = 'thinking-indicator';
@@ -1712,9 +1728,12 @@ export function showThinking(messageId = null, autoScroll = true) {
   const stopBtnHtml = (!IS_SHARED_VIEW && nextMessageId)
     ? `<button type="button" class="bubble-action-btn${isCancelInFlight ? ' stopping' : ''}" data-action="stop-turn" data-message-id="${escHtml(nextMessageId)}"${isCancelInFlight ? ' disabled' : ''}>${isCancelInFlight ? 'Stopping…' : 'Stop'}</button>`
     : '';
+  // Stop stays left; the follow buttons (💭 thoughts, 📃 answer, 🛠️ tools)
+  // sit on the right. See thinking-follow.js.
+  const followBtnsHtml = renderThinkingFollowButtonsHtml(getThinkingFollowMode());
   div.innerHTML = `
     <div class="thinking-bubble">
-      <div class="thinking-bubble-header">${stopBtnHtml}</div>
+      <div class="thinking-bubble-header">${stopBtnHtml}${followBtnsHtml}</div>
       <details id="thinking-thoughts" class="thinking-thoughts-panel" open>
         <summary>💭 Thoughts</summary>
         <div class="thinking-thoughts-list"></div>
@@ -1727,13 +1746,47 @@ export function showThinking(messageId = null, autoScroll = true) {
   anchorThinkingBubble(div, nextMessageId);
   renderThinkingThoughts();
   renderThinkingStream();
-  if (autoScroll) scrollBottom();
+  observeThinkingBubble(div);
+  if (getThinkingFollowMode()) applyThinkingFollow();
+  else if (autoScroll) scrollBottom();
 }
 
 export function removeThinking() {
   thinkingMessageId = null;
   lastInFlightSnapshotKey = '';
+  unobserveThinkingBubble();
   document.getElementById('thinking-indicator')?.remove();
+}
+
+// Stop is one tap away on a sticky header, so a stray touch must not kill a
+// long turn: confirm first, then run the existing stop path.
+function openStopTurnConfirmation(conversationId, messageId) {
+  const convId = String(conversationId || '').trim();
+  const id = String(messageId || '').trim();
+  if (!convId || !id) return;
+  if (bubbleCancelInFlight.has(id)) return;
+  openSummaryModal({
+    title: 'Stop this turn?',
+    subtitle: 'The agent stops after its current step',
+    kind: 'stop-turn',
+    bodyHtml: `
+      <p>Stop the running turn? Work already done stays; anything the agent was about to do is cut short.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn danger-btn" type="button" data-stop-turn-confirm="1">⏹ Stop turn</button>
+        <button class="chat-title-action-btn" type="button" data-stop-turn-cancel="1">Keep running</button>
+      </div>
+    `,
+  });
+  const body = document.getElementById('summary-modal-body');
+  body?.querySelector('[data-stop-turn-confirm]')?.addEventListener('click', (event) => {
+    event.preventDefault();
+    closeSummaryModal();
+    void stopTurnByMessageId(convId, id);
+  }, { once: true });
+  body?.querySelector('[data-stop-turn-cancel]')?.addEventListener('click', (event) => {
+    event.preventDefault();
+    closeSummaryModal();
+  }, { once: true });
 }
 
 export function collapseThinkingThoughts() {
@@ -2919,7 +2972,7 @@ function runRelayErrorCta(cta) {
 }
 
 function handleBubbleActionClick(event) {
-  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn');
+  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn, .thinking-follow-btn');
   if (!btn) return;
   const action = btn.dataset.action;
   const messageId = btn.dataset.messageId;
@@ -2944,7 +2997,15 @@ function handleBubbleActionClick(event) {
   if (action === 'stop-turn' && messageId) {
     event.preventDefault();
     event.stopPropagation();
-    void stopTurnByMessageId(currentConvId, messageId);
+    openStopTurnConfirmation(currentConvId, messageId);
+  }
+
+  if (action === 'follow-thinking') {
+    event.preventDefault();
+    event.stopPropagation();
+    const mode = toggleThinkingFollowMode(currentConvId, btn.dataset.follow);
+    syncThinkingFollowButtons(document, mode);
+    if (mode) applyThinkingFollow({ force: true });
   }
 
   if (action === 'cancel-queued' && messageId) {
@@ -2997,6 +3058,7 @@ export function initBubbleActionHandlers() {
   if (!messagesEl) return;
   messagesEl.addEventListener('click', handleBubbleActionClick);
   messagesEl.addEventListener('click', handleEmbeddedImageClick);
+  initThinkingFollow({ getCurrentConversationId: () => currentConvId });
 }
 
 export function appendMessage(msg, scroll = true, msgId = null, force = false, insertAfterId = null, trackHistory = true) {
