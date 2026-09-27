@@ -5,6 +5,12 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.5] — 2026-09-27
+
+Highlights: a Claude reply on the wrong row no longer blocks the conversation,
+workers on Windows write a log, and agents can set the effort of a session on
+another relay.
+
 ### Added
 
 - **Remote relays**: an agent can set the reasoning effort of a session it starts or

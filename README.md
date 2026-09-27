@@ -78,7 +78,7 @@ curl -fsSL oar.sh/install | sh
 The script checks for Node.js 22.13 or newer, runs `npm install -g @oar-sh/oar`, and then hands off to `oar setup` (with `--defaults` when there is no terminal to ask questions in). It refuses to run as root, because OAR installs per user. `OAR_VERSION=x.y.z` pins a version, `OAR_CHANNEL=beta` follows the beta channel, and `OAR_DRY_RUN=1` only prints what it would do:
 
 ```bash
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.4 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.5 sh
 ```
 
 Read it before you run it: [oar.sh/install](https://oar.sh/install).
@@ -89,7 +89,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.4'` before the command.
+The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.5'` before the command.
 
 ### npm
 
@@ -325,6 +325,13 @@ The composer's model picker is the union of every enabled provider's catalog, fi
 Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
 
 ## Highlights
+
+### New in 0.9.5
+
+- **A misplaced Claude reply no longer blocks the conversation**: when a reply is published as a *background continuation* instead of under your message, the message closes after about 45 seconds of silence with a small note naming that reply, and the next message runs normally. It used to hold every later message for up to 5 minutes.
+- **Effort for remote sessions**: an agent can set the reasoning effort of a session it starts or prompts on another relay; a new session takes the calling session's effort when the model there supports it. See [Remote relays](#remote-relays).
+- **Waiting on another relay is steadier**: the wait no longer stops at an interim answer while the remote agent goes on in a turn of its own, for example while its subagents work.
+- **Worker logs on Windows**: session workers now write the same `worker-<session>.log` as on Linux, in the relay's log directory, while the console window keeps showing the output.
 
 ### New in 0.9.4
 
