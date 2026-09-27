@@ -88,4 +88,5 @@ Do not consider relay-related work complete until restart + status + log checks 
 - When in doubt, always ask before committing.
 - Never push without explicit user instruction.
 - Work happens on a topic branch (`dev/<topic>`) that is pushed to the private remote `work`, never to `origin`. `main` is the only branch the public repository receives, and it only moves through `npm run land`, which squashes the branch into one commit after the hygiene guard, the unit suite and the end-to-end suite passed. Never use `git push --no-verify`. See `DEVELOPING.md`, "Branches and landing".
+- Never run `git reflog expire --all` or `git gc --prune` by hand: they can delete stashes. `node scripts/prune-local.mjs` lists what a prune would remove, and only deletes with `--apply` after the user agreed.
 - Invent every name that goes into a fixture, comment, doc or commit message; never copy session titles, repository slugs, branch names, ticket ids, accounts or hosts from a live relay, a log or the machine.

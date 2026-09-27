@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { buildCommitMessage, findMessageLeaks, land, LandError, parseLandArgs } from './land.mjs';
+import { buildCommitMessage, findMessageLeaks, findWorktreeHolding, land, LandError, parseLandArgs } from './land.mjs';
 import { buildDenylistPatterns } from './hygiene-patterns.mjs';
 import { createSandbox, hasGit } from './git-test-helpers.mjs';
 
@@ -180,6 +180,53 @@ test('refuses to land while the git identity carries a private name', { skip: !h
     assert.equal(box.remoteGit(box.publicDir)('rev-parse', 'main'), base);
     assert.equal(run(buildDenylistPatterns(['acme-internal'])).pushed, false, 'a clean identity passes the check');
   } finally {
+    box.cleanup();
+  }
+});
+
+test('findWorktreeHolding names the other worktree that has the branch, never this one', () => {
+  const porcelain = [
+    'worktree /srv/work/demo',
+    'HEAD 1111111111111111111111111111111111111111',
+    'branch refs/heads/main',
+    '',
+    'worktree /srv/work/demo-topic',
+    'HEAD 2222222222222222222222222222222222222222',
+    'branch refs/heads/dev/topic',
+    '',
+    'worktree /srv/work/demo-detached',
+    'HEAD 3333333333333333333333333333333333333333',
+    'detached',
+  ].join('\n');
+  assert.equal(path.resolve(findWorktreeHolding(porcelain, 'refs/heads/main', '/srv/work/demo-topic')), path.resolve('/srv/work/demo'));
+  assert.equal(findWorktreeHolding(porcelain, 'refs/heads/main', '/srv/work/demo'), '', 'this checkout holding main is not a conflict');
+  assert.equal(findWorktreeHolding(porcelain, 'refs/heads/release', '/srv/work/demo'), '');
+});
+
+test('refuses up front when main is checked out in another worktree, before any gate runs', { skip: !hasGit() }, () => {
+  const box = createSandbox();
+  const topic = path.join(box.root, 'topic-worktree');
+  try {
+    const base = box.git('rev-parse', 'HEAD');
+    box.git('worktree', 'add', '-q', '-b', 'dev/topic', topic, 'main');
+    const inTopic = box.remoteGit(topic);
+    fs.writeFileSync(path.join(topic, 'feature.md'), 'done\n');
+    inTopic('add', '-A');
+    inTopic('commit', '-q', '-m', 'wip');
+    const gatesRun = [];
+    assert.throws(() => land({
+      cwd: topic,
+      message: 'Add the feature',
+      gates: [{ name: 'unit' }],
+      runGate: (gate) => { gatesRun.push(gate.name); return true; },
+      patterns: NO_PATTERNS,
+      identityPatterns: NO_PATTERNS,
+      log: quiet,
+    }), /main is checked out in another worktree/);
+    assert.deepEqual(gatesRun, [], 'no gate ran');
+    assert.equal(box.remoteGit(box.publicDir)('rev-parse', 'main'), base, 'nothing was published');
+  } finally {
+    try { box.git('worktree', 'remove', '--force', topic); } catch {}
     box.cleanup();
   }
 });

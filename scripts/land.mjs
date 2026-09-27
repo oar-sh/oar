@@ -65,6 +65,20 @@ export function buildCommitMessage({ message = '', body = '' } = {}) {
   return rest ? `${subject}\n\n${rest}\n` : `${subject}\n`;
 }
 
+/**
+ * Path of the worktree that has `ref` checked out, other than `self`.
+ * Input is the output of `git worktree list --porcelain`.
+ */
+export function findWorktreeHolding(porcelain, ref, self = '') {
+  const same = (a, b) => path.resolve(String(a)).toLowerCase() === path.resolve(String(b)).toLowerCase();
+  let current = '';
+  for (const line of String(porcelain || '').split(/\r?\n/)) {
+    if (line.startsWith('worktree ')) current = line.slice('worktree '.length).trim();
+    else if (line.trim() === `branch ${ref}` && current && !(self && same(current, self))) return current;
+  }
+  return '';
+}
+
 export function findMessageLeaks(text, patterns) {
   const hits = [];
   for (const line of String(text || '').split('\n')) {
@@ -123,6 +137,16 @@ export function land({
   if (branch === MAIN) throw new LandError(`you are on ${MAIN}; work happens on a topic branch (git switch -c dev/<topic>).`);
   if (git(['status', '--porcelain'])) {
     throw new LandError('the working tree has uncommitted changes; commit them on the branch first, so the gates test exactly what lands.');
+  }
+  // Landing ends by switching this checkout to main. git refuses that while
+  // another worktree has main checked out, and by then the commit would be
+  // published already. Say so before anything runs.
+  const elsewhere = findWorktreeHolding(git(['worktree', 'list', '--porcelain']), `refs/heads/${MAIN}`, git(['rev-parse', '--show-toplevel']));
+  if (elsewhere) {
+    throw new LandError(
+      `${MAIN} is checked out in another worktree (${elsewhere}). Land from that checkout instead: `
+      + `commit and push here, then run "git switch ${branch}" and the landing there.`,
+    );
   }
   const commitMessage = buildCommitMessage({ message, body });
   const leaks = findMessageLeaks(commitMessage, patterns || buildPublishPatterns());

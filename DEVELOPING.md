@@ -412,6 +412,11 @@ touched; the relay usually runs from this checkout. `--dry-run` does everything 
 
 One topic per branch: what lands is one commit, so its message has to describe one change.
 
+**Working in a separate worktree.** Landing ends by switching the checkout to `main`, so it has to
+run where `main` is not held by another worktree; it checks that first and says where to go.
+Commit and push in the worktree, remove it, then `git switch dev/<topic>` in the main checkout and
+land there.
+
 From PowerShell call the script directly, `node scripts/land.mjs -m "…" --body-file notes.txt`:
 npm's PowerShell shim swallows the `--` separator and then reads `--body-file` as its own option.
 The same goes for `node scripts/setup-git.mjs --work-url <url>`.
@@ -441,6 +446,21 @@ and the `gh` account. Every example in them is invented.
 Rewriting and force-pushing removes it from the branch, not from the host: the old commits remain
 fetchable by hash. Rewrite first, then ask the host's support to purge the unreachable commits and
 cached views, and treat any secret among them as compromised.
+
+Every clone that had the old commits keeps them too, held by its reflogs. Clean each one with:
+
+```bash
+node scripts/prune-local.mjs                  # lists what would be deleted, changes nothing
+node scripts/prune-local.mjs --list gone.txt  # the same, written to a file for review
+node scripts/prune-local.mjs --apply          # deletes; cannot be undone
+```
+
+Do **not** use `git reflog expire --expire=now --all` for this. It also empties the stash reflog,
+and every stash except the newest exists only there: they disappear from `git stash list` and the
+following `git gc` deletes them. The script expires every reflog except the stash's, in all
+worktrees of the repository. Besides the rewritten commits, a prune removes whatever else nothing
+refers to any more: commits of deleted branches, pre-rebase copies, and stashes dropped earlier.
+Read the list first.
 
 ## Tests
 

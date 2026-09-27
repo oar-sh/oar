@@ -45,6 +45,7 @@
     "test:e2e": "node tests/run-e2e.mjs",
     "setup:git": "node scripts/setup-git.mjs",
     "land": "node scripts/land.mjs",
+    "prune:local": "node scripts/prune-local.mjs",
     "test:e2e:raw": "node ./node_modules/@playwright/test/cli.js test --config tests/playwright.config.mjs"
   },
   "dependencies": {
