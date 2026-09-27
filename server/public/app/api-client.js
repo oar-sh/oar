@@ -876,6 +876,24 @@ export async function requestHostSuspend(body = {}) {
   });
 }
 
+export async function getHostSuspendState() {
+  return apiFetch('/api/host/suspend');
+}
+
+export async function cancelHostSuspend(body = {}) {
+  return apiFetch('/api/host/suspend/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ requestedBy: 'localhost-api', ...(body || {}) }),
+  });
+}
+
+export async function cancelRelayRestart(body = {}) {
+  return apiFetch('/api/relay/shutdown/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ requestedBy: 'localhost-api', ...(body || {}) }),
+  });
+}
+
 export async function requestQueueEmpty(body = {}) {
   return apiFetch('/api/queue/empty', {
     method: 'POST',

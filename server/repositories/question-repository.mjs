@@ -112,6 +112,9 @@ export function createQuestionRepository(db) {
           FROM subagent_runs
           WHERE queue_message_id = ? AND status = 'running'
         `),
+        countRunningSubagentRuns: db.prepare(`
+          SELECT COUNT(*) AS cnt FROM subagent_runs WHERE status = 'running'
+        `),
         closeRunningSubagentRunsByQueueMessage: db.prepare(`
           UPDATE subagent_runs
           SET status = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)

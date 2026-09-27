@@ -273,6 +273,12 @@ export function buildRelayServerEnv({
     GROK_STUB_SUCCESS_SENTINEL: grokLoginAuthorizedFile,
     GROK_STUB_FAILURE_SENTINEL: grokLoginDeniedFile,
 
+    // --- Host suspend -----------------------------------------------------
+    // A test relay must never actually sleep the developer's machine: the
+    // deferred suspend (tests/host-suspend.spec.mjs) logs instead of running
+    // SetSuspendState.
+    OAR_HOST_SUSPEND_DRY_RUN: "1",
+
     ...(disableCliSpawn ? { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: disableCliSpawn } : {}),
     ...overrides,
   };

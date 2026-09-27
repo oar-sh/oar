@@ -10,7 +10,7 @@
  * reports outcomes through the status-events store instead.
  */
 
-export const PUSH_EVENT_TYPES = Object.freeze(['question', 'turnComplete', 'turnFailed', 'board', 'cliOffline']);
+export const PUSH_EVENT_TYPES = Object.freeze(['question', 'turnComplete', 'turnFailed', 'board', 'cliOffline', 'hostSuspend']);
 
 export const VAPID_PUBLIC_KEY_SETTING = 'push_vapid_public_key';
 export const VAPID_PRIVATE_KEY_SETTING = 'push_vapid_private_key';
@@ -34,7 +34,12 @@ const EVENT_LABELS = Object.freeze({
   turnFailed: { title: 'Turn failed', generic: 'The agent turn failed.' },
   board: { title: 'Plan ready for review', generic: 'The agent posted a board for review.' },
   cliOffline: { title: 'CLI offline', generic: 'The relay lost its connection to the CLI host.' },
+  hostSuspend: { title: 'Host suspend', generic: 'The queued host suspend changed state.' },
 });
+
+// System events carry their own body: no conversation text to preview, and
+// the body is the message itself regardless of the preview preference.
+const SYSTEM_BODY_TYPES = new Set(['hostSuspend']);
 
 function clampInt(value, min, max, fallback) {
   const numeric = Number(value);
@@ -90,7 +95,9 @@ export function renderPushNotification(event, preferences) {
   let body = labels.generic;
   const text = String(event?.body || '').trim();
   // cliOffline has no conversation text to preview; the generic body is the message.
-  if (text && type !== 'cliOffline') {
+  if (text && SYSTEM_BODY_TYPES.has(type)) {
+    body = text.slice(0, MAX_FULL_PREVIEW_CHARS);
+  } else if (text && type !== 'cliOffline') {
     if (prefs.content.preview === 'full') {
       body = text.slice(0, MAX_FULL_PREVIEW_CHARS);
     } else if (prefs.content.preview === 'truncated') {
@@ -443,7 +450,12 @@ export function createPushDispatchService({
     return dispatch({ type: 'cliOffline' });
   }
 
+  function notifyHostSuspend({ body = null } = {}) {
+    return dispatch({ type: 'hostSuspend', body: body || null, data: { hostSuspendAt: Date.now() } });
+  }
+
   return {
+    notifyHostSuspend,
     listDevices,
     getDevice,
     upsertSubscription,

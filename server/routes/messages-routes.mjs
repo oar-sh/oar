@@ -1784,6 +1784,7 @@ export function registerMessagesRoutes(app, deps) {
     relayBridgeOwnerService,
     relayRestartOrchestrator,
     requestRelayShutdown,
+    cancelRelayShutdown = null,
     featureFlags,
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
@@ -6044,6 +6045,20 @@ export function registerMessagesRoutes(app, deps) {
       || String(rawRestart || '').trim().toLowerCase() === 'true'
       || String(rawRestart || '').trim() === '1';
     const result = requestRelayShutdown({ reason, requestedBy, restart });
+    return res.json({ ok: true, ...result });
+  });
+
+  // Withdraw a queued (not yet started) shutdown/restart. Same trust boundary
+  // as queueing one.
+  app.post('/api/relay/shutdown/cancel', auth, (req, res) => {
+    if (!isLoopbackRequest(req)) {
+      return res.status(403).json({ error: 'Relay shutdown endpoint is localhost-only' });
+    }
+    if (typeof cancelRelayShutdown !== 'function') {
+      return res.status(501).json({ error: 'Relay shutdown orchestration is unavailable' });
+    }
+    const requestedBy = String(req.body?.requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
+    const result = cancelRelayShutdown({ requestedBy });
     return res.json({ ok: true, ...result });
   });
 

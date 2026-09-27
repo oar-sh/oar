@@ -6,7 +6,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
-import { spawn } from 'child_process';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
@@ -684,26 +683,6 @@ function normalizeRequestedProviderType(value = '') {
 function isOpenAIImageModelId(model = '') {
   const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
   return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
-}
-
-function runHostSuspendToRam() {
-  if (process.platform !== 'win32') {
-    return { ok: false, statusCode: 501, error: 'Host suspend is only supported on Windows' };
-  }
-  try {
-    const child = spawn('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,0,0'], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
-    child.unref?.();
-    return {
-      ok: true,
-      command: 'rundll32.exe powrprof.dll,SetSuspendState 0,0,0',
-    };
-  } catch (error) {
-    return { ok: false, statusCode: 500, error: error?.message || 'Failed to launch host suspend command' };
-  }
 }
 
 function isPidAlive(pidValue) {
@@ -2105,6 +2084,9 @@ export function registerSessionsRoutes(app, deps) {
     windowsBootAutostartService,
     isSha256,
     uploadPathForSha,
+    hostSuspendService = null,
+    collectHostActivity = null,
+    hostSuspendPlatform = process.platform,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   // Generic synchronous transaction runner for the session-sync route: binding
@@ -5088,6 +5070,7 @@ export function registerSessionsRoutes(app, deps) {
       activeBridgeOwner: runtimeState.activeBridgeOwner || null,
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       relayShutdown: runtimeState.relayShutdown || null,
+      hostSuspend: runtimeState.hostSuspend || null,
       platform: process.platform,
       features: featureFlags || {},
       sessionWorker: sessionWorkerStatus,
@@ -6182,19 +6165,57 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
-  app.post('/api/host/suspend', auth, (req, res) => {
-    const result = runHostSuspendToRam();
-    if (!result?.ok) {
-      return res.status(result?.statusCode || 500).json({
-        ok: false,
-        error: result?.error || 'Failed to suspend host',
-      });
+  // Deferred host suspend: the request is queued and fulfilled by the
+  // host-suspend service once nothing runs any more (see
+  // docs/plans/2026-09-27-deferred-host-suspend.md).
+  app.get('/api/host/suspend', auth, (req, res) => {
+    if (!hostSuspendService) {
+      return res.status(501).json({ ok: false, error: 'Host suspend is unavailable' });
     }
+    const state = hostSuspendService.refresh();
+    let activity = null;
+    if (!state.pending && typeof collectHostActivity === 'function') {
+      try {
+        activity = collectHostActivity({ request: null });
+      } catch (error) {
+        activity = { blockers: [], error: String(error?.message || error) };
+      }
+    }
+    return res.json({
+      ok: true,
+      supported: hostSuspendPlatform === 'win32',
+      state,
+      blockers: state.pending ? state.blockers : (activity?.blockers || []),
+      activity,
+    });
+  });
+
+  app.post('/api/host/suspend', auth, (req, res) => {
+    if (!hostSuspendService) {
+      return res.status(501).json({ ok: false, error: 'Host suspend is unavailable' });
+    }
+    if (hostSuspendPlatform !== 'win32') {
+      return res.status(501).json({ ok: false, error: 'Host suspend is only supported on Windows' });
+    }
+    const reason = String(req.body?.reason || 'manual-suspend').trim().slice(0, 140) || 'manual-suspend';
+    const requestedBy = String(req.body?.requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
+    const result = hostSuspendService.request({ reason, requestedBy });
     return res.status(202).json({
       ok: true,
       queued: true,
-      command: result.command,
+      accepted: result.accepted !== false,
+      alreadyPending: !!result.alreadyPending,
+      state: result.state,
     });
+  });
+
+  app.post('/api/host/suspend/cancel', auth, (req, res) => {
+    if (!hostSuspendService) {
+      return res.status(501).json({ ok: false, error: 'Host suspend is unavailable' });
+    }
+    const requestedBy = String(req.body?.requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
+    const result = hostSuspendService.cancel({ requestedBy });
+    return res.json({ ok: true, cancelled: !!result.cancelled, state: result.state });
   });
 
   app.get('/api/restart-orchestrator', auth, (req, res) => {

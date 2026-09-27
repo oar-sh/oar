@@ -5,16 +5,26 @@ import {
   openSummaryModal,
   closeSummaryModal,
   setSummaryModalLoading,
+  renderSummaryModalContent,
+  summaryModalState,
   showTransientRelayNotice,
 } from './store.js';
 import {
   killSessionWorker,
   requestRelayRestart,
   requestHostSuspend,
+  getHostSuspendState,
+  cancelHostSuspend,
   requestQueueEmpty,
   refreshWorkspaceRootHints,
 } from './api-client.js';
 import { isSuspendHostActionVisible } from './settings-modal.js';
+import {
+  applyHostSuspendState,
+  describeHostSuspendBlocker,
+  formatCountdown,
+  isHostSuspendPending,
+} from './host-suspend-ui.js';
 
 let killSessionInFlight = false;
 let restartRelayInFlight = false;
@@ -129,22 +139,111 @@ export function openEmptyQueueConfirmation() {
   });
 }
 
+const SUSPEND_MODAL_KIND = 'suspend-host';
+
+/**
+ * Body of the Suspend host modal for one activity snapshot. Pure so the three
+ * shapes (idle, busy, already pending) are unit-testable without a DOM.
+ */
+export function renderSuspendHostModalBody({ state = null, blockers = [], supported = true } = {}) {
+  const list = Array.isArray(blockers) ? blockers : [];
+  const items = list.map((b) => `<li>${escHtml(describeHostSuspendBlocker(b))}</li>`).join('');
+  if (!supported) {
+    return `
+      <p>Host suspend is only available when the relay runs on Windows.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Close</button>
+      </div>`;
+  }
+  if (isHostSuspendPending(state)) {
+    const status = String(state?.status || '');
+    const countdown = status === 'countdown' ? formatCountdown(state.fireAt) : null;
+    const headline = status === 'suspending'
+      ? '<p>The host is suspending now.</p>'
+      : status === 'countdown'
+        ? `<p>Everything is idle. The host suspends in <strong>${escHtml(countdown || 'a moment')}</strong> unless you cancel.</p>`
+        : '<p>A suspend is already queued. The PC will not go to sleep until these finish, then after 2 minutes of quiet:</p>';
+    return `
+      ${headline}
+      ${items ? `<ul class="suspend-host-blockers">${items}</ul>` : ''}
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn danger-btn" type="button" onclick="cancelQueuedHostSuspend()"${status === 'suspending' ? ' disabled data-keep-disabled="1"' : ''}>Cancel queued suspend</button>
+        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Close</button>
+      </div>`;
+  }
+  if (!list.length) {
+    return `
+      <p>Put this PC to sleep?</p>
+      <p>Nothing is running. The host suspends <strong>30 seconds</strong> after you confirm; a banner with a countdown lets you cancel until then.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn" type="button" onclick="confirmSuspendHost()">💤 Suspend host</button>
+        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
+      </div>`;
+  }
+  return `
+    <p><strong>Agents are still active.</strong> The PC will not suspend until these finish, then after 2 minutes of quiet:</p>
+    <ul class="suspend-host-blockers">${items}</ul>
+    <p>You can cancel the queued suspend from the banner or this menu at any time.</p>
+    <div class="summary-modal-actions">
+      <button class="chat-title-action-btn" type="button" onclick="confirmSuspendHost()">💤 Suspend when idle</button>
+      <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
+    </div>`;
+}
+
+async function loadSuspendHostModal() {
+  const result = await getHostSuspendState();
+  if (summaryModalState.kind !== SUSPEND_MODAL_KIND) return;
+  if (!result?.ok) {
+    renderSummaryModalContent({
+      title: 'Suspend host',
+      subtitle: 'Suspend-to-RAM once agents are done',
+      kind: SUSPEND_MODAL_KIND,
+      refresh: loadSuspendHostModal,
+      bodyHtml: `
+        <div class="summary-error">Could not read what is running right now.</div>
+        <div class="summary-modal-actions">
+          <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Close</button>
+        </div>`,
+    });
+    return;
+  }
+  if (result.state) applyHostSuspendState(result.state);
+  renderSummaryModalContent({
+    title: 'Suspend host',
+    subtitle: isHostSuspendPending(result.state) ? 'Suspend queued' : 'Suspend-to-RAM once agents are done',
+    kind: SUSPEND_MODAL_KIND,
+    refresh: loadSuspendHostModal,
+    bodyHtml: renderSuspendHostModalBody({
+      state: result.state,
+      blockers: result.blockers,
+      supported: result.supported !== false,
+    }),
+  });
+}
+
 export function openSuspendHostConfirmation() {
-  if (!isSuspendHostActionVisible()) return;
+  if (!isSuspendHostActionVisible() && !isHostSuspendPending()) return;
   menuDeps.lockChatActionsMenuShield(350);
   menuDeps.closeChatActionsMenu();
   openSummaryModal({
     title: 'Suspend host',
-    subtitle: 'Requests suspend-to-RAM',
-    kind: 'suspend-host',
-    bodyHtml: `
-      <p>Put this PC to sleep now?</p>
-      <p>This requests suspend-to-RAM immediately.</p>
-      <div class="summary-modal-actions">
-        <button class="chat-title-action-btn" type="button" onclick="confirmSuspendHost()">💤 Suspend host</button>
-        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
-    `,
+    subtitle: 'Suspend-to-RAM once agents are done',
+    kind: SUSPEND_MODAL_KIND,
+    refresh: loadSuspendHostModal,
+    bodyHtml: '<div class="summary-loading">Checking what is still running…</div>',
+  });
+  setSummaryModalLoading(true);
+  loadSuspendHostModal().catch(() => {
+    if (summaryModalState.kind !== SUSPEND_MODAL_KIND) return;
+    renderSummaryModalContent({
+      title: 'Suspend host',
+      kind: SUSPEND_MODAL_KIND,
+      bodyHtml: `
+        <div class="summary-error">Could not read what is running right now.</div>
+        <div class="summary-modal-actions">
+          <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Close</button>
+        </div>`,
+    });
   });
   window.setTimeout(() => {
     const modal = document.getElementById('summary-modal');
@@ -152,7 +251,7 @@ export function openSuspendHostConfirmation() {
     const ariaVisible = String(modal?.getAttribute('aria-hidden') || 'true') === 'false';
     const displayVisible = modal ? window.getComputedStyle(modal).display !== 'none' : false;
     if (classVisible && ariaVisible && displayVisible) return;
-    const confirmed = window.confirm('Put this PC to sleep now?\n\nThis requests suspend-to-RAM.');
+    const confirmed = window.confirm('Put this PC to sleep once all agents are done?\n\nThe suspend is queued and fires after everything has been idle.');
     if (!confirmed) return;
     confirmSuspendHost().catch(() => {});
   }, 90);
@@ -170,9 +269,37 @@ export async function confirmSuspendHost() {
     });
     closeSummaryModal();
     if (!result?.ok) {
-      alert('Failed to suspend host');
+      alert('Failed to queue host suspend');
       return;
     }
+    if (result.state) applyHostSuspendState(result.state);
+    const status = String(result.state?.status || '');
+    if (result.alreadyPending) {
+      showTransientRelayNotice('A host suspend is already queued.', 5000);
+    } else if (status === 'countdown') {
+      showTransientRelayNotice('Host suspend queued: everything is idle, sleeping in 30 seconds. Cancel from the banner.', 7000);
+    } else {
+      showTransientRelayNotice('Host suspend queued: the PC sleeps once all agents are done.', 7000);
+    }
+  } finally {
+    suspendHostInFlight = false;
+    setSummaryModalLoading(false);
+  }
+}
+
+export async function cancelQueuedHostSuspend() {
+  if (suspendHostInFlight) return;
+  suspendHostInFlight = true;
+  setSummaryModalLoading(true);
+  try {
+    const result = await cancelHostSuspend();
+    closeSummaryModal();
+    if (!result?.ok) {
+      alert('Failed to cancel the queued host suspend');
+      return;
+    }
+    if (result.state) applyHostSuspendState(result.state);
+    showTransientRelayNotice(result.cancelled ? 'Queued host suspend cancelled.' : 'No host suspend was pending.', 4000);
   } finally {
     suspendHostInFlight = false;
     setSummaryModalLoading(false);
@@ -263,5 +390,6 @@ export function initActionConfirmations({
   window.confirmKillCurrentSession = confirmKillCurrentSession;
   window.confirmRestartWebRelay = confirmRestartWebRelay;
   window.confirmSuspendHost = confirmSuspendHost;
+  window.cancelQueuedHostSuspend = cancelQueuedHostSuspend;
   window.confirmEmptyQueue = confirmEmptyQueue;
 }

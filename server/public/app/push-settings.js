@@ -10,6 +10,7 @@ const PUSH_EVENT_CONTROL_IDS = {
   turnFailed: 'push-event-turn-failed-toggle',
   board: 'push-event-board-toggle',
   cliOffline: 'push-event-cli-offline-toggle',
+  hostSuspend: 'push-event-host-suspend-toggle',
 };
 
 let pushUpdateInFlight = false;

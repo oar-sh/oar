@@ -2343,6 +2343,48 @@
     cursor: pointer;
   }
   .relay-toast-action:hover { background: rgba(210, 153, 34, 0.2); }
+  /* Persistent app-wide banner for a queued host suspend / relay restart
+     (host-suspend-ui.js). Same look as the toast, one row per pending action,
+     sits just below the toast so both stay readable; takes pointer input for
+     its Cancel buttons. */
+  #pending-action-banner {
+    display: none;
+    position: fixed;
+    top: calc(var(--header-safe-top, 0px) + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 12590;
+    max-width: min(640px, calc(100vw - 24px));
+    background: var(--bg2);
+    background: color-mix(in srgb, var(--warn) 14%, var(--bg2));
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 10px;
+    padding: 6px 12px;
+    font-size: var(--fs-meta-sm);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    pointer-events: auto;
+  }
+  #pending-action-banner.visible { display: flex; flex-direction: column; gap: 4px; }
+  #relay-toast.visible ~ #app #pending-action-banner,
+  #relay-toast.visible + #pending-action-banner { top: calc(var(--header-safe-top, 0px) + 56px); }
+  .pending-action-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    text-align: center;
+  }
+  .pending-action-text { overflow-wrap: anywhere; }
+  .pending-action-cancel { margin-left: 0; }
+  .suspend-host-blockers {
+    margin: 6px 0 10px;
+    padding-left: 20px;
+    color: var(--text);
+    font-size: var(--fs-meta-md);
+  }
+  .suspend-host-blockers li { margin: 2px 0; overflow-wrap: anywhere; }
   #model-metadata-blocker {
     display: none;
     align-items: center;
@@ -5106,6 +5148,7 @@
 <div id="chat-actions-menu-backdrop" onclick="window.closeChatActionsMenu && window.closeChatActionsMenu()"></div>
 <div id="font-scale-indicator" aria-live="polite" aria-atomic="true" hidden>100%</div>
 <div id="relay-toast" role="status" aria-live="polite"></div>
+<div id="pending-action-banner" role="status" aria-live="polite" hidden></div>
 
 <!-- Main App -->
   <div id="app">
@@ -6017,6 +6060,10 @@
           <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
             <label for="push-event-cli-offline-toggle">CLI went offline</label>
             <input id="push-event-cli-offline-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" disabled>
+          </div>
+          <div class="settings-row" style="width: 100%; margin-top: 6px; margin-bottom: 0;">
+            <label for="push-event-host-suspend-toggle">Host suspend fired or was dropped</label>
+            <input id="push-event-host-suspend-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
           </div>
           <label style="margin-top: 10px;">Devices</label>
           <div id="push-device-list" style="width: 100%;"></div>

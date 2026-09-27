@@ -301,7 +301,9 @@ import {
   confirmEmptyQueue,
   openSuspendHostConfirmation,
   confirmSuspendHost,
+  cancelQueuedHostSuspend,
 } from './action-confirmations.js';
+import { applyPendingActionsFromStatus, initHostSuspendUi } from './host-suspend-ui.js';
 import {
   startClaudeRelogin,
   submitClaudeLoginCodeFromInput,
@@ -3242,6 +3244,7 @@ async function refreshSessionWorkerStatus() {
   const status = await refreshWorkspaceRootHints();
   if (!status) return;
   syncQueueStatusMenuEntry(status);
+  applyPendingActionsFromStatus(status);
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();
     // A worker steering snapshot may have changed; the composer's Steer
@@ -3950,6 +3953,7 @@ async function initApp() {
   syncQueueStatusMenuEntry();
   if (!sharedMode) {
     syncSuspendHostVisibility();
+    initHostSuspendUi();
   }
   setupViewportTracking();
   bindChatSelectionGuard();
@@ -4413,6 +4417,7 @@ window.openSuspendHostConfirmation = openSuspendHostConfirmation;
 window.confirmKillCurrentSession = confirmKillCurrentSession;
 window.confirmRestartWebRelay = confirmRestartWebRelay;
 window.confirmSuspendHost = confirmSuspendHost;
+window.cancelQueuedHostSuspend = cancelQueuedHostSuspend;
 window.confirmEmptyQueue = confirmEmptyQueue;
 window.openMessageSearchModal = openMessageSearchModal;
 window.closeMessageSearchModal = closeMessageSearchModal;

@@ -48,6 +48,9 @@ import { createGrokAuthService } from './services/grok-auth-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
 import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
+import { createHostSuspendService } from './services/host-suspend-service.mjs';
+import { createGitHubCiActivityService } from './services/github-ci-activity-service.mjs';
+import { runHostSuspendToRam } from './services/host-suspend-command.mjs';
 import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
 import { registerPushRoutes } from './routes/push-routes.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
@@ -3136,6 +3139,36 @@ function getRelayShutdownState() {
   };
 }
 
+// Every client shows a banner while a shutdown/restart is queued, so the
+// state goes out on each transition (request, cancel, drain) and on connect.
+function relayShutdownStatePayload() {
+  return { ...getRelayShutdownState(), queue: queueCounts() };
+}
+function emitRelayShutdownState() {
+  try { io.emit('relay_shutdown_state', relayShutdownStatePayload()); } catch {}
+}
+
+function cancelRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
+  if (runtimeShutdownStarted) {
+    return { cancelled: false, status: 'shutting_down', ...relayShutdownStatePayload() };
+  }
+  if (!pendingRelayShutdownRequest) {
+    return { cancelled: false, ...relayShutdownStatePayload() };
+  }
+  const dropped = pendingRelayShutdownRequest;
+  pendingRelayShutdownRequest = null;
+  if (runtimeTimers.shutdownDrain) {
+    try { clearInterval(runtimeTimers.shutdownDrain); } catch {}
+    runtimeTimers.shutdownDrain = null;
+  }
+  console.log(
+    `${runtimeLogPrefix()}Relay ${dropped.action || 'shutdown'} request cancelled by `
+    + `${String(requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api'}`,
+  );
+  emitRelayShutdownState();
+  return { cancelled: true, dropped, ...relayShutdownStatePayload() };
+}
+
 function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localhost-api', restart = false } = {}) {
   const safeReason = String(reason || 'manual-request').trim().slice(0, 140) || 'manual-request';
   const safeRequestedBy = String(requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
@@ -3188,12 +3221,14 @@ function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localh
     );
     sessionWorkerWebSocketService.emitDraining(`api-${action}:${requestInfo?.reason || 'manual-request'}`);
     void shutdownRuntime(`api-${action}:${requestInfo?.reason || 'manual-request'}`, { exitCode });
+    emitRelayShutdownState();
   };
 
   if (!runtimeTimers.shutdownDrain) {
     runtimeTimers.shutdownDrain = setInterval(tryShutdownWhenIdle, 1000);
   }
   tryShutdownWhenIdle();
+  if (pendingRelayShutdownRequest) emitRelayShutdownState();
   const counts = queueCounts();
   return {
     accepted: true,
@@ -4883,6 +4918,98 @@ const backgroundTaskStore = {
   },
 };
 
+// ─── Deferred host suspend ───────────────────────────────────────────────────
+// "💤 Suspend host" waits until nothing runs any more: no queued/processing
+// turn, no live background task of a live worker, no open CI run in a
+// workspace that was busy since the request. The relay-side signals are read
+// synchronously each tick; CI is refreshed in the background and read from
+// the last snapshot (a never-checked workspace counts as busy).
+const hostActivityWorkerStatuses = new Set(['starting', 'ready', 'processing']);
+function hostActivityPidAlive(pidValue) {
+  const pid = Number(pidValue);
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+function hostActivityWorkerAlive(key) {
+  const worker = sessionWorkerRegistry?.getWorker?.(key)
+    || sessionWorkerRegistry?.getWorkerByConversationId?.(key)
+    || null;
+  if (!worker) return false;
+  return hostActivityWorkerStatuses.has(String(worker.status || '').trim().toLowerCase())
+    && hostActivityPidAlive(worker.pid);
+}
+const hostSuspendWatchedConversationIds = new Set();
+const githubCiActivityService = createGitHubCiActivityService({ logger: console });
+function hostActivityTitle(conversationId, fallbackTitle = null) {
+  const title = String(fallbackTitle || stmts.getConv?.get?.(conversationId)?.title || '').trim();
+  return title || String(conversationId || '').slice(0, 8);
+}
+function collectHostActivity({ request = null } = {}) {
+  const blockers = [];
+  const turnsByConversation = stmts.listActiveQueueCountsByConversation?.all?.() || [];
+  for (const row of turnsByConversation) {
+    const conversationId = String(row.conversation_id || '');
+    if (!conversationId) continue;
+    hostSuspendWatchedConversationIds.add(conversationId);
+    const count = Number(row.cnt || 0);
+    blockers.push({
+      kind: 'turn',
+      conversationId,
+      title: hostActivityTitle(conversationId, row.title),
+      count,
+      detail: count > 1 ? `${count} turns running` : 'turn running',
+    });
+  }
+  for (const [key, entry] of backgroundTaskStore.sets) {
+    const tasks = Array.isArray(entry?.tasks) ? entry.tasks : [];
+    if (!tasks.length || !hostActivityWorkerAlive(key)) continue;
+    const worker = sessionWorkerRegistry?.getWorker?.(key) || sessionWorkerRegistry?.getWorkerByConversationId?.(key) || null;
+    const conversationId = String(worker?.conversationId || key);
+    hostSuspendWatchedConversationIds.add(conversationId);
+    const what = tasks.slice(0, 3).map((task) => String(task?.description || task?.taskType || 'task').slice(0, 80)).join('; ');
+    blockers.push({
+      kind: 'background',
+      conversationId,
+      title: hostActivityTitle(conversationId),
+      count: tasks.length,
+      detail: `${tasks.length} background agent${tasks.length === 1 ? '' : 's'}: ${what}`,
+    });
+  }
+  const runningSubagents = Number(stmts.countRunningSubagentRuns?.get?.()?.cnt || 0);
+  // CI is only worth a network round-trip for workspaces that were busy since
+  // the request (or, for the modal's peek, that are busy right now).
+  const roots = [...hostSuspendWatchedConversationIds]
+    .map((conversationId) => {
+      try { return resolveConversationWorkspaceState({ conversationId })?.currentWorkspaceRootPath || ''; } catch { return ''; }
+    })
+    .filter(Boolean);
+  if (roots.length) void githubCiActivityService.describeRuns(roots).catch(() => {});
+  const ci = roots.length ? githubCiActivityService.snapshot(roots) : { repos: [], unknown: [], blockers: [] };
+  blockers.push(...ci.blockers);
+  if (!request && !hostSuspendService.getState().pending) hostSuspendWatchedConversationIds.clear();
+  return { blockers, runningSubagents, ci };
+}
+const hostSuspendService = createHostSuspendService({
+  collectActivity: collectHostActivity,
+  runSuspend: () => runHostSuspendToRam({ logger: console }),
+  logger: console,
+  onStateChange: (state) => {
+    if (state.status === 'idle') hostSuspendWatchedConversationIds.clear();
+    try { io.emit('host_suspend_state', state); } catch {}
+  },
+  onSuspended: () => {
+    void pushDispatchService.notifyHostSuspend({ body: 'All agents finished; the host is suspending now.' });
+  },
+  onDropped: (state, reason) => {
+    void pushDispatchService.notifyHostSuspend({ body: `Queued host suspend dropped: relay ${reason || 'restarting'}.` });
+  },
+});
+
 // The live turn among a conversation's processing rows. Mid-turn steering can
 // leave several processing at once — the running turn, steered messages the
 // CLI folded into it (no output of their own), a handed-off row still settling
@@ -6040,6 +6167,7 @@ const runtimeState = {
   set relayPaused(value) { relayPaused = value; },
   get ttyConsoleActive() { return Boolean(ttyConsoleRuntime?.tty); },
   get relayShutdown() { return getRelayShutdownState(); },
+  get hostSuspend() { return hostSuspendService.getState(); },
   get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
   get workerWebSocketStatus() { return sessionWorkerWebSocketService.status(); },
   get tmuxInspectorStatus() { return tmuxInspectorSocketService.status(); },
@@ -6239,6 +6367,10 @@ const sharedRouteDeps = {
   getPwaAppName,
   setPwaAppName,
   requestRelayShutdown,
+  cancelRelayShutdown,
+  relayShutdownStatePayload,
+  hostSuspendService,
+  collectHostActivity,
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
@@ -6619,6 +6751,9 @@ io.on('connection', (socket) => {
   });
   // Send current CLI status immediately on connect
   socket.emit('cli_status', { online: cliOnline });
+  // Pending host suspend / relay restart banners must survive a reconnect.
+  try { socket.emit('host_suspend_state', hostSuspendService.getState()); } catch {}
+  try { socket.emit('relay_shutdown_state', relayShutdownStatePayload()); } catch {}
   // Visibility heartbeats for push suppression; also clears a stale
   // deviceVisible flag restored by connectionStateRecovery.
   activeDeviceTracker.registerSocket(socket);
@@ -6753,6 +6888,9 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   runtimeShutdownStarted = true;
   console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
+  // A queued host suspend is in-memory only; drop it loudly rather than let
+  // the next runtime forget about it in silence.
+  try { hostSuspendService.dispose({ reason }); } catch {}
   try { updateCheckService?.stop(); } catch {}
   // Started here (flips the importer's closing flag synchronously) but awaited
   // below before the transports close: fire-and-forget disposal let a

@@ -71,6 +71,7 @@ test('normalizePushPreferences fills safe defaults', () => {
     turnFailed: true,
     board: true,
     cliOffline: false,
+    hostSuspend: true,
   });
   assert.deepEqual(prefs.content, { includeTitle: false, preview: 'none', previewChars: 80 });
 });

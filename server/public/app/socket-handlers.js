@@ -46,6 +46,7 @@ import { applyClaudeAuthState } from './claude-auth-ui.js';
 import { applyGrokAuthState } from './grok-auth-ui.js';
 import { applyCliInstallState } from './cli-install-ui.js';
 import { renderUpdateSection } from './update-ui.js';
+import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
 import {
   showThinking,
   removeThinking,
@@ -387,6 +388,14 @@ export async function connectSocket(overrideDeps) {
   socket.on('update_state', (payload) => {
     setUpdateState(payload || null);
     renderUpdateSection();
+  });
+  // Pending host suspend / relay restart: banner + menu labels on every
+  // device. Also sent on connect, so a reconnecting client catches up.
+  socket.on('host_suspend_state', (payload) => {
+    applyHostSuspendState(payload || null);
+  });
+  socket.on('relay_shutdown_state', (payload) => {
+    applyRelayShutdownState(payload || null);
   });
   socket.on('grok_settings_updated', (payload) => {
     deps?.applyGrokSettingsState?.(payload || {});

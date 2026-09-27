@@ -284,6 +284,13 @@ export function createMessageRepository(db) {
           LIMIT ?
         `),
         countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
+        // Deferred host suspend: which conversations still hold live turns.
+        listActiveQueueCountsByConversation: db.prepare(`
+          SELECT q.conversation_id, COUNT(*) AS cnt, MAX(c.title) AS title
+          FROM queue q LEFT JOIN conversations c ON c.id = q.conversation_id
+          WHERE q.status IN ('pending','processing','parked')
+          GROUP BY q.conversation_id
+        `),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
         setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ?, attempt_id = ? WHERE id = ?`),
         setProcessingWithWorkerLease: db.prepare(`
