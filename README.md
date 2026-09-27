@@ -677,7 +677,9 @@ chain of relays prompting relays stops after two hops.
 Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Per paired
 relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
 (also create sessions, answer questions, stop turns, archive). In the *ask* and *plan* relay
-modes, every write action first asks you with a question card.
+modes, every write action first asks you with a question card. For a session it starts, an agent
+can set the provider, model, relay mode and reasoning effort; what it leaves out follows the
+session it works in, as far as the other relay offers it.
 
 When an agent prompts a session on another relay, that relay shows a **↗ from …** badge with the
 sending relay, session and model on the message, and marks sessions an agent created in the

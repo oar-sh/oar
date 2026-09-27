@@ -155,10 +155,12 @@ export function createRemoteRelayCallerContext({
   questionTimeoutMs = DEFAULT_QUESTION_TIMEOUT_MS,
 } = {}) {
   const questionStatements = questions || createQuestionRepository(db);
-  const getConversation = db.prepare(`SELECT id, title, preferred_relay_mode, preferred_model FROM conversations WHERE id = ?`);
+  const getConversation = db.prepare(`
+    SELECT id, title, preferred_relay_mode, preferred_model, preferred_reasoning_effort FROM conversations WHERE id = ?
+  `);
   const getRuntimeSession = db.prepare(`SELECT provider_type, provider_model, model FROM runtime_sessions WHERE conversation_id = ?`);
   const listProcessingRows = db.prepare(`
-    SELECT id, kind, relay_mode, model, attempt_id, owner_sdk_session_id, timestamp, processing_at
+    SELECT id, kind, relay_mode, model, reasoning_effort, attempt_id, owner_sdk_session_id, timestamp, processing_at
     FROM queue
     WHERE conversation_id = ? AND status = 'processing'
     ORDER BY COALESCE(processing_at, timestamp) ASC
@@ -217,8 +219,10 @@ export function createRemoteRelayCallerContext({
   }
 
   /**
-   * `{ conversationId, title, provider, model, mode, processingRowId,
+   * `{ conversationId, title, provider, model, effort, mode, processingRowId,
    * attemptId, userMessageId, hops }` for the conversation making the call.
+   * `effort` is the reasoning effort of the live turn, else the one the
+   * conversation prefers ('' when neither is known).
    * `hops` is how many relays the current turn's prompt already crossed: 0
    * for a human's message. A steered message folded into the live turn is
    * part of what the agent is acting on, so the highest count among the
@@ -240,6 +244,7 @@ export function createRemoteRelayCallerContext({
       title: toText(conversation?.title),
       provider: toText(runtime?.provider_type).toLowerCase() || 'github',
       model: toText(live?.model) || toText(runtime?.provider_model) || toText(runtime?.model) || toText(conversation?.preferred_model) || '',
+      effort: (toText(live?.reasoning_effort) || toText(conversation?.preferred_reasoning_effort)).toLowerCase(),
       mode: normalizeMode(live?.relay_mode || conversation?.preferred_relay_mode),
       processingRowId: live?.id || null,
       attemptId: toText(live?.attempt_id) || null,

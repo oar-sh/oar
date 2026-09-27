@@ -63,6 +63,7 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   model: text('model'),
   cwd: text('cwd'),
   mode: choice('mode', REMOTE_RELAY_MODES),
+  effort: text('effort'),
   title: text('title'),
   question_id: text('question_id'),
   answer: text('answer'),

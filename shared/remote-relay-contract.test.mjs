@@ -107,6 +107,48 @@ test('create_session accepts provider, model, cwd, mode and title', () => {
   assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'r', text: 'x', mode: 'yolo' }).ok, false);
 });
 
+test('send and create_session take an effort: any short lowercase token, no fixed list', () => {
+  const send = { action: 'send', relay: 'r', session: 's', text: 'x' };
+  const create = { action: 'create_session', relay: 'r', text: 'x' };
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.effort.type, 'string');
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.effort.enum, undefined, 'efforts differ per provider and model');
+  assert.equal(validateRemoteRelayToolInput({ ...send, effort: 'medium' }).args.effort, 'medium');
+  assert.equal(validateRemoteRelayToolInput({ ...create, effort: 'medium' }).args.effort, 'medium');
+  for (const effort of ['none', 'low', 'high', 'xhigh', 'max', 'ultracode', 'auto', 'level-2', 'x'.repeat(32)]) {
+    assert.equal(validateRemoteRelayToolInput({ ...create, effort }).args.effort, effort, effort);
+  }
+  assert.equal(validateRemoteRelayToolInput({ ...send, effort: ' High ' }).args.effort, 'high', 'trimmed and lowercased');
+  for (const effort of ['very high!', 'very high', 'x'.repeat(33), '-high', 'high_er', 'hoch/höher', 7.5]) {
+    for (const input of [send, create]) {
+      const result = validateRemoteRelayToolInput({ ...input, effort });
+      assert.equal(result.ok, false, `${input.action} ${effort}`);
+      assert.equal(result.code, REMOTE_RELAY_ERROR_CODES.invalidInput);
+      assert.match(result.error, /^effort must be/);
+    }
+  }
+  for (const effort of ['', '  ', null, undefined]) {
+    assert.equal('effort' in validateRemoteRelayToolInput({ ...send, effort }).args, false, 'an empty effort is no effort');
+  }
+});
+
+test('an effort on any other action is ignored, not validated', () => {
+  const inputs = [
+    { action: 'list_relays' },
+    { action: 'relay_info', relay: 'r' },
+    { action: 'list_sessions', relay: 'r' },
+    { action: 'read_session', relay: 'r', session: 's' },
+    { action: 'wait', relay: 'r', session: 's', message_id: 'm-1' },
+    { action: 'answer_question', relay: 'r', question_id: 'q', answer: 'yes' },
+    { action: 'stop', relay: 'r', session: 's' },
+    { action: 'archive', relay: 'r', session: 's' },
+  ];
+  for (const input of inputs) {
+    const plain = validateRemoteRelayToolInput(input);
+    assert.equal(plain.ok, true, input.action);
+    assert.deepEqual(validateRemoteRelayToolInput({ ...input, effort: 'very high!' }), plain, input.action);
+  }
+});
+
 test('text longer than the limit is refused', () => {
   const text = 'x'.repeat(REMOTE_RELAY_LIMITS.textMax + 1);
   assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text }).ok, false);

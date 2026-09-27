@@ -80,6 +80,30 @@ test('the zod mirror has parity with the contract schema', () => {
   }
 });
 
+test('the zod mirror takes an effort as free text and the handler passes it on', async () => {
+  const schema = REMOTE_RELAY_TOOL_ZOD_SHAPE.effort;
+  assert.ok(schema, 'effort is part of the shape');
+  for (const effort of ['none', 'medium', 'xhigh', 'ultracode']) {
+    assert.equal(schema.safeParse(effort).success, true, `${effort}: the relay validates the value, not the SDK`);
+  }
+  assert.equal(schema.safeParse(undefined).success, true);
+  assert.equal(schema.safeParse(3).success, false);
+
+  const stub = recordingApi({ ok: true, status: 'queued' });
+  const definition = createRemoteRelayToolDefinition({ api: stub.api, getConversationId: () => 'conv-1' });
+  await definition.handler({ action: 'create_session', relay: 'linux-test', text: 'build it', model: 'claude-opus-5', effort: 'Medium' }, {});
+  assert.equal(stub.calls[0].body.args.effort, 'medium');
+  assert.equal(stub.calls[0].body.args.model, 'claude-opus-5');
+
+  const refused = JSON.parse((await definition.handler(
+    { action: 'send', relay: 'linux-test', session: 's-1', text: 'go on', effort: 'very high!' },
+    {},
+  )).content[0].text);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, 'REMOTE_RELAY_INVALID_INPUT');
+  assert.equal(stub.calls.length, 1, 'a malformed effort never reaches the relay');
+});
+
 test('the handler forwards the call with the live conversation id and returns pretty JSON text', async () => {
   const reply = { ok: true, relays: [{ name: 'linux-test', unlocked: false }], summary: 'list_relays' };
   const stub = recordingApi(reply);

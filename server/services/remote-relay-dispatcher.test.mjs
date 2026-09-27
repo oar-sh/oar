@@ -126,8 +126,26 @@ function createFakeRemote() {
       openai: { configured: true, enabled: true, model: 'gpt-4o' },
       copilot: { engine: 'sdk', engines: ['extension', 'sdk'] },
     },
+    // The efforts the remote's model takes (null: it takes any), and whether a
+    // route refuses another one (as the OpenAI provider does) or falls back to
+    // its default (as the other providers do).
+    efforts: { supported: null, strictBootstrap: false, strictMessage: false },
     stamp,
 
+    resolveEffort(relay, requested, { strict, withCode }) {
+      const supported = remote.efforts.supported;
+      const effort = String(requested || '').trim().toLowerCase();
+      if (!supported) return effort;
+      const fallback = supported.includes('none') ? 'none' : supported[0];
+      if (!effort || supported.includes(effort)) return effort || fallback;
+      if (!strict) return fallback;
+      const error = `Reasoning effort "${effort}" is not supported`;
+      throw remoteError(`${CODES.httpPrefix}400`, `Relay "${relay.name}" answered HTTP 400: ${error}`, 400, {
+        ...(withCode ? { ok: false, code: 'REASONING_EFFORT_UNSUPPORTED' } : {}),
+        error,
+        supportedReasoningEfforts: [...supported],
+      });
+    },
     addConversation(input) {
       const conv = {
         provider: 'claude',
@@ -263,6 +281,7 @@ function createFakeRemote() {
             runtimeSession: { providerType: conv.provider, providerModel: conv.model, model: conv.model },
             preferredModel: conv.model,
             preferredRelayMode: conv.mode,
+            preferredReasoningEffort: conv.effort || '',
             inFlight: conv.inFlight,
             ...(conv.reportActiveTurn ? { activeTurn: conv.activeTurn } : {}),
             ...(conv.origin ? { origin: conv.origin } : {}),
@@ -285,6 +304,7 @@ function createFakeRemote() {
       }
 
       if (method === 'POST' && path === '/api/conversation/bootstrap') {
+        const effort = remote.resolveEffort(relay, body.reasoningEffort, { strict: remote.efforts.strictBootstrap, withCode: true });
         const id = `conv-new-${remote.conversations.size + 1}`;
         remote.addConversation({
           id,
@@ -292,6 +312,7 @@ function createFakeRemote() {
           provider: body.providerType,
           model: body.model,
           mode: body.relayMode,
+          effort,
           origin: body.origin,
         });
         return {
@@ -300,6 +321,7 @@ function createFakeRemote() {
           selectedModel: body.model,
           selectedProviderType: body.providerType,
           preferredRelayMode: body.relayMode,
+          preferredReasoningEffort: effort,
         };
       }
 
@@ -319,17 +341,20 @@ function createFakeRemote() {
             conversationId: conv.id,
           });
         }
+        // The message route sends its effort refusal without a code.
+        const effort = remote.resolveEffort(relay, body.reasoningEffort, { strict: remote.efforts.strictMessage, withCode: false });
         remote.addMessage(conv.id, {
           id: body.messageId,
           role: 'user',
           text: body.text,
           model: body.model,
           mode: body.relayMode,
+          effort,
           origin: body.origin,
         });
         conv.activeTurn = true;
         remote.onMessage?.(conv, body);
-        return { ok: true, messageId: body.messageId, conversationId: conv.id };
+        return { ok: true, messageId: body.messageId, conversationId: conv.id, selectedReasoningEffort: effort || null };
       }
 
       if (method === 'GET' && path === '/api/relay-questions') {
@@ -1273,7 +1298,243 @@ test('create_session refuses a provider the remote lacks and lists the ones it h
   assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
 });
 
+// ─── Reasoning effort ────────────────────────────────────────────────────────
+
+const CREATE = Object.freeze({ relay: 'linux-test', text: PROMPT, wait_seconds: 0 });
+const SEND = Object.freeze({ relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+
+function effortsSent(remote) {
+  return {
+    bootstrap: remote.callsTo('POST', '/api/conversation/bootstrap').map((entry) => entry.body.reasoningEffort),
+    message: remote.callsTo('POST', '/api/message').map((entry) => entry.body.reasoningEffort),
+  };
+}
+
+test('create_session passes an explicit effort to the bootstrap and to the first prompt', async () => {
+  const { run, remote } = setup({ caller: { effort: 'low' } });
+  const result = await run('create_session', { ...CREATE, model: 'claude-opus-5', effort: 'medium' });
+  assert.equal(result.status, 200);
+  assert.deepEqual(effortsSent(remote), { bootstrap: ['medium'], message: ['medium'] });
+  assert.equal(result.body.model, 'claude-opus-5');
+  assert.equal(result.body.effort, 'medium');
+  assert.equal(result.body.effortSource, 'requested');
+  assert.equal(result.body.note, undefined);
+  assert.equal(remote.conversations.get('conv-new-1').effort, 'medium');
+});
+
+test('create_session mirrors the caller\'s effort when the agent names none', async () => {
+  const mirrored = setup({ caller: { effort: 'high' } });
+  const result = await mirrored.run('create_session', CREATE);
+  assert.deepEqual(effortsSent(mirrored.remote), { bootstrap: ['high'], message: ['high'] });
+  assert.equal(result.body.effort, 'high');
+  assert.equal(result.body.effortSource, 'same as this session');
+  assert.equal(result.body.note, undefined);
+
+  // Neither side knows an effort: nothing is sent, the remote decides.
+  const unknown = setup();
+  const plain = await unknown.run('create_session', CREATE);
+  assert.deepEqual(effortsSent(unknown.remote), { bootstrap: [undefined], message: [undefined] });
+  assert.equal(plain.body.effort, null);
+  assert.equal(plain.body.effortSource, 'remote default');
+  assert.equal(plain.body.note, undefined);
+});
+
+test('create_session leaves out a caller effort the remote does not list for the model', async () => {
+  const { run, remote } = setup({ caller: { effort: 'ultracode' } });
+  remote.models.reasoningByProvider = { claude: { 'claude-sonnet-5': ['none', 'low', 'medium', 'high'] } };
+  remote.efforts.supported = ['none', 'low', 'medium', 'high'];
+  const result = await run('create_session', CREATE);
+  assert.equal(result.status, 200);
+  assert.equal(effortsSent(remote).bootstrap[0], undefined, 'not sent: the remote would not take it');
+  assert.equal(effortsSent(remote).message[0], 'none', 'the first prompt runs with the effort the session was bound to');
+  assert.equal(result.body.effort, 'none');
+  assert.equal(result.body.effortSource, 'remote default');
+  assert.match(result.body.note, /does not offer this session's effort "ultracode" \(it takes: none, low, medium, high\)/);
+});
+
+test('a mirrored effort the remote refuses is dropped: one retry without it, and a note', async () => {
+  const { run, remote } = setup({ caller: { provider: 'openai', model: 'gpt-4o', effort: 'xhigh' } });
+  remote.efforts = { supported: ['low', 'medium', 'high'], strictBootstrap: true, strictMessage: true };
+  const result = await run('create_session', CREATE);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.status, 'queued');
+  assert.deepEqual(effortsSent(remote).bootstrap, ['xhigh', undefined], 'asked again once, without the effort');
+  assert.equal(remote.conversations.size, 1, 'the refused bootstrap created nothing');
+  assert.deepEqual(effortsSent(remote).message, ['low'], 'the effort the remote bound instead');
+  assert.equal(result.body.effort, 'low');
+  assert.equal(result.body.effortSource, 'remote default');
+  assert.match(result.body.note, /refused this session's effort "xhigh" \(it takes: low, medium, high\)/);
+  assert.match(result.body.note, /started without it/);
+});
+
+test('a mirrored effort refused only by the message route is dropped there, and the wait note is kept', async () => {
+  const { run, remote } = setup({ caller: { effort: 'max' } });
+  // The bootstrap takes the effort as it comes; the message route refuses it.
+  const original = remote.request;
+  remote.request = async (relay, method, path, options = {}) => {
+    const message = method === 'POST' && path === '/api/message';
+    remote.efforts = { supported: message ? ['none', 'low'] : null, strictBootstrap: false, strictMessage: true };
+    return original(relay, method, path, options);
+  };
+  remote.onRead = (conv) => { conv.inFlight = { messageId: 'm-sent-2', streamEvents: [], activities: [] }; };
+  const result = await run('create_session', { ...CREATE, wait_seconds: 1 });
+  assert.equal(result.status, 200);
+  assert.deepEqual(effortsSent(remote), { bootstrap: ['max'], message: ['max', undefined] });
+  assert.equal(remote.conversations.size, 1);
+  assert.equal(result.body.message_id, 'm-sent-2', 'the refused prompt was never stored');
+  assert.equal(result.body.status, 'running');
+  assert.equal(result.body.effort, 'none');
+  assert.equal(result.body.effortSource, 'remote default');
+  assert.match(result.body.note, /^Relay "linux-test" refused effort "max" \(it takes: none, low\); sent again without it/);
+  assert.match(result.body.note, /Not finished yet\. Call wait/, 'the outcome\'s own note follows');
+});
+
+test('an explicit effort the remote refuses comes back as its error, with the efforts it takes', async () => {
+  const { run, remote, events } = setup({ caller: { effort: 'low' } });
+  remote.efforts = { supported: ['low', 'medium', 'high'], strictBootstrap: true, strictMessage: true };
+  const result = await run('create_session', { ...CREATE, provider: 'openai', model: 'gpt-4o', effort: 'ultracode' });
+  assert.equal(result.status, 400);
+  assert.equal(result.body.ok, false);
+  assert.equal(result.body.code, `${CODES.httpPrefix}400`);
+  assert.equal(result.body.remoteCode, 'REASONING_EFFORT_UNSUPPORTED');
+  assert.deepEqual(result.body.supportedEfforts, ['low', 'medium', 'high']);
+  assert.match(result.body.error, /Reasoning effort "ultracode" is not supported/);
+  assert.deepEqual(effortsSent(remote), { bootstrap: ['ultracode'], message: [] }, 'no retry, no fallback to the caller\'s effort');
+  assert.equal(remote.conversations.size, 0);
+  assert.equal(events.at(-1).ok, false);
+
+  // The message route refuses without a code; the list still comes through.
+  const sending = setup();
+  withSession(sending.remote, { provider: 'openai', model: 'gpt-4o' });
+  sending.remote.efforts = { supported: ['low', 'medium', 'high'], strictBootstrap: true, strictMessage: true };
+  const refused = await sending.run('send', { ...SEND, effort: 'max' });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, `${CODES.httpPrefix}400`);
+  assert.equal(refused.body.remoteCode, undefined);
+  assert.deepEqual(refused.body.supportedEfforts, ['low', 'medium', 'high']);
+  assert.deepEqual(effortsSent(sending.remote).message, ['max']);
+  assert.equal(sending.remote.conversations.get('conv-1').messages.length, 2, 'nothing was queued');
+});
+
+test('an explicit effort refused after the session was created names that session', async () => {
+  const { run, remote } = setup();
+  // The bootstrap takes the effort as it comes; the message route refuses it.
+  const original = remote.request;
+  remote.request = async (relay, method, path, options = {}) => {
+    const message = method === 'POST' && path === '/api/message';
+    remote.efforts = { supported: message ? ['none', 'low'] : null, strictBootstrap: false, strictMessage: true };
+    return original(relay, method, path, options);
+  };
+  const result = await run('create_session', { ...CREATE, effort: 'high' });
+  assert.equal(result.status, 400);
+  assert.equal(result.body.code, `${CODES.httpPrefix}400`);
+  assert.equal(result.body.session, 'conv-new-1');
+  assert.equal(result.body.openUrl, 'https://relay-b.example.test/?conv=conv-new-1');
+  assert.deepEqual(result.body.supportedEfforts, ['none', 'low']);
+  assert.match(result.body.error, /The session was created, but the prompt was not queued\./);
+  assert.match(result.body.note, /do not create another session/);
+  assert.deepEqual(effortsSent(remote), { bootstrap: ['high'], message: ['high'] });
+});
+
+test('an effort the remote replaces without refusing is reported as the one the turn runs with', async () => {
+  const { run, remote } = setup();
+  remote.efforts = { supported: ['none', 'low', 'medium', 'high'], strictBootstrap: false, strictMessage: false };
+  const created = await run('create_session', { ...CREATE, effort: 'max' });
+  assert.equal(created.status, 200);
+  assert.deepEqual(effortsSent(remote), { bootstrap: ['max'], message: ['none'] });
+  assert.equal(created.body.effort, 'none');
+  assert.equal(created.body.effortSource, 'remote default');
+  assert.match(created.body.note, /does not offer effort "max" for this model; the turn runs with "none"/);
+
+  const sent = await run('send', { ...SEND, session: 'conv-new-1', effort: 'xhigh' });
+  assert.equal(sent.status, 200);
+  assert.equal(sent.body.effort, 'none');
+  assert.equal(sent.body.effortSource, 'remote default');
+  assert.match(sent.body.note, /does not offer effort "xhigh"/);
+});
+
+test('send without an effort sends none, and never the caller\'s', async () => {
+  const { run, remote } = setup({ caller: { effort: 'high' } });
+  withSession(remote);
+  const result = await run('send', SEND);
+  assert.equal(result.status, 200);
+  const post = remote.callsTo('POST', '/api/message')[0].body;
+  assert.equal('reasoningEffort' in post, false);
+  assert.equal('effort' in result.body, false);
+  assert.equal('effortSource' in result.body, false);
+  assert.equal(result.body.note, undefined);
+});
+
+test('send passes an explicit effort, and otherwise the one the remote session is set to', async () => {
+  const explicit = setup({ caller: { effort: 'low' } });
+  withSession(explicit.remote, { effort: 'high' });
+  const chosen = await explicit.run('send', { ...SEND, effort: 'medium' });
+  assert.deepEqual(effortsSent(explicit.remote).message, ['medium']);
+  assert.equal(chosen.body.effort, 'medium');
+  assert.equal(chosen.body.effortSource, 'requested');
+
+  const own = setup({ caller: { effort: 'low' } });
+  withSession(own.remote, { effort: 'high' });
+  const kept = await own.run('send', SEND);
+  assert.deepEqual(effortsSent(own.remote).message, ['high'], 'the session keeps its own effort');
+  assert.equal(kept.body.effort, 'high');
+  assert.equal(kept.body.effortSource, 'remote default');
+
+  // The session's own effort does not fit the model this prompt switches to.
+  const switched = setup();
+  withSession(switched.remote, { effort: 'max' });
+  switched.remote.efforts = { supported: ['none', 'low', 'medium'], strictBootstrap: true, strictMessage: true };
+  const retried = await switched.run('send', { ...SEND, model: 'claude-opus-5' });
+  assert.equal(retried.status, 200);
+  assert.deepEqual(effortsSent(switched.remote).message, ['max', undefined]);
+  assert.equal(retried.body.effort, 'none');
+  assert.match(retried.body.note, /refused effort "max"/);
+});
+
 // ─── relay_info, list_sessions, read_session ─────────────────────────────────
+
+test('relay_info lists the efforts of each provider\'s models, grouped and capped', async () => {
+  const { run, remote } = setup();
+  const many = Array.from({ length: 45 }, (_, index) => `claude-lab-${index + 1}`);
+  remote.settings.claude.models = ['claude-sonnet-5', 'claude-opus-5', 'claude-haiku-5', ...many];
+  remote.models.reasoningByModel = {
+    'gpt-5.6-luna': ['low', 'medium', 'high'],
+    // Copilot's view of a model the Claude provider serves too.
+    'claude-sonnet-5': ['low', 'high'],
+    'gpt-4o': ['none'],
+  };
+  remote.models.reasoningByProvider = {
+    claude: {
+      'claude-sonnet-5': ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
+      'claude-opus-5': ['None', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
+      'claude-haiku-5': ['none', 'not a level!', ...Array.from({ length: 20 }, (_, index) => `level-${index + 1}`)],
+      ...Object.fromEntries(many.map((model) => [model, ['none', 'low']])),
+    },
+    openai: { 'gpt-4o': [] },
+  };
+  const result = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(result.status, 200);
+  const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
+  assert.deepEqual(byName.github.efforts, [
+    { efforts: ['low', 'medium', 'high'], models: ['gpt-5.6-luna'] },
+    { efforts: ['low', 'high'], models: ['claude-sonnet-5'] },
+  ]);
+  assert.deepEqual(byName.claude.efforts[0], {
+    efforts: ['none', 'low'],
+    models: many.slice(0, 40),
+    more: 5,
+  });
+  assert.deepEqual(byName.claude.efforts[1], {
+    efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
+    models: ['claude-sonnet-5', 'claude-opus-5'],
+  });
+  assert.equal(byName.claude.efforts[2].efforts.length, 12, 'a long list is capped');
+  assert.equal(byName.claude.efforts[2].efforts.includes('not a level!'), false);
+  assert.deepEqual(byName.openai.efforts, [{ efforts: ['none'], models: ['gpt-4o'] }], 'falls back to reasoningByModel');
+  assert.equal('efforts' in byName.cursor, false, 'a provider that is not set up lists nothing');
+  assert.ok(JSON.stringify(result.body).length < 6000, 'the result stays small');
+});
 
 test('relay_info describes providers, workspaces and modes, tolerating missing routes', async () => {
   const { run, remote } = setup();

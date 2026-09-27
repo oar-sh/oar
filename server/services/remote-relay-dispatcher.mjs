@@ -4,6 +4,7 @@ import { randomUUID as nodeRandomUUID } from 'crypto';
 
 import {
   REMOTE_RELAY_APPROVAL_MODES,
+  REMOTE_RELAY_EFFORT_PATTERN,
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_LIMITS,
   REMOTE_RELAY_PROVIDERS,
@@ -93,6 +94,20 @@ const FAILURE_TEXT_PATTERNS = Object.freeze([
   /^relay timeout after \d+ attempts/i,
 ]);
 const CLAUDE_LONG_CONTEXT_SUFFIX = /\[1m\]$/i;
+// POST /api/conversation/bootstrap refuses an effort its model does not take
+// with this code (400); POST /api/message sends the same 400 without a code,
+// but with the list below.
+const EFFORT_UNSUPPORTED_CODE = 'REASONING_EFFORT_UNSUPPORTED';
+const EFFORT_SUPPORTED_FIELD = 'supportedReasoningEfforts';
+const EFFORT_SOURCES = Object.freeze({
+  requested: 'requested',
+  caller: 'same as this session',
+  remote: 'remote default',
+});
+// relay_info: efforts per provider, as groups of models that take the same ones.
+const EFFORT_LEVELS_MAX = 12;
+const EFFORT_GROUPS_MAX = 8;
+const EFFORT_GROUP_MODELS_MAX = 40;
 // Assistant rows that are markers, not replies of their own.
 const STUB_KINDS = new Set(['folded', 'stopped']);
 
@@ -212,6 +227,73 @@ function matchOfferedModel(candidate, offered = []) {
   if (exact) return exact;
   const wantedBase = wanted.replace(CLAUDE_LONG_CONTEXT_SUFFIX, '');
   return offered.find((model) => model.toLowerCase().replace(CLAUDE_LONG_CONTEXT_SUFFIX, '') === wantedBase) || '';
+}
+
+/** A reasoning effort as the relays write it, or '' when the value is not one. */
+function normalizeEffort(value) {
+  const effort = toText(value).toLowerCase();
+  return REMOTE_RELAY_EFFORT_PATTERN.test(effort) ? effort : '';
+}
+
+function effortLevels(values) {
+  return uniqueTexts((Array.isArray(values) ? values : []).map(normalizeEffort)).slice(0, EFFORT_LEVELS_MAX);
+}
+
+/**
+ * The efforts /api/models lists for a provider's model, or null when the
+ * remote does not say. `reasoningByProvider` is the provider's own view;
+ * `reasoningByModel` is keyed by model id alone, which providers share, so it
+ * only decides where the provider has no entry of its own.
+ */
+function catalogEffortsFor(models, provider, model) {
+  const key = toText(model).toLowerCase();
+  if (!key || !isPlainObject(models)) return null;
+  const keys = uniqueTexts([key, key.replace(CLAUDE_LONG_CONTEXT_SUFFIX, '')]);
+  const maps = [
+    isPlainObject(models.reasoningByProvider) ? models.reasoningByProvider[provider] : null,
+    models.reasoningByModel,
+  ];
+  for (const map of maps) {
+    if (!isPlainObject(map)) continue;
+    for (const candidate of keys) {
+      const levels = effortLevels(map[candidate]);
+      if (levels.length) return levels;
+    }
+  }
+  return null;
+}
+
+/** `[{ efforts, models }]`: the models of a provider grouped by the efforts they take. */
+function groupEffortsByModel(models, provider, offered = []) {
+  const groups = new Map();
+  for (const model of offered) {
+    const levels = catalogEffortsFor(models, provider, model);
+    if (!levels) continue;
+    const id = levels.join(' ');
+    if (!groups.has(id)) groups.set(id, { efforts: levels, models: [] });
+    groups.get(id).models.push(model);
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.models.length - a.models.length)
+    .slice(0, EFFORT_GROUPS_MAX)
+    .map((group) => (group.models.length > EFFORT_GROUP_MODELS_MAX
+      ? { efforts: group.efforts, models: group.models.slice(0, EFFORT_GROUP_MODELS_MAX), more: group.models.length - EFFORT_GROUP_MODELS_MAX }
+      : group));
+}
+
+/** True when the remote answered 400 because its model does not take the effort we sent. */
+function isEffortRejection(error) {
+  const body = isPlainObject(error?.remoteBody) ? error.remoteBody : null;
+  if (!body || Number(error?.status) !== 400) return false;
+  return toText(body.code) === EFFORT_UNSUPPORTED_CODE || Array.isArray(body[EFFORT_SUPPORTED_FIELD]);
+}
+
+function supportedEffortsOf(error) {
+  return effortLevels(error?.remoteBody?.[EFFORT_SUPPORTED_FIELD]);
+}
+
+function supportedEffortsText(levels) {
+  return levels.length ? ` (it takes: ${levels.join(', ')})` : '';
 }
 
 function isRemoteRelayError(error) {
@@ -772,8 +854,18 @@ export function createRemoteRelayDispatcher({
     };
   }
 
-  /** `[{ provider, configured, defaultModel, models }]` in contract order. */
+  /**
+   * `[{ provider, configured, defaultModel, models }]` in contract order, with
+   * `efforts` where the remote lists the reasoning efforts of those models.
+   */
   function buildProviders(catalog) {
+    return listProviders(catalog).map((entry) => {
+      const efforts = groupEffortsByModel(catalog.models, entry.provider, entry.models);
+      return efforts.length ? { ...entry, efforts } : entry;
+    });
+  }
+
+  function listProviders(catalog) {
     const models = catalog.models || {};
     const providersByModel = isPlainObject(models.providersByModel) ? models.providersByModel : {};
     const catalogModels = Array.isArray(models.models) ? models.models.map(toText).filter(Boolean) : [];
@@ -1061,7 +1153,7 @@ export function createRemoteRelayDispatcher({
    * When the replay fails too, nobody knows; the error carries the session
    * and message id so the agent checks with wait instead of sending again.
    */
-  async function postPrompt(ctx, { session, text, origin, model, mode }) {
+  async function postPrompt(ctx, { session, text, origin, model, mode, effort }) {
     const messageId = String(randomUUID());
     const body = {
       conversationId: session,
@@ -1070,6 +1162,7 @@ export function createRemoteRelayDispatcher({
       origin,
       ...(model ? { model } : {}),
       ...(mode ? { relayMode: mode } : {}),
+      ...(effort ? { reasoningEffort: effort } : {}),
     };
     let sent;
     try {
@@ -1096,11 +1189,72 @@ export function createRemoteRelayDispatcher({
         messageId: toText(sent.duplicateOfMessageId) || null,
       };
     }
-    return { duplicate: false, messageId: toText(sent?.messageId) || messageId };
+    return {
+      duplicate: false,
+      messageId: toText(sent?.messageId) || messageId,
+      effort: normalizeEffort(sent?.selectedReasoningEffort),
+    };
   }
 
-  async function deliverAndWait(action, ctx, { session, sent, waitSeconds, extra = {} }) {
+  /**
+   * What the remote made of the effort: `reported` is the one it bound (the
+   * bootstrap's preferredReasoningEffort, the message's
+   * selectedReasoningEffort). Most providers do not refuse an effort their
+   * model lacks, they fall back to their default, so the result names the
+   * effort the turn runs with and says when that is not the one asked for.
+   */
+  function settleEffort(ctx, choice, reported) {
+    const bound = normalizeEffort(reported);
+    if (!bound || bound === choice.effort) return choice;
+    if (!choice.effort) return { ...choice, effort: bound, source: EFFORT_SOURCES.remote };
+    return {
+      effort: bound,
+      source: EFFORT_SOURCES.remote,
+      note: choice.note
+        || `Relay "${ctx.relay.name}" does not offer effort "${choice.effort}" for this model; the turn runs with "${bound}".`,
+    };
+  }
+
+  /**
+   * Queues the prompt with the chosen effort. An effort the agent did not ask
+   * for (this session's, the remote session's own) that the remote refuses is
+   * dropped and the prompt sent once more without it; one the agent asked for
+   * is the remote's to refuse, so that error goes back as it is.
+   */
+  async function postPromptWithEffort(ctx, prompt, choice) {
+    try {
+      const sent = await postPrompt(ctx, { ...prompt, effort: choice.effort });
+      return { sent, choice: settleEffort(ctx, choice, sent.effort) };
+    } catch (error) {
+      if (!choice.effort || choice.source === EFFORT_SOURCES.requested || !isEffortRejection(error)) throw error;
+      const dropped = {
+        effort: '',
+        source: EFFORT_SOURCES.remote,
+        note: `Relay "${ctx.relay.name}" refused effort "${choice.effort}"${supportedEffortsText(supportedEffortsOf(error))}; sent again without it, so the turn runs with the remote's default.`,
+      };
+      const sent = await postPrompt(ctx, { ...prompt, effort: '' });
+      return { sent, choice: settleEffort(ctx, dropped, sent.effort) };
+    }
+  }
+
+  /** The `effort` / `effortSource` fields of a result, and the note that goes with them. */
+  function effortResult(choice) {
+    return {
+      ...(choice.source ? { effort: choice.effort || null, effortSource: choice.source } : {}),
+      ...(choice.note ? { note: choice.note } : {}),
+    };
+  }
+
+  async function deliverAndWait(action, ctx, { session, sent, waitSeconds, extra: given = {} }) {
     const openUrl = remoteConversationUrl(ctx.relay.url, session);
+    // `extra.note` (how the effort was settled) goes in front of the outcome's own.
+    const { note: extraNote, ...extra } = given;
+    const result = await deliverOutcome(action, ctx, { session, sent, waitSeconds, extra, openUrl });
+    const note = [extraNote, result.note].map(toText).filter(Boolean).join(' ');
+    return note ? { ...result, note } : result;
+  }
+
+  async function deliverOutcome(action, ctx, { session, sent, waitSeconds, extra, openUrl }) {
     if (sent.duplicate) {
       const outcome = {
         status: 'duplicate',
@@ -1134,9 +1288,18 @@ export function createRemoteRelayDispatcher({
     const model = args.model
       || (provider === 'grok' ? '' : (toText(conversation?.preferredModel) || toText(runtime.providerModel) || toText(runtime.model)));
     const mode = args.mode || ctx.caller.mode || toText(conversation?.preferredRelayMode) || '';
+    // The remote runs a prompt that names no effort with its provider's
+    // default, not with the one the session is set to: pass that one on, so
+    // the session keeps its own. This session's effort is never mirrored here.
+    const requested = normalizeEffort(args.effort);
+    const own = requested ? '' : normalizeEffort(conversation?.preferredReasoningEffort);
     const origin = await buildOrigin(ctx);
-    const sent = await postPrompt(ctx, { session, text: args.text, origin, model, mode });
-    return deliverAndWait('send', ctx, { session, sent, waitSeconds: args.wait_seconds });
+    const { sent, choice } = await postPromptWithEffort(ctx, { session, text: args.text, origin, model, mode }, {
+      effort: requested || own,
+      source: requested ? EFFORT_SOURCES.requested : (own ? EFFORT_SOURCES.remote : ''),
+      note: null,
+    });
+    return deliverAndWait('send', ctx, { session, sent, waitSeconds: args.wait_seconds, extra: effortResult(choice) });
   }
 
   async function createSession(ctx, args) {
@@ -1169,23 +1332,75 @@ export function createRemoteRelayDispatcher({
     const title = args.title || firstLine(args.text, TITLE_MAX) || 'Remote session';
     const origin = await buildOrigin(ctx);
 
-    const bootstrap = await call(ctx, 'POST', '/api/conversation/bootstrap', {
+    // The effort mirrors the caller like the model does: this session's when
+    // the remote lists it for the model (or lists nothing), else the remote's.
+    let choice = { effort: normalizeEffort(args.effort), source: EFFORT_SOURCES.requested, note: null };
+    if (!choice.effort) {
+      const callerEffort = normalizeEffort(ctx.caller.effort);
+      const offered = catalogEffortsFor(catalog.models, provider, model);
+      if (callerEffort && (!offered || offered.includes(callerEffort))) {
+        choice = { effort: callerEffort, source: EFFORT_SOURCES.caller, note: null };
+      } else {
+        choice = {
+          effort: '',
+          source: EFFORT_SOURCES.remote,
+          note: callerEffort
+            ? `${model || provider} on relay "${ctx.relay.name}" does not offer this session's effort "${callerEffort}"${supportedEffortsText(offered || [])}; the session uses the remote's default.`
+            : null,
+        };
+      }
+    }
+
+    const bootstrapWith = (effort) => call(ctx, 'POST', '/api/conversation/bootstrap', {
       body: {
         providerType: provider,
         ...(model ? { model } : {}),
         ...(mode ? { relayMode: mode } : {}),
+        ...(effort ? { reasoningEffort: effort } : {}),
         title,
         ...(args.cwd ? { cwd: args.cwd } : {}),
         origin,
       },
     });
+    let bootstrap;
+    try {
+      bootstrap = await bootstrapWith(choice.effort);
+    } catch (error) {
+      // Only an effort the agent did not ask for is dropped; a refused
+      // bootstrap created nothing, so asking again is safe.
+      if (!choice.effort || choice.source === EFFORT_SOURCES.requested || !isEffortRejection(error)) throw error;
+      choice = {
+        effort: '',
+        source: EFFORT_SOURCES.remote,
+        note: `Relay "${ctx.relay.name}" refused this session's effort "${choice.effort}"${supportedEffortsText(supportedEffortsOf(error))}; the session was started without it and uses the remote's default.`,
+      };
+      bootstrap = await bootstrapWith('');
+    }
+    choice = settleEffort(ctx, choice, bootstrap?.preferredReasoningEffort);
     const session = toText(bootstrap?.conversationId);
     if (!session) {
       throw new DispatchFailure(502, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}502`,
         `Relay "${ctx.relay.name}" did not return the new session's id.`);
     }
     const boundModel = toText(bootstrap?.selectedModel) || model;
-    const sent = await postPrompt(ctx, { session, text: args.text, origin, model: boundModel, mode });
+    let sent;
+    try {
+      ({ sent, choice } = await postPromptWithEffort(ctx, { session, text: args.text, origin, model: boundModel, mode }, choice));
+    } catch (error) {
+      if (!choice.effort || !isEffortRejection(error)) throw error;
+      // The session exists by now: say so, or the agent starts a second one.
+      const supported = supportedEffortsOf(error);
+      const remoteCode = toText(error.remoteBody?.code);
+      throw new DispatchFailure(400, toText(error.code) || `${REMOTE_RELAY_ERROR_CODES.httpPrefix}400`,
+        `${toText(error.message) || `Relay "${ctx.relay.name}" refused effort "${choice.effort}"`}. The session was created, but the prompt was not queued.`,
+        {
+          session,
+          ...(remoteCode ? { remoteCode } : {}),
+          ...(supported.length ? { supportedEfforts: supported } : {}),
+          openUrl: remoteConversationUrl(ctx.relay.url, session),
+          note: 'Use send with this session and an effort it takes (or none); do not create another session.',
+        });
+    }
     return deliverAndWait('create_session', ctx, {
       session,
       sent,
@@ -1198,6 +1413,7 @@ export function createRemoteRelayDispatcher({
         title,
         ...(toText(bootstrap?.workspaceRootWarning) ? { cwdWarning: toText(bootstrap.workspaceRootWarning) } : {}),
         ...(note ? { modelNote: note } : {}),
+        ...effortResult(choice),
       },
     });
   }
@@ -1338,10 +1554,13 @@ export function createRemoteRelayDispatcher({
     }
     const remoteCode = toText(remoteBody?.code) || null;
     const supportedModels = Array.isArray(remoteBody?.supportedModels) ? remoteBody.supportedModels.slice(0, 50) : null;
+    // A refused effort: the ones the remote's model takes, so the agent can pick one.
+    const supportedEfforts = isEffortRejection(error) ? supportedEffortsOf(error) : [];
     const details = {
       ...extra,
       ...(remoteCode ? { remoteCode } : {}),
       ...(supportedModels ? { supportedModels } : {}),
+      ...(supportedEfforts.length ? { supportedEfforts } : {}),
     };
     if (code.startsWith(C.httpPrefix) && status >= 400 && status < 500) return failure(status, code, message, details);
     return failure(502, code || `${C.httpPrefix}502`, message, details);

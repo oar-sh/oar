@@ -60,6 +60,10 @@ export const REMOTE_RELAY_SESSION_SCOPES = Object.freeze(['active', 'recent', 'a
 export const REMOTE_RELAY_PROVIDERS = Object.freeze(['github', 'openai', 'claude', 'cursor', 'grok']);
 export const REMOTE_RELAY_MODES = Object.freeze(['plan', 'ask', 'agent', 'autopilot']);
 export const REMOTE_RELAY_IF_BUSY = Object.freeze(['queue', 'fail']);
+// Reasoning efforts differ per provider and model (none, low, medium, high,
+// xhigh, max, ultracode, ...), so the contract only checks the shape of the
+// value: the remote relay decides whether its model takes it.
+export const REMOTE_RELAY_EFFORT_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 export const REMOTE_RELAY_RESULT_STATUSES = Object.freeze([
   'queued',
@@ -203,6 +207,12 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
       enum: [...REMOTE_RELAY_MODES],
       description: 'send / create_session: relay mode for the remote turn (default: this session\'s mode).',
     },
+    effort: {
+      type: 'string',
+      description: 'send / create_session: reasoning effort for the remote turn, e.g. low, medium, high (relay_info lists '
+        + 'what each model takes). create_session default: this session\'s effort when the remote model supports it, '
+        + 'else the remote\'s default. send default: the remote session keeps its own.',
+    },
     title: { type: 'string', description: 'create_session: session title (default: from the prompt).' },
     question_id: { type: 'string', description: 'answer_question: id from pendingQuestions.' },
     answer: { type: 'string', description: 'answer_question: free-text answer.' },
@@ -312,6 +322,13 @@ export function validateRemoteRelayToolInput(input = {}) {
     optionalText('model', 200);
     const modeCheck = optionalEnum('mode', REMOTE_RELAY_MODES);
     if (!modeCheck.ok) return modeCheck;
+    const effort = toText(input?.effort).toLowerCase();
+    if (effort) {
+      if (!REMOTE_RELAY_EFFORT_PATTERN.test(effort)) {
+        return invalid('effort must be a short word such as low, medium or high (letters, digits and dashes, at most 32 characters)');
+      }
+      args.effort = effort;
+    }
     if (action === 'send') {
       const busyCheck = optionalEnum('if_busy', REMOTE_RELAY_IF_BUSY);
       if (!busyCheck.ok) return busyCheck;

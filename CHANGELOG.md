@@ -5,6 +5,12 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Remote relays**: an agent can set the reasoning effort of a session it starts or
+  prompts on another relay (`effort` on `create_session` and `send`), and `relay_info`
+  lists the efforts each model there takes.
+
 ### Fixed
 
 - **Remote relays:** waiting for a remote agent's reply no longer stops at an

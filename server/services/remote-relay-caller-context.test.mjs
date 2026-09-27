@@ -47,9 +47,12 @@ function seedConversation(db, {
   preferredMode = 'ask',
   provider = 'claude',
   providerModel = 'claude-sonnet-5',
+  preferredEffort = null,
 } = {}) {
-  db.prepare(`INSERT INTO conversations (id, title, preferred_relay_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`)
-    .run(id, title, preferredMode, T0, T0);
+  db.prepare(`
+    INSERT INTO conversations (id, title, preferred_relay_mode, preferred_reasoning_effort, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, title, preferredMode, preferredEffort, T0, T0);
   db.prepare(`
     INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, runtime_key, model, provider_type, provider_model, created_at, last_used_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -66,13 +69,14 @@ function seedTurn(db, {
   attemptId = `attempt-${id}`,
   owner = 'sdk-c-1',
   text = 'please check linux-test',
+  effort = null,
 } = {}) {
   db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES (?, ?, 'user', ?, ?)`)
     .run(id, conversationId, text, processingAt);
   db.prepare(`
-    INSERT INTO queue (id, conversation_id, model, relay_mode, text, status, timestamp, processing_at, owner_sdk_session_id, attempt_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, conversationId, model, mode, text, status, processingAt, status === 'processing' ? processingAt : null, owner, attemptId);
+    INSERT INTO queue (id, conversation_id, model, reasoning_effort, relay_mode, text, status, timestamp, processing_at, owner_sdk_session_id, attempt_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, conversationId, model, effort, mode, text, status, processingAt, status === 'processing' ? processingAt : null, owner, attemptId);
 }
 
 /** A background continuation turn: a processing queue row with no user message behind it. */
@@ -98,12 +102,35 @@ test('the caller context comes from the live turn, the runtime binding and the c
     title: 'report builder',
     provider: 'claude',
     model: 'claude-sonnet-5[1m]',
+    effort: '',
     mode: 'plan',
     processingRowId: 'q-1',
     attemptId: 'attempt-q-1',
     userMessageId: 'q-1',
     hops: 0,
   });
+});
+
+test('the effort is the live turn\'s, else the one the conversation prefers', () => {
+  const live = setup();
+  seedConversation(live.db, { preferredEffort: 'low' });
+  seedTurn(live.db, { id: 'q-1', effort: 'XHigh' });
+  assert.equal(live.context.getCallerContext('c-1').effort, 'xhigh', 'the turn in flight decides');
+
+  const continued = setup();
+  seedConversation(continued.db, { preferredEffort: 'medium' });
+  seedContinuation(continued.db, { id: 'q-cont' });
+  assert.equal(continued.context.getCallerContext('c-1').effort, 'medium', 'a turn without an effort of its own');
+
+  const offTurn = setup();
+  seedConversation(offTurn.db, { preferredEffort: 'ultracode' });
+  seedTurn(offTurn.db, { id: 'q-old', status: 'done', effort: 'high' });
+  assert.equal(offTurn.context.getCallerContext('c-1').effort, 'ultracode', 'a finished turn says nothing about the next');
+
+  const unknown = setup();
+  seedConversation(unknown.db);
+  assert.equal(unknown.context.getCallerContext('c-1').effort, '');
+  assert.equal(unknown.context.getCallerContext('c-missing').effort, '');
 });
 
 test('hops come from the origin of the message behind the turn, the highest of a steered pair', () => {
