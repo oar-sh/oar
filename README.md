@@ -442,7 +442,9 @@ Use **➡️ Share conversation** in the `⋯` menu to publish a read-only link.
 
 ### The conversation menu
 
-Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title**, **🖥️ Inspect tmux console** (a read-only view of the session's tmux pane), **🤗 Select Models**, **⚙️ Settings**, **🌄 Restart web relay** (queued until the current turn is idle), **💤 Suspend host**, and **☠️ Kill session** (stops the conversation's worker; an active turn then needs a retry or a new message). Its header shows the queue counts with **🚮 Empty queue**.
+Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title**, **🖥️ Inspect tmux console** (a read-only view of the session's tmux pane), **🤗 Select Models**, **⚙️ Settings**, **🌄 Restart web relay** (queued until the current turn is idle), **💤 Suspend host** (Windows; see below), and **☠️ Kill session** (stops the conversation's worker; an active turn then needs a retry or a new message). Its header shows the queue counts with **🚮 Empty queue**.
+
+**💤 Suspend host** puts the machine the relay runs on to sleep, once the work is done. The confirmation lists what is still active. The relay then queues the suspend and fires it after 2 minutes with nothing active: no queued, running or parked turn, no background task of a live worker, and no open GitHub Actions run in the repository of a conversation that was busy since the request (read through `gh`; a repository whose state cannot be read blocks for 15 minutes, then is ignored). With nothing running when you confirm, it fires after a 30-second countdown. While a suspend is queued, every device shows a banner with the blockers or the countdown and a **Cancel** button, and a push notification reports the suspend. A relay restart drops a queued suspend and says so. **Show Suspend host action** in Settings hides the entry per browser.
 
 ## Settings and configuration reference
 
@@ -539,6 +541,8 @@ The config file is `server/config.json` in a git checkout and `~/.oar/config.jso
 | `COPILOT_WEB_RELAY_LOG_DIR` | Log directory |
 | `OAR_STATE_ROOT` | State root of a global install, instead of `~/.oar` / `%APPDATA%\oar` |
 | `OAR_NO_UPDATE_CHECK=1` | Never contact oar.sh, not even for a manual update check |
+| `OAR_HOST_SUSPEND_DRY_RUN=1` | **Suspend host** logs the suspend instead of sleeping the machine |
+| `OAR_MCP_SERVER=0` | Do not attach OAR's MCP server to Grok and the Copilot extension engine; they get the preview instructions as text again, and no `remote_relay` tool |
 | `COPILOT_SDK_PATH` | The Copilot CLI runtime's `copilot-sdk` directory, instead of the newest one in the CLI's package cache |
 | `COPILOT_PKG_DIR` | An additional Copilot CLI package cache to search |
 | `GH_TOKEN`, `GITHUB_TOKEN` | GitHub token for the Copilot usage card, instead of `gh auth token` |
