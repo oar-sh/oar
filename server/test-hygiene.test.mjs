@@ -97,7 +97,65 @@ function readHostIdentity() {
     username,
     homedir: String(os.homedir() || '').trim(),
     hostname: String(os.hostname() || '').trim(),
+    githubLogins: readGitHubLogins(),
   };
+}
+
+// The GitHub account(s) the host's `gh` CLI is signed in to, read from its
+// local hosts.yml (no network). A fixture naming the maintainer's own account
+// leaks which repositories exist behind it: a CI-blocker fixture once read
+// "<login>/<private repo>", copied from what a real relay showed.
+function readGitHubLogins(env = process.env) {
+  const dirs = [
+    env.GH_CONFIG_DIR,
+    env.XDG_CONFIG_HOME && path.join(env.XDG_CONFIG_HOME, 'gh'),
+    env.APPDATA && path.join(env.APPDATA, 'GitHub CLI'),
+    path.join(os.homedir(), '.config', 'gh'),
+  ].filter(Boolean);
+  const logins = new Set();
+  for (const dir of dirs) {
+    let text = '';
+    try { text = fs.readFileSync(path.join(dir, 'hosts.yml'), 'utf8'); } catch { continue; }
+    for (const match of text.matchAll(/^\s*user:\s*["']?([A-Za-z0-9-]+)["']?\s*$/gm)) logins.add(match[1]);
+  }
+  return [...logins];
+}
+
+// Private names no machine property reveals — other projects, their ticket
+// ids, personal domains — listed in an UNTRACKED file, so the list itself is
+// never published: `.git/info/hygiene-denylist` (git's common dir, shared by
+// every worktree) or the file OAR_HYGIENE_DENYLIST names. One entry per line,
+// `#` starts a comment; entries match case-insensitively as whole words.
+function readLocalDenylist(env = process.env) {
+  let file = String(env.OAR_HYGIENE_DENYLIST || '').trim();
+  if (!file) {
+    try {
+      const commonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      file = path.resolve(repoRoot, commonDir, 'info', 'hygiene-denylist');
+    } catch {
+      return [];
+    }
+  }
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return []; }
+  return text.split(/\r?\n/).map((line) => line.replace(/#.*/, '').trim()).filter(Boolean);
+}
+
+// Word-ish boundaries that still see a name inside a path, slug or domain:
+// `/name`, `name-wt` and `relay.name.tld` match, `names` and `rename` do not.
+function wholeWordPattern(value) {
+  return new RegExp(String.raw`(?<![A-Za-z0-9_])` + escapeRegExp(value) + String.raw`(?![A-Za-z0-9_])`, 'i');
+}
+
+function buildDenylistPatterns(entries = readLocalDenylist()) {
+  return entries.map((entry) => ({
+    label: `name from the local hygiene denylist (${entry})`,
+    re: wholeWordPattern(entry),
+  }));
 }
 
 function buildFingerprintPatterns(identity = readHostIdentity()) {
@@ -142,6 +200,14 @@ function buildFingerprintPatterns(identity = readHostIdentity()) {
         'i',
       ),
     });
+  }
+  // Unlike a bare username (see FINGERPRINT_CASES), the gh login is an account
+  // that owns repositories, so it is flagged wherever it appears; fixtures
+  // use `example-org/...`.
+  for (const login of identity.githubLogins || []) {
+    const name = String(login || '').trim();
+    if (name.length < 3 || isGenericIdentity(name)) continue;
+    patterns.push({ label: `GitHub account of this host's gh login (${name})`, re: wholeWordPattern(name) });
   }
   return patterns;
 }
@@ -438,4 +504,53 @@ test('a public domain sharing the hostname label is deliberately not flagged', (
   const patterns = buildFingerprintPatterns({ username: '', homedir: '', hostname: 'bigbox9' });
   assert.equal(patterns.some(({ re }) => re.test('https://bigbox9.com/blog')), false);
   assert.equal(patterns.some(({ re }) => re.test('https://bigbox9')), true, 'the bare authority still flags');
+});
+
+// Guard: names from the local hygiene denylist (see readLocalDenylist), over
+// everything git publishes plus every test file, tracked or not. Skipped, not
+// passed, on a checkout without a list: the list is private by design, so a
+// fresh clone has nothing to enforce.
+test('published and test files contain nothing from the local hygiene denylist', (t) => {
+  const patterns = buildDenylistPatterns();
+  if (!patterns.length) {
+    t.skip('no local hygiene denylist (.git/info/hygiene-denylist or OAR_HYGIENE_DENYLIST)');
+    return;
+  }
+  const tracked = collectTrackedTextFiles() || [];
+  const files = [...new Set([...tracked, ...collectTestFiles(repoRoot)].map((file) => path.resolve(file)))];
+  const violations = [];
+  for (const file of files) {
+    const relPath = path.relative(repoRoot, file);
+    let lines = [];
+    try { lines = fs.readFileSync(file, 'utf8').split(/\r?\n/); } catch { continue; }
+    lines.forEach((line, idx) => {
+      for (const { label, re } of patterns) {
+        if (re.test(line)) violations.push(`${relPath}:${idx + 1} — ${label}`);
+      }
+    });
+  }
+  assert.deepEqual(violations, [],
+    'Committed files and fixtures must not name private projects, tickets or domains; use fictional '
+    + `values (example-org/demo, example.com). Violations:\n${violations.join('\n')}`);
+});
+
+// The account and denylist patterns, pinned against SYNTHETIC values so their
+// behaviour does not depend on who runs the suite (same idea as
+// FINGERPRINT_CASES above).
+test('account and denylist patterns behave the same on any machine', () => {
+  const flags = (patterns, line) => patterns.some(({ re }) => re.test(line));
+  const login = buildFingerprintPatterns({ username: '', homedir: '', hostname: '', githubLogins: ['octo-jane'] });
+  assert.equal(flags(login, "{ kind: 'ci', title: 'octo-jane/private-repo' }"), true, 'account slug in a fixture');
+  assert.equal(flags(login, 'git clone https://github.com/Octo-Jane/tools'), true, 'any case, inside a URL');
+  assert.equal(flags(login, 'git clone https://github.com/oar-sh/oar'), false, 'the project org is not the account');
+  assert.equal(flags(login, 'octo-janet reviewed it'), false, 'a longer name is a different account');
+  const generic = buildFingerprintPatterns({ username: '', homedir: '', hostname: '', githubLogins: ['dev'] });
+  assert.equal(flags(generic, 'const cwd = "/home/dev/project";'), false, 'a generic login is skipped');
+
+  const deny = buildDenylistPatterns(['acme-internal', 'corp.example9', 'tree view 7']);
+  assert.equal(flags(deny, "{ kind: 'background', title: 'acme-internal' }"), true, 'a bare private name');
+  assert.equal(flags(deny, 'describeRuns(["/srv/acme-internal-wt"])'), true, 'the name inside a path');
+  assert.equal(flags(deny, 'https://relay.corp.example9/api'), true, 'a private domain under a subdomain');
+  assert.equal(flags(deny, "{ title: 'Tree View 7' }"), true, 'multi-word entries, any case');
+  assert.equal(flags(deny, 'acme-internals and the corp.example90'), false, 'longer words are other words');
 });

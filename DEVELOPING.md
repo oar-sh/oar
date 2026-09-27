@@ -479,6 +479,14 @@ Do not run tests that spawn Copilot CLI clients unless explicitly permitted.
   `C:\Users\dev`, `/home/dev`, `user@example.com`, obviously fake tokens. Never embed real
   usernames, home paths, hostnames, e-mail addresses, or credentials — not even your own.
   `server/test-hygiene.test.mjs` enforces this and fails the suite on violations.
+- **No real accounts or private project names either, anywhere git publishes.** The guard also
+  reads the GitHub login your `gh` CLI is signed in to (its local `hosts.yml`, no network) and
+  fails on any file naming it; fixtures use `example-org/demo`. Names no machine property
+  reveals (your other projects, their ticket ids, personal domains) go into an untracked
+  `.git/info/hygiene-denylist`: one entry per line, `#` for comments, matched case-insensitively
+  as whole words, so the list itself is never published (`OAR_HYGIENE_DENYLIST` points at another
+  file). Create it on every checkout you work in; without it that check is reported as skipped.
+  Agents writing fixtures from what a live relay shows are the usual source of such leaks.
 - **Platform behavior is injected, not detected.** Services take `platform`, `homedir`, `env`,
   `spawnImpl`/`execImpl` parameters; tests pass `'win32'`/`'linux'` explicitly so the whole
   suite runs identically on any OS. Do not write tests that branch on `process.platform` —
