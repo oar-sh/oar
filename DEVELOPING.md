@@ -26,6 +26,13 @@ These rules apply to any agent working in this repository (they were in the READ
   may run beside it; see [Tests](#tests).
 - Do not run extension-managed relay transport together with standalone relay runtime transport
   (see [Single runtime owner rule](#single-runtime-owner-rule)).
+- Work on a topic branch, never on `main`. Push it to the private remote `work` (a bare
+  `git push` does that), never to `origin`. Land finished work with `npm run land`. Never pass
+  `--no-verify` to `git push`, and never set the `OAR_ALLOW_PUBLIC_*` variables unless the user
+  asked for exactly that (see [Branches and landing](#branches-and-landing)).
+- Invent every name that goes into a fixture, a comment, a doc or a commit message. Do not copy
+  what a live relay, a log or this machine shows you: session titles, repository slugs, branch
+  names, ticket ids, accounts, hosts.
 
 `.github/copilot-instructions.md` carries the same restart policy for Copilot sessions.
 
@@ -341,6 +348,81 @@ when no getter is supplied, i.e. in tests). Stopping the runtime still kills its
 Live testing spends real Copilot quota: **`gpt-5.4-mini` is the only sanctioned model for live
 relay tests**, per the standing live-testing policy, and only with the user's explicit go-ahead.
 Everything else belongs in the unit suites, which drive the worker against a fake SDK client.
+
+## Branches and landing
+
+`main` is the only permanent branch, and the only one the public repository receives. Everything
+else is a short-lived topic branch that lives on a **private** remote and is deleted once it has
+landed. There is no long-lived `dev` branch.
+
+Why it is set up this way: on a public host, deleting a branch does not delete its commits. They
+stay fetchable by hash until the host's support purges them, so anything pushed there, including
+a leak and the commit that cleans it up, is effectively permanent. On the private remote nobody
+else can read them, and once the branch has landed squashed, its intermediate commits are not part
+of any public history.
+
+| Remote | What it is | What goes there |
+| ------ | ---------- | --------------- |
+| `origin` | the public repository | `main` and release tags, nothing else |
+| `work` | your private working repository | topic branches, and a mirror of `main` |
+
+Agents and scripts address the remotes **by name**; the URL behind `work` differs per
+maintainer and is not recorded in the repository.
+
+### One-time setup per checkout
+
+```bash
+npm run setup:git -- --work-url <url of your PRIVATE repository>
+```
+
+It sets `core.hooksPath` to `scripts/git-hooks` (shared by every worktree of the checkout), adds
+the `work` remote, makes a bare `git push` go to `work`, and creates an empty hygiene denylist if
+there is none. It is idempotent; run it again whenever in doubt. Then add your private names to
+the denylist (see [Test authoring rules](#test-authoring-rules)).
+
+### Day to day
+
+```bash
+git switch -c dev/<topic> origin/main   # start from the current public main
+# ...commit as often as you like; these commits are never published...
+git push                                # goes to the private remote
+git fetch origin && git rebase origin/main   # when main moved meanwhile
+npm run land -- -m "Subject line" --body-file notes.txt
+```
+
+`npm run land` refuses unless the branch is clean and sits on top of `origin/main`, then runs the
+hygiene guard, the unit suite and the end-to-end suite on exactly the tree that is about to be
+published. Only if all three pass does it build **one** squashed commit, push it to `origin/main`,
+mirror `main` to `work`, switch the checkout to `main` and delete the topic branch locally and on
+`work`. The squashed commit is built with `git commit-tree`, so the files on disk are never
+touched; the relay usually runs from this checkout. `--dry-run` does everything except publish.
+`--skip-e2e` exists for changes that cannot affect the app, and only when the user agreed.
+
+One topic per branch: what lands is one commit, so its message has to describe one change.
+
+From PowerShell call the script directly, `node scripts/land.mjs -m "…" --body-file notes.txt`:
+npm's PowerShell shim swallows the `--` separator and then reads `--body-file` as its own option.
+The same goes for `node scripts/setup-git.mjs --work-url <url>`.
+
+### The pre-push hook
+
+`scripts/git-hooks/pre-push` (logic in `scripts/pre-push.mjs`) runs on every push:
+
+- To `origin` it accepts only `main` and tags, refuses a non-fast-forward of `main`, and scans
+  the commits being pushed (messages and added lines) for machine fingerprints, the `gh`
+  account, denylist names and secrets. Deleting a branch is always allowed.
+- To any remote it first runs the hygiene guard over the working tree.
+
+The two overrides are environment variables, deliberately not flags:
+`OAR_ALLOW_PUBLIC_BRANCH=1` and `OAR_ALLOW_PUBLIC_REWRITE=1`. They are for a maintainer repairing
+the public repository by hand. What counts as a leak is defined once, in
+`scripts/hygiene-patterns.mjs`, and shared with `server/test-hygiene.test.mjs`.
+
+### If something private was published anyway
+
+Rewriting and force-pushing removes it from the branch, not from the host: the old commits remain
+fetchable by hash. Rewrite first, then ask the host's support to purge the unreachable commits and
+cached views, and treat any secret among them as compromised.
 
 ## Tests
 

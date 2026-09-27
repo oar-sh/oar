@@ -40,9 +40,11 @@
   "scripts": {
     "start": "node server/server.js",
     "copilot:relay": "gh copilot -- --allow-all",
-    "test": "node --test \"server/**/*.test.mjs\" \"shared/**/*.test.mjs\" \".github/extensions/web-relay/**/*.test.mjs\"",
+    "test": "node --test \"server/**/*.test.mjs\" \"shared/**/*.test.mjs\" \".github/extensions/web-relay/**/*.test.mjs\" \"scripts/**/*.test.mjs\"",
     "test:agents:smoke": "node --test \"tests/agents/**/*.test.mjs\"",
     "test:e2e": "node tests/run-e2e.mjs",
+    "setup:git": "node scripts/setup-git.mjs",
+    "land": "node scripts/land.mjs",
     "test:e2e:raw": "node ./node_modules/@playwright/test/cli.js test --config tests/playwright.config.mjs"
   },
   "dependencies": {

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Installed by `npm run setup:git` (core.hooksPath = scripts/git-hooks).
+# The rules live in scripts/pre-push.mjs; see DEVELOPING.md, "Branches and landing".
+root="$(git rev-parse --show-toplevel)" || exit 1
+exec node "$root/scripts/pre-push.mjs" "$@"
