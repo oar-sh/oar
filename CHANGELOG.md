@@ -5,6 +5,31 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Follow the live reply**: three toggles in the running reply's header keep
+  its thoughts, its answer or its tool list pinned just above the composer as
+  the reply grows. Scrolling the transcript by hand turns it off; typing in the
+  composer does not. The choice is remembered per conversation until the page
+  reloads.
+- A queued relay restart shows a banner on every client, with a **Cancel**
+  button (a new localhost-only cancel endpoint behind it).
+
+### Changed
+
+- **Suspend host waits for the work to finish.** Instead of sleeping the
+  machine at once, the relay queues the suspend and fires it after 2 minutes
+  with nothing active: no queued, running or parked turn, no background task of
+  a live worker, and no open GitHub Actions run in a busy conversation's
+  repository (read through `gh`; a repository whose state cannot be read blocks
+  for 15 minutes, then is ignored). With nothing running at confirm time it
+  fires after a 30-second countdown. The confirmation lists what is still
+  active, every client shows a banner with the blockers or the countdown and a
+  **Cancel** button, and a push notification reports the suspend, or its drop
+  when the relay restarts. Suspend remains Windows-only;
+  `OAR_HOST_SUSPEND_DRY_RUN=1` logs instead of suspending.
+- **Stop** asks for confirmation before cancelling the running turn.
+
 ## [0.9.3] — 2026-09-27
 
 Highlights: mid-turn steering on Claude and Copilot, Copilot background tasks on

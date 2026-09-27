@@ -201,9 +201,34 @@ manifest-update flow — one confirmation prompt showing the new name, then the
 launcher label updates. A legacy per-browser name is adopted by the relay the
 first time that browser loads the app.
 
+**💤 Suspend host** (Windows relay hosts) puts the PC into suspend-to-RAM once
+nothing is running any more. The confirmation modal first lists what is still
+active — sessions with a running turn, sessions with live background agents, and
+open GitHub Actions runs in the workspaces of those sessions (read through the
+host's `gh` CLI; an unreadable CI state blocks for 15 minutes, then is ignored).
+Confirming queues the request: the relay polls every second and suspends after
+everything has been idle for 2 minutes (or 30 seconds when nothing was running
+at confirm time). While a suspend is queued every connected client shows a
+banner with the blockers or the countdown and a **Cancel** button, the menu entry
+reads **💤 Suspend pending…**, and reopening the modal offers to cancel. A relay
+restart drops the queued suspend; a push notification (event **Host suspend**)
+reports both the actual suspend and such a drop. A queued **🌄 Restart web relay**
+gets the same banner and can be cancelled from it too.
+
+API: `GET /api/host/suspend` (state plus current blockers), `POST /api/host/suspend`,
+`POST /api/host/suspend/cancel`, and `POST /api/relay/shutdown/cancel`
+(localhost-only). Set `OAR_HOST_SUSPEND_DRY_RUN=1` to log instead of sleeping.
+
 You can also hide the **💤 Suspend host** action from **⚙️ Settings** with the
-**Show Suspend host action** checkbox. This only controls UI visibility; it does not
-change host suspend implementation behavior.
+**Show Suspend host action** checkbox. This only controls the menu entry; the
+banner for an already queued suspend still shows on every device.
+
+The live thinking bubble's header carries three follow buttons on the right —
+**💭** thoughts, **📃** streamed answer, **🛠️** tool list. Arming one keeps that
+section's last line pinned just above the composer as the reply grows; scrolling
+the transcript by hand (wheel, touch, scroll keys) disarms it, typing in the
+composer does not. The armed mode is remembered per conversation for the life of
+the page. **Stop** now asks for confirmation before cancelling the turn.
 
 If you host the relay behind a subpath, set `remotePath` in `server/config.json` to that public path prefix and open the URL with a trailing slash so the PWA scope matches correctly for install prompts. The relay serves a path-relative manifest identity (`id`, `start_url`, `scope`) so each install stays bound to its own URL subtree and avoids cross-app collisions on shared origins.
 
