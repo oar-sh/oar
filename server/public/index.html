@@ -5424,7 +5424,7 @@
             onchange="updateBackgroundTaskTimeoutSetting(this.value)"
           >
         </div>
-        <div class="settings-help" style="margin-top: 6px;">How long background tasks (backgrounded commands, subagents, monitors) may keep a Claude session's CLI process alive after its turn ends. When the limit is reached the tasks are stopped and the agent reports what they left behind. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
+        <div class="settings-help" style="margin-top: 6px;">How long background tasks may keep a session alive after its turn ends: backgrounded commands, subagents and monitors on Claude; background agents and detached shells on Copilot's SDK engine. When the limit is reached the tasks are stopped. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
         <div id="windows-autostart-setting" hidden>
           <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
             <label>Autostart (Windows)</label>
@@ -5599,14 +5599,14 @@
           <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
             <label for="copilot-engine-select">Copilot engine</label>
             <select id="copilot-engine-select" aria-label="Copilot engine">
-              <option value="extension">Extension — current</option>
-              <option value="sdk">SDK — experimental</option>
+              <option value="extension">Extension</option>
+              <option value="sdk">SDK — default</option>
             </select>
             <div id="copilot-settings-status" class="settings-help settings-provider-status">Loading Copilot settings…</div>
             <div style="display: flex; gap: 8px; margin-top: 8px;">
               <button id="copilot-save-btn" type="button" class="summary-btn" onclick="saveCopilotSettings()">Save Copilot settings</button>
             </div>
-            <div class="settings-help">Chooses how GitHub Copilot conversations run. <strong>Extension</strong> is the current default: the Copilot CLI in a terminal session, which you can attach to with the tmux inspector. <strong>SDK</strong> is experimental and headless — no CLI extension to install, but no tmux inspector for those sessions. Applies to newly started conversations; sessions already running keep their engine until their worker restarts.</div>
+            <div class="settings-help">Chooses how GitHub Copilot conversations run. <strong>SDK</strong> is the default: a headless worker per conversation with mid-turn steering and background task cards — no CLI extension to install, but no tmux inspector for those sessions. <strong>Extension</strong> runs the Copilot CLI in a terminal session, which you can attach to with the tmux inspector. A relay that cannot run the SDK engine uses Extension. Applies to newly started conversations; sessions already running keep their engine until their worker restarts.</div>
           </div>
         </div>
         <div

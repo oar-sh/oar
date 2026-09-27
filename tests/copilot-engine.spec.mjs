@@ -36,8 +36,8 @@ import { buildCopilotPlanCard } from "../server/services/plan-usage-copilot.mjs"
  * (server/copilot-worker/*.test.mjs). See docs/plans/copilot-sdk-worker.md §4c.
  */
 
-const EXTENSION_STATUS = "New Copilot conversations run on the Copilot CLI with the web-relay extension (current default).";
-const SDK_STATUS = "New Copilot conversations run on the experimental headless SDK worker. No tmux inspector for these sessions.";
+const EXTENSION_STATUS = "New Copilot conversations run on the Copilot CLI with the web-relay extension.";
+const SDK_STATUS = "New Copilot conversations run on the headless SDK worker. No tmux inspector for these sessions.";
 
 function authHeaders(token = relayToken()) {
   return { Authorization: `Bearer ${token}` };
@@ -97,8 +97,8 @@ test.describe.serial("Copilot engine panel on a relay without session-worker rou
 
     await expect(engineSelect(page)).toHaveValue("extension");
     await expect(engineSelect(page).locator("option")).toHaveText([
-      "Extension — current",
-      "SDK — experimental",
+      "Extension",
+      "SDK — default",
     ]);
     expect(await engineSelect(page).locator("option").evaluateAll(
       (options) => options.map((option) => option.value),

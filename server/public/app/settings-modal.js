@@ -355,8 +355,8 @@ export function applyCopilotSettingsState(settings = {}, { error = '' } = {}) {
       status.dataset.state = 'error';
     } else {
       status.textContent = copilotSettingsState.engine === 'sdk'
-        ? 'New Copilot conversations run on the experimental headless SDK worker. No tmux inspector for these sessions.'
-        : 'New Copilot conversations run on the Copilot CLI with the web-relay extension (current default).';
+        ? 'New Copilot conversations run on the headless SDK worker. No tmux inspector for these sessions.'
+        : 'New Copilot conversations run on the Copilot CLI with the web-relay extension.';
       status.dataset.state = copilotSettingsState.engine === 'sdk' ? 'active' : 'unconfigured';
     }
   }
@@ -398,7 +398,7 @@ export async function saveCopilotSettings() {
     settled = result;
     showTransientRelayNotice(
       String(result.engine) === 'sdk'
-        ? 'Copilot engine set to SDK (experimental). New conversations use the headless worker; running sessions keep the extension until they restart.'
+        ? 'Copilot engine set to SDK. New conversations use the headless worker; running sessions keep their engine until they restart.'
         : 'Copilot engine set to Extension. New conversations use the Copilot CLI.',
       6000,
     );
