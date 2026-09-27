@@ -220,6 +220,8 @@ devices, and a sidebar title filter.
   launcher never read.
 - Concurrent conversation deletes could start extra Copilot runtimes that were
   never shut down.
+- Question cards said *Copilot question* in every conversation; they now name
+  the runtime that asks (Claude, Copilot, Cursor, OpenAI).
 
 ## [0.9.2] — 2026-09-13
 
