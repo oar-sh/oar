@@ -35,6 +35,14 @@ export function conversationProviderIndicatorLabel(conversation = null) {
   return '';
 }
 
+// A question card names the runtime that asks, the way the list pill names it.
+// Unresolved reads plain "Question": every card used to say "Copilot question",
+// Claude's and Cursor's included.
+export function questionCardHeadLabel(conversation = null) {
+  const provider = conversationProviderIndicatorLabel(conversation);
+  return provider ? `${provider} question` : 'Question';
+}
+
 const SESSION_LOCK_LABELS = {
   github: 'GitHub Copilot',
   openai: 'OpenAI',

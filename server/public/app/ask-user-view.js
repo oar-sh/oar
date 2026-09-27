@@ -12,6 +12,7 @@ import { renderLinkedPlainText } from './router.js';
 import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 import { composeMultiSelectAnswer, isMultiSelectQuestion, offersMultiSelectToggle } from './question-multi-select.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
+import { questionCardHeadLabel } from './conversation-provider-indicator.mjs';
 
 let relayQuestionRenderHash = '';
 let renderedRelayQuestionIds = new Set();
@@ -318,7 +319,7 @@ export function renderRelayQuestions() {
 
     wrapper.innerHTML = `
       <div class="relay-question-card${question.status === 'timed_out' ? ' relay-question-timed-out' : ''}">
-        <div class="relay-question-head">Copilot question${modeTag} · ${fmtDate(question.createdAt)}</div>
+        <div class="relay-question-head">${questionCardHeadLabel(conversations[question.conversationId])}${modeTag} · ${fmtDate(question.createdAt)}</div>
         <div class="relay-question-body">${renderLinkedPlainText(question.prompt || '')}</div>
         ${contextHtml}
         ${answeredHtml}

@@ -8,6 +8,7 @@ import {
   isConversationUsingGrokProvider,
   isConversationUsingOpenAIProvider,
   isOpenAIImageModelId,
+  questionCardHeadLabel,
   resolveConversationProviderType,
   sessionLockNoteText,
   sessionLockProviderKey,
@@ -132,4 +133,14 @@ test('builds the composer session lock note', () => {
   );
   assert.equal(sessionLockNoteText({ providerType: 'unknown', pinnedModel: 'gpt-4o' }), '');
   assert.equal(sessionLockNoteText(), '');
+});
+
+test('question cards name the runtime that asks, not always Copilot', () => {
+  assert.equal(questionCardHeadLabel({ runtimeProviderType: 'claude' }), 'Claude question');
+  assert.equal(questionCardHeadLabel({ runtimeProviderType: 'github' }), 'Copilot question');
+  assert.equal(questionCardHeadLabel({ runtime_provider_type: 'cursor' }), 'Cursor question');
+  assert.equal(questionCardHeadLabel({ runtimeProviderType: 'openai' }), 'OpenAI question');
+  // A conversation the client has not resolved yet claims no provider.
+  assert.equal(questionCardHeadLabel(null), 'Question');
+  assert.equal(questionCardHeadLabel({}), 'Question');
 });
