@@ -1,6 +1,6 @@
 {
   "name": "@oar-sh/oar",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "type": "module",
   "description": "OAR — Open Agent Relay: drive your local coding agents from any browser",
   "license": "MIT",

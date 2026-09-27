@@ -78,7 +78,7 @@ curl -fsSL oar.sh/install | sh
 The script checks for Node.js 22.13 or newer, runs `npm install -g @oar-sh/oar`, and then hands off to `oar setup` (with `--defaults` when there is no terminal to ask questions in). It refuses to run as root, because OAR installs per user. `OAR_VERSION=x.y.z` pins a version, `OAR_CHANNEL=beta` follows the beta channel, and `OAR_DRY_RUN=1` only prints what it would do:
 
 ```bash
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.3 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.4 sh
 ```
 
 Read it before you run it: [oar.sh/install](https://oar.sh/install).
@@ -89,7 +89,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.3'` before the command.
+The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.4'` before the command.
 
 ### npm
 
@@ -326,15 +326,15 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 
 ## Highlights
 
-### New in 0.9.3
+### New in 0.9.4
 
-- **Mid-turn steering** for Claude, and for Copilot on the SDK engine with every model, hosted or BYOK: a message you send while a turn runs goes into that turn instead of waiting behind it. The send button reads **Steer**; while a question card, plan approval, or compaction is open it reads **Queue**, and the message steers in once that is resolved, so a question card is never bypassed. **Stop** lives on the running reply's bubble, and steered messages that a Stop cut off offer a one-tap **Resend**.
-- **Copilot background tasks** (SDK engine): background agents and detached shells appear in the task panel with the model they run on, the command they are running right now, their token count, and a **Stop** that works. The reply no longer waits for them; a background agent's result arrives afterwards as its own *continuation* reply.
-- **Multi-select question cards**: a question that allows several answers shows checkmarks and one **Reply with selection** button. Claude cards follow Claude's own flag; Copilot choice cards (SDK engine) also carry a **Select several** switch for when the model forgets to flag it.
-- **Drafts sync safely across devices**: an idle device no longer overwrites the draft you are typing on another one, and when two devices edit at once, the text that lost is offered back with **Restore**.
-- **Sidebar title filter** above the conversation list. It loads older pages while it is active, so it searches every conversation, not just the loaded ones.
-- **Deleting a conversation stops its worker and removes the CLI session OAR created for it** (Copilot's through the runtime, Claude's by deleting that session's transcript). A Copilot session OAR only imported from the host, one you started in a terminal, is hidden instead, and nothing is stopped for it. A conversation that is still working is not deleted; the sidebar tells you why, so you can stop it first.
-- The **Background task timeout** defaults to **4 hours** instead of no limit, for Claude and Copilot alike: long-running work still finishes, but a forgotten shell or agent no longer keeps its session alive forever. A value you already chose is kept.
+- **Remote relays**: pair two OAR relays in **Settings → Relays** by pasting the other relay's web address; the pairing works both ways. An agent in any session can then work on the other relay when you ask it to: list and read its sessions, prompt one, start a new one, wait for the reply, and pass a question the remote agent asks back to you. See [Remote relays](#remote-relays).
+- **You decide when a relay is in reach**: a paired relay stays locked in a conversation until you mention it (`@` picks it from a list). Per relay, **Agents may** limits agents to *read only*, *read and prompt*, or *full*, and in ask and plan mode every write action asks you first. The receiving relay marks such messages with a **↗ from …** badge.
+- **Every provider gets the same tools**: Grok and the Copilot extension engine now get `remote_relay` and `preview` as real tools through OAR's MCP server, instead of instruction text.
+- **Follow the live reply**: three toggles in the running reply's header keep its thoughts, its answer, or its tool list pinned just above the composer as the reply grows. Scrolling the transcript by hand turns it off; typing in the composer does not.
+- **Suspend host waits for the work to finish** (Windows): the relay queues the suspend and fires it after 2 minutes with no turn, background task, or GitHub Actions run active, or after a 30-second countdown when nothing was running. Every device shows a banner with what is still active and a **Cancel** button; a queued relay restart shows the same banner.
+- **Stop** asks for confirmation before it cancels the running turn.
+- **Fewer stuck and failed sends**: switching the Claude model mid-conversation no longer strands the next message, and the relay keeps idle connections open for 65 seconds, so a request sent after a short pause is no longer reset (behind a proxy or tunnel: an occasional 502).
 
 ### Everything else
 

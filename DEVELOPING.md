@@ -497,10 +497,9 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **3233 pass / 0 fail / 0 skip on Linux (2026-09-27)** — the count
+Expected: **0 fail** everywhere; **3707 pass / 0 fail / 0 skip on Linux (0.9.4, 2026-09-27)** — the count
 grows with every change, so treat it as a floor. Windows runs the same suite with **4 skips** that are host-gated
-(0600 file modes, symlinks) and run on Linux; its last measured count (2467 pass) predates the 2026-09
-steering and draft-sync waves — re-measure there before quoting it.
+(0600 file modes, symlinks) and run on Linux: **3703 pass / 0 fail / 4 skip** on the same commit.
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns
@@ -528,7 +527,8 @@ node --test server/services/context-usage-view.test.mjs
 npm run test:e2e
 ```
 
-Expected: **146 passed / 0 failed / 3 skipped on Linux (2026-09-27)** (the 3 are host-gated). Two question-card
+Expected: **158 passed / 0 failed / 6 skipped on Linux (0.9.4, 2026-09-27)**, and 160 passed / 4 skipped on
+Windows (the skipped ones are host-gated). Two question-card
 tests in `relay-question-ui.spec.mjs` (`:82` and `:386`) are **known flaky** and usually pass on
 Playwright's single retry; across five full runs they failed 0–2 times each with no relation to what
 else was in the suite. Treat a failure there as flake only after re-running — anything else failing

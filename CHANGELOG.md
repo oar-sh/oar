@@ -5,6 +5,12 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-09-27
+
+Highlights: remote relays (pair OAR relays and let an agent on one work on the
+other), follow toggles for the running reply, and a Suspend host that waits for
+agents, background tasks and CI to finish.
+
 ### Added
 
 - **Remote relays**: pair OAR relays in **Settings → Relays** by pasting the other
@@ -40,6 +46,14 @@ All notable changes to OAR are documented here. The format follows
   when the relay restarts. Suspend remains Windows-only;
   `OAR_HOST_SUSPEND_DRY_RUN=1` logs instead of suspending.
 - **Stop** asks for confirmation before cancelling the running turn.
+- The **Install app name** setting is now called **Relay name**. Your value is
+  kept. It still labels the installed app, and it is the name paired relays
+  know this relay by; when it is empty, paired relays see the machine's
+  hostname.
+- Dependency updates clear all five `npm audit` findings, one of them rated
+  high: express 4.22.3, body-parser 1.20.8, qs 6.16.0, fast-uri 3.1.8 and
+  hono 4.13.9. All were inside the declared ranges, so `package.json` is
+  unchanged; a git checkout gets them with `npm ci`.
 
 ### Fixed
 
@@ -48,6 +62,15 @@ All notable changes to OAR are documented here. The format follows
   switch landed on a *continuation* row while the message itself stayed
   processing, and every later message waited behind it for up to 5 minutes, or
   until the session was killed.
+- **Requests on an idle connection are no longer reset.** The relay closed a
+  kept-alive connection after 5 seconds without traffic, so a request sent on
+  it a moment later could be reset before the relay read a byte. Behind a
+  reverse proxy or tunnel that pools its connections this showed up as an
+  occasional 502, and a send was not repeated. Idle connections now stay open
+  for 65 seconds.
+- After a send, the transcript stays at the newest message when the composer
+  grows (a session note or a warning banner appearing under it). It used to
+  slip up until the draft was saved.
 
 ## [0.9.3] — 2026-09-27
 
