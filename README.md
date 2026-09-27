@@ -1,364 +1,238 @@
 # OAR — Open Agent Relay
 
-Drive your local coding agents from any browser (phone, tablet, or second computer) through a self-hosted web relay.
+Drive the coding agents on your machine from any browser (phone, tablet, or a second computer) through a self-hosted web relay.
 
 ```bash
 curl -fsSL oar.sh/install | sh
 ```
 
-Landing page and installers: [oar.sh](https://oar.sh). From a git checkout, the Quick start below still applies unchanged.
+On Windows, run `irm oar.sh/install.ps1 | iex` in PowerShell. Landing page: [oar.sh](https://oar.sh). npm and git-checkout installs are covered under [Install](#install).
 
-GitHub Copilot CLI is the default runtime, and two more can be enabled per conversation: **OpenAI (BYOK)** and **Claude (Agent SDK)**. All three share the same chat UI, queue, history, file browser, and question cards — you pick the runtime when you start a conversation.
+OAR relays six runtimes: **GitHub Copilot**, **OpenAI (BYOK)**, **OpenAI Image (BYOK)**, **Claude (Agent SDK)**, **Cursor (Agent SDK)**, and **Grok (CLI ACP)**. You pick one per conversation, and all of them share the same chat UI, queue, history, file browser, and question cards.
 
 ```text
-                                            ┌── Copilot CLI session  (default)
-[Browser] <--WebSocket--> [server.js :3333] ┼── OpenAI BYOK worker   (your API key)
-                                            └── Claude worker        (host's Claude login)
+                                             ┌── Copilot       SDK worker, or Copilot CLI + extension
+                                             ├── OpenAI        Copilot runtime, your API key
+[Browser] <--WebSocket--> [OAR relay :3333]  ┼── OpenAI Image  Images API, called by the relay
+                                             ├── Claude        Agent SDK worker, host's Claude login
+                                             ├── Cursor        Agent SDK worker, your Cursor API key
+                                             └── Grok          Grok CLI over ACP, host's Grok login
 ```
+
+The relay runs on your hardware, listens on localhost only until you change that, and collects no telemetry (see [Security notes](#security-notes)).
+
+OAR is under active development, so expect occasional rough edges and some provider SDK features that are missing or incomplete.
 
 ## In action
 
-OAR is built to feel at home on both desktop and mobile. Your conversations can follow you from a browser tab to a PWA install, with file browsing and previews built in.
-
-<div align="center">
-<table width="100%" cellspacing="0" cellpadding="0">
+<table>
 <tr>
-<td rowspan="2" width="40%" align="center" valign="middle">
-<a href="docs/screenshots/mobile_session.jpg" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/mobile_session.jpg" alt="Mobile session view">
-</a>
-<div align="center"><small>Mobile session view with the composer and a PWA-style fullscreen layout.</small></div>
+<td width="42%" rowspan="3" valign="top">
+<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.3"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.3" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></a>
+<br><sub>On a phone: the same conversations, installable as an app.</sub>
 </td>
-<td width="60%" align="right" valign="top">
-<a href="docs/screenshots/desktop_pwa_background_agents.png" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/desktop_pwa_background_agents.png" alt="Desktop PWA chat view with background agents">
-</a>
-<div align="center"><small>Desktop PWA App (Chrome), chat view with background agents running in parallel.</small></div>
+<td width="58%" valign="top">
+<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.3"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.3" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></a>
+<br><sub>Agents working in parallel, each with live token counts and its own Stop.</sub>
 </td>
 </tr>
 <tr>
-<td width="60%" align="right" valign="bottom">
-<a href="docs/screenshots/desktop_pwa_file_viewer.png" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/desktop_pwa_file_viewer.png" alt="Desktop PWA file viewer">
-</a>
-<div align="center"><small>Integrated file viewer for previews and inline file browsing.</small></div>
+<td valign="top">
+<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.3"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.3" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></a>
+<br><sub>When the agent needs a decision, it asks, and waits for your answer.</sub>
+</td>
+</tr>
+<tr>
+<td valign="top">
+<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.3"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.3" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></a>
+<br><sub>Read the reasoning, not just the answer.</sub>
 </td>
 </tr>
 </table>
-</div>
 
-## What this repository provides
+<a id="quick-start"></a>
 
-OAR is split into three pieces:
+## Install
 
-1. **Web relay server** (`server/`): queueing, persistence, auth, browser UI, file browser, uploads, and the OpenAI BYOK image path.
-2. **Copilot CLI extension** (`.github/extensions/web-relay/`): polls the relay, executes turns, streams activity, bridges `ask_user` questions into web question cards.
-3. **Claude worker** (`server/claude-worker/`): a per-conversation Node process that runs turns through the Claude Agent SDK and speaks the same relay contracts as the Copilot workers.
+### Prerequisites
 
+You need Node.js plus whatever the runtimes you actually use need. Nothing else is required.
 
+| Requirement | Needed for | Notes |
+| ----------- | ---------- | ----- |
+| Node.js 22.13 or newer | always | Both installers check this. Running the development test suite needs Node 24 (see [DEVELOPING.md](DEVELOPING.md#node-version)) |
+| GitHub Copilot CLI (`copilot`), signed in | Copilot and OpenAI (BYOK) chats | Install it with `npm install -g @github/copilot`, then run `copilot` once on the relay host and sign in. The relay looks for the CLI's runtime when it starts, so restart the relay after installing or upgrading the CLI. Needs a GitHub Copilot plan that includes Copilot CLI |
+| GitHub CLI (`gh`), signed in | the `oar` launcher command; Extension-engine sessions on Windows; the Copilot card in **Check Usage** | `gh copilot` is built into current GitHub CLI releases, so there is no extension to install. The usage card also accepts a token in `GH_TOKEN` or `GITHUB_TOKEN` |
+| OpenAI API key | OpenAI and OpenAI Image chats | Entered in **⚙️ Settings**, stored in the relay database |
+| A Claude login on the relay host | Claude chats | Log in from **⚙️ Settings → Providers → Claude → Relogin** (the panel can install the Claude Code CLI first), or run `claude` once on the host. The relay stores no Claude key |
+| Cursor API key | Cursor chats | Entered in **⚙️ Settings**, stored in the relay database |
+| Grok CLI, signed in | Grok chats | Install it and sign in from **⚙️ Settings → Providers → Grok**, or set `XAI_API_KEY` in the relay's environment |
+| tmux (optional) | Linux and macOS | Session workers run in detached tmux sessions you can watch from the browser (**🖥️ Inspect tmux console**). Without tmux they run as plain background processes |
 
-## Project Status
+### macOS and Linux
 
-OAR is still under active development, so expect occasional rough edges and some provider SDK features to be missing or incomplete for now.
+```bash
+curl -fsSL oar.sh/install | sh
+```
 
+The script checks for Node.js 22.13 or newer, runs `npm install -g @oar-sh/oar`, and then hands off to `oar setup` (with `--defaults` when there is no terminal to ask questions in). It refuses to run as root, because OAR installs per user. `OAR_VERSION=x.y.z` pins a version, `OAR_CHANNEL=beta` follows the beta channel, and `OAR_DRY_RUN=1` only prints what it would do:
 
-## Highlights
+```bash
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.3 sh
+```
 
-- Remote chat UI for local coding agents — Copilot CLI, OpenAI (BYOK), Claude (Agent SDK), or Cursor (Agent SDK), chosen per conversation
-- Per-message **mode** picker: `plan`, `ask`, `agent`, `autopilot`
-- Per-message **model** and **reasoning effort** pickers (live model discovery + fallback catalog)
-- Streaming tool/activity updates *and* live assistant reply text while a turn runs
-- Nested **subagent bubbles**: each subagent gets its own live bubble with its own thoughts, activity, and streamed text, kept as collapsible sections after the turn finishes
-- **Background task panel** with live per-task state, model, and token use; Claude workflow tasks fold out into a progress tree of phases and agents, and leave a *Finished background task* card in the transcript when they complete
-- Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
-- Web question cards for `ask_user` clarification flows (single-field text, multi-select checkmarks when several answers are allowed, and multi-field structured forms)
-- Structured answer support: multi-field elicitation with JSON schema validation and UI-rendered forms
-- **Context usage** modal with a per-category token breakdown of the model's context window, plus a per-conversation **auto-compact window** slider for Claude sessions
-- **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context, and matching dots beside the scrollbar
-- **Plan usage** modal with subscription credits, rate-limit windows and reset countdowns for Copilot, Claude, Cursor, and Grok
-- **Image conversations** (OpenAI BYOK): generate images in chat and iterate on a generated image with *Edit this image*
-- **Share** a conversation by link, with per-message *Hide from shares* control
-- Conversation history stored in local SQLite
-- Deleting a conversation stops its session worker and removes its CLI session too (Copilot through the SDK's `deleteSession()`, Claude by deleting that session's transcript); a conversation that is still working (a running turn or live background tasks) is refused until it is stopped
-- Conversation **compact** workflow (`/compact`) to continue with summary carry-over
-- Workspace + drives browser with file preview, raw file access, and sticky hidden/heavy filters
-- **Git changes** modal: branch + ahead/behind info, pull, and a per-file diff viewer with *Changes only* / *Full file* modes
-- `@file:` and `@folder:` reference tokens with copy-to-clipboard helpers
-- Uploads and image attachment relay support
-- Optional SSH reverse tunnel support for internet access
-- PWA install support with installed-app fullscreen preference and browser-mode fallbacks
+Read it before you run it: [oar.sh/install](https://oar.sh/install).
 
-## Prerequisites
+### Windows
 
-Only Node.js and the runtime you actually intend to use are required.
+```powershell
+irm oar.sh/install.ps1 | iex
+```
 
+The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.3'` before the command.
 
-| Requirement                  | Needed for                    | Notes                                     |
-| ---------------------------- | ----------------------------- | ----------------------------------------- |
-| Node.js 24+                  | always                        | Runs the relay server. Verified on 24; the unit suite requires 24+ (20 and 22 fail — see DEVELOPING.md) |
-| GitHub CLI (`gh`)            | Copilot provider              | Must be available in PATH                 |
-| GitHub Copilot CLI extension | Copilot provider              | `gh extension install github/gh-copilot`  |
-| Copilot subscription         | Copilot provider              | Individual, Business, or Enterprise       |
-| OpenAI API key               | OpenAI + OpenAI Image chats   | Entered in **⚙️ Settings**, stored locally |
-| Claude Code CLI, logged in   | Claude chats                  | Log in from **⚙️ Settings → Providers → Claude → Relogin**, or run `claude` once on the relay host; no API key is stored by the relay |
+### npm
 
+```bash
+npm install -g @oar-sh/oar
+oar setup
+```
 
-## Quick start
+### From a git checkout
 
 ```bash
 git clone https://github.com/oar-sh/oar
 cd oar
 npm install
+node bin/oar.js setup   # writes server/config.json with a fresh auth token
+npm start               # the same as: node server/server.js
 ```
 
-Create `server/config.json`:
+A checkout keeps all of its state inside the repository (`server/config.json`, `server/data/`, `server/uploads/`, `server/logs/`) and never updates itself. `node server/server.js --port <port> --token <token>` overrides the config for one run without saving it.
+
+You can also write `server/config.json` by hand; every key you leave out takes its default (see the [configuration reference](#configuration-reference-serverconfigjson)):
 
 ```json
 {
-  "authToken": "change-me",
+  "authToken": "change-me-to-a-long-random-secret",
   "port": 3333,
-  "localhostOnly": true,
-  "pollIntervalMs": 3000,
-  "processingTimeoutMs": 600000,
-  "conversationSessionMode": "isolated"
+  "localhostOnly": true
 }
 ```
 
-Start Copilot with the relay extension:
+Development workflows, tests, and relay internals are in [DEVELOPING.md](DEVELOPING.md).
+
+### Start the relay
+
+`oar setup` creates the config and prints the relay URL with a QR code, but it does not start the relay. Pick one:
+
+- **Linux (global install):** accept the systemd user service that `oar setup` offers, then run `systemctl --user enable --now oar`. The relay then starts when you log in; run `loginctl enable-linger "$USER"` once if it should keep running while you are logged out.
+- **Windows:** start the relay once with `oar`, then choose **⚙️ Settings → General → Autostart (Windows)**: *At sign-in* opens a visible terminal after you log on, and *At system startup* runs it headless before anyone signs in, after one admin confirmation on the PC itself.
+- **Any platform:** `oar` starts the relay in the background if it is not already running, then opens the Copilot CLI (`gh copilot`) in the same shell. A relay that `oar` started stops again when that Copilot session ends, and `oar` needs the GitHub CLI.
+
+To run only the relay from a global install, without a Copilot session, start the server the way the systemd unit does:
 
 ```bash
-npm run copilot:relay
+COPILOT_WEB_RELAY_CONFIG="$HOME/.oar/config.json" \
+COPILOT_WEB_RELAY_DATA_DIR="$HOME/.oar/data" \
+COPILOT_WEB_RELAY_LOG_DIR="$HOME/.oar/logs" \
+node "$(npm root -g)/@oar-sh/oar/server/server.js"
 ```
 
-If you installed the extension globally in `~/.copilot/extensions/web-relay/`, you can also start plain Copilot from any repository:
+On Windows, point the same three variables at `%APPDATA%\oar\config.json`, `%APPDATA%\oar\data`, and `%APPDATA%\oar\logs`. The directory you start it from becomes the default working directory for new sessions.
 
-```bash
-gh copilot
-```
+Then open the URL that `oar setup` printed, or scan its QR code. With `localhostOnly` on (the default) that is `http://localhost:3333/` on the relay host; reach it from other devices through a [tunnel](#remote-access), or set `localhostOnly` to `false` in the config file and restart the relay for LAN access. The URL carries your token once (`?token=…`); after that, the relay keeps the browser signed in with an HttpOnly cookie.
 
-In that setup, the extension auto-starts and supervises `server.js` for the active CLI session; `npm run copilot:relay` is just a convenience launcher for this repository.
+### The `oar` command
 
-On Windows, the relay's visible launcher path now targets a stable per-workspace Windows Terminal window name so later foreground launches reuse the same window instead of opening new desktop windows. Use the hidden/stdio fallback only when you explicitly need it.
+| Command | What it does |
+| ------- | ------------ |
+| `oar` | Starts the relay in the background unless one is already running, then runs `gh copilot` in the same shell. The relay's output goes to its log directory, not your terminal |
+| `oar -- <args>` | The same, passing `<args>` through to the Copilot CLI (`gh copilot -- <args>`) |
+| `oar --port <port>` | Finds or starts the relay on `<port>` for this run, overriding the config's `port` without changing the file; a config this command creates saves it. Without it, `oar` uses the config's `port` (default `3333`) |
+| `oar --migrate-from <dir>` | Global installs: copies the relay state of a pre-rename git checkout at `<dir>` into the OAR state root, once. The source is never moved or changed, and a relay still running from it blocks the copy. `oar setup` accepts the same option |
+| `oar --install-extension` | Writes or refreshes the user-global Copilot CLI extension wrapper in `~/.copilot/extensions/web-relay/`, then exits. Plain `oar` does this on every run; `--no-install-extension` skips it |
+| `oar setup [--defaults]` | Creates or updates the config: generates an auth token (with a config already present it offers a new one, which signs every device out), asks whether a new config should allow LAN access and whether to enable the managed Cloudflare tunnel, offers the systemd user service on Linux global installs, then prints the relay URL and a QR code. An existing config keeps its `localhostOnly` value. `--defaults` accepts every default without asking |
+| `oar doctor` | Prints the version, Node.js, install mode, state root, config path, port, whether an auth token is set, the tunnel mode, the database path and size, and which provider CLIs (`gh`, `claude`, `grok`) answer. It changes nothing |
+| `oar update [--beta] [--to X.Y.Z]` | Global installs: looks up the newest release of your channel in `https://oar.sh/latest.json` (`--beta` for the beta channel), installs it with `npm install -g`, and asks a running relay to restart once no turn is running. `--to X.Y.Z` installs that version straight from npm, which works even when `OAR_NO_UPDATE_CHECK=1` blocks the lookup |
+| `oar --version`, `oar --help` | Prints the version, or the usage |
 
-Open:
+### Where OAR keeps its files
 
-```text
-http://<your-pc-ip>:3333/
-```
+A global install keeps its state in `~/.oar` (`%APPDATA%\oar` on Windows; `OAR_STATE_ROOT` moves it): `config.json`, `data/` (the database and uploads), and `logs/` (`server.log` when `oar` started the relay, and a `worker-<session>.log` per Node session worker). `npm install -g` updates never touch it. A git checkout uses `server/config.json`, `server/data/`, `server/uploads/`, and `server/logs/` instead.
 
-When `localhostOnly` is `true`, use `http://localhost:3333/` from the same machine.
+`COPILOT_WEB_RELAY_CONFIG`, `COPILOT_WEB_RELAY_DATA_DIR`, and `COPILOT_WEB_RELAY_LOG_DIR` override the config file, the data directory, and the log directory. `oar doctor` prints the paths in use.
 
-Sign in once with your token. The relay then uses an HttpOnly auth cookie.
+### Updating
 
-For day-to-day development workflows, relay restart steps, and worker debugging notes, see [`DEVELOPING.md`](./DEVELOPING.md).
+- **Global install:** **⚙️ Settings → General → Check for updates** shows a newer release with an **Update** button, which installs it with npm and restarts the relay once no turn is running. `oar update` does the same from a terminal. Automatic checks are opt-in: **Check for updates automatically** asks oar.sh about twice a day. `OAR_NO_UPDATE_CHECK=1` in the relay's environment blocks every check, manual ones included.
+- **Git checkout:** `git pull`, `npm install`, then restart the relay (**🌄 Restart web relay** in the conversation's `⋯` menu).
 
-## Runtime modes and startup commands
+<a id="providers"></a>
 
-| Command                 | Purpose                                                                                                                                   |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `oar`                   | Global npm command (`npm i -g @oar-sh/oar`, or `npm link` from a checkout) that starts the web relay if needed, then runs `gh copilot` in the same shell |
-| `oar --install-extension` | Installs/updates a user-global `web-relay` wrapper entrypoint and exits                                                                |
-| `npm run copilot:relay` | Starts Copilot CLI with an initial prompt so the extension loads and the relay worker link comes online                                      |
-| `node server/server.js` | The one way to start the relay server. `npm start` is an alias for exactly this command                                                    |
+## Runtimes
 
-### The single server entry point
+The runtime (called the *provider* in the UI) is chosen in **New Chat** and then fixed for that conversation: once a conversation has sent its first message it keeps that provider, and its composer is locked to that provider's models. The composer states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / Cursor SDK / Grok models.`, colour-coded per provider. OpenAI sessions also pin one exact model, which the note names in parentheses and the model dropdown shows as a disabled `🔒` entry.
 
-`server/server.js` is the only entry point, in every mode — manual runs, the CLI
-extension, `oar`, Windows autostart, and the e2e runner all start it.
-Its role is chosen by argv, never by the environment:
+Turning a provider **off** (or removing the OpenAI key) rebinds conversations that have not sent a message yet back to Copilot, so you are never left with a conversation pointing at a runtime that can no longer start. Conversations already in flight, and conversations belonging to a different provider, are left alone.
 
-- `node server/server.js` — the process stays attached to your terminal as a
-  supervisor and runs the real server (`server-runtime.mjs`) in a worker child it
-  marks with `--relay-runtime`. Exit code 75 relaunches the worker; any other
-  non-zero exit is retried up to 3 times before the supervisor gives up.
-- `node server/server.js --supervised` — runs the server in this process and
-  exits 75 on restart, leaving restarts to whoever spawned it. The CLI extension
-  passes this so its own bounded-backoff supervision is the only one in play.
-
-Role flags travel on argv because the server's environment is inherited by tmux
-worker sessions and by the Copilot CLI it launches — an env-based flag would be
-read by unrelated servers started further down that tree.
-
-### Single runtime owner rule
-
-Run only one relay owner at a time:
-
-1. **Extension-managed mode** (the normal one): the Copilot CLI extension owns the relay worker WebSocket and fallback dequeue loop. `github`/`openai` turns run in Copilot CLI sessions the server launches per conversation.
-2. **Standalone mode** (manual escape hatch): start the server, then run `node server/relay.mjs` by hand. It spawns its own Copilot CLI process and polls `GET /api/pending` over HTTP. Use it only when the extension transport is unavailable — there is no npm script for it.
-
-Do not run extension-managed relay transport together with standalone relay runtime transport.
-Do not restart the web relay unless the user has explicitly given permission.
-If a manual restart is requested, use `POST /api/relay/shutdown` only.
-Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
-Unit tests (`npm test`) and e2e tests (`npm run test:e2e`) are isolated from a live relay and may run beside it; see `DEVELOPING.md` → Tests.
-
-In extension-managed mode, the worker WebSocket begins after the CLI session becomes active (typically after the first prompt), with HTTP dequeue kept only as fallback when the socket is unavailable.
-The extension now supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
-When the CLI extension connects, it also prints the relay info window (local/network/remote/auth URLs) directly in the Copilot CLI client.
-
-On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry. It opens a visible terminal at sign-in and runs the installed `node server\server.js` path. This starts only the web relay server; a Copilot CLI session using the extension must attach separately before queued turns can be processed. Turning the setting off removes the OAR Startup entry.
-
-Do not restart the relay by killing processes; use `POST /api/relay/shutdown` instead.
-
-Manual relay control details:
-
-- `POST /api/relay/shutdown` without `restart` queues a normal relay shutdown.
-- `POST /api/relay/shutdown` with `restart: true` queues an intentional self-restart.
-- Requests are localhost-only and still require relay auth.
-- The relay waits until the queue is idle before acting; this endpoint does not interrupt an in-flight turn.
-- `/api/status` exposes the queued relay exit state as `relayShutdown` so the UI/logs can distinguish idle, queued, and shutting-down restart/shutdown flows.
-- Restart ownership follows the argv role, so exactly one supervisor acts on exit code 75:
-  - `node server/server.js` — the attached supervisor respawns its worker child in the same terminal session
-  - `node server/server.js --supervised` — the server exits 75 and the CLI extension relaunches it (bounded backoff, and it stops trying once the CLI session shuts down)
-
-### Global npm command (Windows first)
-
-You can install the repo locally and get a global `oar` command without publishing:
-
-```powershell
-npm link
-# or
-npm install -g .
-```
-
-Run it from any folder to start the web relay server for that folder's workspace root, then immediately hand the shell to `gh copilot` without a bootstrap prompt. If a relay is already active, the command reuses it and still opens Copilot in the same shell.
-
-Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` (git checkouts) or `%APPDATA%\oar\logs` (global installs) by default (or `COPILOT_WEB_RELAY_LOG_DIR` if you set it), so it stays out of the CLI terminal.
-
-If you want custom token/tunnel settings from a specific `server/config.json`, point `COPILOT_WEB_RELAY_CONFIG` at that file before launching. A plain `npm install -g .` does not bundle the repo-local gitignored config file.
-
-Manual relay shutdowns are queued via `POST /api/relay/shutdown` and only take effect after the current turn goes idle, so they are not a way to interrupt a turn in progress.
-
-Roadmap for later launcher modes:
-
-1. **Option 2**: launch/attach a Copilot CLI session directly.
-2. **Option 3**: support `oar -- [gh copilot args]` pass-through.
-3. **Session resume**: add `--session-id=<...>` handoff once the session orchestration contract is defined.
-
-## Using the web UI
-
-On startup, the relay imports locally persisted Copilot sessions through the installed Copilot SDK into its database. Session lists, details, sharing, and history refreshes use that database; an unavailable SDK runtime is reported as an import failure and is not replaced with filesystem discovery.
-
-- Start a chat with **New Chat**, which asks for the **working directory**, **provider**, **model**, and **reasoning effort** (or **quality** and **size**, for image chats) before the conversation exists. The working directory picker lists the known CWDs (current session, relay workspace, browser folder, recent roots) plus a **Custom path…** entry, defaults to the last directory you picked, and the chosen directory is applied before the session worker first launches. With Copilot as the only provider the provider row is hidden.
-- Choose **mode** and **model** per message in the composer.
-- Use **Compact** to branch to a fresh conversation seeded with summary context.
-- Type **`/preview`** to publish a local dev server or directory on the public preview host without involving the agent: `/preview 5173 [label]`, `/preview ./dist [label]`, `/preview list`, `/preview close`. Agents can do the same via the `preview` tool (Claude/Cursor) or the documented API (see `docs/preview-servers.md`).
-- Use **Browse files** to inspect workspace/drives and open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.
-- Click file/folder copy controls to insert `@file:...` / `@folder:...` tokens.
-- Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes only** and **Full file** modes; closing it returns to the still-open list.
-- Answer clarification prompts in relay question cards (from `ask_user`, or Claude's `AskUserQuestion`).
-- Watch the reply arrive: assistant text streams into the pending bubble as it is generated, and any subagent the turn spawns gets its own nested bubble with its own thoughts, activity, and text.
-- Use **Check Usage** (`📊`) in the conversation menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Each provider gets its own tab, opening on the conversation's own provider, and the card names the signed-in account (email and plan) beneath its title. Sources differ per provider:
-  - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing. Conversations running on the experimental SDK engine add a **Last SDK worker turn** section (AI credits actually spent, tokens, model calls, overage) with the model and how long ago it was captured; it is one turn's numbers rather than a running total, and it stops being shown once it is more than seven days old.
-  - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn.
-  - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools. Cursor exposes no account API for included pools, so these figures are estimates and the Spending dashboard remains authoritative.
-  - **Grok** — per-turn tokens and estimated cost from the agent prompt result (no live plan-quota API over ACP). Optional monthly USD allowance in Settings for an estimated remaining meter; card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
-- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
-- Use the **Context** button for a per-category breakdown of the conversation's context window: a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets.
-- Claude conversations additionally get an **auto-compact window** slider in that modal. Claude Code compacts a session once it approaches a model-tuned window (around 967k tokens on Opus 5), which is why long conversations rarely compact at all; setting a smaller window makes it happen sooner and keeps turns cheaper. *Auto* hands the choice back to the CLI. The smallest window is 100k, because the CLI silently ignores anything below that and falls back to its own default. The line beneath the slider reports the window actually in force and where it came from — your setting, the model default, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment override — and fills in once the conversation's first turn completes. The change reaches a running session on its next message.
-- The transcript marks day boundaries, and marks the point where a Claude session compacted its context with the tokens before and after. Both appear as dots beside the scrollbar for the messages currently loaded.
-- Use **Share** in the conversation menu to publish a read-only link. Hover any message and choose **Hide from shares** to keep it out of the shared view without deleting it; hidden messages stay fully visible to you and are marked as hidden.
-- External links in chat open in a new tab with `noopener`/`noreferrer`; workspace file mentions stay in the in-app preview.
-- Workspace browsing follows the selected CLI session's effective CWD. Running sessions keep their learned runtime CWD, menu changes update the next-launch CWD, and chat `cd ...` commands do not retarget the browser.
-
-## Providers
-
-The provider is chosen in **New Chat** and then fixed for that conversation: once a conversation has sent its first message it keeps that provider, and its composer is locked to that provider's models. The composer states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / Cursor SDK models.`, colour-coded per provider. OpenAI sessions also pin one exact model, which the note names in brackets and the model dropdown shows as a disabled `🔒` entry.
-
-Turning a provider **off** (or removing the OpenAI key) rebinds conversations that have not yet sent a message back to Copilot, so you are never left with a conversation pointing at a runtime that can no longer start. Conversations already in flight, and conversations belonging to a different provider, are left alone.
-
-
-| Provider              | Enable via                              | Auth                                  | Notes                                                                 |
-| --------------------- | --------------------------------------- | ------------------------------------- | --------------------------------------------------------------------- |
-| **Copilot** (default) | always available                        | your `gh` / Copilot CLI login         | Full relay feature set; the only provider that reports Copilot usage. Two engines: the CLI extension (default) or an experimental headless SDK worker |
-| **OpenAI (BYOK)**     | ⚙️ Settings → Providers → OpenAI        | your API key, stored in the relay DB  | Runs the Copilot CLI in BYOK mode against an OpenAI-compatible endpoint |
-| **OpenAI Image (BYOK)** | ⚙️ Settings → Providers → OpenAI      | same key                              | Calls the OpenAI Images API directly; a chat whose replies are images  |
-| **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude        | the relay host's logged-in Claude CLI — **switchable from the panel** | No API key is stored; runs a dedicated Node worker per conversation. The CLI itself can be installed/updated from the panel |
-| **Cursor (Agent SDK)** | ⚙️ Settings → Providers → Cursor        | your Cursor API key, stored in the relay DB | Runs a dedicated Node worker per conversation through the Cursor Agent SDK |
-| **Grok (CLI ACP)**    | ⚙️ Settings → Providers → Grok          | the relay host's Grok CLI login — **sign in / out from the panel** | No API key is stored; drives `grok agent stdio` over ACP. The CLI itself can be installed/updated from the panel |
-
-### Installing a provider CLI from the relay
-
-Grok and Claude both run as CLIs on the relay host, and the failure mode used to be a dead end: a
-turn fails with *"Grok CLI was not found on PATH"* and the only fix is a shell on the host — the one
-thing the relay exists to avoid. Each provider sub-tab now carries a CLI row at the top:
-
-```
-Grok CLI    not installed                                    [ Install ]
-Grok CLI    1.0.13 · ~/.grok/bin/grok · native · up to date  [ Update  ]
-```
-
-- **Install** asks for confirmation first, naming the exact command and the directory it writes into.
-  The commands are the vendors' own one-liners (`curl -fsSL https://x.ai/cli/install.sh | bash`,
-  `curl -fsSL https://claude.ai/install.sh | bash`, or their PowerShell equivalents on Windows) and
-  they are hardcoded in the relay — nothing you type reaches a shell. They run as the relay user,
-  into your home directory, never under sudo.
-- The output streams into the panel live, and the log survives closing the modal or watching from
-  another device. One install at a time, relay-wide.
-- When it finishes, the relay resolves the binary, wires it into the environment it launches workers
-  with, and remembers it across restarts — **no relay restart is needed**. Sessions already running
-  keep the binary they started with.
-- **Update** runs the CLI's own updater (`grok update`, `claude update`), not the install script again.
-- If your Claude was installed with npm into a folder the relay user cannot write, `claude doctor`
-  says so and the button becomes **Switch to native installer** — Anthropic's own recommended fix.
-  The npm copy stays where it is; the native build takes precedence on PATH.
-- The **Copilot** row is read-only: that CLI is managed with npm on this host, so there is nothing
-  the relay could usefully run.
-
-When a turn fails because a CLI is missing or signed out, the failed reply itself carries the fix as
-a button — **Install Grok CLI**, **Sign in to Grok**, **Claude settings** — which opens the right
-panel and, for an install, the same confirmation sheet.
+| Runtime | Enable via | Auth | Notes |
+| ------- | ---------- | ---- | ----- |
+| **Copilot** (default) | always available | the relay host's Copilot CLI login | Two engines: the headless **SDK** worker (default) or the Copilot CLI with OAR's **Extension**. The only runtime that reports Copilot usage |
+| **OpenAI (BYOK)** | ⚙️ Settings → Providers → OpenAI | your API key, stored in the relay database | Runs the Copilot runtime, on either engine, against an OpenAI-compatible endpoint |
+| **OpenAI Image (BYOK)** | ⚙️ Settings → Providers → OpenAI | the same key | The relay calls the OpenAI Images API itself; a chat whose replies are images |
+| **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude | the relay host's Claude login, **switchable from the panel** | A dedicated Node worker per conversation. The Claude Code CLI can be installed and updated from the panel |
+| **Cursor (Agent SDK)** | ⚙️ Settings → Providers → Cursor | your Cursor API key, stored in the relay database | A dedicated Node worker per conversation through the Cursor Agent SDK |
+| **Grok (CLI ACP)** | ⚙️ Settings → Providers → Grok | the relay host's Grok CLI login, **sign in and out from the panel** | Drives the Grok CLI's `grok agent stdio` over ACP. The CLI can be installed and updated from the panel |
 
 ### GitHub Copilot — engine choice
 
-Copilot conversations can run on either of two engines, chosen in **⚙️ Settings → Providers → Copilot → Copilot engine**. The setting is per relay and applies to newly started conversations; sessions already running keep the engine they started on until their worker restarts.
+Copilot conversations, and OpenAI (BYOK) ones, run on one of two engines, chosen in **⚙️ Settings → Providers → Copilot → Copilot engine**. The setting is per relay and is read whenever a conversation's worker starts; sessions already running keep their engine until their worker restarts.
 
-| Engine | What runs | Trade-offs |
-| ------ | --------- | ---------- |
-| **Extension** (default) | The Copilot CLI in a terminal session with the web-relay extension loaded | The engine everything has shipped on. Attach to a live session with the tmux inspector (`tmux attach -t <sdk-session-id>`) |
-| **SDK** (experimental) | A headless Node worker per conversation, driving the CLI's bundled SDK runtime over JSON-RPC | No CLI extension to install or keep in sync — first run needs only a Copilot CLI that is installed and logged in. **No tmux inspector** for those sessions: there is no TUI to attach to. The SDK engine is the one with Claude-parity **mid-turn steering** (Steer / Queue, question cards never bypassed, Stop with Resend), a **Cancel** on queued messages the runtime has not started yet, and the **background task panel** for the agents and detached shells a turn spawns (model, live tool call, tokens, a working Stop) — every Copilot model, hosted or BYOK |
+| Engine | What runs | Notes |
+| ------ | --------- | ----- |
+| **SDK** (default) | A headless Node worker per conversation, driving the Copilot CLI's bundled SDK runtime | Needs only a Copilot CLI that is installed and signed in; there is no extension to install or keep in sync. This engine has [mid-turn steering](#while-a-turn-runs), the [background task panel](#background-tasks) with a working **Stop**, **Cancel** on a steered message the runtime has not picked up yet, and multi-select question cards, for every Copilot model, hosted or BYOK. There is no TUI: the tmux console shows the worker's log |
+| **Extension** | The Copilot CLI in a terminal session with OAR's web-relay extension loaded | The engine OAR started with. **🖥️ Inspect tmux console** shows the live Copilot TUI (Linux and macOS, with tmux). Messages sent during a turn queue behind it |
 
-Switching to **SDK** can be refused, and the panel says why in place of the engine description:
+The SDK engine has been the default since 0.9.2. A relay where nobody has saved a choice uses it whenever it can and falls back to **Extension** when it cannot; a saved choice always wins. Saving **SDK** is refused, with the reason shown in place of the engine description, when:
 
-- *"The Copilot SDK was not found when the relay started (COPILOT_SDK_PATH did not resolve)…"* — no Copilot CLI bundle with an SDK was found. Install or upgrade the GitHub Copilot CLI **and restart the relay**: the launch environment is snapshotted at startup, so a CLI installed since then is not visible yet.
-- *"The SDK engine requires session worker routing, which is disabled on this relay (SESSION_WORKER_ROUTING_ENABLED)…"* — with routing off no SDK worker is ever spawned, so the setting would have no effect.
+- *"The Copilot SDK was not found when the relay started (COPILOT_SDK_PATH did not resolve)…"*: the relay found no Copilot CLI runtime at startup. It looks in the Copilot CLI's package cache, newest version first (`~/.cache/copilot/pkg` on Linux, `~/Library/Application Support/copilot/pkg` on macOS, `%LOCALAPPDATA%\copilot\pkg` on Windows; `COPILOT_PKG_DIR` adds a location), unless `COPILOT_SDK_PATH` names the runtime's `copilot-sdk` directory directly. Install or upgrade the Copilot CLI, run it once, **and restart the relay**: the launch environment is snapshotted at startup, so a CLI installed since then is not visible yet.
+- *"The SDK engine requires session worker routing, which is disabled on this relay (SESSION_WORKER_ROUTING_ENABLED)…"*: with routing off no SDK worker is ever spawned. Turn **Session worker routing** back on in **⚙️ Settings → Features** (it is on by default) and restart the relay.
 
 A refusal never changes the stored engine; the select snaps back to the engine the relay actually runs.
 
-SDK-engine turns report their own per-turn billing to the relay, which appears as the **Last SDK worker turn** section on the Copilot card in **Check Usage** (see above). The card's meters come from the account-level quota API and are correct for both engines.
+SDK-engine turns report their own per-turn billing to the relay, which appears as the **Last SDK worker turn** section on the Copilot card in **Check Usage**. The card's meters come from the account-level quota API and are correct for both engines.
+
+### OpenAI (BYOK) and OpenAI Image
+
+Save your key in **⚙️ Settings → Providers → OpenAI**, together with the **OpenAI model ID** (default `gpt-4o`) and an optional **Base URL** (default `https://api.openai.com/v1`). **Enable OpenAI API key for New Chat model selection** is on once a key is saved, and saving discovers the endpoint's models from `/v1/models`.
+
+- **OpenAI (BYOK)** conversations run the Copilot runtime against that endpoint with your key, on whichever Copilot engine is selected.
+- **OpenAI Image (BYOK)** conversations are chats whose replies are images. **New Chat** asks for **Quality** and **Size** instead of reasoning effort, and **Edit this image** under a generated image iterates on it.
 
 ### Claude (Agent SDK)
 
-Turn on **⚙️ Settings → Providers → Claude → Enable Claude for New Chat model selection**. The relay authenticates through the Claude credentials present on the host machine (`~/.claude`), so there is no key to enter.
+Turn on **⚙️ Settings → Providers → Claude → Enable Claude for New Chat model selection**. The relay authenticates through the Claude credentials on the host machine (`~/.claude`), so there is no key to enter.
 
 The same panel manages the account itself. The row at the top names the signed-in account and plan, and:
 
 - **Relogin** runs the Claude CLI's login on the relay host and brings the flow to the browser: the authorize link appears inline with a **Copy link** button — open it on any device, authorize on claude.ai, then paste the returned code back into the field. The relay holds no Claude secret; the CLI rewrites the host credentials, and a fresh model discovery runs straight after, so switching accounts needs no relay restart. The flow is pushed over the socket, so you can start it on one device and finish it on another, and closing the modal does not lose it.
 - **Logout** asks for confirmation first and tells you how many Claude workers are running. Running Claude sessions keep the previous account's token until their worker exits; new sessions use the new account.
 
-If Claude has never been logged in on the host, running `claude` there once still works as before.
+If Claude has never been logged in on the host, running `claude` there once works too.
 
-Enabling it also runs model discovery against the Agent SDK and adds the discovered `claude-*` model IDs to the pickers. Use **Select Models → Claude SDK** to choose which of them appear in the composer; the configured default model always stays enabled.
+Enabling Claude also runs model discovery against the Agent SDK and adds the discovered `claude-*` model IDs to the pickers (default model `claude-sonnet-5`). Use **🤗 Select Models → Claude SDK** to choose which of them appear in the composer; the configured default model always stays enabled. Discovery runs the Claude Code build bundled with the Agent SDK, so `claude update` alone never surfaces a new Claude model: that arrives with an OAR update.
 
 What Claude conversations support:
 
 - Per-message model and reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`), changeable between turns, plus **Ultracode** on models that support `xhigh` — `xhigh` effort *and* multi-agent workflow orchestration, at a matching jump in token use
 - All four relay modes — `plan` maps to the SDK's plan permission mode and produces a **Plan ready** board, `ask` and `autopilot` adjust the system prompt
-- Image and file attachments (images up to ~5 MB are inlined; larger files are passed as paths for Claude to read)
-- Question cards, thinking/thought streams, live reply streaming, and nested subagent bubbles
-- **Mid-turn steering** — messages sent while a turn runs are pushed into the live turn (any number
-  of them, Claude Code parity) instead of waiting behind it; each folded message keeps a compact
-  *merged* marker in the transcript. The composer button reads **Steer** during a live turn; while
-  the turn waits on a question card or plan approval, or is compacting, it reads **Queue** instead:
-  the message waits (cancellable) and steers in once the card is answered or compaction ends, so a
-  question card is never bypassed
-- **Stop** to abort the running turn — on the reply bubble, whose header stays pinned while a long
-  reply scrolls; queued messages carry their own **Cancel** until they are picked up. Steered
-  messages cut off by a Stop are marked *Stopped with the turn — not answered* with a one-tap
-  **Resend**
-- Background tasks that outlive the reply that started them: the composer's task panel lists them live with their own **Stop**, and an **Ultracode** workflow folds out into a tree of its phases and agents (state, model, tokens). When the workflow finishes, the summarizing reply keeps a collapsed *Finished background task* card holding the final tree, which survives reloads
+- Image and file attachments (images up to 5 MB are inlined; larger files are passed as paths for Claude to read)
+- Question cards (including multi-select), thinking/thought streams, live reply streaming, and nested subagent bubbles
+- **Mid-turn steering** with **Steer** / **Queue**, **Stop** on the reply bubble, and **Resend** for steered messages a Stop cut off (see [While a turn runs](#while-a-turn-runs))
+- Background tasks that outlive the reply that started them, in the composer's task panel, including **Ultracode** workflow trees (see [Background tasks](#background-tasks))
 - Session continuity across worker restarts — the native Agent SDK session id is stored and resumed
-- Real context-window metrics, reported after each turn
+- Real context-window metrics, reported after each turn, and a per-conversation auto-compact window (see [Usage and context](#usage-and-context))
 
 Differences from Copilot conversations:
 
@@ -368,7 +242,7 @@ Differences from Copilot conversations:
 
 ### Cursor (Agent SDK)
 
-Turn on **⚙️ Settings → Providers → Cursor**, paste your Cursor API key, and enable it for New Chat model selection. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model always stays enabled).
+Turn on **⚙️ Settings → Providers → Cursor**, paste your Cursor API key, and enable it for New Chat model selection. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **🤗 Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model, `composer-2.5` unless you change it, always stays enabled).
 
 What Cursor conversations support:
 
@@ -378,13 +252,11 @@ What Cursor conversations support:
 - The browsable **Session** root points at the worker's per-session agent store, created on the session's first turn
 - Expired cached agent handles are recreated and retried automatically once — a second auth failure means the API key itself is invalid
 
-Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under Settings → Providers → Cursor → Cursor monthly plan allowance.
+Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under **⚙️ Settings → Providers → Cursor → Cursor monthly plan allowance**. The optional **Dashboard session token** in the same panel unlocks live *Included in plan* bars; it is detected automatically from the host's Cursor IDE login when there is one, and headless hosts can set `CURSOR_SESSION_TOKEN` instead.
 
 ### Grok (CLI ACP)
 
-Turn on **⚙️ Settings → Providers → Grok**. There is no key to enter: the relay drives the Grok CLI
-on the host and uses whatever account that CLI is signed in to (or `XAI_API_KEY` in the host
-environment).
+Turn on **⚙️ Settings → Providers → Grok**. There is no key to enter: the relay drives the Grok CLI on the host and uses whatever account that CLI is signed in to (or `XAI_API_KEY` in the host environment).
 
 The same panel manages both the CLI and the account:
 
@@ -405,11 +277,98 @@ CLI straight into `~/.grok/auth.json`. Running `grok login` on the host still wo
 
 Grok conversations support live reply streaming, thoughts, plan boards, subagent lifecycle chips,
 **Stop**, session resume across worker restarts, per-turn context metrics, and the live weekly quota
-bar in **Check Usage**. The model is fixed per conversation (ACP has no mid-session switch), and
-question cards are not available — the protocol has no ask-user surface.
+bar in **Check Usage**. The model is fixed per conversation (ACP has no mid-session switch; the default
+is `grok-4.5`), and question cards are not available — the protocol has no ask-user surface.
 
-## Relay modes
+### Installing a provider CLI from the relay
 
+Grok and Claude both run as CLIs on the relay host, and the failure mode used to be a dead end: a
+turn fails with *"Grok CLI was not found on PATH"* and the only fix is a shell on the host — the one
+thing the relay exists to avoid. The Copilot, Claude, and Grok sub-tabs therefore carry a CLI row at the top:
+
+```
+Grok CLI    not installed                                    [ Install ]
+Grok CLI    1.0.13 · ~/.grok/bin/grok · native · up to date  [ Update  ]
+```
+
+- **Install** asks for confirmation first, naming the exact command and the directory it writes into.
+  The commands are the vendors' own one-liners (`curl -fsSL https://x.ai/cli/install.sh | bash`,
+  `curl -fsSL https://claude.ai/install.sh | bash`, or their PowerShell equivalents on Windows) and
+  they are hardcoded in the relay — nothing you type reaches a shell. They run as the relay user,
+  into your home directory, never under sudo.
+- The output streams into the panel live, and the log survives closing the modal or watching from
+  another device. One install at a time, relay-wide.
+- When it finishes, the relay resolves the binary, wires it into the environment it launches workers
+  with, and remembers it across restarts — **no relay restart is needed**. Sessions already running
+  keep the binary they started with.
+- **Update** runs the CLI's own updater (`grok update`, `claude update`), not the install script again.
+- If your Claude was installed with npm into a folder the relay user cannot write, `claude doctor`
+  says so and the button becomes **Switch to native installer** — Anthropic's own recommended fix.
+  The npm copy stays where it is; the native build takes precedence on PATH.
+- The **Copilot** row is read-only: that CLI is managed with npm on the host, so there is nothing
+  the relay could usefully run.
+
+When a turn fails because a CLI is missing or signed out, the failed reply itself carries the fix as
+a button — **Install Grok CLI**, **Sign in to Grok**, **Claude settings** — which opens the right
+panel and, for an install, the same confirmation sheet.
+
+### Models
+
+The composer's model picker is the union of every enabled provider's catalog, filtered to the models the active conversation's provider can actually serve:
+
+- **Copilot** models are discovered from the installed Copilot CLI runtime a few seconds after the relay starts, and refreshed by the sessions that run on it. Each model shows the reasoning efforts and context window the runtime reports. The list starts with `auto`, then groups models by vendor (OpenAI, Anthropic, Google, xAI, Microsoft, Azure OpenAI, Moonshot AI, then any others alphabetically), newest version first. Before the first discovery, a fresh relay offers a curated set: `gpt-5.4`, `gpt-5.4-mini` (the default), `gpt-5.3-codex`, `claude-sonnet-4.6`, and `claude-haiku-4.5`.
+- **OpenAI (BYOK)** models are discovered from `/v1/models` when the key is saved or re-enabled.
+- **Claude** models are discovered from the Agent SDK when the provider is enabled. Bracketed `[1m]` long-context variants (such as `claude-opus-5[1m]`) do not appear as separate entries; they surface as a 1M option in the composer's context-size dropdown for the base model.
+- **Cursor** models (and their per-model reasoning-effort tiers) are discovered when the API key is saved or the provider is re-enabled.
+- **Grok** models are discovered from the Grok CLI over ACP when the provider is enabled, after a sign-in, and after a CLI install from the panel.
+
+Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
+
+## Highlights
+
+### New in 0.9.3
+
+- **Mid-turn steering** for Claude, and for Copilot on the SDK engine with every model, hosted or BYOK: a message you send while a turn runs goes into that turn instead of waiting behind it. The send button reads **Steer**; while a question card, plan approval, or compaction is open it reads **Queue**, and the message steers in once that is resolved, so a question card is never bypassed. **Stop** lives on the running reply's bubble, and steered messages that a Stop cut off offer a one-tap **Resend**.
+- **Copilot background tasks** (SDK engine): background agents and detached shells appear in the task panel with the model they run on, the command they are running right now, their token count, and a **Stop** that works. The reply no longer waits for them; a background agent's result arrives afterwards as its own *continuation* reply.
+- **Multi-select question cards**: a question that allows several answers shows checkmarks and one **Reply with selection** button. Claude cards follow Claude's own flag; Copilot choice cards (SDK engine) also carry a **Select several** switch for when the model forgets to flag it.
+- **Drafts sync safely across devices**: an idle device no longer overwrites the draft you are typing on another one, and when two devices edit at once, the text that lost is offered back with **Restore**.
+- **Sidebar title filter** above the conversation list. It loads older pages while it is active, so it searches every conversation, not just the loaded ones.
+- **Deleting a conversation stops its worker and removes the CLI session OAR created for it** (Copilot's through the runtime, Claude's by deleting that session's transcript). A Copilot session OAR only imported from the host, one you started in a terminal, is hidden instead, and nothing is stopped for it. A conversation that is still working is not deleted; the sidebar tells you why, so you can stop it first.
+- The **Background task timeout** defaults to **4 hours** instead of no limit, for Claude and Copilot alike: long-running work still finishes, but a forgotten shell or agent no longer keeps its session alive forever. A value you already chose is kept.
+
+### Everything else
+
+- Remote chat UI for local coding agents, with the runtime chosen per conversation
+- Per-message **mode** (`plan`, `ask`, `agent`, `autopilot`), **model**, and **reasoning effort** pickers, backed by live model discovery
+- Streaming tool activity, thoughts, and live assistant reply text while a turn runs
+- Nested **subagent bubbles**: each subagent gets its own live bubble with its own thoughts, activity, and streamed text, kept as collapsible sections after the turn finishes
+- **Background task panel** with live per-task state, model, and token use; Claude workflow tasks fold out into a progress tree of phases and agents, and leave a *Finished background task* card in the transcript when they complete
+- Question cards for clarification: one-click choices, multi-select checkmarks, free text, and multi-field structured forms validated against their JSON schema
+- Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
+- **Context usage** modal with a per-category token breakdown of the model's context window, plus a per-conversation **auto-compact window** slider for Claude sessions
+- **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context, and matching dots beside the scrollbar
+- **Plan usage** modal with subscription credits, rate-limit windows, and reset countdowns for Copilot, Claude, Cursor, and Grok
+- **Image conversations** (OpenAI Image): generate images in chat and iterate on a generated image with **Edit this image**
+- Agents can embed **images, video, and audio** in a reply by their absolute path, on every runtime; clicking an embedded image opens the file viewer with zoom, download, and copy
+- **Screenshot annotations**: mark up an uploaded screenshot with highlighter strokes before or after sending; the original upload is never modified
+- **Share** a conversation by read-only link, and hide individual messages from the shared view
+- Conversation history in local SQLite, including the Copilot sessions already stored on the host
+- `/compact` continues in a fresh conversation seeded with a summary; `/preview` publishes a local dev server or folder on a public preview host
+- Workspace and drive browser with file previews, **Git changes** with a diff viewer, and `@file:` / `@folder:` reference tokens
+- **Push notifications** for questions, finished or failed turns, plan boards, and a CLI going offline
+- Opt-in **self-update** from Settings or `oar update`
+- Remote access through a managed **SSH** reverse tunnel or **Cloudflare Tunnel**
+- Installable **PWA** with an installed-app fullscreen preference and browser-mode fallbacks
+
+## Using the web UI
+
+### Starting a conversation
+
+- Start a chat with **+ New Chat**, which asks for the **Working directory**, **Provider**, **Model**, and **Reasoning effort** (or **Quality** and **Size**, for image chats; **Context window** where a model offers several) before the conversation exists. The working-directory list offers the known directories (current session, relay workspace, browser folder, recent roots), a **Custom path…** entry, and a 📁 folder picker; it defaults to the directory you picked last, and the chosen directory is applied before the session worker first launches. With Copilot as the only provider the provider row is hidden.
+- Choose the **mode** and **model** per message in the composer.
+- The composer knows two slash commands, with autocomplete: **`/compact`** branches to a fresh conversation seeded with summary context, and **`/preview`** publishes a local dev server or directory on the public preview host without involving the agent (`/preview 5173 [label]`, `/preview ./dist [label]`, `/preview list`, `/preview close`). Agents can do the same through the `preview` tool (Claude and Cursor) or the documented API (see [docs/preview-servers.md](docs/preview-servers.md)). Any other single-line text starting with `/` is held back once with an *Unknown command* notice; press send again to send it as text.
+
+### Relay modes
 
 | Mode        | Behavior                                                     |
 | ----------- | ------------------------------------------------------------ |
@@ -418,34 +377,98 @@ question cards are not available — the protocol has no ask-user surface.
 | `agent`     | Interactive coding agent behavior                            |
 | `autopilot` | Action-first behavior; asks only when truly blocking         |
 
+### While a turn runs
 
-## Models
+- Assistant text streams into the pending bubble as it is generated, next to the turn's tool activity and thoughts. Any subagent the turn spawns gets its own nested bubble with its own thoughts, activity, and text.
+- **Steer or queue.** On Claude, and on Copilot's SDK engine, a message you send during a live turn is pushed into that turn; the send button reads **Steer**. A folded message keeps a compact *merged* marker in the transcript, and one the agent answers separately gets its own reply. While the turn waits on a question card or plan approval, or is compacting, the button reads **Queue** and its tooltip says why: the message waits as a pending bubble (with **Cancel**) and steers in once the card is answered or the compaction ends. On the other runtimes, and on Copilot's Extension engine, messages sent during a turn queue behind it, and the button reads **Queue**.
+- **Stop** is on the running reply's bubble, whose header stays pinned at the top while a long reply scrolls; the send button never turns into Stop. Queued messages carry their own **Cancel** until they are picked up. A steered message that a Stop cut off is marked *Stopped with the turn — not answered* and offers **Resend**; the button then reads **Resent** on every device.
+- On Copilot, **Stop** ends only the reply: background agents the turn started keep running under their own **Stop** in the task panel.
 
-The composer's model picker is the union of every enabled provider's catalog, filtered to the models the active conversation's provider can actually serve:
+### Question cards
 
-- **Copilot** models come from live snapshot updates published by the active CLI runtime, falling back to a curated set (`claude-sonnet-4.6`, `claude-haiku-4.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`).
-- **OpenAI (BYOK)** models are discovered from `/v1/models` when the key is saved or re-enabled.
-- **Claude** models are discovered from the Agent SDK when the provider is enabled. Bracketed `[1m]` long-context variants (such as `claude-opus-5[1m]`) do not appear as separate entries; they surface as a 1M option in the composer's context-size dropdown for the base model.
-- **Cursor** models (and their per-model reasoning-effort tiers) are discovered when the API key is saved or the provider is re-enabled.
+- Agents ask clarifying questions through question cards: `ask_user` on Copilot and Cursor, `AskUserQuestion` on Claude. A choice answers with one click; a question that allows several answers shows checkmarks and one **Reply with selection** button, whose reply lists every ticked choice plus anything you typed. Structured requests render as multi-field forms.
+- On Copilot's SDK engine, the model gets OAR's own `ask_user` tool, which can mark a question as multi-select; a question worded "select all that apply" counts too, and every Copilot choice card that accepts free text has a **Select several** switch.
+- A card waits 8 hours for an answer (2 hours on Copilot's Extension engine). After that the agent is told nobody answered and continues according to the conversation's mode. A turn that is waiting on a card is never treated as stuck.
+- Grok has no question cards: ACP has no ask-user surface.
 
-Use **Select Models** to choose which variants show up in the composer. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
+### Background tasks
 
-Selection is persisted in browser storage and attached per message.
+- The composer's task panel lists background work that outlives the reply that started it: backgrounded commands, subagents, monitors, and workflows on Claude; background agents and detached shells on Copilot's SDK engine. Each row shows its state, the model it runs on, the command it is running right now, its token count, and its own **Stop**. The panel scrolls when it holds more tasks than fit.
+- An **Ultracode** workflow folds out into a tree of its phases and agents (state, model, tokens). When it finishes, the summarizing reply keeps a collapsed *Finished background task* card holding the final tree, which survives reloads.
+- A background task's result arrives as its own *continuation* reply.
+- **⚙️ Settings → General → Background task timeout** (default 4 h; 0 = no limit, up to 10 h) caps how long background tasks alone may keep a Claude or Copilot session running after its reply. When the limit is reached, the tasks are stopped.
 
-## Settings (⚙️ in the web UI)
+### Drafts across devices
 
-The modal is organised into four tabs — **General**, **Providers** (with an OpenAI / Claude / Grok / Cursor sub-tab each), **Previews**, and **Notifications** — and reopens on the tab you used last. Most of these settings live in the relay database rather than `server/config.json`, and apply to every browser that connects:
+The composer draft, attachments included, is saved per conversation on the relay and follows you to your other devices. Saves happen only on real edits and are version-checked, so an idle device never overwrites the draft you are typing on another one, and a device you are not typing on picks up the other's draft. When two devices edit at once, the newest keystroke wins and the replaced text is offered back with **Restore** (and **Undo**). A draft longer than 20,000 characters is saved up to that length, and the composer says the rest is not saved.
 
-| Setting                    | Default    | What it does                                                                    |
-| -------------------------- | ---------- | ------------------------------------------------------------------------------- |
-| OpenAI API key / model / base URL | —   | Enables the OpenAI and OpenAI Image providers                                    |
-| Claude (Agent SDK)         | disabled   | Enables Claude as a New Chat provider and runs model discovery                    |
-| Claude account (Relogin / Logout) | host login | Switches the Claude account the relay host's CLI uses, from the browser (see [Claude (Agent SDK)](#claude-agent-sdk)) |
-| Max turn duration          | `60 min`   | Hard cap on how long one turn may run before the relay requeues it (see below)    |
-| Default session workspace root | —      | CWD used by sessions that have no configured root                                |
-| Install app name           | —          | Label used for future PWA installs (per browser)                                 |
-| Show Suspend host action   | on         | UI visibility of the **💤 Suspend host** menu action                              |
-| Autostart (Windows)        | off        | Adds a per-user Startup entry that launches the relay server at sign-in           |
+### The conversation list
+
+- **Filter conversations…** above the list matches titles, ignoring case. It clears with **×** or Escape, and while it is active it loads older pages, so it searches every conversation, not just the loaded ones.
+- **🔍** in the conversation header searches message text across all conversations.
+- On startup, the relay imports the Copilot sessions stored on the host (through the installed Copilot runtime) into its database, so they appear in the list with their history. If the runtime is unavailable, the import is reported as failed rather than guessed from the filesystem.
+- Deleting a conversation stops its session worker and removes its CLI session too (Copilot through the runtime, Claude by deleting that session's transcript). An imported Copilot session the relay never ran is only hidden: its CLI session stays, and nothing is stopped for it. A conversation that is still working — a running turn, one waiting on a question card or approval, or live background tasks — is not deleted, and the sidebar says why so you can stop it first.
+
+### Files, git, and previews
+
+- Use **📁 Browse files** to inspect the workspace (💼), drives (📀), or the session's own folder (🕵️), and to open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.
+- Click the file and folder copy controls to insert `@file:...` / `@folder:...` tokens.
+- Workspace browsing follows the selected session's effective working directory. Running sessions keep their learned runtime directory, **🗂️ Change CWD** in the `⋯` menu changes the directory for the next launch, and `cd ...` typed in chat does not retarget the browser.
+- Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **⬇ Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes** and **Full file** modes; closing it returns to the still-open list.
+- Agents can embed images, video, and audio in a reply by absolute path; they render inline.
+- Tap an image attachment in the composer (it carries a 🖍️ badge), or use **🖍️ Annotate** in the file viewer, to mark it up with highlighter strokes. The annotated copy is uploaded; the original stays untouched.
+- External links in chat open in a new tab with `noopener`/`noreferrer`; workspace file mentions stay in the in-app preview.
+
+### Usage and context
+
+- Use **📊 Check Usage** in the conversation `⋯` menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Each provider gets its own tab, opening on the conversation's own provider, and the card names the signed-in account (email and plan) beneath its title. Sources differ per provider:
+  - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing. Conversations on the SDK engine add a **Last SDK worker turn** section (AI credits actually spent, tokens, model calls, overage) with the model and how long ago it was captured; it is one turn's numbers rather than a running total, and it stops being shown once it is more than seven days old.
+  - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn.
+  - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools; these figures are estimates, and Cursor's Spending dashboard remains authoritative. With a dashboard session token, the card adds live *Included in plan* bars.
+  - **Grok** — the live weekly subscription quota, read with the host's Grok CLI login, plus per-turn tokens and estimated cost from the agent's prompt result. An optional monthly USD allowance in Settings adds an estimated remaining meter; the card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
+- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
+- Use the **🧠** context button for a per-category breakdown of the conversation's context window: a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets.
+- Claude conversations additionally get an **auto-compact window** slider in that modal. Claude Code compacts a session once it approaches a model-tuned window (around 967k tokens on a 1M-context model), which is why long conversations rarely compact at all; setting a smaller window makes it happen sooner and keeps turns cheaper. *Auto* hands the choice back to the CLI. The smallest window is 100k, because the CLI silently ignores anything below that and falls back to its own default. The line beneath the slider reports the window actually in force and where it came from — your setting, the model default, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment override — and fills in once the conversation's first turn completes. The change reaches a running session on its next message.
+- The transcript marks day boundaries, and marks the point where a Claude session compacted its context with the tokens before and after. Both appear as dots beside the scrollbar for the messages currently loaded.
+
+### Sharing
+
+Use **➡️ Share conversation** in the `⋯` menu to publish a read-only link. Each message has a **Hide** button that keeps it out of the shared view without deleting it; hidden messages stay fully visible to you, marked *Hidden from shared viewers*, with an **Unhide** button. Anyone with the link can read the shared view, without signing in.
+
+### Notifications and the app
+
+- **⚙️ Settings → Notifications** turns on push notifications per device: for questions from the agent, completed or failed turns, plan boards, and the CLI going offline. They need a secure context (HTTPS, or `localhost`), are sent only while no device has the app in the foreground, and show generic text unless you opt in to message previews on that device.
+- The **⬇** button in the sidebar installs OAR as an app (PWA). **Install app name** in Settings sets its label on every device that connects to this relay.
+
+### The conversation menu
+
+Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title**, **🖥️ Inspect tmux console** (a read-only view of the session's tmux pane), **🤗 Select Models**, **⚙️ Settings**, **🌄 Restart web relay** (queued until the current turn is idle), **💤 Suspend host**, and **☠️ Kill session** (stops the conversation's worker; an active turn then needs a retry or a new message). Its header shows the queue counts with **🚮 Empty queue**.
+
+## Settings and configuration reference
+
+### Settings (⚙️ in the web UI)
+
+The modal is organised into five tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Grok**, and **Cursor** sub-tab), **Previews**, **Notifications**, and **Features** — and reopens on the tab you used last. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
+
+| Tab | Setting | Default | What it does |
+| --- | ------- | ------- | ------------ |
+| General | Theme, Text scaling | dark theme | Per browser |
+| General | Show Suspend host action | on | Per browser: shows **💤 Suspend host** in the conversation menu |
+| General | Max turn duration | `60 min` | Hard cap on how long one turn may run before the relay requeues it (0 = no limit, up to 10 h; see below) |
+| General | Background task timeout | `4 h` | How long background tasks alone may keep a Claude or Copilot session running after its reply; then they are stopped (0 = no limit, up to 10 h) |
+| General | Autostart (Windows) | Off | *At sign-in* (a visible terminal after you log on) or *At system startup* (headless, no logon needed, one admin confirmation) |
+| General | Install app name | `OAR` | Label of the installed PWA on every device |
+| General | Check for updates automatically | off | Opt-in: the relay asks oar.sh for the latest version about twice a day. **Check for updates** works regardless; `OAR_NO_UPDATE_CHECK=1` blocks both |
+| General | Default CWD for new sessions | relay workspace root | Working directory for newly created sessions that have none of their own |
+| Providers | Copilot engine | SDK | Extension when this relay cannot run the SDK engine (see [engine choice](#github-copilot--engine-choice)) |
+| Providers | OpenAI API key / model / base URL | — / `gpt-4o` / `https://api.openai.com/v1` | Enables the OpenAI and OpenAI Image providers |
+| Providers | Claude (Agent SDK) | off | Enables Claude as a New Chat provider and runs model discovery; default model `claude-sonnet-5` |
+| Providers | Claude account (Relogin / Logout) | host login | Switches the Claude account the relay host's CLI uses, from the browser (see [Claude (Agent SDK)](#claude-agent-sdk)) |
+| Providers | Cursor API key / model | — / `composer-2.5` | Enables Cursor; plus monthly plan allowances and the optional dashboard session token |
+| Providers | Grok | off | Enables Grok; default model `grok-4.5`; **Sign in** / **Sign out**; optional monthly allowance |
+| Previews | Live previews | — | Lists the published previews, each of which you can close |
+| Notifications | Push notifications | off | Per device: which events notify, and whether titles and message previews are included |
+| Features | Feature flags | see below | **Session worker routing** (on), **Continuation answer routing** (on), **Generated-image continuity** (on), and a reserved **Worker fallback restart** (off, no effect yet). Changes apply after a relay restart; a `COPILOT_REMOTE_<FLAG>` environment variable pins a flag, e.g. `COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED=0` |
 
 ### How a stuck turn is detected
 
@@ -456,26 +479,24 @@ Two independent guards, both of which exempt a turn that is waiting on an unansw
 
 When either trips, the turn is returned to the queue rather than lost.
 
-## Configuration reference (`server/config.json`)
+### Configuration reference (`server/config.json`)
 
+The config file is `server/config.json` in a git checkout and `~/.oar/config.json` (`%APPDATA%\oar\config.json`) for a global install; `COPILOT_WEB_RELAY_CONFIG` points the relay at another file. It holds the auth token, so the relay keeps it owner-only. The relay reads it at startup: restart the relay after editing it.
 
 | Key                        | Default              | Description                                                               |
 | -------------------------- | -------------------- | ------------------------------------------------------------------------- |
-| `authToken`                | generated if missing | Required for API/UI auth; set explicitly for stable access                |
+| `authToken`                | generated if empty   | Required for API/UI auth. If empty, the relay generates a random token on every start and prints it to its log without saving it; `oar setup` writes a stable one |
 | `port`                     | `3333`               | HTTP + WebSocket port                                                     |
 | `localhostOnly`            | `true`               | Bind only to loopback (`127.0.0.1`) and disable LAN/WAN access            |
-| `pollIntervalMs`           | `3000`               | CLI heartbeat/poll cadence                                                |
+| `dataDir`                  | `data/` beside the server | Database and uploads; a relative path resolves against the config file's directory. `COPILOT_WEB_RELAY_DATA_DIR` wins, and global installs started by `oar` use `~/.oar/data` |
 | `processingTimeoutMs`      | `600000`             | Inactivity window before a turn is treated as stale (not a cap on turn length) |
-| `ask_user` timeout         | `900000`             | `ask_user` question wait; edit `shared/question-timeout.mjs` to change it |
-| `conversationSessionMode`  | `isolated`           | Configured strategy (`isolated` / `shared`) exposed in status             |
-| `restartGracefulTimeoutMs` | `8000`               | Graceful restart wait before force fallback                               |
-| `restartShutdownTimeoutMs` | `45000`              | Drain timeout while waiting for active queue job completion               |
-| `restartSpawnTimeoutMs`    | `18000`              | Max wait for resume/restart phase per attempt                             |
-| `restartRebindTimeoutMs`   | `20000`              | Max wait for rebind/session-sync completion per attempt                   |
-| `restartMaxAttempts`       | `3`                  | Bounded restart attempts before terminal exhaustion                       |
-| `restartRetryBackoffMs`    | `[1000,3000,7000]`   | Deterministic retry backoff schedule in milliseconds                      |
+| `conversationSessionMode`  | `isolated`           | Configured strategy (`isolated` / `shared`) recorded on sessions and exposed in status |
 | `maxRequeueRetries`        | `5`                  | Queue retry limit for failed processing                                   |
 | `remotePath`               | `""`                 | URL base path when reverse-proxied under a subpath; also drives PWA URLs and socket.io path |
+| `trustProxy`               | `"loopback"`         | Which proxies may set `X-Forwarded-*` headers (Express `trust proxy`); widen it with a hop count or subnet when a proxy on another host forwards to the relay |
+| `workspaceRootAllowList`   | unset                | Directories that conversations may start in (they and their subdirectories); unset allows any. `COPILOT_WORKSPACE_ROOT_ALLOW_LIST` sets it too, separated by the platform's path delimiter |
+| `publicHostnames`          | `[]`                 | Hostnames the relay itself answers on; the preview lane refuses to share one |
+| `tunnelMarkerHeaders`      | `[]`                 | Extra edge-injected headers that mark tunnel traffic (see [Session-worker path guard](#session-worker-path-guard)) |
 | `sshTunnel.mode`           | `disabled`           | Tunnel mode (`disabled` or `managed`)                                    |
 | `sshTunnel.enabled`        | `false`              | Legacy alias (`true` => `managed`)                                       |
 | `sshTunnel.required`       | `false`              | Pause dequeue while managed tunnel is disconnected                        |
@@ -485,24 +506,59 @@ When either trips, the turn is returned to the queue rather than lost.
 | `sshTunnel.host`           | —                    | SSH host                                                                  |
 | `sshTunnel.remotePort`     | —                    | Remote forwarded port                                                     |
 | `sshTunnel.identityFile`   | optional             | SSH key path (falls back to default agent/key)                            |
-| `cloudflaredTunnel.mode`   | `disabled`           | Cloudflare tunnel mode (`disabled` or `managed`)                          |
+| `cloudflaredTunnel.mode`   | `disabled`           | Cloudflare tunnel mode (`disabled` or `managed`; `enabled: true` is a legacy alias for `managed`) |
 | `cloudflaredTunnel.required` | `false`            | Pause dequeue while the managed Cloudflare tunnel is disconnected         |
-| `cloudflaredTunnel.token`  | —                    | Tunnel token issued by the router panel                                   |
+| `cloudflaredTunnel.token`  | —                    | The tunnel token from your own Cloudflare Zero Trust tunnel               |
 | `cloudflaredTunnel.binary` | *(auto)*             | `cloudflared` path; defaults to the npm package, then `PATH`              |
 | `cloudflaredTunnel.extraArgs` | `[]`              | Extra arguments appended to `cloudflared tunnel run`                      |
-| `tunnelMarkerHeaders`      | `[]`                 | Extra edge-injected headers that mark tunnel traffic (see worker-path guard) |
-| `publicHostnames`          | `[]`                 | Hostnames the relay itself answers on; the preview lane refuses to share one |
-| `previews.enabled`         | `false`              | Publish local dev servers on a separate listener (see `docs/preview-servers.md`) |
+| `previews.enabled`         | `false`              | Publish local dev servers on a separate listener (see [docs/preview-servers.md](docs/preview-servers.md)) |
 | `previews.port`            | `port + 1`           | Loopback port for the preview listener; `0` picks an ephemeral port        |
 | `previews.bindHost`        | `127.0.0.1`          | Bind address; non-loopback needs `previews.allowPublicBind`                |
 | `previews.publicBaseUrl`   | —                    | Public base URL on a hostname **different** from the relay's               |
 | `previews.allowedTargetHosts` | `[]`              | Upstreams allowed beyond loopback (container/VM IPs)                       |
 | `previews.maxLive`         | `8`                  | Maximum simultaneously published previews                                  |
+| `pushVapidSubject`         | `mailto:copilot-remote@example.com` | Contact URI the relay sends to push services with Web Push requests |
+| `sharedPresenceMaxPerConversation` | `200`        | Most live viewers tracked per shared conversation                          |
+| `sharedPresenceMaxGlobal`  | `5000`               | Most live shared-link viewers tracked in total                             |
+| `cliBinaries`              | *(written by the relay)* | Provider CLI paths resolved after an install from Settings, restored at startup |
+| `restartGracefulTimeoutMs` | `8000`               | Graceful restart wait before force fallback                               |
+| `restartShutdownTimeoutMs` | `45000`              | Drain timeout while waiting for active queue job completion               |
+| `restartSpawnTimeoutMs`    | `18000`              | Max wait for resume/restart phase per attempt                             |
+| `restartRebindTimeoutMs`   | `20000`              | Max wait for rebind/session-sync completion per attempt                   |
+| `restartMaxAttempts`       | `3`                  | Bounded restart attempts before terminal exhaustion                       |
+| `restartRetryBackoffMs`    | `[1000,3000,7000]`   | Deterministic retry backoff schedule in milliseconds                      |
 
+### Environment variables
 
-> Session mismatch recovery is restart-driven: the relay restart orchestrator parks queue work, restarts/rebinds the CLI runtime, and resumes dequeueing after rebind confirmation. The extension no longer attempts in-process session switch APIs from the dequeue/send path.
+| Variable | Effect |
+| -------- | ------ |
+| `COPILOT_WEB_RELAY_CONFIG` | Config file to use |
+| `COPILOT_WEB_RELAY_DATA_DIR` | Data directory (database and uploads) |
+| `COPILOT_WEB_RELAY_LOG_DIR` | Log directory |
+| `OAR_STATE_ROOT` | State root of a global install, instead of `~/.oar` / `%APPDATA%\oar` |
+| `OAR_NO_UPDATE_CHECK=1` | Never contact oar.sh, not even for a manual update check |
+| `COPILOT_SDK_PATH` | The Copilot CLI runtime's `copilot-sdk` directory, instead of the newest one in the CLI's package cache |
+| `COPILOT_PKG_DIR` | An additional Copilot CLI package cache to search |
+| `GH_TOKEN`, `GITHUB_TOKEN` | GitHub token for the Copilot usage card, instead of `gh auth token` |
+| `XAI_API_KEY` | Grok authentication instead of the Grok CLI login |
+| `CURSOR_SESSION_TOKEN` | Cursor dashboard session token for live plan bars |
+| `CLAUDE_CONFIG_DIR` | Claude configuration directory, instead of `~/.claude` |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Overrides the Claude auto-compact window |
+| `COPILOT_CLOUDFLARED_MODE`, `COPILOT_CLOUDFLARED_TOKEN`, `COPILOT_CLOUDFLARED_BINARY` | Override `cloudflaredTunnel.mode`, `.token`, and `.binary` |
+| `COPILOT_WORKSPACE_ROOT_ALLOW_LIST` | Same as `workspaceRootAllowList` |
+| `COPILOT_REMOTE_<FLAG>` | Pins a feature flag from the **Features** tab (`1`/`0`, `true`/`false`) |
 
-## Optional remote internet access (SSH tunnel)
+Many internal names still say "copilot" (`COPILOT_WEB_RELAY_*`, `copilot.db`) from the project's earlier life; they apply to every runtime.
+
+### API overview
+
+Every authenticated HTTP route accepts `Authorization: Bearer <token>` or the login cookie; the routes are documented in [server/README.md](server/README.md#api-reference).
+
+## Remote access
+
+`localhostOnly` controls only the relay's own listener (`127.0.0.1` vs `0.0.0.0`). To reach the relay from outside your network, prefer one of the two managed tunnels below over opening a port. They are independent and can run at the same time.
+
+### Optional remote internet access (SSH tunnel)
 
 Configure:
 
@@ -518,8 +574,7 @@ Configure:
 }
 ```
 
-`localhostOnly` controls only the local relay listener (`127.0.0.1` vs `0.0.0.0`).
-SSH tunnel exposure is controlled independently by `sshTunnel.remoteBind`.
+SSH tunnel exposure is controlled by `sshTunnel.remoteBind`, independently of `localhostOnly`.
 
 Then reverse proxy on the VPS (example Caddy):
 
@@ -531,11 +586,17 @@ relay.example.com {
 
 The relay auto-reconnects tunnel drops with exponential backoff.
 
-## Optional remote internet access (Cloudflare Tunnel)
+### Optional remote internet access (Cloudflare Tunnel)
 
 An alternative to the SSH tunnel that needs no VPS and no inbound port: the relay
 supervises Cloudflare's `cloudflared` binary, and Cloudflare carries your hostname down
-to `127.0.0.1:3333`. Both modes are independent and may run at the same time.
+to `127.0.0.1:3333`.
+
+1. In your own Cloudflare Zero Trust account, create a tunnel and route a public hostname on
+   your zone to `http://localhost:3333` (or your `port`). That routing lives in Cloudflare, not
+   on this machine.
+2. Put the tunnel's token into the config and restart the relay. (`oar setup` can switch the
+   tunnel on for you; it still needs the token.)
 
 ```json
 "cloudflaredTunnel": {
@@ -547,10 +608,8 @@ to `127.0.0.1:3333`. Both modes are independent and may run at the same time.
 }
 ```
 
-Hostname-to-machine bindings are managed remotely in the router panel (see the
-`cpr-router` project), never configured on this machine — paste the token it gives you and
-start the relay. Environment overrides: `COPILOT_CLOUDFLARED_MODE`,
-`COPILOT_CLOUDFLARED_TOKEN`, `COPILOT_CLOUDFLARED_BINARY`.
+Environment overrides: `COPILOT_CLOUDFLARED_MODE`, `COPILOT_CLOUDFLARED_TOKEN`,
+`COPILOT_CLOUDFLARED_BINARY`.
 
 `localhostOnly` stays `true`: `cloudflared` connects outbound and nothing binds publicly.
 The binary resolves from `cloudflaredTunnel.binary`, then the optional `cloudflared` npm
@@ -579,148 +638,63 @@ covering `/api/shared/*` — shared views poll for liveness and an edge-cached r
 would pin viewers to a stale snapshot. Likewise, a Cloudflare Access application over the
 bound hostname breaks share links unless it bypasses `/shared/*` and `/api/shared/*`.
 
-## Global extension install (optional)
+## Security notes
 
-Install a user-global extension entrypoint for use across repositories:
-
-```text
-%USERPROFILE%\.copilot\extensions\web-relay\   (Windows)
-~/.copilot/extensions/web-relay/               (Linux/macOS)
-```
-
-Recommended command:
-
-```bash
-oar --install-extension
-```
-
-This writes/updates `extension.mjs` in the user-global extension directory as a wrapper that imports the repository extension entrypoint directly.
-The wrapper also avoids double-loading when you start Copilot from this repository itself, so the
-project-local extension remains the single runtime owner in repo-root sessions.
-
-Useful environment variables:
-
-- `COPILOT_WEB_RELAY_SERVER_DIR` (recommended)
-- `COPILOT_WEB_RELAY_ROOT`
-- `COPILOT_WEB_RELAY_CONFIG`
-- `COPILOT_WEB_RELAY_TOOLS`
-- `COPILOT_WEB_RELAY_LOG_DIR`
-- `COPILOT_WEB_RELAY_NODE`
-
-Project-local extension files still take precedence when both exist.
-
-If the same extension is available both project-local (`.github/extensions/web-relay/`) and user-global (`~/.copilot/extensions/web-relay/`), Copilot may show duplicates in extension management. Keep only one active copy to avoid double-loading.
-
-## API overview
-
-Common routes:
-
-- Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`, `/api/context/:conversationId`
-- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
-- Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
-- Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
-- Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
-- Claude account auth: `/api/claude/auth/status`, `/api/claude/auth/login/start`, `/api/claude/auth/login/code`, `/api/claude/auth/login/cancel`, `/api/claude/auth/logout`
-- Grok account auth: `/api/grok/auth/status`, `/api/grok/auth/login/start`, `/api/grok/auth/login/cancel`, `/api/grok/auth/logout`
-- Provider CLI install: `/api/cli/status`, `/api/cli/install`, `/api/cli/install/cancel`
-- Cursor worker: `/api/cursor-agent-id`, `/api/cursor-context-usage`, `/api/cursor-plan-usage`
-- Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
-- Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
-- Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
-- File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
-- Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`
-- Previews: `/api/previews`, `/api/previews/:token` (publish a local dev server; see `docs/preview-servers.md`)
-- Uploads: `/api/upload`, `/api/upload/:sha256/content`
-
-All authenticated routes accept either:
-
-- `Authorization: Bearer <token>`
-- auth cookie from prior login
-
-For deeper implementation/API details, see `[server/README.md](server/README.md)`.
+- The auth token guards the API and the Socket.IO channel. A browser signs in once, with the token or with a URL carrying `?token=` (such as the one `oar setup` prints and puts in its QR code), and then holds an HttpOnly cookie for 30 days, marked `Secure` when the relay is reached over HTTPS. Treat the token, and that URL, like a password.
+- Keep the config file private (the relay keeps it owner-only) and rotate `authToken` if it is exposed: `oar setup` offers a new token, which signs every device out.
+- `localhostOnly` (default `true`) keeps the relay on loopback. Beyond your LAN, use HTTPS through one of the [tunnels](#remote-access) rather than an open port.
+- Agents act with the permissions of the user the relay runs as. OAR adds reach, not a sandbox: whoever holds the token can have them run commands on the host. `workspaceRootAllowList` limits the directories conversations may start in.
+- Shared conversation links and preview links are public by design: anyone with the URL can read the shared transcript or reach the previewed app, without signing in.
+- API keys you enter (OpenAI, Cursor) are stored in the relay database on the host and never sent to browsers. Claude and Grok credentials stay with their CLIs on the host.
+- OAR has no telemetry. Its only request to oar.sh is the update check, which is off until you enable it.
 
 ## Troubleshooting
 
-
 | Symptom                            | What to check                                                                    |
 | ---------------------------------- | -------------------------------------------------------------------------------- |
-| UI says CLI offline                | Send one CLI prompt to trigger extension session start, then check `/api/status` |
-| Messages stuck pending             | Ensure only one relay owner is running and only one process owns port `3333`     |
-| Wrong/old model shown              | Check `/api/models` and extension logs for model snapshot updates                |
-| Clarification card not progressing | Answer via the web card; relay resumes after question status becomes `answered`  |
+| Banner says *CLI is offline*       | No session worker has reported in during the last 10 seconds, which can be normal on an idle relay. Send a message: the relay starts that conversation's worker, and the banner clears once it connects. If it stays, check `/api/status` and the worker's `worker-<session>.log` in the log directory |
+| `oar` exits with *Copilot CLI process error: spawn gh ENOENT* | `oar` runs `gh copilot` after starting the relay, and stops the relay again when that fails. Install the GitHub CLI, or [run only the relay](#start-the-relay) |
+| Settings refuses the **SDK** engine | Install or upgrade the Copilot CLI, run `copilot` once, and restart the relay (see [engine choice](#github-copilot--engine-choice)) |
+| Messages stuck pending             | Only one relay may run per data directory (a second one exits on the singleton lock), and only one process may own port `3333`. `oar doctor` shows the config and database in use |
+| Wrong or old model list            | **🤗 Select Models → Refresh** reruns discovery; `/api/model-variants` shows the Copilot catalog's `source` and `refreshedAt` |
+| Clarification card not progressing | Answer via the web card; the turn resumes once the question status becomes `answered` |
 | File links fail                    | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
 | Claude missing from New Chat       | Enable it in **⚙️ Settings → Providers → Claude**; the toggle is off by default   |
 | Claude reply says it cannot authenticate | Press **Claude settings** on the failed reply, then **Relogin** (or run `claude` on the relay host), and retry the turn |
 | Grok reply says the CLI was not found | Press **Install Grok CLI** on the failed reply, or install it from **⚙️ Settings → Providers → Grok**; no relay restart is needed afterwards |
 | Grok reply says authentication failed | Press **Sign in to Grok** on the failed reply and confirm the device code in a browser |
-| Claude model list empty or stale   | Re-save the Claude settings, or use **Select Models → Refresh** to rerun discovery |
 | Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
-| No usage line under a reply        | Expected for OpenAI, Claude, and Cursor turns; only Copilot turns record plan usage |
-
-
-## Security notes
-
-- Auth is token-based and enforced on API + Socket.IO.
-- Successful auth sets an HttpOnly cookie for browser sessions.
-- Keep `server/config.json` private and rotate `authToken` if exposed.
-- Set `localhostOnly` to `true` to force local-only access (no LAN/WAN listener).
-- If exposed beyond LAN, use HTTPS and a strong token.
+| Background agent or shell stopped on its own | It reached the **Background task timeout** (default 4 h); raise it or set 0 for no limit |
+| A conversation will not delete     | It is still working: a running turn, one waiting on a question card or approval, or live background tasks. Stop it, then delete |
+| A conversation seems wedged        | **☠️ Kill session** in the `⋯` menu stops its worker; retry the turn or send a new message |
+| **🌄 Restart web relay** fails with *localhost-only* | The restart endpoint accepts loopback connections only: use it on the relay host or through a tunnel, not over a direct LAN connection |
+| `npm install -g @oar-sh/oar` fails with node-gyp or prebuild errors | `better-sqlite3` has no prebuilt binary for your platform; install a C/C++ build toolchain and Python, then retry |
+| No usage line under a reply        | Expected for OpenAI, Claude, Cursor, and Grok turns; only Copilot turns record plan usage |
 
 ## Repository layout
 
 ```text
 oar/
-├── .github/extensions/web-relay/   # Copilot CLI extension (worker WebSocket, ask_user bridge, model snapshotting)
+├── .github/extensions/web-relay/   # Copilot CLI extension for the Extension engine (worker link, ask_user bridge, model snapshots)
+├── bin/                            # The `oar` command (oar.js) and a Windows cmd shim for checkouts (bat/oar.bat)
+├── docs/                           # Preview-server guide, Copilot BYOK notes, SDK feature tracker
 ├── server/
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
+│   ├── copilot-worker/             # Copilot SDK engine session worker (steering, background tasks, questions)
 │   ├── cursor-worker/              # Cursor Agent SDK session worker (turn runner, mode nudges, auth retry)
-│   ├── public/app/                 # Browser app modules
+│   ├── grok-worker/                # Grok CLI session worker over ACP
+│   ├── migrations/                 # Database migrations
+│   ├── public/                     # Browser app (index.html, app/ modules, PWA shell)
+│   ├── repositories/               # SQLite data access
 │   ├── routes/                     # Express route registration
-│   ├── services/                   # Relay services (workers, context usage, images, tunnels)
-│   └── server.js                   # Express + Socket.IO relay server
-├── shared/                         # Code shared by server, extension, and workers
-├── docs/                           # Project planning notes
+│   ├── services/                   # Relay services (workers, usage, images, tunnels, previews, updates)
+│   ├── tools/                      # Diagnostic tools (OpenAI BYOK capture proxy)
+│   ├── server.js                   # Entry point: supervisor plus relay runtime
+│   └── server-runtime.mjs          # Express + Socket.IO relay server
+├── shared/                         # Code shared by the server, the extension, and the workers
+│   └── worker-runtime/             # Common worker plumbing (relay API client, heartbeat, worker link)
+├── tests/                          # Playwright end-to-end suite and its isolated relay harness
+├── CHANGELOG.md
+├── DEVELOPING.md                   # Development workflows, tests, relay internals
 └── README.md
 ```
-
-## Extra screenshots
-
-More views from the same app experience:
-
-<div align="center">
-<table width="100%" cellspacing="0" cellpadding="0">
-<tr>
-<td rowspan="2" width="50%" align="center" valign="middle">
-<a href="docs/screenshots/mobile_session_input.jpg" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/mobile_session_input.jpg" alt="Mobile session composer">
-</a>
-<div align="center"><small>Mobile chat composer in portrait, with the keyboard open and the input ready to send.</small></div>
-</td>
-<td width="50%" align="right" valign="top">
-<a href="docs/screenshots/desktop_pwa_chrome_portrait.png" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/desktop_pwa_chrome_portrait.png" alt="Desktop PWA portrait view">
-</a>
-<div align="center"><small>Desktop PWA running in portrait mode, sized for a narrow browser window.</small></div>
-</td>
-</tr>
-<tr>
-<td width="50%" align="right" valign="bottom">
-<a href="docs/screenshots/desktop_pwa_workspace_file_explorer.png" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/desktop_pwa_workspace_file_explorer.png" alt="Workspace file explorer">
-</a>
-<div align="center"><small>Workspace file explorer with folder browsing and file previews.</small></div>
-</td>
-</tr>
-</table>
-
-<table width="50%" cellspacing="0" cellpadding="0">
-<tr>
-<td align="center">
-<a href="docs/screenshots/mobile_file_viewer.jpg" target="_blank" rel="noopener noreferrer">
-<img src="docs/screenshots/mobile_file_viewer.jpg" alt="Mobile file viewer">
-</a>
-<div align="center"><small>Mobile (PWA/Browser) file viewer showing an image preview and download actions.</small></div>
-</td>
-</tr>
-</table>
-</div>

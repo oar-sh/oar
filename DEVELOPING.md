@@ -1,6 +1,8 @@
 # Developing
 
-This document covers day-to-day development workflows for the web relay and Copilot CLI extension.
+This document covers day-to-day development workflows for the web relay, its session workers, and
+the Copilot CLI extension, plus the relay internals that used to live in the README. The
+[README](README.md) is written for people who install and use OAR.
 
 ## Naming: OAR vs "copilot"
 
@@ -12,20 +14,189 @@ Copilot CLI's contracts or are invisible identifiers whose rename would only buy
 a migration. Do not "fix" them in passing — the deferred rename list lives in
 `docs/plans/oar-rebrand-and-release.md` §11.
 
-## Runtime ownership
+## Rules for coding agents
 
-Everything starts the same way — `node server/server.js` (which is all `npm start` does).
-The role is chosen by argv: bare, the process stays attached as a supervisor and runs the
-server in a `--relay-runtime` worker child; with `--supervised` it runs the server in-process
-and exits 75 so its spawner handles restarts. Never set a role via the environment: the
-server's env is inherited by tmux workers and by the Copilot CLI, so it would leak downward.
+These rules apply to any agent working in this repository (they were in the README until 0.9.3):
 
-Use a **single runtime owner** at a time:
+- Do not restart the web relay unless the user has explicitly given permission. If a manual
+  restart is requested, use `POST /api/relay/shutdown` only — never restart the relay by killing
+  processes (see [Manual relay control](#manual-relay-control)).
+- Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
+  Unit tests (`npm test`) and e2e tests (`npm run test:e2e`) are isolated from a live relay and
+  may run beside it; see [Tests](#tests).
+- Do not run extension-managed relay transport together with standalone relay runtime transport
+  (see [Single runtime owner rule](#single-runtime-owner-rule)).
 
-- **Extension-managed**: start `gh copilot` or `copilot-remote` and let the extension supervise `server.js --supervised`
-- **Standalone**: start the server yourself, then `node server/relay.mjs` by hand — only when you intentionally want the standalone relay flow
+`.github/copilot-instructions.md` carries the same restart policy for Copilot sessions.
 
-Do **not** run extension-managed polling and standalone relay processes together.
+## Relay internals
+
+Operator and developer detail moved here from the README.
+
+### The pieces
+
+1. **Web relay server** (`server/`): queueing, persistence, auth, browser UI, file browser,
+   uploads, the OpenAI Image path, and the supervision of per-conversation session workers.
+2. **Session workers** (`server/copilot-worker/`, `server/claude-worker/`, `server/cursor-worker/`,
+   `server/grok-worker/`): one Node process per conversation that runs its turns through the
+   Copilot SDK engine, the Claude Agent SDK, the Cursor Agent SDK, or the Grok CLI over ACP, and
+   speaks the same relay contracts as the Copilot workers.
+3. **Copilot CLI extension** (`.github/extensions/web-relay/`): the Extension engine. It polls the
+   relay, executes turns, streams activity, and bridges `ask_user` questions into web question
+   cards.
+
+### The single server entry point
+
+`server/server.js` is the only entry point, in every mode — manual runs, the CLI
+extension, `oar`, the systemd unit, Windows autostart, and the e2e runner all start it
+(`npm start` is an alias for exactly `node server/server.js`).
+Its role is chosen by argv, never by the environment:
+
+- `node server/server.js` — the process stays attached to your terminal as a
+  supervisor and runs the real server (`server-runtime.mjs`) in a worker child it
+  marks with `--relay-runtime`. Exit code 75 relaunches the worker; any other
+  non-zero exit is retried up to 3 times before the supervisor gives up.
+- `node server/server.js --supervised` — runs the server in this process and
+  exits 75 on restart, leaving restarts to whoever spawned it. The CLI extension
+  passes this so its own bounded-backoff supervision is the only one in play.
+
+Role flags travel on argv because the server's environment is inherited by tmux
+worker sessions and by the Copilot CLI it launches — an env-based flag would be
+read by unrelated servers started further down that tree.
+
+### Runtime ownership
+
+With session worker routing on (the default), the server launches each conversation's worker
+itself, so a plain `node server/server.js` — `npm start`, the systemd unit, Windows autostart —
+serves every runtime without a Copilot CLI session attached.
+
+### Single runtime owner rule
+
+Run only one relay owner at a time:
+
+1. **Extension-managed mode**: the Copilot CLI extension (loaded into `gh copilot` by `oar`,
+   `npm run copilot:relay`, or the global wrapper) starts and supervises `server.js --supervised`,
+   and owns the relay worker WebSocket and fallback dequeue loop. `github`/`openai` turns run in
+   Copilot sessions the server launches per conversation.
+2. **Standalone mode** (manual escape hatch): start the server, then run `node server/relay.mjs` by hand. It spawns its own Copilot CLI process and polls `GET /api/pending` over HTTP. Use it only when the extension transport is unavailable — there is no npm script for it. On Windows, its visible launcher targets a stable per-workspace Windows Terminal window name, so later foreground launches reuse the same window instead of opening new desktop windows; use the hidden/stdio fallback only when you explicitly need it.
+
+Do not run extension-managed relay transport together with standalone relay runtime transport.
+
+`npm run copilot:relay` is the convenience launcher for extension-managed mode in this repository:
+it runs `gh copilot -- --allow-all` from the repo root, so the project-local extension loads and
+starts the relay. With the global wrapper installed (see
+[Global extension install](#global-extension-install-optional)), plain `gh copilot` from any
+repository does the same.
+
+In extension-managed mode, the worker WebSocket begins after the CLI session becomes active (typically after the first prompt), with HTTP dequeue kept only as fallback when the socket is unavailable.
+The extension supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
+When the CLI extension connects, it also prints the relay info window (local/network/remote/auth URLs) directly in the Copilot CLI client.
+
+On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry (*At sign-in*) that opens a visible terminal at sign-in and runs the installed `node server\server.js` path, or a boot-triggered scheduled task (*At system startup*). Either starts only the web relay server. With session worker routing on (the default), the relay then launches each conversation's worker itself; only with routing off must a Copilot CLI session using the extension attach before queued turns can be processed. Turning the setting off removes the OAR Startup entry.
+
+### Manual relay control
+
+Do not restart the relay by killing processes; use `POST /api/relay/shutdown` instead.
+
+- `POST /api/relay/shutdown` without `restart` queues a normal relay shutdown.
+- `POST /api/relay/shutdown` with `restart: true` queues an intentional self-restart.
+- Requests are localhost-only and still require relay auth.
+- The relay waits until the queue is idle before acting; this endpoint does not interrupt an in-flight turn.
+- `/api/status` exposes the queued relay exit state as `relayShutdown` so the UI/logs can distinguish idle, queued, and shutting-down restart/shutdown flows.
+- Restart ownership follows the argv role, so exactly one supervisor acts on exit code 75:
+  - `node server/server.js` — the attached supervisor respawns its worker child in the same terminal session
+  - `node server/server.js --supervised` — the server exits 75 and the CLI extension relaunches it (bounded backoff, and it stops trying once the CLI session shuts down)
+
+The web UI's **🌄 Restart web relay** and `oar update` use the same endpoint.
+
+### Session mismatch recovery
+
+Session mismatch recovery is restart-driven: the relay restart orchestrator parks queue work, restarts/rebinds the CLI runtime, and resumes dequeueing after rebind confirmation. The extension no longer attempts in-process session switch APIs from the dequeue/send path.
+
+### Global npm command from a checkout
+
+You can install a checkout locally and get a global `oar` command without publishing:
+
+```powershell
+npm link
+# or
+npm install -g .
+```
+
+Run it from any folder to start the web relay server for that folder's workspace root, then immediately hand the shell to `gh copilot` without a bootstrap prompt. If a relay is already active, the command reuses it and still opens Copilot in the same shell.
+
+Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` (`~/.config/copilot-remote/logs` elsewhere) for git checkouts, or `~/.oar/logs` (`%APPDATA%\oar\logs`) for global installs, unless `COPILOT_WEB_RELAY_LOG_DIR` is set, so it stays out of the CLI terminal.
+
+If you want custom token/tunnel settings from a specific `server/config.json`, point `COPILOT_WEB_RELAY_CONFIG` at that file before launching. A plain `npm install -g .` does not bundle the repo-local gitignored config file.
+
+Manual relay shutdowns are queued via `POST /api/relay/shutdown` and only take effect after the current turn goes idle, so they are not a way to interrupt a turn in progress.
+
+### Global extension install (optional)
+
+Install a user-global extension entrypoint for use across repositories:
+
+```text
+%USERPROFILE%\.copilot\extensions\web-relay\   (Windows)
+~/.copilot/extensions/web-relay/               (Linux/macOS)
+```
+
+Recommended command:
+
+```bash
+oar --install-extension
+```
+
+This writes/updates `extension.mjs` in the user-global extension directory as a wrapper that imports the repository extension entrypoint directly. Plain `oar` does the same on every run unless you pass `--no-install-extension`.
+The wrapper also avoids double-loading when you start Copilot from this repository itself, so the
+project-local extension remains the single runtime owner in repo-root sessions.
+
+Useful environment variables:
+
+- `COPILOT_WEB_RELAY_SERVER_DIR` (recommended)
+- `COPILOT_WEB_RELAY_ROOT`
+- `COPILOT_WEB_RELAY_CONFIG`
+- `COPILOT_WEB_RELAY_TOOLS`
+- `COPILOT_WEB_RELAY_LOG_DIR`
+- `COPILOT_WEB_RELAY_NODE`
+
+Project-local extension files still take precedence when both exist.
+
+If the same extension is available both project-local (`.github/extensions/web-relay/`) and user-global (`~/.copilot/extensions/web-relay/`), Copilot may show duplicates in extension management. Keep only one active copy to avoid double-loading.
+
+### Roadmap for later launcher modes
+
+1. **Option 2**: launch/attach a Copilot CLI session directly.
+2. **Option 3**: support `oar -- [gh copilot args]` pass-through. *Shipped:* `oar -- <args>` runs
+   `gh copilot -- <args>`.
+3. **Session resume**: add `--session-id=<...>` handoff once the session orchestration contract is defined.
+
+### API overview
+
+Common routes:
+
+- Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`, `/api/context/:conversationId`
+- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
+- Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
+- Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
+- Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
+- Claude account auth: `/api/claude/auth/status`, `/api/claude/auth/login/start`, `/api/claude/auth/login/code`, `/api/claude/auth/login/cancel`, `/api/claude/auth/logout`
+- Grok account auth: `/api/grok/auth/status`, `/api/grok/auth/login/start`, `/api/grok/auth/login/cancel`, `/api/grok/auth/logout`
+- Provider CLI install: `/api/cli/status`, `/api/cli/install`, `/api/cli/install/cancel`
+- Cursor worker: `/api/cursor-agent-id`, `/api/cursor-context-usage`, `/api/cursor-plan-usage`
+- Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
+- Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
+- Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
+- File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
+- Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`
+- Previews: `/api/previews`, `/api/previews/:token` (publish a local dev server; see `docs/preview-servers.md`)
+- Uploads: `/api/upload`, `/api/upload/:sha256/content`
+
+All authenticated routes accept either:
+
+- `Authorization: Bearer <token>`
+- auth cookie from prior login
+
+For deeper implementation/API details, see [server/README.md](server/README.md#api-reference).
 
 ## Restarting the extension-managed relay
 
@@ -91,7 +262,7 @@ gh copilot
 or:
 
 ```bash
-copilot-remote
+oar
 ```
 
 ## Worker debugging
@@ -126,12 +297,14 @@ Useful overrides: `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary),
 
 ### Copilot SDK workers
 
-With **Settings → Providers → Copilot → Copilot engine** set to *SDK*, Copilot conversations run
+With **Settings → Providers → Copilot → Copilot engine** on *SDK* (the default since 0.9.2, with a
+fallback to *Extension* on a relay that cannot run it — `getCopilotEngine()` in
+`server/server-runtime.mjs`), Copilot conversations run
 `server/copilot-worker/copilot-sdk-session-worker.mjs` as a plain Node process instead of a Copilot
 CLI session — same shape as the Claude worker, and with the same `[copilot-sdk-worker …]` log lines
 under `tmux attach`. There is **no TUI to inspect**: the worker drives the CLI's bundled SDK runtime
-headlessly, so the tmux inspector shows the worker's own log, not a Copilot session. The default
-engine (*Extension*) is unaffected.
+headlessly, so the tmux inspector shows the worker's own log, not a Copilot session. The
+*Extension* engine is unaffected.
 
 Prerequisite: `COPILOT_SDK_PATH` must point at the `copilot-sdk` directory inside an installed
 Copilot CLI bundle. The relay derives it once at boot from the extension bootstrap path, which is
@@ -203,8 +376,8 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **3065 pass / 0 skip on Linux** (2026-09-25 — the count grows with
-every change, so treat it as a floor). Windows runs the same suite with **4 skips** that are host-gated
+Expected: **0 fail** everywhere; **3216 pass / 0 fail / 0 skip on Linux (2026-09-26)** — the count
+grows with every change, so treat it as a floor. Windows runs the same suite with **4 skips** that are host-gated
 (0600 file modes, symlinks) and run on Linux; its last measured count (2467 pass) predates the 2026-09
 steering and draft-sync waves — re-measure there before quoting it.
 
@@ -234,7 +407,7 @@ node --test server/services/context-usage-view.test.mjs
 npm run test:e2e
 ```
 
-Expected on Linux: **110 passed / 0 failed / 3 skipped** (the 3 are host-gated). Two question-card
+Expected: **146 passed / 0 failed / 3 skipped on Linux (2026-09-26)** (the 3 are host-gated). Two question-card
 tests in `relay-question-ui.spec.mjs` (`:82` and `:386`) are **known flaky** and usually pass on
 Playwright's single retry; across five full runs they failed 0–2 times each with no relation to what
 else was in the suite. Treat a failure there as flake only after re-running — anything else failing
