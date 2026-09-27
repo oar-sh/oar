@@ -1277,6 +1277,8 @@ function createMessageNode(msg, msgId = null, force = false) {
   // The settle marker of a steer the CLI consumed without a turn of its own:
   // folded into (and answered by) the turn above, or cut off unanswered by a
   // Stop. Compact, attached to its own user message, never merging forward.
+  // Also the marker of a message answered on a continuation row, which only
+  // shares the look.
   const steerMarkerClass = msg.role === 'assistant' ? STEER_MARKER_CLASS_BY_KIND[messageKind] : null;
   if (steerMarkerClass) div.classList.add(steerMarkerClass);
   const isStoppedSteer = msg.role === 'assistant' && messageKind === 'stopped';

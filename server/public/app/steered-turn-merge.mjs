@@ -10,6 +10,10 @@
 // - stopped: the steer was pushed into a turn the user then stopped, so it
 //   went unanswered (kind='stopped', a marker with Resend).
 // The steered user message of a fold or stop is still classed as steered.
+// A fourth marker is not a steer's: kind='answered-elsewhere' closes a message
+// whose answer was published on a background-continuation row. It gets the
+// markers' muted look and nothing else — its message was not steered, and the
+// reply next to it is an ordinary one.
 //
 // One idempotent DOM pass, same contract as syncTranscriptSeparators: every
 // insertion path (full render, live append, prepended history page) re-runs it,
@@ -23,11 +27,16 @@ export const STEERED_MSG_CLASS = 'msg-steered';
 export const STEERED_CONTINUATION_CLASS = 'msg-steered-continuation';
 export const FOLDED_MSG_CLASS = 'msg-folded';
 export const STEER_STOPPED_MSG_CLASS = 'msg-steer-stopped';
+export const ANSWERED_ELSEWHERE_MSG_CLASS = 'msg-answered-elsewhere';
 
-/** The assistant row kinds that are settle markers of a steer, not replies. */
+/**
+ * The assistant row kinds that are settle markers, not replies. The first two
+ * are a steer's (see isSteerMarker); the last only shares their styling.
+ */
 export const STEER_MARKER_CLASS_BY_KIND = Object.freeze({
   folded: FOLDED_MSG_CLASS,
   stopped: STEER_STOPPED_MSG_CLASS,
+  'answered-elsewhere': ANSWERED_ELSEWHERE_MSG_CLASS,
 });
 
 function isSteerMarker(node) {

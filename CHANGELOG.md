@@ -22,6 +22,13 @@ All notable changes to OAR are documented here. The format follows
 - **Remote relays:** waiting for a remote agent's reply no longer stops at an
   interim answer ("still waiting for …") while the agent goes on in a turn of
   its own without a background task, for example while its subagents work.
+- A Claude reply published as a *background continuation* instead of under
+  your message no longer blocks the conversation for up to 5 minutes: after
+  about 45 seconds of silence your message closes with a small muted note
+  naming that reply, and the next message runs normally. The note sends no
+  second notification, and an agent on a paired relay receives the reply
+  itself, not the note. A stray re-init of the Claude CLI between turns no
+  longer sends the reply there in the first place.
 
 ## [0.9.4] — 2026-09-27
 

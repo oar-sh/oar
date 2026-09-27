@@ -41,6 +41,12 @@ const VARIANTS = Object.freeze({
     message: `This message was sent to ${label} just before you stopped the turn, so it was not answered.`,
     guidance: 'Resend it if you still want an answer.',
   }),
+  // Not a steer: delivered between turns and answered on a background
+  // continuation row (ANSWERED_ELSEWHERE_KIND in steer-settle-markers.mjs).
+  answeredElsewhere: (label) => ({
+    message: `${sentenceCase(label)} answered this message in a reply marked “background continuation” — check the replies next to it.`,
+    guidance: 'Resend it only if it went unanswered.',
+  }),
   // Pulled back out of the runtime's queue by the user (un-steer) — the
   // prompt never ran — but the relay could not be told in time.
   cancelled: (label) => ({

@@ -10,7 +10,11 @@ import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildSteerSettleFailure, STEER_SETTLE_FAILED_TEXT } from './claude-turn-publisher.mjs';
 import { failSettlingRowsOnShutdown } from './claude-worker-link-wiring.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
-import { STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
+import {
+  ANSWERED_ELSEWHERE_KIND,
+  DELIVERY_ANSWERED_ELSEWHERE_TEXT,
+  STEER_FOLDED_TEXT,
+} from '../../shared/steer-settle-markers.mjs';
 import {
   noopRelocate,
   waitFor,
@@ -140,7 +144,7 @@ function makeRouteDeps({ db, stmts, emitted }) {
   });
 }
 
-function bootRelayRoutes() {
+function bootRelayRoutes({ depsOverrides = {} } = {}) {
   const db = makeDb();
   seedClaudeConversation(db);
   // Same composition (and override order) as server-runtime.mjs `stmts`.
@@ -150,7 +154,7 @@ function bootRelayRoutes() {
     ...createQuestionRepository(db),
   };
   const emitted = [];
-  const deps = makeRouteDeps({ db, stmts, emitted });
+  const deps = { ...makeRouteDeps({ db, stmts, emitted }), ...depsOverrides };
   // The runner's api(method, path, body): dispatch into the captured real
   // handlers with the same bridge identity header the live worker sends;
   // makeApi surfaces non-2xx as a rejection like the worker's HTTP client does.
@@ -694,6 +698,78 @@ test('a folded steer persists kind=folded, and reloads anchored to its prompt af
   assert.equal(reloaded.find((message) => message.id === stub.id)?.sourceMessageId, msg2Id);
   const answer = reloaded.find((message) => message.role === 'assistant' && message.text === 'did both');
   assert.equal(answer?.sourceMessageId, msg1Id);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a message answered on a continuation row closes with a pointer to that reply', async (t) => {
+  // A boundary the worker misread sends the answer to a continuation row. The
+  // delivered row is settled after the window, through the real routes: done,
+  // a marker of its own kind, one completion push, nothing left processing.
+  const pushes = [];
+  const { db, stmts, deps, api, emitted } = bootRelayRoutes({
+    depsOverrides: { pushDispatchService: { notifyTurnComplete: (turn) => { pushes.push(turn.sourceMessageId); } } },
+  });
+  const cwd = fsSync.mkdtempSync(nodePathModule.join(osModule.tmpdir(), 'claude-routes-overtaken-'));
+  t.after(() => { fsSync.rmSync(cwd, { recursive: true, force: true }); });
+
+  await api('POST', '/api/message', {
+    clientId: 'client-overtaken-1', conversationId: CONV, text: 'first', model: MODEL, relayMode: 'agent',
+  });
+  const turn = scriptedTurn();
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: CONV,
+    cwd,
+    startClaudeSessionImpl: () => turn,
+    relocateTranscriptImpl: noopRelocate,
+    continuationRetryDelayMs: 10,
+    lifecyclePollMs: 10,
+    strandedSettleMs: 100,
+  });
+  const first = runner.handlePendingPayload({ message: dequeueForWorker({ db, stmts, deps }) });
+  turn.emit(initMessage('native-overtaken-1'));
+  turn.emit(userReplay('first'));
+  turn.emit(resultMessage('first answer', 'native-overtaken-1'));
+  assert.equal(await first, true);
+
+  const msg2Id = (await api('POST', '/api/message', {
+    clientId: 'client-overtaken-1', conversationId: CONV, text: 'second', model: MODEL, relayMode: 'agent',
+  })).messageId;
+  const delivered2 = dequeueForWorker({ db, stmts, deps });
+  // Owned by this worker session, as with session-worker routing on.
+  db.prepare(`UPDATE queue SET owner_sdk_session_id = ? WHERE id = ?`).run(CONV, delivered2.id);
+  const second = runner.handlePendingPayload({ message: delivered2 });
+  await waitFor(() => runner._getProcess()?.pendingDelivered?.length === 1, { label: 'message 2 is pushed' });
+  // A record of the CLI's own opens the turn; the init is the turn's start.
+  turn.emit(userReplay('<cli-record>something the CLI noted for itself</cli-record>'));
+  turn.emit(initMessage('native-overtaken-1'));
+  turn.emit(assistantText('second answer'));
+  turn.emit(resultMessage('second answer', 'native-overtaken-1'));
+  assert.equal(await second, true);
+
+  const row2 = stmts.findQById.get(msg2Id);
+  assert.equal(row2.status, 'done', 'closed as answered, not failed');
+  assert.ok(row2.consumed_at, 'and marked consumed: no recovery path may re-run it');
+  const marker = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(row2.response_message_id);
+  assert.equal(marker.text, DELIVERY_ANSWERED_ELSEWHERE_TEXT);
+  assert.equal(marker.kind, ANSWERED_ELSEWHERE_KIND, 'a marker of its own kind, not a reply and not a steer stub');
+  assert.equal(marker.source_message_id, msg2Id);
+  const live = emitted.find((entry) => entry.event === 'assistant_message' && entry.payload.sourceMessageId === msg2Id);
+  assert.equal(live.payload.message.kind, ANSWERED_ELSEWHERE_KIND, 'the live append carries the kind');
+  const reloaded = buildConversationMessages({ dbMessages: stmts.getMessages.all(CONV) });
+  assert.equal(reloaded.find((message) => message.id === marker.id)?.kind, ANSWERED_ELSEWHERE_KIND);
+
+  const continuation = db.prepare(`SELECT * FROM queue WHERE kind = 'continuation'`).get();
+  assert.equal(continuation.status, 'done');
+  assert.equal(continuation.response, 'second answer');
+  assert.equal(db.prepare(`SELECT COUNT(*) AS cnt FROM queue WHERE status = 'processing'`).get().cnt, 0);
+  assert.equal(pushes.includes(msg2Id), false, 'the marker sends no second "turn completed" push');
+  assert.equal(pushes.filter((id) => id === continuation.id).length, 1, 'the answer sent the one push');
+
+  // Stored order: the message, the answer, then the marker that names it.
+  const transcript = stmts.getMessages.all(CONV).map((message) => message.text);
+  assert.deepEqual(transcript.slice(-3), ['second', 'second answer', marker.text]);
   turn.endInput();
   await settled(runner);
 });

@@ -20,6 +20,7 @@ import {
   withRemotePromptHeader,
 } from '../../shared/remote-relay-contract.mjs';
 import { schemaFields } from '../../shared/question-schema.mjs';
+import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 
 // The one place a `remote_relay` tool call is decided and carried out (plan
 // §5.6). Every provider adapter ends up at POST /api/remote-relays/tool, whose
@@ -108,8 +109,6 @@ const EFFORT_SOURCES = Object.freeze({
 const EFFORT_LEVELS_MAX = 12;
 const EFFORT_GROUPS_MAX = 8;
 const EFFORT_GROUP_MODELS_MAX = 40;
-// Assistant rows that are markers, not replies of their own.
-const STUB_KINDS = new Set(['folded', 'stopped']);
 
 function toText(value) {
   return String(value ?? '').trim();
@@ -482,6 +481,25 @@ export function settleRemoteReply(messages, messageId) {
     const note = 'The message was steered into the turn that was already running; this is that turn\'s reply.';
     if (looksLikeFailureText(answer.text)) return { status: 'failed', reply: replyOf(answer, { folded: true }), note };
     return { status: 'done', reply: replyOf(answer, { folded: true }), note };
+  }
+  if (kind === ANSWERED_ELSEWHERE_KIND) {
+    // The marker only points at the answer, which the remote published as a
+    // background turn BEFORE it closed the message: the nearest continuation
+    // reply above the marker. The marker's own text is never the reply — it
+    // tells a human to resend, and a calling agent would run the prompt twice.
+    const answer = rows.slice(0, rows.indexOf(own)).reverse().find((row) => row?.role === 'assistant'
+      && toText(row.kind).toLowerCase() === 'continuation');
+    if (!answer) {
+      return {
+        status: 'done',
+        note: 'The remote agent answered this message in a background turn, but that reply was not found after the message; use read_session to see it. Do not send the message again.',
+      };
+    }
+    const note = 'The remote relay published the answer to this message as a background turn; this is that turn\'s reply.';
+    if (looksLikeFailureText(answer.text)) {
+      return { status: 'failed', reply: replyOf(answer, { answeredElsewhere: true }), note };
+    }
+    return { status: 'done', reply: replyOf(answer, { answeredElsewhere: true }), note };
   }
   if (looksLikeFailureText(own.text)) {
     return { status: 'failed', reply: replyOf(own), note: 'The remote turn failed; the reply is the relay\'s failure text.' };

@@ -185,6 +185,32 @@ test('reload: a steer cut off by Stop renders a marker with Resend, never mergin
   assert.equal(messagesEl.querySelectorAll('[data-action="resend-stopped-steer"]').length, 1, 'only the stopped marker offers it');
 });
 
+test('reload: a message answered on a continuation row shows a muted marker, and nothing reads as steered', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'u1', role: 'user', text: 'first', timestamp: at(0) },
+    { id: 'a1', role: 'assistant', text: 'first answer', timestamp: at(5), sourceMessageId: 'u1' },
+    { id: 'u2', role: 'user', text: 'second', timestamp: at(20) },
+    // The answer to u2, published on a continuation row; its marker follows.
+    { id: 'c1', role: 'assistant', text: 'second answer', timestamp: at(30), sourceMessageId: 'q-continuation', kind: 'continuation' },
+    { id: 'a2', role: 'assistant', text: '_(Answered in the reply marked “background continuation” next to this message.)_', timestamp: at(80), sourceMessageId: 'u2', kind: 'answered-elsewhere' },
+    { id: 'u3', role: 'user', text: 'third', timestamp: at(120) },
+    { id: 'a3', role: 'assistant', text: 'third answer', timestamp: at(130), sourceMessageId: 'u3' },
+  ], false, { conversationId: conv });
+
+  // A reload anchors the marker under its own message: the reply it names is
+  // below it, which is why its wording names the badge and not a direction.
+  assert.deepEqual(rowIds(), ['u1', 'a1', 'u2', 'a2', 'c1', 'u3', 'a3']);
+  assert.ok(row('a2').classList.contains('msg-answered-elsewhere'));
+  assert.ok(!row('a2').classList.contains('msg-folded'), 'not a steer marker');
+  assert.ok(!row('u2').classList.contains('msg-steered'), 'the message was not steered');
+  assert.ok(!row('c1').classList.contains('msg-steered-continuation'));
+  assert.match(row('c1').textContent, /background continuation/, 'the reply carries the badge the marker names');
+  assert.equal(row('a2').querySelector('[data-action="resend-stopped-steer"]'), null);
+  assert.ok(!row('u3').classList.contains('msg-steered'));
+});
+
 test('Resend re-sends the original text and attachment references once, however fast it is tapped', async () => {
   resetView();
   const conv = openConversation();

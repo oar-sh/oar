@@ -766,6 +766,65 @@ test('a folded steer settles with the reply of the turn it joined', async () => 
   assert.match(result.body.note, /steered into the turn/);
 });
 
+test('a message answered in a background turn settles with that turn’s reply, never with the marker', async () => {
+  // The remote published the answer on a continuation row and closed the
+  // message afterwards with a marker that points at it. The marker tells a
+  // human to resend: handed over as the reply, it would make the calling
+  // agent run the prompt a second time.
+  const { run, remote } = setup();
+  withSession(remote);
+  remote.onRead = (conv, query, count) => {
+    if (count === 1) remote.reply('conv-1', { kind: 'continuation', text: 'The export now covers CSV and PDF.' });
+    if (count === 2) {
+      remote.reply('conv-1', {
+        sourceMessageId: query.afterMessageId,
+        kind: 'answered-elsewhere',
+        text: '_(Answered in the reply marked “background continuation” next to this message. Resend the message if that reply does not answer it.)_',
+      });
+      conv.activeTurn = false;
+    }
+  };
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT });
+  assert.equal(result.body.status, 'done');
+  assert.equal(result.body.reply.text, 'The export now covers CSV and PDF.');
+  assert.equal(result.body.reply.answeredElsewhere, true);
+  assert.match(result.body.note, /published the answer to this message as a background turn/);
+  assert.equal(JSON.stringify(result.body).includes('Resend'), false, 'the pointer text reaches no caller');
+});
+
+test('settleRemoteReply resolves an answered-elsewhere marker to the continuation reply before it', () => {
+  const marker = { id: 'r-marker', role: 'assistant', sourceMessageId: 'm-1', kind: 'answered-elsewhere', text: '_(Answered in the reply marked…)_' };
+  const settled = settleRemoteReply([
+    { id: 'r-older', role: 'assistant', kind: 'continuation', text: 'An earlier background report.' },
+    { id: 'r-plain', role: 'assistant', sourceMessageId: 'm-0', text: 'Someone else\'s answer.' },
+    { id: 'r-answer', role: 'assistant', kind: 'continuation', text: 'The answer.' },
+    { id: 'r-stub', role: 'assistant', sourceMessageId: 'm-0b', kind: 'folded', text: 'stub' },
+    marker,
+    { id: 'r-later', role: 'assistant', kind: 'continuation', text: 'A later background report.' },
+  ], 'm-1');
+  assert.equal(settled.status, 'done');
+  assert.equal(settled.reply.messageId, 'r-answer', 'the nearest continuation reply before the marker');
+  assert.equal(settled.reply.text, 'The answer.');
+
+  // Nothing to point at: done, without a reply, and no hint to send again.
+  const bare = settleRemoteReply([
+    { id: 'r-plain', role: 'assistant', sourceMessageId: 'm-0', text: 'Someone else\'s answer.' },
+    marker,
+    { id: 'r-later', role: 'assistant', kind: 'continuation', text: 'A later background report.' },
+  ], 'm-1');
+  assert.equal(bare.status, 'done');
+  assert.equal(bare.reply, undefined);
+  assert.match(bare.note, /read_session/);
+  assert.match(bare.note, /Do not send the message again/);
+
+  const failed = settleRemoteReply([
+    { id: 'r-answer', role: 'assistant', kind: 'continuation', text: 'The Grok CLI is not installed. Error code: relay.grok-cli-missing. Install it on the relay host.' },
+    marker,
+  ], 'm-1');
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.reply.messageId, 'r-answer');
+});
+
 test('an interim reply with background work waits for the follow-up and returns it', async () => {
   const { run, remote } = setup();
   withSession(remote);

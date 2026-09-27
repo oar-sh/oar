@@ -37,7 +37,7 @@ import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mj
 import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning-effort.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
-import { STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
+import { ANSWERED_ELSEWHERE_KIND, STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { isLiveResend } from '../services/steer-resend.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
@@ -6488,7 +6488,11 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
-  const SETTLED_STEER_KINDS = new Set(['folded', 'stopped']);
+  // Responses that are settle markers, not replies: stamped with their kind,
+  // and no "turn completed" push. The last one is not a steer's: it closes a
+  // message whose answer was published on a continuation row, and that reply
+  // already sent the push.
+  const SETTLED_STEER_KINDS = new Set(['folded', 'stopped', ANSWERED_ELSEWHERE_KIND]);
 
   // POST /api/response — CLI submits response
   app.post('/api/response', auth, async (req, res) => {
@@ -7013,7 +7017,8 @@ export function registerMessagesRoutes(app, deps) {
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
     // An absorbed row is not a finished turn — the reply continues on the
     // steered message's row, whose own completion sends the one notification.
-    // A stopped steer has no reply at all.
+    // A stopped steer has no reply at all, and a message answered on a
+    // continuation row was notified by that row.
     if (!settledKind) {
       void pushDispatchService?.notifyTurnComplete?.({
         conversationId: targetConversationId,

@@ -8,6 +8,7 @@ import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildClaudePlanReadyBoardPayload } from './claude-turn-publisher.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { SLASH_COMMAND_GUARD } from '../../shared/slash-command-guard.mjs';
+import { ANSWERED_ELSEWHERE_KIND, DELIVERY_ANSWERED_ELSEWHERE_TEXT } from '../../shared/steer-settle-markers.mjs';
 import {
   noopRelocate,
   tick,
@@ -6062,6 +6063,542 @@ test('one re-init per settings request is expected, not only the first', async (
   const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
   assert.equal(response.body.text, 'user answer');
   assert.equal(stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+// ---------------------------------------------------------------------------
+// False self-opened boundaries in general. The fixes above each closed one
+// trigger; these cover whatever trigger comes next. Preventative: a boundary
+// an init armed is dropped once a later init starts another turn for a
+// waiting message, unless a task corroborates it. Curative: a message whose
+// answer a continuation published is settled once nothing else can be coming
+// for it.
+//
+// The scripts follow the CLI's real order: every turn opens with an init,
+// after the CLI has taken the turn's input, and a delivered message's own
+// turn has no user replay.
+
+const responsesFor = (stub, id) => stub.calls
+  .filter((call) => call.routePath === '/api/response' && call.body.messageId === id)
+  .map((call) => call.body);
+
+/** q-1 runs `firstTurn` and is answered; the process is idle afterwards. */
+async function idleAfterFirstTurn({ firstTurn = () => {}, ...overrides } = {}) {
+  const stub = overrides.stub || makeApiStub();
+  const turn = scriptedTurn();
+  const lines = [];
+  const runner = makeRunner({
+    startImpl: () => turn,
+    dbg: (...args) => lines.push(args.join(' ')),
+    ...overrides,
+    stub,
+  });
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  await firstTurn(turn);
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+  return { stub, turn, runner, lines };
+}
+
+const continuationOpenings = (lines) => lines
+  .filter((line) => /continuation opens while a delivered message waits unattached/.test(line));
+
+/** A bare init with nothing queued arms the boundary; then q-2 is delivered. */
+async function deliverBehindBareInit({ stub, turn, runner }) {
+  turn.emit(initMessage('native-1'));
+  await waitFor(() => runner._getProcess().lastBoundary === 'self-opened', { label: 'the init armed the boundary' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second question' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/continuation-turn'), false);
+  // Wrapped: an async function returning the promise itself would await it.
+  return { second };
+}
+
+/**
+ * The turn the armed init opened answers on a continuation row, for `reason`;
+ * q-2 then gets its own turn (init, then traffic) and its own answer.
+ */
+async function expectContinuationThenOwnTurn({ stub, turn, runner, lines }, second, reason) {
+  turn.emit(assistantText('the task report'));
+  turn.emit(resultMessage('the task report', 'native-1'));
+  await waitFor(() => responsesFor(stub, 'cont-1').length, { label: 'continuation response' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'the task report');
+  assert.deepEqual(responsesFor(stub, 'q-2'), [], 'the waiting message did not take the task report');
+  assert.equal(continuationOpenings(lines).length, 1, 'logged once');
+  assert.ok(
+    continuationOpenings(lines)[0].endsWith(`q-2 boundary=a bare init with nothing queued reason=${reason}`),
+    continuationOpenings(lines)[0],
+  );
+
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('second answer'));
+  turn.emit(resultMessage('second answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), ['second answer']);
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length, 1);
+  assert.equal(runner.isDeliveryHeld(), false);
+  turn.endInput();
+  await settled(runner);
+}
+
+test('a stray init between turns does not strand the message delivered after it', async () => {
+  // An init nothing asked for (no settings change, no task): the boundary it
+  // arms stays armed until a turn opens. The message's own turn then opens
+  // with its init, and its answer used to land on a continuation row while
+  // its own row never attached.
+  const session = await idleAfterFirstTurn();
+  const { stub, turn, runner, lines } = session;
+  const { second } = await deliverBehindBareInit(session);
+
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('second answer'));
+  turn.emit(resultMessage('second answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), ['second answer']);
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/continuation-turn'), false);
+  assert.equal(runner.isDeliveryHeld(), false, 'the next message is not held behind a stranded row');
+  const dropped = lines.filter((line) => /self-opened boundary has no corroboration/.test(line));
+  assert.equal(dropped.length, 1, 'logged once');
+  assert.match(dropped[0], /q-2 boundary=a bare init with nothing queued/);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stray init does not strand a delivered turn that ends on its result alone', async () => {
+  const session = await idleAfterFirstTurn();
+  const { stub, turn, runner } = session;
+  const { second } = await deliverBehindBareInit(session);
+
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('second answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), ['second answer']);
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/continuation-turn'), false);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a turn the CLI opened before the message was pushed keeps its row, with no task to vouch for it', async () => {
+  // The init came before the push, so the turn it opened is not the
+  // message's own, and its traffic follows with no init in between. Dropping
+  // the boundary here put the CLI's report on the message's row and the
+  // message's real answer on a continuation row.
+  const session = await idleAfterFirstTurn();
+  const proc = session.runner._getProcess();
+  assert.equal(proc.liveTasks.size, 0);
+  assert.equal(proc.taskSettleSeq, 0, 'no task ever settled');
+  const { second } = await deliverBehindBareInit(session);
+  await expectContinuationThenOwnTurn(
+    session,
+    second,
+    'its init came before the message was pushed and no turn has started since',
+  );
+});
+
+test('a bare-init continuation of a task that settled between turns keeps its row with a message behind it', async () => {
+  const session = await idleAfterFirstTurn({
+    firstTurn: (turn) => turn.emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'e2e suite' }])),
+  });
+  session.turn.emit(backgroundTasksMessage([]));
+  session.turn.emit(taskNotificationMessage('bash-1'));
+  const { second } = await deliverBehindBareInit(session);
+  await expectContinuationThenOwnTurn(session, second, 'a background task settled and no continuation has opened since');
+});
+
+test('a task that settled early in a long turn still vouches for its continuation after that turn', async () => {
+  // The ordinary case: the task settles, the turn runs on past the
+  // notification grace, and the continuation opens by bare init once it ends.
+  // Neither the settle clock nor "settled since the turn ended" is left by
+  // then; what remains is that no continuation has opened for the settle.
+  const session = await idleAfterFirstTurn({
+    notificationGraceMs: 30,
+    firstTurn: async (turn) => {
+      turn.emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'e2e suite' }]));
+      turn.emit(assistantText('waiting for the suite'));
+      turn.emit(backgroundTasksMessage([]));
+      turn.emit(taskNotificationMessage('bash-1'));
+      await tick(100);
+      turn.emit(assistantText('still working on the rest'));
+    },
+  });
+  const proc = session.runner._getProcess();
+  assert.equal(proc.taskSettleSeq, proc.settleSeqAtTurnEnd, 'nothing settled since the turn ended');
+  assert.ok(proc.taskSettledAt && Date.now() - proc.taskSettledAt > 30, 'and the grace has run out');
+  const { second } = await deliverBehindBareInit(session);
+  await expectContinuationThenOwnTurn(session, second, 'a background task settled and no continuation has opened since');
+  assert.equal(proc.settleSeqAtContinuationOpen, proc.taskSettleSeq, 'spent by the continuation that opened');
+});
+
+test('a bare-init turn opened for a live task keeps its row with a message behind it', async () => {
+  // A live task reports back without settling (a monitor's events).
+  const session = await idleAfterFirstTurn({
+    firstTurn: (turn) => turn.emit(backgroundTasksMessage([{ task_id: 'monitor-1', task_type: 'monitor', description: 'log watch' }])),
+  });
+  const { second } = await deliverBehindBareInit(session);
+  await expectContinuationThenOwnTurn(session, second, 'a live background task can report back');
+});
+
+test('a boundary left armed by a message the watchdog failed does not mislead the next self-opened turn', async () => {
+  // A stray init arms the boundary; q-2 is pushed and its own init starts a
+  // turn that never produces anything, so the watchdog fails q-2. No context
+  // opened, so the boundary is still armed, and still marked as superseded by
+  // q-2's init. The next turn the CLI opens by itself re-arms it; that turn
+  // is superseded by nothing, and its report must not land on q-3's row.
+  const session = await idleAfterFirstTurn({ pendingDeliveredTimeoutMs: 150, lifecyclePollMs: 10 });
+  const { stub, turn, runner, lines } = session;
+  const { second } = await deliverBehindBareInit(session);
+  turn.emit(initMessage('native-1'));
+  assert.equal(await boundedSettle(second, 'the watchdog'), true);
+  assert.ok(responsesFor(stub, 'q-2')[0].terminalError, 'q-2 was failed over');
+  assert.equal(runner._getProcess().lastBoundary, 'self-opened', 'no turn opened: the boundary is still armed');
+  assert.equal(runner.isDeliveryHeld(), false);
+
+  // The CLI wakes up by itself, q-3 is pushed before that turn's first
+  // traffic, and q-3's own turn follows it.
+  turn.emit(initMessage('native-1'));
+  await tick(20);
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'third question' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  turn.emit(assistantText('the wake-up report'));
+  turn.emit(resultMessage('the wake-up report', 'native-1'));
+  await waitFor(() => responsesFor(stub, 'cont-1').length, { label: 'continuation response' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'the wake-up report');
+  assert.deepEqual(responsesFor(stub, 'q-3'), [], 'the waiting message did not take the report');
+  assert.ok(
+    continuationOpenings(lines).at(-1).endsWith(
+      'q-3 boundary=a bare init with nothing queued reason=its init came before the message was pushed and no turn has started since',
+    ),
+    continuationOpenings(lines).at(-1),
+  );
+
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('third answer'));
+  turn.emit(resultMessage('third answer', 'native-1'));
+  assert.equal(await boundedSettle(third, 'the delivered turn'), true);
+  assert.deepEqual(responsesFor(stub, 'q-3').map((body) => body.text), ['third answer']);
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length, 1);
+  turn.endInput();
+  await settled(runner);
+});
+
+/**
+ * q-1 is answered and q-2 delivered between turns. Then a record of the CLI's
+ * own that the worker does not know replays, and the turn that follows (its
+ * init, then the answer to q-2) publishes on a continuation row. Returns with
+ * that row settled and q-2 still unattached.
+ */
+async function answeredOnContinuationRow({ secondId = 'q-2', ...overrides } = {}) {
+  const session = await idleAfterFirstTurn({ strandedSettleMs: 150, lifecyclePollMs: 10, ...overrides });
+  const { stub, turn, runner } = session;
+  const second = runner.handlePendingPayload({
+    message: { ...baseMessage, id: secondId, text: 'second question', attemptId: 'attempt-2' },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(userReplay('<cli-record>something the CLI noted for itself</cli-record>'));
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('second answer'));
+  turn.emit(resultMessage('second answer', 'native-1'));
+  await waitFor(
+    () => responsesFor(stub, 'cont-1').length && !runner._getProcess().activeCtx,
+    { label: 'the answer published on a continuation row' },
+  );
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, 'second answer');
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'the delivered row is unattached');
+  assert.equal(runner.isDeliveryHeld(), true, 'and holds later messages out');
+  return { ...session, second };
+}
+
+test('a message answered on a continuation row settles after the window and frees the queue', async () => {
+  const readiness = [];
+  const { stub, turn, runner, second, lines } = await answeredOnContinuationRow({
+    secondId: 'msg-0123456789',
+    onDeliveryReadinessChange: (ready) => readiness.push(ready),
+  });
+
+  assert.equal(await boundedSettle(second, 'the stranded row'), true);
+  const [marker, ...rest] = responsesFor(stub, 'msg-0123456789');
+  assert.deepEqual(rest, [], 'one response for the row');
+  assert.equal(marker.text, DELIVERY_ANSWERED_ELSEWHERE_TEXT);
+  assert.equal(marker.attemptId, 'attempt-2');
+  assert.equal(marker.kind, ANSWERED_ELSEWHERE_KIND, 'a marker of its own kind: no reply, no steer stub');
+  assert.equal(marker.absorbed, undefined);
+  assert.equal(marker.terminalError, undefined, 'answered, not failed');
+  assert.equal(
+    stub.calls.some((call) => call.routePath === '/api/requeue' && call.body.messageId === 'msg-0123456789'),
+    false,
+    'never handed back: the prompt would run twice',
+  );
+  const consumed = stub.calls.find((call) => call.routePath === '/api/queue-consumed');
+  assert.deepEqual(consumed.body.entries, [{ id: 'msg-0123456789', attemptId: 'attempt-2' }]);
+  const order = stub.calls.filter((call) => call.routePath === '/api/response').map((call) => call.body.messageId);
+  assert.ok(order.indexOf('cont-1') < order.indexOf('msg-0123456789'), 'the marker follows the answer it points at');
+
+  assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  assert.equal(runner.isDeliveryHeld(), false);
+  assert.equal(readiness.at(-1), true, 'readiness is re-armed for the next message');
+  await waitFor(() => runner.getActiveQueueMessageIds().length === 0, { label: 'the row is released' });
+
+  // Diagnostics: one line when the continuation opened over the message, with
+  // the id prefix, the boundary and the reason; one when it was settled.
+  const opened = lines.filter((line) => /continuation opens while a delivered message waits unattached/.test(line));
+  assert.equal(opened.length, 1);
+  assert.match(opened[0], /msg-0123 boundary=an unmatched user replay \(origin none\) reason=an unmatched user replay/);
+  assert.equal(opened[0].includes('msg-0123456789'), false, 'the id is logged as a prefix');
+  assert.equal(lines.filter((line) => /answered on a continuation row; settling it msg-0123 continuation=cont-1/.test(line)).length, 1);
+
+  // The next message runs as an ordinary turn.
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'third question' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('third answer'));
+  turn.emit(resultMessage('third answer', 'native-1'));
+  assert.equal(await boundedSettle(third, 'the next turn'), true);
+  assert.deepEqual(responsesFor(stub, 'q-3').map((body) => body.text), ['third answer']);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stranded row is not settled before the window has passed', async () => {
+  const { stub, turn, runner, second } = await answeredOnContinuationRow({ strandedSettleMs: 60_000 });
+  await tick(150);
+  assert.deepEqual(responsesFor(stub, 'q-2'), []);
+  assert.equal(runner.isDeliveryHeld(), true);
+
+  // A continuation that ran ahead of the message: its own turn follows.
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('the real second answer'));
+  turn.emit(resultMessage('the real second answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), ['the real second answer']);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stranded row is held back during a compaction', async () => {
+  const { stub, turn, runner, second } = await answeredOnContinuationRow();
+  turn.emit(compactingStatusMessage());
+  await tick(400);
+  assert.deepEqual(responsesFor(stub, 'q-2'), [], 'a compacting CLI is working, not done');
+  assert.equal(runner._getProcess().pendingDelivered.length, 1);
+
+  // The compaction ends without a turn: the wait starts over, then settles.
+  turn.emit({ type: 'system', subtype: 'status', status: null, compact_result: 'failed' });
+  assert.equal(await boundedSettle(second, 'the stranded row'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), [DELIVERY_ANSWERED_ELSEWHERE_TEXT]);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stranded row is held back during an API retry', async () => {
+  // The gate alone is under test, so the retry is scripted without the init
+  // that precedes a turn's request (which takes the row out by itself, see
+  // the next test but one).
+  const { stub, turn, runner, second } = await answeredOnContinuationRow();
+  turn.emit({
+    type: 'system',
+    subtype: 'api_retry',
+    attempt: 1,
+    max_retries: 10,
+    retry_delay_ms: 611,
+    error_status: 529,
+    session_id: 'native-1',
+  });
+  await tick(400);
+  assert.deepEqual(responsesFor(stub, 'q-2'), [], 'the CLI is mid-request for a turn');
+  assert.equal(runner._getProcess().pendingDelivered.length, 1);
+
+  // The request gets through: the turn is the message's own.
+  turn.emit(assistantText('the real second answer'));
+  turn.emit(resultMessage('the real second answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), ['the real second answer']);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stranded row is held back while a control request is open', async () => {
+  const { stub, turn, runner, second } = await answeredOnContinuationRow();
+  // A question card or permission prompt (see the steering tests above).
+  runner._getProcess().pendingControlRequests += 1;
+  await tick(400);
+  assert.deepEqual(responsesFor(stub, 'q-2'), [], 'a card is never settled away');
+  assert.equal(runner._getProcess().pendingDelivered.length, 1);
+
+  runner._getProcess().pendingControlRequests -= 1;
+  assert.equal(await boundedSettle(second, 'the stranded row'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), [DELIVERY_ANSWERED_ELSEWHERE_TEXT]);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stranded row is held back while the stream still produces events', async () => {
+  const { stub, turn, runner, second } = await answeredOnContinuationRow();
+  for (let round = 0; round < 10; round += 1) {
+    turn.emit({ type: 'system', subtype: 'status', status: null, permissionMode: 'default' });
+    await tick(40);
+  }
+  assert.deepEqual(responsesFor(stub, 'q-2'), [], 'a CLI that still talks is not done');
+
+  assert.equal(await boundedSettle(second, 'the stranded row'), true);
+  assert.equal(runner.isDeliveryHeld(), false);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a turn starting after the continuation takes the row out of the settle', async () => {
+  // The init of the next turn: its first traffic may take longer than the
+  // window, and the turn may be the message's own.
+  const { stub, turn, runner, second } = await answeredOnContinuationRow();
+  turn.emit(initMessage('native-1'));
+  await tick(400);
+  assert.deepEqual(responsesFor(stub, 'q-2'), []);
+  assert.equal(runner._getProcess().pendingDelivered.length, 1);
+
+  turn.emit(assistantText('the real second answer'));
+  turn.emit(resultMessage('the real second answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), ['the real second answer']);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the init of the message’s own turn takes it out of the settle while the continuation still registers', async () => {
+  // The continuation's result arrived while its row was still registering,
+  // so it is still the active context when the next turn's init lands. That
+  // init was skipped, the row got the pointer after the window, and the real
+  // answer was dropped as between-turn chatter.
+  let releaseRegistration = null;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': () => new Promise((resolve) => {
+        releaseRegistration = () => resolve({ messageId: 'cont-1', attemptId: 'attempt-cont-1' });
+      }),
+    },
+  });
+  const { turn, runner } = await idleAfterFirstTurn({ stub, strandedSettleMs: 100, lifecyclePollMs: 10 });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second question' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+
+  // A turn of the CLI's own, ahead of the message.
+  turn.emit(taskNotificationReplay());
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('the task report'));
+  turn.emit(resultMessage('the task report', 'native-1'));
+  await waitFor(
+    () => releaseRegistration && runner._getProcess().activeCtx?.resultBuffered,
+    { label: 'the continuation finished, still registering' },
+  );
+  // The message's own turn starts.
+  turn.emit(initMessage('native-1'));
+  await waitFor(
+    () => runner._getProcess().pendingDelivered[0].overtakenBy === null,
+    { label: 'the init took the row out of the settle' },
+  );
+  assert.ok(runner._getProcess().activeCtx, 'with the continuation still the active context');
+  releaseRegistration();
+  await waitFor(
+    () => responsesFor(stub, 'cont-1').length && !runner._getProcess().activeCtx,
+    { label: 'the continuation published' },
+  );
+
+  // Its first traffic takes longer than the window.
+  await tick(400);
+  assert.deepEqual(responsesFor(stub, 'q-2'), [], 'no pointer in place of the answer');
+  turn.emit(assistantText('second answer'));
+  turn.emit(resultMessage('second answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+  assert.deepEqual(responsesFor(stub, 'cont-1').map((body) => body.text), ['the task report']);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), ['second answer']);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the quiet period of a stranded row never starts before the row was pushed', async () => {
+  // Counted from the latest of the continuation's end, the push and the last
+  // stream event. In a real run the push precedes the continuation's end; it
+  // is moved here to show that the latest of the three is what counts.
+  const { stub, turn, runner, second } = await answeredOnContinuationRow({ strandedSettleMs: 150 });
+  const [entry] = runner._getProcess().pendingDelivered;
+  entry.pushedAt = Date.now() + 250;
+  await tick(300);
+  assert.deepEqual(responsesFor(stub, 'q-2'), [], 'not counted from the continuation’s end alone');
+  assert.equal(await boundedSettle(second, 'the stranded row'), true);
+  assert.deepEqual(responsesFor(stub, 'q-2').map((body) => body.text), [DELIVERY_ANSWERED_ELSEWHERE_TEXT]);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a continuation that never reached the relay settles nothing', async () => {
+  // Its registration failed, so there is no reply for a marker to point at:
+  // the row stays the watchdog's, which fails it with the resend wording.
+  const session = await idleAfterFirstTurn({
+    stub: makeApiStub({ failRoutes: new Set(['/api/continuation-turn']) }),
+    strandedSettleMs: 40,
+    pendingDeliveredTimeoutMs: 400,
+    lifecyclePollMs: 10,
+  });
+  const { stub, turn, runner } = session;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second question' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(userReplay('<cli-record>something the CLI noted for itself</cli-record>'));
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('second answer'));
+  await waitFor(() => runner._getProcess().activeCtx?.discarded, { label: 'the registration gave up' });
+  turn.emit(resultMessage('second answer', 'native-1'));
+
+  assert.equal(await boundedSettle(second, 'the watchdog'), true);
+  const [failed, ...rest] = responsesFor(stub, 'q-2');
+  assert.deepEqual(rest, []);
+  assert.ok(failed.terminalError, 'failed over, not marked answered');
+  assert.match(failed.text, /watchdog/);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a stranded row whose marker cannot be saved at first is retried, never handed back', async () => {
+  let refused = 0;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': (body) => {
+        if (body.messageId === 'q-2' && refused < 1) {
+          refused += 1;
+          throw new Error('stubbed relay outage');
+        }
+        return { ok: true };
+      },
+    },
+  });
+  const { turn, runner, second } = await answeredOnContinuationRow({ stub, settleRetryDelaysMs: [60] });
+
+  await waitFor(() => refused === 1, { label: 'the first attempt was refused' });
+  const owned = runner.getActiveQueueMessageIds();
+  assert.deepEqual(owned.map((entry) => entry.id), ['q-2'], 'still owned while the marker is retried');
+  // What a shutdown in this moment fails the row with: where the answer is,
+  // not the steer wording.
+  assert.equal(
+    owned[0].terminalError.message,
+    'Claude answered this message in a reply marked “background continuation” — check the replies next to it.',
+  );
+  assert.equal(owned[0].terminalError.guidance, 'Resend it only if it went unanswered.');
+  assert.equal(await boundedSettle(second, 'the stranded row'), true);
+  await waitFor(() => responsesFor(stub, 'q-2').length === 2, { label: 'the retry' });
+  assert.ok(responsesFor(stub, 'q-2').every((body) => body.text === DELIVERY_ANSWERED_ELSEWHERE_TEXT && !body.terminalError));
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/requeue'), false);
+  await waitFor(() => runner.getActiveQueueMessageIds().length === 0, { label: 'released once saved' });
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the settle window can be switched off', async () => {
+  const { stub, turn, runner, second } = await answeredOnContinuationRow({
+    strandedSettleMs: 0,
+    pendingDeliveredTimeoutMs: 300,
+  });
+  assert.equal(await boundedSettle(second, 'the watchdog'), true);
+  assert.ok(responsesFor(stub, 'q-2')[0].terminalError, 'the watchdog alone decides');
   turn.endInput();
   await settled(runner);
 });

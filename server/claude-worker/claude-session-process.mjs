@@ -37,7 +37,12 @@ import {
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
-import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
+import {
+  ANSWERED_ELSEWHERE_KIND,
+  DELIVERY_ANSWERED_ELSEWHERE_TEXT,
+  STEER_FOLDED_TEXT,
+  STEER_STOPPED_TEXT,
+} from '../../shared/steer-settle-markers.mjs';
 import { stripSteerNote, withSteerNoteContent } from '../../shared/steer-note.mjs';
 import {
   stripSlashCommandGuard,
@@ -464,6 +469,17 @@ export function createClaudeSessionRunner({
   // takes to distinguish a fold from a queued run. Far below the watchdog so a
   // folded row settles as answered, not failed with a "resend" error.
   steeredFoldGraceMs = 2_000,
+  // How long a NON-steered entry may sit unattached after a continuation that
+  // opened over it has published its answer, with the stream quiet and no
+  // turn starting, before it is settled as answered by that continuation. The
+  // CLI starts the turn of a message queued behind another one when that
+  // turn ends, and every turn opens with an init, which takes the entry out
+  // of this settle for good. So the window only has to outlast the gap up to
+  // that init (input processing, hooks); it is sized well above it because a
+  // settle that comes too early costs the user the real answer's place.
+  // Without the settle the row held every later message out of the worker
+  // until the watchdog failed it minutes later. 0 = disabled.
+  strandedSettleMs = 45_000,
   // Backstop for the compaction hold. A compaction is announced ONCE by
   // `status: 'compacting'` (the CLI's periodic re-emit is gated on the
   // remote-control client's activity callback, which the plain SDK `query()`
@@ -793,6 +809,8 @@ export function createClaudeSessionRunner({
   function attachDeliveredContext(index = 0, { provisional = false } = {}) {
     const [entry] = proc.pendingDelivered.splice(index, 1);
     entry.ctx.deliveredEntry = entry;
+    // It has a turn now; an adoption that is unwound puts it back unmarked.
+    entry.overtakenBy = null;
     // A provisional (post-compaction) attach may still be unwound back onto
     // the queue; its un-mark waits for the adoption to commit.
     if (!provisional) unmarkConsumedOnOwnTurn(entry);
@@ -869,7 +887,89 @@ export function createClaudeSessionRunner({
   function handBackAdoptedContext(ctx) {
     restoreAdoptedContext(ctx);
     dbg('post-compaction adoption handed back to a task continuation', ctx.message?.id || '(no id)');
-    return openContinuationContext();
+    return openContinuationContext({ evidence: 'a task notification replayed into the adopted turn' });
+  }
+
+  /**
+   * Mark the next turn as one the CLI opened by itself. `corroborated` says
+   * whether the signal proves that on its own (a turn opener's replay, the
+   * Stop guard standing down) or only suggests it (a bare init, which the CLI
+   * also emits for reasons of its own). Sticky until the boundary is spent: a
+   * weaker signal behind a proven one does not take the proof back.
+   *
+   * Every marking starts with nothing superseding it, a re-marking of an
+   * armed boundary included. A bare init marks only with nothing queued, so
+   * it precedes any later push; and a boundary can stay armed with the flag
+   * set, when the message whose init set it was failed by the watchdog
+   * without a turn ever opening. Left standing, that flag made the next turn
+   * the CLI opened by itself look superseded by an init it never saw.
+   */
+  function markSelfOpenedBoundary(reason, { corroborated = false } = {}) {
+    if (proc.lastBoundary === 'self-opened' && proc.boundaryCorroborated) return;
+    proc.lastBoundary = 'self-opened';
+    proc.boundarySuperseded = false;
+    proc.boundaryCorroborated = corroborated;
+    proc.boundaryReason = reason;
+  }
+
+  /**
+   * What says the CLI really opened the turn the boundary announces, or ''
+   * when nothing does. Beyond the signal itself:
+   *  - a task settled and no continuation has opened since. Counted, not
+   *    timed, and not reset by a turn ending: a task that settles early in a
+   *    long turn has its continuation open after that turn, by which time
+   *    both the notification grace and `settleSeqAtTurnEnd` have moved on.
+   *    Over-long by design: a settle whose notification was silent or folded
+   *    into another turn stays evidence until the next continuation opens,
+   *    which only keeps a boundary the way it was always kept;
+   *  - a live task, which can report back without settling;
+   *  - order: the init that armed the boundary came before the waiting
+   *    message was pushed (an init arms it only with nothing queued), so that
+   *    turn is not the message's own, and no later init has started another
+   *    turn in its place (see `boundarySuperseded`).
+   */
+  function selfOpenedEvidence() {
+    if (proc.boundaryCorroborated) return proc.boundaryReason;
+    if (proc.taskSettleSeq !== proc.settleSeqAtContinuationOpen) {
+      return 'a background task settled and no continuation has opened since';
+    }
+    if (proc.liveTasks.size > 0) return 'a live background task can report back';
+    if (!proc.boundarySuperseded) return 'its init came before the message was pushed and no turn has started since';
+    return '';
+  }
+
+  /**
+   * A self-opened boundary diverts the next turn's answer to a continuation
+   * row. One armed by a bare init stays armed until a turn opens, however
+   * long that takes, and the CLI inits for reasons of its own: read as
+   * self-opened, a settings re-init published the user's answer on a
+   * continuation and left the delivered row unattached, holding every later
+   * message out until the watchdog failed it (see the init handler).
+   *
+   * Every turn opens with an init, so what tells a stale boundary from a live
+   * one is what follows the push. Traffic with no init in between belongs to
+   * the turn the armed init opened: a continuation, as before. A SECOND init,
+   * after the push, starts a newer turn; the armed one never produced
+   * anything, and unless a task corroborates it the boundary is dropped here
+   * and the turn attaches to the waiting message, as if it had never been
+   * marked. Steered entries do not count: they settle by the fold reaper. A
+   * boundary marked by a replay is never dropped; if that one is false, the
+   * settle in reapOvertakenDeliveredEntries recovers.
+   */
+  function disownUnprovenBoundary() {
+    if (proc.lastBoundary !== 'self-opened') return;
+    const waiting = proc.pendingDelivered.find((entry) => !entry.steered);
+    if (!waiting || selfOpenedEvidence()) return;
+    dbg(
+      'self-opened boundary has no corroboration; the turn goes to the waiting message',
+      shortMessageId(waiting.ctx.message),
+      `boundary=${proc.boundaryReason}`,
+    );
+    proc.lastBoundary = null;
+  }
+
+  function shortMessageId(message) {
+    return String(message?.id || '').slice(0, 8) || '(no id)';
   }
 
   /**
@@ -879,7 +979,7 @@ export function createClaudeSessionRunner({
    * discards the turn's relay output (it still lands in the native
    * transcript) rather than failing the process.
    */
-  function openContinuationContext() {
+  function openContinuationContext({ evidence = '' } = {}) {
     const ctx = createContext('continuation', {
       id: null,
       conversationId: sdkSessionId,
@@ -887,6 +987,26 @@ export function createClaudeSessionRunner({
       model: '',
     });
     ctx.registered = false;
+    // Delivered messages this turn opens over. Remembered on the entry: if
+    // this turn turns out to have taken their prompt, nothing will ever open
+    // for them (see reapOvertakenDeliveredEntries). Read before the
+    // activation below spends the boundary.
+    const overtaken = proc.pendingDelivered.filter((entry) => !entry.steered);
+    if (overtaken.length) {
+      const selfOpened = proc.lastBoundary === 'self-opened';
+      dbg(
+        'continuation opens while a delivered message waits unattached',
+        overtaken.map((entry) => shortMessageId(entry.ctx.message)).join(','),
+        `boundary=${selfOpened ? proc.boundaryReason : 'none'}`,
+        `reason=${evidence || (selfOpened && selfOpenedEvidence()) || 'none'}`,
+      );
+      for (const entry of overtaken) {
+        entry.overtakenBy = ctx;
+        entry.overtakenSince = 0;
+      }
+    }
+    // Whatever settled up to here has its continuation now.
+    proc.settleSeqAtContinuationOpen = proc.taskSettleSeq;
     activateContext(ctx);
     (async () => {
       // One idempotency key for the whole loop: a retry whose predecessor was
@@ -1149,11 +1269,21 @@ export function createClaudeSessionRunner({
       // A turn the CLI opened on its own (task-notification replay). The
       // context opens lazily on its first real traffic so a bookkeeping
       // replay that ends in a phantom result never creates a relay turn.
-      proc.lastBoundary = 'self-opened';
+      // A turn opener that matched no delivered message proves the turn is
+      // the CLI's own, tagged or not: the adoption rules above rest on that.
+      const originKind = String(sdkMessage?.origin?.kind || '').trim();
+      markSelfOpenedBoundary(
+        isTaskNotificationReplay(sdkMessage)
+          ? 'a task notification replay'
+          : `an unmatched user replay (origin ${originKind || 'none'})`,
+        { corroborated: true },
+      );
+      turnStartedForWaitingDeliveries();
       return null;
     }
 
     if (type === 'assistant' || type === 'stream_event' || type === 'user') {
+      disownUnprovenBoundary();
       if (proc.lastBoundary !== 'self-opened') {
         // A background subagent's frames arrive at top level carrying
         // `parent_tool_use_id` (same marker the adoption commit checks): they
@@ -1177,6 +1307,7 @@ export function createClaudeSessionRunner({
         proc.lastBoundary = null;
         return null;
       }
+      disownUnprovenBoundary();
       if (proc.lastBoundary !== 'self-opened' && proc.pendingDelivered.length && !sdkMessage?.parent_tool_use_id) {
         return attachDeliveredContext();
       }
@@ -1971,11 +2102,21 @@ export function createClaudeSessionRunner({
     if (type !== 'system') return;
     const subtype = String(sdkMessage.subtype || '');
     if (subtype === 'init') {
-      // The FIRST init of a process is the spawn's, and a spawn is always
-      // driven by a delivered message; a LATER one is the CLI opening a turn
-      // by itself.
+      // The CLI emits an init at the start of EVERY turn, after it has taken
+      // the turn's input and before the API request (read in the CLI, 2.1.282):
+      // a delivered message's own turn opens init → traffic, with no user
+      // replay, exactly like a continuation the CLI opens by itself. The
+      // FIRST init of a process is the spawn's, and a spawn is always driven
+      // by a delivered message.
       const firstInit = !proc.sawInit;
       proc.sawInit = true;
+      // A turn is starting while delivered messages wait, and it may be
+      // theirs: they leave the overtaken settle for good. Whether a context is
+      // still active does not matter. A continuation whose result arrived
+      // while its row was still registering is active when the next turn's
+      // init lands, and skipping that init settled the message with a pointer
+      // and dropped its real answer.
+      if (!firstInit && proc.pendingDelivered.length) turnStartedForWaitingDeliveries();
       persistNativeSessionId(sdkSessionId, sdkMessage.session_id).catch(() => {});
       // Tracked on the process too (not only through the persist round-trip):
       // the workflow poller needs the native id to find the session dir even
@@ -2010,17 +2151,20 @@ export function createClaudeSessionRunner({
         // same way.
         if (settingsReinitsOwed > 0) settingsReinitsOwed -= 1;
         else if (!settingsWindowOpen || proc.taskSettleSeq !== proc.settleSeqAtTurnEnd) {
-          proc.lastBoundary = 'self-opened';
+          markSelfOpenedBoundary('a bare init with nothing queued');
         }
       } else if (!proc.activeCtx && !firstInit) {
-        // A LATER init, with a delivered row waiting, is the CLI opening a turn
-        // of its own — the live-verified continuation shape is a bare init with
-        // no user replay at all. A delivered turn cannot produce one: the
-        // process is already running, and only a spawn inits (which is
-        // `firstInit`, and always has its row queued before the stream is
-        // read). A compaction inside such a turn would otherwise see no
-        // turn-level boundary and adopt the queued row — and in this shape
-        // nothing later replays to correct it.
+        // A LATER init, with a delivered row waiting: a turn is starting, and
+        // the init cannot say whose. It may be the CLI opening a turn of its
+        // own (the live-verified continuation shape is a bare init with no
+        // user replay at all) or the waiting message's own turn, which opens
+        // with an init just the same. For a compaction inside that turn the
+        // flag errs toward the continuation: adopting the queued row for a
+        // turn that was the CLI's own closes it with another turn's answer,
+        // and in this shape nothing later replays to correct it. When the
+        // turn was the message's own, its answer publishes on a continuation
+        // row instead and the row is settled with a pointer to it (see
+        // reapOvertakenDeliveredEntries).
         //
         // Structural, not a clock. Gating this on "a task settled recently"
         // fails twice over: the grace (60 s) is shorter than a compaction
@@ -2036,6 +2180,9 @@ export function createClaudeSessionRunner({
         // continuation). This suppresses adoption and nothing else; if the turn
         // really is the delivered message's, it attaches exactly as before.
         proc.continuationInitPending = true;
+        // A boundary an earlier init armed announced a turn that never
+        // produced anything: this init starts a newer one in its place.
+        if (proc.lastBoundary === 'self-opened') proc.boundarySuperseded = true;
       }
       return;
     }
@@ -2341,7 +2488,9 @@ export function createClaudeSessionRunner({
     if (suppressed === 'observe-only') return;
     // Its traffic opens a continuation of its own instead of attaching to the
     // stopped steer waiting in pendingDelivered (which still settles stopped).
-    if (suppressed === 'continuation') proc.lastBoundary = 'self-opened';
+    if (suppressed === 'continuation') {
+      markSelfOpenedBoundary('the stop guard stood down for a task continuation', { corroborated: true });
+    }
     const ctx = resolveContext(sdkMessage);
     if (proc.handoffSettling) {
       // An absorbed-steering handoff just settled the previous context;
@@ -2530,6 +2679,112 @@ export function createClaudeSessionRunner({
     }
   }
 
+  /**
+   * A turn is starting while delivered messages wait. Whatever opened over
+   * them before, they are no longer known to be left behind: this turn may be
+   * theirs, and its first traffic can take longer than the settle window.
+   */
+  function turnStartedForWaitingDeliveries() {
+    for (const entry of proc.pendingDelivered) entry.overtakenBy = null;
+  }
+
+  /** The continuation ran to a clean end and its answer is on the relay. */
+  function publishedItsAnswer(ctx) {
+    return Boolean(ctx)
+      && ctx.finalized
+      && ctx.registered
+      && !ctx.discarded
+      && !ctx.interrupted
+      && Boolean(ctx.message?.id)
+      && Boolean(ctx.state.result)
+      && !ctx.state.result.isError;
+  }
+
+  /**
+   * Settle delivered messages whose prompt a continuation's turn took. A
+   * continuation opened over a waiting NON-steered entry either ran ahead of
+   * the entry's own turn, which then follows at once, or WAS that turn: a
+   * false boundary published the answer on the continuation row, or the CLI
+   * folded the queued prompt into the turn it had already begun. In the
+   * second case nothing attaches the entry anymore, and it held every later
+   * message out of the worker until the watchdog failed it with a "resend"
+   * error for a message that had been answered (seen live 2026-09-27).
+   *
+   * Told apart by silence: the continuation published its answer, no turn
+   * started since (any init takes the entry out, see the init handler), and
+   * the stream stayed quiet for the settle window, counted from whichever is
+   * latest: the continuation's end, the entry's push, the last stream event.
+   * Same gates as the fold reaper, so never during a compaction, an API
+   * retry, an open control round-trip or a task continuation that is due. A
+   * continuation that was stopped, failed or never reached the relay settles
+   * nothing: the marker points at its reply, and the watchdog keeps those
+   * rows.
+   */
+  function reapOvertakenDeliveredEntries(now) {
+    if (!proc || !proc.pendingDelivered.length) return;
+    if (!(strandedSettleMs > 0)) return;
+    if (proc.activeCtx || proc.pendingControlRequests > 0 || isCompacting() || isContinuationImminent()
+      || isApiRetryPending() || isStopFollowUpPending(now)) {
+      for (const entry of proc.pendingDelivered) entry.overtakenSince = 0;
+      return;
+    }
+    const answered = [];
+    proc.pendingDelivered = proc.pendingDelivered.filter((entry) => {
+      if (entry.steered || !publishedItsAnswer(entry.overtakenBy)) return true;
+      if (!entry.overtakenSince) { entry.overtakenSince = now; return true; }
+      // Any stream event restarts the wait: a CLI that still talks is not done.
+      const quietSince = Math.max(entry.overtakenSince, entry.pushedAt || 0, proc.lastEventAt);
+      if (now - quietSince < strandedSettleMs) return true;
+      answered.push(entry);
+      // Owned until the marker is committed (same claim as a folded steer).
+      claimSettling(entry.ctx.message, 'answeredElsewhere');
+      return false;
+    });
+    if (!answered.length) return;
+    void (async () => {
+      for (const entry of answered) {
+        dbg(
+          'delivered message was answered on a continuation row; settling it',
+          shortMessageId(entry.ctx.message),
+          `continuation=${shortMessageId(entry.overtakenBy.message)}`,
+        );
+        try {
+          await settleOvertakenDeliveredEntry(entry);
+        } catch (error) {
+          dbg('overtaken-delivery settle failed', error?.message || String(error));
+        }
+      }
+    })();
+  }
+
+  async function settleOvertakenDeliveredEntry(entry) {
+    const ctx = entry.ctx;
+    if (ctx.finalized) {
+      releaseSettling(ctx.message?.id);
+      return;
+    }
+    ctx.finalized = true;
+    const model = entry.overtakenBy.state.responseModel || proc?.model || null;
+    try {
+      // Marked consumed BEFORE the first publish attempt: should the worker
+      // die while the marker is retried, the relay fails the row instead of
+      // running its prompt again. Never rejects (best-effort).
+      await markConsumed(ctx.message?.conversationId, [ctx.message]);
+      // The row closes with a pointer to the answer, under a kind of its own:
+      // a marker, not a reply. Not requeued (the prompt would run twice) and
+      // not failed (it was answered).
+      await publishSettleMarker(ctx.message, {
+        text: DELIVERY_ANSWERED_ELSEWHERE_TEXT,
+        model,
+        kind: ANSWERED_ELSEWHERE_KIND,
+        variant: 'answeredElsewhere',
+      });
+    } finally {
+      // Spliced out of pendingDelivered already: nothing else resolves it.
+      ctx.resolveDone?.(true);
+    }
+  }
+
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   /**
@@ -2563,7 +2818,14 @@ export function createClaudeSessionRunner({
     const workflowRuns = publisher.drainWorkflowRuns();
     try {
       for (let attempt = 0; ; attempt += 1) {
-        const outcome = await publisher.publishResponse(message, { text, model, kind, workflowRuns });
+        // Never requeued, with or without a kind: the CLI has the prompt.
+        const outcome = await publisher.publishResponse(message, {
+          text,
+          model,
+          kind,
+          workflowRuns,
+          requeueOnFailure: false,
+        });
         reportFirstAttempt();
         if (outcome !== 'failed') return;
         if (attempt >= settleRetryDelaysMs.length) break;
@@ -2659,6 +2921,9 @@ export function createClaudeSessionRunner({
     // Before the 5-minute watchdog: a folded steered entry settles as merged
     // within the short fold grace instead of failing over.
     reapFoldedSteeredEntries(now);
+    // Also before the watchdog: a message a continuation answered settles as
+    // answered instead of failing over minutes later.
+    reapOvertakenDeliveredEntries(now);
     reapStalePendingDelivered(now);
     if (hasLiveWork()) {
       // Track how long background tasks alone have held the process, for the
@@ -2855,6 +3120,16 @@ export function createClaudeSessionRunner({
       activeCtx: null,
       pendingDelivered: [],
       lastBoundary: null,
+      // What marked the boundary, and whether that alone proves the CLI
+      // opened the turn; read only while lastBoundary is 'self-opened'.
+      boundaryReason: '',
+      boundaryCorroborated: false,
+      // An init arrived after the boundary was armed, with a delivered
+      // message waiting: a newer turn started in place of the announced one.
+      boundarySuperseded: false,
+      // taskSettleSeq when a continuation context last opened: a settle since
+      // then still has its continuation coming.
+      settleSeqAtContinuationOpen: 0,
       pendingControlRequests: 0,
       lastEventAt: Date.now(),
       heldForTasksSince: 0,

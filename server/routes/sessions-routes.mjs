@@ -1772,8 +1772,10 @@ export function buildConversationMessages({
           executedProvider: message?.executed_provider || message?.executedProvider || undefined,
           // 'continuation' badges a self-started turn; 'absorbed' marks a
           // reply that continues through the next (steered) user message;
-          // 'folded'/'stopped' are a steer's settle markers. Without this the
-          // live-appended badge/merge/marker vanished on reload.
+          // 'folded'/'stopped' are a steer's settle markers, and
+          // 'answered-elsewhere' marks a message whose answer is on a
+          // continuation row. Without this the live-appended
+          // badge/merge/marker vanished on reload.
           kind: message?.kind || undefined,
           resendOfMessageId: message?.role === 'user' ? (message?.resend_of_message_id || undefined) : undefined,
           resentAs: (message?.role === 'assistant' && message?.kind === 'stopped' && sourceMessageId)
