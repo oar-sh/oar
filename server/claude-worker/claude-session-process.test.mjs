@@ -5856,6 +5856,193 @@ test('a settings re-init after a task settled between turns still belongs to the
   await settled(runner);
 });
 
+/**
+ * What the CLI replays when `set_model` changes the model of a conversation
+ * another model already answered: the "/model" breadcrumb's stdout line, as a
+ * user-role replay with string content and no origin.
+ */
+function modelSwitchBreadcrumb(model = 'claude-fable-5-1') {
+  return {
+    type: 'user',
+    parent_tool_use_id: null,
+    isReplay: true,
+    message: { role: 'user', content: `<local-command-stdout>Set model to \`${model}\`</local-command-stdout>` },
+  };
+}
+
+/** q-1 answered on one model; the returned turn is ready for a switch. */
+async function answeredTurnBeforeModelSwitch({ onSetModel }) {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+  turn.setModel = async () => {
+    onSetModel(turn);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+  turn.applyFlagSettings = async () => {
+    turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, model: 'claude-opus-5-5' } });
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-opus-5-5' });
+  turn.emit(assistantText('first answer'));
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+  return { stub, turn, runner };
+}
+
+test('the model switch breadcrumb before the push does not strand the delivered message', async () => {
+  // Live incident (2026-09-27): a /model switch in a session that had
+  // already answered. The CLI replayed its "/model" breadcrumb while
+  // adaptProcess awaited setModel; the replay matched no delivered message and
+  // armed a self-opened boundary, so the answer ran on a continuation row. The
+  // delivered row never attached and held the next message out of the worker
+  // until the session was killed.
+  const { stub, turn, runner } = await answeredTurnBeforeModelSwitch({
+    onSetModel: (t) => {
+      t.emit(modelSwitchBreadcrumb());
+      t.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+    },
+  });
+
+  const second = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', text: 'after the model switch', model: 'claude-fable-5-1', reasoningEffort: 'medium' },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('answer on the new model'));
+  turn.emit(resultMessage('answer on the new model', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.ok(response, 'the delivered message gets its own response');
+  assert.equal(response.body.text, 'answer on the new model');
+  assert.equal(
+    stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length,
+    0,
+    'no continuation row is opened for a model switch breadcrumb',
+  );
+  assert.equal(runner.isDeliveryHeld(), false, 'the next message is not held behind a stranded row');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the model switch breadcrumb after the push does not strand the delivered message', async () => {
+  // The same replay, read only once the message is registered and pushed.
+  const { stub, turn, runner } = await answeredTurnBeforeModelSwitch({ onSetModel: () => {} });
+
+  const second = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', text: 'after the model switch', model: 'claude-fable-5-1' },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(modelSwitchBreadcrumb());
+  turn.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+  turn.emit(assistantText('answer on the new model'));
+  turn.emit(resultMessage('answer on the new model', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(response.body.text, 'answer on the new model');
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('the model switch breadcrumb with block content is ignored the same way', async () => {
+  const { stub, turn, runner } = await answeredTurnBeforeModelSwitch({
+    onSetModel: (t) => {
+      const breadcrumb = modelSwitchBreadcrumb();
+      t.emit({ ...breadcrumb, message: { role: 'user', content: [{ type: 'text', text: breadcrumb.message.content }] } });
+    },
+  });
+
+  const second = runner.handlePendingPayload({
+    message: { ...baseMessage, id: 'q-2', text: 'after the model switch', model: 'claude-fable-5-1' },
+  });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('answer on the new model'));
+  turn.emit(resultMessage('answer on the new model', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/continuation-turn').length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a command header or a record with an origin still opens a turn of its own', async () => {
+  // Only the CLI's own command OUTPUT is ignored. A `<command-name>` record
+  // heads prompt-type commands and skills, and a record with an origin was
+  // sent by someone: both are real turn openers.
+  const openers = [
+    { type: 'user', parent_tool_use_id: null, isReplay: true, message: { role: 'user', content: '<command-name>/report</command-name>' } },
+    { ...modelSwitchBreadcrumb(), origin: { kind: 'task-notification' } },
+    { ...modelSwitchBreadcrumb(), isReplay: false },
+  ];
+  for (const opener of openers) {
+    const { stub, turn, runner } = await answeredTurnBeforeModelSwitch({ onSetModel: () => {} });
+    turn.emit(opener);
+    turn.emit(assistantText('the command ran'));
+    turn.emit(resultMessage('the command ran', 'native-1'));
+    await waitFor(
+      () => stub.calls.some((call) => call.routePath === '/api/continuation-turn'),
+      { label: `continuation for ${JSON.stringify(opener).slice(0, 60)}` },
+    );
+    turn.endInput();
+    await settled(runner);
+  }
+});
+
+test('a task continuation behind the model switch breadcrumb still gets its own row', async () => {
+  // The breadcrumb is ignored, not turned into a shield: a settled task's
+  // notification replay behind it opens the continuation as before, and the
+  // delivered message is answered by the turn after it.
+  const { stub, turn, runner } = await settledTaskBeforeModelSwitch({
+    onSetModel: (t) => {
+      t.emit(modelSwitchBreadcrumb());
+      t.emit({ type: 'system', subtype: 'init', session_id: 'native-1', model: 'claude-fable-5-1' });
+      t.emit(taskNotificationReplay());
+    },
+  });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'after the model switch', model: 'claude-fable-5-1' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(assistantText('continuation answer'));
+  turn.emit(resultMessage('continuation answer', 'native-1'));
+  await waitFor(
+    () => stub.calls.find((call) => call.routePath === '/api/response' && call.body.text === 'continuation answer'),
+    { label: 'first answer published' },
+  );
+  turn.emit(assistantText('user answer'));
+  turn.emit(resultMessage('user answer', 'native-1'));
+  assert.equal(await boundedSettle(second, 'the delivered turn'), true);
+
+  const continuation = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1');
+  assert.equal(continuation.body.text, 'continuation answer');
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-2');
+  assert.equal(response.body.text, 'user answer');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a delivered message that reads like a local command record still opens its turn', async () => {
+  // The text match runs first: only a replay no delivered message sent is
+  // taken for the CLI's own record.
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({ stub, startImpl: () => turn });
+  const text = '<local-command-stdout>what does this tag mean?</local-command-stdout>';
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage, text } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('It marks the output of a local command.'));
+  turn.emit(resultMessage('It marks the output of a local command.', 'native-1'));
+  assert.equal(await boundedSettle(pending, 'the delivered turn'), true);
+
+  const response = stub.calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'q-1');
+  assert.equal(response.body.text, 'It marks the output of a local command.');
+  turn.endInput();
+  await settled(runner);
+});
+
 test('one re-init per settings request is expected, not only the first', async () => {
   // Model and effort both change: setModel and applyFlagSettings each make
   // the CLI re-init. With no task settled, neither may open a continuation.

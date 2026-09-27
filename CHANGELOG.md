@@ -41,6 +41,14 @@ All notable changes to OAR are documented here. The format follows
   `OAR_HOST_SUSPEND_DRY_RUN=1` logs instead of suspending.
 - **Stop** asks for confirmation before cancelling the running turn.
 
+### Fixed
+
+- Switching the Claude model in a conversation that already had replies no
+  longer strands the next message. The reply to the message that carried the
+  switch landed on a *continuation* row while the message itself stayed
+  processing, and every later message waited behind it for up to 5 minutes, or
+  until the session was killed.
+
 ## [0.9.3] — 2026-09-27
 
 Highlights: mid-turn steering on Claude and Copilot, Copilot background tasks on

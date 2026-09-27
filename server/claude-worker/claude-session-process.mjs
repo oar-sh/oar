@@ -338,6 +338,34 @@ function isTaskNotificationReplay(sdkMessage) {
 }
 
 /**
+ * The CLI's own record of a command that ran locally, replayed on the stream
+ * as a user-role message. The one the relay causes is the model switch:
+ * `set_model` on a conversation another model already answered writes the
+ * "/model" breadcrumbs into the transcript and replays the
+ * `<local-command-stdout>Set model to …` one (`isReplay: true`, string
+ * content, no `origin`) BEFORE it answers the control request — read in the
+ * CLI binaries 2.1.261 to 2.1.283. A session that was never answered gets no
+ * breadcrumb, which is why a probe on a fresh session only ever shows the
+ * re-init. Only the two output tags count, and only on a replay the CLI wrote
+ * itself (no origin, not inside a subagent): output is never a prompt, so it
+ * never opens a turn. A `<command-name>` record is left alone on purpose: it
+ * heads prompt-type slash commands and skills, which do open one.
+ */
+const LOCAL_COMMAND_OUTPUT_TAG_PREFIXES = Object.freeze([
+  '<local-command-stdout>',
+  '<local-command-stderr>',
+]);
+
+function isLocalCommandReplay(sdkMessage) {
+  if (sdkMessage?.isReplay !== true) return false;
+  if (sdkMessage.origin || sdkMessage.parent_tool_use_id) return false;
+  const text = firstTextBlock(sdkMessage);
+  if (text === null) return false;
+  const trimmed = text.trimStart();
+  return LOCAL_COMMAND_OUTPUT_TAG_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+/**
  * Whether a turn the CLI opened by itself may be the compaction re-opening a
  * delivered turn, rather than something else the CLI decided to say.
  *
@@ -1071,6 +1099,18 @@ export function createClaudeSessionRunner({
     if (openingText !== null) {
       const matched = proc.pendingDelivered.findIndex((entry) => entry.expectedText === openingText);
       if (matched >= 0) return attachDeliveredContext(matched);
+      // The CLI's record of a local command is not a turn, and no traffic
+      // follows it. Read as a self-opened boundary, the "/model" breadcrumb a
+      // setModel leaves stayed armed through the push that followed: the
+      // delivered message's answer opened a continuation row, and its own row
+      // sat unattached, holding every later message out until the watchdog
+      // failed it or the session was killed (seen live 2026-09-27; the
+      // re-init handling alone cannot cover it). Checked after the match, so
+      // a user who sends such a text still gets their turn.
+      if (isLocalCommandReplay(sdkMessage)) {
+        dbg('local command replay ignored as a turn boundary');
+        return null;
+      }
       // A compaction just replayed the conversation: the CLI re-opens the turn
       // with its own summary message ("This session is being continued…"),
       // whose text matches no delivered entry, and then answers the delivered
