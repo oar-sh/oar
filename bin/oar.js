@@ -17,7 +17,7 @@ function resolvePackageRoot(metaUrl = import.meta.url) {
   return path.resolve(path.dirname(fileURLToPath(metaUrl)), '..');
 }
 
-function parsePort(argv = []) {
+function parsePort(argv = [], fallback = 3333) {
   const args = Array.isArray(argv) ? argv : [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = String(args[index] || '');
@@ -30,7 +30,12 @@ function parsePort(argv = []) {
       if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
     }
   }
-  return 3333;
+  return fallback;
+}
+
+function normalizePort(value) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
 }
 
 function readRelayLock(lockPath) {
@@ -184,7 +189,7 @@ function createDefaultConfig({ port = 3333, token = '' } = {}) {
   };
 }
 
-function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = '', relayPort = 3333, layout = null } = {}) {
+function resolveConfigPaths({ packageRoot, env = process.env, layout = null } = {}) {
   const envConfigPath = String(env.COPILOT_WEB_RELAY_CONFIG || '').trim();
   const repoConfigPath = path.join(packageRoot, 'server', 'config.json');
   const oarConfigPath = layout && !layout.checkout ? path.join(layout.configDir, 'config.json') : null;
@@ -195,7 +200,11 @@ function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = ''
     || null
   );
   const managedPath = oarConfigPath || path.join(getLegacyManagedConfigDir(env), 'config.json');
-  const configPath = seedPath || managedPath;
+  return { seedPath, configPath: seedPath || managedPath };
+}
+
+function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = '', relayPort = 3333, portOverride = null, layout = null } = {}) {
+  const { seedPath, configPath } = resolveConfigPaths({ packageRoot, env, layout });
   const seedConfig = readJsonFile(seedPath) || {};
   const runtimeConfig = {
     ...createDefaultConfig({ port: relayPort }),
@@ -203,10 +212,9 @@ function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = ''
   };
   if (relayToken) runtimeConfig.authToken = relayToken;
   if (!String(runtimeConfig.authToken || '').trim()) runtimeConfig.authToken = randomUUID();
-  const parsedPort = Number.parseInt(String(runtimeConfig.port || relayPort || 3333), 10);
-  runtimeConfig.port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535
-    ? parsedPort
-    : 3333;
+  // An explicit --port wins over the config for this run: the server gets it
+  // on argv, and only a config this command creates saves it.
+  runtimeConfig.port = normalizePort(portOverride) ?? normalizePort(runtimeConfig.port) ?? normalizePort(relayPort) ?? 3333;
   return {
     configPath,
     managed: !seedPath,
@@ -262,7 +270,7 @@ export async function launchRelay({
   const forwardedArgs = separatorIdx === -1 ? [] : args.slice(separatorIdx + 1);
   if (args.includes('--help') || args.includes('-h')) {
     logger.log([
-      'Usage: oar [--port <port>] [--token <token>] [--migrate-from <old-checkout>] [--install-extension] [--no-install-extension] [-- [gh copilot args...]]',
+      'Usage: oar [--port <port>] [--migrate-from <old-checkout>] [--install-extension] [--no-install-extension] [-- [gh copilot args...]]',
       '',
       'Starts the web relay server if needed, then launches gh copilot in the current shell.',
       '--install-extension installs/updates a user-global web-relay wrapper extension and exits.',
@@ -284,7 +292,7 @@ export async function launchRelay({
     return { code: 0, reason: 'extension-installed' };
   }
 
-  const port = parsePort(launcherArgs);
+  const cliPort = parsePort(launcherArgs, null);
   const serverDir = path.join(packageRoot, 'server');
   const layout = resolveStateLayout({ packageRoot, env });
 
@@ -311,6 +319,12 @@ export async function launchRelay({
   const lockPath = layout.checkout
     ? path.join(serverDir, 'data', 'relay-server.lock')
     : path.join(layout.dataDir, 'relay-server.lock');
+  // One port finds, launches and probes the relay: an explicit --port for this
+  // run, else the config's, else 3333. The probe used to take --port (or 3333)
+  // while the server started on the config's port, so any mismatch waited out
+  // the readiness deadline and killed the relay it had just started.
+  const { seedPath } = resolveConfigPaths({ packageRoot, env, layout });
+  const port = cliPort ?? normalizePort(readJsonFile(seedPath)?.port) ?? 3333;
   const statusUrl = `http://localhost:${port}/api/status`;
   const running = await detectRunningRelay({
     lockPath,
@@ -323,6 +337,7 @@ export async function launchRelay({
     env,
     relayToken: running?.lock?.token || '',
     relayPort: port,
+    portOverride: cliPort,
     layout,
   });
   if (runtimeConfig.managed || !fs.existsSync(runtimeConfig.configPath)) {
