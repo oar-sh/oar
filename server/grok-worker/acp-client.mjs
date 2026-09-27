@@ -17,6 +17,40 @@ function whichCommand(command = 'grok') {
 // ceiling bounds a single prompt absolutely. Both are overridable per call.
 export const ACP_PROMPT_INACTIVITY_MS = 120_000;
 export const ACP_PROMPT_MAX_TURN_MS = 1_800_000;
+// How long the watchdog waits for its `holdStall` question before treating
+// the silence as a stall after all.
+export const ACP_HOLD_CHECK_TIMEOUT_MS = 10_000;
+
+/**
+ * An MCP server launch (`{ command, args, env }`, see
+ * server/mcp/oar-mcp-server.mjs `buildOarMcpServerLaunch`) in the ACP stdio
+ * shape `session/new` and `session/load` take: no `type` field (that marks the
+ * http/sse transports), `args` and `env` always present, `env` as a list of
+ * `{ name, value }` pairs.
+ */
+export function toAcpStdioMcpServer(launch, name = 'oar') {
+  const env = launch?.env && typeof launch.env === 'object' ? launch.env : {};
+  return {
+    name: String(name || '').trim() || 'oar',
+    command: String(launch?.command || ''),
+    args: Array.isArray(launch?.args) ? launch.args.map((arg) => String(arg)) : [],
+    env: Object.entries(env).map(([key, value]) => ({ name: key, value: String(value ?? '') })),
+  };
+}
+
+/**
+ * An AcpClient class whose sessions carry `mcpServers` unless the caller
+ * passes its own. Lets the turn runner hand the adapter (which builds the
+ * client and opens the session in one step) a client that already knows them.
+ */
+export function withAcpMcpServers(BaseClient, mcpServers = []) {
+  const servers = Array.isArray(mcpServers) ? mcpServers : [];
+  return class AcpClientWithMcpServers extends BaseClient {
+    constructor(opts = {}) {
+      super({ ...opts, mcpServers: Array.isArray(opts?.mcpServers) ? opts.mcpServers : servers });
+    }
+  };
+}
 
 /**
  * Pick the one-shot allow option from an ACP permission request. A blanket
@@ -47,10 +81,13 @@ export class AcpClient extends EventEmitter {
    * @param {string} [opts.cwd]
    * @param {NodeJS.ProcessEnv} [opts.env]
    * @param {boolean} [opts.alwaysApprove]
+   * @param {Array<object>} [opts.mcpServers] ACP McpServer entries every
+   *   session/new and session/load carries (see toAcpStdioMcpServer)
    * @param {typeof spawn} [opts.spawnImpl]
    */
   constructor(opts = {}) {
     super();
+    this.mcpServers = Array.isArray(opts.mcpServers) ? opts.mcpServers.map((server) => ({ ...server })) : [];
     this.command = whichCommand(opts.command || 'grok');
     this.args = Array.isArray(opts.args) ? [...opts.args] : ['agent', '--no-leader', 'stdio'];
     if (opts.alwaysApprove && !this.args.includes('--always-approve') && !this.args.includes('--yolo')) {
@@ -276,10 +313,12 @@ export class AcpClient extends EventEmitter {
     return this.initializeResult;
   }
 
+  // MCP servers are per session in ACP, and a loaded session does not keep the
+  // ones it was created with — both calls pass them.
   async sessionNew(cwd, extra = {}) {
     return this.request('session/new', {
       cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServers,
       ...extra,
     });
   }
@@ -288,7 +327,7 @@ export class AcpClient extends EventEmitter {
     return this.request('session/load', {
       sessionId,
       cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServers,
       ...extra,
     });
   }
@@ -305,8 +344,15 @@ export class AcpClient extends EventEmitter {
    * @param {string} sessionId
    * @param {Array} prompt content blocks
    * @param {(update: object) => void} [onUpdate]
+   * `holdStall` (async, optional) is asked once the inactivity window has run
+   * out: `true` re-arms the full window instead of failing the prompt. It is
+   * for work the agent is blocked on that this client cannot see — a
+   * remote_relay call the agent runs through its MCP server, which the relay
+   * reports as in flight. A question that fails or takes longer than
+   * `holdCheckTimeoutMs` counts as `false`.
+   *
    * @param {object} [extra] additional session/prompt params (e.g. `_meta`)
-   * @param {object} [watchdog] { inactivityMs, maxTurnMs, hasPendingWork }
+   * @param {object} [watchdog] { inactivityMs, maxTurnMs, hasPendingWork, holdStall, holdCheckTimeoutMs }
    */
   async sessionPrompt(sessionId, prompt, onUpdate, extra = {}, watchdog = {}) {
     const inactivityMs = Number(watchdog?.inactivityMs) > 0
@@ -322,6 +368,10 @@ export class AcpClient extends EventEmitter {
     const hasPendingWork = typeof watchdog?.hasPendingWork === 'function'
       ? watchdog.hasPendingWork
       : () => false;
+    const holdStall = typeof watchdog?.holdStall === 'function' ? watchdog.holdStall : null;
+    const holdCheckTimeoutMs = Number(watchdog?.holdCheckTimeoutMs) > 0
+      ? Number(watchdog.holdCheckTimeoutMs)
+      : ACP_HOLD_CHECK_TIMEOUT_MS;
     const handler = (msg) => {
       if (msg.method !== 'session/update') return;
       if (msg.params?.sessionId && msg.params.sessionId !== sessionId) return;
@@ -329,8 +379,40 @@ export class AcpClient extends EventEmitter {
     };
     this.on('notification', handler);
     let watchdogTimer = null;
+    let settled = false;
+    // A granted hold restarts the window without faking ACP traffic.
+    let heldAt = 0;
+    let holdCheck = null;
+    const quietSince = () => Math.max(this.lastActivityAt, heldAt);
     const startedAt = Date.now();
     const stallPromise = new Promise((_, reject) => {
+      const stall = () => {
+        if (settled) return;
+        try { this.sessionCancel(sessionId); } catch { /* ignore */ }
+        reject(new Error(`grok turn stalled: no ACP activity for ${Math.round(inactivityMs / 1000)}s`));
+      };
+      const askForHold = () => {
+        let timer = null;
+        holdCheck = Promise.race([
+          Promise.resolve().then(() => holdStall()),
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(false), holdCheckTimeoutMs);
+            timer.unref?.();
+          }),
+        ])
+          .then((hold) => hold === true, () => false)
+          .then((hold) => {
+            if (timer) clearTimeout(timer);
+            holdCheck = null;
+            if (settled) return;
+            if (hold) {
+              heldAt = Date.now();
+              return;
+            }
+            // Traffic that arrived while the question ran re-armed it anyway.
+            if (Date.now() - quietSince() >= inactivityMs) stall();
+          });
+      };
       const pollMs = Math.max(250, Math.min(5000, Math.floor(inactivityMs / 4)));
       watchdogTimer = setInterval(() => {
         const now = Date.now();
@@ -340,10 +422,13 @@ export class AcpClient extends EventEmitter {
           return;
         }
         if (hasPendingWork()) return;
-        if (now - this.lastActivityAt >= inactivityMs) {
-          try { this.sessionCancel(sessionId); } catch { /* ignore */ }
-          reject(new Error(`grok turn stalled: no ACP activity for ${Math.round(inactivityMs / 1000)}s`));
+        if (now - quietSince() < inactivityMs) return;
+        if (!holdStall) {
+          stall();
+          return;
         }
+        // Before the abort: is the agent blocked on work only the relay sees?
+        if (!holdCheck) askForHold();
       }, pollMs);
       if (typeof watchdogTimer.unref === 'function') watchdogTimer.unref();
     });
@@ -360,6 +445,7 @@ export class AcpClient extends EventEmitter {
         stallPromise,
       ]);
     } finally {
+      settled = true;
       clearInterval(watchdogTimer);
       this.off('notification', handler);
     }

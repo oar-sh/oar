@@ -108,9 +108,26 @@ const LEGACY_SETTINGS_IDS = [
   "update-install-status",
   "update-outcome",
   "update-outcome-dismiss-btn",
+  // Relays (remote relays, added with the tab — settings-modal.js and
+  // remote-relays-settings.js look these up by ID too)
+  "settings-panel-relays",
+  "remote-relays-self-name",
+  "remote-relays-public-url-input",
+  "remote-relays-self-status",
+  "remote-relays-inbound-toggle",
+  "remote-relays-list",
+  "remote-relays-empty",
+  "remote-relays-status",
+  "remote-relays-add-url-input",
+  "remote-relays-add-token-row",
+  "remote-relays-add-token-input",
+  "remote-relays-use-token-btn",
+  "remote-relays-pair-back-toggle",
+  "remote-relays-add-btn",
+  "remote-relays-add-status",
 ];
 
-const TABS = ["general", "providers", "previews", "notifications", "features"];
+const TABS = ["general", "providers", "relays", "previews", "notifications", "features"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
 const PROVIDER_TABS = ["copilot", "openai", "claude", "grok", "cursor"];
@@ -161,7 +178,7 @@ async function expectActiveProviderTab(page, providerTab) {
 }
 
 test.describe("tabbed settings modal", () => {
-  test("renders five top-level tabs with one panel visible at a time", async ({ page }) => {
+  test("renders six top-level tabs with one panel visible at a time", async ({ page }) => {
     await loadApp(page);
     await openSettings(page, "general");
 

@@ -42,6 +42,8 @@ import {
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
 import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
+import { setRemoteRelaysSnapshot } from './remote-relays-store.mjs';
+import { REMOTE_RELAY_SOCKET_EVENT } from './remote-relay-shared.mjs';
 import { applyClaudeAuthState } from './claude-auth-ui.js';
 import { applyGrokAuthState } from './grok-auth-ui.js';
 import { applyCliInstallState } from './cli-install-ui.js';
@@ -431,7 +433,8 @@ export async function connectSocket(overrideDeps) {
   socket.on('user_message', ({ conversationId, messageId, senderClientId, message }) => {
     const normalizedMessage = {
       ...(message && typeof message === 'object' ? message : {}),
-      text: stripRelayPromptContext(message?.text, message?.mode),
+      // `origin`: a prompt another relay's agent sent; its header line hides.
+      text: stripRelayPromptContext(message?.text, message?.mode, { origin: message?.origin }),
     };
     if (senderClientId && senderClientId === CLIENT_ID) {
       pendingUserMessageIds.delete(messageId);
@@ -503,6 +506,11 @@ export async function connectSocket(overrideDeps) {
   // and global, so every change ships the full list.
   socket.on('previews', ({ previews }) => {
     setPreviews(previews);
+  });
+  // REPLACE semantics too: the relay ships the whole remote-relay list (no
+  // tokens) whenever a remote is added, removed, renamed or changes status.
+  socket.on(REMOTE_RELAY_SOCKET_EVENT, (payload) => {
+    setRemoteRelaysSnapshot(payload || null);
   });
   socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId, metadata }) => {
     if (!messageId || !text) return;

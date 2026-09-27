@@ -40,6 +40,13 @@ import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { registerGitRoutes } from './routes/git-routes.mjs';
 import { registerPreviewRoutes } from './routes/preview-routes.mjs';
+import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
+import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
+import { createRemoteRelayClient } from './services/remote-relay-client.mjs';
+import { createRemoteRelayRegistry } from './services/remote-relay-registry-service.mjs';
+import { createRemoteRelayPairing } from './services/remote-relay-pairing.mjs';
+import { createRemoteRelayCallerContext } from './services/remote-relay-caller-context.mjs';
+import { createRemoteRelayDispatcher } from './services/remote-relay-dispatcher.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
 import { createClaudeAuthService } from './services/claude-auth-service.mjs';
@@ -6191,6 +6198,82 @@ const windowsBootAutostartService = createWindowsBootAutostartService({
 });
 
 const gitChangesService = createGitChangesService();
+
+// ─── Remote Relays ────────────────────────────────────────────────────────────
+// Other OAR relays this one is paired with, so its agents can work there. Built
+// before the shared route deps: the message, session and question routes read
+// the registry for mentions, unlocks and the inbound switch.
+// Null when migration 0005 failed this boot (db-schema retries it next boot):
+// remotes still list and pair, nothing unlocks until then.
+const remoteRelayRepository = (() => {
+  try {
+    return createRemoteRelayRepository(db);
+  } catch (error) {
+    console.warn(`[remote-relays] unlock storage unavailable: ${error?.message || error}`);
+    return null;
+  }
+})();
+const remoteRelayClient = createRemoteRelayClient({
+  // A closure: the registry owning the instance id is declared just below.
+  getOwnRelayId: () => remoteRelayRegistry.instanceId(),
+  getOwnToken: () => config.authToken,
+});
+const remoteRelayRegistry = createRemoteRelayRegistry({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  client: remoteRelayClient,
+  repository: remoteRelayRepository,
+  getOwnToken: () => config.authToken,
+  getSelfName: getPwaAppName,
+  hostname: os.hostname(),
+  platform: process.platform,
+  version: RUNNING_VERSION,
+  emit: (event, payload) => io.emit(event, payload),
+  logger: console,
+});
+const remoteRelayPairing = createRemoteRelayPairing({
+  registry: remoteRelayRegistry,
+  client: remoteRelayClient,
+  getOwnToken: () => config.authToken,
+});
+// What the inbound routes need: no tokens, only ids, names and state.
+const remoteRelayInbound = {
+  listRelays: () => remoteRelayRegistry.list().map(({ id, name, url, lastStatus, version }) => ({ id, name, url, lastStatus, version })),
+  selfNames: () => [remoteRelayRegistry.selfName()],
+  inboundEnabled: () => remoteRelayRegistry.getSelfSettings().inboundEnabled,
+  recordUnlock: (conversationId, relayId, messageId) => remoteRelayRepository?.recordUnlock(conversationId, relayId, messageId) ?? false,
+  describeRelay: (id) => {
+    const relay = remoteRelayRegistry.get(id);
+    return relay ? { id: relay.id, name: relay.name, online: relay.lastStatus === 'online', version: relay.version } : null;
+  },
+  repository: remoteRelayRepository,
+};
+// The remote_relay tool: who is calling (live turn, provider, model, mode,
+// hops) and the Allow / Deny card write actions need in ask/plan mode.
+const remoteRelayCallerContext = createRemoteRelayCallerContext({
+  db,
+  repository: remoteRelayRepository,
+  questions: stmts,
+  resolveLiveTurnQueueRow,
+  formatQuestionRow,
+  normalizeRelayMode,
+  defaultRelayMode: DEFAULT_RELAY_MODE,
+  emit: (event, payload) => io.emit(event, payload),
+  notifyQuestion: (question) => pushDispatchService.notifyQuestion?.(question),
+  uuid: uuidv4,
+  logger: console,
+});
+const remoteRelayDispatcher = createRemoteRelayDispatcher({
+  registry: remoteRelayRegistry,
+  client: remoteRelayClient,
+  repository: remoteRelayRepository,
+  getCallerContext: (conversationId) => remoteRelayCallerContext.getCallerContext(conversationId),
+  requestApproval: (request) => remoteRelayCallerContext.requestApproval(request),
+  emitStatusEvent: ({ type, ...details }) => statusEventService.recordEvent(type, details),
+  resolveConversationId: (id) => resolveConversationRecord({ conversationId: id, sdkSessionId: id })?.id || id,
+  logger: console,
+});
+
 const sharedRouteDeps = {
   auth,
   gitChangesService,
@@ -6392,6 +6475,7 @@ const sharedRouteDeps = {
   windowsAutostartService,
   windowsBootAutostartService,
   pushDispatchService,
+  remoteRelayInbound,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
@@ -6403,6 +6487,12 @@ registerPushRoutes(app, {
   auth,
   pushDispatchService,
   getPushVapidPublicKey: () => pushVapidKeys.publicKey,
+});
+registerRemoteRelayRoutes(app, {
+  auth,
+  registry: remoteRelayRegistry,
+  pairing: remoteRelayPairing,
+  dispatcher: remoteRelayDispatcher,
 });
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   cliLastSeen = null;
@@ -6926,6 +7016,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   sshTunnelManager.stop();
   cloudflaredTunnelManager.stop();
   previewHealthProbe.stop();
+  try { remoteRelayRegistry.stopHealthLoop(); } catch {}
   // Previews are in-memory by design: a restart is the only implicit cleanup,
   // so every public link dies with the process.
   previewRegistry.clear();
@@ -7058,6 +7149,8 @@ httpServer.listen(config.port, listenHost, () => {
   // Start SSH tunnel after server is listening
   sshTunnelManager.start();
   cloudflaredTunnelManager.start();
+  // Status, version and renames of paired relays; a first pass right away.
+  remoteRelayRegistry.startHealthLoop();
   // A preview-lane failure must never take the relay with it: the listener is
   // optional infrastructure, so a bind error is logged and the relay carries on
   // without previews.

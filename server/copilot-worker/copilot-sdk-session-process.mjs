@@ -84,6 +84,8 @@ import {
   isToolOverrideRejection,
   parseAskUserToolArguments,
 } from './copilot-ask-user-tool.mjs';
+import { buildCopilotRemoteRelayTool } from './copilot-remote-relay-tool.mjs';
+import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import {
   EXIT_PLAN_BOARD_POSTED_FEEDBACK,
   EXIT_PLAN_NO_BOARD_FEEDBACK,
@@ -351,6 +353,9 @@ export function createCopilotSdkSessionRunner({
   // runtime's built-in one. A runtime that refuses the override falls back
   // to the built-in for the rest of this worker's life.
   relayAskUserTool = true,
+  // Whether sessions carry the relay's `remote_relay` tool
+  // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
+  remoteRelayToolGate = null,
   taskRefreshMs = DEFAULT_TASK_REFRESH_MS,
   taskPublishThrottleMs = DEFAULT_TASK_PUBLISH_THROTTLE_MS,
   // Called with `true`/`false` whenever the runner flips between accepting
@@ -518,6 +523,17 @@ export function createCopilotSdkSessionRunner({
   // the human's eventual answer to a runtime whose row is already settled.
   // Same guard the Cursor worker's `hasPendingClientWork` provides.
   let pendingHumanRequests = 0;
+  // Running `remote_relay` calls. The runtime is just as silent while one
+  // runs (the relay may wait up to 600 s for a remote turn, plus an approval
+  // card), so they hold the stall watchdog and the idle shutdown too — but
+  // not steering: nobody is answering a card here.
+  let pendingRelayToolCalls = 0;
+  // `remote_relay` is registered only while this relay has paired remotes.
+  // Asked once when the worker starts; a session build waits for that first
+  // answer (it is async anyway), and every runtime stop asks again so the
+  // next session picks up a remote paired in the meantime.
+  const remoteRelayGate = remoteRelayToolGate || createRemoteRelayToolGate({ api });
+  void remoteRelayGate.refresh();
   // The `SessionConfig.provider` block this session was BUILT with, or null for
   // a hosted (`github`) session. Set by `buildSessionConfig` rather than by a
   // second throwaway resolve here, so "is this BYOK?" and "what did the runtime
@@ -1787,6 +1803,32 @@ export function createCopilotSdkSessionRunner({
     };
   }
 
+  /**
+   * The relay's `remote_relay` tool (copilot-remote-relay-tool.mjs). Every call
+   * is counted while it runs: the stall watchdog re-arms instead of failing the
+   * row, and the lifecycle keeps the runtime up. The clock restarts from the
+   * answer, like after a card. A call is cancelled by the runtime (its
+   * invocation signal) or by a Stop of the turn it started under.
+   */
+  function buildRemoteRelayTool() {
+    return buildCopilotRemoteRelayTool({
+      api,
+      getConversationId: () => activeTurn?.message?.conversationId || sdkSessionId || '',
+      getSignal: (invocation) => combineSignals(activeTurn?.remoteRelayStop?.signal, invocation?.signal),
+      runCall: async (fn) => {
+        pendingRelayToolCalls += 1;
+        try {
+          return await fn();
+        } finally {
+          pendingRelayToolCalls -= 1;
+          touch();
+          activeTurn?.armStall?.();
+        }
+      },
+      dbg,
+    });
+  }
+
   /** One signal that aborts when any of the given ones does (nulls ignored). */
   function combineSignals(...signals) {
     const live = signals.filter((signal) => signal && typeof signal.aborted === 'boolean');
@@ -1804,18 +1846,33 @@ export function createCopilotSdkSessionRunner({
    * Open a session, retrying once without the relay's `ask_user` when the
    * runtime refuses the override (an older runtime). The refusal is
    * remembered until the runtime is stopped — the next runtime (possibly
-   * auto-updated under the relay) gets another try.
+   * auto-updated under the relay) gets another try. Only the override goes:
+   * the relay's other tools (`remote_relay`) override nothing and stay.
    */
   async function openSession(open, config) {
     try {
       return await open(config);
     } catch (error) {
-      if (!config?.tools?.length || !isToolOverrideRejection(error) || isSessionNotFoundError(error)) throw error;
+      const tools = Array.isArray(config?.tools) ? config.tools : [];
+      const isAskUserOverride = (tool) => tool?.name === RELAY_ASK_USER_TOOL_NAME && tool?.overridesBuiltInTool === true;
+      if (!tools.some(isAskUserOverride) || !isToolOverrideRejection(error) || isSessionNotFoundError(error)) throw error;
       dbg('the runtime refused the relay ask_user override; using its built-in ask_user', error?.message || String(error));
       askUserOverrideRejected = true;
       const { tools: _tools, ...withoutTools } = config;
-      return open(withoutTools);
+      const kept = tools.filter((tool) => !isAskUserOverride(tool));
+      return open(kept.length ? { ...withoutTools, tools: kept } : withoutTools);
     }
+  }
+
+  /** The relay's own session tools; each is added only when it applies. */
+  function relaySessionTools() {
+    return [
+      // The relay's `ask_user` (see copilot-ask-user-tool.mjs): the built-in's
+      // fields plus `multi_select`, so a model can declare a multi-select
+      // question instead of the relay guessing from its wording.
+      ...(relayAskUserTool && !askUserOverrideRejected ? [buildRelayAskUserTool()] : []),
+      ...(remoteRelayGate.isEnabled() ? [buildRemoteRelayTool()] : []),
+    ];
   }
 
   function buildSessionConfig(model, reasoningEffort = null) {
@@ -1857,6 +1914,7 @@ export function createCopilotSdkSessionRunner({
     const provider = resolveProviderConfigImpl({ env, model: model || defaultModel, dbg });
     byokProvider = provider;
     const effort = normalizeRelayEffort(reasoningEffort);
+    const tools = relaySessionTools();
     return {
       // The relay session id IS the SDK session id, so the runtime's own state
       // under ~/.copilot/session-state/<id> is addressable by conversation and
@@ -1879,10 +1937,8 @@ export function createCopilotSdkSessionRunner({
       // The runtime's own defaults, pinned. See DEFAULT_INFINITE_SESSION_CONFIG.
       ...(infiniteSessionConfig ? { infiniteSessions: { ...infiniteSessionConfig } } : {}),
       onEvent: routeEvent,
-      // The relay's `ask_user` (see copilot-ask-user-tool.mjs): the built-in's
-      // fields plus `multi_select`, so a model can declare a multi-select
-      // question instead of the relay guessing from its wording.
-      ...(relayAskUserTool && !askUserOverrideRejected ? { tools: [buildRelayAskUserTool()] } : {}),
+      // The relay's own tools (`relaySessionTools`); omitted when there are none.
+      ...(tools.length ? { tools } : {}),
       // Permission policy follows the conversation's relay mode: agent and
       // autopilot auto-approve, plan denies non-read tools with feedback, and
       // ask asks the human through a relay question card. The handler reads the
@@ -2119,6 +2175,9 @@ export function createCopilotSdkSessionRunner({
   async function ensureSession(model, effort) {
     await ensureClient();
     if (!session) {
+      // The tool list is part of the session: wait for the worker's first
+      // registration answer (bounded, and it fails closed).
+      await remoteRelayGate.ready();
       const config = buildSessionConfig(model, effort);
       // Resume first, always. On a brand-new conversation this costs one
       // failed RPC; on every other path (worker restart, idle shutdown,
@@ -2185,6 +2244,8 @@ export function createCopilotSdkSessionRunner({
 
   async function stopRuntime(reason) {
     stopLifecycleTimer();
+    // The next session is built from a fresh registration answer.
+    void remoteRelayGate.refresh();
     try { detachRuntimeExit(); } catch { /* the observer is best-effort */ }
     detachRuntimeExit = () => {};
     const closingSession = session;
@@ -2320,7 +2381,9 @@ export function createCopilotSdkSessionRunner({
     // A pending question card means a human is mid-answer; tearing the runtime
     // down under them would discard the session the answer belongs to. A turn
     // that is still publishing counts too: it settled, but its rows are live.
-    if (disposed || activeTurn || publishingTurns.size > 0 || pendingHumanRequests > 0 || !client) return;
+    if (
+      disposed || activeTurn || publishingTurns.size > 0 || pendingHumanRequests > 0 || pendingRelayToolCalls > 0 || !client
+    ) return;
     if (!(idleShutdownMs > 0)) return;
     // Evaluated before the idle clock so the caps still expire on a runtime
     // that has been quiet far longer than the idle window.
@@ -2441,6 +2504,10 @@ export function createCopilotSdkSessionRunner({
       // Cancels any relay question card this turn is blocked on, so an aborted
       // turn does not leave a human answering into the void.
       abortController: new AbortController(),
+      // Cancels the `remote_relay` calls that started under this turn — on the
+      // user's Stop only. Not `abortController`: that one also fires when the
+      // turn settles normally, and a background agent's call must outlive that.
+      remoteRelayStop: new AbortController(),
       // Cards (questions, ask-mode approvals, elicitations) open on this
       // turn's row; `humansIdle` resolves when the last one is done. A turn
       // that settles with one still open publishes only after it (driveTurn).
@@ -2546,7 +2613,9 @@ export function createCopilotSdkSessionRunner({
         // A human staring at a question card is not a stalled runtime. Re-arm
         // rather than fail: the card has its own (much longer) timeout, and
         // failing the row here would settle it while the answer is still coming.
-        if (pendingHumanRequests > 0) {
+        // A remote_relay call waiting on another relay is the same kind of
+        // silence; the relay bounds that wait itself.
+        if (pendingHumanRequests > 0 || pendingRelayToolCalls > 0) {
           turn.armStall();
           return;
         }
@@ -3010,6 +3079,10 @@ export function createCopilotSdkSessionRunner({
     }
     turn.aborted = true;
     turn.abortedRowId = rowId;
+    // A pending `remote_relay` call ends now rather than when the runtime gets
+    // round to it: the relay drops the request, withdraws its approval card
+    // and stops waiting on the remote, and the watchdog hold is released.
+    turn.remoteRelayStop?.abort();
     // While `ensureSession` is still connecting there is no session to abort
     // and this would be a silent no-op; `runTurn` re-checks `turn.aborted`
     // once the session exists and settles there instead.
@@ -3937,6 +4010,7 @@ export function createCopilotSdkSessionRunner({
       continuationDueSince,
       compacting: isCompacting(),
       pendingHumanRequests,
+      pendingRelayToolCalls,
       sessionRpc: { ...sessionRpc },
       activeEntries: activeTurn
         ? activeTurn.entries.map((entry) => ({

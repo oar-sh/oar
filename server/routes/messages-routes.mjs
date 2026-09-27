@@ -40,6 +40,14 @@ import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { isLiveResend } from '../services/steer-resend.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
+import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
+import {
+  admitRemoteRelayRequest,
+  findMentionedRemoteRelays,
+  formatRemoteRelayMentionHint,
+  recordRemoteRelayUnlocks,
+  withRemoteRelayMentionHint,
+} from '../services/remote-relay-inbound.mjs';
 
 export const SESSION_WORKER_OWNER_LEASE_MS = 120_000;
 export const SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES = 2;
@@ -1802,6 +1810,10 @@ export function registerMessagesRoutes(app, deps) {
     opaqueResponseRecoveryPollMs = OPAQUE_RESPONSE_RECOVERY_POLL_MS,
     relayQuestionFinalizationHoldMs = RELAY_QUESTION_FINALIZATION_HOLD_MS,
     imageOperationService = null,
+    // Remote relays (server/services/remote-relay-inbound.mjs): origin on
+    // agent-sent messages, the inbound switch, and mention unlocks. Absent in
+    // older wiring and most tests, where every remote-relay step is a no-op.
+    remoteRelayInbound = null,
   } = deps;
 
   const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
@@ -1953,6 +1965,16 @@ export function registerMessagesRoutes(app, deps) {
     };
   }
 
+  // The stored preferences, for a send that must leave them alone.
+  function readConversationModelPreference(conversationId, fallbackRelayMode = DEFAULT_RELAY_MODE) {
+    const row = stmts.getConvAnyStatus?.get?.(String(conversationId || '').trim()) || null;
+    return {
+      preferredRelayMode: normalizeRelayMode(row?.preferred_relay_mode) || fallbackRelayMode || DEFAULT_RELAY_MODE,
+      preferredModel: String(row?.preferred_model || '').trim(),
+      preferredReasoningEffort: String(row?.preferred_reasoning_effort || '').trim(),
+    };
+  }
+
   function getConversationSessionState(conversationId) {
     const normalizedConversationId = String(conversationId || '').trim();
     if (!normalizedConversationId) {
@@ -2082,7 +2104,7 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId, status: 'failed' });
-    void pushDispatchService?.notifyTurnFailed?.({ conversationId, messageId: responseId, text: responseText });
+    void pushDispatchService?.notifyTurnFailed?.({ conversationId, messageId: responseId, sourceMessageId: messageId, text: responseText });
     cancelPendingRelayQuestionsForMessage(messageId);
     const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
       ? normalizeSessionWorkerId(queueRow?.owner_sdk_session_id)
@@ -2825,6 +2847,7 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   app.post('/api/conversation/:conversationId/cancel-turn', auth, (req, res) => {
+    if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     const conversationId = String(req.params.conversationId || '').trim();
     const requestedMessageId = String(req.body?.messageId || req.body?.queueMessageId || '').trim();
     const sessionState = getConversationSessionState(conversationId);
@@ -3073,6 +3096,7 @@ export function registerMessagesRoutes(app, deps) {
   }
 
   app.post('/api/conversation/:conversationId/cancel-queued-turn', auth, (req, res) => {
+    if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     const conversationId = String(req.params.conversationId || '').trim();
     const requestedMessageId = String(req.body?.messageId || '').trim();
     if (!conversationId) {
@@ -4054,6 +4078,12 @@ export function registerMessagesRoutes(app, deps) {
       attachments: rawAttachments,
       imageTarget: rawImageTarget,
     } = req.body;
+    // A prompt from another relay's agent (body `origin` or the
+    // X-OAR-Remote-Origin header) is refused while the inbound switch is off.
+    // Otherwise its provenance is stored with the message, and it never
+    // unlocks relays or touches the composer draft and preferences.
+    const remoteRequest = admitRemoteRelayRequest(req, res, remoteRelayInbound);
+    if (!remoteRequest) return;
     const sessionId = clientId || ensureSessionId(req, res);
     const requesterIdentity = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requesterIdentity?.sessionId);
@@ -4548,7 +4578,12 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     const resendOriginId = resend?.originId || null;
-    if (!shouldCreateConversation) {
+    // Another relay's agent sends every prompt with a fresh messageId, and a
+    // retry of the same send hits the messageId check at insert. The text
+    // window below would instead swallow a deliberate repeat ("run the tests
+    // again"), which the agent cannot tell from a lost send.
+    const exemptFromTextDuplicateCheck = remoteRequest.remote && !!clientMessageId;
+    if (!shouldCreateConversation && !exemptFromTextDuplicateCheck) {
       const recentUserMessages = stmts.getRecentMessagesDesc.all(conversationId, 20);
       const recentQueueRows = db.prepare(`
         SELECT id, text, status, timestamp
@@ -4578,7 +4613,10 @@ export function registerMessagesRoutes(app, deps) {
 
     const convId = shouldCreateConversation ? uuidv4() : conversationId;
     if (shouldCreateConversation) {
-      getOrCreateConversation(convId, trimmedText || attachmentSummary(attachments) || 'Image');
+      // An agent's prompt opens with the sending relay's header line, which
+      // says who is talking, not what the conversation is about.
+      const titleText = remoteRequest.remote ? stripRemotePromptHeader(trimmedText).trim() : trimmedText;
+      getOrCreateConversation(convId, titleText || attachmentSummary(attachments) || 'Image');
     }
     let conversationWorkspaceRootState = null;
     if (workspaceRootUpdate.changed && workspaceRootUpdate.resolvedPath) {
@@ -4638,7 +4676,7 @@ export function registerMessagesRoutes(app, deps) {
       isNewConversation: shouldCreateConversation,
     });
     const msgId = clientMessageId || uuidv4();
-    const queueText = shouldApplySeed
+    const promptText = shouldApplySeed
       ? [
           '[Carry-over context from previous compacted conversation]',
           String(convSeed.summary_seed).trim(),
@@ -4647,6 +4685,16 @@ export function registerMessagesRoutes(app, deps) {
           trimmedText || '(User sent image attachments only.)',
         ].join('\n')
       : trimmedText;
+    // Only what a human typed unlocks a remote relay (decision 19). The hint
+    // rides in the queued prompt only, so the stored message and the user's
+    // bubble stay exactly what was typed.
+    const mentionedRemoteRelays = remoteRequest.remote
+      ? []
+      : findMentionedRemoteRelays(remoteRelayInbound, trimmedText);
+    const queueText = withRemoteRelayMentionHint(promptText, formatRemoteRelayMentionHint(mentionedRemoteRelays));
+    // A Resend never came from the composer, and neither did another relay's
+    // agent: whatever the user is typing there stays their draft.
+    const keepsComposerDraft = !!resendOriginId || remoteRequest.remote;
 
     const requestedModelOrigin = deriveModelOrigin(requestedModelVariantId || requestedModel);
     let conversationPreferences;
@@ -4665,12 +4713,11 @@ export function registerMessagesRoutes(app, deps) {
         null,
         requestedModelOrigin,
       );
+      if (remoteRequest.origin) remoteRelayInbound?.repository?.setMessageOrigin?.(msgId, remoteRequest.origin);
       linkUploadReferences(convId, msgId, attachments);
       stmts.updateConvTime.run(now, convId);
       if (resendOriginId) stmts.setMessageResendOf?.run(resendOriginId, msgId);
-      // A Resend never came from the composer: whatever the user is typing
-      // there stays their draft.
-      if (!resendOriginId) {
+      if (!keepsComposerDraft) {
         if (typeof stmts.updateConvDraft?.run === 'function') {
           stmts.updateConvDraft.run(null, now, sessionId || null, convId);
         } else {
@@ -4717,13 +4764,17 @@ export function registerMessagesRoutes(app, deps) {
       ) {
         stmts.updateRuntimeSessionProvider.run('claude', claudeModel, claudeModel, now, runtimeSession.id);
       }
-      conversationPreferences = persistConversationModelPreference(
-        convId,
-        requestedRelayMode,
-        requestedModel,
-        requestedReasoningEffort,
-        now,
-      );
+      // Another relay's agent picks the model and mode of its own turn; the
+      // composer keeps restoring the user's choice for this conversation.
+      conversationPreferences = remoteRequest.remote && !shouldCreateConversation
+        ? readConversationModelPreference(convId, requestedRelayMode)
+        : persistConversationModelPreference(
+          convId,
+          requestedRelayMode,
+          requestedModel,
+          requestedReasoningEffort,
+          now,
+        );
       stmts.insertQ.run(
         msgId,
         convId,
@@ -4782,7 +4833,12 @@ export function registerMessagesRoutes(app, deps) {
       }
       throw error;
     }
-    if (!resendOriginId) {
+    recordRemoteRelayUnlocks(remoteRelayInbound, {
+      conversationId: convId,
+      messageId: msgId,
+      relays: mentionedRemoteRelays,
+    });
+    if (!keepsComposerDraft) {
       io.emit('conversation_draft_updated', {
         conversationId: convId,
         draftText: '',
@@ -4852,7 +4908,7 @@ export function registerMessagesRoutes(app, deps) {
       stmts.clearConvSeed.run(now, convId);
     }
 
-    console.log(`[${ts()}] QUEUED    ${msgId.slice(0,8)} conv=${convId.slice(0,8)} rs=${String(runtimeSession?.id || 'none').slice(0,8)} owner=${String(ownerSessionId || 'none').slice(0,8)} new=${!conversationId || !!newConversation} model=${requestedModel} variant=${requestedModelVariantId}${requestedReasoningEffort ? ` effort=${requestedReasoningEffort}` : ''} mode=${requestedRelayMode} text="${trimmedText.slice(0,60)}"${shouldApplySeed ? ' seeded=1' : ''}${attachments.length ? ` attachments=${attachments.length}` : ''}`);
+    console.log(`[${ts()}] QUEUED    ${msgId.slice(0,8)} conv=${convId.slice(0,8)} rs=${String(runtimeSession?.id || 'none').slice(0,8)} owner=${String(ownerSessionId || 'none').slice(0,8)} new=${!conversationId || !!newConversation} model=${requestedModel} variant=${requestedModelVariantId}${requestedReasoningEffort ? ` effort=${requestedReasoningEffort}` : ''} mode=${requestedRelayMode} text="${trimmedText.slice(0,60)}"${shouldApplySeed ? ' seeded=1' : ''}${attachments.length ? ` attachments=${attachments.length}` : ''}${remoteRequest.remote ? ` remote=${remoteRequest.origin?.relayName || remoteRequest.origin?.relayId || 'unknown'} hops=${remoteRequest.origin?.hops ?? '?'}` : ''}${mentionedRemoteRelays.length ? ` mentions=${mentionedRemoteRelays.length}` : ''}`);
 
     emitToClientsExceptSessionId(
       'user_message',
@@ -4868,6 +4924,7 @@ export function registerMessagesRoutes(app, deps) {
           mode: requestedRelayMode,
           timestamp: now,
           attachments,
+          ...(remoteRequest.origin ? { origin: remoteRequest.origin } : {}),
         },
       },
       sessionId,
@@ -6961,6 +7018,8 @@ export function registerMessagesRoutes(app, deps) {
       void pushDispatchService?.notifyTurnComplete?.({
         conversationId: targetConversationId,
         messageId: responseId,
+        // The push service skips turns another relay's agent started.
+        sourceMessageId: messageId,
         text: resolvedText,
       });
     }

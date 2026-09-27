@@ -196,6 +196,7 @@ Common routes:
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
 - Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`
 - Previews: `/api/previews`, `/api/previews/:token` (publish a local dev server; see `docs/preview-servers.md`)
+- Remote relays: `/api/relay/identity`, `/api/remote-relays`, `/api/remote-relays/:id`, `/api/remote-relays/:id/check`, `/api/remote-relays/pair`, `/api/settings/remote-relays`; agent tool calls go through `/api/remote-relays/tool`, and workers read `/api/remote-relays/summary` and `/api/remote-relays/inflight`
 - Uploads: `/api/upload`, `/api/upload/:sha256/content`
 
 All authenticated routes accept either:

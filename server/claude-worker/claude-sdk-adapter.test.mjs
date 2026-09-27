@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   CLAUDE_ULTRACODE_EFFORT,
   RELAY_MCP_SERVER_NAME,
+  RELAY_MCP_TOOL_TIMEOUT_MS,
   applyThinkingDisplay,
   claudeAutoCompactFlagSettings,
   claudeSpawnSettings,
@@ -106,6 +107,54 @@ test('an injected api registers the relay MCP server carrying the preview tool',
   const result = await registered.preview.handler({ action: 'list' }, {});
   assert.deepEqual(calls, [{ method: 'GET', routePath: '/api/previews', body: undefined }]);
   assert.deepEqual(JSON.parse(result.content[0].text), { ok: true, enabled: true, previews: [] });
+});
+
+test('the relay MCP server carries remote_relay only when the worker registered it', async () => {
+  const calls = [];
+  const capture = (remoteRelayTool) => {
+    let captured = null;
+    startClaudeSession({
+      content: null,
+      cwd: '/workspace',
+      api: async (method, routePath, body) => {
+        calls.push({ method, routePath, body });
+        return { ok: true, relays: [] };
+      },
+      getConversationId: () => 'conv-9',
+      ...(remoteRelayTool === undefined ? {} : { remoteRelayTool }),
+      queryImpl: (params) => { captured = params; return {}; },
+    });
+    return captured.options.mcpServers[RELAY_MCP_SERVER_NAME];
+  };
+
+  assert.deepEqual(Object.keys(capture(undefined).instance._registeredTools), ['preview'], 'off by default');
+  assert.deepEqual(Object.keys(capture(false).instance._registeredTools), ['preview']);
+  const server = capture(true);
+  const registered = server.instance._registeredTools;
+  assert.deepEqual(Object.keys(registered), ['preview', 'remote_relay']);
+
+  const result = await registered.remote_relay.handler({ action: 'list_relays' }, {});
+  assert.deepEqual(calls, [{
+    method: 'POST',
+    routePath: '/api/remote-relays/tool',
+    body: { conversationId: 'conv-9', action: 'list_relays', args: {} },
+  }]);
+  assert.deepEqual(JSON.parse(result.content[0].text), { ok: true, relays: [] });
+});
+
+test('the relay MCP server pins its own tool-call timeout above any remote_relay wait', () => {
+  let captured = null;
+  startClaudeSession({
+    content: null,
+    cwd: '/workspace',
+    api: async () => ({}),
+    remoteRelayTool: true,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  const server = captured.options.mcpServers[RELAY_MCP_SERVER_NAME];
+  assert.equal(server.timeout, RELAY_MCP_TOOL_TIMEOUT_MS);
+  // wait_seconds tops out at 600 s; the rest of the budget is approval time.
+  assert.ok(RELAY_MCP_TOOL_TIMEOUT_MS >= 60 * 60_000);
 });
 
 test('a session without an api helper registers no MCP servers', () => {

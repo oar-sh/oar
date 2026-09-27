@@ -7,6 +7,17 @@ All notable changes to OAR are documented here. The format follows
 
 ### Added
 
+- **Remote relays**: pair OAR relays in **Settings → Relays** by pasting the other
+  relay's web address; the pairing works both ways. Agents of every provider get a
+  `remote_relay` tool to list and read the other relay's sessions, prompt one, start
+  a new one, wait for its reply and relay its questions to you. A relay unlocks in a
+  conversation only once you mention it (`@` picks it from a list). Per relay, agents
+  may read, prompt or do everything; in ask and plan mode each write action asks you
+  first. The receiving relay marks such messages with a **↗ from …** badge. Tokens
+  stay on the relay; agents never see them.
+- **OAR MCP server** (`server/mcp/oar-mcp-server.mjs`): Grok and the Copilot
+  extension engine now get the `preview` and `remote_relay` tools as real tools
+  instead of instruction text.
 - **Follow the live reply**: three toggles in the running reply's header keep
   its thoughts, its answer or its tool list pinned just above the composer as
   the reply grows. Scrolling the transcript by hand turns it off; typing in the

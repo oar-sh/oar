@@ -1,6 +1,8 @@
 'use strict';
 
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
+import { admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
+import { isRemoteRelayApprovalQuestion } from '../../shared/remote-relay-contract.mjs';
 import {
   extractRequestedSchema,
   normalizeSchema,
@@ -31,6 +33,21 @@ function firstKnownValue(source, keyPaths = []) {
     if (normalized) return normalized;
   }
   return null;
+}
+
+/**
+ * A stored question row that is this relay's Allow / Deny card for one of its
+ * own agent's calls to another relay (remote-relay-caller-context.mjs). The
+ * context lives in the row's request envelope.
+ */
+function isRemoteRelayApprovalRow(row) {
+  let envelope = null;
+  try {
+    envelope = JSON.parse(String(row?.request || ''));
+  } catch {
+    return false;
+  }
+  return isRemoteRelayApprovalQuestion(envelope);
 }
 
 function extractContinuationOwnership(rawRequest) {
@@ -99,6 +116,9 @@ export function registerAskUserRoutes(app, deps) {
     DEFAULT_RELAY_MODE,
     sessionWorkerRegistry,
     pushDispatchService,
+    // Remote relays: another relay's agent answering a question is refused
+    // while the inbound switch is off. Absent in older wiring (no-op).
+    remoteRelayInbound = null,
   } = deps;
 
   const continuationRoutingEnabled = runtimeState?.featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true;
@@ -108,16 +128,26 @@ export function registerAskUserRoutes(app, deps) {
     sessionWorkerRegistry,
   });
 
+  // A request from another relay's agent, by the test the inbound switch
+  // applies (X-OAR-Remote-Origin or a body origin). Made even without the
+  // remote-relay deps: an approval card is only ever this relay's user's.
+  function fromRemoteRelay(req) {
+    return readRemoteRelayRequest(req, remoteRelayInbound || {}).remote;
+  }
+
   app.get('/api/relay-questions', auth, (req, res) => {
     const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;
     const status = String(req.query.status || 'pending').trim() || 'pending';
-    const rows = stmts.listQuestions.all(status, conversationId, conversationId);
+    let rows = stmts.listQuestions.all(status, conversationId, conversationId);
+    if (fromRemoteRelay(req)) rows = rows.filter((row) => !isRemoteRelayApprovalRow(row));
     res.json({ questions: rows.map(formatQuestionRow) });
   });
 
   app.get('/api/relay-question/:id', auth, (req, res) => {
     const row = stmts.getQuestion.get(req.params.id);
-    if (!row) return res.status(404).json({ error: 'Not found' });
+    if (!row || (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req))) {
+      return res.status(404).json({ error: 'Not found' });
+    }
     res.json({ question: formatQuestionRow(row) });
   });
 
@@ -220,6 +250,7 @@ export function registerAskUserRoutes(app, deps) {
   });
 
   app.post('/api/relay-question/:id/answer', auth, (req, res) => {
+    if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     const id = String(req.params.id || '').trim();
     const { answer, structuredAnswer, sdk_session_id, continuation_id, continuation_question_id } = req.body;
     const sdkSessionId = normalizeId(sdk_session_id);
@@ -228,6 +259,12 @@ export function registerAskUserRoutes(app, deps) {
 
     const row = stmts.getQuestion.get(id);
     if (!row) return res.status(404).json({ error: 'Not found' });
+    // Allow / Deny on this relay's own call to another relay is its user's
+    // decision; the relay that call went to must never make it.
+    if (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req)) {
+      console.warn(`[${ts()}] QUESTION  reject id=${id.slice(0, 8)} reason=remote-relay-approval-from-remote`);
+      return res.status(403).json({ error: 'Only this relay\'s user can answer a remote relay approval' });
+    }
     if (row.status !== 'pending') return res.status(409).json({ error: `Question already ${row.status}` });
 
     const schema = parseQuestionRequest(row.request_schema);
@@ -287,6 +324,9 @@ export function registerAskUserRoutes(app, deps) {
   app.post('/api/relay-question/:id/timeout', auth, (req, res) => {
     const row = stmts.getQuestion.get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Not found' });
+    if (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req)) {
+      return res.status(403).json({ error: 'Only this relay\'s user can answer a remote relay approval' });
+    }
     if (row.status !== 'pending') return res.json({ ok: true, question: formatQuestionRow(row) });
 
     const result = stmts.timeoutQuestion.run(row.id);

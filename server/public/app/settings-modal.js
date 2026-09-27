@@ -43,6 +43,7 @@ import { refreshClaudeAuthSection } from './claude-auth-ui.js';
 import { refreshGrokAuthSection } from './grok-auth-ui.js';
 import { refreshCliInstallSections } from './cli-install-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
+import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -1632,8 +1633,8 @@ subscribePreviews(() => {
   renderPreviewsSection();
 });
 
-// `tab` / `providerTab` are optional deep links (e.g. openSettingsModal('providers', 'claude'));
-// omitting them restores the last tab the user was on.
+// `tab` / `providerTab` are optional deep links (e.g. openSettingsModal('providers', 'claude')
+// or openSettingsModal('relays')); omitting them restores the last tab the user was on.
 export function openSettingsModal(tab, providerTab) {
   closeChatActionsMenu();
   const modal = document.getElementById('settings-modal');
@@ -1676,6 +1677,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshBackgroundTaskTimeoutSetting();
   void refreshPushSettingsSection();
   void refreshPreviewsSection();
+  void refreshRemoteRelaysSection();
   void refreshFeatureFlagsSection();
   void refreshUpdateSection();
   modal?.classList.add('visible');

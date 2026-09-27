@@ -58,6 +58,7 @@ import {
   conversationProviderIndicatorLabel,
 } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
+import { renderConversationOriginMarkerHtml } from './remote-relay-origin-view.mjs';
 import {
   normalizeConversationFilter,
   filterConversations,
@@ -349,10 +350,12 @@ export function renderConvList() {
     const providerIndicatorHtml = providerIndicatorLabel
       ? `<span class="conv-provider-indicator"${providerIndicatorKey ? ` data-provider="${providerIndicatorKey}"` : ''}>${providerIndicatorLabel}</span>`
       : '';
+    // "↗ win-test": another relay's agent created this conversation.
+    const originMarkerHtml = renderConversationOriginMarkerHtml(c);
     return `
     <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}" onclick="openConversation('${c.id}')">
       <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${c.archived ? ' <span style="font-size:0.68rem;color:var(--muted)">(archived)</span>' : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${providerIndicatorHtml}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${originMarkerHtml}${providerIndicatorHtml}</div>
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
   }).join('')}${footerHtml}`;

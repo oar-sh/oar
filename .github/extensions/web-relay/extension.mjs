@@ -97,7 +97,12 @@ const bannerStateStore = createBannerStateStore({
 
 const buildPromptWithRelayContext = createRelayPromptBuilder({
   toolInstructions: RELAY_TOOL_INSTRUCTIONS,
-  getPreviewInstructions: createPreviewInstructionsProvider({ api }),
+  // With the OAR MCP server attached (session-worker-launch-service sets the
+  // flag), the CLI has a real `preview` tool: the HTTP-API instructions would
+  // only contradict it, so the section is dropped.
+  getPreviewInstructions: process.env.OAR_MCP_SERVER_ATTACHED === "1"
+    ? null
+    : createPreviewInstructionsProvider({ api }),
 });
 
 const managedServerLifecycle = createManagedServerLifecycle({

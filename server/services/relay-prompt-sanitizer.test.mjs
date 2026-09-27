@@ -47,6 +47,31 @@ test('a steered message\'s hidden note is stripped, with or without a mode marke
   assert.equal(stripRelayPromptContext(`see ${note}`), `see ${note}`);
 });
 
+// Remote relays: the mention hint rides in the queued prompt only, and any
+// displayed copy of that prompt (a transcript) must drop it. The header line
+// another relay writes on an agent's prompt is the agent's to read: the server
+// keeps it (POST /api/message runs this sanitizer on incoming text, and the
+// stored text must still carry it); the browser hides it when the message has
+// an origin.
+test('the remote relay mention hint is stripped wherever the prompt is displayed', async () => {
+  const { formatRemoteRelayMentionHint } = await import('./remote-relay-inbound.mjs');
+  const hint = formatRemoteRelayMentionHint([{ relayId: 'r-linux', name: 'linux-test', online: true, version: '0.9.4' }]);
+  assert.equal(stripRelayPromptContext(`ask @linux-test for the numbers\n\n${hint}`, 'agent'), 'ask @linux-test for the numbers');
+  assert.equal(
+    stripRelayPromptContext(`[Relay mode: agent] ask @linux-test for the numbers\n\n${hint}`, 'agent'),
+    'ask @linux-test for the numbers',
+  );
+});
+
+test('the header line of a remote agent\'s prompt survives, alone or behind a mode marker', async () => {
+  const { withRemotePromptHeader, formatRemotePromptHeader } = await import('../../shared/remote-relay-contract.mjs');
+  const origin = { relayName: 'win-test', conversationTitle: 'report builder', model: 'claude-sonnet-5' };
+  const text = withRemotePromptHeader('summarise the sidebar polish work', origin);
+  assert.equal(stripRelayPromptContext(text, 'agent'), text);
+  assert.equal(stripRelayPromptContext(`[Relay mode: agent] ${text}`, 'agent'), text);
+  assert.ok(stripRelayPromptContext(text).startsWith(`${formatRemotePromptHeader(origin)}\n\n`));
+});
+
 test('the slash-command guard the Claude worker puts in front of a "/x" is stripped', async () => {
   const { SLASH_COMMAND_GUARD, withSlashCommandGuard } = await import('../../shared/slash-command-guard.mjs');
   assert.equal(stripRelayPromptContext(withSlashCommandGuard('/help what is 3 + 4?')), '/help what is 3 + 4?');

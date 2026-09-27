@@ -1,5 +1,6 @@
 import { capThought } from '../../shared/thought-cap.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
+import { isRemoteRelayToolName, remoteRelayActivitySummary } from '../../shared/remote-relay-tool-core.mjs';
 
 const MAX_TOOL_DETAIL_LENGTH = 140;
 const REDACTED_THINKING_PLACEHOLDER = '[Reasoning redacted by the model provider]';
@@ -89,6 +90,12 @@ export function isSubagentToolName(name) {
 
 export function summarizeToolInput(toolName, input) {
   if (!input || typeof input !== 'object') return '';
+  // `mcp__relay__remote_relay` reads as what it does on which relay
+  // (`send → linux-test session 01234567: “…”`), not as its first argument.
+  if (isRemoteRelayToolName(toolName)) {
+    const summary = remoteRelayActivitySummary(input);
+    if (summary) return summary;
+  }
   const candidates = [
     input.command,
     input.file_path,

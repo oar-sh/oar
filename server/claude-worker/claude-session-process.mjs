@@ -35,6 +35,7 @@ import {
   isStaleAttemptError,
 } from './claude-turn-publisher.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { stripSteerNote, withSteerNoteContent } from '../../shared/steer-note.mjs';
@@ -484,6 +485,9 @@ export function createClaudeSessionRunner({
   // the socket link: a hold withdraws the relay's readiness, and its end
   // re-arms it at once so a held message steers into the resumed turn.
   onDeliveryReadinessChange = () => {},
+  // Whether CLI processes carry the relay's `remote_relay` tool
+  // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
+  remoteRelayToolGate = null,
   dbg = () => {},
 } = {}) {
   const publisher = createClaudeTurnPublisher({
@@ -491,6 +495,13 @@ export function createClaudeSessionRunner({
     dbg,
     takeWorkflowRuns: () => drainSettledWorkflowRuns(),
   });
+  // `remote_relay` is registered only while this relay has paired remotes.
+  // Asked once when the worker starts, and again whenever a CLI process winds
+  // down, so a remote paired later reaches the next process. A cold spawn
+  // waits for the pending answer (handlePendingPayload): the tool list is
+  // fixed per process, and the first delivery can beat the startup GET.
+  const remoteRelayGate = remoteRelayToolGate || createRemoteRelayToolGate({ api });
+  void remoteRelayGate.refresh();
   const resolveWorkflowSessionDir = resolveWorkflowSessionDirImpl || createDefaultWorkflowSessionDirResolver();
   let claudeNativeSessionId = '';
   let proc = null;
@@ -2672,6 +2683,8 @@ export function createClaudeSessionRunner({
 
   async function cleanupProcess(processRef, streamError) {
     const wasCurrent = proc === processRef;
+    // The next spawn reads the registration decision; refresh it now.
+    if (wasCurrent) void remoteRelayGate.refresh();
     stopLifecycleTimer(processRef);
     if (processRef.taskPublishTimer) {
       clearTimeout(processRef.taskPublishTimer);
@@ -2903,6 +2916,7 @@ export function createClaudeSessionRunner({
         || sdkSessionId
         || '',
       ),
+      remoteRelayTool: remoteRelayGate.isEnabled(),
       dbg,
     });
     processRef.lifecycleTimer = setInterval(() => evaluateLifecycle(), lifecyclePollMs);
@@ -2940,18 +2954,10 @@ export function createClaudeSessionRunner({
     // A mode change that would alter the spawn-time system prompt append gets
     // a fresh process — but only when nothing lives in the old one.
     if (modeAppendClass(relayMode) !== proc.appendClass && !hasLiveWork() && !proc.liveTasks.size) {
-      const previous = proc;
       gracefulShutdown('mode-change');
-      await Promise.race([
-        previous.consumer,
-        new Promise((resolve) => setTimeout(resolve, 10_000)),
-      ]);
-      if (proc === previous) {
-        // The drain timed out: force the old CLI down so it cannot keep
-        // streaming next to the replacement the caller is about to spawn.
-        try { previous.turn.close?.(); } catch {}
-        proc = null;
-      }
+      // A drain that times out forces the old CLI down so it cannot keep
+      // streaming next to the replacement the caller is about to spawn.
+      await drainClosingProcess(10_000);
       return null;
     }
 
@@ -3173,6 +3179,25 @@ export function createClaudeSessionRunner({
     return { turnActive, canSteer, holdReason, messageId, supported: true };
   }
 
+  /**
+   * A closing process drains on its own; wait (bounded) so two CLIs never
+   * share the native session transcript, then make sure it is gone.
+   */
+  async function drainClosingProcess(timeoutMs = 15_000) {
+    const previous = proc;
+    if (!previous) return;
+    let timer = null;
+    await Promise.race([
+      previous.consumer,
+      new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+    clearTimeout(timer);
+    if (proc === previous) {
+      try { previous.turn.close?.(); } catch {}
+      proc = null;
+    }
+  }
+
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
@@ -3204,20 +3229,22 @@ export function createClaudeSessionRunner({
         await adaptProcess(message);
       }
       if (!proc || proc.closing || proc.aborted) {
-        // A closing process drains on its own; wait so two CLIs never share
-        // the native session transcript.
-        const previous = proc;
-        if (previous) {
-          await Promise.race([
-            previous.consumer,
-            new Promise((resolve) => setTimeout(resolve, 15_000)),
-          ]);
-          if (proc === previous) {
-            try { previous.turn.close?.(); } catch {}
-            proc = null;
-          }
-        }
-        spawnProcess(message);
+        // Awaited only when there is one: a cold spawn with the decision
+        // already in pushes synchronously.
+        if (proc) await drainClosingProcess();
+        // The tool set is fixed per CLI process: let the remote_relay
+        // decision settle first. The worker's first delivery can arrive
+        // before its startup GET has answered (seen live: 180 ms after the
+        // spawn). ready() never rejects and is bounded by the gate's timeout.
+        if (!remoteRelayGate.isSettled?.()) await remoteRelayGate.ready();
+        // Another delivery spawned while this one waited: join that process
+        // like any delivery (between turns: adapt; mid-turn: steer below).
+        if (proc && !proc.closing && !proc.aborted && !proc.activeCtx) await adaptProcess(message);
+        // What it joined may be gone by now: that adapt can recycle the
+        // process (a mode change), and a process can wind down under any of
+        // these waits. Only a live one takes the push below.
+        if (proc && (proc.closing || proc.aborted)) await drainClosingProcess();
+        if (!proc) spawnProcess(message);
         // A cold start is the one moment a turn can sit silent for many
         // seconds (transcript load + first request); say so instead of
         // showing bare dots. Posted once here — not in spawnProcess — so a

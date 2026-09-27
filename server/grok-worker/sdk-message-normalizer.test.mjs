@@ -115,6 +115,25 @@ test('a task-shaped tool call opens a subagent run (the category never matches)'
   assert.equal(terminal.payload.status, 'completed');
 });
 
+test('a remote_relay call through the OAR MCP server reads as its action and target', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const actions = normalizer.normalizeAcpUpdate({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'tc-rr-1',
+    title: 'oar/remote_relay',
+    kind: 'other',
+    status: 'pending',
+    rawInput: { action: 'create_session', relay: 'linux-test', text: 'sidebar polish' },
+  });
+  assert.equal(
+    actions.find((a) => a.channel === 'activity').payload.text,
+    'Tool (remote_relay): create_session → linux-test: “sidebar polish”',
+  );
+  // An explicit name wins over the title; a frame without arguments stays generic.
+  assert.equal(formatToolActivityText('mcp__oar__remote_relay', { action: 'list_relays' }, 'Remote relay'), 'Tool (remote_relay): list_relays');
+  assert.equal(formatToolActivityText('', null, 'remote_relay'), 'Tool (remote_relay)');
+});
+
 test('formatToolActivityText and classifyGrokError are pure helpers', () => {
   assert.match(formatToolActivityText('bash', { command: 'ls -la' }), /bash/);
   const auth = classifyGrokError(new Error('not logged in'));

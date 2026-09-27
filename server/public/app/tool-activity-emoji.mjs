@@ -31,6 +31,10 @@ export function prefixToolActivityEmoji(text) {
   if (/^Tool \((create_file|write)\)/i.test(value)) return `🆕 ${value}`;
   if (/^Tool \((bash|shell|terminal)\)/i.test(value)) return `🔧 ${value}`;
   if (/^Tool \((sql|sqlite)\)/i.test(value)) return `🗄️ ${value}`;
+  // Work on another OAR relay. Claude's raw name is mcp__relay__remote_relay and
+  // the Copilot CLI names MCP tools <server>-<tool> (oar-remote_relay); the
+  // activity normalisers strip both, but a line that kept one matches too.
+  if (/^Tool \((?:mcp__[a-z0-9_-]+__|[a-z0-9_]+-)?remote_relay\)/i.test(value)) return `🛰️ ${value}`;
   if (/^Tool \(/i.test(value)) return `🛠️ ${value}`;
   return `ℹ️ ${value}`;
 }

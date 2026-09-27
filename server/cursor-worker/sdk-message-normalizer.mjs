@@ -1,6 +1,11 @@
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { capThought } from '../../shared/thought-cap.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
+import {
+  REMOTE_RELAY_TOOL_NAME,
+  isRemoteRelayToolName,
+  remoteRelayActivitySummary,
+} from '../../shared/remote-relay-tool-core.mjs';
 
 const MAX_TOOL_DETAIL_LENGTH = 140;
 const SUBAGENT_TOOL_NAMES = new Set(['task', 'agent']);
@@ -39,7 +44,27 @@ export function summarizeToolInput(toolName, input) {
   }
 }
 
+/**
+ * The relay's custom tools reach the stream as the SDK's generic MCP call
+ * (`name: 'mcp'`, args `{ providerIdentifier: 'custom-user-tools', toolName,
+ * args }`). `remote_relay` is shown as itself with the contract's one-line
+ * summary, so the transcript reads `Tool (remote_relay): send → …` like every
+ * other provider's; null for any other tool.
+ */
+function remoteRelayCallArgs(toolName, input) {
+  if (isRemoteRelayToolName(toolName)) return input || {};
+  if (String(toolName || '').trim().toLowerCase() !== 'mcp' || !input || typeof input !== 'object') return null;
+  return isRemoteRelayToolName(input.toolName) ? (input.args || {}) : null;
+}
+
 export function formatToolActivityText(toolName, input) {
+  const remoteArgs = remoteRelayCallArgs(toolName, input);
+  if (remoteArgs) {
+    const remoteSummary = remoteRelayActivitySummary(remoteArgs);
+    return truncate(remoteSummary
+      ? `Tool (${REMOTE_RELAY_TOOL_NAME}): ${remoteSummary}`
+      : `Tool (${REMOTE_RELAY_TOOL_NAME})`);
+  }
   const summary = summarizeToolInput(toolName, input);
   return truncate(summary ? `Tool (${toolName}): ${summary}` : `Tool (${toolName})`);
 }

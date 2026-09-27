@@ -12,6 +12,8 @@ import {
 } from './cursor-sdk-adapter.mjs';
 import { createAskUserTool } from './cursor-ask-user-tool.mjs';
 import { createPreviewTool } from './cursor-preview-tool.mjs';
+import { createRemoteRelayTool } from './cursor-remote-relay-tool.mjs';
+import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import {
   buildCursorSubagentAgents,
   cursorSubagentRosterFingerprint,
@@ -120,6 +122,9 @@ export function createCursorTurnRunner({
   resolveModelParamsImpl = resolveCursorReasoningParams,
   createNormalizerImpl = createSdkMessageNormalizer,
   buildUserMessageImpl = buildCursorUserMessage,
+  // Whether agent handles carry the relay's `remote_relay` tool
+  // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
+  remoteRelayToolGate = null,
   dbg = () => {},
 } = {}) {
   // Unlike the Claude worker, the agent handle (and the custom tools bound
@@ -140,6 +145,9 @@ export function createCursorTurnRunner({
   // Open ask_user round-trips: the merged-stream stall watchdog defers while
   // a human is thinking about a question card.
   let pendingAskUserCalls = 0;
+  // Running remote_relay calls, same family: the relay may be waiting up to
+  // 600 s for a remote turn (plus an approval card) with no SDK traffic.
+  let pendingRemoteRelayCalls = 0;
   // Mirrors the Copilot extension's lastPromptedRelayMode: full mode
   // instructions ride on the first message of a mode and on mode changes only.
   let lastNudgedRelayMode = '';
@@ -188,6 +196,39 @@ export function createCursorTurnRunner({
       execute: previewTool.execute,
     },
   };
+  // `remote_relay` joins the set only while this relay has paired remotes.
+  // Asked once when the worker starts; the first handle waits for the answer
+  // (it is created asynchronously anyway), and every handle creation refreshes
+  // it so a later rebuild picks up a remote paired in the meantime.
+  const remoteRelayGate = remoteRelayToolGate || createRemoteRelayToolGate({ api });
+  void remoteRelayGate.refresh();
+  const remoteRelayTool = createRemoteRelayTool({
+    api,
+    getConversationId: () => activeMessage?.conversationId || sdkSessionId || '',
+    onCallStart: () => { pendingRemoteRelayCalls += 1; },
+    onCallEnd: () => { pendingRemoteRelayCalls -= 1; },
+    // The running turn's signal, read when the call starts: a Stop (or the
+    // auth retry burning a dead attempt) cancels the pending relay request.
+    // Between turns there is none — the last turn's may be aborted already.
+    getAbortSignal: () => (waitingForTurn ? currentAbortController?.signal || null : null),
+    dbg,
+  });
+
+  function customToolsForHandle() {
+    if (!remoteRelayGate.isEnabled()) return customTools;
+    return {
+      ...customTools,
+      [remoteRelayTool.name]: {
+        description: remoteRelayTool.description,
+        inputSchema: remoteRelayTool.inputSchema,
+        execute: remoteRelayTool.execute,
+      },
+    };
+  }
+
+  function hasPendingClientWork() {
+    return pendingAskUserCalls > 0 || pendingRemoteRelayCalls > 0;
+  }
 
   function getActiveQueueMessageId() {
     return waitingForTurn ? String(activeMessage?.id || '') : '';
@@ -262,7 +303,9 @@ export function createCursorTurnRunner({
     if (!agentHandle) {
       const durableId = String(message.cursorAgentId || '').trim() || cursorAgentId;
       const agents = buildCursorSubagentAgents(rosterModels);
-      const options = { apiKey, model, cwd, storeDir, sdkSessionId, customTools, agents, dbg };
+      await remoteRelayGate.ready();
+      const options = { apiKey, model, cwd, storeDir, sdkSessionId, customTools: customToolsForHandle(), agents, dbg };
+      void remoteRelayGate.refresh();
       try {
         agentHandle = await createAgentHandleImpl({ ...options, agentId: durableId });
       } catch (error) {
@@ -565,7 +608,7 @@ export function createCursorTurnRunner({
             // The SDK's documented recovery for a wedged persisted run —
             // armed by the second busy retry below.
             sendLocal: forceNextSend ? { force: true } : null,
-            hasPendingClientWork: () => pendingAskUserCalls > 0,
+            hasPendingClientWork,
             dbg,
           });
           forceNextSend = false;

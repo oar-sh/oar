@@ -116,7 +116,15 @@ test('launchSessionCli still spawns the copilot CLI for non-claude workers witho
     execFileSyncImpl: () => { throw new Error('tmux missing'); },
     processInspector: { findProcessForSession: () => null },
     allowProcessReuse: false,
+    // The extension engine's OAR MCP config file; faked so nothing is written.
+    prepareOarMcpConfigImpl: () => '/workspace/logs/worker-session-4.mcp.json',
   });
   assert.equal(spawnCalls[0].command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0].args, ['--allow-all', '--session-id', 'session-4']);
+  assert.deepEqual(spawnCalls[0].args, [
+    '--allow-all',
+    '--session-id',
+    'session-4',
+    '--additional-mcp-config',
+    '@/workspace/logs/worker-session-4.mcp.json',
+  ]);
 });

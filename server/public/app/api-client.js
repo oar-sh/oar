@@ -457,6 +457,91 @@ export async function updatePwaAppNameSetting(appName) {
   });
 }
 
+// ─── Remote relays (Settings → Relays) ───────────────────────────────────────
+// Adding a relay has several distinct refusals the form has to tell apart
+// (needs a token, this is this relay, bad address), so these calls hand back
+// the relay's JSON body on failure too — `{ ok:false, status, code, error }` —
+// instead of apiFetch's bare null. They never throw; null only when network
+// requests are paused.
+
+async function remoteRelayRequest(path, { method = 'GET', body = undefined, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}${path}`, {
+      signal: requestTimeoutSignal(timeoutMs),
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    const payload = await response.json().catch(() => null);
+    noteFetchSuccess();
+    const result = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+    if (!response.ok) {
+      return {
+        ...result,
+        ok: false,
+        status: response.status,
+        error: String(result.error || `Request failed (${response.status})`),
+      };
+    }
+    return { ok: true, ...result, status: response.status };
+  } catch (error) {
+    noteFetchFailure(path, error);
+    return { ok: false, status: 0, code: 'NETWORK', error: toErrorMessage(error) };
+  }
+}
+
+function remoteRelayPath(id, suffix = '') {
+  return `/api/remote-relays/${encodeURIComponent(String(id || '').trim())}${suffix}`;
+}
+
+/** `{ relays, self }`; never carries tokens. Null on any failure. */
+export async function loadRemoteRelays() {
+  return apiFetch('/api/remote-relays');
+}
+
+/**
+ * Probes and saves a remote relay, and (pairBack) asks it to add this relay.
+ * The probe and the pair-back are two remote round trips of up to 15 s each,
+ * hence the long timeout.
+ */
+export async function addRemoteRelay({ url, token = '', pairBack = true, selfUrl = '' } = {}) {
+  const body = { url: String(url || '').trim(), pairBack: pairBack !== false };
+  const trimmedToken = String(token || '').trim();
+  if (trimmedToken) body.token = trimmedToken;
+  const trimmedSelfUrl = String(selfUrl || '').trim();
+  if (trimmedSelfUrl) body.selfUrl = trimmedSelfUrl;
+  return remoteRelayRequest('/api/remote-relays', { method: 'POST', body, timeoutMs: LONG_REQUEST_TIMEOUT_MS });
+}
+
+/** `patch`: any of `{ permission, url, token, tokenMode }`. */
+export async function updateRemoteRelay(id, patch = {}) {
+  return remoteRelayRequest(remoteRelayPath(id), { method: 'PATCH', body: patch || {} });
+}
+
+export async function removeRemoteRelay(id) {
+  return remoteRelayRequest(remoteRelayPath(id), { method: 'DELETE' });
+}
+
+export async function checkRemoteRelay(id) {
+  return remoteRelayRequest(remoteRelayPath(id, '/check'), { method: 'POST', body: {}, timeoutMs: LONG_REQUEST_TIMEOUT_MS });
+}
+
+/** `{ publicUrl, inboundEnabled }` for this relay. */
+export async function loadRemoteRelaySettings() {
+  return apiFetch('/api/settings/remote-relays');
+}
+
+export async function updateRemoteRelaySettings(patch = {}) {
+  const body = {};
+  if (typeof patch.publicUrl === 'string') body.publicUrl = patch.publicUrl.trim();
+  if (typeof patch.inboundEnabled === 'boolean') body.inboundEnabled = patch.inboundEnabled;
+  return remoteRelayRequest('/api/settings/remote-relays', { method: 'POST', body });
+}
+
 export async function loadUpdateState() {
   return apiFetch('/api/update/state');
 }

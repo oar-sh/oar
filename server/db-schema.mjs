@@ -10,6 +10,7 @@
 import { rebuildRecentWorkspaceRootsTable } from './migrations/0002-recent-workspace-roots-path-key.mjs';
 import { ensurePushSubscriptionsTable } from './migrations/0003-push-subscriptions.mjs';
 import { migrateSteerSettleMarkers } from './migrations/0004-steer-settle-markers.mjs';
+import { migrateRemoteRelays } from './migrations/0005-remote-relays.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -701,6 +702,13 @@ try {
   }
 } catch (error) {
   console.warn(`[steering] migration 0004 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Remote relays: additive columns and the unlock table. Readers tolerate their
+// absence, so a failure is logged and retried next boot like 0004.
+try {
+  migrateRemoteRelays(db);
+} catch (error) {
+  console.warn(`[remote-relays] migration 0005 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

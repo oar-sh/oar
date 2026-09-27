@@ -193,7 +193,7 @@ where supported (with standalone fallback), and hides install/fullscreen header 
 When opened in a regular browser tab, the in-app **Install** button remains available
 in the chat header (shown as `⬇` on small screens).
 
-You can rename the installed app label from **⚙️ Settings → Install app name**.
+You can rename the installed app label from **⚙️ Settings → Relay name** (paired relays know this relay by the same name).
 The name is stored on the relay (app settings) and served in the web app manifest
 to every browser and origin (LAN and tunnel agree), so future installs pick it up
 immediately and already-installed Android apps receive it through Chrome's normal
@@ -846,6 +846,17 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/openai/images/generate` | Generate images for an OpenAI Image conversation |
 | POST | `/api/image-operations/:operationId/execute` | Execute a queued image generation/edit operation |
 | GET | `/api/generated-image/:conversationId/:messageId/:imageId/content` | Stream a generated image blob |
+| GET | `/api/relay/identity` | This relay's identity for paired relays: `relayId`, `name` (the PWA app name, else the hostname), `version`, `platform`, `publicUrl`, `remoteRelays.{protocol, inbound}` |
+| GET | `/api/remote-relays` | Paired remote relays with their status (`relays[]`, never a token) plus `self` |
+| POST | `/api/remote-relays` | Pair a relay from a pasted web address (`url`, optional `token`, `pairBack`, `selfUrl`); `{ needsToken: true }` when neither token works |
+| PATCH | `/api/remote-relays/:id` | Change a paired relay's `permission` (`read` / `prompt` / `full`), URL or token |
+| DELETE | `/api/remote-relays/:id` | Remove a paired relay here (the other side keeps its entry) |
+| POST | `/api/remote-relays/:id/check` | Probe a paired relay now |
+| POST | `/api/remote-relays/pair` | (Relay to relay) Another relay introduces itself after the user paired it there |
+| GET | `/api/remote-relays/summary` | (Worker) Number of paired relays; workers register `remote_relay` only when it is above zero |
+| POST | `/api/remote-relays/tool` | (Worker) One `remote_relay` tool call: `{ conversationId, action, args }`. The relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote |
+| GET | `/api/remote-relays/inflight` | (Worker) Number of `remote_relay` calls running for `conversationId` |
+| GET/POST | `/api/settings/remote-relays` | This relay's `publicUrl` and `inboundEnabled` (accept prompts from other relays' agents) |
 
 ### Manual relay shutdown / self-restart
 
@@ -1402,6 +1413,10 @@ and on `messages`:
 
 - `hidden_from_shares` / `share_hidden_at` — per-message share visibility (see
   [Conversation sharing](#conversation-sharing-and-per-message-visibility))
+
+`0005-remote-relays.mjs` adds `origin_json` to `messages` and `conversations` (provenance of
+prompts and sessions another relay's agent created) and the table
+`conversation_remote_relay_unlocks` (the remote relays the user mentioned per conversation).
 
 New tables are likewise created at startup with `CREATE TABLE IF NOT EXISTS` in both the fresh-schema
 and migration blocks — most recently `workflow_runs` (final workflow digest per assistant message,

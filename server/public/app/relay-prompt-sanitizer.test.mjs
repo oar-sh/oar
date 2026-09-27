@@ -1,7 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
+import { stripRelayPromptContext, stripRemoteRelayDisplayArtifacts } from './relay-prompt-sanitizer.mjs';
+import { withRemotePromptHeader } from '../../../shared/remote-relay-contract.mjs';
+
+const ORIGIN = {
+  kind: 'agent',
+  relayId: 'relay-a',
+  relayName: 'win-test',
+  relayUrl: 'https://relay-a.example.test',
+  conversationId: 'conv-a',
+  conversationTitle: 'report builder',
+  provider: 'claude',
+  model: 'claude-sonnet-5',
+  hops: 1,
+};
+const MENTION_HINT = '<system_reminder>The user mentioned the remote OAR relay "linux-test" (online, OAR 0.9.4). Use the remote_relay tool for work there.</system_reminder>';
 
 test('browser stripRelayPromptContext handles datetime and system reminder wrappers', () => {
   const input = [
@@ -47,4 +61,33 @@ test('the slash-command guard the Claude worker puts in front of a "/x" is strip
   assert.equal(stripRelayPromptContext(`[Relay mode: agent] ${SLASH_COMMAND_GUARD}/x`, 'agent'), '/x');
   assert.equal(stripRelayPromptContext(`${SLASH_COMMAND_GUARD}hello`), `${SLASH_COMMAND_GUARD}hello`);
   assert.equal(stripRelayPromptContext('/review this'), '/review this');
+});
+
+test('the remote prompt header is hidden only on a message that carries origin', () => {
+  const stored = withRemotePromptHeader('run the suite and report back', ORIGIN);
+  assert.equal(stripRelayPromptContext(stored, 'agent', { origin: ORIGIN }), 'run the suite and report back');
+  // No origin: a human who pasted such a line sees it as typed.
+  assert.equal(stripRelayPromptContext(stored, 'agent'), stored);
+  assert.equal(stripRelayPromptContext(stored, 'agent', {}), stored);
+  // Behind a mode marker (a runtime-stored prompt) and behind a steer note.
+  const note = '[Sent while you were still working on my previous message. If that request is not finished yet, finish it too; do not drop it unless this message says so.]';
+  assert.equal(stripRelayPromptContext(`[Relay mode: agent] ${stored}`, 'agent', { origin: ORIGIN }), 'run the suite and report back');
+  assert.equal(stripRelayPromptContext(`${note}\n\n${stored}`, '', { origin: ORIGIN }), 'run the suite and report back');
+  // A header with nothing after it is not turned into nothing.
+  assert.match(stripRelayPromptContext('[Remote prompt from an agent on relay "win-test" · acting for the user]', '', { origin: ORIGIN }), /^\[Remote prompt/);
+});
+
+test('the mention hint never reaches a bubble', () => {
+  assert.equal(stripRelayPromptContext(`ask @linux-test to run it\n\n${MENTION_HINT}`, 'agent'), 'ask @linux-test to run it');
+  assert.equal(stripRemoteRelayDisplayArtifacts(`ask @linux-test to run it\n\n${MENTION_HINT}`), 'ask @linux-test to run it');
+});
+
+test('display cleanup leaves ordinary text alone', () => {
+  const stored = withRemotePromptHeader('run the suite', ORIGIN);
+  assert.equal(stripRemoteRelayDisplayArtifacts(stored, { origin: ORIGIN }), 'run the suite');
+  assert.equal(stripRemoteRelayDisplayArtifacts(stored), stored);
+  for (const text of ['', '  indented\ntext  ', 'see <system_reminder>other</system_reminder>', '@linux-test hi']) {
+    assert.equal(stripRemoteRelayDisplayArtifacts(text), text);
+    assert.equal(stripRemoteRelayDisplayArtifacts(text, { origin: ORIGIN }), text);
+  }
 });

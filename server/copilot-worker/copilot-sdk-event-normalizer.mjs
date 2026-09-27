@@ -22,6 +22,11 @@
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { capThought } from '../../shared/thought-cap.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
+import {
+  REMOTE_RELAY_TOOL_NAME,
+  isRemoteRelayToolName,
+  remoteRelayActivitySummary,
+} from '../../shared/remote-relay-tool-core.mjs';
 
 const MAX_TOOL_DETAIL_LENGTH = 140;
 
@@ -78,8 +83,13 @@ export function summarizeToolInput(input) {
 }
 
 export function formatToolActivityText(toolName, input) {
-  const name = String(toolName || '').trim() || 'tool';
-  const summary = summarizeToolInput(input);
+  const rawName = String(toolName || '').trim() || 'tool';
+  // `remote_relay` (bare, or namespaced by an MCP server) reads as what it
+  // does on which relay (`send → linux-test session 01234567: “…”`); its
+  // arguments may arrive as a JSON string.
+  const isRemoteRelay = isRemoteRelayToolName(rawName);
+  const name = isRemoteRelay ? REMOTE_RELAY_TOOL_NAME : rawName;
+  const summary = (isRemoteRelay && remoteRelayActivitySummary(input)) || summarizeToolInput(input);
   return truncate(summary ? `Tool (${name}): ${summary}` : `Tool (${name})`);
 }
 

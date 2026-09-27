@@ -6,6 +6,16 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import {
+  OAR_MCP_SERVER_NAME,
+  OAR_MCP_SERVER_SCRIPT_PATH,
+  OAR_MCP_TOOL_TIMEOUT_MS,
+  buildOarMcpServerLaunch,
+  isOarMcpServerDisabled,
+} from '../mcp/oar-mcp-server.mjs';
+
+export { isOarMcpServerDisabled };
+
 function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
 }
@@ -302,7 +312,7 @@ function resolveNodeWorkerDescriptor(env = {}) {
   };
 }
 
-function buildPosixWorkerLaunchCommand(targetSessionId, env = {}) {
+function buildPosixWorkerLaunchCommand(targetSessionId, env = {}, extraCliArgs = []) {
   const nodeWorker = resolveNodeWorkerDescriptor(env);
   if (nodeWorker) {
     const nodeExecutable = normalizeText(env?.COPILOT_WEB_RELAY_NODE) || 'node';
@@ -312,7 +322,88 @@ function buildPosixWorkerLaunchCommand(targetSessionId, env = {}) {
     || normalizeText(env?.COPILOT_CLI_EXECUTABLE)
     || normalizeText(env?.COPILOT_CLI_PATH)
     || 'copilot';
-  return `${shellQuote(cliExecutable)} --allow-all --session-id ${shellQuote(targetSessionId)}`;
+  const extra = (Array.isArray(extraCliArgs) ? extraCliArgs : []).map((arg) => ` ${shellQuote(arg)}`).join('');
+  return `${shellQuote(cliExecutable)} --allow-all --session-id ${shellQuote(targetSessionId)}${extra}`;
+}
+
+// ─── The OAR MCP server for the extension engine ─────────────────────────────
+//
+// The Copilot CLI takes extra MCP servers per run through
+// `--additional-mcp-config <json>`, where `<json>` may be `@<file>` (CLI
+// 1.0.83 `--help`: "JSON string or file path (prefix with @)"; the file is
+// read as UTF-8 and merged over ~/.copilot/mcp-config.json for that run
+// only). The config goes to a file rather than inline: the argument then
+// crosses cmd.exe/`start` on Windows and `sh -lc` + `script -c` on the tmux
+// path as one plain path, with no JSON to escape through two shells.
+//
+// Server entry shape (the CLI's own `copilot mcp add` writes the same):
+// `{ type: 'local', command, args, env, tools: ['*'], timeout }`. `timeout` is
+// the per-call limit in ms; without it the CLI cuts a tool call off at 180 s,
+// shorter than one remote_relay wait.
+
+export function resolveOarMcpServerScriptPath(env = {}, { pathImpl = path } = {}) {
+  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
+  if (repoRoot) return pathImpl.join(repoRoot, 'server', 'mcp', 'oar-mcp-server.mjs');
+  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
+  if (serverDir) return pathImpl.join(serverDir, 'mcp', 'oar-mcp-server.mjs');
+  return OAR_MCP_SERVER_SCRIPT_PATH;
+}
+
+/** The `--additional-mcp-config` document for one extension-engine session. */
+export function buildCopilotOarMcpConfig(targetSessionId, env = {}, {
+  nodePath = normalizeText(env?.COPILOT_WEB_RELAY_NODE) || process.execPath,
+  pathImpl = path,
+} = {}) {
+  const launch = buildOarMcpServerLaunch({
+    nodePath,
+    conversationId: targetSessionId,
+    env,
+    scriptPath: resolveOarMcpServerScriptPath(env, { pathImpl }),
+  });
+  return {
+    mcpServers: {
+      [OAR_MCP_SERVER_NAME]: {
+        type: 'local',
+        command: launch.command,
+        args: launch.args,
+        env: launch.env,
+        tools: ['*'],
+        timeout: OAR_MCP_TOOL_TIMEOUT_MS,
+      },
+    },
+  };
+}
+
+/**
+ * Writes the session's MCP config next to its worker log and returns the file
+ * path, or null — best-effort like the log itself: a session that cannot get
+ * the file still starts, just without the OAR tools. No secrets go in: the
+ * server reads the token from the relay config the file points at.
+ */
+export function prepareOarMcpConfigFile(targetSessionId, launchEnv = {}, {
+  fsImpl = fs,
+  pathImpl = path,
+  nodePath = undefined,
+} = {}) {
+  if (isOarMcpServerDisabled(launchEnv)) return null;
+  try {
+    const config = buildCopilotOarMcpConfig(targetSessionId, launchEnv, {
+      pathImpl,
+      ...(nodePath ? { nodePath } : {}),
+    });
+    const baseDir = resolveWorkerLogDir(launchEnv, { pathImpl });
+    fsImpl.mkdirSync(baseDir, { recursive: true });
+    const filePath = pathImpl.join(baseDir, `worker-${safeWorkerFileId(targetSessionId)}.mcp.json`);
+    fsImpl.writeFileSync(filePath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    return filePath;
+  } catch {
+    return null;
+  }
+}
+
+function oarMcpCliArgs(configFilePath) {
+  const filePath = normalizeText(configFilePath);
+  return filePath ? ['--additional-mcp-config', `@${filePath}`] : [];
 }
 
 export function normalizeTmuxSessionName(targetSessionId) {
@@ -418,20 +509,28 @@ export function createWorkerSecretEnvFile(env = {}, {
  * incident undiagnosable. Best-effort by design: a log problem must never
  * block a worker spawn. Naive rotation: >10 MB rolls to `<file>.1`.
  */
+function resolveWorkerLogDir(launchEnv = {}, { pathImpl = path } = {}) {
+  const explicitDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_LOG_DIR);
+  const serverDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_SERVER_DIR);
+  // `new URL(...).pathname` yields '/C:/git/...' on Windows, which pathImpl.join
+  // then mangles into '\C:\git\...'; fileURLToPath decodes it to a real host path.
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  return explicitDir
+    || (serverDir ? pathImpl.join(serverDir, 'logs') : pathImpl.join(moduleDir, '..', 'logs'));
+}
+
+function safeWorkerFileId(targetSessionId) {
+  return String(targetSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'worker';
+}
+
 export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, {
   fsImpl = fs,
   pathImpl = path,
 } = {}) {
   try {
-    const explicitDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_LOG_DIR);
-    const serverDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_SERVER_DIR);
-    // `new URL(...).pathname` yields '/C:/git/...' on Windows, which pathImpl.join
-    // then mangles into '\C:\git\...'; fileURLToPath decodes it to a real host path.
-    const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-    const baseDir = explicitDir
-      || (serverDir ? pathImpl.join(serverDir, 'logs') : pathImpl.join(moduleDir, '..', 'logs'));
+    const baseDir = resolveWorkerLogDir(launchEnv, { pathImpl });
     fsImpl.mkdirSync(baseDir, { recursive: true });
-    const safeId = String(targetSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'worker';
+    const safeId = safeWorkerFileId(targetSessionId);
     const logPath = pathImpl.join(baseDir, `worker-${safeId}.log`);
     try {
       const stats = fsImpl.statSync(logPath);
@@ -446,6 +545,9 @@ export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, {
 export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
   secretEnvFilePath = '',
   workerLogPath = '',
+  // Extension engine only: appended to the CLI command, each shell-quoted
+  // (and quoted again with it for `script -c`).
+  extraCliArgs = [],
 } = {}) {
   const launchEnv = {
     ...env,
@@ -503,6 +605,10 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     'GROK_RELAY_MODEL',
     'GROK_CLI_COMMAND',
     'GROK_ALWAYS_APPROVE',
+    // The OAR MCP server kill switch (the Grok worker reads it too), and the
+    // extension engine's "it is attached" marker.
+    'OAR_MCP_SERVER',
+    'OAR_MCP_SERVER_ATTACHED',
     'SESSION_ID',
     'COPILOT_WORKSPACE_ROOT',
     'INIT_CWD',
@@ -515,7 +621,7 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
   const secretPrefix = normalizedSecretEnvFilePath
     ? `. ${shellQuote(normalizedSecretEnvFilePath)} || exit $?; rm -f ${shellQuote(normalizedSecretEnvFilePath)}; rmdir ${shellQuote(path.dirname(normalizedSecretEnvFilePath))}; `
     : '';
-  const workerCommand = buildPosixWorkerLaunchCommand(targetSessionId, launchEnv);
+  const workerCommand = buildPosixWorkerLaunchCommand(targetSessionId, launchEnv, extraCliArgs);
   if (resolveNodeWorkerDescriptor(launchEnv)) {
     // Node workers (Claude, Cursor, Grok) are plain processes; no pseudo-TTY
     // needed. Their output is teed to the worker log so a crash leaves a
@@ -574,6 +680,9 @@ export async function launchSessionCli({
   detachedPollDelayMs = 200,
   allowProcessReuse = true,
   createSecretEnvFileImpl = createWorkerSecretEnvFile,
+  // Extension engine: writes the session's OAR MCP config, returns its path
+  // (or null to launch without it).
+  prepareOarMcpConfigImpl = prepareOarMcpConfigFile,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
@@ -610,6 +719,14 @@ export async function launchSessionCli({
     ...launchEnv,
     SESSION_ID: target,
   };
+  // The extension engine gets the OAR MCP server (remote_relay + preview) the
+  // node workers carry in-process; every launch path appends the same args.
+  const extensionCliArgs = resolveNodeWorkerDescriptor(launchSessionEnv)
+    ? []
+    : oarMcpCliArgs(prepareOarMcpConfigImpl(target, launchSessionEnv));
+  // Tells the in-CLI web-relay extension that `preview` is a real tool in this
+  // session, so its prompt context need not teach the HTTP fallback.
+  if (extensionCliArgs.length) launchSessionEnv.OAR_MCP_SERVER_ATTACHED = '1';
 
   if (isTmuxAvailable({ platform, execFileSyncImpl })) {
     const sessionName = normalizeTmuxSessionName(target);
@@ -647,6 +764,7 @@ export async function launchSessionCli({
         buildTmuxWorkerShellCommand(target, launchSessionEnv, {
           secretEnvFilePath: secretEnvFile?.filePath,
           workerLogPath: tmuxWorkerLogPath || '',
+          extraCliArgs: extensionCliArgs,
         }),
       ], {
         env: tmuxEnv,
@@ -717,10 +835,11 @@ export async function launchSessionCli({
         '--allow-all',
         '--session-id',
         target,
+        ...extensionCliArgs,
       ])
     : (nodeWorker
       ? [nodeWorker.scriptPath, '--session-id', target]
-      : ['--allow-all', '--session-id', target]);
+      : ['--allow-all', '--session-id', target, ...extensionCliArgs]);
   // POSIX node workers tee stdout/stderr into the worker log (a crash must
   // leave a trail). On win32 the `start` intermediary opens its own console,
   // so fd inheritance cannot reach the worker — its window shows the output.

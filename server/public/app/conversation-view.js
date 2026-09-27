@@ -57,6 +57,9 @@ import { buildWorkflowRunCard } from './background-tasks-view.mjs';
 import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
 import { buildTranscriptPreviewCard } from './preview-cards.mjs';
 import { closeSlashAutocomplete, handleSlashAutocompleteKey, updateSlashAutocomplete } from './slash-autocomplete.mjs';
+import { closeMentionAutocomplete, handleMentionAutocompleteKey, updateMentionAutocomplete } from './mention-autocomplete.mjs';
+import { renderRemoteOriginBadgeHtml } from './remote-relay-origin-view.mjs';
+import { stripRemoteRelayDisplayArtifacts } from './relay-prompt-sanitizer.mjs';
 import { evaluateUnknownCommandGuard } from './slash-commands.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
 import { relayErrorCtaActions } from './relay-error-ctas.mjs';
@@ -1224,8 +1227,18 @@ function createMessageNode(msg, msgId = null, force = false) {
     seenMessageIds.add(msgId);
   }
 
+  // A prompt another relay's agent sent carries `origin`: its header line is
+  // hidden (the badge below says the same), and a stray remote-relay mention
+  // hint never shows on any user bubble.
+  const remoteOrigin = (msg?.role === 'user' && msg?.origin && typeof msg.origin === 'object') ? msg.origin : null;
+  if (msg?.role === 'user') {
+    const displayText = stripRemoteRelayDisplayArtifacts(msg.text, { origin: remoteOrigin });
+    if (displayText !== String(msg.text ?? '')) msg = { ...msg, text: displayText };
+  }
+
   const div = document.createElement('div');
   div.className = `msg ${msg.role}`;
+  if (remoteOrigin) div.classList.add('msg-from-remote-relay');
   if (msgId) div.dataset.messageId = msgId;
   const fingerprint = buildLiveMessageFingerprint({
     ...(msg && typeof msg === 'object' ? msg : {}),
@@ -1388,8 +1401,13 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn" data-action="resend-stopped-steer" data-message-id="${escHtml(msgId)}" title="Send this message again as a new turn"${resendState ? ' disabled' : ''}>${resendLabel}</button></div>`
     : '';
 
+  // Shared viewers get the badge without the link to the other relay.
+  const originBadgeHtml = remoteOrigin
+    ? renderRemoteOriginBadgeHtml(remoteOrigin, { linkable: !IS_SHARED_VIEW })
+    : '';
+
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}${stoppedSteerActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${originBadgeHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}${stoppedSteerActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -3404,6 +3422,7 @@ export async function sendMessage() {
   }
   if (!hasDraft) return;
   closeSlashAutocomplete();
+  closeMentionAutocomplete();
 
   // Warn-once typo guard: a message that looks like a command but matches none
   // would otherwise burn an agent turn as plain text.
@@ -3729,12 +3748,16 @@ export async function sendMessage() {
 // menu in sync with the caret. Cheap no-op for non-slash text.
 export function updateComposerSlashMenu(input) {
   updateSlashAutocomplete(input, { conversationId: currentConvId });
+  // Second, so it sees the slash menu's verdict: the @relay popup never opens
+  // over an open slash menu, and at most one of them ever handles keys.
+  updateMentionAutocomplete(input);
 }
 
 export function handleKey(e) {
   // The open menu owns navigation keys; Ctrl/Cmd+Enter still falls through to
-  // send because the menu never consumes it.
+  // send because neither menu consumes it.
   if (handleSlashAutocompleteKey(e, e.target)) return;
+  if (handleMentionAutocompleteKey(e, e.target)) return;
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
     sendMessage();

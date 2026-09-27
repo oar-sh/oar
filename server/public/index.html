@@ -2516,8 +2516,11 @@
     gap: 6px;
   }
   /* Slash-command autocompletion: same composer-anchored overlay as the emoji
-     popup, but list-shaped. Row highlight follows the arrow keys only. */
-  #slash-autocomplete-popup {
+     popup, but list-shaped. Row highlight follows the arrow keys only. The
+     @relay mention popup (mention-autocomplete.mjs) is its twin; the two are
+     never open at once. */
+  #slash-autocomplete-popup,
+  #mention-autocomplete-popup {
     display: none;
     position: absolute;
     left: 16px;
@@ -2532,7 +2535,9 @@
     box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
     z-index: 30;
   }
-  #slash-autocomplete-popup.visible { display: block; }
+  #slash-autocomplete-popup.visible,
+  #mention-autocomplete-popup.visible { display: block; }
+  .mention-item { align-items: center; }
   .slash-item {
     display: flex; align-items: baseline; gap: 10px;
     padding: 6px 8px; border-radius: 8px; cursor: pointer;
@@ -2544,7 +2549,8 @@
   .slash-item-hint { cursor: default; }
   .slash-item-hint:hover { background: transparent; }
   .slash-item-hint .slash-item-name { color: var(--muted); }
-  body.shared-reader-mode #slash-autocomplete-popup { display: none; }
+  body.shared-reader-mode #slash-autocomplete-popup,
+  body.shared-reader-mode #mention-autocomplete-popup { display: none; }
   #emoji-popup.visible {
     display: grid;
   }
@@ -2694,6 +2700,68 @@
   .preview-close:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
   .preview-close:disabled { opacity: 0.5; cursor: default; }
   #settings-previews-empty { color: var(--muted); font-size: var(--fs-meta-sm); }
+  /* Remote relays (Settings → Relays, the @mention popup): a health dot —
+     online green, unreachable/refused red, never checked grey. */
+  .remote-relay-dot {
+    width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0;
+    background: var(--relay-tone-offline);
+  }
+  .remote-relay-dot[data-status="online"] { background: var(--relay-tone-online); }
+  .remote-relay-dot[data-status="offline"],
+  .remote-relay-dot[data-status="unauthorized"],
+  .remote-relay-dot[data-status="error"] { background: #f85149; }
+  #remote-relays-list { width: 100%; }
+  .remote-relay-tag {
+    border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+    font-size: var(--fs-meta-sm); color: var(--muted); background: var(--bg3); white-space: nowrap;
+  }
+  .remote-relay-error { color: #f85149; overflow-wrap: anywhere; }
+  .remote-relay-http-warning { color: var(--warn); opacity: 1; }
+  label.remote-relay-permission { display: flex; align-items: center; gap: 6px; font-size: var(--fs-meta-sm); color: var(--muted); font-weight: normal; }
+  .remote-relay-permission select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 2px 6px; font-size: var(--fs-meta-sm);
+  }
+  .remote-relays-self-name-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .remote-relays-self-name { font-family: var(--mono, monospace); color: var(--text); }
+  #remote-relays-public-url-input,
+  #remote-relays-add-url-input,
+  #remote-relays-add-token-input {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; outline: none; font-size: var(--fs-meta-md);
+    width: min(420px, 100%); box-sizing: border-box;
+  }
+  .remote-relays-add-token-row { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+  .remote-relays-add-token-row[hidden] { display: none; }
+  .remote-relays-add-token-row label { font-weight: normal; color: var(--muted); font-size: var(--fs-meta-sm); }
+  .remote-relays-link-btn {
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: var(--accent); font-size: var(--fs-meta-sm); text-decoration: underline;
+  }
+  .remote-relays-link-btn[hidden] { display: none; }
+  .settings-row label.remote-relays-pair-back { display: flex; align-items: center; gap: 8px; font-weight: normal; }
+  #remote-relays-add-status[data-state="working"] { color: var(--muted); }
+  #remote-relays-add-status[data-state="added"],
+  #remote-relays-add-status[data-state="paired"] { color: #3fb950; }
+  #remote-relays-add-status[data-state="pair-failed"],
+  #remote-relays-add-status[data-state="needs-token"] { color: var(--warn); }
+  #remote-relays-add-status[data-state="self"],
+  #remote-relays-add-status[data-state="error"] { color: #f85149; }
+  /* Provenance of a prompt another relay's agent sent (remote-relay-origin-view.mjs). */
+  .msg-origin { margin-bottom: 6px; max-width: 100%; }
+  .msg-origin-badge {
+    display: inline-block; max-width: 100%; box-sizing: border-box;
+    padding: 1px 8px; border-radius: 999px; font-size: var(--fs-meta-sm); line-height: 1.5;
+    border: 1px solid color-mix(in srgb, currentColor 40%, transparent);
+    background: color-mix(in srgb, currentColor 12%, transparent);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .msg.user .msg-bubble a.msg-origin-badge { text-decoration: none; }
+  .msg.user .msg-bubble a.msg-origin-badge:hover { text-decoration: underline; }
+  .conv-origin-marker {
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--muted); font-size: var(--fs-ui-chip);
+  }
   /* Transcript card: a preview published during this turn, pinned into the
      response bubble. Compact single row; closed previews keep the label but
      lose the dead link. */
@@ -5262,6 +5330,7 @@
       <div id="image-edit-target" aria-live="polite"></div>
       <div id="emoji-popup" aria-hidden="true"></div>
       <div id="slash-autocomplete-popup" aria-hidden="true" role="listbox"></div>
+      <div id="mention-autocomplete-popup" aria-hidden="true" role="listbox" aria-label="Remote relays"></div>
       <details id="background-tasks-panel" hidden>
         <summary id="background-tasks-summary"></summary>
         <div id="background-panel-body">
@@ -5272,7 +5341,7 @@
       <div class="input-row">
         <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">
         <button id="emoji-btn" onclick="toggleEmojiPicker()" title="Emoji picker (Tip: Win + .)">🙂</button>
-        <textarea id="msg-input" placeholder="Message Copilot…" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this); updateComposerSlashMenu(this)"></textarea>
+        <textarea id="msg-input" placeholder="Message Copilot…" rows="1" aria-autocomplete="list" onkeydown="handleKey(event)" oninput="autoResize(this); updateComposerSlashMenu(this)"></textarea>
         <select id="mode-select" title="Mode">
           <option value="agent" selected>Agent</option>
           <option value="ask">Ask</option>
@@ -5410,6 +5479,16 @@
         data-settings-tab="providers"
       >Providers</button>
       <button
+        id="settings-tab-relays"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-relays"
+        tabindex="-1"
+        data-settings-tab="relays"
+      >Relays</button>
+      <button
         id="settings-tab-previews"
         class="settings-tab"
         type="button"
@@ -5524,16 +5603,16 @@
           </div>
         </div>
         <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
-          <label for="pwa-app-name-input">Install app name</label>
+          <label for="pwa-app-name-input">Relay name</label>
           <input
             id="pwa-app-name-input"
             type="text"
             maxlength="60"
             placeholder="OAR"
-            aria-label="Install app name"
+            aria-label="Relay name"
             onchange="updatePwaAppName(this.value)"
           >
-          <div class="settings-help">Used for the installed PWA app label on every device connecting to this relay. On Android, a rename reaches an already-installed app after a short delay, with one confirmation prompt showing the new name.</div>
+          <div class="settings-help">Shown to other relays and used as the installed app's name. On Android, a rename reaches an already-installed app after a short delay, with one confirmation prompt showing the new name.</div>
         </div>
         <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
           <label for="update-auto-check-toggle">Check for updates automatically</label>
@@ -6023,6 +6102,96 @@
             </div>
             <div class="settings-help">Unlocks the live "Included in plan" percentage bars on Check Usage. Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Headless hosts can also set <code>CURSOR_SESSION_TOKEN</code> in the relay environment. Tokens stay on the relay.</div>
           </div>
+        </div>
+      </div>
+      <div
+        id="settings-panel-relays"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-relays"
+        data-settings-panel="relays"
+        hidden
+      >
+        <div id="remote-relays-self-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label>This relay</label>
+          <div class="remote-relays-self-name-row">
+            <span id="remote-relays-self-name" class="remote-relays-self-name">—</span>
+            <span class="settings-help">Change it under General → Relay name.</span>
+          </div>
+        </div>
+        <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="remote-relays-public-url-input">Public address</label>
+          <input
+            id="remote-relays-public-url-input"
+            type="url"
+            inputmode="url"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="https://…"
+            aria-label="Public address of this relay"
+            onchange="saveRemoteRelayPublicUrl(this.value)"
+          >
+          <div class="settings-help">How other relays reach this one — the address you open this relay at from another device. Needed for "Also add this relay there".</div>
+          <div id="remote-relays-self-status" class="settings-help settings-provider-status" role="status" aria-live="polite" hidden></div>
+        </div>
+        <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="remote-relays-inbound-toggle">Accept prompts from other relays' agents</label>
+          <input
+            id="remote-relays-inbound-toggle"
+            type="checkbox"
+            onchange="toggleRemoteRelayInbound(this.checked)"
+            aria-label="Accept prompts from other relays' agents"
+            checked
+          >
+        </div>
+        <div class="settings-help" style="margin-top: 6px;">When off, agents on paired relays can still read sessions here, but cannot send prompts, start sessions, answer questions or stop turns. The relay token stays the real boundary: anyone holding it has full access.</div>
+        <div id="remote-relays-list-section" class="settings-row settings-row-column" style="margin-top: 16px; margin-bottom: 0;">
+          <label>Remote relays</label>
+          <div id="remote-relays-list"></div>
+          <div id="remote-relays-empty" class="settings-help">Loading remote relays…</div>
+          <div id="remote-relays-status" class="settings-help settings-provider-status" role="status" aria-live="polite" hidden></div>
+          <div class="settings-help">Agents in any session here can work on these relays once you mention one in the conversation (for example <code>@name</code>). "Agents may" limits what they can do there.</div>
+        </div>
+        <div id="remote-relays-add-section" class="settings-row settings-row-column" style="margin-top: 16px; margin-bottom: 0;">
+          <label for="remote-relays-add-url-input">Add a relay</label>
+          <input
+            id="remote-relays-add-url-input"
+            type="url"
+            inputmode="url"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="Paste the other relay's web address"
+            aria-label="Paste the other relay's web address"
+            onkeydown="if (event.key === 'Enter') { event.preventDefault(); addRemoteRelayFromForm(); }"
+          >
+          <div id="remote-relays-add-token-row" class="remote-relays-add-token-row" hidden>
+            <label for="remote-relays-add-token-input">Token of the other relay</label>
+            <input
+              id="remote-relays-add-token-input"
+              type="password"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="Only needed when it differs from this relay's token"
+              aria-label="Token of the other relay"
+              onkeydown="if (event.key === 'Enter') { event.preventDefault(); addRemoteRelayFromForm(); }"
+            >
+          </div>
+          <button id="remote-relays-use-token-btn" class="remote-relays-link-btn" type="button" onclick="showRemoteRelayTokenField()">Use a different token</button>
+          <label class="remote-relays-pair-back">
+            <input id="remote-relays-pair-back-toggle" type="checkbox" checked>
+            Also add this relay there
+          </label>
+          <div id="remote-relays-pair-back-hint" class="settings-help">
+            The other relay gets this relay's public address and, if it uses a different token, this
+            relay's token too: its agents can then work here. Removing a relay here does not revoke
+            that; rotate this relay's token to lock it out.
+          </div>
+          <button id="remote-relays-add-btn" class="chat-title-action-btn" type="button" onclick="addRemoteRelayFromForm()">Add</button>
+          <div id="remote-relays-add-status" class="settings-help settings-provider-status" role="status" aria-live="polite" hidden></div>
         </div>
       </div>
       <div

@@ -384,6 +384,67 @@ test('dispatch rejects unknown event types without touching subscriptions', asyn
   assert.equal(sends.length, 0);
 });
 
+// ── Turns another relay's agent started (remote relays, decision 22) ──────
+
+function addMessagesTable(db) {
+  db.exec(`CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT, role TEXT, text TEXT, origin_json TEXT)`);
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, origin_json) VALUES (?, ?, 'user', ?, ?)`)
+    .run('msg-agent', 'conv-1', 'from an agent', JSON.stringify({ kind: 'agent', relayId: 'relay-id-win', relayName: 'win-test', hops: 1 }));
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, origin_json) VALUES (?, ?, 'user', ?, NULL)`)
+    .run('msg-user', 'conv-1', 'from the user');
+}
+
+test('an agent-started turn pushes neither "reply ready" nor "failed"; the user\'s turns still do', async () => {
+  const db = makeDb();
+  addMessagesTable(db);
+  const sends = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { sends.push(JSON.parse(body).data.type); } },
+  });
+  subscribeDevice(service);
+
+  assert.deepEqual(
+    await service.notifyTurnComplete({ conversationId: 'conv-1', messageId: 'reply-1', sourceMessageId: 'msg-agent', text: 'done' }),
+    { outcome: 'remote-agent' },
+  );
+  assert.deepEqual(
+    await service.notifyTurnFailed({ conversationId: 'conv-1', messageId: 'reply-2', sourceMessageId: 'msg-agent', text: 'failed' }),
+    { outcome: 'remote-agent' },
+  );
+  assert.deepEqual(sends, []);
+
+  await service.notifyTurnComplete({ conversationId: 'conv-1', messageId: 'reply-3', sourceMessageId: 'msg-user', text: 'done' });
+  await service.notifyTurnFailed({ conversationId: 'conv-1', messageId: 'reply-4', sourceMessageId: 'msg-user', text: 'failed' });
+  // Callers that do not name the turn's message keep the old behaviour.
+  await service.notifyTurnComplete({ conversationId: 'conv-1', messageId: 'reply-5', text: 'done' });
+  assert.deepEqual(sends, ['turnComplete', 'turnFailed', 'turnComplete']);
+});
+
+test('question pushes from an agent-started turn are unchanged', async () => {
+  const db = makeDb();
+  addMessagesTable(db);
+  const sends = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { sends.push(JSON.parse(body).data.type); } },
+  });
+  subscribeDevice(service);
+  const result = await service.notifyQuestion({ id: 'q-1', conversationId: 'conv-1', prompt: 'Which report?', choices: ['A', 'B'] });
+  assert.equal(result.outcome, 'dispatched');
+  assert.deepEqual(sends, ['question']);
+});
+
+test('without the origin column (before migration 0005) every turn pushes as before', async () => {
+  const db = makeDb();
+  const sends = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { sends.push(JSON.parse(body).data.type); } },
+  });
+  subscribeDevice(service);
+  const result = await service.notifyTurnComplete({ conversationId: 'conv-1', messageId: 'reply-1', sourceMessageId: 'msg-agent', text: 'done' });
+  assert.equal(result.outcome, 'dispatched');
+  assert.deepEqual(sends, ['turnComplete']);
+});
+
 // ── Subscription upsert semantics ──────────────────────────────────────────
 
 test('re-subscribing the same endpoint updates in place', () => {

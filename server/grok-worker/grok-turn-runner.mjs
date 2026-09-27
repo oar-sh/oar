@@ -3,9 +3,12 @@ import {
   startGrokTurn,
   classifyGrokError,
 } from './grok-sdk-adapter.mjs';
+import { AcpClient, toAcpStdioMcpServer, withAcpMcpServers } from './acp-client.mjs';
 import { buildGrokContextUsage, resolveGrokContextWindow } from './grok-context-usage.mjs';
 import { extractGrokUsageFromPromptResult, normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
+import { OAR_MCP_SERVER_NAME, buildOarMcpServerLaunch, isOarMcpServerDisabled } from '../mcp/oar-mcp-server.mjs';
 import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
+import { fetchRemoteRelayInflight } from '../../shared/remote-relay-tool-core.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
@@ -110,8 +113,30 @@ export function createGrokTurnRunner({
   startGrokTurnImpl = startGrokTurn,
   classifyErrorImpl = classifyGrokError,
   getPreviewInstructions = createPreviewInstructionsProvider({ api }),
+  env = process.env,
+  nodePath = process.execPath,
+  // The OAR MCP server launch (`{ command, args, env }`) every Grok session
+  // gets through ACP `mcpServers`; undefined builds the default for this
+  // worker's conversation, null leaves Grok without it.
+  oarMcpServer = undefined,
   dbg = () => {},
 } = {}) {
+  // The OAR MCP server gives Grok the relay's real tools — `preview`, and
+  // `remote_relay` when remotes are paired — bound to this conversation.
+  // `OAR_MCP_SERVER=0` is the operator's way back to the preview instruction
+  // block, should an agent build turn out to ignore ACP `mcpServers`.
+  const oarMcpLaunch = oarMcpServer !== undefined
+    ? (oarMcpServer || null)
+    : (() => {
+      if (isOarMcpServerDisabled(env)) return null;
+      try {
+        return buildOarMcpServerLaunch({ nodePath, conversationId: sdkSessionId, env });
+      } catch (error) {
+        dbg('oar mcp server unavailable', error?.message || String(error));
+        return null;
+      }
+    })();
+  const acpMcpServers = oarMcpLaunch ? [toAcpStdioMcpServer(oarMcpLaunch, OAR_MCP_SERVER_NAME)] : [];
   let agentHandle = null;
   let grokNativeSessionId = '';
   let activeMessage = null;
@@ -175,6 +200,12 @@ export function createGrokTurnRunner({
       alwaysApprove,
       nativeSessionId: resumeId,
       model,
+      // The adapter builds the ACP client and opens the session in one step,
+      // so the client it builds must already carry the MCP servers — for
+      // session/new and for session/load alike.
+      ...(acpMcpServers.length
+        ? { AcpClientImpl: withAcpMcpServers(AcpClient, acpMcpServers), mcpServers: acpMcpServers }
+        : {}),
       dbg,
     });
     if (agentHandle.sessionId) {
@@ -186,6 +217,20 @@ export function createGrokTurnRunner({
       await postActivity(message, 'System note: the previous Grok session could not be restored; this turn starts a fresh agent session without the earlier context.');
     }
     return agentHandle;
+  }
+
+  /**
+   * The inactivity hold. A remote_relay call runs inside the MCP server, which
+   * this worker cannot see: Grok just goes quiet for as long as the relay
+   * waits on the remote turn. Before the ACP watchdog calls that a stall, the
+   * relay is asked whether a call of this conversation is still in flight.
+   * Keyed by the MCP server's own conversation id, which is what its calls
+   * carry.
+   */
+  async function remoteRelayCallInFlight() {
+    const inflight = await fetchRemoteRelayInflight({ api, conversationId: sdkSessionId });
+    if (inflight > 0) dbg('remote_relay call in flight; holding the inactivity watchdog', String(inflight));
+    return inflight > 0;
   }
 
   async function postActivity(message, text, subagentRunId = null) {
@@ -369,7 +414,9 @@ export function createGrokTurnRunner({
     const modeNudge = grokModeNudge(message.relayMode, lastNudgedRelayMode);
     const userText = buildGrokUserText(message);
     // Advisory: a preview lookup that fails costs the guidance, never the turn.
-    const previewBlock = previewInstructionsSent
+    // With the OAR MCP server wired in, `preview` is a real tool and the HTTP
+    // instruction block (which says there is none) would contradict it.
+    const previewBlock = previewInstructionsSent || acpMcpServers.length
       ? ''
       : await Promise.resolve()
         .then(() => getPreviewInstructions?.())
@@ -377,6 +424,16 @@ export function createGrokTurnRunner({
     const mediaBlock = mediaInstructionsSent ? '' : renderMediaEmbedInstructionBlock();
     const promptText = [previewBlock, mediaBlock, modeNudge, userText].filter(Boolean).join('\n\n');
     const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
+
+    // The user's max-turn-duration setting overrides the worker-local
+    // absolute cap: "No limit" (0) must not be silently trimmed to the
+    // 30-minute default. The inactivity watchdog stays — it detects a dead
+    // transport, not a long turn — but asks the relay before it fires while
+    // Grok may be blocked on a remote_relay call.
+    const watchdog = {
+      ...(turnCeilingMs !== null ? { maxTurnMs: turnCeilingMs > 0 ? turnCeilingMs : 0 } : {}),
+      ...(acpMcpServers.length ? { holdStall: remoteRelayCallInFlight } : {}),
+    };
 
     let turn = null;
     let planBoardPosted = false;
@@ -399,13 +456,7 @@ export function createGrokTurnRunner({
             text: promptText,
             reasoningEffort: message.reasoningEffort || '',
             abortSignal: abortController.signal,
-            // The user's max-turn-duration setting overrides the worker-local
-            // absolute cap: "No limit" (0) must not be silently trimmed to
-            // the 30-minute default. The inactivity watchdog stays — it
-            // detects a dead transport, not a long turn.
-            watchdog: turnCeilingMs !== null
-              ? { maxTurnMs: turnCeilingMs > 0 ? turnCeilingMs : 0 }
-              : null,
+            watchdog: Object.keys(watchdog).length ? watchdog : null,
             dbg,
           });
           for await (const action of turn) {

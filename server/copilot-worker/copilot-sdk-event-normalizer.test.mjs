@@ -520,6 +520,22 @@ test('formatToolActivityText degrades without arguments', () => {
   assert.equal(formatToolActivityText('bash', { command: 'x'.repeat(300) }).length, 140);
 });
 
+test('a remote_relay call reads as its action and target', () => {
+  const input = { action: 'send', relay: 'linux-test', session: '0123456789abcdef', text: 'run the tests' };
+  const expected = 'Tool (remote_relay): send → linux-test session 01234567: “run the tests”';
+  assert.equal(formatToolActivityText('remote_relay', input), expected);
+  assert.equal(formatToolActivityText('remote_relay', JSON.stringify(input)), expected, 'string arguments');
+  assert.equal(formatToolActivityText('oar-remote_relay', input), expected, 'an MCP-namespaced name');
+  assert.equal(formatToolActivityText('remote_relay', null), 'Tool (remote_relay)');
+
+  const normalizer = createCopilotEventNormalizer();
+  const actions = normalizer.normalize({
+    type: 'tool.execution_start',
+    data: { toolCallId: 'call-rr-1', toolName: 'remote_relay', arguments: { action: 'list_relays' } },
+  });
+  assert.deepEqual(actions.map((action) => action.payload?.text), ['Tool (remote_relay): list_relays']);
+});
+
 test('subagent text goes to the lane and never into the main reply', () => {
   // `agentId` sits on the event ENVELOPE and is absent for the root agent.
   // The runtime forwards subagent streaming by default and the flag that

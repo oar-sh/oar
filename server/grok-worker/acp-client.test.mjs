@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
-import { AcpClient } from './acp-client.mjs';
+import { AcpClient, toAcpStdioMcpServer, withAcpMcpServers } from './acp-client.mjs';
 import { createGrokAgentHandle } from './grok-sdk-adapter.mjs';
 
 function createFakeProc() {
@@ -223,5 +223,140 @@ test('createGrokAgentHandle surfaces a missing CLI as a rejection, not a crash',
       },
     }),
     /ENOENT/,
+  );
+});
+
+// ─── MCP servers in session/new and session/load ─────────────────────────────
+
+test('toAcpStdioMcpServer turns a launch into the ACP stdio shape', () => {
+  assert.deepEqual(
+    toAcpStdioMcpServer({
+      command: '/usr/local/bin/node',
+      args: ['/srv/oar/server/mcp/oar-mcp-server.mjs', '--conversation-id', 'conv-1'],
+      env: { COPILOT_WEB_RELAY_CONFIG: '/srv/oar/server/config.json' },
+    }, 'oar'),
+    {
+      name: 'oar',
+      command: '/usr/local/bin/node',
+      args: ['/srv/oar/server/mcp/oar-mcp-server.mjs', '--conversation-id', 'conv-1'],
+      env: [{ name: 'COPILOT_WEB_RELAY_CONFIG', value: '/srv/oar/server/config.json' }],
+    },
+  );
+  // args and env are required by the schema, even when empty.
+  assert.deepEqual(toAcpStdioMcpServer({ command: 'node' }), { name: 'oar', command: 'node', args: [], env: [] });
+});
+
+const OAR_SERVER = {
+  name: 'oar',
+  command: '/usr/local/bin/node',
+  args: ['/srv/oar/server/mcp/oar-mcp-server.mjs', '--conversation-id', 'conv-1'],
+  env: [{ name: 'COPILOT_WEB_RELAY_CONFIG', value: '/srv/oar/server/config.json' }],
+};
+
+test('session/new and session/load carry the configured MCP servers', async () => {
+  const sent = [];
+  class RecordingClient extends AcpClient {
+    async request(method, params) {
+      sent.push({ method, params });
+      return { sessionId: 'sess-1' };
+    }
+  }
+  const plain = new RecordingClient({ spawnImpl: () => createFakeProc() });
+  await plain.sessionNew('/home/dev/app');
+  assert.deepEqual(sent[0].params.mcpServers, [], 'none unless configured');
+
+  const Wired = withAcpMcpServers(RecordingClient, [OAR_SERVER]);
+  const client = new Wired({ spawnImpl: () => createFakeProc() });
+  await client.sessionNew('/home/dev/app', { _meta: { modelId: 'grok-4.5' } });
+  await client.sessionLoad('sess-1', '/home/dev/app');
+  assert.deepEqual(sent[1], {
+    method: 'session/new',
+    params: { cwd: '/home/dev/app', mcpServers: [OAR_SERVER], _meta: { modelId: 'grok-4.5' } },
+  });
+  assert.deepEqual(sent[2], {
+    method: 'session/load',
+    params: { sessionId: 'sess-1', cwd: '/home/dev/app', mcpServers: [OAR_SERVER] },
+  });
+  // An explicit list wins over the bound one.
+  const explicit = new Wired({ spawnImpl: () => createFakeProc(), mcpServers: [] });
+  assert.deepEqual(explicit.mcpServers, []);
+});
+
+test('createGrokAgentHandle opens the session with the MCP servers of the client class it is given', async () => {
+  const sent = [];
+  class FakeClient extends AcpClient {
+    constructor(opts) {
+      super({ ...opts, spawnImpl: () => createFakeProc() });
+    }
+    async request(method, params) {
+      sent.push({ method, params });
+      if (method === 'initialize') return { agentCapabilities: { loadSession: true } };
+      return { sessionId: 'sess-live' };
+    }
+  }
+  const services = { attach() {}, hasPendingWork: () => false, disposeAll() {} };
+  const fresh = await createGrokAgentHandle({
+    cwd: '/home/dev/app',
+    AcpClientImpl: withAcpMcpServers(FakeClient, [OAR_SERVER]),
+    createHostServicesImpl: () => services,
+  });
+  const resumed = await createGrokAgentHandle({
+    cwd: '/home/dev/app',
+    nativeSessionId: 'sess-old',
+    AcpClientImpl: withAcpMcpServers(FakeClient, [OAR_SERVER]),
+    createHostServicesImpl: () => services,
+  });
+  assert.deepEqual(sent.find((entry) => entry.method === 'session/new').params.mcpServers, [OAR_SERVER]);
+  assert.deepEqual(sent.find((entry) => entry.method === 'session/load').params.mcpServers, [OAR_SERVER]);
+  await fresh.close();
+  await resumed.close();
+});
+
+// ─── the inactivity hold ─────────────────────────────────────────────────────
+
+test('a granted hold re-arms the inactivity window; the prompt still completes', async () => {
+  const { client, pushLine } = startClientWithCapturedWrites();
+  let asked = 0;
+  const promptPromise = client.sessionPrompt('sess', [{ type: 'text', text: 'hi' }], null, {}, {
+    inactivityMs: 40,
+    maxTurnMs: 60_000,
+    holdStall: async () => { asked += 1; return true; },
+  });
+  // Well past several silent windows: the relay keeps saying a call is running.
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  assert.ok(asked >= 2, `the relay was asked each time the window ran out (${asked})`);
+  pushLine({ jsonrpc: '2.0', id: 1, result: { stopReason: 'end_turn' } });
+  const result = await promptPromise;
+  assert.equal(result.stopReason, 'end_turn');
+});
+
+test('a refused, failing or slow hold question lets the stall fire', async () => {
+  for (const holdStall of [
+    async () => false,
+    async () => { throw new Error('relay down'); },
+    () => new Promise(() => {}),
+  ]) {
+    const { client } = startClientWithCapturedWrites();
+    await assert.rejects(
+      client.sessionPrompt('sess', [{ type: 'text', text: 'hi' }], null, {}, {
+        inactivityMs: 40,
+        maxTurnMs: 60_000,
+        holdStall,
+        holdCheckTimeoutMs: 50,
+      }),
+      /turn stalled/,
+    );
+  }
+});
+
+test('a hold never outlives the turn ceiling', async () => {
+  const { client } = startClientWithCapturedWrites();
+  await assert.rejects(
+    client.sessionPrompt('sess', [{ type: 'text', text: 'hi' }], null, {}, {
+      inactivityMs: 40,
+      maxTurnMs: 700,
+      holdStall: async () => true,
+    }),
+    /turn ceiling/,
   );
 });

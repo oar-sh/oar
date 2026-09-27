@@ -2,11 +2,22 @@ import { createSdkMcpServer, query } from '@anthropic-ai/claude-agent-sdk';
 
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
 import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructions.mjs';
+import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-tool-core.mjs';
 import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
+import { createRemoteRelayToolDefinition } from './claude-remote-relay-tool.mjs';
 
 // The name the in-process MCP server is registered under; it prefixes every
-// tool it carries on the wire (`mcp__relay__preview`).
+// tool it carries on the wire (`mcp__relay__preview`, `mcp__relay__remote_relay`).
 export const RELAY_MCP_SERVER_NAME = 'relay';
+
+// The per-server tool-call timeout the CLI applies to the relay's tools.
+// Measured against CLI 2.1.283: an SDK server's calls are bounded by this
+// value, else by the MCP_TOOL_TIMEOUT environment variable, else by 1e8 ms —
+// and SDK servers are exempt from the idle timeout. Pinning it here keeps a
+// host-wide MCP_TOOL_TIMEOUT (set for some other server) from cutting off a
+// remote_relay wait: those run up to wait_seconds (≤ 600 s) plus however long
+// an approval card sits unanswered.
+export const RELAY_MCP_TOOL_TIMEOUT_MS = REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS;
 
 const MODE_SYSTEM_PROMPT_APPEND = {
   ask: 'Prioritize clarification questions (AskUserQuestion) before implementation work; do not make broad assumptions when a question would materially change the result.',
@@ -143,11 +154,19 @@ export function systemPromptForRelayMode(relayMode) {
  * which beats inventing a capability flag to plumb through the delivery
  * payload. `getConversationId` is called per tool call because a process
  * outlives the turn it was spawned for.
+ *
+ * `remote_relay` is the exception: it rides along only when the worker found
+ * at least one paired remote (`remoteRelayTool`), because a tool that can do
+ * nothing on a relay without remotes would only cost context on every turn.
  */
-export function createRelayMcpServer({ api, getConversationId, dbg } = {}) {
+export function createRelayMcpServer({ api, getConversationId, dbg, remoteRelayTool = false } = {}) {
   return createSdkMcpServer({
     name: RELAY_MCP_SERVER_NAME,
-    tools: [createPreviewToolDefinition({ api, getConversationId, dbg })],
+    timeout: RELAY_MCP_TOOL_TIMEOUT_MS,
+    tools: [
+      createPreviewToolDefinition({ api, getConversationId, dbg }),
+      ...(remoteRelayTool ? [createRemoteRelayToolDefinition({ api, getConversationId, dbg })] : []),
+    ],
   });
 }
 
@@ -215,6 +234,9 @@ export function startClaudeSession({
   pathToClaudeCodeExecutable = '',
   api = null,
   getConversationId = () => '',
+  // Whether this process carries `remote_relay` (the worker's registration
+  // decision). Fixed for the process: the tool list is part of the spawn.
+  remoteRelayTool = false,
   queryImpl = query,
   dbg = () => {},
 } = {}) {
@@ -230,7 +252,7 @@ export function startClaudeSession({
   // Relay tools need the worker's authenticated API helper; a caller that
   // passes none (tests, probes) gets a session without them.
   const relayMcpServer = typeof api === 'function'
-    ? createRelayMcpServer({ api, getConversationId, dbg })
+    ? createRelayMcpServer({ api, getConversationId, dbg, remoteRelayTool: remoteRelayTool === true })
     : null;
   const options = {
     cwd,

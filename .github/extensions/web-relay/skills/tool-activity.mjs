@@ -3,6 +3,8 @@ import {
   formatToolResultActivity as formatSharedToolResultActivity,
   formatVoteMemoryActivity,
 } from "../../../../shared/tool-activity.mjs";
+import { isRemoteRelayToolName } from "../../../../shared/remote-relay-tool-core.mjs";
+import { summarizeRemoteRelayCall } from "../../../../shared/remote-relay-contract.mjs";
 
 export function normalizeActivityText(value, maxToolDetailLength = 140) {
   const text = String(value || "").trim();
@@ -132,6 +134,11 @@ export function formatToolActivity(request, maxToolDetailLength = 140) {
   }
   if (lower.includes("report_intent")) {
     return detail ? `● ${detail}` : "● Working…";
+  }
+  // The OAR MCP server's tool reaches the CLI as `oar-remote_relay`: show the
+  // same line every other engine writes for it.
+  if (isRemoteRelayToolName(rawName)) {
+    return `Tool (remote_relay): ${summarizeRemoteRelayCall(toolArgsSnapshot(request))}`;
   }
   return detail ? `Tool (${rawName}): ${detail}` : `Tool (${rawName})`;
 }

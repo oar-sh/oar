@@ -1,3 +1,5 @@
+import { stripRemotePromptHeader } from './remote-relay-shared.mjs';
+
 const RELAY_TOOL_GUIDANCE = [
   '# Relay Tool Guidance',
   'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
@@ -118,12 +120,36 @@ const STEER_NOTE_PATTERN = /^\s*\[Sent while you were still working on my previo
 // it is matched on its own, and only where it guards a "/".
 const SLASH_COMMAND_GUARD_PATTERN = /^\u200B(?=\s*\/)/;
 
-function stripLeadingRelayNotes(text) {
-  const stripped = String(text || '').replace(STEER_NOTE_PATTERN, '').replace(SLASH_COMMAND_GUARD_PATTERN, '');
+// The hint the relay adds to a turn whose user message mentions a remote relay
+// (docs/plans/2026-09-27-remote-relays.md §5.5). stripAttachmentPromptArtifacts
+// already drops every <system_reminder>; this narrower pattern is for text that
+// did not come through that path (a stored bubble the server already sanitised).
+const REMOTE_RELAY_MENTION_HINT_PATTERN = /<system_reminder>\s*The user mentioned the remote OAR relay[\s\S]*?<\/system_reminder>\s*/gi;
+
+function hasRemoteOrigin(origin) {
+  return !!origin && typeof origin === 'object';
+}
+
+function stripLeadingRelayNotes(text, { origin = null } = {}) {
+  const remote = hasRemoteOrigin(origin);
+  let stripped = String(text || '');
+  // A prompt another relay's agent sent starts with a header line naming it;
+  // the bubble's provenance badge carries the same facts, so it is hidden —
+  // but only when the message really carries `origin`, never on a lookalike a
+  // human typed. A steer note may sit in front of it.
+  if (remote) stripped = stripRemotePromptHeader(stripped.trimStart());
+  stripped = stripped.replace(STEER_NOTE_PATTERN, '');
+  if (remote) stripped = stripRemotePromptHeader(stripped.trimStart());
+  stripped = stripped.replace(SLASH_COMMAND_GUARD_PATTERN, '');
   return stripped.trim() ? stripped.trim() : String(text || '').trim();
 }
 
-export function stripRelayPromptContext(text, relayMode = '') {
+/**
+ * `options.origin`: the message's remote-relay provenance, when it has one.
+ * Only then is the remote prompt header line stripped.
+ */
+export function stripRelayPromptContext(text, relayMode = '', options = {}) {
+  const origin = options && typeof options === 'object' ? options.origin : null;
   const value = stripAttachmentPromptArtifacts(text)
     .replace(MEDIA_EMBED_BLOCK_PATTERN, '')
     .trim();
@@ -131,7 +157,24 @@ export function stripRelayPromptContext(text, relayMode = '') {
   const patterns = buildPromptPrefixPatterns(relayMode);
   for (const pattern of patterns) {
     const stripped = value.replace(pattern, '').trim();
-    if (stripped && stripped !== value) return stripLeadingRelayNotes(stripped);
+    if (stripped && stripped !== value) return stripLeadingRelayNotes(stripped, { origin });
   }
-  return stripLeadingRelayNotes(value);
+  return stripLeadingRelayNotes(value, { origin });
+}
+
+/**
+ * For a user bubble's text as it is about to render (already sanitised by the
+ * relay): drops a stray remote-relay mention hint, and the remote prompt header
+ * when the message carries `origin`. Text without either is returned untouched.
+ */
+export function stripRemoteRelayDisplayArtifacts(text, { origin = null } = {}) {
+  const value = String(text ?? '');
+  let next = value.replace(REMOTE_RELAY_MENTION_HINT_PATTERN, '');
+  if (hasRemoteOrigin(origin)) {
+    const leading = next.trimStart();
+    const withoutHeader = stripRemotePromptHeader(leading);
+    if (withoutHeader !== leading) next = withoutHeader;
+  }
+  if (next === value) return value;
+  return next.trim() ? next.trim() : value.trim();
 }

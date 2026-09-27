@@ -306,6 +306,8 @@ export function initFullscreenButton() {
 // The app name is stored on the relay and baked into /manifest.webmanifest by
 // the server, so every manifest fetch — including Android's out-of-page WebAPK
 // update checks — sees the same name. The client only edits the setting.
+// Settings shows it as "Relay name": it is also the name paired relays know
+// this one by (and mention it by).
 
 function paintPwaAppNameInput() {
   const input = document.getElementById('pwa-app-name-input');
@@ -330,16 +332,19 @@ export async function updatePwaAppName(rawValue) {
   const seq = ++pwaAppNameRequestSeq;
   const result = await updatePwaAppNameSetting(rawValue);
   if (!result || typeof result.appName !== 'string') {
-    alert('Failed to update the install app name.');
+    alert('Failed to update the relay name.');
     if (seq === pwaAppNameRequestSeq) paintPwaAppNameInput();
     return;
   }
   if (seq !== pwaAppNameRequestSeq) return; // a newer edit owns the UI now
   pwaAppName = result.appName;
   showTransientRelayNotice(result.appName
-    ? `Install app name updated to "${result.appName}".`
-    : 'Install app name reset to default.');
+    ? `Relay name updated to "${result.appName}".`
+    : 'Relay name reset to default.');
   paintPwaAppNameInput();
+  // The same name is what paired relays see (GET /api/relay/identity); the
+  // Relays tab re-reads it, including the host-name fallback for an empty one.
+  window.dispatchEvent(new CustomEvent('oar:relay-name-changed', { detail: { name: result.appName } }));
 }
 
 /**

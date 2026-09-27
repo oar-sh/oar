@@ -5,6 +5,7 @@
 // Not a *.test.mjs file on purpose — the node --test glob must not pick it up.
 
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
+import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 
 // Keeps the tests off the real `~/.claude/projects`; transcript relocation has
 // its own suite in claude-transcript-relocator.test.mjs.
@@ -241,6 +242,9 @@ export function makeRunner({ stub, startImpl, ...overrides }) {
     relocateTranscriptImpl: noopRelocate,
     startClaudeSessionImpl: startImpl,
     continuationRetryDelayMs: 10,
+    // A settled "no remotes" answer: a cold spawn then pushes synchronously,
+    // as these suites expect. Suites about the tool pass their own gate.
+    remoteRelayToolGate: createRemoteRelayToolGate({ fixed: false }),
     ...overrides,
   });
 }

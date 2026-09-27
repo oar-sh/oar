@@ -4,13 +4,39 @@ import assert from 'node:assert/strict';
 
 import {
   applyOpenAIProviderEnvironment,
+  buildCopilotOarMcpConfig,
   buildTmuxWorkerShellCommand,
   createWorkerSecretEnvFile,
+  isOarMcpServerDisabled,
   killTmuxSession,
   launchSessionCli,
   normalizeTmuxSessionName,
+  prepareOarMcpConfigFile,
+  resolveOarMcpServerScriptPath,
   resolveOpenAIWireApi,
 } from './session-worker-launch-service.mjs';
+import { OAR_MCP_SERVER_SCRIPT_PATH, OAR_MCP_TOOL_TIMEOUT_MS } from '../mcp/oar-mcp-server.mjs';
+
+// The extension engine writes an OAR MCP config file per launch. Tests hand
+// the launcher a fake that names a file instead, so nothing lands in a real
+// log directory; the writer itself is tested on its own below.
+const POSIX_MCP_CONFIG = '/relay/logs/worker-abc-123.mcp.json';
+const WIN32_MCP_CONFIG = path.win32.join('C:\\relay', 'logs', 'worker-abc-123.mcp.json');
+
+function fakeMcpConfig(filePath) {
+  const calls = [];
+  const impl = (target, env) => {
+    calls.push({ target, env });
+    return filePath;
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+// sh single-quoting, as the launcher does it.
+function shq(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
 
 test('resolveOpenAIWireApi uses responses for reasoning model families', () => {
   assert.equal(resolveOpenAIWireApi('gpt-5.6-sol'), 'responses');
@@ -222,6 +248,7 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
     },
   };
 
+  const mcpConfig = fakeMcpConfig(POSIX_MCP_CONFIG);
   const launched = await launchSessionCli({
     targetSessionId: 'abc-123',
     processCwd: '/relay',
@@ -238,8 +265,12 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
     processInspector,
     tmuxPollAttempts: 2,
     tmuxPollDelayMs: 1,
+    prepareOarMcpConfigImpl: mcpConfig,
   });
 
+  assert.equal(mcpConfig.calls.length, 1);
+  assert.equal(mcpConfig.calls[0].target, 'abc-123');
+  assert.equal(mcpConfig.calls[0].env.COPILOT_WEB_RELAY_CONFIG, '/relay/server/config.json');
   assert.equal(launched.launchMode, 'tmux');
   assert.equal(launched.pid, process.pid);
   assert.equal(launched.tmuxSessionName, 'abc-123');
@@ -257,6 +288,34 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
   assert.doesNotMatch(shellCommand, /(?:^|\s)-i(?:\s|$)|launch the server/);
   assert.match(shellCommand, /abc-123/);
   assert.doesNotMatch(shellCommand, /GH_FORCE_TTY/);
+  assert.match(shellCommand, /export OAR_MCP_SERVER_ATTACHED='1';/);
+  // The MCP config rides the CLI command, quoted once for the command and
+  // once more for `script -c`.
+  const cliCommand = `${shq('copilot')} --allow-all --session-id ${shq('abc-123')} ${shq('--additional-mcp-config')} ${shq(`@${POSIX_MCP_CONFIG}`)}`;
+  assert.ok(
+    shellCommand.endsWith(`exec script -q -c ${shq(cliCommand)} /dev/null`),
+    `unexpected tmux command: ${shellCommand}`,
+  );
+});
+
+test('buildTmuxWorkerShellCommand quotes extra CLI args through both shells', () => {
+  const hostile = "@/srv/it's here/worker-abc-123.mcp.json";
+  const command = buildTmuxWorkerShellCommand('abc-123', {}, {
+    extraCliArgs: ['--additional-mcp-config', hostile],
+  });
+  const cliCommand = `${shq('copilot')} --allow-all --session-id ${shq('abc-123')} ${shq('--additional-mcp-config')} ${shq(hostile)}`;
+  assert.ok(command.endsWith(`exec script -q -c ${shq(cliCommand)} /dev/null`), command);
+
+  // Node workers never take them: the OAR tools ride in-process there.
+  const nodeWorker = buildTmuxWorkerShellCommand('abc-123', { COPILOT_WEB_RELAY_WORKER_KIND: 'claude' }, {
+    extraCliArgs: ['--additional-mcp-config', hostile],
+  });
+  assert.doesNotMatch(nodeWorker, /additional-mcp-config/);
+});
+
+test('buildTmuxWorkerShellCommand forwards the OAR MCP kill switch to workers', () => {
+  const command = buildTmuxWorkerShellCommand('abc-123', { OAR_MCP_SERVER: '0', COPILOT_WEB_RELAY_WORKER_KIND: 'grok' });
+  assert.match(command, /export OAR_MCP_SERVER='0';/);
 });
 
 test('launchSessionCli falls back to detached spawn when tmux is unavailable', async () => {
@@ -274,6 +333,7 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
       COPILOT_WORKSPACE_ROOT: '/stale',
     },
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     execFileSyncImpl(command) {
       if (command === 'tmux') throw new Error('missing tmux');
       throw new Error(`unexpected command: ${command}`);
@@ -295,6 +355,8 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, 'copilot');
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '--additional-mcp-config', `@${POSIX_MCP_CONFIG}`]);
+  assert.equal(spawnCalls[0]?.options?.env?.OAR_MCP_SERVER_ATTACHED, '1', 'the extension learns preview is a real tool');
   assert.equal(spawnCalls[0]?.options?.cwd, '/relay');
   assert.equal(spawnCalls[0]?.options?.env?.COPILOT_WORKSPACE_ROOT, '/repo');
   assert.equal(spawnCalls[0]?.options?.env?.INIT_CWD, '/repo');
@@ -317,6 +379,7 @@ test('launchSessionCli uses the configured host CLI executable', async () => {
       COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
     },
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     execFileSyncImpl(command) {
       if (command === 'tmux') throw new Error('missing tmux');
       throw new Error(`unexpected command: ${command}`);
@@ -338,7 +401,7 @@ test('launchSessionCli uses the configured host CLI executable', async () => {
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '--additional-mcp-config', `@${POSIX_MCP_CONFIG}`]);
 });
 
 test('launchSessionCli uses the host CLI on posix when extension bootstrap is configured', async () => {
@@ -354,6 +417,7 @@ test('launchSessionCli uses the host CLI on posix when extension bootstrap is co
       EXTENSION_PATH: '/repo/server/relay-extension.mjs',
     },
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     execFileSyncImpl(command) {
       if (command === 'tmux') throw new Error('missing tmux');
       throw new Error(`unexpected command: ${command}`);
@@ -375,7 +439,7 @@ test('launchSessionCli uses the host CLI on posix when extension bootstrap is co
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '--additional-mcp-config', `@${POSIX_MCP_CONFIG}`]);
 });
 
 test('launchSessionCli uses copilot command when bootstrap is set without cli executable', async () => {
@@ -390,6 +454,7 @@ test('launchSessionCli uses copilot command when bootstrap is set without cli ex
       EXTENSION_PATH: '/repo/server/relay-extension.mjs',
     },
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     execFileSyncImpl(command) {
       if (command === 'tmux') throw new Error('missing tmux');
       throw new Error(`unexpected command: ${command}`);
@@ -411,7 +476,7 @@ test('launchSessionCli uses copilot command when bootstrap is set without cli ex
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, 'copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '--additional-mcp-config', `@${POSIX_MCP_CONFIG}`]);
 });
 
 test('launchSessionCli uses the configured host CLI when bootstrap is set without extension path', async () => {
@@ -426,6 +491,7 @@ test('launchSessionCli uses the configured host CLI when bootstrap is set withou
       COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH: '/cache/copilot/preloads/extension_bootstrap.mjs',
     },
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     execFileSyncImpl(command) {
       if (command === 'tmux') throw new Error('missing tmux');
       throw new Error(`unexpected command: ${command}`);
@@ -447,7 +513,7 @@ test('launchSessionCli uses the configured host CLI when bootstrap is set withou
   assert.equal(launched.launchMode, 'detached');
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls[0]?.command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123']);
+  assert.deepEqual(spawnCalls[0]?.args, ['--allow-all', '--session-id', 'abc-123', '--additional-mcp-config', `@${POSIX_MCP_CONFIG}`]);
 });
 
 test('launchSessionCli opens a visible detached console on windows', async () => {
@@ -465,6 +531,7 @@ test('launchSessionCli opens a visible detached console on windows', async () =>
       COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION: 'true',
     },
     platform: 'win32',
+    prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
     processInspector: {
       findProcessForSession() {
         return null;
@@ -498,6 +565,9 @@ test('launchSessionCli opens a visible detached console on windows', async () =>
     '--allow-all',
     '--session-id',
     'abc-123',
+    // One plain path argument: no JSON has to survive cmd.exe and `start`.
+    '--additional-mcp-config',
+    `@${WIN32_MCP_CONFIG}`,
   ]);
   assert.equal(spawnCalls[0]?.options?.shell, undefined);
   assert.equal(spawnCalls[0]?.options?.detached, true);
@@ -519,6 +589,7 @@ test('launchSessionCli returns unknown pid when windows console spawn has no pid
       ComSpec: 'C:\\Windows\\System32\\cmd.exe',
     },
     platform: 'win32',
+    prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
     processInspector: {
       findProcessForSession() {
         return null;
@@ -549,6 +620,7 @@ test('launchSessionCli captures worker pid from windows process polling', async 
       ComSpec: 'C:\\Windows\\System32\\cmd.exe',
     },
     platform: 'win32',
+    prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
     processInspector: {
       findProcessForSession() {
         inspections += 1;
@@ -575,6 +647,7 @@ test('launchSessionCli reuses a live existing process before launching', async (
     targetSessionId: 'abc-123',
     cwd: '/repo',
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     processInspector: {
       findProcessForSession() {
         return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
@@ -602,6 +675,7 @@ test('launchSessionCli bypasses process reuse when disabled', async () => {
       PATH: process.env.PATH || '',
     },
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     allowProcessReuse: false,
     processInspector: {
       findProcessForSession() {
@@ -639,6 +713,7 @@ test('launchSessionCli ignores a dead discovered pid and continues to launch', a
       PATH: process.env.PATH || '',
     },
     platform: 'linux',
+    prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     processInspector: {
       findProcessForSession() {
         return { processId: 99999999, commandLine: 'gh copilot -- --session-id abc-123' };
@@ -729,4 +804,153 @@ test('prepareWorkerLogFile never throws when the filesystem misbehaves', async (
     fsImpl: { mkdirSync: () => { throw new Error('read-only fs'); } },
   });
   assert.equal(logPath, null);
+});
+
+// ─── the OAR MCP server for the extension engine ─────────────────────────────
+
+test('the extension-engine MCP config registers the OAR server the way the CLI expects', () => {
+  const config = buildCopilotOarMcpConfig('abc-123', {
+    COPILOT_WEB_RELAY_ROOT: '/srv/oar',
+    COPILOT_WEB_RELAY_CONFIG: '/srv/oar/server/config.json',
+    COPILOT_PROVIDER_API_KEY: 'sk-never-written',
+  }, { nodePath: '/usr/local/bin/node', pathImpl: path.posix });
+  assert.deepEqual(config, {
+    mcpServers: {
+      oar: {
+        type: 'local',
+        command: '/usr/local/bin/node',
+        args: [path.posix.join('/srv/oar', 'server', 'mcp', 'oar-mcp-server.mjs'), '--conversation-id', 'abc-123'],
+        env: {
+          COPILOT_WEB_RELAY_CONFIG: '/srv/oar/server/config.json',
+          COPILOT_WEB_RELAY_ROOT: '/srv/oar',
+        },
+        tools: ['*'],
+        // The CLI's own per-call default is 180 s: far below one remote_relay wait.
+        timeout: OAR_MCP_TOOL_TIMEOUT_MS,
+      },
+    },
+  });
+  assert.ok(OAR_MCP_TOOL_TIMEOUT_MS > 600_000);
+  assert.doesNotMatch(JSON.stringify(config), /sk-never-written/);
+});
+
+test('the MCP server script resolves like the worker scripts, on both platforms', () => {
+  assert.equal(
+    resolveOarMcpServerScriptPath({ COPILOT_WEB_RELAY_SERVER_DIR: '/srv/oar/server' }, { pathImpl: path.posix }),
+    path.posix.join('/srv/oar/server', 'mcp', 'oar-mcp-server.mjs'),
+  );
+  assert.equal(
+    resolveOarMcpServerScriptPath({ COPILOT_WEB_RELAY_ROOT: 'C:\\srv\\oar' }, { pathImpl: path.win32 }),
+    path.win32.join('C:\\srv\\oar', 'server', 'mcp', 'oar-mcp-server.mjs'),
+  );
+  assert.equal(resolveOarMcpServerScriptPath({}), OAR_MCP_SERVER_SCRIPT_PATH, 'else the module beside this service');
+});
+
+function recordingFs() {
+  const writes = [];
+  const dirs = [];
+  return {
+    writes,
+    dirs,
+    mkdirSync: (dir) => { dirs.push(dir); },
+    writeFileSync: (file, contents, options) => { writes.push({ file, contents, options }); },
+  };
+}
+
+test('prepareOarMcpConfigFile writes the config beside the worker log and returns its path', () => {
+  const fsImpl = recordingFs();
+  const filePath = prepareOarMcpConfigFile('abc-123', {
+    COPILOT_WEB_RELAY_LOG_DIR: '/var/log/relay',
+    COPILOT_WEB_RELAY_CONFIG: '/srv/oar/server/config.json',
+  }, { fsImpl, pathImpl: path.posix, nodePath: '/usr/local/bin/node' });
+  assert.equal(filePath, path.posix.join('/var/log/relay', 'worker-abc-123.mcp.json'));
+  assert.deepEqual(fsImpl.dirs, ['/var/log/relay']);
+  assert.equal(fsImpl.writes.length, 1);
+  assert.equal(fsImpl.writes[0].options.mode, 0o600);
+  const written = JSON.parse(fsImpl.writes[0].contents);
+  assert.equal(written.mcpServers.oar.command, '/usr/local/bin/node');
+  assert.deepEqual(written.mcpServers.oar.args.slice(1), ['--conversation-id', 'abc-123']);
+
+  const win = recordingFs();
+  const winPath = prepareOarMcpConfigFile('abc-123', { COPILOT_WEB_RELAY_SERVER_DIR: 'C:\\srv\\relay' }, {
+    fsImpl: win,
+    pathImpl: path.win32,
+    nodePath: 'C:\\Program Files\\nodejs\\node.exe',
+  });
+  assert.equal(winPath, path.win32.join('C:\\srv\\relay', 'logs', 'worker-abc-123.mcp.json'));
+  assert.equal(JSON.parse(win.writes[0].contents).mcpServers.oar.command, 'C:\\Program Files\\nodejs\\node.exe');
+});
+
+test('prepareOarMcpConfigFile is best-effort and honours the kill switch', () => {
+  const broken = prepareOarMcpConfigFile('abc-123', { COPILOT_WEB_RELAY_LOG_DIR: '/var/log/relay' }, {
+    fsImpl: { mkdirSync: () => { throw new Error('read-only fs'); }, writeFileSync: () => {} },
+    pathImpl: path.posix,
+    nodePath: '/usr/local/bin/node',
+  });
+  assert.equal(broken, null);
+
+  const fsImpl = recordingFs();
+  for (const value of ['0', 'false', 'off', 'NO']) {
+    assert.equal(isOarMcpServerDisabled({ OAR_MCP_SERVER: value }), true, value);
+    assert.equal(
+      prepareOarMcpConfigFile('abc-123', { OAR_MCP_SERVER: value, COPILOT_WEB_RELAY_LOG_DIR: '/var/log/relay' }, {
+        fsImpl,
+        pathImpl: path.posix,
+        nodePath: '/usr/local/bin/node',
+      }),
+      null,
+    );
+  }
+  assert.equal(fsImpl.writes.length, 0);
+  assert.equal(isOarMcpServerDisabled({}), false);
+  assert.equal(isOarMcpServerDisabled({ OAR_MCP_SERVER: '1' }), false);
+});
+
+test('a launch without a config file starts the CLI without the flag', async () => {
+  const spawnCalls = [];
+  await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
+    env: { PATH: process.env.PATH || '' },
+    platform: 'linux',
+    prepareOarMcpConfigImpl: () => null,
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    processInspector: { findProcessForSession: () => null },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return { pid: 4242, unref() {} };
+    },
+  });
+  assert.deepEqual(spawnCalls[0].args, ['--allow-all', '--session-id', 'abc-123']);
+  assert.equal(spawnCalls[0].options.env.OAR_MCP_SERVER_ATTACHED, undefined);
+});
+
+test('node workers never get the extension-engine MCP config', async () => {
+  const mcpConfig = fakeMcpConfig(POSIX_MCP_CONFIG);
+  const spawnCalls = [];
+  await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
+    env: {
+      PATH: process.env.PATH || '',
+      COPILOT_WEB_RELAY_WORKER_KIND: 'grok',
+      COPILOT_WEB_RELAY_GROK_WORKER_PATH: '/srv/oar/server/grok-worker/grok-session-worker.mjs',
+    },
+    platform: 'win32',
+    prepareOarMcpConfigImpl: mcpConfig,
+    processInspector: { findProcessForSession: () => null },
+    detachedPollAttempts: 1,
+    detachedPollDelayMs: 1,
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return { pid: null, unref() {} };
+    },
+  });
+  assert.equal(mcpConfig.calls.length, 0);
+  assert.equal(spawnCalls[0].args.includes('--additional-mcp-config'), false);
 });

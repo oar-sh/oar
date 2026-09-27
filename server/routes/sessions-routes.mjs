@@ -35,6 +35,8 @@ import {
 import { workspaceRootDisplayName } from '../workspace-root.mjs';
 import { createKeyedMutex } from '../services/keyed-mutex-service.mjs';
 import { createFixedWindowRateLimiter } from '../services/rate-limit-service.mjs';
+import { parseRemoteRelayOriginJson } from '../repositories/remote-relay-repository.mjs';
+import { admitRemoteRelayRequest, publicRemoteRelayOrigin } from '../services/remote-relay-inbound.mjs';
 import {
   RELAUNCH_COALESCE_WINDOW_MS,
   buildRelaunchRequestKey,
@@ -1745,6 +1747,8 @@ export function buildConversationMessages({
         const queueRow = sourceMessageId
           ? queueRowsById.get(sourceMessageId)
           : (message?.role === 'user' ? queueRowsById.get(id) : null);
+        // Provenance of a prompt another relay's agent sent: the bubble's badge.
+        const origin = message?.role === 'user' ? parseRemoteRelayOriginJson(message?.origin_json) : null;
         return {
           activities: message?.role === 'assistant' ? (relayActivitiesByMessageId.get(id) || []) : [],
           thoughts: message?.role === 'assistant' ? (relayThoughtsByMessageId.get(id) || []) : [],
@@ -1775,6 +1779,7 @@ export function buildConversationMessages({
           resentAs: (message?.role === 'assistant' && message?.kind === 'stopped' && sourceMessageId)
             ? (liveResends.get(sourceMessageId) || undefined)
             : undefined,
+          ...(origin ? { origin } : {}),
         };
       })
     : [];
@@ -2087,6 +2092,10 @@ export function registerSessionsRoutes(app, deps) {
     hostSuspendService = null,
     collectHostActivity = null,
     hostSuspendPlatform = process.platform,
+    // Remote relays (server/services/remote-relay-inbound.mjs): origin on
+    // conversations another relay's agent created, and the inbound switch.
+    // Absent in older wiring and most tests, where both are no-ops.
+    remoteRelayInbound = null,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   // Generic synchronous transaction runner for the session-sync route: binding
@@ -2615,7 +2624,11 @@ export function registerSessionsRoutes(app, deps) {
     });
     messages = messages.map((message) => {
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
-      const nextMessage = sourceMessageId ? { ...message, sourceMessageId } : message;
+      const withSource = sourceMessageId ? { ...message, sourceMessageId } : message;
+      // A public share never shows another relay's address or ids.
+      const nextMessage = withSource.origin
+        ? { ...withSource, origin: publicRemoteRelayOrigin(withSource.origin) }
+        : withSource;
       const attachments = Array.isArray(nextMessage?.attachments)
         ? nextMessage.attachments.map((attachment) => rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken))
         : nextMessage?.attachments;
@@ -2764,6 +2777,8 @@ export function registerSessionsRoutes(app, deps) {
         draftAttachments: parseDraftAttachmentsColumn(r.draft_attachments),
         draftUpdatedAt: r.draft_updated_at || null,
         draftUpdatedByClientId: r.draft_updated_by_client_id || null,
+        // Set on conversations another relay's agent created ("via <relay>").
+        origin: parseRemoteRelayOriginJson(r.origin_json),
       };
     });
 
@@ -3405,6 +3420,7 @@ export function registerSessionsRoutes(app, deps) {
       draftAttachments: parseDraftAttachmentsColumn(conv.draft_attachments),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
+      origin: parseRemoteRelayOriginJson(conv.origin_json),
       messages: history.messages,
       pageInfo: history.pageInfo,
       refreshed: true,
@@ -3800,6 +3816,10 @@ export function registerSessionsRoutes(app, deps) {
       updatedAt: conv.updated_at,
       sessionUsageSummary,
       inFlight,
+      // A queued (pending/parked) row counts too: inFlight covers only the
+      // processing one. Another relay's agent tells "still queued" from
+      // "cancelled" with it.
+      activeTurn: Number(stmts.getConversationActiveQueueCount?.get?.(resolvedConversationId)?.count || 0) > 0,
       backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
       previews: listConversationPreviews?.(resolvedConversationId) || [],
       preferredRelayMode: preferences.preferredRelayMode,
@@ -3809,6 +3829,8 @@ export function registerSessionsRoutes(app, deps) {
       draftAttachments: parseDraftAttachmentsColumn(conv.draft_attachments),
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
+      // Set on conversations another relay's agent created ("via <relay>").
+      origin: parseRemoteRelayOriginJson(conv.origin_json),
       messages: history.messages,
       pageInfo: history.pageInfo,
     });
@@ -4530,6 +4552,7 @@ export function registerSessionsRoutes(app, deps) {
     });
     const orphanedUploads = collectOrphanedUploadsFromConversation(id);
     hardDeleteConversationRows(id);
+    remoteRelayInbound?.repository?.forgetConversation?.(id);
     deleteOrphanedUploads(orphanedUploads);
     if (sdkSessionId && !cliSession.queued) stmts.deleteSdkDeleteRequest?.run?.(sdkSessionId);
     io.emit('conversation_deleted', { conversationId: id });
@@ -4538,6 +4561,7 @@ export function registerSessionsRoutes(app, deps) {
 
   // POST /api/conversation/:id/archive — archive conversation
   app.post('/api/conversation/:id/archive', auth, async (req, res) => {
+    if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     const id = String(req.params.id || '').trim();
     if (!id) return res.status(400).json({ error: 'Missing conversation id' });
     try {
@@ -4555,6 +4579,10 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.post('/api/conversation/bootstrap', auth, async (req, res) => {
+    // Another relay's agent starting a session: refused while the inbound
+    // switch is off, otherwise the conversation keeps its provenance.
+    const remoteRequest = admitRemoteRelayRequest(req, res, remoteRelayInbound);
+    if (!remoteRequest) return;
     const clientSessionId = String(ensureSessionId(req, res) || '').trim();
     const now = new Date().toISOString();
     let conversationId = '';
@@ -4850,6 +4878,7 @@ export function registerSessionsRoutes(app, deps) {
       // single canonical tuple.
       const commitBootstrapState = db.transaction(() => {
         stmts.insertConv.run(conversationId, title, now, now);
+        if (remoteRequest.origin) remoteRelayInbound?.repository?.setConversationOrigin?.(conversationId, remoteRequest.origin);
         const boundRuntimeSession = ensureRuntimeSessionBinding(
           conversationId,
           selectedModel,
@@ -4969,6 +4998,7 @@ export function registerSessionsRoutes(app, deps) {
         ok: true,
         conversationId,
         conversation,
+        origin: parseRemoteRelayOriginJson(conversation?.origin_json),
         runtimeSessionId: runtimeSession?.id || null,
         ownerSessionId,
         worker: ownerWorker,

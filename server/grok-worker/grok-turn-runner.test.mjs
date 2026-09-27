@@ -385,7 +385,10 @@ function createPreviewApi(lane) {
   return api;
 }
 
-function createPromptCapturingRunner({ api, sdkSessionId }) {
+// The preview block is the fallback for a Grok session WITHOUT the OAR MCP
+// server (its real `preview` tool replaces the block), so these runners
+// switch the MCP wiring off.
+function createPromptCapturingRunner({ api, sdkSessionId, oarMcpServer = null }) {
   const prompts = [];
   async function* quickTurn() {
     yield {
@@ -404,6 +407,7 @@ function createPromptCapturingRunner({ api, sdkSessionId }) {
       return quickTurn();
     },
     getPreviewInstructions: createPreviewInstructionsProvider({ api }),
+    oarMcpServer,
   });
   return { runner, prompts };
 }
@@ -560,6 +564,7 @@ test('a preview lookup failure does not fail the Grok turn', async () => {
       return quickTurn();
     },
     getPreviewInstructions: async () => { throw new Error('HTTP 500 /api/previews'); },
+    oarMcpServer: null,
   });
 
   const ok = await runner.handlePendingPayload({
@@ -570,5 +575,109 @@ test('a preview lookup failure does not fail the Grok turn', async () => {
   // user text still go through.
   assert.doesNotMatch(prompts[0], /Preview servers/);
   assert.match(prompts[0], /^## Embedding media in replies[\s\S]*still works$/);
+  await runner.dispose();
+});
+
+// ─── the OAR MCP server ──────────────────────────────────────────────────────
+
+function createMcpRunner({ api = createPreviewApi({ enabled: true, publicBaseUrl: 'https://previews.example.test', previews: [] }), env, ...overrides } = {}) {
+  const handleOptions = [];
+  const turnOptions = [];
+  async function* quickTurn() {
+    yield {
+      channel: 'result',
+      payload: { text: 'ok', isError: false, errorMessage: '', stopReason: 'end_turn', model: 'grok-4.5' },
+    };
+  }
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-mcp',
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    nodePath: '/usr/local/bin/node',
+    env: env || { COPILOT_WEB_RELAY_CONFIG: '/srv/oar/server/config.json', COPILOT_PROVIDER_API_KEY: 'sk-never-forwarded' },
+    createAgentHandleImpl: async (options) => {
+      handleOptions.push(options);
+      return makeHandle('sess-mcp');
+    },
+    startGrokTurnImpl: (options) => {
+      turnOptions.push(options);
+      return quickTurn();
+    },
+    getPreviewInstructions: createPreviewInstructionsProvider({ api }),
+    ...overrides,
+  });
+  return { runner, handleOptions, turnOptions, api };
+}
+
+test('Grok sessions get the OAR MCP server in the ACP stdio shape', async () => {
+  const { runner, handleOptions } = createMcpRunner();
+  await runner.handlePendingPayload({
+    message: { id: 'msg-m1', conversationId: 'conv-mcp', text: 'hi', relayMode: 'agent' },
+  });
+  const [server] = handleOptions[0].mcpServers;
+  assert.equal(handleOptions[0].mcpServers.length, 1);
+  assert.equal(server.name, 'oar');
+  assert.equal(server.command, '/usr/local/bin/node');
+  assert.match(server.args[0], /oar-mcp-server\.mjs$/);
+  assert.deepEqual(server.args.slice(1), ['--conversation-id', 'conv-mcp']);
+  assert.deepEqual(server.env, [{ name: 'COPILOT_WEB_RELAY_CONFIG', value: '/srv/oar/server/config.json' }]);
+  assert.equal('type' in server, false, 'stdio servers carry no transport type');
+
+  // The adapter builds the client itself: the class it gets must already
+  // carry the servers into session/new and session/load.
+  const Client = handleOptions[0].AcpClientImpl;
+  assert.equal(typeof Client, 'function');
+  const client = new Client({ command: 'grok', spawnImpl: () => { throw new Error('not spawned in this test'); } });
+  assert.deepEqual(client.mcpServers, handleOptions[0].mcpServers);
+  await runner.dispose();
+});
+
+test('with the MCP server wired in, the preview instruction block is neither looked up nor sent', async () => {
+  const { runner, turnOptions, api } = createMcpRunner();
+  await runner.handlePendingPayload({
+    message: { id: 'msg-m2', conversationId: 'conv-mcp', text: 'show me the app', relayMode: 'agent' },
+  });
+  assert.doesNotMatch(turnOptions[0].text, /Preview servers/);
+  assert.equal(turnOptions[0].text.includes(PREVIEW_TOOL_DESCRIPTION), false);
+  assert.match(turnOptions[0].text, /^## Embedding media in replies[\s\S]*show me the app$/);
+  assert.equal(api.calls.some((call) => call.path === '/api/previews'), false);
+  await runner.dispose();
+});
+
+test('OAR_MCP_SERVER=0 turns the wiring off and brings the preview block back', async () => {
+  const { runner, handleOptions, turnOptions } = createMcpRunner({ env: { OAR_MCP_SERVER: '0' } });
+  await runner.handlePendingPayload({
+    message: { id: 'msg-m3', conversationId: 'conv-mcp', text: 'show me the app', relayMode: 'agent' },
+  });
+  assert.equal('mcpServers' in handleOptions[0], false);
+  assert.equal('AcpClientImpl' in handleOptions[0], false);
+  assert.ok(turnOptions[0].text.includes(PREVIEW_TOOL_DESCRIPTION));
+  assert.equal(turnOptions[0].watchdog, null, 'no hold without the MCP server');
+  await runner.dispose();
+});
+
+test('the inactivity watchdog asks the relay for an in-flight remote_relay call before it fires', async () => {
+  let inflight = 1;
+  const calls = [];
+  const api = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (path.startsWith('/api/remote-relays/inflight')) return { inflight };
+    return { ok: true };
+  };
+  const { runner, turnOptions } = createMcpRunner({ api });
+  runner.setTurnCeilingMs(0);
+  await runner.handlePendingPayload({
+    message: { id: 'msg-m4', conversationId: 'conv-mcp', text: 'wait for linux-test', relayMode: 'agent' },
+  });
+  const { watchdog } = turnOptions[0];
+  assert.equal(watchdog.maxTurnMs, 0, 'the user ceiling still rides along');
+  assert.equal(typeof watchdog.holdStall, 'function');
+
+  assert.equal(await watchdog.holdStall(), true, 'a call in flight holds');
+  assert.equal(calls.at(-1).method, 'GET');
+  assert.equal(calls.at(-1).path, '/api/remote-relays/inflight?conversationId=conv-mcp');
+  inflight = 0;
+  assert.equal(await watchdog.holdStall(), false, 'nothing in flight: the stall is real');
   await runner.dispose();
 });

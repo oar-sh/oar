@@ -4,6 +4,11 @@
  */
 import { capThought } from '../../shared/thought-cap.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
+import {
+  REMOTE_RELAY_TOOL_NAME,
+  isRemoteRelayToolName,
+  remoteRelayActivitySummary,
+} from '../../shared/remote-relay-tool-core.mjs';
 
 const MAX_TOOL_DETAIL_LENGTH = 140;
 const SUBAGENT_TOOL_NAMES = new Set(['task', 'agent', 'subagent']);
@@ -59,6 +64,14 @@ export function summarizeToolInput(input) {
 }
 
 export function formatToolActivityText(toolName, input, title = '') {
+  // The OAR MCP server's `remote_relay`, however the agent labels it (bare,
+  // or namespaced by the server), reads as what it does on which relay.
+  if (isRemoteRelayToolName(toolName) || isRemoteRelayToolName(title)) {
+    const remoteSummary = remoteRelayActivitySummary(input);
+    return truncate(remoteSummary
+      ? `Tool (${REMOTE_RELAY_TOOL_NAME}): ${remoteSummary}`
+      : `Tool (${REMOTE_RELAY_TOOL_NAME})`);
+  }
   const name = String(toolName || title || 'tool').trim() || 'tool';
   const summary = summarizeToolInput(input) || String(title || '').trim();
   return truncate(summary ? `Tool (${name}): ${summary}` : `Tool (${name})`);

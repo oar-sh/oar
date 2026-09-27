@@ -119,6 +119,14 @@ import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserS
 import { handleAttachmentInput, retryAttachmentUpload, openAnnotateEditorForPending, openAnnotateEditorForPreview, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, copyFilePreviewImage, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import { initSlashAutocomplete } from './slash-autocomplete.mjs';
+import { initMentionAutocomplete } from './mention-autocomplete.mjs';
+import { consumeConversationDeepLink } from './conversation-deep-link.mjs';
+import {
+  addRemoteRelayFromForm,
+  saveRemoteRelayPublicUrl,
+  showRemoteRelayTokenField,
+  toggleRemoteRelayInbound,
+} from './remote-relays-settings.js';
 import { dataTransferHasFiles } from './composer-paste.mjs';
 import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
 import {
@@ -700,13 +708,10 @@ function initPushNotificationClientHooks() {
   });
 }
 
+// ?push_conv=<id> (a notification tap) and ?conv=<id> (another relay's
+// provenance badge links here) both open that conversation once.
 function consumePushConversationDeepLink() {
-  const url = new URL(window.location.href);
-  const conversationId = String(url.searchParams.get('push_conv') || '').trim();
-  if (!conversationId) return '';
-  url.searchParams.delete('push_conv');
-  history.replaceState(null, document.title, `${url.pathname}${url.search}${url.hash}`);
-  return conversationId;
+  return consumeConversationDeepLink();
 }
 
 function handleForegroundTransition(reason, { immediate = false } = {}) {
@@ -4189,6 +4194,7 @@ async function initApp() {
   initChatTitleCopy();
   initEmojiPicker();
   initSlashAutocomplete();
+  initMentionAutocomplete();
   initConversationListLazyLoading();
   initConversationFilter();
   initConversationHistoryLazyLoading();
@@ -4321,6 +4327,10 @@ window.togglePushOnThisDevice = togglePushOnThisDevice;
 window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;
 window.openSettingsModal = openSettingsModal;
 window.closeSettingsModal = closeSettingsModal;
+window.addRemoteRelayFromForm = addRemoteRelayFromForm;
+window.showRemoteRelayTokenField = showRemoteRelayTokenField;
+window.saveRemoteRelayPublicUrl = saveRemoteRelayPublicUrl;
+window.toggleRemoteRelayInbound = toggleRemoteRelayInbound;
 window.doAuth = doAuth;
 window.initApp = initApp;
 window.connectSocket = connectSocket;

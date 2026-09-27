@@ -438,7 +438,7 @@ Use **➡️ Share conversation** in the `⋯` menu to publish a read-only link.
 ### Notifications and the app
 
 - **⚙️ Settings → Notifications** turns on push notifications per device: for questions from the agent, completed or failed turns, plan boards, and the CLI going offline. They need a secure context (HTTPS, or `localhost`), are sent only while no device has the app in the foreground, and show generic text unless you opt in to message previews on that device.
-- The **⬇** button in the sidebar installs OAR as an app (PWA). **Install app name** in Settings sets its label on every device that connects to this relay.
+- The **⬇** button in the sidebar installs OAR as an app (PWA). **Relay name** in Settings sets its label on every device that connects to this relay, and is the name [paired relays](#remote-relays) know it by.
 
 ### The conversation menu
 
@@ -448,7 +448,7 @@ Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title
 
 ### Settings (⚙️ in the web UI)
 
-The modal is organised into five tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Grok**, and **Cursor** sub-tab), **Previews**, **Notifications**, and **Features** — and reopens on the tab you used last. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
+The modal is organised into six tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Grok**, and **Cursor** sub-tab), **Relays**, **Previews**, **Notifications**, and **Features** — and reopens on the tab you used last. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
 
 | Tab | Setting | Default | What it does |
 | --- | ------- | ------- | ------------ |
@@ -457,7 +457,7 @@ The modal is organised into five tabs — **General**, **Providers** (with a **C
 | General | Max turn duration | `60 min` | Hard cap on how long one turn may run before the relay requeues it (0 = no limit, up to 10 h; see below) |
 | General | Background task timeout | `4 h` | How long background tasks alone may keep a Claude or Copilot session running after its reply; then they are stopped (0 = no limit, up to 10 h) |
 | General | Autostart (Windows) | Off | *At sign-in* (a visible terminal after you log on) or *At system startup* (headless, no logon needed, one admin confirmation) |
-| General | Install app name | `OAR` | Label of the installed PWA on every device |
+| General | Relay name | `OAR` (the hostname for paired relays) | Label of the installed PWA on every device, and this relay's name for [paired relays](#remote-relays) |
 | General | Check for updates automatically | off | Opt-in: the relay asks oar.sh for the latest version about twice a day. **Check for updates** works regardless; `OAR_NO_UPDATE_CHECK=1` blocks both |
 | General | Default CWD for new sessions | relay workspace root | Working directory for newly created sessions that have none of their own |
 | Providers | Copilot engine | SDK | Extension when this relay cannot run the SDK engine (see [engine choice](#github-copilot--engine-choice)) |
@@ -466,6 +466,8 @@ The modal is organised into five tabs — **General**, **Providers** (with a **C
 | Providers | Claude account (Relogin / Logout) | host login | Switches the Claude account the relay host's CLI uses, from the browser (see [Claude (Agent SDK)](#claude-agent-sdk)) |
 | Providers | Cursor API key / model | — / `composer-2.5` | Enables Cursor; plus monthly plan allowances and the optional dashboard session token |
 | Providers | Grok | off | Enables Grok; default model `grok-4.5`; **Sign in** / **Sign out**; optional monthly allowance |
+| Relays | Public address, Accept prompts from other relays' agents | browser address / on | How paired relays reach this one, and whether their agents may prompt sessions here (see [Remote relays](#remote-relays)) |
+| Relays | Remote relays | — | Pair a relay by pasting its web address; per relay **Agents may** read only, read and prompt, or do everything |
 | Previews | Live previews | — | Lists the published previews, each of which you can close |
 | Notifications | Push notifications | off | Per device: which events notify, and whether titles and message previews are included |
 | Features | Feature flags | see below | **Session worker routing** (on), **Continuation answer routing** (on), **Generated-image continuity** (on), and a reserved **Worker fallback restart** (off, no effect yet). Changes apply after a relay restart; a `COPILOT_REMOTE_<FLAG>` environment variable pins a flag, e.g. `COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED=0` |
@@ -638,6 +640,52 @@ covering `/api/shared/*` — shared views poll for liveness and an edge-cached r
 would pin viewers to a stale snapshot. Likewise, a Cloudflare Access application over the
 bound hostname breaks share links unless it bypasses `/shared/*` and `/api/shared/*`.
 
+## Remote relays
+
+Several OAR relays can be paired, for example the one on your workstation and the one on a
+server. An agent in any session can then work on the other relay when you ask it to: list and
+read its sessions, prompt one, start a new one, wait for the reply, and pass a question the
+remote agent asks back to you.
+
+**Pairing.** Open **Settings → Relays** and paste the other relay's web address (the URL you
+open it with in the browser). OAR checks the address with its own token, or with a
+`?token=` the pasted link carries, and asks for a token only when that fails. It reads the
+other relay's name from its API. With **Also add this relay there** checked, it introduces
+itself to the other relay using the address in **Public address**, so the pairing works in both
+directions. When the two relays use different tokens, that introduction hands over this relay's
+token, so the other relay's agents can then work here. Each side can remove the other on its own,
+but removing a relay does not revoke a token it already holds: rotate the token for that. A relay
+that is already paired keeps the address and token stored for it when it introduces itself again;
+change those in **Settings → Relays**.
+
+A relay's name is the **Relay name** under **General** (it also names the installed app); when it
+is empty, the machine's hostname is used.
+
+**Mention a relay to unlock it.** Agents can see which relays are paired, but a relay stays
+locked in a conversation until you mention it in one of your messages: type `@` and pick it
+from the list, or write its name or its host name. An IP address or `localhost` never counts as a
+host name; a relay whose name is itself an address is unlocked only with a leading `@`. The
+mention unlocks that relay for the rest of
+the conversation. Prompts that arrive from another relay's agent never unlock anything, and a
+chain of relays prompting relays stops after two hops.
+
+**What agents can do.** Every provider gets the same `remote_relay` tool (Claude, Cursor and
+Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Per paired
+relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
+(also create sessions, answer questions, stop turns, archive). In the *ask* and *plan* relay
+modes, every write action first asks you with a question card.
+
+When an agent prompts a session on another relay, that relay shows a **↗ from …** badge with the
+sending relay, session and model on the message, and marks sessions an agent created in the
+conversation list. The remote agent sees a one-line header saying that another agent is talking
+to it. Turns started this way do not send "reply ready" notifications on the remote relay;
+question cards still do. **Accept prompts from other relays' agents** in **Settings → Relays**
+switches incoming agent prompts off.
+
+The calls go through your own relay, which holds the other relay's token: agents never see a
+token. Remote addresses must use `https://`; plain `http://` is accepted only for loopback (an
+SSH port forward, for example) and private network ranges.
+
 ## Security notes
 
 - The auth token guards the API and the Socket.IO channel. A browser signs in once, with the token or with a URL carrying `?token=` (such as the one `oar setup` prints and puts in its QR code), and then holds an HttpOnly cookie for 30 days, marked `Secure` when the relay is reached over HTTPS. Treat the token, and that URL, like a password.
@@ -645,6 +693,7 @@ bound hostname breaks share links unless it bypasses `/shared/*` and `/api/share
 - `localhostOnly` (default `true`) keeps the relay on loopback. Beyond your LAN, use HTTPS through one of the [tunnels](#remote-access) rather than an open port.
 - Agents act with the permissions of the user the relay runs as. OAR adds reach, not a sandbox: whoever holds the token can have them run commands on the host. `workspaceRootAllowList` limits the directories conversations may start in.
 - Shared conversation links and preview links are public by design: anyone with the URL can read the shared transcript or reach the previewed app, without signing in.
+- A [paired relay](#remote-relays) holds a token that opens the other relay completely. The per-relay "Agents may" limit and the "Accept prompts from other relays' agents" switch are honoured by OAR's own traffic, but anyone holding the token can still use the full API: the token is the real boundary. A token entered for a paired relay is stored like the API keys below and never sent to browsers or agents.
 - API keys you enter (OpenAI, Cursor) are stored in the relay database on the host and never sent to browsers. Claude and Grok credentials stay with their CLIs on the host.
 - OAR has no telemetry. Its only request to oar.sh is the update check, which is off until you enable it.
 

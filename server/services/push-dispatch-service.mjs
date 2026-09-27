@@ -307,6 +307,23 @@ export function createPushDispatchService({
     } catch {}
   }
 
+  // A turn another relay's agent started (its user message carries `origin`)
+  // pushes no "reply ready" or "failed": that agent is the one waiting for the
+  // reply and reports back to the user itself (decision 22). Question pushes
+  // are unchanged. Prepared lazily: a schema without the column (before
+  // migration 0005) simply means "not an agent's turn".
+  let messageOriginStatement = null;
+  function turnStartedByRemoteAgent(sourceMessageId) {
+    const id = String(sourceMessageId || '').trim();
+    if (!id) return false;
+    try {
+      messageOriginStatement ??= db.prepare(`SELECT origin_json FROM messages WHERE id = ?`);
+      return String(messageOriginStatement.get(id)?.origin_json || '').trim() !== '';
+    } catch {
+      return false;
+    }
+  }
+
   async function sendToSubscription(row, event) {
     const preferences = normalizePushPreferences(parseJsonObject(row.preferences_json));
     const payload = renderPushNotification(event, preferences);
@@ -419,7 +436,10 @@ export function createPushDispatchService({
     });
   }
 
-  function notifyTurnComplete({ conversationId, messageId, text } = {}) {
+  // `messageId` is the reply; `sourceMessageId` the user message that started
+  // the turn.
+  function notifyTurnComplete({ conversationId, messageId, sourceMessageId, text } = {}) {
+    if (turnStartedByRemoteAgent(sourceMessageId)) return Promise.resolve({ outcome: 'remote-agent' });
     return dispatch({
       type: 'turnComplete',
       conversationId: conversationId || null,
@@ -428,7 +448,8 @@ export function createPushDispatchService({
     });
   }
 
-  function notifyTurnFailed({ conversationId, messageId, text } = {}) {
+  function notifyTurnFailed({ conversationId, messageId, sourceMessageId, text } = {}) {
+    if (turnStartedByRemoteAgent(sourceMessageId)) return Promise.resolve({ outcome: 'remote-agent' });
     return dispatch({
       type: 'turnFailed',
       conversationId: conversationId || null,
