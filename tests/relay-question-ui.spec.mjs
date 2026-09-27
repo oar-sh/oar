@@ -1213,6 +1213,10 @@ test("shows a compact CWD picker menu for long known CWD lists", async ({ page, 
     await trigger.click();
     await expect(menu).toBeVisible();
   } finally {
+    // The app keeps polling /api/status, and the cleanup below makes it
+    // refresh: drop the interceptor first, so a poll still inside it when the
+    // page closes does not fail the test on a disposed response.
+    await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
     if (messageId && conversationId) {
       await request.post("/api/response", {
         headers,
