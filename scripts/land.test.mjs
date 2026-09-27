@@ -166,3 +166,20 @@ test('refuses: on main, dirty tree, stale base, empty branch, leaking message', 
     box.cleanup();
   }
 });
+
+test('refuses to land while the git identity carries a private name', { skip: !hasGit() }, () => {
+  const box = createSandbox();
+  try {
+    const base = box.git('rev-parse', 'HEAD');
+    topicBranch(box);
+    const run = (identityPatterns) => land({
+      cwd: box.repo, message: 'Add the feature', gates: [], patterns: NO_PATTERNS, identityPatterns, dryRun: true, log: quiet,
+    });
+    // The sandbox identity is "Dev <dev@example.com>".
+    assert.throws(() => run(buildDenylistPatterns(['example.com'])), /git identity of this checkout contains a name from the hygiene denylist/);
+    assert.equal(box.remoteGit(box.publicDir)('rev-parse', 'main'), base);
+    assert.equal(run(buildDenylistPatterns(['acme-internal'])).pushed, false, 'a clean identity passes the check');
+  } finally {
+    box.cleanup();
+  }
+});

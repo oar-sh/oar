@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   buildDenylistPatterns,
   buildFingerprintPatterns,
+  buildPrivateNamePatterns,
   SECRET_PATTERNS,
 } from '../scripts/hygiene-patterns.mjs';
 
@@ -381,6 +382,43 @@ test('published and test files contain nothing from the local hygiene denylist',
   assert.deepEqual(violations, [],
     'Committed files and fixtures must not name private projects, tickets or domains; use fictional '
     + `values (example-org/demo, example.com). Violations:\n${violations.join('\n')}`);
+});
+
+// Guard: the blind spot of every scan above. This file skips itself (SELF),
+// because it has to spell out example fingerprints and secrets, and the
+// pre-push hook treated it and its own test file the same way. That left a
+// place where a real name was caught by nothing, and one did get in: a private
+// domain, written into a "must not match" example.
+// So the hygiene files are scanned too, for private NAMES only (denylist and
+// gh account). Their examples are invented and match no real list.
+const HYGIENE_FILES = [
+  SELF,
+  path.join(repoRoot, 'scripts', 'pre-push.test.mjs'),
+  path.join(repoRoot, 'scripts', 'pre-push.mjs'),
+  path.join(repoRoot, 'scripts', 'hygiene-patterns.mjs'),
+];
+
+test('the hygiene files themselves name no private project, domain or account', () => {
+  const patterns = buildPrivateNamePatterns();
+  const violations = [];
+  for (const file of HYGIENE_FILES) {
+    const relPath = path.relative(repoRoot, file);
+    let lines = [];
+    try {
+      lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+    } catch {
+      violations.push(`${relPath} — cannot be read`);
+      continue;
+    }
+    lines.forEach((line, idx) => {
+      for (const { label, re } of patterns) {
+        if (re.test(line)) violations.push(`${relPath}:${idx + 1} — ${label}`);
+      }
+    });
+  }
+  assert.deepEqual(violations, [],
+    'The hygiene files are exempt from the secret and fingerprint patterns, not from private names. '
+    + `Use invented values in their examples. Violations:\n${violations.join('\n')}`);
 });
 
 // The account and denylist patterns, pinned against SYNTHETIC values so their

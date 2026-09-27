@@ -20,14 +20,17 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { buildPublishPatterns } from './hygiene-patterns.mjs';
+import { buildIdentityHeaderPatterns, buildPrivateNamePatterns, buildPublishPatterns } from './hygiene-patterns.mjs';
 
 const ZERO_SHA_RE = /^0+$/;
 const DEFAULT_PUBLIC_REMOTE_RE = /github\.com[:/]+oar-sh\/oar(?:\.git)?\/?$/i;
 const PUBLIC_BRANCHES = new Set(['refs/heads/main']);
-// Never scanned: the lockfile is machine-written noise, and the two hygiene
-// files carry the synthetic names their own tests look for.
-const SCAN_SKIP_FILES = new Set(['package-lock.json', 'server/test-hygiene.test.mjs', 'scripts/pre-push.test.mjs']);
+// Never scanned: the lockfile is machine-written noise.
+const SCAN_SKIP_FILES = new Set(['package-lock.json']);
+// Scanned for private names only: these files have to spell out example
+// secrets and fingerprints, but their examples are invented, so a denylist
+// entry or the gh account in them is a real leak like anywhere else.
+const HYGIENE_FILES = new Set(['server/test-hygiene.test.mjs', 'scripts/pre-push.test.mjs']);
 
 export function parseRefLines(text) {
   return String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
@@ -78,7 +81,7 @@ export function evaluatePublicRefs(refs, { env = process.env, isAncestor = () =>
  * Scan `git log -p` output: commit messages and added lines. Returns
  * `{ commit, file, line, label }` records; `file` is null for a message line.
  */
-export function scanLogOutput(text, patterns) {
+export function scanLogOutput(text, patterns, { privateNamePatterns = patterns } = {}) {
   const findings = [];
   let commit = '';
   let file = null;
@@ -89,16 +92,16 @@ export function scanLogOutput(text, patterns) {
     const fileMatch = raw.match(/^diff --git a\/(.+?) b\/(.+)$/);
     if (fileMatch) { file = fileMatch[2]; inMessage = false; continue; }
     let candidate = null;
+    let active = patterns;
     if (inMessage) {
-      // Header lines carry the identity every commit has anyway.
-      if (/^(Author|AuthorDate|Commit|CommitDate|Date|Merge):/.test(raw)) continue;
       candidate = raw;
     } else if (raw.startsWith('+') && !raw.startsWith('+++')) {
       if (file && SCAN_SKIP_FILES.has(file)) continue;
+      if (file && HYGIENE_FILES.has(file)) active = privateNamePatterns;
       candidate = raw.slice(1);
     }
     if (candidate === null) continue;
-    for (const { label, re } of patterns) {
+    for (const { label, re } of active) {
       if (re.test(candidate)) findings.push({ commit, file: inMessage ? null : file, line: candidate.trim().slice(0, 120), label });
     }
   }
@@ -109,7 +112,31 @@ function git(args, { cwd } = {}) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-export function scanPushedCommits(refs, { remoteName, cwd, patterns }) {
+/**
+ * Author and committer of each commit. Input is the output of
+ * `git log --format=%H%x09%an <%ae>%x09%cn <%ce>`.
+ */
+export function scanIdentityHeaders(text, identityPatterns) {
+  const findings = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const [hash, author = '', committer = ''] = raw.split('\t');
+    if (!hash) continue;
+    for (const [role, value] of [['author', author], ['committer', committer]]) {
+      for (const { label, re } of identityPatterns) {
+        if (re.test(value)) findings.push({ commit: hash.slice(0, 7), file: null, header: role, line: role, label });
+      }
+    }
+  }
+  return findings;
+}
+
+export function scanPushedCommits(refs, {
+  remoteName,
+  cwd,
+  patterns,
+  privateNamePatterns = patterns,
+  identityPatterns = [],
+}) {
   const findings = [];
   for (const ref of refs) {
     if (isDeletion(ref)) continue;
@@ -123,7 +150,12 @@ export function scanPushedCommits(refs, { remoteName, cwd, patterns }) {
       findings.push({ commit: '', file: null, line: String(error?.message || error).split('\n')[0], label: 'could not read the commits being pushed' });
       continue;
     }
-    for (const finding of scanLogOutput(log, patterns)) findings.push({ ...finding, ref: ref.remoteRef });
+    for (const finding of scanLogOutput(log, patterns, { privateNamePatterns })) findings.push({ ...finding, ref: ref.remoteRef });
+    if (identityPatterns.length) {
+      let headers = '';
+      try { headers = git(['log', '--format=%H%x09%an <%ae>%x09%cn <%ce>', ...range], { cwd }); } catch { headers = ''; }
+      for (const finding of scanIdentityHeaders(headers, identityPatterns)) findings.push({ ...finding, ref: ref.remoteRef });
+    }
   }
   return findings;
 }
@@ -137,6 +169,8 @@ export function runPrePush({
   log = (line) => process.stderr.write(`${line}\n`),
   runHygieneGuard = defaultHygieneGuard,
   patterns = null,
+  privateNamePatterns = null,
+  identityPatterns = null,
 } = {}) {
   const refs = parseRefLines(stdin);
   const pushed = refs.filter((ref) => !isDeletion(ref));
@@ -163,11 +197,23 @@ export function runPrePush({
   }
 
   if (publicRemote) {
-    const findings = scanPushedCommits(pushed, { remoteName, cwd, patterns: patterns || buildPublishPatterns() });
+    const findings = scanPushedCommits(pushed, {
+      remoteName,
+      cwd,
+      patterns: patterns || buildPublishPatterns(),
+      privateNamePatterns: privateNamePatterns || buildPrivateNamePatterns(),
+      identityPatterns: identityPatterns || buildIdentityHeaderPatterns(),
+    });
     if (findings.length) {
       log('pre-push: the commits being published contain private or machine-specific text:');
       for (const f of findings.slice(0, 40)) {
-        log(`  - ${f.commit} ${f.file || '(commit message)'} — ${f.label}`);
+        const where = f.header ? `(${f.header} header)` : (f.file || '(commit message)');
+        log(`  - ${f.commit} ${where} — ${f.label}`);
+      }
+      if (findings.some((f) => f.header)) {
+        log('A commit header carries a private name. Give this repository a neutral identity:');
+        log('  node scripts/setup-git.mjs --email "<id>+<login>@users.noreply.github.com"');
+        log('then recreate the commits; landing with node scripts/land.mjs does that.');
       }
       if (findings.length > 40) log(`  … and ${findings.length - 40} more`);
       log('Rewrite those commits (or land a squashed commit with `npm run land`) before publishing.');

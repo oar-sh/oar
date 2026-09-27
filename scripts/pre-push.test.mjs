@@ -6,6 +6,7 @@ import {
   isPublicRemote,
   parseRefLines,
   runPrePush,
+  scanIdentityHeaders,
   scanLogOutput,
   scanPushedCommits,
 } from './pre-push.mjs';
@@ -168,6 +169,74 @@ test('a new ref is scanned only for commits the remote does not have yet', { ski
     scanPushedCommits(refs, { remoteName: 'origin', cwd: box.repo, patterns });
     assert.ok(seen.includes('one'), 'the new commit was scanned');
     assert.equal(seen.includes('demo'), false, 'the commit already on the remote was not');
+  } finally {
+    box.cleanup();
+  }
+});
+
+// Assembled at runtime: a token-shaped literal in this file would itself trip
+// the suite guard, which scans every test file for secrets.
+const EXAMPLE_TOKEN = `ghp_${'a'.repeat(30)}`;
+
+test('the hygiene files are scanned for private names, and only for those', () => {
+  const log = [
+    `commit ${A}`,
+    'Extend the guard',
+    '',
+    'diff --git a/server/test-hygiene.test.mjs b/server/test-hygiene.test.mjs',
+    "+  assert.equal(flags(deny, 'acme-internal board'), true);",
+    `+  const fake = '${EXAMPLE_TOKEN}';`,
+    'diff --git a/scripts/pre-push.test.mjs b/scripts/pre-push.test.mjs',
+    "+const host = 'https://relay.corp.example9/x';",
+    'diff --git a/server/other.test.mjs b/server/other.test.mjs',
+    `+const fake = '${EXAMPLE_TOKEN}';`,
+  ].join('\n');
+  const privateNamePatterns = buildDenylistPatterns(['acme-internal', 'corp.example9']);
+  const findings = scanLogOutput(log, PATTERNS, { privateNamePatterns });
+  const where = findings.map((f) => `${f.file}: ${f.label.replace(/ \(.*/, '')}`);
+  assert.deepEqual(where, [
+    'server/test-hygiene.test.mjs: name from the local hygiene denylist',
+    'scripts/pre-push.test.mjs: name from the local hygiene denylist',
+    'server/other.test.mjs: GitHub token',
+  ], 'an example token is fine in a hygiene file, a private name is not');
+});
+
+test('scanIdentityHeaders flags a private name in an author or committer header', () => {
+  const identityPatterns = buildDenylistPatterns(['corp.example9']);
+  const text = [
+    `${A}\tDev <dev@corp.example9>\tDev <1+octo-jane@users.noreply.example.com>`,
+    `${B}\tDev <1+octo-jane@users.noreply.example.com>\tDev <1+octo-jane@users.noreply.example.com>`,
+  ].join('\n');
+  const findings = scanIdentityHeaders(text, identityPatterns);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].commit, A.slice(0, 7));
+  assert.equal(findings[0].header, 'author');
+});
+
+test('a push to the public remote is refused when a commit header carries a private name', { skip: !hasGit() }, () => {
+  const box = createSandbox();
+  try {
+    const base = box.git('rev-parse', 'HEAD');
+    box.git('config', 'user.email', 'dev@corp.example9');
+    box.commit('notes.md', 'plain text\n', 'Add notes');
+    const tip = box.git('rev-parse', 'HEAD');
+    const lines = [];
+    const run = (identityPatterns) => runPrePush({
+      remoteName: 'origin',
+      remoteUrl: 'https://github.com/oar-sh/oar.git',
+      stdin: `refs/heads/main ${tip} refs/heads/main ${base}\n`,
+      cwd: box.repo,
+      env: {},
+      log: (line) => lines.push(line),
+      runHygieneGuard: () => true,
+      patterns: [],
+      privateNamePatterns: [],
+      identityPatterns,
+    });
+    assert.equal(run(buildDenylistPatterns(['corp.example9'])), 1);
+    assert.match(lines.join('\n'), /\(author header\)/);
+    assert.match(lines.join('\n'), /setup-git\.mjs --email/);
+    assert.equal(run(buildDenylistPatterns(['acme-internal'])), 0, 'an unrelated denylist lets it through');
   } finally {
     box.cleanup();
   }

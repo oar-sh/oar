@@ -158,9 +158,15 @@ export function buildFingerprintPatterns(identity = readHostIdentity()) {
       ),
     });
   }
-  // Unlike a bare username (see FINGERPRINT_CASES in the suite guard), the gh
-  // login is an account that owns repositories, so it is flagged wherever it
-  // appears; fixtures use `example-org/...`.
+  patterns.push(...buildAccountPatterns(identity));
+  return patterns;
+}
+
+// Unlike a bare username (see FINGERPRINT_CASES in the suite guard), the gh
+// login is an account that owns repositories, so it is flagged wherever it
+// appears; fixtures use `example-org/...`.
+export function buildAccountPatterns(identity = readHostIdentity()) {
+  const patterns = [];
   for (const login of identity.githubLogins || []) {
     const name = String(login || '').trim();
     if (name.length < 3 || isGenericIdentity(name)) continue;
@@ -178,6 +184,28 @@ export const SECRET_PATTERNS = [
   { label: 'AWS access key id', re: /\bAKIA[0-9A-Z]{16}\b/ },
   { label: 'private key block', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
 ];
+
+/**
+ * Private NAMES only: the denylist and the gh account. This is the set applied
+ * to the hygiene files themselves. Those files have to spell out example
+ * secrets and fingerprints to test the patterns, so they are exempt from
+ * those, but nothing excuses a real project name or account in them. Their
+ * own examples are invented and match no real list.
+ */
+export function buildPrivateNamePatterns({
+  identity = readHostIdentity(),
+  denylist = readLocalDenylist(),
+} = {}) {
+  return [...buildDenylistPatterns(denylist), ...buildAccountPatterns(identity)];
+}
+
+/**
+ * What an author or committer header must not contain. Denylist only: the gh
+ * account is expected there (a noreply address carries the login).
+ */
+export function buildIdentityHeaderPatterns({ denylist = readLocalDenylist() } = {}) {
+  return buildDenylistPatterns(denylist);
+}
 
 /** Every pattern a published line must not match, for this host and checkout. */
 export function buildPublishPatterns({

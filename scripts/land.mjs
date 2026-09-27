@@ -26,7 +26,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { buildPublishPatterns } from './hygiene-patterns.mjs';
+import { buildIdentityHeaderPatterns, buildPublishPatterns } from './hygiene-patterns.mjs';
 
 export const PUBLIC_REMOTE = 'origin';
 export const WORK_REMOTE = 'work';
@@ -110,6 +110,7 @@ export function land({
   gates = DEFAULT_GATES,
   runGate = defaultRunGate,
   patterns = null,
+  identityPatterns = null,
   publicRemote = PUBLIC_REMOTE,
   workRemote = WORK_REMOTE,
   log = console.log,
@@ -126,6 +127,15 @@ export function land({
   const commitMessage = buildCommitMessage({ message, body });
   const leaks = findMessageLeaks(commitMessage, patterns || buildPublishPatterns());
   if (leaks.length) throw new LandError(`the commit message contains private or machine-specific text: ${leaks.join('; ')}`);
+  // The squashed commit is authored and committed by whoever git is
+  // configured as here, and those headers are published with it.
+  const identity = `${git(['config', 'user.name'], { allowFail: true }) || ''} <${git(['config', 'user.email'], { allowFail: true }) || ''}>`;
+  if (findMessageLeaks(identity, identityPatterns || buildIdentityHeaderPatterns()).length) {
+    throw new LandError(
+      'the git identity of this checkout contains a name from the hygiene denylist, and it would be published in the commit header. '
+      + 'Set a neutral one for this repository: node scripts/setup-git.mjs --email "<id>+<login>@users.noreply.github.com"',
+    );
+  }
 
   git(['fetch', '--quiet', publicRemote, MAIN]);
   const base = git(['rev-parse', `${publicRemote}/${MAIN}`]);

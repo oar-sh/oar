@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { resolveLocalDenylistPath } from './hygiene-patterns.mjs';
+import { buildIdentityHeaderPatterns, readLocalDenylist, resolveLocalDenylistPath } from './hygiene-patterns.mjs';
 
 export const WORK_REMOTE = 'work';
 export const HOOKS_PATH = 'scripts/git-hooks';
@@ -28,15 +28,17 @@ const DENYLIST_STUB = [
 ].join('\n');
 
 export function parseSetupArgs(argv) {
-  const args = { workUrl: '' };
+  const args = { workUrl: '', email: '' };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--work-url') { args.workUrl = String(argv[i + 1] || '').trim(); i += 1; }
     else if (argv[i].startsWith('--work-url=')) args.workUrl = argv[i].slice('--work-url='.length).trim();
+    else if (argv[i] === '--email') { args.email = String(argv[i + 1] || '').trim(); i += 1; }
+    else if (argv[i].startsWith('--email=')) args.email = argv[i].slice('--email='.length).trim();
   }
   return args;
 }
 
-export function setupGit({ cwd, workUrl = '', env = process.env, log = console.log } = {}) {
+export function setupGit({ cwd, workUrl = '', email = '', env = process.env, log = console.log } = {}) {
   const git = (args, { allowFail = false } = {}) => {
     try {
       return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -84,6 +86,22 @@ export function setupGit({ cwd, workUrl = '', env = process.env, log = console.l
     log(`denylist:  ${path.relative(cwd, denylistPath) || denylistPath}`);
   }
 
+  // The author and committer headers are published with every commit. Set for
+  // this repository only; the global identity is left alone.
+  if (email) {
+    git(['config', '--local', 'user.email', email]);
+    log('identity:  user.email set for this repository');
+  }
+  const identity = `${git(['config', 'user.name'], { allowFail: true }) || ''} <${git(['config', 'user.email'], { allowFail: true }) || ''}>`;
+  const denylist = readLocalDenylist(env, cwd);
+  report.identityClean = !buildIdentityHeaderPatterns({ denylist }).some(({ re }) => re.test(identity));
+  if (!report.identityClean) {
+    report.warnings.push(
+      'the git identity of this checkout matches the hygiene denylist, and it is published in every commit header. '
+      + 'Set a neutral one for this repository: node scripts/setup-git.mjs --email "<id>+<login>@users.noreply.github.com"',
+    );
+  }
+
   for (const warning of report.warnings) log(`WARNING:   ${warning}`);
   return report;
 }
@@ -92,6 +110,6 @@ const invokedDirectly = process.argv[1]
   && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 if (invokedDirectly) {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const { workUrl } = parseSetupArgs(process.argv.slice(2));
-  setupGit({ cwd: repoRoot, workUrl });
+  const { workUrl, email } = parseSetupArgs(process.argv.slice(2));
+  setupGit({ cwd: repoRoot, workUrl, email });
 }

@@ -380,6 +380,18 @@ the `work` remote, makes a bare `git push` go to `work`, and creates an empty hy
 there is none. It is idempotent; run it again whenever in doubt. Then add your private names to
 the denylist (see [Test authoring rules](#test-authoring-rules)).
 
+**Your git identity is published too.** Every commit carries the author's and the committer's
+name and e-mail address, and no later change takes them out of a published commit. If your usual
+address is on a personal domain, give this repository its own neutral one. The setting is local to
+the checkout; your global identity stays as it is:
+
+```bash
+node scripts/setup-git.mjs --email "<id>+<login>@users.noreply.github.com"
+```
+
+The setup warns when the identity in effect matches the denylist, `land` refuses to build a
+commit with it, and the hook refuses to publish one.
+
 ### Day to day
 
 ```bash
@@ -410,13 +422,19 @@ The same goes for `node scripts/setup-git.mjs --work-url <url>`.
 
 - To `origin` it accepts only `main` and tags, refuses a non-fast-forward of `main`, and scans
   the commits being pushed (messages and added lines) for machine fingerprints, the `gh`
-  account, denylist names and secrets. Deleting a branch is always allowed.
+  account, denylist names and secrets. It also checks the **author and committer headers** of
+  those commits against the denylist. Deleting a branch is always allowed.
 - To any remote it first runs the hygiene guard over the working tree.
 
 The two overrides are environment variables, deliberately not flags:
 `OAR_ALLOW_PUBLIC_BRANCH=1` and `OAR_ALLOW_PUBLIC_REWRITE=1`. They are for a maintainer repairing
 the public repository by hand. What counts as a leak is defined once, in
 `scripts/hygiene-patterns.mjs`, and shared with `server/test-hygiene.test.mjs`.
+
+The hygiene files themselves (`server/test-hygiene.test.mjs`, `scripts/pre-push.test.mjs`) have
+to spell out example secrets and fingerprints, so they are exempt from those patterns. They are
+**not** exempt from private names: both the suite and the hook check them against the denylist
+and the `gh` account. Every example in them is invented.
 
 ### If something private was published anyway
 

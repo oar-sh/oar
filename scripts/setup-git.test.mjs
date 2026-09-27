@@ -48,3 +48,27 @@ test('without a private remote the setup says what is missing and does not redir
     box.cleanup();
   }
 });
+
+test('setup warns about an identity on the denylist and --email fixes it for this repository only', { skip: !hasGit() }, () => {
+  const box = createSandbox();
+  try {
+    const denylist = path.join(box.root, 'denylist.txt');
+    fs.writeFileSync(denylist, 'example.com\n');
+    const env = { OAR_HYGIENE_DENYLIST: denylist };
+    const before = setupGit({ cwd: box.repo, env, log: quiet });
+    assert.equal(before.identityClean, false);
+    assert.match(before.warnings.join('\n'), /git identity of this checkout matches the hygiene denylist/);
+
+    const after = setupGit({ cwd: box.repo, env, email: '1+octo-jane@users.noreply.example.org', log: quiet });
+    assert.equal(after.identityClean, true);
+    assert.deepEqual(after.warnings, []);
+    assert.equal(box.git('config', '--local', 'user.email'), '1+octo-jane@users.noreply.example.org');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('parseSetupArgs reads --email in both forms', () => {
+  assert.equal(parseSetupArgs(['--email', 'a@example.com']).email, 'a@example.com');
+  assert.equal(parseSetupArgs(['--email=a@example.com', '--work-url', 'w']).workUrl, 'w');
+});
