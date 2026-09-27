@@ -281,6 +281,27 @@ On Linux/macOS, session workers prefer detached `tmux` sessions when `tmux` is a
 tmux attach -t <sdk-session-id>
 ```
 
+### Worker logs
+
+Every Node session worker (Claude, Cursor, Grok, Copilot SDK) appends its stdout and stderr to
+`worker-<sdk-session-id>.log` in the relay's log directory (`COPILOT_WEB_RELAY_LOG_DIR`; `oar doctor`
+prints it), across restarts of the worker. At each launch a file over 10 MB is moved to
+`worker-<sdk-session-id>.log.1`, replacing the previous one.
+
+- **Linux/macOS**: the launcher redirects the worker's output into the file (`>> file 2>&1` under
+  tmux, an inherited descriptor without tmux).
+- **Windows**: each worker runs in its own console window (relay log: `mode=console`), which keeps
+  showing the output. The launcher passes the file in `COPILOT_WEB_RELAY_WORKER_LOG_FILE` and the
+  worker copies what it writes into it (`shared/worker-runtime/worker-log-file.mjs`). The file is
+  next to `server.log`: `%LOCALAPPDATA%\copilot-remote\logs` for a git checkout started with
+  `oar`, `%APPDATA%\oar\logs` for a global install, `server\logs` for a relay started without the
+  launcher. Not in the file on Windows: what Node prints natively (a V8 fatal error such as heap
+  exhaustion, a module that fails to load at startup) and the output of a worker started by hand,
+  which has no launcher to name the file; set the variable yourself to get one.
+
+The Copilot *Extension* engine has no worker log on any platform: it is the CLI's own TUI. Its
+relay extension writes `ext-debug.log` in the same directory.
+
 ### Claude workers
 
 Claude conversations run `server/claude-worker/claude-session-worker.mjs` as a plain Node process

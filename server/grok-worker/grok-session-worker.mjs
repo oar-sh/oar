@@ -12,9 +12,14 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-file.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
+
+// Windows console launch: the launcher names the worker log, this copies
+// stdout/stderr into it. A no-op wherever the launcher redirects instead.
+installWorkerLogFile();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HEARTBEAT_MS = 10_000;

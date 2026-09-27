@@ -11,6 +11,12 @@ All notable changes to OAR are documented here. The format follows
   prompts on another relay (`effort` on `create_session` and `send`), and `relay_info`
   lists the efforts each model there takes.
 
+### Changed
+
+- Session workers on Windows now write the same `worker-<session>.log` as on
+  Linux, in the relay's log directory; the console window keeps showing the
+  output.
+
 ### Fixed
 
 - **Remote relays:** waiting for a remote agent's reply no longer stops at an

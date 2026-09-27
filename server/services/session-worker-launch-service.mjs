@@ -13,6 +13,7 @@ import {
   buildOarMcpServerLaunch,
   isOarMcpServerDisabled,
 } from '../mcp/oar-mcp-server.mjs';
+import { WORKER_LOG_FILE_ENV } from '../../shared/worker-runtime/worker-log-file.mjs';
 
 export { isOarMcpServerDisabled };
 
@@ -507,7 +508,8 @@ export function createWorkerSecretEnvFile(env = {}, {
  * their output discarded (`stdio: 'ignore'` / bare tmux exec), so a crash
  * left zero forensic trail — the failure mode that made the 2026-08-11
  * incident undiagnosable. Best-effort by design: a log problem must never
- * block a worker spawn. Naive rotation: >10 MB rolls to `<file>.1`.
+ * block a worker spawn. Naive rotation: >10 MB rolls to `<file>.1`, checked
+ * at each launch on every platform.
  */
 function resolveWorkerLogDir(launchEnv = {}, { pathImpl = path } = {}) {
   const explicitDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_LOG_DIR);
@@ -683,6 +685,9 @@ export async function launchSessionCli({
   // Extension engine: writes the session's OAR MCP config, returns its path
   // (or null to launch without it).
   prepareOarMcpConfigImpl = prepareOarMcpConfigFile,
+  // Windows console launch: resolves (and rotates) the worker log the worker
+  // then writes itself; returns its path or null.
+  prepareWorkerLogFileImpl = prepareWorkerLogFile,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
@@ -719,6 +724,9 @@ export async function launchSessionCli({
     ...launchEnv,
     SESSION_ID: target,
   };
+  // Set per launch below, never inherited: a relay started from inside a
+  // worker session would otherwise hand its workers that session's log.
+  delete launchSessionEnv[WORKER_LOG_FILE_ENV];
   // The extension engine gets the OAR MCP server (remote_relay + preview) the
   // node workers carry in-process; every launch path appends the same args.
   const extensionCliArgs = resolveNodeWorkerDescriptor(launchSessionEnv)
@@ -842,8 +850,15 @@ export async function launchSessionCli({
       : ['--allow-all', '--session-id', target, ...extensionCliArgs]);
   // POSIX node workers tee stdout/stderr into the worker log (a crash must
   // leave a trail). On win32 the `start` intermediary opens its own console,
-  // so fd inheritance cannot reach the worker — its window shows the output.
+  // so fd inheritance cannot reach the worker, and a shell redirect would
+  // leave its window empty: the worker is told the file and copies its own
+  // output into it (shared/worker-runtime/worker-log-file.mjs). Only the path
+  // travels; nothing of the environment or command line is written to the log.
   let detachedStdio = 'ignore';
+  if (platform === 'win32' && nodeWorker) {
+    const workerLogPath = prepareWorkerLogFileImpl(target, launchSessionEnv);
+    if (workerLogPath) launchSessionEnv[WORKER_LOG_FILE_ENV] = workerLogPath;
+  }
   if (platform !== 'win32' && nodeWorker) {
     const workerLogPath = prepareWorkerLogFile(target, launchSessionEnv);
     if (workerLogPath) {

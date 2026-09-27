@@ -20,6 +20,7 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-file.mjs';
 import {
   createRunnerLinkBridge,
   failSettlingRowsOnShutdown,
@@ -32,6 +33,10 @@ import {
   readOptionalMs,
 } from '../../shared/worker-bootstrap.mjs';
 import { createCopilotSdkSessionRunner } from './copilot-sdk-session-process.mjs';
+
+// Windows console launch: the launcher names the worker log, this copies
+// stdout/stderr into it. A no-op wherever the launcher redirects instead.
+installWorkerLogFile();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HEARTBEAT_MS = 10_000;

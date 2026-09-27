@@ -954,3 +954,113 @@ test('node workers never get the extension-engine MCP config', async () => {
   assert.equal(mcpConfig.calls.length, 0);
   assert.equal(spawnCalls[0].args.includes('--additional-mcp-config'), false);
 });
+
+// ─── the worker log on the windows console launch ────────────────────────────
+
+const WIN32_WORKER_LOG = path.win32.join('C:\relay', 'logs', 'worker-abc-123.log');
+
+function launchOnWindowsConsole({ env = {}, prepareWorkerLogFileImpl } = {}) {
+  const spawnCalls = [];
+  return launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: 'C:\relay',
+    workspaceRoot: 'C:\repo',
+    env: { ComSpec: 'C:\Windows\System32\cmd.exe', ...env },
+    platform: 'win32',
+    prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
+    prepareWorkerLogFileImpl,
+    processInspector: { findProcessForSession: () => null },
+    detachedPollAttempts: 1,
+    detachedPollDelayMs: 1,
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return { pid: null, unref() {} };
+    },
+  }).then(() => spawnCalls);
+}
+
+test('every node worker kind is told its worker log on the windows console launch', async () => {
+  for (const kind of ['claude', 'cursor', 'grok', 'copilot-sdk']) {
+    const prepared = [];
+    const spawnCalls = await launchOnWindowsConsole({
+      env: {
+        COPILOT_WEB_RELAY_WORKER_KIND: kind,
+        COPILOT_WEB_RELAY_ROOT: 'C:\srv\oar',
+        COPILOT_WEB_RELAY_WORKER_LOG_FILE: 'C:\relay\logs\worker-inherited.log',
+      },
+      prepareWorkerLogFileImpl: (target) => {
+        prepared.push(target);
+        return WIN32_WORKER_LOG;
+      },
+    });
+    assert.deepEqual(prepared, ['abc-123'], kind);
+    assert.equal(spawnCalls[0].options.env.COPILOT_WEB_RELAY_WORKER_LOG_FILE, WIN32_WORKER_LOG, kind);
+    // The console window stays: no redirect in the command, nothing hidden.
+    assert.deepEqual(spawnCalls[0].args.slice(-2), ['--session-id', 'abc-123'], kind);
+    assert.equal(spawnCalls[0].args.some((arg) => /worker-abc-123\.log|>/.test(arg)), false, kind);
+    assert.equal(spawnCalls[0].options.stdio, 'ignore', kind);
+    assert.equal(spawnCalls[0].options.windowsHide, false, kind);
+  }
+});
+
+test('the windows worker log hand-over carries no secret onto the command line', async () => {
+  const spawnCalls = await launchOnWindowsConsole({
+    env: {
+      COPILOT_WEB_RELAY_WORKER_KIND: 'cursor',
+      COPILOT_WEB_RELAY_ROOT: 'C:\srv\oar',
+      CURSOR_API_KEY: 'cursor-test-key',
+    },
+    prepareWorkerLogFileImpl: () => WIN32_WORKER_LOG,
+  });
+  assert.equal(spawnCalls[0].args.join(' ').includes('cursor-test-key'), false);
+  assert.equal(spawnCalls[0].options.env.COPILOT_WEB_RELAY_WORKER_LOG_FILE, WIN32_WORKER_LOG);
+});
+
+test('a windows worker still launches when its log cannot be prepared', async () => {
+  const spawnCalls = await launchOnWindowsConsole({
+    env: { COPILOT_WEB_RELAY_WORKER_KIND: 'claude', COPILOT_WEB_RELAY_ROOT: 'C:\srv\oar' },
+    prepareWorkerLogFileImpl: () => null,
+  });
+  assert.equal(spawnCalls.length, 1);
+  assert.equal('COPILOT_WEB_RELAY_WORKER_LOG_FILE' in spawnCalls[0].options.env, false);
+});
+
+test('the extension engine gets no worker log on windows, as on linux', async () => {
+  const prepared = [];
+  const spawnCalls = await launchOnWindowsConsole({
+    env: { COPILOT_WEB_RELAY_WORKER_LOG_FILE: 'C:\relay\logs\worker-inherited.log' },
+    prepareWorkerLogFileImpl: (target) => {
+      prepared.push(target);
+      return WIN32_WORKER_LOG;
+    },
+  });
+  assert.deepEqual(prepared, []);
+  assert.equal(spawnCalls[0].args[5], 'gh');
+  assert.equal('COPILOT_WEB_RELAY_WORKER_LOG_FILE' in spawnCalls[0].options.env, false);
+});
+
+test('an inherited worker log variable never reaches a redirected posix worker', async () => {
+  const spawnCalls = [];
+  await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: '/relay',
+    workspaceRoot: '/repo',
+    env: {
+      COPILOT_WEB_RELAY_WORKER_KIND: 'grok',
+      COPILOT_WEB_RELAY_ROOT: '/srv/oar',
+      COPILOT_WEB_RELAY_WORKER_LOG_FILE: '/relay/logs/worker-inherited.log',
+    },
+    platform: 'linux',
+    prepareWorkerLogFileImpl: () => { throw new Error('the posix paths redirect instead'); },
+    execFileSyncImpl(command) {
+      if (command === 'tmux') throw new Error('missing tmux');
+      throw new Error(`unexpected command: ${command}`);
+    },
+    processInspector: { findProcessForSession: () => null },
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return { pid: 4242, unref() {} };
+    },
+  });
+  assert.equal('COPILOT_WEB_RELAY_WORKER_LOG_FILE' in spawnCalls[0].options.env, false);
+});
