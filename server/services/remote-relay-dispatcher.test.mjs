@@ -764,6 +764,45 @@ test('an interim reply with background work waits for the follow-up and returns 
   assert.match(result.body.note, /background/);
 });
 
+test('a follow-up turn in flight counts as work even when no background task was published', async () => {
+  // Seen live: the agent answered "waiting for my translator", then went on in
+  // a turn of its own (subagents, no published background task).
+  const { run, remote } = setup();
+  withSession(remote);
+  remote.onRead = (conv, query, count) => {
+    if (count === 1) {
+      remote.reply('conv-1', { sourceMessageId: query.afterMessageId, text: 'One translator has not reported back yet.' });
+      conv.inFlight = { messageId: 'cont-row-1', streamEvents: [{ seq: 1, text: 'Running the checks' }], activities: [] };
+      conv.activeTurn = true;
+    }
+    if (count === 4) {
+      remote.reply('conv-1', { kind: 'continuation', text: 'All five pages are deployed.' });
+      conv.inFlight = null;
+      conv.activeTurn = false;
+    }
+  };
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT });
+  assert.equal(result.body.status, 'done');
+  assert.equal(result.body.reply.text, 'All five pages are deployed.');
+  assert.equal(result.body.firstReply.text, 'One translator has not reported back yet.');
+});
+
+test('a turn still in flight for the sent message itself is not taken for a follow-up', async () => {
+  const { run, remote } = setup();
+  withSession(remote);
+  remote.onRead = (conv, query, count) => {
+    if (count === 1) {
+      remote.reply('conv-1', { sourceMessageId: query.afterMessageId, text: 'Here is the summary.' });
+      // The reply is saved a moment before the relay clears the turn.
+      conv.inFlight = { messageId: query.afterMessageId, streamEvents: [], activities: [] };
+    }
+  };
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT });
+  assert.equal(result.body.status, 'done');
+  assert.equal(result.body.reply.text, 'Here is the summary.');
+  assert.equal(result.body.firstReply, undefined);
+});
+
 test('a quiet moment between two follow-up turns is not the end of the background work', async () => {
   const { run, remote } = setup();
   withSession(remote);

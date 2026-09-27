@@ -5,6 +5,12 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Remote relays:** waiting for a remote agent's reply no longer stops at an
+  interim answer ("still waiting for …") while the agent goes on in a turn of
+  its own without a background task, for example while its subagents work.
+
 ## [0.9.4] — 2026-09-27
 
 Highlights: remote relays (pair OAR relays and let an agent on one work on the

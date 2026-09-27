@@ -333,7 +333,7 @@ const FINISHED_TASK_STATUSES = new Set(['completed', 'complete', 'done', 'failed
  * read they came with. A later user message ends the follow-up: from there
  * the session is working for someone else.
  */
-export function remoteFollowUpState(rows, replyMessageId, page, { sawBackgroundWork = false } = {}) {
+export function remoteFollowUpState(rows, replyMessageId, page, { sawBackgroundWork = false, sentMessageId = '' } = {}) {
   const list = Array.isArray(rows) ? rows : [];
   const start = list.findIndex((row) => toText(row?.id) === replyMessageId);
   const afterReply = start === -1 ? [] : list.slice(start + 1);
@@ -346,7 +346,13 @@ export function remoteFollowUpState(rows, replyMessageId, page, { sawBackgroundW
   // A queued follow-up turn shows only as activeTurn (between a task's end and
   // the follow-up turn starting); on its own, activeTurn is too weak a sign, so
   // it counts once background work or a follow-up was seen for this message.
-  const backgroundSeen = sawBackgroundWork || tasks.length > 0 || followUps.length > 0;
+  // A turn in flight that belongs to no user message (not the sent one, and no
+  // later one exists) is a turn the agent opened itself: a follow-up that is
+  // running right now, whether or not a background task was ever published
+  // (subagents the agent waits for are not).
+  const turnInFlight = isPlainObject(page?.inFlight) ? toText(page.inFlight.messageId) : '';
+  const ownTurnInFlight = !!turnInFlight && !handedOver && !!sentMessageId && turnInFlight !== sentMessageId;
+  const backgroundSeen = sawBackgroundWork || tasks.length > 0 || followUps.length > 0 || ownTurnInFlight;
   const working = !handedOver && (
     tasks.length > 0
     || (isPlainObject(page?.inFlight) && backgroundSeen)
@@ -638,7 +644,7 @@ export function createRemoteRelayDispatcher({
       const settled = settleRemoteReply(after.rows, messageId);
       if (settled && !settled.foldedWithoutReply) {
         if (settled.status !== 'done' || !settled.reply?.messageId) return { ...base, ...settled };
-        const follow = remoteFollowUpState(after.rows, settled.reply.messageId, page, { sawBackgroundWork: seen.background === true });
+        const follow = remoteFollowUpState(after.rows, settled.reply.messageId, page, { sawBackgroundWork: seen.background === true, sentMessageId: messageId });
         if (follow.backgroundSeen) seen.background = true;
         const latestReply = follow.latest ? replyOf(follow.latest, { followUp: true }) : settled.reply;
         if (!follow.working) {
