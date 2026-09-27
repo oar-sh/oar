@@ -5,6 +5,12 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-09-27
+
+Highlights: mid-turn steering on Claude and Copilot, Copilot background tasks on
+par with Claude's, multi-select question cards, drafts that stay safe across
+devices, and a sidebar title filter.
+
 ### Added
 
 - **Mid-turn steering** for Claude conversations: messages sent while a turn is
@@ -118,6 +124,10 @@ All notable changes to OAR are documented here. The format follows
 - `@github/copilot-sdk` 1.0.14: typed message provenance (human vs. system vs.
   agent senders), a `fast` auto-routing tier, a `managedSettings.clearCache`
   RPC, and streaming-throughput fixes.
+- `@cursor/sdk` 1.0.32 (additive API changes only).
+- The npm package no longer ships test fixtures and test harnesses.
+- The README is reorganized around installing and using OAR; relay internals
+  and development notes moved to DEVELOPING.md.
 
 ### Fixed
 
@@ -127,8 +137,12 @@ All notable changes to OAR are documented here. The format follows
   conversations never had their CLI session removed. Delete now stops the
   worker first, removes the CLI session (Copilot through the SDK, Claude by
   deleting that session's transcript) and the conversation at once. A
+  Copilot session the relay only imported from the host, and never ran, is
+  hidden instead: its CLI session stays, and no process is stopped for it. A
   conversation that is still working, with a running turn or live background
-  tasks, is not deleted: the sidebar says why, so you can stop it first.
+  tasks, is not deleted: the sidebar says why, so you can stop it first (a task
+  without a Stop button: use **Kill session**). A worker that a failed turn
+  marked as errored counts as working for as long as its process runs.
 - A message starting with "/" (other than the relay's own `/compact` and
   `/preview`) that reached a Claude conversation between turns ran as a Claude
   CLI command instead: Claude never saw the text, and the next reply was
@@ -192,6 +206,20 @@ All notable changes to OAR are documented here. The format follows
   matches accented titles regardless of how they were typed, no longer zooms
   the page on iOS, and announces the match count once to screen readers
   (saying when only loaded conversations were searched).
+- A background agent's failure no longer vanishes: a Copilot follow-up turn
+  that carries the failure line, but has nothing else to show, keeps its row.
+- The **Background task timeout** slider no longer reads *No limit* while the
+  settings load; it starts at the 4-hour default.
+- Settings calls the SDK engine the Copilot default (it still read
+  *experimental*, with Extension as *current*), and the background task
+  timeout help names Copilot's background agents and shells.
+- `oar` probed a different port than the one it started the relay on when the
+  config's `port` was not 3333 or differed from `--port`, then killed the relay
+  it had just started after 20 seconds. It now uses one port: `--port` for that
+  run, else the config's. `--help` no longer lists `--token`, which the
+  launcher never read.
+- Concurrent conversation deletes could start extra Copilot runtimes that were
+  never shut down.
 
 ## [0.9.2] — 2026-09-13
 
