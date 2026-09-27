@@ -1550,11 +1550,13 @@ test("mobile send blurs composer and keeps newest message in view", async ({ pag
   await page.waitForFunction(() => document.activeElement?.id !== "msg-input");
   await expect(page.locator(".msg.user .msg-bubble", { hasText: "Scroll and blur check" })).toBeVisible();
 
-  const atBottom = await page.evaluate(() => {
+  // Polled: the scroll is re-applied on the next frame and again shortly
+  // after, so one sample can land between two passes. A failure reports the
+  // distance, which tells a missed pass (a few px) from a lost pin (hundreds).
+  await expect.poll(() => page.evaluate(() => {
     const box = document.getElementById("messages");
-    return box.scrollTop + box.clientHeight >= box.scrollHeight - 12;
-  });
-  expect(atBottom).toBeTruthy();
+    return Math.round(box.scrollHeight - box.clientHeight - box.scrollTop);
+  }), { timeout: 5_000 }).toBeLessThanOrEqual(12);
 });
 
 test("mobile chat title exposes and copies the sdk session id", async ({ page, request }) => {

@@ -3651,6 +3651,12 @@ export async function sendMessage() {
       };
       window.syncAutoModelAvailability?.();
     }
+    // Adopting the conversation can grow the composer (session-lock note,
+    // warning banner), which shrinks the transcript under a pane that was
+    // pinned to the newest message. Re-pin now rather than after the draft
+    // save's round trip below, or the new bubble sits under the composer
+    // for as long as that request takes.
+    if (viewingSendConversation()) scrollBottom();
     const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
     if (persistedConversationId) {
       restorableDraftByConversation.delete(persistedConversationId);

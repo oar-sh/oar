@@ -129,9 +129,17 @@ test.describe.serial("opt-in update checks", () => {
     // The card is still visible from the first check, so it cannot signal that
     // the second one has reached the manifest server.
     const requestsBefore = manifestRequests.length;
+    // The check route answers only after the relay's manifest fetch settled, so
+    // its response marks "the second check is done"; the card alone cannot,
+    // it is already on screen.
+    const checkResponse = page.waitForResponse((response) => (
+      response.request().method() === "POST" && response.url().endsWith("/api/update/check")
+    ));
     await page.locator("#update-check-now-btn").click();
+    const checked = await (await checkResponse).json();
     await expect.poll(() => manifestRequests.length).toBeGreaterThan(requestsBefore);
     expect(manifestRequests[manifestRequests.length - 1], "If-None-Match was sent").toBe('"m1"');
+    expect(checked?.update?.check?.available, "still available after the 304").toBe(true);
     await expect(page.locator("#update-available-card")).toBeVisible();
   });
 

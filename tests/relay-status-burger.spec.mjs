@@ -31,6 +31,21 @@ function setTone(page, tone) {
   }, tone);
 }
 
+// The colour and the glow fade over 0.2s, so both are polled rather than
+// sampled once: a single read lands on a frame of the transition and returns a
+// blend. With a `tone`, every sample first re-applies it, because the app
+// republishes the real tone on its status poll (every few seconds) and would
+// otherwise undo a hand-set one in the middle of the wait. Re-applying the same
+// value does not restart the fade.
+function settled(page, property, tone = null) {
+  return expect.poll(async () => {
+    if (tone) await setTone(page, tone);
+    return (await burgerStyle(page))[property];
+  });
+}
+const settledColor = (page, tone = null) => settled(page, "color", tone);
+const settledGlow = (page, tone = null) => settled(page, "textShadow", tone);
+
 test.describe("relay status on the mobile burger", () => {
   test("the bars carry the relay tone while the conversation list is closed", async ({ page }) => {
     const token = relayToken();
@@ -43,9 +58,11 @@ test.describe("relay status on the mobile burger", () => {
     await expect(page.locator("#sidebar")).not.toHaveClass(/\bopen\b/);
     await expect(burger(page)).toHaveAttribute("data-relay-tone", "online");
 
+    // The attribute flips the moment the socket connects, which is when the
+    // fade from the offline grey STARTS.
+    await settledColor(page).toBe(ONLINE);
+    await settledGlow(page).toContain("rgba(63, 185, 80, 0.35)");
     const online = await burgerStyle(page);
-    expect(online.color).toBe(ONLINE);
-    expect(online.textShadow).toContain("rgba(63, 185, 80, 0.35)");
 
     // Only the bars are dyed: the button chrome is whatever .header-icon-btn
     // gives every other header button.
@@ -62,17 +79,10 @@ test.describe("relay status on the mobile burger", () => {
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
 
-    // The colour fades over 0.2s, so poll rather than sampling a frame of the
-    // transition.
-    const settledColor = () => expect.poll(() => burgerStyle(page).then((style) => style.color));
+    await settledColor(page, "offline").toBe(OFFLINE);
 
-    await setTone(page, "offline");
-    await settledColor().toBe(OFFLINE);
-
-    await setTone(page, "tunnelled");
-    await settledColor().toBe(TUNNELLED);
-    const tunnelled = await burgerStyle(page);
-    expect(tunnelled.textShadow).toContain("rgba(210, 153, 34, 0.35)");
+    await settledColor(page, "tunnelled").toBe(TUNNELLED);
+    await settledGlow(page, "tunnelled").toContain("rgba(210, 153, 34, 0.35)");
 
     // The three tones must stay visually distinct from each other.
     expect(new Set([OFFLINE, TUNNELLED, ONLINE]).size).toBe(3);

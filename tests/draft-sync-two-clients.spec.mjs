@@ -7,7 +7,7 @@ import { relayToken, relayDbPath } from "./e2e-env.mjs";
 // other device's draft on every 3s question/status poll, unversioned.
 
 function readDraftText(conversationId) {
-  const db = new DatabaseSync(relayDbPath(), { readOnly: true });
+  const db = new DatabaseSync(relayDbPath(), { readOnly: true, timeout: 2_000 });
   try {
     const row = db.prepare(`SELECT draft_text FROM conversations WHERE id = ?`).get(conversationId);
     return String(row?.draft_text || "");
@@ -17,7 +17,7 @@ function readDraftText(conversationId) {
 }
 
 function readDraftAttachmentCount(conversationId) {
-  const db = new DatabaseSync(relayDbPath(), { readOnly: true });
+  const db = new DatabaseSync(relayDbPath(), { readOnly: true, timeout: 2_000 });
   try {
     const row = db.prepare(`SELECT draft_attachments FROM conversations WHERE id = ?`).get(conversationId);
     const parsed = JSON.parse(String(row?.draft_attachments || "[]"));
@@ -49,7 +49,7 @@ async function createConversation(request, headers, text) {
     headers,
     data: { text, relayMode: "ask", model: "gpt-5.4-mini" },
   });
-  expect(created.ok()).toBeTruthy();
+  expect(created.ok(), `POST /api/message answered ${created.status()}`).toBeTruthy();
   const conversationId = String((await created.json())?.conversationId || "");
   expect(conversationId).toBeTruthy();
   return conversationId;
@@ -60,19 +60,30 @@ async function openDevice(browser, token, conversationId) {
   await context.addInitScript((id) => {
     localStorage.setItem("copilot_last_conv", id);
   }, conversationId);
-  const page = await context.newPage();
-  const draftPatches = [];
-  page.on("request", (req) => {
-    if (req.method() === "PATCH" && req.url().includes(`/api/conversation/${conversationId}/draft`)) {
-      draftPatches.push(req.postDataJSON());
-    }
-  });
-  await page.goto(`/?token=${encodeURIComponent(token)}`);
-  await page.waitForLoadState("networkidle");
-  await expect(page.locator("#msg-input")).toBeVisible();
-  // The seeding message's bubble means the conversation (and its draft) loaded.
-  await expect(page.locator(".msg").first()).toBeVisible();
-  return { context, page, draftPatches };
+  try {
+    const page = await context.newPage();
+    const draftPatches = [];
+    page.on("request", (req) => {
+      if (req.method() === "PATCH" && req.url().includes(`/api/conversation/${conversationId}/draft`)) {
+        draftPatches.push(req.postDataJSON());
+      }
+    });
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    // Not networkidle: the app polls every few seconds, so "idle" is a matter
+    // of timing and says nothing about the modules having bound.
+    await page.waitForFunction(() => typeof window.openConversation === "function");
+    await expect(page.locator("#msg-input")).toBeVisible();
+    // The seeding message's bubble means the conversation (and its draft) loaded.
+    await expect(page.locator(".msg").first()).toBeVisible();
+    // Only the socket's connect handler turns the dot green, so from here on
+    // this device receives the other one's draft broadcasts.
+    await expect(page.locator("#cli-dot")).toHaveClass("online");
+    return { context, page, draftPatches };
+  } catch (error) {
+    // A device that failed to open must not stay connected to the shared relay.
+    await context.close().catch(() => {});
+    throw error;
+  }
 }
 
 test("an idle, focused device never overwrites the draft typed on another device", async ({ browser, request }) => {
@@ -80,9 +91,11 @@ test("an idle, focused device never overwrites the draft typed on another device
   const headers = { Authorization: `Bearer ${token}` };
   const conversationId = await createConversation(request, headers, "draft sync idle device");
 
-  const deviceA = await openDevice(browser, token, conversationId);
-  const deviceB = await openDevice(browser, token, conversationId);
+  let deviceA;
+  let deviceB;
   try {
+    deviceA = await openDevice(browser, token, conversationId);
+    deviceB = await openDevice(browser, token, conversationId);
     await deviceB.page.click("#msg-input");
 
     await deviceA.page.fill("#msg-input", "typed on device A");
@@ -97,8 +110,8 @@ test("an idle, focused device never overwrites the draft typed on another device
     expect(deviceB.draftPatches, "the idle device never saves a draft").toEqual([]);
     await expect(deviceA.page.locator("#msg-input")).toHaveValue("typed on device A");
   } finally {
-    await deviceA.context.close();
-    await deviceB.context.close();
+    await deviceA?.context.close();
+    await deviceB?.context.close();
   }
 });
 
@@ -155,9 +168,11 @@ test("a simultaneous edit keeps the newest keystroke and offers the other text b
   const headers = { Authorization: `Bearer ${token}` };
   const conversationId = await createConversation(request, headers, "draft sync simultaneous edit");
 
-  const deviceA = await openDevice(browser, token, conversationId);
-  const deviceB = await openDevice(browser, token, conversationId);
+  let deviceA;
+  let deviceB;
   try {
+    deviceA = await openDevice(browser, token, conversationId);
+    deviceB = await openDevice(browser, token, conversationId);
     // Hold B's first save in flight so A's save lands in between: B's request
     // then carries a base version the server has already moved past.
     let releaseB;
@@ -201,7 +216,7 @@ test("a simultaneous edit keeps the newest keystroke and offers the other text b
     await expect.poll(() => readDraftText(conversationId), { timeout: 10_000 }).toBe("typed on device A");
     await expect(deviceA.page.locator("#msg-input")).toHaveValue("typed on device A");
   } finally {
-    await deviceA.context.close();
-    await deviceB.context.close();
+    await deviceA?.context.close();
+    await deviceB?.context.close();
   }
 });

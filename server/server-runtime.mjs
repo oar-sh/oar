@@ -5518,6 +5518,13 @@ const app        = express();
 // via config.trustProxy (e.g. a hop count or subnet).
 app.set('trust proxy', config.trustProxy ?? 'loopback');
 const httpServer = http.createServer(app);
+// Node closes an idle keep-alive connection after 5 s. A client that pools
+// connections (a fronting proxy such as Caddy or cloudflared, an API client)
+// can pick such a socket in the very moment the relay closes it; its request
+// is then reset before the relay reads a byte, and a POST is not replayed.
+// Holding idle connections longer than those pools do closes that window.
+httpServer.keepAliveTimeout = 65_000;
+httpServer.headersTimeout = 66_000;
 httpServer.prependListener('request', (req, _res) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
