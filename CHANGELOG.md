@@ -67,17 +67,14 @@ All notable changes to OAR are documented here. The format follows
 - A session worker that was idle and whose process has ended (stopped from
   outside, or crashed between turns) is no longer listed as ready with its old
   process id. The next message started a new worker before as well; the list
-  now says what is there.
+  now says what is there, about a minute and a half after the process ended.
 - A reply that quotes or describes a failure note (an agent reporting on a
   failed test, for example) is no longer taken for a failure itself. The relay
   cut such a reply off at the quoted error code, put its own advice behind it
-  and stored the turn as failed.
-- A single `~` in a reply ("about", as in "~35 s … ~7 min") no longer strikes
-  out the text up to the next one. Strikethrough needs two tildes on each side:
-  `~~text~~`.
   and stored the turn as failed. Where a failure is known from its text alone,
   that text is now kept whole.
-  now says what is there, about a minute and a half after the process ended.
+- A single `~` in a reply ("about", as in "~35 s … ~7 min") no longer strikes
+  out the text up to the next one. Strikethrough needs two tildes on each side:
   `~~text~~`. The page now names the version of its Markdown library (15.0.12,
   the one it was served until now) instead of taking whatever the CDN hands out.
 - **Copilot:** a command the agent had started no longer runs on after its
@@ -86,9 +83,9 @@ All notable changes to OAR are documented here. The format follows
   to read its result. The relay now stops what such a runtime leaves behind
   (first gently, then by force), and the failure note says that a command that
   was still running is being stopped, as far as that is known at that moment:
-  the note comes at once and does not wait for the list of processes. A command the agent started to outlive the
-  session (`detach`) is left alone, and so are the commands of a runtime that
-  shuts down in good order.
+  the note comes at once and does not wait for the list of processes. A command
+  the agent started to outlive the session (`detach`) is left alone, and so are
+  the commands of a runtime that shuts down in good order.
 - **Grok:** a quiet-turn window that is set for the model request or for a tool
   is kept when the shared watchdog is switched off by the environment, and the
   watchdog looks often enough for the shortest window that is set.
