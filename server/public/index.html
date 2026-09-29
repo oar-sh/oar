@@ -1451,6 +1451,7 @@
   .thinking-bubble a,
   .subagent-bubble a,
   .relay-question-card a,
+  .relay-board-body a,
   .workspace-file-link {
     color: var(--bubble-link);
     text-decoration-thickness: 1.2px;
@@ -1460,6 +1461,7 @@
   .thinking-bubble a:visited,
   .subagent-bubble a:visited,
   .relay-question-card a:visited,
+  .relay-board-body a:visited,
   .workspace-file-link:visited { color: var(--bubble-link); }
   .msg.user .msg-bubble code:not(pre code) {
     background: var(--user-bubble-chip-bg);
@@ -3046,6 +3048,17 @@
   .file-preview-markdown th, .file-preview-markdown td { border: 1px solid var(--border); padding: 6px 9px; }
   .file-preview-markdown th { background: var(--bg3); }
   .file-preview-markdown img { display: block; max-width: 100%; height: auto; }
+  /* Without a colour of their own, links fell back to the browser's default
+     blue, which cannot be read on the dark background. The accent is the
+     calmer of the two blues: the bubbles' link colour is for a tinted bubble,
+     and on the viewer's plain background it glares. */
+  .file-preview-markdown a,
+  .file-preview-markdown a:visited {
+    color: var(--accent);
+    text-decoration-thickness: 1.2px;
+    text-underline-offset: 2px;
+  }
+  .file-preview-markdown a code { color: inherit; }
   .file-preview-markdown pre,
   .file-preview-code pre {
     background: #0b0f14;

@@ -20,6 +20,8 @@ All notable changes to OAR are documented here. The format follows
   on, without the message that carries the plan out.
 - A finished subagent no longer turns back to "Running" in the running turn
   when another line of activity arrives or the page reloads.
+- Links in the file viewer and in plan boards have a colour that can be read in
+  dark mode; they used the browser's default blue.
 
 ## [0.9.5] — 2026-09-27
 
