@@ -130,6 +130,19 @@ test.describe.serial("Provider CLI install rows", () => {
     await expect(page.locator(`#settings-provider-panel-${providerId}`)).toBeVisible();
   }
 
+  /**
+   * The row names `version`. A probe is given five seconds; on a loaded host
+   * the first start of a stub can take longer, and the row then says "version
+   * unknown" until the next probe, which the relay runs by itself 30 seconds
+   * later at the earliest. Opening the panel asks for a probe at once.
+   */
+  async function expectVersion(page, providerId, version) {
+    await expect(async () => {
+      await openProviderSettings(page, providerId);
+      await expect(status(page, providerId)).toContainText(version, { timeout: 8_000 });
+    }).toPass({ timeout: 90_000 });
+  }
+
   /** "Already installed", produced by the same fixture the relay runs. */
   function seedInstalledBinary(providerId, version) {
     execFileSync(process.execPath, [INSTALL_STUB, providerId, "install"], {
@@ -272,7 +285,7 @@ test.describe.serial("Provider CLI install rows", () => {
     // Windows relay.
     const installedPath = path.join(relay.cliBinDir, process.platform === "win32" ? "grok.cmd" : "grok"); // host-platform: launcher shape per OS
     await expect(logBody(page, "grok")).toContainText(`Installed grok ${INSTALLED_VERSION}`);
-    await expect(status(page, "grok")).toContainText(INSTALLED_VERSION);
+    await expectVersion(page, "grok", INSTALLED_VERSION);
     await expect(status(page, "grok")).toContainText(installedPath);
     // `grok update --check --json` really ran against the freshly installed
     // binary, so the row can say which side of an update it is on.
@@ -307,7 +320,7 @@ test.describe.serial("Provider CLI install rows", () => {
 
     await loadApp(page);
     await openProviderSettings(page, "grok");
-    await expect(status(page, "grok")).toContainText(OLDER_VERSION);
+    await expectVersion(page, "grok", OLDER_VERSION);
     await expect(updateBtn(page, "grok")).toBeVisible();
     await expect(installBtn(page, "grok")).toBeHidden();
 
@@ -320,7 +333,7 @@ test.describe.serial("Provider CLI install rows", () => {
     await expect(page.locator("#summary-modal")).not.toHaveClass(/visible/);
 
     await expect(logSummary(page, "grok")).toHaveText(/^Finished · grok update$/, { timeout: 30_000 });
-    await expect(status(page, "grok")).toContainText(INSTALLED_VERSION);
+    await expectVersion(page, "grok", INSTALLED_VERSION);
     await expect(status(page, "grok")).not.toContainText(OLDER_VERSION);
     await dismissBtn(page, "grok").click();
   });
@@ -330,7 +343,7 @@ test.describe.serial("Provider CLI install rows", () => {
 
     await loadApp(page);
     await openProviderSettings(page, "claude");
-    await expect(status(page, "claude")).toContainText("2.1.247");
+    await expectVersion(page, "claude", "2.1.247");
     await expect(status(page, "claude")).toContainText("npm-global");
     // The doctor warning is quoted verbatim — they are the CLI's own words, and
     // the migration note spells out the consequence rather than hiding it.
@@ -343,7 +356,7 @@ test.describe.serial("Provider CLI install rows", () => {
 
     // The migration really replaced what the relay resolves, so the row stops
     // offering it — it is never a standing option, only the fix for this case.
-    await expect(status(page, "claude")).toContainText(INSTALLED_VERSION);
+    await expectVersion(page, "claude", INSTALLED_VERSION);
     await expect(status(page, "claude")).toContainText("native");
     await expect(migrateBtn(page, "claude")).toBeHidden();
     await expect(note(page, "claude")).toBeHidden();
