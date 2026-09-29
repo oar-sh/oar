@@ -99,6 +99,13 @@ export function registerRelayBoardRoutes(app, deps) {
   app.get('/api/relay-boards', auth, (req, res) => {
     const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;
     const status = String(req.query.status || 'pending').trim() || 'pending';
+    // Every board of one conversation, settled ones included: a reply goes on
+    // showing the plan it offered and what was chosen. Per conversation only.
+    if (status === 'all') {
+      if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+      const all = stmts.listBoardsForConversation.all(conversationId);
+      return res.json({ boards: all.map(formatRelayBoardRow).filter(Boolean) });
+    }
     const rows = stmts.listBoards.all(status, conversationId, conversationId);
     res.json({ boards: rows.map(formatRelayBoardRow).filter(Boolean) });
   });

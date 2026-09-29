@@ -1767,6 +1767,8 @@ export function showThinking(messageId = null, autoScroll = true) {
   anchorThinkingBubble(div, nextMessageId);
   renderThinkingThoughts();
   renderThinkingStream();
+  // A board the turn has posted already lives in its live bubble.
+  renderRelayBoards();
   observeThinkingBubble(div);
   if (getThinkingFollowMode()) applyThinkingFollow();
   else if (autoScroll) scrollBottom();
@@ -3201,6 +3203,8 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
     }
   }
   if (isNewNode && insertedNode) {
+    // A reply takes over the board its turn posted (relay-board-view).
+    if (msg?.role === 'assistant') renderRelayBoards();
     syncSeparatorsNow();
     if (scroll) scrollBottom();
   }

@@ -174,6 +174,7 @@ export function createQuestionRepository(db) {
         insertBoard: db.prepare(`INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`),
         getBoard: db.prepare(`SELECT * FROM relay_boards WHERE id = ?`),
         findBoardByMessageType: db.prepare(`SELECT * FROM relay_boards WHERE message_id = ? AND board_type = ? ORDER BY created_at DESC LIMIT 1`),
+        listBoardsForConversation: db.prepare(`SELECT * FROM relay_boards WHERE conversation_id = ? ORDER BY created_at ASC`),
         listBoards: db.prepare(`SELECT * FROM relay_boards WHERE status = ? AND (? IS NULL OR conversation_id = ?) ORDER BY created_at ASC`),
         markBoardAction: db.prepare(`UPDATE relay_boards SET status = 'acted', selected_action = ?, acted_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`),
         dismissBoard: db.prepare(`UPDATE relay_boards SET status = 'dismissed', selected_action = ?, acted_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`),

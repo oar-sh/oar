@@ -1091,8 +1091,9 @@ export async function answerRelayQuestionStructured(questionId, structuredAnswer
   }
 }
 
-export async function loadRelayBoards(status = 'pending') {
-  return apiFetch(`/api/relay-boards?status=${encodeURIComponent(status)}`);
+export async function loadRelayBoards(status = 'pending', conversationId = '') {
+  const conversation = String(conversationId || '').trim();
+  return apiFetch(`/api/relay-boards?status=${encodeURIComponent(status)}${conversation ? `&conversationId=${encodeURIComponent(conversation)}` : ''}`);
 }
 
 export async function loadRelayBoard(boardId) {

@@ -25,6 +25,12 @@ All notable changes to OAR are documented here. The format follows
   any failure, and a Stop during that start now takes effect at once.
 - **Cursor:** a stalled run is cancelled, so the next message does not wait for
   it.
+- A plan board is part of the reply it belongs to: its content and its buttons
+  are shown inside the agent's reply bubble (inside the running turn's bubble
+  until the reply is there) instead of on a card of their own at the end of the
+  transcript. When the reply already is the plan, the plan is shown once, with
+  the buttons below it. After you chose, the plan stays and the bubble says
+  what was chosen.
 
 ### Fixed
 

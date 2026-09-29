@@ -22,7 +22,7 @@ async function dequeue(request, headers, messageId, ownerSessionId) {
   throw new Error("the queued message was never handed out");
 }
 
-test("a plan board action queues its follow-up message", async ({ request }) => {
+test("a plan board action queues its follow-up message", async ({ page, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
@@ -60,18 +60,44 @@ test("a plan board action queues its follow-up message", async ({ request }) => 
     expect(created.ok()).toBeTruthy();
     const boardId = String((await created.json())?.board?.id || "");
     expect(boardId).toBeTruthy();
+
+    // While the turn runs, the board lives in the turn's live bubble.
+    await page.setViewportSize({ width: 412, height: 915 });
+    await page.addInitScript((id) => { localStorage.setItem("copilot_last_conv", id); }, conversationId);
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    const board = page.locator(`.relay-board-inline[data-board-id="${boardId}"]`);
+    await expect(board).toBeVisible();
+    await expect(page.locator("#thinking-indicator .relay-board-inline")).toHaveCount(1);
+    await expect(board.locator(".relay-board-body")).toContainText("Rename the module");
+
+    // The reply takes it over: inside the reply's bubble, no card of its own.
     await request.post("/api/response", {
       headers,
       data: { messageId, conversationId, text: "The plan is ready.", model: "gpt-5.4-mini", mode: "plan" },
     });
+    const reply = page.locator(`.msg.assistant[data-source-message-id="${messageId}"]`);
+    await expect(reply.locator(".msg-bubble")).toContainText("The plan is ready.");
+    await expect(reply.locator(".msg-bubble .relay-board-inline")).toHaveCount(1);
+    await expect(page.locator(".relay-board-inline")).toHaveCount(1);
+    await expect(page.locator(".relay-board-container")).toHaveCount(0);
+    await expect(board.getByRole("button", { name: "Implement in autopilot" })).toBeVisible();
 
-    const acted = await request.post(`/api/relay-board/${boardId}/action`, {
-      headers,
-      data: { actionId: "autopilot" },
-    });
+    // The buttons work from inside the bubble, and the choice stays on show.
+    const acting = page.waitForResponse((response) => response.url().includes(`/api/relay-board/${boardId}/action`));
+    await board.getByRole("button", { name: "Implement in autopilot" }).click();
+    const acted = await acting;
     expect(acted.status()).toBe(200);
     followUpId = String((await acted.json())?.queuedMessageId || "");
     expect(followUpId).toBeTruthy();
+    await expect(board.locator(".relay-board-outcome")).toHaveText("Chosen: Implement in autopilot");
+    await expect(board.locator("button")).toHaveCount(0);
+    await expect(board.locator(".relay-board-body")).toContainText("Rename the module");
+
+    // A reload finds the settled board where it was.
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(reply.locator(".msg-bubble .relay-board-outcome")).toHaveText("Chosen: Implement in autopilot");
 
     // The follow-up is a message like any other: a worker is handed it.
     await dequeue(request, headers, followUpId, String(queuedBody?.ownerSessionId || ""));
@@ -80,6 +106,62 @@ test("a plan board action queues its follow-up message", async ({ request }) => 
       await request.post("/api/response", {
         headers,
         data: { messageId: id, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" },
+      }).catch(() => {});
+    }
+    if (conversationId) await request.post(`/api/conversation/${conversationId}/archive`, { headers }).catch(() => {});
+  }
+});
+
+test("a reply that is the plan shows it once, with the buttons below", async ({ page, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  const plan = `1. Split the parser ${stamp}\n2. Move the tests`;
+  let conversationId = "";
+  let messageId = "";
+  try {
+    const queued = await request.post("/api/message", {
+      headers,
+      data: { text: `Plan the split ${stamp}`, relayMode: "plan", model: "gpt-5.4-mini" },
+    });
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "");
+    messageId = String(queuedBody?.messageId || "");
+    await dequeue(request, headers, messageId, String(queuedBody?.ownerSessionId || ""));
+    const created = await request.post("/api/relay-board", {
+      headers,
+      data: {
+        queueId: messageId,
+        messageId,
+        conversationId,
+        mode: "plan",
+        boardType: "plan_ready",
+        title: "Plan ready for review",
+        body: plan,
+        actions: [{ id: "autopilot", label: "Implement in autopilot", mode: "autopilot" }],
+      },
+    });
+    expect(created.ok()).toBeTruthy();
+    await request.post("/api/response", {
+      headers,
+      data: { messageId, conversationId, text: `Here is what I would do.\n\n${plan}`, model: "gpt-5.4-mini", mode: "plan" },
+    });
+
+    await page.setViewportSize({ width: 412, height: 915 });
+    await page.addInitScript((id) => { localStorage.setItem("copilot_last_conv", id); }, conversationId);
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    const reply = page.locator(`.msg.assistant[data-source-message-id="${messageId}"] .msg-bubble`);
+    await expect(reply.locator(".relay-board-inline")).toHaveCount(1);
+    await expect(reply.locator(".relay-board-inline .relay-board-body")).toHaveCount(0);
+    await expect(reply.getByRole("button", { name: "Implement in autopilot" })).toBeVisible();
+    await expect(reply.getByText(`Split the parser ${stamp}`)).toHaveCount(1);
+    await page.screenshot({ path: "/tmp/oar-plan-board-in-reply.png" });
+  } finally {
+    if (messageId) {
+      await request.post("/api/response", {
+        headers,
+        data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" },
       }).catch(() => {});
     }
     if (conversationId) await request.post(`/api/conversation/${conversationId}/archive`, { headers }).catch(() => {});

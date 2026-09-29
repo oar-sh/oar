@@ -4678,6 +4678,23 @@
        and overflow horizontally. Pin to 0 so children wrap/scroll instead. */
     min-width: 0;
   }
+  /* A board inside the bubble of the reply it belongs to: set off from the
+     reply's text by a rule, not by a card of its own. */
+  .relay-board-inline {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(80, 227, 194, 0.35);
+  }
+  .relay-board-inline.relay-board-card { margin-top: 0; border-top: 0; }
+  .relay-board-inline .relay-board-head { color: var(--text); font-weight: 600; font-size: var(--fs-meta-md); }
+  .relay-board-outcome {
+    color: var(--muted);
+    font-size: var(--fs-meta-md);
+  }
+  .relay-board-outcome::before { content: '✓ '; color: var(--success); }
   .relay-board-head {
     display: flex;
     align-items: center;
