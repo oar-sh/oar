@@ -82,6 +82,9 @@ All notable changes to OAR are documented here. The format follows
 - **Stop button:** Stop keeps working for a message that waits on a question
   card while the agent starts and finishes other work, and for a second message
   stopped while the same turn goes on. It used to do nothing in both cases.
+- **Copilot:** a turn the runtime itself ended with an error no longer tells
+  you to restart the relay. The worker starts a fresh runtime by itself; a
+  restart repairs nothing and costs every other running session.
 
 ## [0.9.5] — 2026-09-27
 

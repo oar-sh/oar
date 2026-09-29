@@ -404,6 +404,8 @@ export function classifyCopilotSessionError(data) {
     code,
     stableCode: `copilot.${code}`,
     text: `System note: the Copilot turn failed (${detail}). Retry or send a new message.`,
+    // Without one the relay adds its default, "restart the relay".
+    guidance: COPILOT_TURN_FAILURE_GUIDANCE,
     detail,
     quota: false,
   };
@@ -476,8 +478,8 @@ export function isCopilotAuthError(error) {
  * ("restart the relay"). The worker deals with its runtime itself: a delivered
  * turn that failed tore it down and the next message starts a fresh one, so a
  * relay restart repairs nothing here and costs every other running session.
- * Failures the runtime reports as a session error, and sign-in failures, keep
- * the wording of their own.
+ * That holds for a failure the runtime reports as a session error too.
+ * Sign-in and quota failures keep the wording of their own.
  */
 export const COPILOT_TURN_FAILURE_GUIDANCE =
   'If this keeps failing, include the error code when you report it; the relay does not need a restart.';

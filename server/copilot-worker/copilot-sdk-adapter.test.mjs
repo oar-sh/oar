@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   buildRuntimeConnection,
   classifyCopilotSessionError,
+  COPILOT_TURN_FAILURE_GUIDANCE,
   classifyCopilotTurnException,
   copilotAgentModeForRelayMode,
   copilotPermissionDecision,
@@ -171,6 +172,18 @@ test('a non-terminal session error gets a provider-scoped stable code', () => {
   assert.equal(classified.stableCode, 'copilot.network');
   assert.match(classified.text, /the Copilot turn failed \(connection reset\)/);
   assert.equal(classified.quota, false);
+});
+
+test('a session error does not send the user to restart the relay', () => {
+  // The runtime's answer to an empty model reply, as it arrived on a live turn.
+  const classified = classifyCopilotSessionError({
+    errorType: 'query',
+    message: 'No response was returned. Send your message again to retry.',
+  });
+  assert.equal(classified.stableCode, 'copilot.query');
+  assert.equal(classified.guidance, COPILOT_TURN_FAILURE_GUIDANCE);
+  assert.doesNotMatch(`${classified.text} ${classified.guidance}`, /restart the relay/i);
+  assert.match(classified.guidance, /does not need a restart/);
 });
 
 test('an empty session error still produces a usable record', () => {
