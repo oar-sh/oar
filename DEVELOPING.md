@@ -400,6 +400,13 @@ whether it is still there (`ping`, 5 s to answer). A runtime that does not answe
 once. The other two runtimes have no such request; a dead Grok agent is noticed by its process
 exiting.
 
+The Claude worker only observes. Its CLI sends a heartbeat every 30 s while a tool runs in
+silence and a frame about every second while the model works (SDK 0.3.283, measured), but how
+long its silent stretches get in real sessions is not known (a compaction, the backoff of an API
+retry), and failing a turn there means killing the CLI and its background tasks. So a running
+turn the CLI has said nothing in for 10 minutes (30 minutes with a tool open) is written to the
+worker's log with what was in flight, `running turn quiet for …`, and left running.
+
 A question card, a `remote_relay` call and a compaction hold the watchdog whatever the phase. What
 bounds a turn that stays quiet and alive is the relay's turn ceiling.
 

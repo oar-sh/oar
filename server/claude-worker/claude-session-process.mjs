@@ -37,6 +37,7 @@ import {
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
+import { createTurnLiveness, resolveTurnStallWindows } from '../../shared/worker-runtime/turn-liveness.mjs';
 import {
   ANSWERED_ELSEWHERE_KIND,
   DELIVERY_ANSWERED_ELSEWHERE_TEXT,
@@ -451,6 +452,10 @@ export function createClaudeSessionRunner({
   // next delivery.
   getThinking = () => ({ enabled: null, display: '' }),
   lifecyclePollMs = 5_000,
+  // How long a RUNNING turn may go without a message from the CLI before
+  // that is written to the log. Nothing is failed over it: see
+  // `noteQuietTurn`. `{ model, tool }` in ms; 0 for either turns it off.
+  quietTurnWindowsMs = undefined,
   // A settled task's continuation normally begins within ~1s; when nothing
   // arrives inside this window the notification was silent (skip_transcript)
   // and must stop pinning the process.
@@ -2475,6 +2480,90 @@ export function createClaudeSessionRunner({
     return 'swallow';
   }
 
+  // ---------------------------------------------------------------------------
+  // A running turn that went quiet
+  //
+  // The other workers fail a turn whose runtime has been silent for too long
+  // (shared/worker-runtime/turn-liveness.mjs). This one only WRITES IT DOWN.
+  // What the CLI sends is known (SDK 0.3.283, measured 2026-09-28): a
+  // `tool_progress` heartbeat every 30 s while a tool runs in silence, for the
+  // Agent call as a whole when the tool runs inside a subagent; a
+  // `thinking_tokens` or stream frame about every second while the model
+  // works. What is not known is how long its silent stretches get in real
+  // sessions: a compaction (133 s seen), the backoff of an API retry, a
+  // request it is waiting on. Failing a turn here also means killing the CLI
+  // and its background tasks. So the windows are generous, the known silent
+  // stretches are holds, and a turn that outlasts them is logged with what
+  // the CLI was doing — the measurements a failing watchdog would need.
+
+  const quietWindows = (() => {
+    const windows = resolveTurnStallWindows({
+      // The CLI gives up on a silent model stream by itself after 300 s and
+      // says so (`api_retry`); a window of the same length would race it.
+      modelMs: quietTurnWindowsMs?.model ?? process.env.OAR_TURN_STALL_MODEL_MS ?? 600_000,
+      toolMs: quietTurnWindowsMs?.tool,
+    });
+    return { idle: 0, model: windows.model, tool: windows.tool };
+  })();
+
+  function observeQuietTurn(sdkMessage) {
+    const liveness = proc?.liveness;
+    if (!liveness) return;
+    const type = String(sdkMessage?.type || '');
+    const agent = String(sdkMessage?.parent_tool_use_id || '').trim() || 'root';
+    if (proc.quietLoggedAt) {
+      dbg(`the CLI spoke again after ${Math.round(liveness.quietMs() / 1000)}s of silence`, type);
+      proc.quietLoggedAt = 0;
+    }
+    liveness.traffic(type === 'system' ? `system/${sdkMessage?.subtype || ''}` : type);
+    const blocks = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
+    if (type === 'assistant') {
+      for (const block of blocks) {
+        if (block?.type === 'tool_use' && block.id) liveness.begin('tool', `${agent}:${block.id}`, block.name);
+      }
+    } else if (type === 'user') {
+      for (const block of blocks) {
+        if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
+        liveness.end('tool', `${agent}:${block.tool_use_id}`);
+        // The result of an Agent call: whatever that agent had open ended with it.
+        liveness.endAgent(String(block.tool_use_id));
+      }
+    } else if (type === 'stream_event') {
+      const event = String(sdkMessage?.event?.type || '');
+      if (event === 'message_start') liveness.begin('model', agent);
+      else if (event === 'message_stop') liveness.end('model', agent);
+    } else if (type === 'result') {
+      liveness.reset();
+    }
+  }
+
+  /**
+   * Log a running turn the CLI has said nothing in for longer than its phase
+   * allows. Once per silence, and never while the silence has a known reason.
+   */
+  function noteQuietTurn() {
+    const liveness = proc?.liveness;
+    const ctx = proc?.activeCtx;
+    if (!liveness || !ctx || ctx.finalized || proc.closing || proc.quietLoggedAt) return;
+    // A human is deciding, a compaction is running, the relay is slow to take
+    // a publish (the stream is not read meanwhile), or the turn is being
+    // stopped: silence with a reason.
+    if (proc.pendingControlRequests > 0 || isCompacting() || proc.dispatching > 0 || ctx.interrupted) {
+      liveness.traffic('held');
+      return;
+    }
+    // Inside a turn the CLI is waiting for the model unless a tool is open.
+    const phase = liveness.phase() === 'tool' ? 'tool' : 'model';
+    const limitMs = quietWindows[phase];
+    if (!(limitMs > 0) || liveness.quietMs() < limitMs) return;
+    proc.quietLoggedAt = Date.now();
+    dbg(
+      `running turn quiet for ${Math.round(liveness.quietMs() / 1000)}s; left running (the quiet-turn watchdog only observes)`,
+      ctx.message?.id || '(continuation)',
+      liveness.describe(),
+    );
+  }
+
   async function onSdkMessage(processRef, sdkMessage) {
     // A superseded process (push-race respawn, mode-recycle timeout) may still
     // be draining its stream; its late messages must not mutate the state of
@@ -2482,6 +2571,19 @@ export function createClaudeSessionRunner({
     // cleanupProcess when the old stream ends.
     if (!proc || proc !== processRef) return;
     proc.lastEventAt = Date.now();
+    observeQuietTurn(sdkMessage);
+    // Counted for as long as this message is being handled: the stream is
+    // not read meanwhile, so the silence is this worker's, not the CLI's.
+    processRef.dispatching += 1;
+    try {
+      await handleSdkMessage(sdkMessage);
+    } finally {
+      processRef.dispatching -= 1;
+      if (proc === processRef) proc.liveness.traffic('handled');
+    }
+  }
+
+  async function handleSdkMessage(sdkMessage) {
     const suppressed = maybeSuppressStopFollowUp(sdkMessage);
     if (suppressed === 'swallow') return;
     observeProcessLevel(sdkMessage);
@@ -2917,6 +3019,7 @@ export function createClaudeSessionRunner({
     if (proc.stopFollowUp && !proc.suppressingTurn && !proc.pendingDelivered.some((entry) => entry.stoppedWithTurn)) {
       proc.stopFollowUp = null;
     }
+    noteQuietTurn();
     reapSilentProvisionalAdoption(now);
     // Before the 5-minute watchdog: a folded steered entry settles as merged
     // within the short fold grace instead of failing over.
@@ -3132,6 +3235,11 @@ export function createClaudeSessionRunner({
       settleSeqAtContinuationOpen: 0,
       pendingControlRequests: 0,
       lastEventAt: Date.now(),
+      // The quiet-turn log (see noteQuietTurn): what the CLI has in flight,
+      // messages being handled right now, and when the silence was logged.
+      liveness: createTurnLiveness({ windows: quietWindows }),
+      dispatching: 0,
+      quietLoggedAt: 0,
       heldForTasksSince: 0,
       taskSettledAt: 0,
       // Bumped by every task-settle signal; the Stop guard compares it.

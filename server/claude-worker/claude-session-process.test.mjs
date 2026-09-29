@@ -6602,3 +6602,79 @@ test('the settle window can be switched off', async () => {
   turn.endInput();
   await settled(runner);
 });
+
+// ---------------------------------------------------------------------------
+// A running turn that went quiet (observed, never failed)
+
+function toolUse(id, name = 'Bash') {
+  return { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', id, name, input: {} }] } };
+}
+
+function toolResult(id) {
+  return { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } };
+}
+
+test('a running turn that goes quiet is written to the log and left running', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 40, tool: 5_000 },
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('Looking into it.'));
+  await waitFor(() => lines.some((line) => /running turn quiet for/.test(line)), { label: 'quiet turn logged' });
+
+  const logged = lines.filter((line) => /running turn quiet for/.test(line));
+  assert.match(logged[0], /left running/);
+  assert.match(logged[0], /q-1/);
+  assert.match(logged[0], /phase=idle|phase=model/);
+  // Nothing was failed or published over it, and the turn still ends normally.
+  assert.equal(stub.calls.filter((call) => call.routePath === '/api/response').length, 0);
+  await tick(60);
+  assert.equal(lines.filter((line) => /running turn quiet for/.test(line)).length, 1, 'once per silence');
+
+  turn.emit(resultMessage('Done.', 'native-1'));
+  assert.equal(await pending, true);
+  assert.ok(lines.some((line) => /the CLI spoke again after/.test(line)));
+  const response = stub.calls.find((call) => call.routePath === '/api/response');
+  assert.equal(response.body.text, 'Done.');
+  assert.ok(!response.body.terminalError);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a tool that runs in silence is given the tool window, not the model one', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn({ echoPushes: true });
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 30, tool: 5_000 },
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(toolUse('tool-1'));
+  await tick(120);
+  assert.equal(lines.filter((line) => /running turn quiet for/.test(line)).length, 0);
+
+  // The tool returns and the model stays silent: now it is the model's window.
+  turn.emit(toolResult('tool-1'));
+  await waitFor(() => lines.some((line) => /running turn quiet for/.test(line)), { label: 'quiet model logged' });
+  assert.match(lines.find((line) => /running turn quiet for/.test(line)), /tools=0/);
+
+  turn.emit(resultMessage('Done.', 'native-1'));
+  assert.equal(await pending, true);
+  turn.endInput();
+  await settled(runner);
+});
