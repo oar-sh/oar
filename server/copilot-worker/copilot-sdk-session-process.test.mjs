@@ -1375,6 +1375,136 @@ test('events of a runtime that is being stopped do not reach the next turn', asy
   assert.doesNotMatch(answered.text, /from the runtime that is going/);
 });
 
+test('a reply the relay could not take is offered again, not run again', async () => {
+  // One failed POST used to requeue the row: the finished answer was thrown
+  // away and the prompt ran a second time, in a session that already held it.
+  let attempt = 0;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': () => {
+        attempt += 1;
+        if (attempt <= 3) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+        return { ok: true };
+      },
+    },
+  });
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  const { runner } = makeRunner({ stub, client, responseRetryWindowMs: 5_000, settleRetryDelaysMs: [1, 1, 1] });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  const responses = stub.bodiesFor('/api/response');
+  assert.equal(responses.length, 4);
+  assert.equal(new Set(responses.map((body) => body.text)).size, 1, 'the same reply every time');
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+  assert.equal(client.session.sends.length, 1);
+  assert.deepEqual(runner.getSettleFailed(), []);
+});
+
+test('the relay\'s own refusal of a reply is not retried', async () => {
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/response': () => { throw Object.assign(new Error('HTTP 400 /api/response: Empty response'), { status: 400 }); },
+    },
+  });
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  const { runner } = makeRunner({ stub, client, responseRetryWindowMs: 5_000, settleRetryDelaysMs: [1] });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(stub.bodiesFor('/api/response').length, 1);
+  assert.equal(stub.bodiesFor('/api/requeue').length, 1);
+});
+
+test('a reply that reached the relay in no way is failed with a note, never left to be re-run', async () => {
+  const stub = makeApiStub({ failRoutes: new Set(['/api/response', '/api/requeue']) });
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  const { runner } = makeRunner({ stub, client, responseRetryWindowMs: 30, settleRetryDelaysMs: [5] });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  assert.ok(stub.bodiesFor('/api/response').length > 1, 'offered again within the window');
+  // The heartbeat keeps claiming the row and hands the relay its failure.
+  const handed = runner.getSettleFailed();
+  assert.equal(handed.length, 1);
+  assert.equal(handed[0].id, 'q-1');
+  assert.match(handed[0].terminalError.message, /Copilot answered this message, but the answer could not be saved/);
+  assert.ok(runner.getActiveQueueMessageIds().some((entry) => entry.id === 'q-1' && entry.terminalError));
+
+  runner.acknowledgeSettleFailed(['q-1']);
+  assert.deepEqual(runner.getSettleFailed(), []);
+  assert.deepEqual(runner.getActiveQueueMessageIds(), []);
+});
+
+test('a relay that takes a reply and never answers is asked again, not left with one attempt', async () => {
+  const stub = makeApiStub();
+  let attempt = 0;
+  const api = (method, routePath, body, options = {}) => {
+    if (routePath !== '/api/response') return stub(method, routePath, body);
+    stub.calls.push({ method, routePath, body });
+    attempt += 1;
+    if (attempt > 2) return Promise.resolve({ ok: true });
+    return new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+    });
+  };
+  api.calls = stub.calls;
+  api.bodiesFor = stub.bodiesFor;
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  const { runner } = makeRunner({
+    stub: api, client, responseRetryWindowMs: 5_000, responseRequestTimeoutMs: 30, settleRetryDelaysMs: [1],
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(api.bodiesFor('/api/response').length, 3);
+  assert.equal(api.bodiesFor('/api/requeue').length, 0);
+});
+
+test('a failure note that cannot be saved is not reported as an answer', async () => {
+  const stub = makeApiStub({ failRoutes: new Set(['/api/response', '/api/requeue']) });
+  const client = createFakeCopilotClient({ onSend: () => {} });
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 100 });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  const handed = runner.getSettleFailed();
+  assert.equal(handed.length, 1);
+  assert.match(handed[0].terminalError.message, /failed, and what went wrong could not be saved/);
+  assert.doesNotMatch(handed[0].terminalError.message, /answered/);
+});
+
+test('a relay that takes a live post and never answers does not hold the turn', async () => {
+  // Live output is posted from the dispatch chain, one event after the
+  // other, so one request that never returned held every later event, the
+  // turn's terminator included, for the transport's 300 s.
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/stream': (_body, _attempt) => new Promise(() => {}),
+    },
+  });
+  const api = (method, routePath, body, options = {}) => {
+    if (routePath !== '/api/stream' || !options.signal) return stub(method, routePath, body);
+    stub.calls.push({ method, routePath, body });
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+    });
+  };
+  api.calls = stub.calls;
+  api.bodiesFor = stub.bodiesFor;
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  const { runner } = makeRunner({ stub: api, client, livePostTimeoutMs: 20, livePostPauseMs: 5_000 });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  // The reply does not go the live way, and it is complete.
+  const response = bodyOf(api, '/api/response');
+  assert.equal(response.terminalError, undefined);
+  assert.ok(response.text.length > 0);
+  // One stream post ran into its limit; the ones after it were skipped, all
+  // but the final one, which is what a reload of the page reads.
+  const streams = api.bodiesFor('/api/stream');
+  assert.equal(streams.length, 2);
+  assert.equal(streams[1].done, true);
+});
+
 test('a stall that fires before anything awaits the turn is not an unhandled rejection', async () => {
   // The stall can reject `turn.done` while `send()` is still in flight. An
   // unhandled rejection there is escalated by the worker crash guard into a

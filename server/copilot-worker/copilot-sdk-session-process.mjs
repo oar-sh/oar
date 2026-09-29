@@ -107,6 +107,7 @@ import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT, STEER_TURN_FAILED_TEXT } from '.
 import { buildSteerSettleFailure } from '../../shared/steer-settle-failure.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
 import { withSteerNote } from '../../shared/steer-note.mjs';
+import { isTransientRelayError } from '../../shared/worker-runtime/relay-errors.mjs';
 import {
   createTurnLiveness,
   createTurnStalledError,
@@ -147,10 +148,47 @@ const DEFAULT_BACKGROUND_TASK_TIMEOUT_MS = 30 * 60_000;
  * worker's `notificationGraceMs`, same value.
  */
 const DEFAULT_CONTINUATION_GRACE_MS = 60_000;
-/** Retry spacing for the synthetic-row registration (3 attempts). */
+/**
+ * Retry spacing for the synthetic-row registration: 3 attempts while the relay
+ * answers without minting a row, and the first step of the backoff while it
+ * cannot be reached at all.
+ */
 const DEFAULT_CONTINUATION_RETRY_DELAY_MS = 500;
+/**
+ * How long the registration keeps trying while the relay cannot be reached. A
+ * relay restart takes seconds; three attempts half a second apart gave up
+ * inside it, and the whole continuation (the report of a background agent
+ * that had worked for an hour) was dropped.
+ */
+const DEFAULT_CONTINUATION_OUTAGE_WINDOW_MS = 120_000;
+/** One registration request; the transport itself would wait 300 s. */
+const DEFAULT_CONTINUATION_REQUEST_TIMEOUT_MS = 15_000;
 /** How long a continuation's actions may buffer before its row is abandoned. */
 const CONTINUATION_REGISTRATION_TIMEOUT_MS = 10_000;
+/**
+ * How long a finished reply is offered to a relay that cannot be reached
+ * before the row is given up. The reply exists once; a requeue runs the
+ * prompt again, in a session that already holds it and its answer.
+ */
+const DEFAULT_RESPONSE_RETRY_WINDOW_MS = 5 * 60_000;
+/**
+ * One attempt to save a reply, or to requeue its row. Without a limit of its
+ * own an attempt lasts as long as the transport lets it (300 s), which is the
+ * whole window: a relay that took the connection and did not answer got one
+ * attempt and then a requeue. Generous, because the route may hold a reply
+ * for a while before it answers (a question card that was just answered).
+ */
+const DEFAULT_RESPONSE_REQUEST_TIMEOUT_MS = 90_000;
+/**
+ * Live output (stream, thoughts, activity lines) is posted from the dispatch
+ * chain, one event after the other. A relay that accepts the connection and
+ * then does not answer held every later event, the turn's terminator
+ * included, for the transport's 300 s. One post waits this long; after one
+ * that ran out, live output is skipped for the pause below. The reply itself
+ * does not go this way.
+ */
+const DEFAULT_LIVE_POST_TIMEOUT_MS = 10_000;
+const DEFAULT_LIVE_POST_PAUSE_MS = 30_000;
 /** Cap on activity lines carried between turns, so a chatty runtime cannot grow them. */
 const MAX_PENDING_ACTIVITIES = 20;
 /**
@@ -365,6 +403,12 @@ export function createCopilotSdkSessionRunner({
   // How long a settled continuation waits for its row before giving up on it.
   // Must outlast the registration's own retries; a test shortens it.
   continuationRegistrationTimeoutMs = CONTINUATION_REGISTRATION_TIMEOUT_MS,
+  continuationOutageWindowMs = DEFAULT_CONTINUATION_OUTAGE_WINDOW_MS,
+  continuationRequestTimeoutMs = DEFAULT_CONTINUATION_REQUEST_TIMEOUT_MS,
+  responseRetryWindowMs = DEFAULT_RESPONSE_RETRY_WINDOW_MS,
+  responseRequestTimeoutMs = DEFAULT_RESPONSE_REQUEST_TIMEOUT_MS,
+  livePostTimeoutMs = DEFAULT_LIVE_POST_TIMEOUT_MS,
+  livePostPauseMs = DEFAULT_LIVE_POST_PAUSE_MS,
   compactionStaleMs = DEFAULT_COMPACTION_STALE_MS,
   settleRetryDelaysMs = DEFAULT_SETTLE_RETRY_DELAYS_MS,
   maxTerminalSettleAttempts = DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS,
@@ -742,16 +786,38 @@ export function createCopilotSdkSessionRunner({
 
   // ---------------------------------------------------------------- publish --
 
+  // Until when live output is skipped (see DEFAULT_LIVE_POST_TIMEOUT_MS).
+  let livePostsPausedUntil = 0;
+
+  /**
+   * One post of live output. Never rejects and never waits longer than
+   * `livePostTimeoutMs`; `droppable` output is skipped while the relay is
+   * known not to answer. A subagent's status is not droppable: a run left
+   * "running" in the transcript is worse than a late post.
+   */
+  async function postLive(routePath, body, { droppable = true } = {}) {
+    if (droppable && Date.now() < livePostsPausedUntil) return;
+    try {
+      await api('POST', routePath, body, livePostTimeoutMs > 0 ? { signal: AbortSignal.timeout(livePostTimeoutMs) } : {});
+    } catch (error) {
+      if (error?.name !== 'TimeoutError') return;
+      if (Date.now() >= livePostsPausedUntil) {
+        dbg(`the relay did not answer ${routePath} within ${livePostTimeoutMs}ms; live output is skipped for ${livePostPauseMs}ms`);
+      }
+      livePostsPausedUntil = Date.now() + livePostPauseMs;
+    }
+  }
+
   async function postActivity(message, text, subagentRunId = null) {
     if (!text) return;
-    await api('POST', '/api/activity', {
+    await postLive('/api/activity', {
       messageId: message.id,
       conversationId: message.conversationId,
       mode: message.relayMode || 'agent',
       text,
       ...(subagentRunId ? { subagentRunId } : {}),
       ...attemptFields(message),
-    }).catch(() => {});
+    });
   }
 
   async function dispatchAction(message, action, state) {
@@ -765,7 +831,7 @@ export function createCopilotSdkSessionRunner({
       // Only main-thread text can stand in for the answer on the abort/error
       // fallback paths; subagent text would publish as the reply.
       if (!payload.subagentRunId) state.lastStreamedText = payload.text;
-      await api('POST', '/api/stream', {
+      await postLive('/api/stream', {
         messageId: message.id,
         conversationId: message.conversationId,
         mode: message.relayMode || 'agent',
@@ -773,11 +839,11 @@ export function createCopilotSdkSessionRunner({
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
         ...attemptFields(message),
-      }).catch(() => {});
+      });
       return;
     }
     if (channel === 'thought') {
-      await api('POST', '/api/thought', {
+      await postLive('/api/thought', {
         messageId: message.id,
         conversationId: message.conversationId,
         mode: message.relayMode || 'agent',
@@ -786,7 +852,7 @@ export function createCopilotSdkSessionRunner({
         done: payload.done === true,
         ...(payload.subagentRunId ? { subagentRunId: payload.subagentRunId } : {}),
         ...attemptFields(message),
-      }).catch(() => {});
+      });
       return;
     }
     if (channel === 'activity') {
@@ -797,7 +863,7 @@ export function createCopilotSdkSessionRunner({
       // Same body as every sibling worker's, so the lane bubbles, the
       // `subagent_status` broadcast and the UI's grouping behave identically
       // whichever provider produced the run.
-      await api('POST', '/api/subagent-run', {
+      await postLive('/api/subagent-run', {
         messageId: message.id,
         conversationId: message.conversationId,
         subagentRunId: payload.subagentRunId,
@@ -805,7 +871,7 @@ export function createCopilotSdkSessionRunner({
         ...(payload.displayName ? { displayName: payload.displayName } : {}),
         status: payload.status,
         ...attemptFields(message),
-      }).catch(() => {});
+      }, { droppable: false });
     }
   }
 
@@ -921,14 +987,14 @@ export function createCopilotSdkSessionRunner({
   }
 
   async function publishFinalStream(message, text) {
-    await api('POST', '/api/stream', {
+    await postLive('/api/stream', {
       messageId: message.id,
       conversationId: message.conversationId,
       mode: message.relayMode || 'agent',
       text: String(text || ''),
       done: true,
       ...attemptFields(message),
-    }).catch(() => {});
+    }, { droppable: false });
   }
 
   /**
@@ -952,35 +1018,52 @@ export function createCopilotSdkSessionRunner({
         .map((entry) => ({ id: String(entry?.id || '').trim(), attemptId: entry?.attemptId || null }))
         .filter((entry) => entry.id)
       : [];
-    try {
-      await api('POST', '/api/response', {
-        messageId: message.id,
-        conversationId: message.conversationId,
-        text: String(text || ''),
-        model: model || null,
-        modelOrigin: modelOrigin
-          || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
-        ...(terminalError ? { terminalError } : {}),
-        // What the turn had written before it failed; the relay keeps it
-        // above the failure note.
-        ...(terminalError && String(partialText || '').trim() ? { partialText: String(partialText).trim() } : {}),
-        ...(kind ? { kind } : {}),
-        ...(consumed.length ? { consumedSteerIds: consumed } : {}),
-        ...attemptFields(message),
-      });
-      return 'published';
-    } catch (error) {
-      // A stale_attempt 409 means the row already moved on to another attempt
-      // (requeued and re-delivered); the requeue would 409 the same way, and
-      // the newer attempt owes the row its answer — drop this one.
-      if (isStaleAttemptError(error)) {
-        dbg('response refused as stale_attempt; dropping', message.id);
-        return 'stale';
+    const body = {
+      messageId: message.id,
+      conversationId: message.conversationId,
+      text: String(text || ''),
+      model: model || null,
+      modelOrigin: modelOrigin
+        || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
+      ...(terminalError ? { terminalError } : {}),
+      // What the turn had written before it failed; the relay keeps it
+      // above the failure note.
+      ...(terminalError && String(partialText || '').trim() ? { partialText: String(partialText).trim() } : {}),
+      ...(kind ? { kind } : {}),
+      ...(consumed.length ? { consumedSteerIds: consumed } : {}),
+      ...attemptFields(message),
+    };
+    // A row's own reply is offered again while the relay cannot be reached:
+    // it exists once, and the route answers a repeat of one it already saved
+    // with `already_done`. Settle markers carry their own ladder
+    // (publishSettleMarker), and a Stop's note is not worth a wait.
+    const patient = !kind && requeueOnFailure;
+    const requestLimit = () => (responseRequestTimeoutMs > 0 ? { signal: AbortSignal.timeout(responseRequestTimeoutMs) } : {});
+    const startedAt = Date.now();
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await api('POST', '/api/response', body, requestLimit());
+        if (attempt) dbg('response saved after the relay came back', message.id, `attempt ${attempt + 1}`);
+        return 'published';
+      } catch (error) {
+        // A stale_attempt 409 means the row already moved on to another attempt
+        // (requeued and re-delivered); the requeue would 409 the same way, and
+        // the newer attempt owes the row its answer — drop this one.
+        if (isStaleAttemptError(error)) {
+          dbg('response refused as stale_attempt; dropping', message.id);
+          return 'stale';
+        }
+        if (patient && !disposed && isTransientRelayError(error) && Date.now() - startedAt < responseRetryWindowMs) {
+          if (!attempt) dbg('the relay did not take the response; trying again', message.id, error?.message || String(error));
+          await sleep(settleRetryDelaysMs[Math.min(attempt, settleRetryDelaysMs.length - 1)] ?? 8_000);
+          continue;
+        }
+        dbg('response could not be saved', message.id, error?.message || String(error));
+        if (kind || !requeueOnFailure) return 'failed';
+        const requeued = await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }, requestLimit())
+          .then(() => true, () => false);
+        return requeued ? 'requeued' : 'failed';
       }
-      if (kind || !requeueOnFailure) return 'failed';
-      const requeued = await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) })
-        .then(() => true, () => false);
-      return requeued ? 'requeued' : 'failed';
     }
   }
 
@@ -2693,6 +2776,9 @@ export function createCopilotSdkSessionRunner({
       liveness: createTurnLiveness({ windows: stallWindows }),
       // The runtime teardown a failure started (see `fail`).
       teardown: null,
+      // Until when a continuation's registration may still get its row from a
+      // relay it cannot reach (0: it is not in that state).
+      registrationDeadline: 0,
       // Tool calls this turn started, whichever agent made them. Told in the
       // failure note when the turn fails.
       toolCalls: 0,
@@ -3036,6 +3122,21 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
+   * A row whose run is over and whose outcome reached the relay neither as a
+   * response nor as a requeue. Releasing it as it is would leave it to the
+   * relay's recovery, which runs the prompt again or fails it as a blocked
+   * replay, whichever it finds. It is handed to the heartbeat instead, to be
+   * failed with a note that says what happened: the run is not repeated.
+   */
+  function noteResponseOutcome(message, outcome, variant = 'replyLost') {
+    const id = String(message?.id || '').trim();
+    if (outcome !== 'failed' || !id) return;
+    dbg('the outcome could not be saved or requeued; handing the row to the heartbeat', id, variant);
+    claimSettling(message, variant);
+    settleFailedTerminals.set(id, buildSteerSettleFailure(message, { variant, agentLabel: SETTLE_AGENT_LABEL }));
+  }
+
+  /**
    * Decide and publish one row's outcome. Idempotent per entry. A run owner's
    * settle also settles the steers folded into its run (they were answered by
    * its reply), in push order, after the reply itself.
@@ -3063,11 +3164,11 @@ export function createCopilotSdkSessionRunner({
             await publishPlanBoard(turn, text, 'plan-mode-fallback');
           }
           await publishFinalStream(entry.message, published);
-          await publishResponse(entry.message, {
+          noteResponseOutcome(entry.message, await publishResponse(entry.message, {
             text: published,
             model,
             consumedSteerIds: folded.map((other) => other.message),
-          });
+          }));
           break;
         }
         case 'aborted-by-user': {
@@ -3106,7 +3207,10 @@ export function createCopilotSdkSessionRunner({
           const own = finalTextFor(turn, entry, turn.result);
           const text = own ? `${own}\n\n${RUNTIME_INTERRUPTED_NOTE}` : RUNTIME_INTERRUPTED_NOTE;
           await publishFinalStream(entry.message, text);
-          await publishResponse(entry.message, { text, model, consumedSteerIds: folded.map((other) => other.message) });
+          noteResponseOutcome(
+            entry.message,
+            await publishResponse(entry.message, { text, model, consumedSteerIds: folded.map((other) => other.message) }),
+          );
           break;
         }
         case 'error': {
@@ -3114,13 +3218,13 @@ export function createCopilotSdkSessionRunner({
           const written = finalTextFor(turn, entry, turn.result);
           const terminalError = terminalErrorRecord(entry.message, classified, { toolCalls: turn.toolCalls });
           await publishFinalStream(entry.message, written || entry.state.lastStreamedText);
-          await publishResponse(entry.message, {
+          noteResponseOutcome(entry.message, await publishResponse(entry.message, {
             text: terminalError.message,
             model,
             terminalError,
             partialText: written,
             consumedSteerIds: folded.map((other) => other.message),
-          });
+          }), 'failureLost');
           break;
         }
         case 'folded':
@@ -3140,7 +3244,11 @@ export function createCopilotSdkSessionRunner({
           // it will be answered at the start of the next interaction — a
           // requeue would run it twice.
           await publishFinalStream(entry.message, STEERED_ROW_MERGED_NOTE);
-          await publishResponse(entry.message, { text: STEERED_ROW_MERGED_NOTE, model });
+          noteResponseOutcome(
+            entry.message,
+            await publishResponse(entry.message, { text: STEERED_ROW_MERGED_NOTE, model, requeueOnFailure: false }),
+            'folded',
+          );
           break;
         case 'cancelled':
         case 'discarded':
@@ -3751,25 +3859,54 @@ export function createCopilotSdkSessionRunner({
     const signal = turn.registrationAbort?.signal || null;
     const abandoned = () => turn.discarded || signal?.aborted === true;
     let response = null;
-    for (let attempt = 0; attempt < 3 && !response?.messageId; attempt += 1) {
+    // Two ways of not getting a row, counted apart. The relay ANSWERED without
+    // one (it refused, or sent an empty body): three attempts, as ever. The
+    // relay could not be REACHED (it is restarting): the attempts go on, spaced
+    // further apart, for the outage window — the turn's output is buffered
+    // meanwhile and nothing else can tell the user what the runtime did.
+    let refusals = 0;
+    let outageSince = 0;
+    let outageDelayMs = continuationRetryDelayMs;
+    while (!response?.messageId) {
       if (abandoned()) return;
+      let failure = null;
+      // The drive path waits at least as long as the request in flight may
+      // take: a relay that took the connection and is slow to answer is not
+      // one that refused.
+      if (continuationOutageWindowMs > 0) {
+        turn.registrationDeadline = Math.max(turn.registrationDeadline || 0, Date.now() + continuationRequestTimeoutMs);
+      }
       response = await api('POST', '/api/continuation-turn', {
         conversationId: sdkSessionId,
         sdkSessionId,
         relayMode: turn.message.relayMode,
         trigger: CONTINUATION_TRIGGER,
         operationId,
-      }).catch((error) => {
+      }, continuationRequestTimeoutMs > 0 ? { signal: AbortSignal.timeout(continuationRequestTimeoutMs) } : {}).catch((error) => {
+        failure = error;
         dbg('continuation turn registration failed', error?.message || String(error));
         return null;
       });
-      if (!response?.messageId) {
-        if (abandoned()) return;
-        await new Promise((resolve) => { setTimeout(resolve, continuationRetryDelayMs); });
+      if (response?.messageId) break;
+      if (abandoned()) return;
+      if (failure && continuationOutageWindowMs > 0 && isTransientRelayError(failure)) {
+        outageSince = outageSince || Date.now();
+        if (Date.now() - outageSince >= continuationOutageWindowMs) break;
+        // The drive path waits for as long as this loop may still succeed.
+        turn.registrationDeadline = outageSince + continuationOutageWindowMs + continuationRequestTimeoutMs;
+        await sleep(outageDelayMs);
+        outageDelayMs = Math.min(outageDelayMs * 2, 8_000);
+        continue;
       }
+      refusals += 1;
+      if (refusals >= 3) break;
+      await sleep(continuationRetryDelayMs);
     }
+    turn.registrationDeadline = 0;
     if (!response?.messageId) {
-      abandonContinuationRegistration(turn, 'no relay message id after 3 attempts');
+      abandonContinuationRegistration(turn, outageSince && refusals < 3
+        ? `the relay could not be reached for ${Math.round((Date.now() - outageSince) / 1000)}s`
+        : 'no relay message id after 3 attempts');
       return;
     }
     const messageId = String(response.messageId);
@@ -3818,17 +3955,24 @@ export function createCopilotSdkSessionRunner({
    */
   async function awaitContinuationRow(turn, timeoutMs = continuationRegistrationTimeoutMs) {
     if (turn.registered || turn.discarded) return;
-    let timer = null;
-    const expired = new Promise((resolve) => {
-      timer = setTimeout(() => resolve('expired'), timeoutMs);
-      timer.unref?.();
-    });
-    // `turn.registration` is the caught chain and never rejects.
-    const outcome = await Promise.race([turn.registration || Promise.resolve(), expired]);
-    clearTimeout(timer);
-    if (outcome === 'expired' && !turn.registered && !turn.message.id) {
-      abandonContinuationRegistration(turn, 'registration outlived the local deadline');
+    let waitMs = timeoutMs;
+    while (true) {
+      let timer = null;
+      const expired = new Promise((resolve) => {
+        timer = setTimeout(() => resolve('expired'), waitMs);
+        timer.unref?.();
+      });
+      // `turn.registration` is the caught chain and never rejects.
+      const outcome = await Promise.race([turn.registration || Promise.resolve(), expired]);
+      clearTimeout(timer);
+      if (outcome !== 'expired' || turn.registered || turn.message.id) return;
+      // Still trying against a relay that cannot be reached: the deadline is
+      // the registration's own, not this wait's.
+      const remainingMs = (turn.registrationDeadline || 0) - Date.now();
+      if (remainingMs <= 0) break;
+      waitMs = remainingMs;
     }
+    abandonContinuationRegistration(turn, 'registration outlived the local deadline');
   }
 
   // --------------------------------------------------------------- steering --

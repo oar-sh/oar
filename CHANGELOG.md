@@ -50,6 +50,18 @@ All notable changes to OAR are documented here. The format follows
   the failed turn gets a short marker with Resend instead of a second copy of
   the failure.
 - **Copilot:** a slow relay no longer makes a busy runtime look silent.
+- **Copilot:** a reply the relay could not take (it was restarting, the
+  connection was reset) is offered again for up to five minutes. One failed
+  attempt used to put the message back in the queue, which threw the finished
+  answer away and ran the prompt a second time. A reply that cannot be saved at
+  all ends as a failure that says so, and nothing is run twice.
+- **Copilot:** what the agent does by itself after a background task (a
+  continuation) is kept while the relay restarts. Its row was given up after
+  about a second, and the whole reply with it.
+- **Copilot:** a relay that accepts live output and does not answer no longer
+  holds the turn: a live update waits 10 seconds at most, and after one that
+  ran out, live updates are skipped for 30 seconds. Tool lines skipped then are
+  missing from the transcript; the reply is not affected.
 
 ## [0.9.5] — 2026-09-27
 

@@ -46,6 +46,17 @@ const VARIANTS = Object.freeze({
     message: `This message was sent to ${label} in a turn that then failed, so it was not answered.`,
     guidance: 'Resend it if you still want an answer.',
   }),
+  // Not a steer: the message was answered, and the answer reached the relay
+  // neither as a reply nor as a requeue.
+  replyLost: (label) => ({
+    message: `${sentenceCase(label)} answered this message, but the answer could not be saved to the relay.`,
+    guidance: 'Ask for the answer again: the session still has it, and nothing is run a second time.',
+  }),
+  // Not a steer: the turn failed, and its failure note could not be saved.
+  failureLost: (label) => ({
+    message: `The turn ${label} ran for this message failed, and what went wrong could not be saved to the relay.`,
+    guidance: 'Send the message again to retry.',
+  }),
   // Not a steer: delivered between turns and answered on a background
   // continuation row (ANSWERED_ELSEWHERE_KIND in steer-settle-markers.mjs).
   answeredElsewhere: (label) => ({

@@ -505,6 +505,87 @@ test('a relay that will not mint a row drops the output instead of failing the w
   await runner.dispose();
 });
 
+test('a relay that restarts while a continuation opens still gets the whole reply', async () => {
+  // Three attempts half a second apart gave up inside an ordinary relay
+  // restart, and what the runtime had to say was dropped.
+  let attempt = 0;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': () => {
+        attempt += 1;
+        if (attempt <= 5) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+        return { ok: true, messageId: 'cont-1', conversationId: 'conv-1', attemptId: 'attempt-cont-1' };
+      },
+    },
+  });
+  const { client, runner } = setup({ stub, continuationOutageWindowMs: 5_000, continuationRegistrationTimeoutMs: 10 });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  fireTimer(client);
+  // The turn is over long before the relay is back, and the wait for the row
+  // (10 ms here) does not give up on a registration that is still trying.
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation reply published' });
+
+  assert.equal(attempt, 6);
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, TIMER_REPLY);
+  // One idempotency key for every attempt: a request that did create the row
+  // must get the same row back.
+  const operationIds = new Set(bodiesFor(stub, '/api/continuation-turn').map((body) => body.operationId));
+  assert.equal(operationIds.size, 1);
+  await runner.dispose();
+});
+
+test('a relay that is slow to answer the first registration is waited for', async () => {
+  // The wait for the row used to run out (10 s) while the first request was
+  // still in flight, before any failure had started the outage patience.
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': async () => {
+        await tick(120);
+        return { ok: true, messageId: 'cont-1', conversationId: 'conv-1', attemptId: 'attempt-cont-1' };
+      },
+    },
+  });
+  const { client, runner } = setup({ stub, continuationOutageWindowMs: 5_000, continuationRegistrationTimeoutMs: 10 });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  fireTimer(client);
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation reply published' });
+  assert.equal(responsesFor(stub, 'cont-1')[0].text, TIMER_REPLY);
+  await runner.dispose();
+});
+
+test('a relay that stays away past the outage window ends the wait for the row', async () => {
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); },
+    },
+  });
+  const { client, runner } = setup({ stub, continuationOutageWindowMs: 400, continuationRegistrationTimeoutMs: 10 });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  fireTimer(client);
+  await waitFor(() => runner.isTurnActive() === false, { label: 'registration gave up' });
+  assert.ok(bodiesFor(stub, '/api/continuation-turn').length > 3, 'more patient than with a relay that refuses');
+  assert.equal(bodiesFor(stub, '/api/response').filter((body) => !body.messageId).length, 0);
+  await runner.dispose();
+});
+
+test('the relay\'s own refusal of a continuation row still ends after three attempts', async () => {
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/continuation-turn': () => { throw Object.assign(new Error('HTTP 409 /api/continuation-turn'), { status: 409 }); },
+    },
+  });
+  const { client, runner } = setup({ stub, continuationOutageWindowMs: 5_000 });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  fireTimer(client);
+  await waitFor(() => runner.isTurnActive() === false, { label: 'registration gave up' });
+  assert.equal(bodiesFor(stub, '/api/continuation-turn').length, 3);
+  await runner.dispose();
+});
+
 test('a relay that answers without a message id is retried, then honoured', async () => {
   // A truthy-but-empty body must not end the retry loop early.
   let attempt = 0;

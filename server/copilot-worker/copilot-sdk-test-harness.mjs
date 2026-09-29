@@ -475,6 +475,11 @@ export function makeRunner({
       relayToolInstructions: '',
       getPreviewInstructionsImpl: () => '',
       createQuestionBridgeImpl: () => questionBridge,
+      // No patience with an unreachable relay by default: a stub route that
+      // fails is a relay that refuses, and the suites written against that
+      // expect the refusal's outcome at once. The outage tests opt in.
+      continuationOutageWindowMs: 0,
+      responseRetryWindowMs: 0,
       startClientImpl: async (options) => {
         started.push(options);
         return {
