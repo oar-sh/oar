@@ -68,6 +68,9 @@ All notable changes to OAR are documented here. The format follows
   out the text up to the next one. Strikethrough needs two tildes on each side:
   `~~text~~`. The page now names the version of its Markdown library (15.0.12,
   the one it was served until now) instead of taking whatever the CDN hands out.
+- **Grok:** a quiet-turn window that is set for the model request or for a tool
+  is kept when the shared watchdog is switched off by the environment, and the
+  watchdog looks often enough for the shortest window that is set.
 - **Windows:** stopping or deleting a session could end the worker of another
   session as well. Windows hands the process id of an ended process out again,
   and a worker whose creator was long gone could so look like a child of the

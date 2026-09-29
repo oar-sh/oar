@@ -182,13 +182,18 @@ test('a tool call of the agent that runs in silence does not stall the prompt', 
 });
 
 test('an environment that turns the shared watchdog off leaves this one on', async () => {
+  // The window named here was dropped when the windows were rebuilt, and
+  // the test waited out the default of five minutes in every run.
   const { client } = startClientWithCapturedWrites();
+  const startedAt = Date.now();
   const error = await client.sessionPrompt('sess', [{ type: 'text', text: 'hi' }], null, {}, {
     env: { OAR_TURN_STALL_IDLE_MS: '0' },
     modelMs: 300,
     maxTurnMs: 0,
   }).then(() => null, (failure) => failure);
   assert.equal(isTurnStalledError(error), true);
+  assert.equal(error.stall?.phase, 'model');
+  assert.ok(Date.now() - startedAt < 30_000, 'the window the caller named decides, not the default');
 });
 
 test('sessionPrompt watchdog defers to pending client-side work until the ceiling', async () => {

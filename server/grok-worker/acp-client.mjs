@@ -374,10 +374,16 @@ export class AcpClient extends EventEmitter {
     // An environment that turns the shared watchdog off does not turn this
     // one off: it is the only thing that notices a dead transport. An idle
     // window of 0 takes the two others to 0 with it, so all three are
-    // rebuilt from the default.
+    // rebuilt from the default. A window the caller named stays the
+    // caller's.
     const stallWindows = resolved.idle > 0
       ? resolved
-      : resolveTurnStallWindows({ env: {}, idleMs: ACP_PROMPT_INACTIVITY_MS });
+      : resolveTurnStallWindows({
+        env: {},
+        idleMs: ACP_PROMPT_INACTIVITY_MS,
+        modelMs: watchdog?.modelMs,
+        toolMs: watchdog?.toolMs,
+      });
     const inactivityMs = stallWindows.idle;
     const liveness = createTurnLiveness({ windows: stallWindows });
     liveness.begin('model', 'prompt');
@@ -458,7 +464,12 @@ export class AcpClient extends EventEmitter {
             if (quiet().stalled) stall();
           });
       };
-      const pollMs = Math.max(250, Math.min(5000, Math.floor(inactivityMs / 4)));
+      // Often enough for the shortest window that is set, not only for the
+      // idle one.
+      const shortestWindowMs = Math.min(
+        ...[stallWindows.idle, stallWindows.model, stallWindows.tool].filter((ms) => Number(ms) > 0),
+      );
+      const pollMs = Math.max(250, Math.min(5000, Math.floor(shortestWindowMs / 4)));
       watchdogTimer = setInterval(() => {
         const now = Date.now();
         if (maxTurnMs > 0 && now - startedAt >= maxTurnMs) {
