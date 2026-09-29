@@ -78,7 +78,7 @@ curl -fsSL oar.sh/install | sh
 The script checks for Node.js 22.13 or newer, runs `npm install -g @oar-sh/oar`, and then hands off to `oar setup` (with `--defaults` when there is no terminal to ask questions in). It refuses to run as root, because OAR installs per user. `OAR_VERSION=x.y.z` pins a version, `OAR_CHANNEL=beta` follows the beta channel, and `OAR_DRY_RUN=1` only prints what it would do:
 
 ```bash
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.5 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.6 sh
 ```
 
 Read it before you run it: [oar.sh/install](https://oar.sh/install).
@@ -89,7 +89,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.5'` before the command.
+The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.6'` before the command.
 
 ### npm
 
@@ -325,6 +325,15 @@ The composer's model picker is the union of every enabled provider's catalog, fi
 Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
 
 ## Highlights
+
+### New in 0.9.6
+
+- **Claude pauses at the usage limit**: a turn that runs into the subscription's usage limit is paused instead of failed. A banner above the composer says when it carries on, with **Resume now** and **Cancel**; after the reset the relay sends a message of its own that quotes what was refused. The pause survives a relay restart, and a reset more than six hours away waits for you. A second banner warns when the usage passes 90 % of a limit.
+- **A quiet command no longer fails its turn** (Copilot, Cursor, Grok): how long a turn may stay silent depends on what the agent is doing: 2 minutes with nothing in flight, 5 minutes during a model request, 30 minutes while a tool runs.
+- **Copilot turns that fail, fail well**: the failure shows at once, what the agent had written stays above the note, Stop works on a stuck turn, a finished reply survives a relay restart, and the commands of a runtime that died are stopped. A message you send while a command runs waits for the command instead of cutting it short.
+- **Agents on paired relays can answer each other**: a relay you mentioned stays in reach for the whole session, and an agent that was asked from another relay can answer, ask back or report later. See [Remote relays](#remote-relays).
+- **Less scrolling in a running turn**: subagents are folded to a one-line header that says what they are doing, and a plan board sits inside the reply it belongs to; its choice also sets the session's mode.
+- **Failure notes that help**: no more advice to restart the relay, and a Claude account problem (billing, sign-in, access) says what to check. The relay keeps its console in `relay-console.log`.
 
 ### New in 0.9.5
 

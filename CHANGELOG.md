@@ -5,6 +5,12 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-09-29
+
+Highlights: a Claude turn pauses at the usage limit and carries on after the
+reset, a command that prints nothing no longer fails its turn, and agents on
+paired relays can work with each other for a whole session.
+
 ### Added
 
 - The relay keeps a copy of its console in `relay-console.log` in its log
