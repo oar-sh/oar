@@ -132,6 +132,7 @@ test('process inspector ignores relay server process on windows path form', () =
         '    parentProcessId = [int]$_.ParentProcessId;',
         '    name = [string]$_.Name;',
         '    commandLine = [string]$_.CommandLine;',
+        '    createdAt = $(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalMilliseconds) } else { [int64]0 });',
         '  }',
         '};',
         '$list | ConvertTo-Json -Depth 3 -Compress',
@@ -291,6 +292,112 @@ test('process inspector finds windows session process tree for kill', () => {
   assert.deepEqual(pids, [800, 801, 802, 803]);
 });
 
+test('a process older than its "parent" is not killed with it: windows hands a pid out again', () => {
+  // Windows keeps the pid of a worker's creator in the worker for good. The
+  // creator ended long ago and its pid (910) now belongs to a tool process of
+  // the session that is being killed: the older worker is no child of it.
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 900,
+          parentProcessId: 1,
+          name: 'node.exe',
+          commandLine: 'node claude-session-worker.mjs --session-id abc-123',
+          createdAt: 5_000_000,
+        },
+        {
+          processId: 910,
+          parentProcessId: 900,
+          name: 'node.exe',
+          commandLine: 'node tool-child-without-session-arg.js',
+          createdAt: 5_000_500,
+        },
+        {
+          processId: 911,
+          parentProcessId: 910,
+          name: 'node.exe',
+          commandLine: 'node grandchild.js',
+          createdAt: 5_000_900,
+        },
+        {
+          // Started two days earlier by a process that had pid 910 then.
+          processId: 920,
+          parentProcessId: 910,
+          name: 'node.exe',
+          commandLine: 'node claude-session-worker.mjs --session-id def-456',
+          createdAt: 1_000_000,
+        },
+        {
+          processId: 921,
+          parentProcessId: 920,
+          name: 'claude.exe',
+          commandLine: 'claude --output-format stream-json',
+          createdAt: 1_000_400,
+        },
+        {
+          // Not a worker, and older than its "parent" as well.
+          processId: 930,
+          parentProcessId: 910,
+          name: 'python.exe',
+          commandLine: 'python long-job.py',
+          createdAt: 2_000_000,
+        },
+      ]));
+    },
+  });
+
+  const pids = inspector.findWindowsProcessTreeForSession('abc-123')
+    .map((proc) => proc.processId)
+    .sort((left, right) => left - right);
+
+  assert.deepEqual(pids, [900, 910, 911]);
+});
+
+test('the worker of another session is never part of a session tree, whatever its start time says', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl() {
+      return Buffer.from(JSON.stringify([
+        {
+          processId: 940,
+          parentProcessId: 1,
+          name: 'node.exe',
+          commandLine: 'node copilot-session-worker.mjs --session-id abc-123',
+        },
+        {
+          // No start times known: the pid alone would make it a child.
+          processId: 941,
+          parentProcessId: 940,
+          name: 'node.exe',
+          commandLine: 'node claude-session-worker.mjs --session-id def-456',
+        },
+        {
+          processId: 942,
+          parentProcessId: 941,
+          name: 'claude.exe',
+          commandLine: 'claude --output-format stream-json',
+        },
+        {
+          processId: 943,
+          parentProcessId: 940,
+          name: 'copilot.exe',
+          commandLine: 'copilot --headless --resume 7d0e-runtime-session',
+        },
+      ]));
+    },
+  });
+
+  const pids = inspector.findWindowsProcessTreeForSession('abc-123')
+    .map((proc) => proc.processId)
+    .sort((left, right) => left - right);
+
+  // The runtime the worker started carries a session id of its own and stays
+  // part of the tree; the other session's worker and what it started do not.
+  assert.deepEqual(pids, [940, 943]);
+});
+
 test('process inspector keeps normal windows worker lookup limited to matching processes', () => {
   const inspector = createSessionWorkerProcessInspector({
     platform: 'win32',
@@ -335,6 +442,10 @@ test('process inspector windows stop command expands descendants before stopping
   assert.match(stopScript, /Get-CimInstance Win32_Process/);
   assert.match(stopScript, /-ErrorAction Stop/);
   assert.match(stopScript, /parentProcessId/);
+  // Descendants are taken by start time too, and never another session's worker.
+  assert.match(stopScript, /CreationDate/);
+  assert.match(stopScript, /\$proc\.createdAt -lt \$parentCreatedAt/);
+  assert.match(stopScript, /if \(\$proc\.worker\) \{ continue \}/);
   assert.match(stopScript, /Stop-Process -Id \$id -Force/);
   assert.match(stopScript, /exit 0/);
 });

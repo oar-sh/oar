@@ -51,7 +51,26 @@ function normalizeWindowsProcess(proc) {
     parentProcessId: Number.isInteger(Number(proc?.parentProcessId)) ? Number(proc.parentProcessId) : null,
     name: String(proc?.name || ''),
     commandLine: String(proc?.commandLine || ''),
+    createdAt: Number(proc?.createdAt) > 0 ? Number(proc.createdAt) : 0,
   };
+}
+
+// The relay's own session workers: `node <kind>-session-worker.mjs --session-id <id>`.
+function isRelaySessionWorker(proc) {
+  return String(proc?.commandLine || '').toLowerCase().includes('-session-worker');
+}
+
+/**
+ * Is `child` a process `parent` started? Windows keeps the parent's pid in a
+ * process for good and hands the pid of an ended process out again: a worker
+ * whose creator is long gone can so appear as the child of a process that has
+ * nothing to do with it. A process older than its parent is no child of it.
+ * Where a start time is not known, the pid decides as before.
+ */
+function isWindowsChildOf(child, parent) {
+  if (!child || !parent) return false;
+  if (!(child.createdAt > 0) || !(parent.createdAt > 0)) return true;
+  return child.createdAt >= parent.createdAt;
 }
 
 function looksLikeCopilotWorkerProcess(proc) {
@@ -126,6 +145,7 @@ export function createSessionWorkerProcessInspector({
       '    parentProcessId = [int]$_.ParentProcessId;',
       '    name = [string]$_.Name;',
       '    commandLine = [string]$_.CommandLine;',
+      '    createdAt = $(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalMilliseconds) } else { [int64]0 });',
       '  }',
       '};',
       '$list | ConvertTo-Json -Depth 3 -Compress',
@@ -190,6 +210,9 @@ export function createSessionWorkerProcessInspector({
     const addDescendants = (pid) => {
       for (const child of childrenByParent.get(pid) || []) {
         if (related.has(child.processId)) continue;
+        if (!isWindowsChildOf(child, byPid.get(pid))) continue;
+        // The worker of another session is never part of this one's tree.
+        if (isRelaySessionWorker(child) && !isWindowsSessionMatch(child, target, targetPattern)) continue;
         addProcess(child);
         addDescendants(child.processId);
       }
@@ -201,6 +224,7 @@ export function createSessionWorkerProcessInspector({
         seen.add(current.parentProcessId);
         const parent = byPid.get(current.parentProcessId);
         if (!parent || !isWindowsWrapperProcess(parent)) return;
+        if (!isWindowsChildOf(current, parent)) return;
         addProcess(parent);
         current = parent;
       }
@@ -259,18 +283,26 @@ export function createSessionWorkerProcessInspector({
       '$ErrorActionPreference = "Continue"',
       '$ids = @(' + ids.join(',') + ')',
       'try {',
-      '  $snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ processId = [int]$_.ProcessId; parentProcessId = [int]$_.ParentProcessId } })',
+      // A child is a process started after its parent: the pid of an ended
+      // process is handed out again, and the worker of another session must
+      // not be taken for a child because of it.
+      '  $snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ processId = [int]$_.ProcessId; parentProcessId = [int]$_.ParentProcessId; createdAt = $(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalMilliseconds) } else { [int64]0 }); worker = ([string]$_.CommandLine -like "*-session-worker*") } })',
       '} catch {',
       '  Write-Error $_',
       '  exit 2',
       '}',
       '$targets = [System.Collections.Generic.HashSet[int]]::new()',
       'foreach ($id in $ids) { [void]$targets.Add([int]$id) }',
+      '$createdAt = @{}',
+      'foreach ($proc in $snapshot) { $createdAt[[int]$proc.processId] = [int64]$proc.createdAt }',
       '$changed = $true',
       'while ($changed) {',
       '  $changed = $false',
       '  foreach ($proc in $snapshot) {',
       '    if ($targets.Contains([int]$proc.parentProcessId) -and -not $targets.Contains([int]$proc.processId)) {',
+      '      if ($proc.worker) { continue }',
+      '      $parentCreatedAt = [int64]$createdAt[[int]$proc.parentProcessId]',
+      '      if ($parentCreatedAt -gt 0 -and [int64]$proc.createdAt -gt 0 -and [int64]$proc.createdAt -lt $parentCreatedAt) { continue }',
       '      [void]$targets.Add([int]$proc.processId)',
       '      $changed = $true',
       '    }',

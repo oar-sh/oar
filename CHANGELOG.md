@@ -28,6 +28,11 @@ All notable changes to OAR are documented here. The format follows
 
 ### Fixed
 
+- **Windows:** stopping or deleting a session could end the worker of another
+  session as well. Windows hands the process id of an ended process out again,
+  and a worker whose creator was long gone could so look like a child of the
+  session that was being stopped. A process older than its parent is no longer
+  taken for its child, and the worker of another session never is.
 - A plan board's action ("Implement in autopilot" and the like) queues its
   follow-up again. It failed with an error and left the board marked as acted
   on, without the message that carries the plan out.
