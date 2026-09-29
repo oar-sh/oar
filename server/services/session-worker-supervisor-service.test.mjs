@@ -134,6 +134,67 @@ test('supervisor marks stale pid when known launched pid is dead and work is pen
   assert.equal(lifecycle?.stalePidDetected, true);
 });
 
+test('an idle worker whose process is gone is no longer listed, and the next message starts a new one', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 10_000;
+  let alive = true;
+  let spawnCount = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    heartbeatTimeoutMs: 5_000,
+    isPidAlive: () => alive,
+    spawnWorker: async () => {
+      spawnCount += 1;
+      return { workerId: `worker-idle-${spawnCount}`, pid: 4100 + spawnCount };
+    },
+  });
+  await supervisor.ensureWorker('idle-123');
+  supervisor.noteSessionHeartbeat('idle-123', nowMs);
+  assert.deepEqual(supervisor.snapshot().workers.map((worker) => [worker.status, worker.pid]), [['ready', 4101]]);
+
+  // Killed from outside, right after a heartbeat: the heartbeat still counts.
+  alive = false;
+  nowMs += 1_000;
+  assert.equal(supervisor.snapshot().workers.length, 1, 'a recent heartbeat outranks the pid');
+
+  nowMs += 5_000;
+  const status = supervisor.snapshot();
+  assert.deepEqual(status.workers, [], 'not listed as ready with a pid that is gone');
+  assert.equal(status.workerCount, 0);
+  assert.equal(registry.getWorker('idle-123'), null);
+
+  alive = true;
+  const again = await supervisor.ensureWorker('idle-123');
+  assert.equal(again.ok, true);
+  assert.equal(spawnCount, 2);
+  assert.equal(registry.getWorker('idle-123').pid, 4102);
+});
+
+test('a dead worker with open work stays listed for the stale-pid handling', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 10_000;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    heartbeatTimeoutMs: 5_000,
+    isPidAlive: () => false,
+    spawnWorker: async () => ({ workerId: 'worker-busy-1', pid: 4200 }),
+  });
+  await supervisor.ensureWorker('busy-123');
+  supervisor.noteSessionHeartbeat('busy-123', nowMs);
+  supervisor.markProcessing('busy-123', 1);
+  nowMs += 60_000;
+  assert.deepEqual(supervisor.snapshot().workers.map((worker) => worker.status), ['processing']);
+
+  // Idle again, with a question card waiting on it.
+  supervisor.markIdle('busy-123', 0);
+  nowMs += 60_000;
+  const waiting = supervisor.snapshot({ pendingQuestionSessionIds: ['busy-123'] });
+  assert.equal(waiting.workers.length, 1);
+  assert.equal(waiting.lifecycle.find((entry) => entry.sdkSessionId === 'busy-123')?.degradedReason, 'stale-pid');
+});
+
 test('supervisor does not reuse worker after startup heartbeat timeout', async () => {
   const registry = createSessionWorkerRegistry();
   let nowMs = 10_000;

@@ -55,6 +55,10 @@ All notable changes to OAR are documented here. The format follows
   cut such a reply off at the quoted error code, put its own advice behind it
   and stored the turn as failed. Where a failure is known from its text alone,
   that text is now kept whole.
+- A session worker that was idle and whose process has ended (stopped from
+  outside, or crashed between turns) is no longer listed as ready with its old
+  process id. The next message started a new worker before as well; the list
+  now says what is there, about a minute and a half after the process ended.
 - **Windows:** stopping or deleting a session could end the worker of another
   session as well. Windows hands the process id of an ended process out again,
   and a worker whose creator was long gone could so look like a child of the

@@ -778,9 +778,41 @@ export function createSessionWorkerSupervisor({
     return evicted;
   }
 
+  /**
+   * An idle worker whose process is gone (killed from outside, crashed
+   * between turns) leaves the registry, so it is not listed as ready with a
+   * pid that no longer exists; the next message starts a new one either way.
+   * A worker that is processing, or that a question card waits on, is left
+   * to the stale-pid handling, which knows about the work that is open. A
+   * heartbeat inside the stale window outranks the pid: the pid on record
+   * can be a launcher's. A worker that was stopped from outside therefore
+   * stays listed until that window has passed (90 s by default); one that
+   * the relay's own kill route stopped leaves the list at once.
+   */
+  function retireDeadIdleWorkers({ keep = new Set() } = {}) {
+    const retired = [];
+    const heartbeatCutoff = nowMs() - heartbeatStaleAfterMs;
+    for (const worker of registry.listWorkers()) {
+      const sessionId = normalizeSessionId(worker.sdkSessionId);
+      if (!sessionId || worker.status !== 'ready') continue;
+      if (pendingStarts.has(sessionId) || keep.has(sessionId)) continue;
+      const pidProbe = checkPidLiveness(worker);
+      if (!pidProbe.checked || pidProbe.alive) continue;
+      const lifecycle = getOrCreateLifecycle(sessionId);
+      if (lifecycle.awaitingHeartbeat) continue;
+      if (lifecycle.lastHeartbeatAtMs && lifecycle.lastHeartbeatAtMs > heartbeatCutoff) continue;
+      if (!registry.removeWorker(sessionId)) continue;
+      lifecycleBySession.delete(sessionId);
+      emitMonitorLog(`worker ${worker.workerId || sessionId} was idle and its process (pid ${worker.pid}) is gone; no longer listed`);
+      retired.push({ sdkSessionId: sessionId, workerId: worker.workerId || null, pid: worker.pid });
+    }
+    return retired;
+  }
+
   function snapshot({ pendingQuestionSessionIds = null } = {}) {
-    const workers = registry.listWorkers();
     const questionPendingSet = normalizePendingQuestionSessionIds(pendingQuestionSessionIds);
+    retireDeadIdleWorkers({ keep: questionPendingSet });
+    const workers = registry.listWorkers();
     const workerBySession = new Map();
     for (const worker of workers) {
       const sid = normalizeSessionId(worker?.sdkSessionId);
