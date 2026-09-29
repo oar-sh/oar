@@ -7,6 +7,14 @@ export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
     const queueHasImageOperationId = db.prepare(`PRAGMA table_info(queue)`).all()
         .some((column) => column.name === 'image_operation_id');
+    // A turn paused at the Claude usage limit (usage-limit-pause-service): a
+    // pending follow-up held until the reset. It is not work waiting for a
+    // worker, so it neither keeps one warm nor counts as queued.
+    const queueHasUsageLimitPause = db.prepare(`PRAGMA table_info(queue)`).all()
+        .some((column) => column.name === 'usage_limit_pause');
+    const notHeldForUsageLimit = (alias = '') => (queueHasUsageLimitPause
+        ? `AND NOT (${alias}usage_limit_pause IS NOT NULL AND ${alias}status = 'pending' AND ${alias}next_attempt_at IS NOT NULL AND ${alias}next_attempt_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`
+        : '');
     const messageColumns = new Set(db.prepare(`PRAGMA table_info(messages)`).all().map((column) => column.name));
     const messagesHaveSourceId = messageColumns.has('source_message_id');
     const messagesHaveResendOf = messageColumns.has('resend_of_message_id');
@@ -270,6 +278,7 @@ export function createMessageRepository(db) {
           LEFT JOIN conversations c
             ON c.id = q.conversation_id
           WHERE q.status = 'pending'
+            ${notHeldForUsageLimit('q.')}
             AND COALESCE(
               NULLIF(q.owner_sdk_session_id, ''),
               NULLIF(rs.sdk_session_id, ''),
@@ -283,7 +292,7 @@ export function createMessageRepository(db) {
           ORDER BY MIN(q.timestamp) ASC
           LIMIT ?
         `),
-        countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') GROUP BY status`),
+        countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') ${notHeldForUsageLimit()} GROUP BY status`),
         // Deferred host suspend: which conversations still hold live turns.
         listActiveQueueCountsByConversation: db.prepare(`
           SELECT q.conversation_id, COUNT(*) AS cnt, MAX(c.title) AS title

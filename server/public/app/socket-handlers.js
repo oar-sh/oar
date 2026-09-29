@@ -49,6 +49,7 @@ import { applyGrokAuthState } from './grok-auth-ui.js';
 import { applyCliInstallState } from './cli-install-ui.js';
 import { renderUpdateSection } from './update-ui.js';
 import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
+import { applyClaudeUsageLimit, applyUsageLimitPause } from './usage-limit-ui.js';
 import {
   showThinking,
   removeThinking,
@@ -398,6 +399,14 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('relay_shutdown_state', (payload) => {
     applyRelayShutdownState(payload || null);
+  });
+  // The Claude usage limit: a conversation's paused turn, and the account's
+  // latest report (also sent on connect).
+  socket.on('usage_limit_pause', (payload) => {
+    applyUsageLimitPause(payload || null);
+  });
+  socket.on('claude_usage_limit', (payload) => {
+    applyClaudeUsageLimit(payload || null);
   });
   socket.on('grok_settings_updated', (payload) => {
     deps?.applyGrokSettingsState?.(payload || {});

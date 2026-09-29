@@ -50,6 +50,7 @@ import {
   stripSlashCommandGuardContent,
   withSlashCommandGuardContent,
 } from '../../shared/slash-command-guard.mjs';
+import { createUsageLimitTracker } from '../../shared/claude-usage-limit.mjs';
 
 /**
  * Which system-prompt append a relay mode gets (claude-sdk-adapter's
@@ -551,6 +552,9 @@ export function createClaudeSessionRunner({
   // fixed per process, and the first delivery can beat the startup GET.
   const remoteRelayGate = remoteRelayToolGate || createRemoteRelayToolGate({ api });
   void remoteRelayGate.refresh();
+  // The subscription's usage limit as the CLI reports it. Runner-level: the
+  // limit is the account's, not the CLI process's.
+  const usageLimit = createUsageLimitTracker();
   const resolveWorkflowSessionDir = resolveWorkflowSessionDirImpl || createDefaultWorkflowSessionDirResolver();
   let claudeNativeSessionId = '';
   let proc = null;
@@ -2584,6 +2588,8 @@ export function createClaudeSessionRunner({
   }
 
   async function handleSdkMessage(sdkMessage) {
+    const usageLimitReport = usageLimit.observe(sdkMessage);
+    if (usageLimitReport) publisher.publishUsageLimitReport({ conversationId: sdkSessionId, sdkSessionId, report: usageLimitReport });
     const suppressed = maybeSuppressStopFollowUp(sdkMessage);
     if (suppressed === 'swallow') return;
     observeProcessLevel(sdkMessage);
@@ -2604,6 +2610,8 @@ export function createClaudeSessionRunner({
     if (!ctx) return;
     const actions = ctx.normalizer.normalize(sdkMessage);
     for (const action of actions) {
+      // Decided here, while the reports the turn ran under are the latest.
+      if (action.channel === 'result') action.payload.usageLimit = usageLimit.classifyResult(sdkMessage);
       await dispatchToContext(ctx, action);
     }
   }
@@ -3133,6 +3141,7 @@ export function createClaudeSessionRunner({
           await publisher.publishTurnException({
             message: ctx.message,
             errorText: String(streamError?.message || streamError || 'unknown error'),
+            usageLimit: usageLimit.classifyException(streamError),
           }).catch(() => {});
         }
         continue;
@@ -3739,7 +3748,7 @@ export function createClaudeSessionRunner({
       settingsWindowOpen = false;
       const errorText = String(error?.message || error || 'unknown error');
       dbg('claude turn failed', message.id, errorText);
-      await publisher.publishTurnException({ message, errorText });
+      await publisher.publishTurnException({ message, errorText, usageLimit: usageLimit.classifyException(error) });
       return true;
     } finally {
       endAdmission();

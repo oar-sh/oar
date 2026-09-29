@@ -2093,6 +2093,7 @@ export function registerSessionsRoutes(app, deps) {
     uploadPathForSha,
     hostSuspendService = null,
     collectHostActivity = null,
+    usageLimitPauseService = null,
     hostSuspendPlatform = process.platform,
     // Remote relays (server/services/remote-relay-inbound.mjs): origin on
     // conversations another relay's agent created, and the inbound switch.
@@ -3823,6 +3824,7 @@ export function registerSessionsRoutes(app, deps) {
       // "cancelled" with it.
       activeTurn: Number(stmts.getConversationActiveQueueCount?.get?.(resolvedConversationId)?.count || 0) > 0,
       backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
+      usageLimitPause: usageLimitPauseService?.getPause?.(resolvedConversationId) || null,
       previews: listConversationPreviews?.(resolvedConversationId) || [],
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModel: preferences.preferredModel,
@@ -5103,6 +5105,7 @@ export function registerSessionsRoutes(app, deps) {
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       relayShutdown: runtimeState.relayShutdown || null,
       hostSuspend: runtimeState.hostSuspend || null,
+      usageLimit: runtimeState.usageLimit || null,
       platform: process.platform,
       features: featureFlags || {},
       sessionWorker: sessionWorkerStatus,
@@ -6248,6 +6251,39 @@ export function registerSessionsRoutes(app, deps) {
     const requestedBy = String(req.body?.requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
     const result = hostSuspendService.cancel({ requestedBy });
     return res.json({ ok: true, cancelled: !!result.cancelled, state: result.state });
+  });
+
+  // Turns paused at the Claude usage limit (usage-limit-pause-service): the
+  // held follow-up can be sent before the reset, or dropped.
+  app.get('/api/usage-limit', auth, (req, res) => {
+    if (!usageLimitPauseService) {
+      return res.status(501).json({ ok: false, error: 'Usage limit handling is unavailable' });
+    }
+    return res.json({
+      ok: true,
+      account: usageLimitPauseService.getAccountState(),
+      pauses: usageLimitPauseService.listPauses(),
+    });
+  });
+
+  app.post('/api/usage-limit/resume', auth, (req, res) => {
+    if (!usageLimitPauseService) {
+      return res.status(501).json({ ok: false, error: 'Usage limit handling is unavailable' });
+    }
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ ok: false, error: 'Missing conversationId' });
+    const result = usageLimitPauseService.resumeNow({ conversationId });
+    return res.json({ ok: true, resumed: !!result.resumed, messageId: result.messageId || null, pause: result.state });
+  });
+
+  app.post('/api/usage-limit/cancel', auth, (req, res) => {
+    if (!usageLimitPauseService) {
+      return res.status(501).json({ ok: false, error: 'Usage limit handling is unavailable' });
+    }
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ ok: false, error: 'Missing conversationId' });
+    const result = usageLimitPauseService.cancel({ conversationId });
+    return res.json({ ok: true, cancelled: !!result.cancelled, messageId: result.messageId || null, pause: result.state });
   });
 
   app.get('/api/restart-orchestrator', auth, (req, res) => {

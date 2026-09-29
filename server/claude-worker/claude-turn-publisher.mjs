@@ -3,6 +3,7 @@ import { classifyClaudeResultFailure, claudeFailureGuidance } from './claude-tur
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
+import { buildUsageLimitFailure } from '../../shared/claude-usage-limit.mjs';
 
 const PLAN_BOARD_ACTIONS = [
   { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
@@ -179,6 +180,18 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     });
   }
 
+  /**
+   * Ship what the CLI reported about the subscription's usage limit: the
+   * relay warns before the limit and shows the reset once it is reached.
+   * Advisory, and fired without waiting: it must not hold up the stream.
+   */
+  function publishUsageLimitReport({ conversationId, sdkSessionId, report }) {
+    if (!report) return;
+    api('POST', '/api/claude-usage-limit', { conversationId, sdkSessionId, report }).catch((error) => {
+      dbg('usage limit report publish failed', error?.message || String(error));
+    });
+  }
+
   async function publishFinalStream(message, text) {
     await api('POST', '/api/stream', {
       messageId: message.id,
@@ -205,6 +218,9 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     text,
     model,
     terminalError = null,
+    // What the turn had written before it failed; the relay keeps it above
+    // the failure or pause note.
+    partialText = '',
     modelOrigin,
     absorbed = false,
     kind = null,
@@ -245,6 +261,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
           || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
         ...(Array.isArray(workflowRuns) && workflowRuns.length ? { workflowRuns } : {}),
         ...(terminalError ? { terminalError } : {}),
+        ...(terminalError && String(partialText || '').trim() ? { partialText: String(partialText).trim() } : {}),
         // The relay stamps the assistant message's kind from these: 'absorbed'
         // renders as merged into the next (steered) user message, 'folded' as
         // a compact marker on its own message, 'stopped' as a steer the
@@ -334,6 +351,25 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     const errorText = result.text
       || `Claude turn failed (${result.subtype || 'unknown error'}).`;
     await publishFinalStream(message, state.lastStreamedText);
+    // Refused at the usage limit: a relay that knows the kind pauses the turn
+    // until the reset instead of failing it.
+    if (result.usageLimit) {
+      // What the turn had written before it was refused, without the CLI's
+      // own line about the limit, which is the last thing in the stream. The
+      // relay keeps it above its note: a turn cut off in the middle has
+      // usually said what it was doing.
+      const refusalText = String(result.usageLimit.text || '').trim();
+      let written = String(state.lastStreamedText || '').trim();
+      if (refusalText && written.endsWith(refusalText)) written = written.slice(0, -refusalText.length).trim();
+      await publishResponse(message, {
+        text: errorText,
+        model: responseModel,
+        terminalError: buildUsageLimitFailure(message, result.usageLimit),
+        partialText: written,
+        consumedSteerIds,
+      });
+      return;
+    }
     await publishResponse(message, {
       text: errorText,
       model: responseModel,
@@ -351,7 +387,15 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     });
   }
 
-  async function publishTurnException({ message, errorText }) {
+  async function publishTurnException({ message, errorText, usageLimit = null }) {
+    if (usageLimit) {
+      await publishResponse(message, {
+        text: usageLimit.text || errorText,
+        model: null,
+        terminalError: buildUsageLimitFailure(message, usageLimit),
+      });
+      return;
+    }
     const isAuthError = /authentication|logged in|login|credential|api key/i.test(errorText);
     await publishResponse(message, {
       text: isAuthError
@@ -376,6 +420,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     dispatchAction,
     publishContextUsage,
     publishPlanUsage,
+    publishUsageLimitReport,
     publishFinalStream,
     publishResponse,
     publishPlanBoard,

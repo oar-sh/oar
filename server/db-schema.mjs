@@ -665,6 +665,13 @@ if (!queueColumns.includes('continuation_op_id')) {
   // after a lost response must find the row it already created, not mint a twin.
   db.exec(`ALTER TABLE queue ADD COLUMN continuation_op_id TEXT`);
 }
+if (!queueColumns.includes('usage_limit_pause')) {
+  // Set on the follow-up the relay queues when a Claude turn is refused at the
+  // subscription's usage limit (JSON: which window, its reset, when to send).
+  // While such a row is pending with next_attempt_at ahead, the turn is
+  // paused: it is held back, keeps no worker warm and blocks no restart.
+  db.exec(`ALTER TABLE queue ADD COLUMN usage_limit_pause TEXT`);
+}
 
 // recent_workspace_roots gained a case-normalized primary key (path_key). The
 // CREATE TABLE IF NOT EXISTS above only covers fresh databases, so upgrade an

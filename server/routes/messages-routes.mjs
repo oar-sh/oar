@@ -32,6 +32,7 @@ import {
   usageSnapshotFromSummary,
 } from '../services/usage-snapshot-helpers.mjs';
 import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services/plan-usage-claude.mjs';
+import { isUsageLimitTerminalError } from '../services/usage-limit-pause-service.mjs';
 import { normalizeCopilotWorkerUsage } from '../services/plan-usage-copilot.mjs';
 import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
@@ -1816,6 +1817,7 @@ export function registerMessagesRoutes(app, deps) {
     resolveSessionStateRoot,
     fetchUsageSummary = null,
     planUsageService = null,
+    usageLimitPauseService = null,
     getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
     getGrokPlanAllowanceSettings = () => ({ monthlyUsd: null, resetDay: 1 }),
     opaqueResponseRecoveryWaitMs = OPAQUE_RESPONSE_RECOVERY_WAIT_MS,
@@ -5364,6 +5366,26 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true });
   });
 
+  // POST /api/claude-usage-limit — the Claude worker forwards what the CLI
+  // reported about the subscription's usage limit (a `rate_limit_event`): the
+  // clients warn before the limit and show the reset once it is reached.
+  app.post('/api/claude-usage-limit', auth, (req, res) => {
+    touchCli();
+    if (!usageLimitPauseService) return res.status(501).json({ error: 'Usage limit handling is unavailable' });
+    // The report is the account's, so only a Claude-bound conversation's
+    // worker may write it (same validation as the plan usage card).
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (conversationId) {
+      const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+      const boundProvider = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
+      if (runtimeSession && boundProvider !== 'claude') {
+        return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
+      }
+    }
+    const state = usageLimitPauseService.recordReport({ report: req.body?.report });
+    res.json({ ok: true, state });
+  });
+
   // POST /api/copilot-plan-usage — the Copilot SDK worker reports the turn's
   // billing/token detail.
   //
@@ -6553,8 +6575,8 @@ export function registerMessagesRoutes(app, deps) {
         });
       }
     };
-    const trimmedText = String(text || '').trim();
-    const terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
+    let trimmedText = String(text || '').trim();
+    let terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
     // Final digests of background workflows that settled during this turn —
     // the transcript's "Finished background task" cards. Same structural
     // sanitizer as the live panel rows; junk entries drop silently (this
@@ -6608,6 +6630,22 @@ export function registerMessagesRoutes(app, deps) {
     }
 
     const relayMode = normalizeRelayMode(mode || q?.relay_mode) || DEFAULT_RELAY_MODE;
+    // A Claude turn refused at the usage limit is paused, not failed: its row
+    // ends with a note like any answered one, and a follow-up is queued that
+    // is held until the reset (usage-limit-pause-service).
+    const usageLimitPause = terminalFailure && q && isUsageLimitTerminalError(req.body?.terminalError)
+      ? (usageLimitPauseService?.planPause?.({
+        terminalError: req.body.terminalError,
+        conversationId: targetConversationId,
+        providerType: stmts.getRuntimeSessionByConversation?.get(targetConversationId)?.provider_type,
+        queueRow: q,
+        partialText: req.body?.partialText,
+      }) || null)
+      : null;
+    if (usageLimitPause) {
+      trimmedText = usageLimitPause.noteText;
+      terminalFailure = null;
+    }
     if (terminalFailure) {
       // Terminal failures carry provenance too: the original hijack incident
       // presented exactly as stolen turns dying on 402 through this path.
@@ -7041,6 +7079,13 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
+    if (usageLimitPause) {
+      try {
+        usageLimitPauseService.schedulePause(usageLimitPause, { queueRow: q });
+      } catch (error) {
+        console.warn(`[${ts()}] USAGE LIMIT ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} the follow-up could not be queued: ${error?.message || error}`);
+      }
+    }
     // An absorbed row is not a finished turn — the reply continues on the
     // steered message's row, whose own completion sends the one notification.
     // A stopped steer has no reply at all, and a message answered on a

@@ -312,6 +312,7 @@ import {
   cancelQueuedHostSuspend,
 } from './action-confirmations.js';
 import { applyPendingActionsFromStatus, initHostSuspendUi } from './host-suspend-ui.js';
+import { applyUsageLimitFromStatus, initUsageLimitUi } from './usage-limit-ui.js';
 import {
   startClaudeRelogin,
   submitClaudeLoginCodeFromInput,
@@ -3250,6 +3251,7 @@ async function refreshSessionWorkerStatus() {
   if (!status) return;
   syncQueueStatusMenuEntry(status);
   applyPendingActionsFromStatus(status);
+  applyUsageLimitFromStatus(status);
   if (setSessionWorkerStatesFromStatusPayload(status.sessionWorker)) {
     renderConvList();
     // A worker steering snapshot may have changed; the composer's Steer
@@ -3959,6 +3961,7 @@ async function initApp() {
   if (!sharedMode) {
     syncSuspendHostVisibility();
     initHostSuspendUi();
+    initUsageLimitUi();
   }
   setupViewportTracking();
   bindChatSelectionGuard();

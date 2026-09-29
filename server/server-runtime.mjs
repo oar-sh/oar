@@ -56,6 +56,7 @@ import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services
 import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
 import { createHostSuspendService } from './services/host-suspend-service.mjs';
+import { USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, createUsageLimitPauseService } from './services/usage-limit-pause-service.mjs';
 import { createGitHubCiActivityService } from './services/github-ci-activity-service.mjs';
 import { runHostSuspendToRam } from './services/host-suspend-command.mjs';
 import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
@@ -4973,12 +4974,19 @@ function collectHostActivity({ request = null } = {}) {
     if (!conversationId) continue;
     hostSuspendWatchedConversationIds.add(conversationId);
     const count = Number(row.cnt || 0);
+    // A turn paused at the Claude usage limit is work still owed: the host
+    // stays up for one that resumes by itself, not for one that waits for
+    // the user.
+    const pause = count === 1 ? usageLimitPauseService.getPause(conversationId) : null;
+    if (pause && !pause.auto) continue;
     blockers.push({
       kind: 'turn',
       conversationId,
       title: hostActivityTitle(conversationId, row.title),
       count,
-      detail: count > 1 ? `${count} turns running` : 'turn running',
+      detail: pause
+        ? `turn paused at the Claude ${pause.label} until ${pause.resumeAt}`
+        : (count > 1 ? `${count} turns running` : 'turn running'),
     });
   }
   for (const [key, entry] of backgroundTaskStore.sets) {
@@ -5024,6 +5032,15 @@ const hostSuspendService = createHostSuspendService({
   onDropped: (state, reason) => {
     void pushDispatchService.notifyHostSuspend({ body: `Queued host suspend dropped: relay ${reason || 'restarting'}.` });
   },
+});
+
+const usageLimitPauseService = createUsageLimitPauseService({
+  db,
+  stmts,
+  emit: (event, payload) => io.emit(event, payload),
+  // A follow-up resumed by hand is due at once: wake its worker.
+  onQueueChanged: (reason) => { void primePendingSessionWorkers(reason); },
+  logger: console,
 });
 
 // The live turn among a conversation's processing rows. Mid-turn steering can
@@ -6191,6 +6208,9 @@ const runtimeState = {
   get ttyConsoleActive() { return Boolean(ttyConsoleRuntime?.tty); },
   get relayShutdown() { return getRelayShutdownState(); },
   get hostSuspend() { return hostSuspendService.getState(); },
+  get usageLimit() {
+    return { account: usageLimitPauseService.getAccountState(), pauses: usageLimitPauseService.listPauses() };
+  },
   get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
   get workerWebSocketStatus() { return sessionWorkerWebSocketService.status(); },
   get tmuxInspectorStatus() { return tmuxInspectorSocketService.status(); },
@@ -6470,6 +6490,7 @@ const sharedRouteDeps = {
   relayShutdownStatePayload,
   hostSuspendService,
   collectHostActivity,
+  usageLimitPauseService,
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
@@ -6860,6 +6881,7 @@ io.on('connection', (socket) => {
   // Pending host suspend / relay restart banners must survive a reconnect.
   try { socket.emit('host_suspend_state', hostSuspendService.getState()); } catch {}
   try { socket.emit('relay_shutdown_state', relayShutdownStatePayload()); } catch {}
+  try { socket.emit(USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, usageLimitPauseService.getAccountState()); } catch {}
   // Visibility heartbeats for push suppression; also clears a stale
   // deviceVisible flag restored by connectionStateRecovery.
   activeDeviceTracker.registerSocket(socket);

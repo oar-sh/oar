@@ -972,6 +972,20 @@ export async function cancelHostSuspend(body = {}) {
   });
 }
 
+export async function resumeUsageLimitPause(conversationId) {
+  return apiFetch('/api/usage-limit/resume', {
+    method: 'POST',
+    body: JSON.stringify({ conversationId }),
+  });
+}
+
+export async function cancelUsageLimitPause(conversationId) {
+  return apiFetch('/api/usage-limit/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ conversationId }),
+  });
+}
+
 export async function cancelRelayRestart(body = {}) {
   return apiFetch('/api/relay/shutdown/cancel', {
     method: 'POST',

@@ -2379,6 +2379,26 @@
     text-align: center;
   }
   #model-banner.visible { display: block; }
+  /* The Claude usage limit (usage-limit-ui.js): a warning before the limit,
+     and a turn paused at it with Resume now / Cancel. In the flow of the
+     composer like #model-banner, for the same reason. */
+  #usage-limit-banner {
+    display: none;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    background: var(--bg2);
+    background: color-mix(in srgb, var(--warn) 14%, var(--bg2));
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-bottom: 10px;
+    font-size: var(--fs-meta-sm);
+  }
+  #usage-limit-banner.visible { display: flex; }
+  #usage-limit-banner .usage-limit-text { flex: 1 1 12em; min-width: 0; }
+  #usage-limit-banner .relay-toast-action { flex: 0 0 auto; }
   /* Transient relay notices (saves, errors, action confirmations) float as a
      fixed toast above every overlay — the annotation editor's error paths
      rely on being readable over its full-screen modal. pointer-events: none
@@ -5392,6 +5412,7 @@
     <div id="input-area">
       <div id="offline-banner">⚠️ CLI is offline — messages will queue until it reconnects</div>
       <div id="model-banner"></div>
+      <div id="usage-limit-banner" role="status" aria-live="polite" hidden></div>
       <div id="model-lock-note" hidden></div>
       <div id="model-metadata-blocker" aria-live="polite">
         <span id="model-metadata-blocker-text">Model metadata is unavailable. Refresh to choose a model and reasoning effort.</span>

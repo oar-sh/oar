@@ -11,6 +11,15 @@ All notable changes to OAR are documented here. The format follows
   folder (`server/logs` unless you moved it), with a time stamp per line. The
   file is rotated at 5 MB and three older copies are kept. The relay's token is
   never written to it. Set `OAR_NO_CONSOLE_LOG=1` to switch it off.
+- **Claude usage limit:** a Claude turn that runs into the subscription's
+  usage limit is paused instead of failed. Your message closes with a note,
+  the relay queues a message of its own ("continue where you left off") and
+  sends it a minute after the limit resets. A banner above the composer says
+  when, with **Resume now** and **Cancel**. The pause survives a relay
+  restart. A reset more than six hours away (a weekly limit) waits for you to
+  resume it.
+- A banner warns in Claude conversations when the usage passes 90 % of a
+  limit, with the time of the reset, and can be hidden until the next one.
 
 ### Changed
 
@@ -55,22 +64,22 @@ All notable changes to OAR are documented here. The format follows
 
 ### Fixed
 
-- A reply that quotes or describes a failure note (an agent reporting on a
-  failed test, for example) is no longer taken for a failure itself. The relay
-  cut such a reply off at the quoted error code, put its own advice behind it
-  and stored the turn as failed. Where a failure is known from its text alone,
-  that text is now kept whole.
 - A session worker that was idle and whose process has ended (stopped from
   outside, or crashed between turns) is no longer listed as ready with its old
   process id. The next message started a new worker before as well; the list
-  now says what is there, about a minute and a half after the process ended.
+  now says what is there.
+- A reply that quotes or describes a failure note (an agent reporting on a
+  failed test, for example) is no longer taken for a failure itself. The relay
+  cut such a reply off at the quoted error code, put its own advice behind it
+  and stored the turn as failed.
 - A single `~` in a reply ("about", as in "~35 s … ~7 min") no longer strikes
   out the text up to the next one. Strikethrough needs two tildes on each side:
+  `~~text~~`.
+  and stored the turn as failed. Where a failure is known from its text alone,
+  that text is now kept whole.
+  now says what is there, about a minute and a half after the process ended.
   `~~text~~`. The page now names the version of its Markdown library (15.0.12,
   the one it was served until now) instead of taking whatever the CDN hands out.
-- **Grok:** a quiet-turn window that is set for the model request or for a tool
-  is kept when the shared watchdog is switched off by the environment, and the
-  watchdog looks often enough for the shortest window that is set.
 - **Copilot:** a command the agent had started no longer runs on after its
   runtime is gone. When the runtime died or was killed in the middle of a turn,
   the turn failed as it should, but the command kept running with nobody left
@@ -80,6 +89,9 @@ All notable changes to OAR are documented here. The format follows
   the note comes at once and does not wait for the list of processes. A command the agent started to outlive the
   session (`detach`) is left alone, and so are the commands of a runtime that
   shuts down in good order.
+- **Grok:** a quiet-turn window that is set for the model request or for a tool
+  is kept when the shared watchdog is switched off by the environment, and the
+  watchdog looks often enough for the shortest window that is set.
 - **Windows:** stopping or deleting a session could end the worker of another
   session as well. Windows hands the process id of an ended process out again,
   and a worker whose creator was long gone could so look like a child of the
