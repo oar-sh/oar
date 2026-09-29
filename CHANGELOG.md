@@ -74,6 +74,9 @@ All notable changes to OAR are documented here. The format follows
   like one it had taken in.
 - **Copilot:** background agents and shells are no longer closed with the
   runtime because its list of them could not be read.
+- **Stop button:** Stop keeps working for a message that waits on a question
+  card while the agent starts and finishes other work, and for a second message
+  stopped while the same turn goes on. It used to do nothing in both cases.
 
 ## [0.9.5] — 2026-09-27
 

@@ -18,6 +18,7 @@ import {
 import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 import { BACKGROUND_QUESTION_NOTE } from './copilot-sdk-session-process.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
+import { createControlPoller } from '../../shared/control-poller.mjs';
 
 const AGENT_ID = 'e489d2f3-2431-4f95-9b71-f15a327f8c92';
 const userMessage = (messageId, delivery = 'idle') => ({ type: 'user.message', data: { messageId, delivery, content: 'hello' } });
@@ -796,6 +797,51 @@ test('a Stop naming a row that waits on a background card ends that card, even w
   client.session.emit({ type: 'assistant.idle', data: {} });
   await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation settled' });
   assert.equal(responsesFor(stub, 'cont-1')[0].text, 'Meanwhile, root work.');
+  await runner.dispose();
+});
+
+test('a Stop for a row that waits on a card is still polled for after a newer turn has come and gone', async (t) => {
+  // The real poller, not a stand-in: the continuation's registration used to
+  // displace q-1's, and its end left nothing polling although q-1 was open.
+  const controls = [];
+  const acks = [];
+  const controlPoller = createControlPoller({
+    api: async (method, routePath, body) => {
+      if (method === 'GET') return { control: controls.shift() || null };
+      acks.push({ routePath, body });
+      return {};
+    },
+    sdkSessionId: 'conv-1',
+    pollMs: 2,
+  });
+  t.after(() => controlPoller.stop());
+  const { relay, stub, client, runner } = setupQuestions({
+    events: (id) => spawnTurnEvents(id).slice(0, -1),
+    controlPoller,
+  });
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
+  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
+  await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  // Root work of its own runs as a continuation, from its start to its end,
+  // while the card on q-1 stays open.
+  client.session.emit({ type: 'assistant.message', data: { messageId: 'm7', content: 'Meanwhile, root work.' } });
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation settled' });
+  await waitFor(() => runner.getActiveQueueMessageIds().length === 1, { label: 'continuation released' });
+  assert.deepEqual(runner.getActiveQueueMessageIds().map((entry) => entry.id), ['q-1']);
+  assert.equal(relay.cards[0].status, 'pending');
+
+  controls.push({ id: 'ctl-1', type: 'abort_turn', queueMessageId: 'q-1' });
+  await waitFor(() => relay.cards[0].status === 'timed_out', { label: 'the Stop ended the card' });
+  await asked;
+  assert.equal(await first, true);
+  await waitFor(() => acks.length === 1, { label: 'the Stop was acknowledged' });
+  assert.deepEqual(acks[0], { routePath: '/api/control/ctl-1/result', body: { ok: true, note: 'query aborted' } });
+  assert.equal(responsesFor(stub, 'q-1').length, 0, 'stopped: the abort control settles it');
+  assert.deepEqual(client.session.interruptCalls, [], 'nothing was running to interrupt');
   await runner.dispose();
 });
 

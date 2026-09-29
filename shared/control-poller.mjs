@@ -23,7 +23,10 @@ export function createControlPoller({
   onAbortSubagent = null,
   dbg = () => {},
 } = {}) {
-  let active = null;
+  // The turns a Stop is polled for, oldest first, and whether the one loop
+  // that serves them all is running.
+  const registrations = new Set();
+  let polling = false;
 
   async function checkOnce({ queueMessageId, onAbortTurn }) {
     const ownerSessionId = String(sdkSessionId || '').trim();
@@ -81,37 +84,83 @@ export function createControlPoller({
     }
   }
 
-  function start({ queueMessageId, onAbortTurn }) {
-    stop();
-    const state = { stopped: false };
-    active = state;
-    (async () => {
-      while (!state.stopped) {
-        await sleep(pollMs);
-        if (state.stopped) return;
+  /**
+   * Hand a Stop to the turns that polled for it, newest first, until one of
+   * them takes it. The candidates were chosen before the request went out and
+   * are not re-checked here: the relay has claimed the control for this worker
+   * by now, so a turn that finished meanwhile still has to answer it.
+   */
+  async function offerAbort(candidates, control) {
+    let failure = null;
+    for (const registration of candidates) {
+      try {
+        await registration.onAbortTurn(control);
+        return;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw failure || new Error('abort failed');
+  }
+
+  async function pollLoop() {
+    while (registrations.size) {
+      await sleep(pollMs);
+      // One request per row filter, however many turns share it, asked in the
+      // order of the newest turn that uses it.
+      const byFilter = new Map();
+      for (const registration of [...registrations].reverse()) {
+        const candidates = byFilter.get(registration.queueMessageId) || [];
+        candidates.push(registration);
+        byFilter.set(registration.queueMessageId, candidates);
+      }
+      for (const [queueMessageId, candidates] of byFilter) {
+        // Every turn behind this filter ended while an earlier one was asked.
+        if (candidates.every((registration) => registration.stopped)) continue;
         try {
-          const aborted = await checkOnce({ queueMessageId, onAbortTurn });
-          if (aborted) return;
+          await checkOnce({ queueMessageId, onAbortTurn: (control) => offerAbort(candidates, control) });
         } catch (error) {
           dbg('control poll failed', error?.message || String(error));
         }
       }
-    })();
-    return state;
+    }
+    polling = false;
+  }
+
+  /**
+   * Poll for a Stop on behalf of one turn, until `stop(handle)`. Turns overlap
+   * (a settled turn still waiting on a question card or publishing, beside the
+   * one that runs), so a new registration never displaces an older one, and a
+   * handled Stop does not end the polling: the Stop may have been for another
+   * turn's row, and the turns that remain still need theirs.
+   */
+  function start({ queueMessageId, onAbortTurn }) {
+    const registration = {
+      stopped: false,
+      queueMessageId: String(queueMessageId || ''),
+      onAbortTurn,
+    };
+    registrations.add(registration);
+    if (!polling) {
+      polling = true;
+      void pollLoop();
+    }
+    return registration;
   }
 
   function stop(handle) {
-    // Handle-scoped stop: a caller finishing an old turn must only stop that
-    // turn's poller. Without the scoping, a late finalize for a previous
-    // context would kill the poller of the turn currently running — leaving
-    // its Stop button dead. A bare stop() still stops whatever is active.
+    // Handle-scoped stop: a caller finishing a turn ends that turn's
+    // registration and no other. Without the scoping, a late finalize for a
+    // previous context would end the polling for the turn currently running,
+    // leaving its Stop button dead. A bare stop() ends every registration (the
+    // worker is shutting down).
     if (handle) {
       handle.stopped = true;
-      if (active === handle) active = null;
+      registrations.delete(handle);
       return;
     }
-    if (active) active.stopped = true;
-    active = null;
+    for (const registration of registrations) registration.stopped = true;
+    registrations.clear();
   }
 
   return { start, stop, checkOnce };
