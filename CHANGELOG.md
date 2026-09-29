@@ -71,6 +71,15 @@ All notable changes to OAR are documented here. The format follows
 - **Grok:** a quiet-turn window that is set for the model request or for a tool
   is kept when the shared watchdog is switched off by the environment, and the
   watchdog looks often enough for the shortest window that is set.
+- **Copilot:** a command the agent had started no longer runs on after its
+  runtime is gone. When the runtime died or was killed in the middle of a turn,
+  the turn failed as it should, but the command kept running with nobody left
+  to read its result. The relay now stops what such a runtime leaves behind
+  (first gently, then by force), and the failure note says that a command that
+  was still running is being stopped, as far as that is known at that moment:
+  the note comes at once and does not wait for the list of processes. A command the agent started to outlive the
+  session (`detach`) is left alone, and so are the commands of a runtime that
+  shuts down in good order.
 - **Windows:** stopping or deleting a session could end the worker of another
   session as well. Windows hands the process id of an ended process out again,
   and a worker whose creator was long gone could so look like a child of the

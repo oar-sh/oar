@@ -1,6 +1,8 @@
 'use strict';
 
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
+
+import { collectProcessDescendants, isChildProcessOf } from '../../shared/worker-runtime/process-tree.mjs';
 
 function normalizeSessionId(value) {
   const text = String(value || '').trim();
@@ -60,17 +62,28 @@ function isRelaySessionWorker(proc) {
   return String(proc?.commandLine || '').toLowerCase().includes('-session-worker');
 }
 
-/**
- * Is `child` a process `parent` started? Windows keeps the parent's pid in a
- * process for good and hands the pid of an ended process out again: a worker
- * whose creator is long gone can so appear as the child of a process that has
- * nothing to do with it. A process older than its parent is no child of it.
- * Where a start time is not known, the pid decides as before.
- */
-function isWindowsChildOf(child, parent) {
-  if (!child || !parent) return false;
-  if (!(child.createdAt > 0) || !(parent.createdAt > 0)) return true;
-  return child.createdAt >= parent.createdAt;
+// Every process with its parent and the time it was created.
+const WINDOWS_PROCESS_SNAPSHOT_SCRIPT = [
+  '$list = Get-CimInstance Win32_Process | ForEach-Object {',
+  '  [pscustomobject]@{',
+  '    processId = [int]$_.ProcessId;',
+  '    parentProcessId = [int]$_.ParentProcessId;',
+  '    name = [string]$_.Name;',
+  '    commandLine = [string]$_.CommandLine;',
+  '    createdAt = $(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalMilliseconds) } else { [int64]0 });',
+  '  }',
+  '};',
+  '$list | ConvertTo-Json -Depth 3 -Compress',
+].join(' ');
+
+/** How long the process list may take when a worker waits for it. */
+const WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 10_000;
+
+function parseWindowsProcessSnapshot(output) {
+  const text = String(output || '').trim();
+  if (!text) return [];
+  const parsed = JSON.parse(text);
+  return Array.isArray(parsed) ? parsed : [parsed];
 }
 
 function looksLikeCopilotWorkerProcess(proc) {
@@ -113,6 +126,7 @@ function looksLikeCopilotWorkerProcess(proc) {
 export function createSessionWorkerProcessInspector({
   platform = process.platform,
   execFileSyncImpl = execFileSync,
+  execFileImpl = execFile,
 } = {}) {
   function getPosixProcessSnapshot() {
     if (platform === 'win32') return [];
@@ -138,25 +152,37 @@ export function createSessionWorkerProcessInspector({
 
   function getWindowsProcessSnapshot() {
     if (platform !== 'win32') return [];
-    const script = [
-      '$list = Get-CimInstance Win32_Process | ForEach-Object {',
-      '  [pscustomobject]@{',
-      '    processId = [int]$_.ProcessId;',
-      '    parentProcessId = [int]$_.ParentProcessId;',
-      '    name = [string]$_.Name;',
-      '    commandLine = [string]$_.CommandLine;',
-      '    createdAt = $(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalMilliseconds) } else { [int64]0 });',
-      '  }',
-      '};',
-      '$list | ConvertTo-Json -Depth 3 -Compress',
-    ].join(' ');
-    const output = execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', script], {
+    const output = execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT], {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const text = String(output || '').trim();
-    if (!text) return [];
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [parsed];
+    return parseWindowsProcessSnapshot(output);
+  }
+
+  /**
+   * The same list without holding the caller's thread for it: a session
+   * worker reads it while it serves a conversation, and PowerShell takes about
+   * a second to start. Rejects when the list could not be read.
+   */
+  function readWindowsProcessSnapshot() {
+    if (platform !== 'win32') return Promise.resolve([]);
+    return new Promise((resolve, reject) => {
+      execFileImpl(
+        'powershell.exe',
+        ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT],
+        { windowsHide: true, timeout: WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 },
+        (error, stdout) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          try {
+            resolve(parseWindowsProcessSnapshot(stdout).map(normalizeWindowsProcess).filter((proc) => proc.processId));
+          } catch (parseError) {
+            reject(parseError);
+          }
+        },
+      );
+    });
   }
 
   function isWindowsSessionMatch(proc, target, targetPattern) {
@@ -195,27 +221,20 @@ export function createSessionWorkerProcessInspector({
       .map(normalizeWindowsProcess)
       .filter((proc) => proc.processId);
     const byPid = new Map(snapshot.map((proc) => [proc.processId, proc]));
-    const childrenByParent = new Map();
-    for (const proc of snapshot) {
-      if (!proc.parentProcessId) continue;
-      const children = childrenByParent.get(proc.parentProcessId) || [];
-      children.push(proc);
-      childrenByParent.set(proc.parentProcessId, children);
-    }
 
     const related = new Map();
     const addProcess = (proc) => {
       if (proc?.processId) related.set(proc.processId, proc);
     };
-    const addDescendants = (pid) => {
-      for (const child of childrenByParent.get(pid) || []) {
-        if (related.has(child.processId)) continue;
-        if (!isWindowsChildOf(child, byPid.get(pid))) continue;
-        // The worker of another session is never part of this one's tree.
-        if (isRelaySessionWorker(child) && !isWindowsSessionMatch(child, target, targetPattern)) continue;
-        addProcess(child);
-        addDescendants(child.processId);
-      }
+    const addDescendants = (proc) => {
+      const found = collectProcessDescendants(snapshot, proc, {
+        accept: (child) => {
+          if (related.has(child.processId)) return false;
+          // The worker of another session is never part of this one's tree.
+          return !(isRelaySessionWorker(child) && !isWindowsSessionMatch(child, target, targetPattern));
+        },
+      });
+      for (const child of found) addProcess(child);
     };
     const addWrapperAncestors = (proc) => {
       let current = proc;
@@ -224,7 +243,8 @@ export function createSessionWorkerProcessInspector({
         seen.add(current.parentProcessId);
         const parent = byPid.get(current.parentProcessId);
         if (!parent || !isWindowsWrapperProcess(parent)) return;
-        if (!isWindowsChildOf(current, parent)) return;
+        // Windows hands a pid out again: see `isChildProcessOf`.
+        if (!isChildProcessOf(current, parent)) return;
         addProcess(parent);
         current = parent;
       }
@@ -232,7 +252,7 @@ export function createSessionWorkerProcessInspector({
 
     for (const proc of snapshot.filter((candidate) => isWindowsSessionMatch(candidate, target, targetPattern))) {
       addProcess(proc);
-      addDescendants(proc.processId);
+      addDescendants(proc);
       addWrapperAncestors(proc);
     }
 
@@ -346,6 +366,7 @@ export function createSessionWorkerProcessInspector({
     findWindowsProcessForSession,
     findWindowsProcessTreeForSession,
     getWindowsProcessSnapshot,
+    readWindowsProcessSnapshot,
     stopWindowsPids,
   };
 }

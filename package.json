@@ -30,6 +30,7 @@
     "server/uploads/image_input.md",
     "shared/",
     "!shared/**/*.test.mjs",
+    "!shared/**/*-test-harness.mjs",
     "!shared/**/fixtures/",
     ".github/extensions/web-relay/",
     "!.github/extensions/web-relay/**/*.test.mjs",

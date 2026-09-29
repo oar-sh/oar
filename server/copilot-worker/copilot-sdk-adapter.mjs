@@ -165,6 +165,22 @@ export function observeRuntimeExit(client, onExit) {
 }
 
 /**
+ * The pid of the runtime process, or 0.
+ *
+ * Like `processExitPromise` this reaches past the public API: the SDK starts
+ * the runtime itself (`spawn` without `detached`, no option for a spawn
+ * function of our own, verified against 1.0.89 and the npm package 1.0.14) and
+ * keeps the child in `cliProcess`, a TS-private, runtime-visible field that
+ * `stop()` and `forceStop()` clear. It is read once, right after the start. A
+ * bundle without the field reads as "not known", and the runtime's commands
+ * are then not watched.
+ */
+export function readRuntimePid(client) {
+  const pid = Number(client?.cliProcess?.pid);
+  return Number.isInteger(pid) && pid > 1 ? pid : 0;
+}
+
+/**
  * Import the installed SDK and start a client against the matching runtime.
  *
  * The version-skew probe is deliberately NOT awaited: `getStatus` is a round

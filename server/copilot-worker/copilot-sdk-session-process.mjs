@@ -78,6 +78,11 @@ import {
 } from './copilot-model-switch.mjs';
 import { createCopilotQuestionBridge } from './copilot-question-bridge.mjs';
 import {
+  describeCommandsBeingStopped,
+  runtimeStopLeavesCommands,
+  watchCopilotRuntimeTree,
+} from './copilot-runtime-tree.mjs';
+import {
   RELAY_ASK_USER_TOOL_DESCRIPTION,
   RELAY_ASK_USER_TOOL_NAME,
   RELAY_ASK_USER_TOOL_PARAMETERS,
@@ -250,7 +255,6 @@ const DEFAULT_ORPHAN_GRACE_MS = 2_000;
  */
 const DEFAULT_RUNTIME_DETACH_TIMEOUT_MS = 10_000;
 const DEFAULT_RUNTIME_STOP_TIMEOUT_MS = 25_000;
-
 /**
  * Appended to the partial answer when the RUNTIME interrupted the turn on its
  * own (as opposed to the user aborting through the relay). The row has to be
@@ -427,6 +431,11 @@ export function createCopilotSdkSessionRunner({
   orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS,
   runtimeDetachTimeoutMs = DEFAULT_RUNTIME_DETACH_TIMEOUT_MS,
   runtimeStopTimeoutMs = DEFAULT_RUNTIME_STOP_TIMEOUT_MS,
+  // The watch over the runtime's process tree (copilot-runtime-tree.mjs): what
+  // a runtime that was killed leaves running is stopped. Tests pass one with a
+  // fake process list; the fake client has no process, so nothing is watched
+  // without one.
+  watchRuntimeTreeImpl = watchCopilotRuntimeTree,
   // Register the relay's own `ask_user` (with `multi_select`) over the
   // runtime's built-in one. A runtime that refuses the override falls back
   // to the built-in for the rest of this worker's life.
@@ -511,6 +520,8 @@ export function createCopilotSdkSessionRunner({
   let opening = null;
   let disposed = false;
   let detachRuntimeExit = () => {};
+  // The process tree of the live runtime, or null where its pid is not known.
+  let runtimeTree = null;
   // A compaction in progress (`session.compaction_start` seen, no `_complete`
   // yet). Holds steering: a message pushed now would land inside the
   // compaction's replay. `compactingSince` backs the stale cap.
@@ -1092,22 +1103,37 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
+   * How many commands the runtime of a failed turn had running when its
+   * teardown began, as far as it was known at that moment: the note does not
+   * wait for a process list. On Linux the list is read at once; on Windows
+   * it takes a PowerShell start, so the note there knows what the last read
+   * knew. 0 where nothing is known or the runtime was kept.
+   */
+  function commandsLeftRunning(turn) {
+    return Number(turn?.commandsLeft) || 0;
+  }
+
+  /**
    * `toolCalls` is how many tool calls the failed turn had started. They ran,
    * and what they changed stays changed, so the note says so: a failure that
    * reads as if nothing happened sends the user back to the start of work
    * that is mostly done.
    */
-  function terminalErrorRecord(message, classified, { toolCalls = 0 } = {}) {
+  function terminalErrorRecord(message, classified, { toolCalls = 0, commandsLeft = 0 } = {}) {
     const worked = toolCalls > 0;
     const work = worked
       ? ` Before that the agent made ${toolCalls} tool call${toolCalls === 1 ? '' : 's'}; what they changed is still in place.`
       : '';
+    // `commandsLeft` is how many commands were running when the turn failed.
+    // They are stopped with the runtime, and a command that was cut short is
+    // something the user has to know whatever the failure was.
+    const stopping = describeCommandsBeingStopped(commandsLeft);
     const guidance = worked && classified.guidance ? COPILOT_TURN_CONTINUE_GUIDANCE : classified.guidance;
     return {
       kind: 'copilot-turn-failed',
       code: classified.code,
       stableCode: classified.stableCode,
-      message: `${classified.text}${classified.guidance ? work : ''}`,
+      message: `${classified.text}${classified.guidance ? work : ''}${stopping ? ` ${stopping}` : ''}`,
       ...(guidance ? { guidance } : {}),
       failedAt: new Date().toISOString(),
       queueMessageId: String(message.id || '') || null,
@@ -1949,7 +1975,11 @@ export function createCopilotSdkSessionRunner({
       await redispatchSettledEvent(event);
       return;
     }
-    if (String(event?.type || '') === 'tool.execution_start') turn.toolCalls += 1;
+    if (String(event?.type || '') === 'tool.execution_start') {
+      turn.toolCalls += 1;
+      // A command may be starting: its process is read once it is there.
+      runtimeTree?.commandStarting();
+    }
     // Root work ends on the runtime's own terminator, so a question-only
     // continuation it joins no longer closes itself (whileAwaitingHuman).
     if (isContinuationOpeningEvent(event)) turn.rootWork = true;
@@ -2326,6 +2356,41 @@ export function createCopilotSdkSessionRunner({
     void stopRuntime('runtime-exit').catch(() => {});
   }
 
+  /**
+   * Start watching the commands of a runtime that has just started. Advisory:
+   * a watch that cannot be set up costs the clean-up after a killed runtime,
+   * never the turn.
+   */
+  function watchRuntimeTree(startedClient) {
+    try {
+      return watchRuntimeTreeImpl({
+        client: startedClient,
+        // Commands run inside a turn, or as background work between turns. A
+        // runtime with neither is not read.
+        isBusy: () => !disposed && (
+          !!activeTurn || publishingTurns.size > 0 || backgroundShells.size() > 0 || backgroundTasks.size > 0
+        ),
+        dbg,
+      }) || null;
+    } catch (error) {
+      dbg('the copilot runtime process tree is not watched', error?.message || String(error));
+      return null;
+    }
+  }
+
+  /**
+   * After the runtime is gone: stop what it left running, where it did not
+   * end in good order (see `runtimeStopLeavesCommands`). Never rejects.
+   */
+  async function releaseRuntimeTree(tree, reason) {
+    if (!tree) return;
+    if (!runtimeStopLeavesCommands(reason)) {
+      tree.close();
+      return;
+    }
+    await tree.stop(reason);
+  }
+
   async function ensureClient() {
     while (runtimeStopping) await runtimeStopping;
     if (client) return client;
@@ -2335,6 +2400,7 @@ export function createCopilotSdkSessionRunner({
       const started = await startClientImpl({ paths: sdkPaths, cwd, clientName, logLevel, dbg });
       client = started.client;
       detachRuntimeExit = observeRuntimeExit(client, handleRuntimeExit);
+      runtimeTree = watchRuntimeTree(client);
       // Diagnostics only, and deliberately not awaited — see startCopilotClient.
       Promise.resolve(started.versionReady)
         .then((info) => {
@@ -2529,8 +2595,10 @@ export function createCopilotSdkSessionRunner({
     detachRuntimeExit = () => {};
     const closingSession = session;
     const closingClient = client;
+    const closingTree = runtimeTree;
     session = null;
     client = null;
+    runtimeTree = null;
     modelSwitch.reset();
     // Detached shells are children of the runtime process, so stopping it ends
     // them: the tracked set is state about a process that no longer exists and
@@ -2570,14 +2638,30 @@ export function createCopilotSdkSessionRunner({
     if (!closingSession && !closingClient) {
       // Nothing of its own to close, but a caller that asked for a stopped
       // runtime (the worker's shutdown) gets one.
+      closingTree?.close();
       if (runtimeStopping) await runtimeStopping;
       return;
     }
     dbg(`stopping the copilot runtime (${reason})`);
+    // Read before the runtime is told to stop, in this very tick: what is
+    // running now is what the failure note names (`turn.fail`), and a runtime
+    // that has to be killed leaves it behind.
+    const leavesCommands = !!closingTree && runtimeStopLeavesCommands(reason);
+    if (leavesCommands) void closingTree.snapshot();
     const previous = runtimeStopping;
     const closing = (async () => {
       if (previous) await previous;
-      await closeRuntime(closingSession, closingClient);
+      // A runtime that has already ended stops nothing any more, and the
+      // teardown below still waits out its windows on a connection that has
+      // nobody behind it (10 s, measured): its commands are stopped at once.
+      const early = leavesCommands
+        ? closingTree.runtimeEnded().then((ended) => (ended ? closingTree.stop(reason) : null))
+        : null;
+      await closeRuntime(closingSession, closingClient, closingTree);
+      await early;
+      // Part of the teardown the next runtime waits for: a command of the old
+      // one must not still be writing into the workspace the new one works in.
+      await releaseRuntimeTree(closingTree, reason);
     })();
     runtimeStopping = closing;
     try {
@@ -2592,7 +2676,7 @@ export function createCopilotSdkSessionRunner({
    * the callers are the failure paths, where the runtime is the thing that
    * stopped answering. Never rejects.
    */
-  async function closeRuntime(closingSession, closingClient) {
+  async function closeRuntime(closingSession, closingClient, closingTree = null) {
     const startedAt = Date.now();
     const bounded = (work, ms) => withTimeout(
       Promise.resolve().then(work).then((value) => {
@@ -2612,6 +2696,9 @@ export function createCopilotSdkSessionRunner({
       const stopped = await bounded(() => closingClient.stop(), runtimeStopTimeoutMs);
       if (stopped === 'timeout') {
         dbg(`client stop did not finish within ${runtimeStopTimeoutMs}ms; killing the runtime`);
+        // The last moment the runtime's commands can be told from anybody
+        // else's: a killed runtime leaves them to pid 1.
+        if (closingTree) await closingTree.snapshot();
         const killed = closingClient.forceStop
           ? await bounded(() => closingClient.forceStop(), runtimeDetachTimeoutMs)
           : 'done';
@@ -2842,6 +2929,9 @@ export function createCopilotSdkSessionRunner({
       // Tool calls this turn started, whichever agent made them. Told in the
       // failure note when the turn fails.
       toolCalls: 0,
+      // What the runtime had running when the turn failed (a promise of the
+      // tree watch's read), for the failure note.
+      commandsLeft: null,
       planBoardPosted: false,
       // Set when a mutating tool was actually approved and run this turn.
       acted: false,
@@ -2972,7 +3062,13 @@ export function createCopilotSdkSessionRunner({
       const runtimeGone = error?.runtimeGone === true || error?.stall?.unresponsive === true;
       if ((turn.kind === 'delivered' || runtimeGone) && !isModelSwitchUnconfirmedError(error)) {
         if (session || client) {
+          const tree = runtimeTree;
           turn.teardown = stopRuntime(runtimeGone ? 'runtime-gone' : 'turn-failure').catch(() => {});
+          // What the runtime had running, as far as it is known now
+          // (`stopRuntime` has just read the list where that takes no time):
+          // the failure note is published before the teardown ends, and says
+          // what is being stopped.
+          turn.commandsLeft = tree ? tree.commandCount() : 0;
         } else {
           // Nothing to stop yet: the runtime was still starting. What it opens
           // for this turn from here on is let go rather than adopted.
@@ -3286,7 +3382,10 @@ export function createCopilotSdkSessionRunner({
         case 'error': {
           const { classified } = outcome;
           const written = finalTextFor(turn, entry, turn.result);
-          const terminalError = terminalErrorRecord(entry.message, classified, { toolCalls: turn.toolCalls });
+          const terminalError = terminalErrorRecord(entry.message, classified, {
+            toolCalls: turn.toolCalls,
+            commandsLeft: commandsLeftRunning(turn),
+          });
           await publishFinalStream(entry.message, written || entry.state.lastStreamedText);
           noteResponseOutcome(entry.message, await publishResponse(entry.message, {
             text: terminalError.message,
