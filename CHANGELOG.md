@@ -47,6 +47,11 @@ All notable changes to OAR are documented here. The format follows
   transcript. When the reply already is the plan, the plan is shown once, with
   the buttons below it. After you chose, the plan stays and the bubble says
   what was chosen.
+- The choice on a plan board also sets the mode of the session: after
+  "Implement in autopilot" the composer says Autopilot, after "Stop here and
+  prompt myself" it says Agent, and the next message carries the work on. The
+  session used to stay in Plan, so the next message planned again. "Stop here"
+  leaves the mode as it is.
 
 ### Fixed
 

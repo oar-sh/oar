@@ -12,7 +12,13 @@ function sleep(ms) {
 async function dequeue(request, headers, messageId, ownerSessionId) {
   const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
   for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
+    // The connection may be one that was kept while the page was at work and
+    // has been closed since: the next round asks again.
+    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders }).catch(() => null);
+    if (!dequeued) {
+      await sleep(200);
+      continue;
+    }
     expect(dequeued.ok()).toBeTruthy();
     const message = (await dequeued.json())?.message || null;
     if (message && String(message.id) === messageId) return;
@@ -82,6 +88,7 @@ test("a plan board action queues its follow-up message", async ({ page, request 
     await expect(page.locator(".relay-board-inline")).toHaveCount(1);
     await expect(page.locator(".relay-board-container")).toHaveCount(0);
     await expect(board.getByRole("button", { name: "Implement in autopilot" })).toBeVisible();
+    await expect(page.locator("#mode-select")).toHaveValue("plan");
 
     // The buttons work from inside the bubble, and the choice stays on show.
     const acting = page.waitForResponse((response) => response.url().includes(`/api/relay-board/${boardId}/action`));
@@ -93,11 +100,14 @@ test("a plan board action queues its follow-up message", async ({ page, request 
     await expect(board.locator(".relay-board-outcome")).toHaveText("Chosen: Implement in autopilot");
     await expect(board.locator("button")).toHaveCount(0);
     await expect(board.locator(".relay-board-body")).toContainText("Rename the module");
+    // The session goes on in the mode that was chosen.
+    await expect(page.locator("#mode-select")).toHaveValue("autopilot");
 
-    // A reload finds the settled board where it was.
+    // A reload finds the settled board where it was, and the mode with it.
     await page.reload();
     await page.waitForLoadState("networkidle");
     await expect(reply.locator(".msg-bubble .relay-board-outcome")).toHaveText("Chosen: Implement in autopilot");
+    await expect(page.locator("#mode-select")).toHaveValue("autopilot");
 
     // The follow-up is a message like any other: a worker is handed it.
     await dequeue(request, headers, followUpId, String(queuedBody?.ownerSessionId || ""));

@@ -1,5 +1,7 @@
 'use strict';
 
+import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+
 function normalizeId(value) {
   const text = String(value || '').trim();
   return text || null;
@@ -86,6 +88,7 @@ export function registerRelayBoardRoutes(app, deps) {
   const {
     auth,
     io,
+    db,
     stmts,
     uuidv4,
     normalizeRelayMode,
@@ -95,6 +98,42 @@ export function registerRelayBoardRoutes(app, deps) {
     formatRelayBoardRow,
     pushDispatchService,
   } = deps;
+
+  /**
+   * The session goes on in the mode that was chosen on the board: after
+   * "Implement in autopilot" the composer says Autopilot, and the next message
+   * carries the work on instead of planning again. The model and the effort
+   * stay as they are. Advisory: the follow-up is queued whatever happens here.
+   */
+  function followChosenMode(conversationId, relayMode, updatedAt) {
+    try {
+      const existing = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+      if (!existing || String(existing.status || '').trim() === 'deleted') return;
+      if ((normalizeRelayMode(existing.preferred_relay_mode) || '') === relayMode) return;
+      const persisted = persistConversationPreferences({
+        db,
+        stmts,
+        conversationId,
+        preferredRelayMode: relayMode,
+        preferredModel: existing.preferred_model,
+        preferredReasoningEffort: existing.preferred_reasoning_effort,
+        updatedAt,
+      });
+      if (!persisted.ok) return;
+      // No sender: the page that pressed the button has to follow as well.
+      io.emit('conversation_preferences_updated', {
+        conversationId,
+        preferredRelayMode: persisted.preferredRelayMode,
+        preferredModel: persisted.preferredModel,
+        preferredReasoningEffort: persisted.preferredReasoningEffort,
+        autoCompactWindow: persisted.autoCompactWindow ?? null,
+        thinkingEnabled: persisted.thinkingEnabled ?? null,
+        thinkingDisplay: persisted.thinkingDisplay ?? null,
+        updatedAt: persisted.updatedAt,
+        senderClientId: null,
+      });
+    } catch {}
+  }
 
   app.get('/api/relay-boards', auth, (req, res) => {
     const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;
@@ -267,6 +306,7 @@ export function registerRelayBoardRoutes(app, deps) {
             timestamp: now,
           },
         });
+        followChosenMode(convId, relayMode, now);
       }
     }
 
