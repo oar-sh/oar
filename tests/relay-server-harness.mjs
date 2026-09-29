@@ -187,6 +187,10 @@ export function buildRelayServerEnv({
     ...process.env,
     COPILOT_WORKSPACE_ROOT: repoRoot,
     COPILOT_WEB_RELAY_DATA_DIR: dataDir,
+    // The host's log folder must not be inherited (a relay that starts the
+    // suite from one of its own sessions exports it): this server's console
+    // log and worker logs stay in its own state.
+    COPILOT_WEB_RELAY_LOG_DIR: path.join(stateRoot, "logs"),
     COPILOT_WEB_RELAY_CONFIG: path.join(stateRoot, "config.json"),
     // Pin session-worker routing OFF. Feature flags now live in app_settings
     // (this server's database is isolated and empty, so registry defaults —

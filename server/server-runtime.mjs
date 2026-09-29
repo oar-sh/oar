@@ -113,6 +113,7 @@ import {
   resolveLaunchWorkspaceRootPath,
 } from './services/workspace-root-defaults-service.mjs';
 import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
+import { installRelayConsoleLog, resolveRelayConsoleLogPath } from './services/relay-console-log.mjs';
 import {
   computeFeatureFlagState,
   FEATURE_REGISTRY,
@@ -186,11 +187,18 @@ const PWA_SW_PATH = path.join(PUBLIC_DIR, 'sw.js');
 const SOCKET_IO_CLIENT_JS_PATH = path.join(__dirname, '..', 'node_modules', 'socket.io', 'client-dist', 'socket.io.js');
 const APP_CONFIG_PLACEHOLDER = /window\.__COPILOT_APP_CONFIG = \{ basePath: '[^']*' \};/;
 const PWA_VERSION_PLACEHOLDER = /const __PWA_VERSION = '[^']*';/;
+// The console goes to a terminal, a tmux pane or nowhere: keep a copy to read
+// after a restart or an incident.
+const relayConsoleLog = installRelayConsoleLog({
+  logPath: resolveRelayConsoleLogPath({ env: process.env, serverDir: __dirname }),
+});
 const ttyConsoleRuntime = await maybeStartTtyConsole({
   serverDir: __dirname,
   logsDir: path.join(__dirname, 'logs'),
   logger: console,
 });
+// The terminal console takes the console's methods over when it starts.
+relayConsoleLog?.rewrap();
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
@@ -1599,6 +1607,7 @@ const CURATED_MODEL_IDS = [
 ];
 
 let config = { ...DEFAULT_CONFIG };
+relayConsoleLog?.setSecrets(() => [config.authToken]);
 if (fs.existsSync(CONFIG_PATH)) {
   try { config = { ...config, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) }; }
   catch (e) { console.error('Failed to read config.json, using defaults.'); }

@@ -5,6 +5,13 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The relay keeps a copy of its console in `relay-console.log` in its log
+  folder (`server/logs` unless you moved it), with a time stamp per line. The
+  file is rotated at 5 MB and three older copies are kept. The relay's token is
+  never written to it. Set `OAR_NO_CONSOLE_LOG=1` to switch it off.
+
 ### Changed
 
 - **Remote relays:** agents on paired relays can now work with each other for
