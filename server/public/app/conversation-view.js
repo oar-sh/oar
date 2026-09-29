@@ -91,6 +91,7 @@ import {
 } from './activity-replay-state.mjs';
 import { SEPARATOR_CLASS, syncSeparatorRail, syncTranscriptSeparators } from './transcript-separators.mjs';
 import { ABSORBED_MSG_CLASS, STEER_MARKER_CLASS_BY_KIND, syncSteeredTurnMerge } from './steered-turn-merge.mjs';
+import { resolveSubagentFold, subagentFoldSummary, toggledSubagentFoldChoice } from './subagent-fold.mjs';
 import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
@@ -1885,6 +1886,7 @@ function renderSubagentStream(subagentRunId, text) {
   }
   box.hidden = false;
   patchRenderedMarkdown(box, renderMarkdownPreview(value, false));
+  refreshSubagentSummary(bubble);
 }
 
 function patchActivityList(box, expectedTexts, className) {
@@ -1932,6 +1934,7 @@ export function renderThinkingActivities() {
     const runBox = bubble?.querySelector('.subagent-activity');
     if (runBox && !selectionIntersectsNode(runBox)) {
       patchActivityList(runBox, expected, 'subagent-activity-item');
+      refreshSubagentSummary(bubble);
     }
   }
 }
@@ -2046,6 +2049,7 @@ export function appendThinkingActivity(item, subagentRunId = null, autoScroll = 
           row.className = 'subagent-activity-item';
           row.textContent = decorated;
           activityBox.appendChild(row);
+          refreshSubagentSummary(subagentBubble);
         }
       }
       if (autoScroll) scrollBottom();
@@ -2125,6 +2129,7 @@ function ensureSubagentBubble(subagentRunId, depth = 0) {
     const status = getSubagentStatus(id);
     updateSubagentBubbleStatus(bubble, status);
     updateSubagentStopButton(id, isSubagentCancelInFlight(id), status);
+    applySubagentFold(id);
     return bubble;
   }
 
@@ -2136,8 +2141,19 @@ function ensureSubagentBubble(subagentRunId, depth = 0) {
   bubble.className = 'subagent-bubble';
   bubble.dataset.subagentRunId = id;
 
+  // The whole header folds and unfolds the bubble (a phone needs the large
+  // target); the Stop button inside it keeps its own click.
   const header = document.createElement('div');
   header.className = 'subagent-bubble-header';
+  header.dataset.action = 'toggle-subagent';
+  header.dataset.subagentRunId = id;
+  header.setAttribute('role', 'button');
+  header.tabIndex = 0;
+
+  const foldMark = document.createElement('span');
+  foldMark.className = 'subagent-bubble-fold';
+  foldMark.setAttribute('aria-hidden', 'true');
+  header.appendChild(foldMark);
 
   const nameSpan = document.createElement('span');
   nameSpan.className = 'subagent-bubble-name';
@@ -2151,6 +2167,10 @@ function ensureSubagentBubble(subagentRunId, depth = 0) {
     ? '● Running'
     : normalizeSubagentBubbleStatus(status).charAt(0).toUpperCase() + normalizeSubagentBubbleStatus(status).slice(1);
 
+  // What the run is doing, in one line, for the header of a folded bubble.
+  const summarySpan = document.createElement('span');
+  summarySpan.className = 'subagent-bubble-summary';
+
   const controls = document.createElement('div');
   controls.className = 'subagent-bubble-controls';
   controls.appendChild(statusSpan);
@@ -2163,6 +2183,7 @@ function ensureSubagentBubble(subagentRunId, depth = 0) {
   controls.appendChild(stopBtn);
 
   header.appendChild(nameSpan);
+  header.appendChild(summarySpan);
   header.appendChild(controls);
 
   const activityBox = document.createElement('div');
@@ -2176,6 +2197,7 @@ function ensureSubagentBubble(subagentRunId, depth = 0) {
   bubble.appendChild(activityBox);
   container.appendChild(bubble);
   updateSubagentStopButton(id, isSubagentCancelInFlight(id), status);
+  applySubagentFold(id);
 
   const entry = getSubagentRun(id);
   if (entry?.thoughts?.length) {
@@ -2205,8 +2227,20 @@ function ensureSubagentBubble(subagentRunId, depth = 0) {
   if (entry?.streamText) {
     renderSubagentStream(id, entry.streamText);
   }
+  refreshSubagentSummary(bubble);
 
   return bubble;
+}
+
+/** Bring the folded header's line up to date with what the bubble holds. */
+function refreshSubagentSummary(bubble) {
+  const summary = bubble?.querySelector(':scope > .subagent-bubble-header > .subagent-bubble-summary');
+  if (!summary) return;
+  const text = subagentFoldSummary({
+    activities: Array.from(bubble.querySelectorAll(':scope > .subagent-activity > .subagent-activity-item'), (row) => row.textContent || ''),
+    streamText: bubble.querySelector(':scope > .subagent-stream')?.textContent || '',
+  });
+  if (summary.textContent !== text) summary.textContent = text;
 }
 
 function updateSubagentBubbleStatus(bubble, status) {
@@ -2216,6 +2250,38 @@ function updateSubagentBubbleStatus(bubble, status) {
   const normalized = normalizeSubagentBubbleStatus(status);
   statusSpan.dataset.status = normalized;
   statusSpan.textContent = normalized === 'running' ? '● Running' : normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+// What the user chose by hand for a live subagent bubble ('open' | 'folded'),
+// by run id. Kept outside the DOM: the live bubble is rebuilt on a
+// conversation switch and on reload-restore, and the choice must survive it.
+const subagentFoldChoices = new Map();
+const MAX_SUBAGENT_FOLD_CHOICES = 500;
+
+/** Show a live subagent bubble folded or open (see subagent-fold.mjs). */
+function applySubagentFold(subagentRunId) {
+  const id = String(subagentRunId || '').trim();
+  if (!id) return;
+  const bubble = document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(id)}"]`);
+  if (!bubble) return;
+  const folded = resolveSubagentFold({ choice: subagentFoldChoices.get(id) || null });
+  bubble.classList.toggle('folded', folded);
+  const header = bubble.querySelector(':scope > .subagent-bubble-header');
+  if (header) {
+    header.setAttribute('aria-expanded', folded ? 'false' : 'true');
+    header.title = folded ? 'Show what this subagent did' : 'Fold this subagent';
+  }
+}
+
+function toggleSubagentFold(subagentRunId) {
+  const id = String(subagentRunId || '').trim();
+  const bubble = id ? document.querySelector(`.subagent-bubble[data-subagent-run-id="${CSS.escape(id)}"]`) : null;
+  if (!bubble) return;
+  while (subagentFoldChoices.size >= MAX_SUBAGENT_FOLD_CHOICES) {
+    subagentFoldChoices.delete(subagentFoldChoices.keys().next().value);
+  }
+  subagentFoldChoices.set(id, toggledSubagentFoldChoice(bubble.classList.contains('folded')));
+  applySubagentFold(id);
 }
 
 const subagentStopUnsupported = new Set();
@@ -2238,6 +2304,11 @@ function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverr
     btn.disabled = true;
     return;
   }
+  const status = normalizeSubagentBubbleStatus(statusOverride || getSubagentStatus(id));
+  const terminal = isSubagentTerminalStatus(status);
+  // Nothing is left to stop once the run has ended; a disabled button there
+  // only took the room the name needs.
+  btn.hidden = terminal;
   if (subagentStopUnsupported.has(id)) {
     btn.disabled = true;
     btn.textContent = 'Stop unavailable';
@@ -2245,8 +2316,6 @@ function updateSubagentStopButton(subagentRunId, isStopping = false, statusOverr
     btn.classList.remove('stopping');
     return;
   }
-  const status = normalizeSubagentBubbleStatus(statusOverride || getSubagentStatus(id));
-  const terminal = isSubagentTerminalStatus(status);
   const stopping = !!isStopping;
   btn.disabled = terminal || stopping;
   btn.textContent = stopping ? 'Stopping…' : 'Stop';
@@ -2265,6 +2334,7 @@ export function updateSubagentBubbleFromStatus(subagentRunId, status) {
     clearSubagentCancelInFlight(id);
   }
   updateSubagentStopButton(id, isSubagentCancelInFlight(id), status);
+  applySubagentFold(id);
 }
 
 function renderSubagentBubbleRecursive(entry) {
@@ -2992,7 +3062,7 @@ function runRelayErrorCta(cta) {
 }
 
 function handleBubbleActionClick(event) {
-  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn, .thinking-follow-btn');
+  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn, .thinking-follow-btn, .subagent-bubble-header');
   if (!btn) return;
   const action = btn.dataset.action;
   const messageId = btn.dataset.messageId;
@@ -3045,6 +3115,22 @@ function handleBubbleActionClick(event) {
     event.stopPropagation();
     void cancelSubagentByRunId(currentConvId, subagentRunId);
   }
+
+  if (action === 'toggle-subagent' && subagentRunId) {
+    // A tap that ends a text selection inside the header is not a toggle.
+    if (String(window.getSelection?.() || '').trim()) return;
+    event.preventDefault();
+    toggleSubagentFold(subagentRunId);
+  }
+}
+
+// Enter and Space on a focused subagent header, like the click.
+function handleBubbleActionKeydown(event) {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const header = event.target.closest?.('.subagent-bubble-header');
+  if (!header || event.target !== header) return;
+  event.preventDefault();
+  toggleSubagentFold(header.dataset.subagentRunId);
 }
 
 // Clicking an inline-embedded image in a message bubble opens it in the file
@@ -3077,6 +3163,7 @@ export function initBubbleActionHandlers() {
   const messagesEl = document.getElementById('messages');
   if (!messagesEl) return;
   messagesEl.addEventListener('click', handleBubbleActionClick);
+  messagesEl.addEventListener('keydown', handleBubbleActionKeydown);
   messagesEl.addEventListener('click', handleEmbeddedImageClick);
   initThinkingFollow({ getCurrentConversationId: () => currentConvId });
 }

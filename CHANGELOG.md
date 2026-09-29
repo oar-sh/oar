@@ -5,11 +5,21 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Subagents are folded to their header inside the running turn, so a turn with
+  many of them stays short to scroll. The header says how many steps the
+  subagent has taken and shows the latest one, as far as there is room. A tap
+  on the header unfolds a subagent and folds it again; what you chose by hand
+  stays. The Stop button of a finished subagent is gone.
+
 ### Fixed
 
 - A plan board's action ("Implement in autopilot" and the like) queues its
   follow-up again. It failed with an error and left the board marked as acted
   on, without the message that carries the plan out.
+- A finished subagent no longer turns back to "Running" in the running turn
+  when another line of activity arrives or the page reloads.
 
 ## [0.9.5] — 2026-09-27
 

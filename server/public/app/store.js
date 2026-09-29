@@ -3,6 +3,7 @@ import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-sto
 import { resolveRelayDotState } from './relay-dot-state.mjs';
 import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
+import { nextSubagentStatus } from './subagent-fold.mjs';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -1475,7 +1476,7 @@ export function upsertSubagentRun(payload) {
     conversationId: String(payload?.conversationId || existing?.conversationId || '').trim() || null,
     parentSubagentId: normalizeSubagentRunId(payload?.parentSubagentId) || existing?.parentSubagentId || null,
     displayName: String(payload?.displayName || existing?.displayName || '').trim() || null,
-    status: normalizeSubagentStatus(payload?.status) || existing?.status || 'running',
+    status: nextSubagentStatus({ reported: payload?.status, known: existing?.status, normalize: normalizeSubagentStatus }),
     startedAt: existing?.startedAt || payload?.timestamp || now,
     updatedAt: payload?.timestamp || now,
     activities: existing?.activities || [],

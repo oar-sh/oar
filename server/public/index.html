@@ -1701,6 +1701,44 @@
     margin-bottom: 6px;
     font-size: var(--fs-meta-sm);
   }
+  .subagent-bubble-header {
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .subagent-bubble-header:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  .subagent-bubble-fold {
+    flex-shrink: 0;
+    width: 1em;
+    color: var(--muted);
+    text-align: center;
+  }
+  .subagent-bubble-fold::before { content: '▾'; }
+  .subagent-bubble.folded > .subagent-bubble-header > .subagent-bubble-fold::before { content: '▸'; }
+  /* Folded: the header alone. What the run wrote, thought and did, and the
+     runs it started, come back with a tap. */
+  .subagent-bubble.folded > :not(.subagent-bubble-header) { display: none; }
+  .subagent-bubble.folded > .subagent-bubble-header { margin-bottom: 0; }
+  .subagent-stop-btn[hidden] { display: none; }
+  /* The folded header's one line about the run. It takes the room the name
+     and the controls leave and is cut with an ellipsis; on a narrow bubble
+     that is little or nothing, and the name keeps its place. */
+  .subagent-bubble-summary {
+    display: none;
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-weight: 400;
+  }
+  .subagent-bubble.folded > .subagent-bubble-header > .subagent-bubble-summary { display: block; }
+  .subagent-bubble.folded > .subagent-bubble-header > .subagent-bubble-name { flex: 0 1 auto; max-width: 55%; }
+  .subagent-bubble.folded > .subagent-bubble-header > .subagent-bubble-summary:empty { flex-grow: 1; }
   .subagent-bubble-name {
     font-weight: 600;
     color: var(--text);
