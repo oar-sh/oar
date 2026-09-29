@@ -111,6 +111,14 @@ All notable changes to OAR are documented here. The format follows
 - **Copilot:** a turn the runtime itself ended with an error no longer tells
   you to restart the relay. The worker starts a fresh runtime by itself; a
   restart repairs nothing and costs every other running session.
+- The note under a failed turn no longer advises restarting the relay: a restart
+  repairs nothing there and interrupts every other running session. It now says
+  to send the message again and to include the error code in a report.
+- **Claude:** a turn the Claude account refuses (billing, an expired sign-in,
+  access the organisation has switched off) says to check the account or to sign
+  in again in Settings → Providers → Claude, with a button that opens the panel,
+  instead of "Retry the message". Its error code names the failure, for example
+  `relay.claude-billing-error`; it used to read `relay.claude-success`.
 
 ## [0.9.5] — 2026-09-27
 

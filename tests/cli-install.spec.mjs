@@ -44,8 +44,8 @@ const OLDER_VERSION = "1.0.0";
 // from classifyGrokError() (grok-sdk-adapter.mjs); the trailing stable code is
 // the only handle the client has for attaching a fix-it button.
 const GROK_CLI_MISSING_TEXT = "Grok CLI was not found on PATH. Install it from Settings → Providers → Grok. "
-  + "Error code: relay.grok-cli-missing. Retry the message. "
-  + "If this keeps failing, restart the relay and include the error code.";
+  + "Error code: relay.grok-cli-missing. Send the message again to retry. "
+  + "If this keeps failing, include the error code when you report it.";
 
 // `claude doctor` on a host whose npm global folder is not writable, verbatim
 // from the plan's live audit (§2.3). No fixture covers this: cli-install-stub.sh

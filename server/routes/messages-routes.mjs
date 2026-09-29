@@ -485,7 +485,7 @@ export function parseTerminalFailureText(text) {
   };
 }
 
-function buildTerminalFailureTextForChat(terminalFailure, fallbackMessage = null) {
+export function buildTerminalFailureTextForChat(terminalFailure, fallbackMessage = null) {
   const failure = terminalFailure && typeof terminalFailure === 'object' ? terminalFailure : {};
   const code = normalizeTerminalErrorCode(failure.code || failure.stableCode) || 'unknown-terminal';
   const stableCode = `relay.${code}`;
@@ -493,7 +493,7 @@ function buildTerminalFailureTextForChat(terminalFailure, fallbackMessage = null
     || normalizeTerminalErrorText(fallbackMessage)
     || 'The relay runtime hit a terminal error and could not complete this turn.';
   const guidance = normalizeTerminalErrorText(failure.guidance)
-    || 'Retry the message. If this keeps failing, restart the relay and include the error code.';
+    || 'Send the message again to retry. If this keeps failing, include the error code when you report it.';
   const detail = normalizeTerminalErrorText(failure.detail);
   const ids = [
     normalizeTerminalErrorText(failure.functionCallId) ? `functionCallId=${failure.functionCallId}` : null,

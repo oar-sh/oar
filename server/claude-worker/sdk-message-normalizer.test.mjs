@@ -234,6 +234,9 @@ test('result success and error map to result actions', () => {
     text: 'All done.',
     isError: false,
     subtype: 'success',
+    assistantError: '',
+    apiErrorStatus: null,
+    terminalReason: '',
     sessionId: 's1',
     model: 'claude-sonnet-5',
     usage: null,
@@ -250,6 +253,41 @@ test('result success and error map to result actions', () => {
   });
   assert.equal(failure[0].payload.isError, true);
   assert.equal(failure[0].payload.subtype, 'error_during_execution');
+});
+
+test('a refused turn\'s result carries what names the failure', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({ type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5' });
+  normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    error: 'billing_error',
+    message: { id: 'msg-1', content: [{ type: 'text', text: 'Credit balance is too low' }] },
+  });
+  // A subagent's message is not the turn's last word.
+  normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: 'toolu_1',
+    message: { id: 'msg-2', content: [{ type: 'text', text: 'working' }] },
+  });
+  const refused = normalizer.normalize({
+    type: 'result',
+    subtype: 'success',
+    is_error: true,
+    api_error_status: 402,
+    terminal_reason: 'api_error',
+    result: 'Credit balance is too low',
+    session_id: 's1',
+  });
+  assert.equal(refused[0].payload.isError, true);
+  assert.equal(refused[0].payload.assistantError, 'billing_error');
+  assert.equal(refused[0].payload.apiErrorStatus, 402);
+  assert.equal(refused[0].payload.terminalReason, 'api_error');
+
+  // The next result does not inherit it.
+  const next = normalizer.normalize({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's1', num_turns: 1 });
+  assert.equal(next[0].payload.assistantError, '');
+  assert.equal(next[0].payload.apiErrorStatus, null);
 });
 
 function assistantMessage(content, parentToolUseId = null) {

@@ -142,13 +142,17 @@ export { shouldEmitStreamUpdate };
  * - `background_tasks` → `{ tasks: [{ taskId, taskType, description }] }`
  *   (REPLACE semantics: the full live set after each membership change)
  * - `background_task_settled` → `{ taskId, status }`
- * - `result`   → `{ text, isError, subtype, sessionId, model, usage }`
+ * - `result`   → `{ text, isError, subtype, sessionId, model, usage }`, and what
+ *   names a failure: `{ assistantError, apiErrorStatus, terminalReason }`
  */
 export function createSdkMessageNormalizer() {
   const threads = new Map(); // threadKey -> per-thread stream/thinking bookkeeping
   const knownSubagentRuns = new Map(); // toolUseId -> { displayName, parentSubagentId }
   let initSessionId = '';
   let initModel = '';
+  // The `error` of the turn's last main-thread assistant message: the SDK's
+  // name for the failure a refused turn ended on.
+  let lastAssistantError = '';
 
   function threadKeyFor(parentToolUseId) {
     return String(parentToolUseId || '').trim() || 'main';
@@ -532,6 +536,7 @@ export function createSdkMessageNormalizer() {
       const parentToolUseId = sdkMessage?.parent_tool_use_id || null;
       const content = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
       const messageId = String(sdkMessage?.message?.id || '').trim();
+      if (!parentToolUseId) lastAssistantError = String(sdkMessage?.error || '').trim();
       return actionsForAssistantMessage(content, parentToolUseId, messageId);
     }
 
@@ -599,12 +604,19 @@ export function createSdkMessageNormalizer() {
         && Number(sdkMessage.duration_api_ms) === 0;
       if (isPhantom) return [];
       const isError = sdkMessage.subtype !== 'success' || sdkMessage.is_error === true;
+      // The next turn's result must not inherit this turn's failure.
+      const assistantError = lastAssistantError;
+      lastAssistantError = '';
+      const apiErrorStatus = Number(sdkMessage.api_error_status ?? NaN);
       return [{
         channel: 'result',
         payload: {
           text: String(sdkMessage.result || '').trim(),
           isError,
           subtype: String(sdkMessage.subtype || ''),
+          assistantError,
+          apiErrorStatus: Number.isFinite(apiErrorStatus) ? apiErrorStatus : null,
+          terminalReason: String(sdkMessage.terminal_reason || ''),
           sessionId: String(sdkMessage.session_id || initSessionId || '').trim(),
           model: initModel,
           usage: sdkMessage.usage || null,

@@ -71,21 +71,21 @@ function classifyTerminalError(text, hint = {}) {
     return {
       code: "missing-tool-output",
       message: "No tool output was returned for a required function call.",
-      guidance: "Retry the message. If this keeps happening, restart the relay and include the error code.",
+      guidance: "Send the message again to retry. If this keeps happening, include the error code when you report it.",
     };
   }
   if (lower.includes("tool call") && (lower.includes("not found") || lower.includes("missing"))) {
     return {
       code: "tool-call-missing",
       message: "A required tool call was missing in the runtime response.",
-      guidance: "Retry the message. If it repeats, restart the relay and include the error code.",
+      guidance: "Send the message again to retry. If it repeats, include the error code when you report it.",
     };
   }
   if (lower.includes("tool output") && lower.includes("invalid")) {
     return {
       code: "invalid-tool-output",
       message: "Tool output returned from the runtime was invalid.",
-      guidance: "Retry the message. If it repeats, restart the relay and include the error code.",
+      guidance: "Send the message again to retry. If it repeats, include the error code when you report it.",
     };
   }
   // Monthly/plan quota exhaustion is not transient: retrying before the
@@ -103,7 +103,7 @@ function classifyTerminalError(text, hint = {}) {
     return {
       code: "request-invalid",
       message: "The runtime rejected the request as invalid and non-retryable.",
-      guidance: "Retry after adjusting the request. If it persists, restart the relay and include the error code.",
+      guidance: "Retry after adjusting the request. If it persists, include the error code when you report it.",
     };
   }
 

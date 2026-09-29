@@ -92,3 +92,27 @@ test('toKebabToken is exported for callers building provider-scoped codes', () =
   assert.equal(toKebabToken('  '), null);
   assert.equal(toKebabToken(null), null);
 });
+
+test('no terminal failure advises a relay restart', () => {
+  // The session workers replace their own runtime: a relay restart repairs
+  // nothing and interrupts every other running session.
+  const cases = [
+    ['No tool output found for function call call_abc123', 'relay.missing-tool-output',
+      'Send the message again to retry. If this keeps happening, include the error code when you report it.'],
+    ['tool call call_abc123 not found', 'relay.tool-call-missing',
+      'Send the message again to retry. If it repeats, include the error code when you report it.'],
+    ['tool output was invalid', 'relay.invalid-tool-output',
+      'Send the message again to retry. If it repeats, include the error code when you report it.'],
+    ['400 the request body is malformed', 'relay.request-invalid',
+      'Retry after adjusting the request. If it persists, include the error code when you report it.'],
+    ['You have exceeded your monthly quota', 'relay.quota-exhausted', null],
+  ];
+  for (const [detail, stableCode, guidance] of cases) {
+    const normalized = normalizeTerminalSendAndWaitError(new Error(detail));
+    assert.equal(normalized?.stableCode, stableCode, detail);
+    if (guidance) assert.equal(normalized.guidance, guidance);
+    assert.doesNotMatch(normalized.guidance, /restart/i, detail);
+    assert.doesNotMatch(buildTerminalFailureText(new Error(detail)), /restart/i, detail);
+  }
+  assert.doesNotMatch(buildTerminalFailureText(new Error('something unheard of')), /restart/i);
+});

@@ -785,7 +785,7 @@ export function createCursorTurnRunner({
           code: classified.code,
           stableCode: classified.stableCode,
           // A stall is told in the user's terms, and with its own advice: the
-          // relay's default ("restart the relay") repairs nothing here.
+          // run was cancelled, so sending the message again is all it takes.
           message: classified.text || classified.message,
           ...(classified.isStalled ? { guidance: 'Send the message again to retry.' } : {}),
           failedAt: new Date().toISOString(),

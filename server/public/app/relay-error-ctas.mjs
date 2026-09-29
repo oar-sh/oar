@@ -13,6 +13,10 @@
 // Codes are matched post-normalisation: normalizeTerminalErrorCode() lowercases
 // and rewrites every non-alphanumeric run to a dash, so `grok.cli_missing`
 // reaches the transcript as `relay.grok-cli-missing`.
+const CLAUDE_SETTINGS_CTA = Object.freeze([
+  Object.freeze({ action: 'open-claude-settings', label: 'Claude settings' }),
+]);
+
 const RELAY_ERROR_CTAS = Object.freeze({
   'grok-cli-missing': Object.freeze([
     Object.freeze({ action: 'install-grok-cli', label: 'Install Grok CLI' }),
@@ -24,9 +28,14 @@ const RELAY_ERROR_CTAS = Object.freeze({
   ]),
   // Shipped with the Claude relogin plan (§4.3 there) as the deep link its
   // reworded message points at.
-  'claude-authentication-failed': Object.freeze([
-    Object.freeze({ action: 'open-claude-settings', label: 'Claude settings' }),
-  ]),
+  'claude-authentication-failed': CLAUDE_SETTINGS_CTA,
+  // A turn the Claude account refused (claude-turn-failure.mjs): the panel
+  // shows the account and signs in to another one.
+  'claude-billing-error': CLAUDE_SETTINGS_CTA,
+  'claude-oauth-org-not-allowed': CLAUDE_SETTINGS_CTA,
+  'claude-account-on-hold': CLAUDE_SETTINGS_CTA,
+  'claude-verification-required': CLAUDE_SETTINGS_CTA,
+  'claude-account-access': CLAUDE_SETTINGS_CTA,
 });
 
 const STABLE_CODE_PATTERN = /error code:\s*relay\.([a-z0-9-]+)/i;

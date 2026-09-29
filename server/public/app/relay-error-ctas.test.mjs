@@ -12,7 +12,7 @@ import {
 // The chat text these read is produced by buildTerminalFailureTextForChat()
 // (messages-routes.mjs); the samples below keep its exact shape.
 const CLI_MISSING = 'Grok CLI was not found on PATH. Install it from Settings → Providers → Grok. '
-  + 'Error code: relay.grok-cli-missing. Retry the message. If this keeps failing, restart the relay and include the error code.';
+  + 'Error code: relay.grok-cli-missing. Send the message again to retry. If this keeps failing, include the error code when you report it.';
 const AUTH_FAILED = 'Grok authentication failed. Sign in from Settings → Providers → Grok. '
   + 'Error code: relay.grok-authentication-failed. Retry the message.';
 
@@ -47,6 +47,10 @@ test('the code lookup tolerates the relay. prefix and casing', () => {
   assert.equal(relayErrorCtaActionsForCode('relay.grok-cli-missing').length, 2);
   assert.equal(relayErrorCtaActionsForCode('GROK-CLI-MISSING').length, 2);
   assert.equal(relayErrorCtaActionsForCode('claude-authentication-failed')[0].action, 'open-claude-settings');
+  for (const code of ['claude-billing-error', 'claude-oauth-org-not-allowed', 'claude-account-on-hold', 'claude-verification-required', 'claude-account-access']) {
+    assert.deepEqual(relayErrorCtaActionsForCode(code).map((item) => item.action), ['open-claude-settings'], code);
+  }
+  assert.deepEqual(relayErrorCtaActionsForCode('claude-rate-limit'), []);
   assert.deepEqual(relayErrorCtaActionsForCode('nope'), []);
 });
 

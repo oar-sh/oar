@@ -65,8 +65,7 @@ function buildGrokTerminalError(classified, message) {
     stableCode: classified.code,
     message: classified.text || classified.message,
     // A stalled turn was cancelled and its agent is restarted for the next
-    // message; the relay's default advice ("restart the relay") repairs
-    // nothing here.
+    // message, so sending the message again is all it takes.
     ...(classified.isStalled ? { guidance: 'Send the message again to retry.' } : {}),
     failedAt: new Date().toISOString(),
     queueMessageId: String(message?.id || '') || null,

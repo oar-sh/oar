@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { classifyClaudeResultFailure, claudeFailureGuidance } from './claude-turn-failure.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
@@ -338,8 +339,10 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
       model: responseModel,
       terminalError: {
         kind: 'claude-turn-failed',
-        code: result.subtype || 'unknown',
-        stableCode: `claude.${result.subtype || 'unknown'}`,
+        // Never built from the subtype alone: a refused turn ends with
+        // subtype 'success'. An account failure brings its own advice, since
+        // sending the message again cannot help before the account is fixed.
+        ...classifyClaudeResultFailure(result),
         message: errorText,
         failedAt: new Date().toISOString(),
         queueMessageId: String(message.id || '') || null,
@@ -360,6 +363,7 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         code: isAuthError ? 'authentication_failed' : 'turn-error',
         stableCode: isAuthError ? 'claude.authentication_failed' : 'claude.turn-error',
         message: errorText,
+        ...(isAuthError ? { guidance: claudeFailureGuidance('authentication_failed') } : {}),
         failedAt: new Date().toISOString(),
         queueMessageId: String(message.id || '') || null,
       },
