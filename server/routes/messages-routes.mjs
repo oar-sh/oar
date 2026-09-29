@@ -22,6 +22,7 @@ import {
   STEER_SETTLE_FAILED_CODE,
   STEER_SETTLE_FAILED_STABLE_CODE,
 } from '../../shared/steer-settle-failure.mjs';
+import { matchFailureNote } from '../../shared/failure-note-text.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
 import {
@@ -450,15 +451,19 @@ function extractTerminalId(text, patterns = []) {
   return null;
 }
 
+/**
+ * Reads a failure a sender reported as text only, without a `terminalError`
+ * record. The text has to BE a failure note, not merely contain one
+ * (shared/failure-note-text.mjs): a reply that quoted a note was stored as a
+ * failed turn, cut off at the quoted code.
+ */
 export function parseTerminalFailureText(text) {
   const raw = String(text || '').trim();
-  if (!raw) return null;
-  const stableCodeMatch = raw.match(/error code:\s*(relay\.[a-z0-9-]+)/i);
-  if (!stableCodeMatch) return null;
-  const stableCode = String(stableCodeMatch[1] || '').trim().toLowerCase();
-  const code = normalizeTerminalErrorCode(stableCode);
+  const note = matchFailureNote(raw);
+  if (!note) return null;
+  const code = normalizeTerminalErrorCode(note.stableCode);
   if (!code) return null;
-  const message = normalizeTerminalErrorText(raw.slice(0, stableCodeMatch.index).trim().replace(/\s+$/, '.'));
+  const message = normalizeTerminalErrorText(note.lead.trim().replace(/\s+$/, '.'));
   const detailMatch = raw.match(/details:\s*(.+)$/i);
   return {
     terminal: true,
@@ -628,8 +633,13 @@ export function resolveTerminalFailurePayload(payload = {}, { fallbackText = nul
   const code = explicitCode
     || normalizeTerminalErrorCode(parsedTextFailure?.code)
     || 'unknown-terminal';
+  // Known from the text alone: nothing but the shape of the text says that
+  // this is a failure, so the text is kept as it was sent.
+  const fromText = !!parsedTextFailure && !direct && !explicitCode
+    && body.terminal !== true && body.isTerminal !== true && body.errorKind !== 'terminal';
   return {
     terminal: true,
+    ...(fromText ? { fromText: true } : {}),
     code,
     stableCode: `relay.${code}`,
     message: explicitMessage || parsedTextFailure?.message || normalizeTerminalErrorText(fallbackText),
@@ -6615,7 +6625,12 @@ export function registerMessagesRoutes(app, deps) {
       if (terminalCrossConversation.crossConversation) {
         console.warn(`[${ts()}] CONVERSATION MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} responderConv=${terminalCrossConversation.responderConversationId?.slice(0, 8)} — terminal failure posted by another conversation's worker`);
       }
-      const failureText = buildTerminalFailureTextForChat(terminalFailure, trimmedText);
+      // A failure read from the text alone keeps that text, whole: it is the
+      // note already, and should the reading be wrong, nothing of a reply is
+      // lost.
+      const failureText = terminalFailure.fromText
+        ? trimmedText
+        : buildTerminalFailureTextForChat(terminalFailure, trimmedText);
       // What the turn had written before it failed stays readable: the note
       // goes below it instead of replacing it.
       const partialText = String(req.body.partialText || '').trim();

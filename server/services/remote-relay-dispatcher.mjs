@@ -2,6 +2,7 @@
 
 import { randomUUID as nodeRandomUUID } from 'crypto';
 
+import { isFailureNoteText } from '../../shared/failure-note-text.mjs';
 import {
   REMOTE_RELAY_APPROVAL_MODES,
   REMOTE_RELAY_EFFORT_PATTERN,
@@ -90,7 +91,6 @@ const WORKING_WORKER_STATUSES = new Set(['starting', 'processing']);
 // marker counts only there: a normal reply that quotes a relay error further
 // down is a reply, not a failure.
 const FAILURE_TEXT_PATTERNS = Object.freeze([
-  /^(?:(?!\n[ \t]*\r?\n)[\s\S]){0,600}?\berror code:\s*relay\.[a-z0-9-]+\.(?=\s|$)/i,
   /^relay recovery limit reached after \d+ attempts/i,
   /^relay timeout after \d+ attempts/i,
 ]);
@@ -184,7 +184,7 @@ function compactQuery(query = {}) {
 
 function looksLikeFailureText(text) {
   const value = toText(text);
-  return FAILURE_TEXT_PATTERNS.some((pattern) => pattern.test(value));
+  return isFailureNoteText(value) || FAILURE_TEXT_PATTERNS.some((pattern) => pattern.test(value));
 }
 
 function normalizeProvider(value) {

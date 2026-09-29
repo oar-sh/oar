@@ -34,6 +34,11 @@ All notable changes to OAR are documented here. The format follows
 
 ### Fixed
 
+- A reply that quotes or describes a failure note (an agent reporting on a
+  failed test, for example) is no longer taken for a failure itself. The relay
+  cut such a reply off at the quoted error code, put its own advice behind it
+  and stored the turn as failed. Where a failure is known from its text alone,
+  that text is now kept whole.
 - **Windows:** stopping or deleting a session could end the worker of another
   session as well. Windows hands the process id of an ended process out again,
   and a worker whose creator was long gone could so look like a child of the
