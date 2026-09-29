@@ -48,6 +48,34 @@ test('message and conversation origins round-trip normalised', () => {
   assert.equal(repo.getMessageOrigin('m-1'), null);
 });
 
+test('a relay whose agent started the conversation or wrote to it counts as having made contact', () => {
+  const { db, repo } = setup();
+  assert.equal(repo.hasContactFrom('c-1', 'r-9'), false);
+  repo.setMessageOrigin('m-1', { relayId: 'r-9', relayName: 'win-test', hops: 1 });
+  assert.equal(repo.hasContactFrom('c-1', 'r-9'), true);
+  assert.equal(repo.hasContactFrom('c-1', 'r-8'), false, 'another relay made none');
+  assert.equal(repo.hasContactFrom('c-2', 'r-9'), false, 'contact is per conversation');
+  assert.equal(repo.hasContactFrom('c-1', ''), false);
+
+  db.prepare(`INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c-3', 'sidebar polish', ?, ?)`)
+    .run('2026-09-20T10:00:00.000Z', '2026-09-20T10:00:00.000Z');
+  repo.setConversationOrigin('c-3', { relayId: 'r-7', relayName: 'spare-test', hops: 1 });
+  assert.equal(repo.hasContactFrom('c-3', 'r-7'), true);
+});
+
+test('the latest message of the user is one no agent sent', () => {
+  const { db, repo } = setup();
+  assert.equal(repo.latestHumanMessageId('c-1'), 'm-1');
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES ('m-2', 'c-1', 'user', 'from an agent', ?)`)
+    .run('2026-09-20T10:05:00.000Z');
+  repo.setMessageOrigin('m-2', { relayId: 'r-9', relayName: 'win-test', hops: 1 });
+  assert.equal(repo.latestHumanMessageId('c-1'), 'm-1', 'an agent\'s prompt is not the user\'s');
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES ('m-3', 'c-1', 'user', 'go on', ?)`)
+    .run('2026-09-20T10:06:00.000Z');
+  assert.equal(repo.latestHumanMessageId('c-1'), 'm-3');
+  assert.equal(repo.latestHumanMessageId('c-9'), null);
+});
+
 test('a damaged origin column reads as no origin', () => {
   assert.equal(parseRemoteRelayOriginJson('{not json'), null);
   assert.equal(parseRemoteRelayOriginJson(null), null);

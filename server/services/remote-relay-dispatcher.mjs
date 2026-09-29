@@ -10,6 +10,7 @@ import {
   REMOTE_RELAY_LIMITS,
   REMOTE_RELAY_PROVIDERS,
   isRemoteRelayApprovalQuestion,
+  isRemoteRelayPromptAction,
   isRemoteRelayWriteAction,
   normalizeRemoteRelayOrigin,
   remoteConversationUrl,
@@ -534,6 +535,10 @@ export function createRemoteRelayDispatcher({
   const inflightByConversation = new Map();
   const callTimesByConversation = new Map();
   const writeTimesByConversation = new Map();
+  // The loop guard: prompts sent to other relays' agents per conversation,
+  // counted from the user's latest own message. Kept in memory: a restart
+  // ends a loop of agents by itself.
+  const agentPromptsByConversation = new Map();
 
   // ─── Bookkeeping ───────────────────────────────────────────────────────────
 
@@ -554,6 +559,31 @@ export function createRemoteRelayDispatcher({
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Why a relay is open to a conversation: 'user' (the user mentioned it),
+   * 'contact' (an agent on that relay wrote to the conversation, so it may be
+   * answered), or null (locked).
+   */
+  function relayAccess(conversationId, relay) {
+    if (isUnlocked(conversationId, relay?.id)) return 'user';
+    try {
+      if (toText(relay?.relayId) && repository?.hasContactFrom?.(conversationId, relay.relayId)) return 'contact';
+    } catch {}
+    return null;
+  }
+
+  function agentPrompts(conversationId) {
+    let since = null;
+    try {
+      since = repository?.latestHumanMessageId?.(conversationId) || null;
+    } catch {}
+    const kept = agentPromptsByConversation.get(conversationId);
+    if (kept && kept.since === since) return kept;
+    const fresh = { since, count: 0 };
+    agentPromptsByConversation.set(conversationId, fresh);
+    return fresh;
   }
 
   function adjustInflight(conversationId, delta) {
@@ -1594,7 +1624,7 @@ export function createRemoteRelayDispatcher({
       online: toText(relay.lastStatus).toLowerCase() === 'online',
       version: relay.version || null,
       permission: relay.permission,
-      unlocked: isUnlocked(conversationId, relay.id),
+      unlocked: relayAccess(conversationId, relay) !== null,
     }));
     const unlocked = listed.filter((relay) => relay.unlocked).length;
     return {
@@ -1604,7 +1634,7 @@ export function createRemoteRelayDispatcher({
         summary: `list_relays: ${listed.length} relay${listed.length === 1 ? '' : 's'}, ${unlocked} unlocked`,
         self: { name: (await registry.selfName?.()) || null },
         relays: listed,
-        hint: 'Mention @name in the chat to unlock a relay.',
+        hint: 'The user unlocks a relay by mentioning @name in the chat; a relay whose agent wrote to this conversation is open as well.',
       },
     };
   }
@@ -1635,7 +1665,8 @@ export function createRemoteRelayDispatcher({
       return result;
     };
 
-    if (!isUnlocked(conversationId, relay.id)) {
+    const access = relayAccess(conversationId, relay);
+    if (!access) {
       return finish(failure(403, REMOTE_RELAY_ERROR_CODES.locked,
         `Relay "${relay.name}" is locked in this conversation. Ask the user to mention @${relay.name} (or its name) in a message to allow work there.`,
         { relay: relay.name }));
@@ -1649,9 +1680,16 @@ export function createRemoteRelayDispatcher({
     const caller = { conversationId, ...((await getCallerContext(conversationId, req)) || {}) };
     caller.mode = toText(caller.mode).toLowerCase();
     const hops = nonNegativeInt(caller.hops) + 1;
-    if (hops > REMOTE_RELAY_LIMITS.hopLimit) {
+    // The hop limit stops a prompt from travelling on to a third relay. A
+    // relay the user unlocked here stays in reach whatever prompts arrive,
+    // the relay the prompts came from may always be answered, and reading
+    // carries nothing on.
+    const origins = Array.isArray(caller.originRelayIds) ? caller.originRelayIds.map(toText) : [];
+    const answering = !!toText(relay.relayId) && origins.length > 0
+      && origins.every((id) => id === toText(relay.relayId));
+    if (write && access !== 'user' && !answering && hops > REMOTE_RELAY_LIMITS.hopLimit) {
       return finish(failure(403, REMOTE_RELAY_ERROR_CODES.hopLimit,
-        `This turn was started by another relay's agent (hop ${hops - 1}); forwarding it again would pass the limit of ${REMOTE_RELAY_LIMITS.hopLimit} hops.`,
+        `This turn acts on a prompt from another relay's agent (hop ${hops - 1}); passing it on to relay "${relay.name}" would pass the limit of ${REMOTE_RELAY_LIMITS.hopLimit} hops. The user can allow it by mentioning @${relay.name} in this conversation.`,
         { relay: relay.name }));
     }
 
@@ -1664,7 +1702,32 @@ export function createRemoteRelayDispatcher({
 
     adjustInflight(conversationId, 1);
     try {
-      if (write && REMOTE_RELAY_APPROVAL_MODES.includes(caller.mode)) {
+      const prompting = isRemoteRelayPromptAction(action);
+      let asked = false;
+      if (prompting && agentPrompts(conversationId).count >= REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking) {
+        // Agents that prompt each other can go on without the user for good:
+        // from time to time the user is asked, in any relay mode.
+        const decision = await requestApproval({
+          conversationId,
+          callerContext: caller,
+          relay: relayTarget(relay),
+          action,
+          args,
+          summary: summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
+          signal,
+          agentPrompts: agentPrompts(conversationId).count,
+        });
+        const approved = decision === true || decision?.approved === true;
+        if (!approved) {
+          const code = toText(decision?.code) || REMOTE_RELAY_ERROR_CODES.approvalDenied;
+          const error = toText(decision?.error)
+            || `The agent has sent ${agentPrompts(conversationId).count} prompts to other relays' agents since the user last wrote, and the user did not allow more for now.`;
+          return finish(failure(403, code, error, { relay: relay.name }));
+        }
+        agentPrompts(conversationId).count = 0;
+        asked = true;
+      }
+      if (!asked && write && REMOTE_RELAY_APPROVAL_MODES.includes(caller.mode)) {
         const decision = await requestApproval({
           conversationId,
           callerContext: caller,
@@ -1685,6 +1748,7 @@ export function createRemoteRelayDispatcher({
 
       const ctx = { relay, caller, hops, conversationId, signal };
       const body = await ACTIONS[action](ctx, args);
+      if (prompting) agentPrompts(conversationId).count += 1;
       const { summary, ...rest } = body;
       return finish({
         status: 200,

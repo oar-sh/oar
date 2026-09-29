@@ -146,6 +146,50 @@ test.describe.serial("remote_relay tool between two relays", () => {
     await expect(bubble).not.toContainText("Remote prompt from an agent");
   });
 
+  test("the agent that was asked can answer on the relay the prompt came from, without a mention", async () => {
+    // B knows A as a paired relay too; nobody mentioned A on B.
+    const paired = await api(relayB.baseUrl, relayB.token, "/api/remote-relays", {
+      method: "POST",
+      body: { url: relayBaseUrl(), token: relayToken(), pairBack: false },
+    });
+    expect(paired.payload?.ok, JSON.stringify(paired.payload)).toBe(true);
+    const toolOnB = (conversationId, action, args = {}) => api(relayB.baseUrl, relayB.token, "/api/remote-relays/tool", {
+      method: "POST",
+      body: { conversationId, action, args },
+    });
+    try {
+      // The session A's agent wrote to (previous test): A is open to it.
+      const listed = await toolOnB(conversationOnB, "list_relays");
+      expect(listed.payload.relays).toEqual([
+        expect.objectContaining({ name: "win-test", unlocked: true }),
+      ]);
+      const onB = await api(relayB.baseUrl, relayB.token, `/api/conversation/${conversationOnB}?limit=5`);
+      const prompt = (onB.payload.messages || []).find((message) => message.origin?.relayName === "win-test");
+      const source = prompt.origin.conversationId;
+
+      const read = await toolOnB(conversationOnB, "read_session", { relay: "win-test", session: source });
+      expect(read.status, JSON.stringify(read.payload)).toBe(200);
+      const answered = await toolOnB(conversationOnB, "send", {
+        relay: "win-test",
+        session: source,
+        text: "report builder: the numbers are collected",
+        wait_seconds: 0,
+      });
+      expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
+      const onA = await api(relayBaseUrl(), relayToken(), `/api/conversation/${source}?limit=5`);
+      const stored = (onA.payload.messages || []).find((message) => message.id === answered.payload.message_id);
+      expect(stored.origin).toEqual(expect.objectContaining({ relayName: "linux-test", conversationId: conversationOnB, hops: 2 }));
+
+      // A session on B that no agent of A wrote to stays locked for A.
+      const untouched = await newConversation(relayB.baseUrl, relayB.token, `sidebar polish ${Date.now()}: local work only`);
+      const locked = await toolOnB(untouched, "list_sessions", { relay: "win-test" });
+      expect(locked.status).toBe(403);
+      expect(locked.payload.code).toBe("REMOTE_RELAY_LOCKED");
+    } finally {
+      await removeAllRemotes(relayB.baseUrl, relayB.token);
+    }
+  });
+
   test("the inbound switch on the other relay refuses prompts but not reads", async () => {
     const conversation = (await queueMessage(relayBaseUrl(), relayToken(), `tool spec ${Date.now()}: ask @linux-test`)).conversationId;
     await api(relayB.baseUrl, relayB.token, "/api/settings/remote-relays", { method: "POST", body: { inboundEnabled: false } });

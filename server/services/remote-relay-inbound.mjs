@@ -161,6 +161,41 @@ export function formatRemoteRelayMentionHint(relays = []) {
   return `<system_reminder>The user mentioned ${subject}. The ${REMOTE_RELAY_TOOL_NAME} tool can list, read, prompt and create sessions there.</system_reminder>`;
 }
 
+/**
+ * The paired relay a remote prompt came from: `{ relayId, name }` (`relayId`
+ * is the local registry id), or null when the sender is not paired here or
+ * names no relay id.
+ */
+export function findOriginRemoteRelay(inbound, origin) {
+  const instance = String(origin?.relayId || '').trim();
+  if (!inbound || typeof inbound.listRelays !== 'function' || !instance) return null;
+  try {
+    const listed = inbound.listRelays();
+    const relay = (Array.isArray(listed) ? listed : [])
+      .find((entry) => String(entry?.relayId || '').trim() === instance);
+    return relay ? { relayId: String(relay.id || ''), name: String(relay.name || relay.id || '') } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The reminder the agent gets with a prompt another relay's agent sent: that
+ * relay is open to this conversation, and where the sender's session is. ''
+ * when the sender is not a paired relay. Like the mention hint, it rides in
+ * the queued prompt only.
+ */
+export function formatRemoteRelayOriginHint(relay, origin) {
+  const name = hintText(relay?.name);
+  if (!name) return '';
+  const session = hintText(origin?.conversationId, 80);
+  const where = session ? `relay "${name}", session "${session}"` : `relay "${name}"`;
+  return `<system_reminder>This prompt came from an agent on the paired OAR relay "${name}". `
+    + 'Your reply to it is handed back to that agent by itself. '
+    + `For more than the reply (reading its session, a question, a later report) the ${REMOTE_RELAY_TOOL_NAME} tool is open for that relay in this conversation: ${where}. `
+    + 'A prompt you send there while its turn is still running is steered into that turn.</system_reminder>';
+}
+
 /** The queued prompt with the mention hint after the user's text. */
 export function withRemoteRelayMentionHint(promptText, hint) {
   const text = String(promptText ?? '');

@@ -677,8 +677,15 @@ locked in a conversation until you mention it in one of your messages: type `@` 
 from the list, or write its name or its host name. An IP address or `localhost` never counts as a
 host name; a relay whose name is itself an address is unlocked only with a leading `@`. The
 mention unlocks that relay for the rest of
-the conversation. Prompts that arrive from another relay's agent never unlock anything, and a
-chain of relays prompting relays stops after two hops.
+the conversation, whatever prompts arrive in it later.
+
+**Agents can answer each other.** When an agent on a paired relay writes to a conversation, that
+relay is open to the conversation from then on, within what **Agents may** allows, so the agent
+that was asked can answer, ask back or report later. A prompt from an agent never unlocks any
+other relay. A prompt that already crossed two relays is not passed on to a third one unless you
+unlocked that relay yourself; reading and waiting are never limited. When the agent of a
+conversation has sent 30 prompts to agents on other relays without a message from you, the next
+one asks you first with a question card; **Allow** starts the count again.
 
 **What agents can do.** Every provider gets the same `remote_relay` tool (Claude, Cursor and
 Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Per paired

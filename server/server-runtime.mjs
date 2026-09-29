@@ -6238,7 +6238,7 @@ const remoteRelayPairing = createRemoteRelayPairing({
 });
 // What the inbound routes need: no tokens, only ids, names and state.
 const remoteRelayInbound = {
-  listRelays: () => remoteRelayRegistry.list().map(({ id, name, url, lastStatus, version }) => ({ id, name, url, lastStatus, version })),
+  listRelays: () => remoteRelayRegistry.list().map(({ id, relayId, name, url, lastStatus, version }) => ({ id, relayId, name, url, lastStatus, version })),
   selfNames: () => [remoteRelayRegistry.selfName()],
   inboundEnabled: () => remoteRelayRegistry.getSelfSettings().inboundEnabled,
   recordUnlock: (conversationId, relayId, messageId) => remoteRelayRepository?.recordUnlock(conversationId, relayId, messageId) ?? false,

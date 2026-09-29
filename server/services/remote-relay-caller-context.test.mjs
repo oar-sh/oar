@@ -108,6 +108,7 @@ test('the caller context comes from the live turn, the runtime binding and the c
     attemptId: 'attempt-q-1',
     userMessageId: 'q-1',
     hops: 0,
+    originRelayIds: [],
   });
 });
 
@@ -145,6 +146,22 @@ test('hops come from the origin of the message behind the turn, the highest of a
   const caller = context.getCallerContext('c-1');
   assert.equal(caller.processingRowId, 'q-1', 'without output the oldest processing row is the live turn');
   assert.equal(caller.hops, 2, 'a folded agent prompt counts too');
+  assert.deepEqual(caller.originRelayIds, ['relay-a'], 'one relay, named once');
+});
+
+test('the relays a turn\'s prompts came from are named: none for the user\'s own words', () => {
+  const { db, repository, context } = setup();
+  seedConversation(db);
+  seedTurn(db, { id: 'q-1' });
+  assert.deepEqual(context.getCallerContext('c-1').originRelayIds, []);
+
+  // An agent's prompt folded into the user's turn, then one from another relay.
+  seedTurn(db, { id: 'q-2', processingAt: '2026-09-20T09:59:30.000Z' });
+  repository.setMessageOrigin('q-2', { relayId: 'relay-a', relayName: 'win-test', hops: 1 });
+  assert.deepEqual(context.getCallerContext('c-1').originRelayIds, ['relay-a']);
+  seedTurn(db, { id: 'q-3', processingAt: '2026-09-20T09:59:40.000Z' });
+  repository.setMessageOrigin('q-3', { relayId: 'relay-b', relayName: 'spare-test', hops: 2 });
+  assert.deepEqual(context.getCallerContext('c-1').originRelayIds, ['relay-a', 'relay-b']);
 });
 
 test('a background continuation counts the hops of the turn it continues', () => {
@@ -373,6 +390,11 @@ test('the card text names the action, the relay and what would be sent', () => {
   assert.equal(
     formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'stop', args: { session: 'abcdef123456' } }),
     'Allow the agent to stop the running turn on relay "linux-test" (session abcdef12)?',
+  );
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'stop', args: {}, agentPrompts: 30 }),
+    'The agent has sent 30 prompts to agents on other relays since your last message. Let it go on?\n\n'
+      + 'Allow the agent to stop the running turn on relay "linux-test"?',
   );
   const long = formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'create_session', args: { text: 'w'.repeat(500) } });
   assert.ok(long.includes(`“${'w'.repeat(199)}…”`), 'the first 200 characters');

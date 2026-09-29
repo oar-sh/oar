@@ -6,6 +6,10 @@ import { normalizeRemoteRelayOrigin } from '../../shared/remote-relay-contract.m
 // conversation has unlocked (the user mentioned them), and the provenance of
 // messages and conversations another relay's agent created. Tables and
 // columns come from migrations/0005-remote-relays.mjs.
+//
+// A relay whose agent wrote to a conversation is open to that conversation as
+// well. That is read from the provenance, not stored as an unlock, so what the
+// user allowed and what another agent started stay apart.
 
 function parseOrigin(json) {
   if (!json) return null;
@@ -26,6 +30,15 @@ export function createRemoteRelayRepository(db) {
   const getMessageOrigin = db.prepare(`SELECT origin_json FROM messages WHERE id = ?`);
   const setConversationOrigin = db.prepare(`UPDATE conversations SET origin_json = ? WHERE id = ?`);
   const getConversationOrigin = db.prepare(`SELECT origin_json FROM conversations WHERE id = ?`);
+  const listUserMessageOrigins = db.prepare(`
+    SELECT DISTINCT origin_json FROM messages
+    WHERE conversation_id = ? AND role = 'user' AND origin_json IS NOT NULL
+  `);
+  const getLatestHumanMessage = db.prepare(`
+    SELECT id FROM messages
+    WHERE conversation_id = ? AND role = 'user' AND origin_json IS NULL
+    ORDER BY timestamp DESC LIMIT 1
+  `);
 
   return {
     hasUnlock(conversationId, remoteRelayId) {
@@ -65,6 +78,23 @@ export function createRemoteRelayRepository(db) {
     },
     getConversationOrigin(conversationId) {
       return parseOrigin(getConversationOrigin.get(String(conversationId || ''))?.origin_json);
+    },
+    /**
+     * Did an agent on the relay with this instance id (the `relayId` of an
+     * origin, not the local registry id) write to the conversation: by
+     * starting it, or with a prompt in it?
+     */
+    hasContactFrom(conversationId, remoteInstanceId) {
+      const conversation = String(conversationId || '').trim();
+      const instance = String(remoteInstanceId || '').trim();
+      if (!conversation || !instance) return false;
+      if (parseOrigin(getConversationOrigin.get(conversation)?.origin_json)?.relayId === instance) return true;
+      return listUserMessageOrigins.all(conversation)
+        .some((row) => parseOrigin(row.origin_json)?.relayId === instance);
+    },
+    /** The id of the latest message the user wrote themselves, or null. */
+    latestHumanMessageId(conversationId) {
+      return getLatestHumanMessage.get(String(conversationId || ''))?.id || null;
     },
   };
 }

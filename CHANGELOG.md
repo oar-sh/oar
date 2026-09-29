@@ -7,6 +7,15 @@ All notable changes to OAR are documented here. The format follows
 
 ### Changed
 
+- **Remote relays:** agents on paired relays can now work with each other for
+  a whole session. A relay you mentioned stays in reach whatever prompts arrive
+  later, and a relay whose agent wrote to a conversation is open to it, so the
+  agent that was asked can answer, ask back or report later. Until now a prompt
+  from another relay's agent took the tool away for the rest of the turn, also
+  in a turn you had started yourself. A prompt that crossed two relays is still
+  not passed on to a third relay you did not unlock; reading and waiting are no
+  longer limited. After 30 prompts to other relays' agents without a message
+  from you, the next one asks you first.
 - Subagents are folded to their header inside the running turn, so a turn with
   many of them stays short to scroll. The header says how many steps the
   subagent has taken and shows the latest one, as far as there is room. A tap

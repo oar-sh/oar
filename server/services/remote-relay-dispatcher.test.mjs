@@ -386,6 +386,10 @@ function createFakeRemote() {
 function setup({
   relays = [LINUX, SPARE],
   unlocked = ['rr_linux', 'rr_spare'],
+  // Relays (by instance id) whose agents wrote to conversation c-1.
+  contacts = [],
+  // `{ latest }`: the id of the user's latest own message in c-1.
+  humans = { latest: null },
   caller = {},
   requestApproval,
   remote = createFakeRemote(),
@@ -393,7 +397,11 @@ function setup({
   resolveConversationId,
 } = {}) {
   const unlocks = new Set(unlocked.map((relayId) => `c-1:${relayId}`));
-  const repository = { hasUnlock: (conversationId, relayId) => unlocks.has(`${conversationId}:${relayId}`) };
+  const repository = {
+    hasUnlock: (conversationId, relayId) => unlocks.has(`${conversationId}:${relayId}`),
+    hasContactFrom: (conversationId, instanceId) => conversationId === 'c-1' && contacts.includes(instanceId),
+    latestHumanMessageId: () => humans.latest,
+  };
   const logs = [];
   const events = [];
   const approvals = [];
@@ -557,7 +565,7 @@ test('the permission level limits actions: read refuses send, prompt refuses cre
 
 // ─── Hops, rate limits, approval, in-flight ──────────────────────────────────
 
-test('the hop count grows by one per relay and stops above the limit', async () => {
+test('the hop count grows by one per relay', async () => {
   const forwarded = setup({ caller: { hops: 1 } });
   withSession(forwarded.remote);
   const ok = await forwarded.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
@@ -566,12 +574,119 @@ test('the hop count grows by one per relay and stops above the limit', async () 
   assert.equal(post.hops, 2);
   assert.equal(post.body.origin.hops, 2);
   assert.ok(forwarded.remote.calls.every((entry) => entry.hops === 2), 'every call carries the outgoing hop count');
+});
 
-  const tooFar = setup({ caller: { hops: REMOTE_RELAY_LIMITS.hopLimit } });
-  const refused = await tooFar.run('read_session', { relay: 'linux-test', session: 'conv-1' });
+test('a relay the user unlocked stays in reach whatever prompts arrive', async () => {
+  // The turn acts on a prompt that crossed two relays already, from a relay
+  // that is not the one being called.
+  const { run, remote } = setup({
+    unlocked: ['rr_linux'],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit, originRelayIds: [SPARE.relayId] },
+  });
+  withSession(remote);
+  const sent = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  assert.equal(remote.callsTo('POST', '/api/message')[0].hops, REMOTE_RELAY_LIMITS.hopLimit + 1);
+});
+
+test('the relay a prompt came from is open without a mention and may always be answered', async () => {
+  const { run, remote } = setup({
+    unlocked: [],
+    contacts: [LINUX.relayId],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit + 3, originRelayIds: [LINUX.relayId] },
+  });
+  withSession(remote);
+  const listed = await run('list_relays');
+  assert.deepEqual(listed.body.relays.map((relay) => relay.unlocked), [true, false]);
+  const sent = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  // The relay that never wrote here stays locked.
+  const other = await run('relay_info', { relay: 'spare-test' });
+  assert.equal(other.body.code, CODES.locked);
+});
+
+test('the hop limit stops a prompt on its way to a third relay, and reading is never limited', async () => {
+  // linux-test wrote to this conversation earlier, so it is open; the turn
+  // acts on a prompt from spare-test that crossed two relays.
+  const { run, remote } = setup({
+    relays: [LINUX, { ...SPARE, permission: 'full' }],
+    unlocked: [],
+    contacts: [LINUX.relayId, SPARE.relayId],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit, originRelayIds: [SPARE.relayId] },
+  });
+  withSession(remote);
+  const refused = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
   assert.equal(refused.status, 403);
   assert.equal(refused.body.code, CODES.hopLimit);
-  assert.equal(tooFar.remote.calls.length, 0);
+  assert.match(refused.body.error, /mentioning @linux-test/);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+
+  const read = await run('read_session', { relay: 'linux-test', session: 'conv-1' });
+  assert.equal(read.status, 200, JSON.stringify(read.body));
+
+  // Prompts from two relays in one turn: answering one of them passes the
+  // other's words on.
+  const mixed = setup({
+    unlocked: [],
+    contacts: [LINUX.relayId],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit, originRelayIds: [LINUX.relayId, SPARE.relayId] },
+  });
+  withSession(mixed.remote);
+  const alsoRefused = await mixed.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(alsoRefused.body.code, CODES.hopLimit);
+});
+
+test('after 30 prompts to other agents without a word from the user, the user is asked', async () => {
+  const humans = { latest: 'm-human-1' };
+  const { run, remote, approvals, clock } = setup({ humans });
+  withSession(remote);
+  const send = async () => {
+    clock.now += 61_000; // stay clear of the per-minute limits
+    return run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  };
+  for (let index = 0; index < REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking; index += 1) {
+    assert.equal((await send()).status, 200);
+  }
+  assert.equal(approvals.length, 0, 'agent mode asks for nothing until the count is reached');
+  // Reading does not count and is not asked for.
+  assert.equal((await run('read_session', { relay: 'linux-test', session: 'conv-1' })).status, 200);
+  assert.equal(approvals.length, 0);
+
+  assert.equal((await send()).status, 200);
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].agentPrompts, REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking);
+  // Allowed: the count starts again.
+  assert.equal((await send()).status, 200);
+  assert.equal(approvals.length, 1);
+});
+
+test('a message from the user starts the count of agent prompts again, and a Deny refuses', async () => {
+  const humans = { latest: 'm-human-1' };
+  const denied = [];
+  const { run, remote, clock } = setup({
+    humans,
+    requestApproval: async (request) => {
+      denied.push(request);
+      return { approved: false };
+    },
+  });
+  withSession(remote);
+  const send = async () => {
+    clock.now += 61_000;
+    return run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  };
+  for (let index = 0; index < REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking; index += 1) await send();
+  const refused = await send();
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, CODES.approvalDenied);
+  assert.match(refused.body.error, /did not allow more/);
+  assert.equal(denied.length, 1);
+  const posted = remote.callsTo('POST', '/api/message').length;
+  assert.equal(posted, REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking);
+
+  humans.latest = 'm-human-2';
+  assert.equal((await send()).status, 200);
+  assert.equal(denied.length, 1, 'no card after the user wrote');
 });
 
 test('writes are limited to 10 a minute per conversation, calls to 60', async () => {

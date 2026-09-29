@@ -45,6 +45,8 @@ import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs'
 import {
   admitRemoteRelayRequest,
   findMentionedRemoteRelays,
+  findOriginRemoteRelay,
+  formatRemoteRelayOriginHint,
   formatRemoteRelayMentionHint,
   recordRemoteRelayUnlocks,
   withRemoteRelayMentionHint,
@@ -4695,13 +4697,19 @@ export function registerMessagesRoutes(app, deps) {
           trimmedText || '(User sent image attachments only.)',
         ].join('\n')
       : trimmedText;
-    // Only what a human typed unlocks a remote relay (decision 19). The hint
+    // Only what a human typed unlocks a remote relay by mention (decision 19);
+    // a prompt from a relay's agent opens that one relay and no other. The hint
     // rides in the queued prompt only, so the stored message and the user's
     // bubble stay exactly what was typed.
     const mentionedRemoteRelays = remoteRequest.remote
       ? []
       : findMentionedRemoteRelays(remoteRelayInbound, trimmedText);
-    const queueText = withRemoteRelayMentionHint(promptText, formatRemoteRelayMentionHint(mentionedRemoteRelays));
+    // A prompt from another relay's agent opens that relay for this
+    // conversation (it may be answered): the agent is told where it came from.
+    const remoteRelayHint = remoteRequest.remote
+      ? formatRemoteRelayOriginHint(findOriginRemoteRelay(remoteRelayInbound, remoteRequest.origin), remoteRequest.origin)
+      : formatRemoteRelayMentionHint(mentionedRemoteRelays);
+    const queueText = withRemoteRelayMentionHint(promptText, remoteRelayHint);
     // A Resend never came from the composer, and neither did another relay's
     // agent: whatever the user is typing there stays their draft.
     const keepsComposerDraft = !!resendOriginId || remoteRequest.remote;

@@ -54,6 +54,9 @@ export const REMOTE_RELAY_ACTION_PERMISSION = Object.freeze({
 // the calling session runs in ask or plan mode.
 export const REMOTE_RELAY_WRITE_ACTIONS = Object.freeze(['send', 'create_session', 'answer_question', 'stop', 'archive']);
 
+// The write actions that carry an agent's words to another relay's agent.
+export const REMOTE_RELAY_PROMPT_ACTIONS = Object.freeze(['send', 'create_session', 'answer_question']);
+
 export const REMOTE_RELAY_APPROVAL_MODES = Object.freeze(['ask', 'plan']);
 
 export const REMOTE_RELAY_SESSION_SCOPES = Object.freeze(['active', 'recent', 'all']);
@@ -87,7 +90,12 @@ export const REMOTE_RELAY_LIMITS = Object.freeze({
   maxCharsMax: 50000,
   perMessageChars: 4000,
   textMax: 100000,
+  // Only toward a relay the user did not unlock and that is not the one the
+  // prompt came from: a third relay.
   hopLimit: 2,
+  // Prompts a conversation's agent may send to other relays' agents without a
+  // message from the user in between, before the user is asked.
+  agentPromptsBeforeAsking: 30,
   callsPerMinute: 60,
   writesPerMinute: 10,
   healthIntervalMs: 60_000,
@@ -139,8 +147,10 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   'Work with sessions on other OAR relays this relay is paired with ("remote relays"): '
   + 'list the relays, list or read their sessions, prompt a session, start a new one, '
   + 'wait for its reply, and answer or stop it. Use it only when the user asks for work '
-  + 'on another relay or mentions one. Start with {action:"list_relays"}. A relay stays '
-  + 'locked until the user mentions it in this conversation (for example @name); a '
+  + 'on another relay or mentions one, or to answer an agent on another relay that wrote '
+  + 'to this conversation. Start with {action:"list_relays"}. A relay stays locked until '
+  + 'the user mentions it in this conversation (for example @name) or an agent on that '
+  + 'relay writes to it; from then on it stays open for the whole conversation. A '
   + 'locked relay refuses everything except list_relays, so ask the user to mention it. '
   + 'send and create_session queue the prompt and wait up to wait_seconds (default 120, '
   + 'max 600) for the reply. If the remote turn is still running you get status '
@@ -371,6 +381,10 @@ export function remoteRelayPermissionAllows(permission, action) {
 
 export function isRemoteRelayWriteAction(action) {
   return REMOTE_RELAY_WRITE_ACTIONS.includes(action);
+}
+
+export function isRemoteRelayPromptAction(action) {
+  return REMOTE_RELAY_PROMPT_ACTIONS.includes(action);
 }
 
 // ─── Approval cards ──────────────────────────────────────────────────────────

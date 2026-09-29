@@ -120,11 +120,16 @@ function describeRemoteTurn(action, args, caller) {
  * run, then the prompt (or the answer) it wants to send, so the user decides
  * on the actual words. `caller` is the calling session's context.
  */
-export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null } = {}) {
+export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null, agentPrompts = 0 } = {}) {
   const name = toText(relay?.name) || 'a remote relay';
   const verb = APPROVAL_VERBS[action] || toText(action).replace(/_/g, ' ') || 'act';
   const target = args.session ? ` (session ${shortId(args.session)})` : '';
-  const lines = [`Allow the agent to ${verb} on relay "${name}"${target}?`];
+  const lines = [];
+  // The loop guard's card: agents that prompt each other without the user.
+  if (agentPrompts > 0) {
+    lines.push(`The agent has sent ${agentPrompts} prompts to agents on other relays since your last message. Let it go on?`);
+  }
+  lines.push(`Allow the agent to ${verb} on relay "${name}"${target}?`);
   if (action === 'send' || action === 'create_session') {
     const details = describeRemoteTurn(action, args, caller);
     if (details) lines.push(details);
@@ -198,29 +203,34 @@ export function createRemoteRelayCallerContext({
     return rows.find((row) => row.id === liveId) || rows[0];
   }
 
-  function originHops(messageId) {
-    const origin = messageId ? repository?.getMessageOrigin?.(messageId) : null;
+  function messageOrigin(messageId) {
+    return (messageId ? repository?.getMessageOrigin?.(messageId) : null) || null;
+  }
+
+  function originHops(origin) {
     const hops = Number(origin?.hops);
     return Number.isInteger(hops) && hops >= 0 ? hops : 0;
   }
 
   /**
-   * A turn's hops: those of its own user message, or for a continuation row
-   * (no message of its own) those of the latest user message before it, the
-   * turn whose background work it continues.
+   * Where a turn's prompt came from (null for a human's): the origin of its
+   * own user message, or for a continuation row (no message of its own) that
+   * of the latest user message before it, the turn whose background work it
+   * continues.
    */
-  function rowHops(conversationId, row) {
-    if (toText(row.kind).toLowerCase() !== 'continuation') return originHops(row.id);
+  function rowOrigin(conversationId, row) {
+    if (toText(row.kind).toLowerCase() !== 'continuation') return messageOrigin(row.id);
     const at = toText(row.timestamp) || toText(row.processing_at);
     const message = at
       ? getLatestUserMessageAtOrBefore.get(conversationId, at)
       : getLatestUserMessage.get(conversationId);
-    return originHops(message?.id);
+    return messageOrigin(message?.id);
   }
 
   /**
    * `{ conversationId, title, provider, model, effort, mode, processingRowId,
-   * attemptId, userMessageId, hops }` for the conversation making the call.
+   * attemptId, userMessageId, hops, originRelayIds }` for the conversation
+   * making the call.
    * `effort` is the reasoning effort of the live turn, else the one the
    * conversation prefers ('' when neither is known).
    * `hops` is how many relays the current turn's prompt already crossed: 0
@@ -229,6 +239,8 @@ export function createRemoteRelayCallerContext({
    * conversation's processing rows wins (a background continuation counts as
    * the turn it continues); without a turn (an off-turn call) the latest user
    * message decides.
+   * `originRelayIds` are the relays (their instance ids) those prompts came
+   * from: empty when the agent acts on the user's words alone.
    */
   function getCallerContext(conversationId) {
     const id = toText(conversationId);
@@ -236,9 +248,11 @@ export function createRemoteRelayCallerContext({
     const runtime = getRuntimeSession.get(id) || null;
     const rows = listProcessingRows.all(id);
     const live = liveTurnRow(id, rows);
-    const hops = rows.length
-      ? Math.max(...rows.map((row) => rowHops(id, row)))
-      : originHops(getLatestUserMessage.get(id)?.id);
+    const origins = (rows.length
+      ? rows.map((row) => rowOrigin(id, row))
+      : [messageOrigin(getLatestUserMessage.get(id)?.id)]).filter(Boolean);
+    const hops = Math.max(0, ...origins.map(originHops));
+    const originRelayIds = [...new Set(origins.map((origin) => toText(origin.relayId)))];
     return {
       conversationId: id,
       title: toText(conversation?.title),
@@ -250,6 +264,7 @@ export function createRemoteRelayCallerContext({
       attemptId: toText(live?.attempt_id) || null,
       userMessageId: live?.id || null,
       hops,
+      originRelayIds,
     };
   }
 
@@ -270,8 +285,11 @@ export function createRemoteRelayCallerContext({
    * denied, timed out, cancelled with the turn, or no turn to ask on (fails
    * closed with REMOTE_RELAY_NO_ACTIVE_TURN). Waits as long as the question
    * lives (8 h by default); `signal` withdraws the card early.
+   * `agentPrompts` (the loop guard) is how many prompts the agent has sent to
+   * other relays' agents since the user last wrote; the card then asks for
+   * that, in any relay mode.
    */
-  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal } = {}) {
+  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal, agentPrompts = 0 } = {}) {
     const rowId = toText(callerContext?.processingRowId);
     const row = rowId ? getQueueRow.get(rowId) : null;
     if (!row || row.status !== 'processing') {
@@ -285,10 +303,12 @@ export function createRemoteRelayCallerContext({
     const createdAt = now().toISOString();
     const questionId = String(uuid());
     const relayMode = normalizeMode(row.relay_mode);
-    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext });
+    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts });
     const context = sanitizeRelayQuestionContext({
       source: REMOTE_RELAY_APPROVAL_SOURCE,
-      rationale: `Write actions on other relays need approval in ${relayMode} mode.`,
+      rationale: agentPrompts > 0
+        ? 'Agents on different relays that keep prompting each other need your go from time to time.'
+        : `Write actions on other relays need approval in ${relayMode} mode.`,
       queueMessageId: row.id,
       conversationId: toText(conversationId) || row.conversation_id,
       relayMode,
