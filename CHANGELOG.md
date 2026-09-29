@@ -22,6 +22,11 @@ All notable changes to OAR are documented here. The format follows
   when another line of activity arrives or the page reloads.
 - Links in the file viewer and in plan boards have a colour that can be read in
   dark mode; they used the browser's default blue.
+- A question or approval card no longer answers itself when the relay is
+  briefly unreachable, for example while it restarts. One failed check used to
+  end the wait: the agent was told to use its own judgement, or the approval
+  was refused, while the card stayed on screen. The wait now lasts through the
+  outage, for every provider.
 
 ## [0.9.5] — 2026-09-27
 

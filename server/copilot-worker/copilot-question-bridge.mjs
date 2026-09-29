@@ -23,6 +23,7 @@
 // question array. Composing the waiter instead of copying it keeps one
 // implementation of the abort semantics.
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { createRelayQuestion } from '../../shared/question-wait.mjs';
 import { looksLikeMultiSelectQuestion } from '../../shared/question-multi-select.mjs';
 import {
   DEFAULT_QUESTION_TIMEOUT_MS,
@@ -139,10 +140,7 @@ export function createCopilotQuestionBridge({
         ...extra,
       },
     };
-    const created = await api('POST', '/api/relay-question', payload);
-    const questionId = created?.question?.id;
-    if (!questionId) throw new Error('Relay question could not be created');
-    return questionId;
+    return createRelayQuestion({ api, payload, dbg });
   }
 
   async function ask(spec, { signal, message } = {}) {

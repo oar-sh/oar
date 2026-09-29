@@ -1,7 +1,5 @@
-import {
-  DEFAULT_QUESTION_TIMEOUT_MS,
-  QUESTION_TIMEOUT_CONTINUATION_TEXT,
-} from './question-timeout.mjs';
+import { DEFAULT_QUESTION_TIMEOUT_MS } from './question-timeout.mjs';
+import { createRelayQuestion, waitForRelayQuestion } from './question-wait.mjs';
 
 function sleepDefault(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -56,38 +54,17 @@ export function createAskUserBridge({
   // `timeoutMs` overrides the bridge-wide default for one wait (a structured
   // elicitation may carry its own deadline). Additive: existing callers pass
   // only `signal` and behave exactly as before.
-  async function waitForRelayQuestionAnswer(questionId, { signal, timeoutMs } = {}) {
-    const started = Date.now();
-    const deadlineMs = timeoutMs ?? questionTimeoutMs;
-    while (true) {
-      if (signal?.aborted) {
-        await api('POST', `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
-        return { answer: QUESTION_TIMEOUT_CONTINUATION_TEXT, timedOut: true, aborted: true };
-      }
-      const { question } = await api('GET', `/api/relay-question/${questionId}`);
-      if (!question) throw new Error('Relay question missing');
-      if (question.status === 'answered') {
-        return {
-          answer: String(question.answer || '').trim(),
-          // The validated structured submission, when the card carried a
-          // `requestedSchema` and the relay stored one. Null otherwise — flat
-          // consumers read `answer` and never see a shape change.
-          structuredAnswer: question.structuredAnswer && typeof question.structuredAnswer === 'object'
-            && !Array.isArray(question.structuredAnswer)
-            ? question.structuredAnswer
-            : null,
-          timedOut: false,
-        };
-      }
-      if (question.status === 'timed_out' || question.status === 'cancelled') {
-        return { answer: QUESTION_TIMEOUT_CONTINUATION_TEXT, timedOut: true };
-      }
-      if (Date.now() - started >= deadlineMs) {
-        await api('POST', `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
-        return { answer: QUESTION_TIMEOUT_CONTINUATION_TEXT, timedOut: true };
-      }
-      await sleep(questionPollMs);
-    }
+  // The wait survives a relay that is briefly not there (question-wait.mjs).
+  function waitForRelayQuestionAnswer(questionId, { signal, timeoutMs } = {}) {
+    return waitForRelayQuestion({
+      api,
+      questionId,
+      deadlineMs: timeoutMs ?? questionTimeoutMs,
+      pollMs: questionPollMs,
+      sleep,
+      signal,
+      dbg,
+    });
   }
 
   async function askSingleQuestion(entry, { signal } = {}) {
@@ -124,9 +101,7 @@ export function createAskUserBridge({
         multiSelect: entry.multiSelect || undefined,
       },
     };
-    const created = await api('POST', '/api/relay-question', questionPayload);
-    const questionId = created?.question?.id;
-    if (!questionId) throw new Error('Relay question could not be created');
+    const questionId = await createRelayQuestion({ api, payload: questionPayload, sleep, signal, dbg });
     dbg('relay question created', questionId, 'prompt=', entry.question.slice(0, 80));
     return waitForRelayQuestionAnswer(questionId, { signal });
   }

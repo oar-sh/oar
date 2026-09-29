@@ -1,5 +1,5 @@
 import { getActiveSession } from '../runtime/session-registry.mjs';
-import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
+import { createRelayQuestion, waitForRelayQuestion } from "../../../../shared/question-wait.mjs";
 import { extractRequestedSchema } from "../../../../shared/question-schema.mjs";
 
 export function createQuestionBridge({
@@ -49,39 +49,18 @@ export function createQuestionBridge({
     return Number.isFinite(fallback) && fallback >= 0 ? fallback : 0;
   }
 
-  async function waitForRelayQuestionAnswer(questionId, timeoutMs = null) {
-    const started = Date.now();
-    const effectiveTimeoutMs = resolveQuestionWaitTimeoutMs(timeoutMs);
-
-    while (true) {
-      const { question } = await api("GET", `/api/relay-question/${questionId}`);
-      if (!question) throw new Error("Relay question missing");
-      if (question.status === "answered") {
-        return {
-          answer: String(question.answer || ""),
-          structuredAnswer: question.structuredAnswer && typeof question.structuredAnswer === "object"
-            ? question.structuredAnswer
-            : null,
-          timedOut: false,
-        };
-      }
-      if (question.status === "timed_out" || question.status === "cancelled") {
-        return {
-          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
-          structuredAnswer: null,
-          timedOut: true,
-        };
-      }
-      if (Date.now() - started >= effectiveTimeoutMs) {
-        await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
-        return {
-          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
-          structuredAnswer: null,
-          timedOut: true,
-        };
-      }
-      await sleep(questionPollMs);
-    }
+  // The wait survives a relay that is briefly not there
+  // (shared/question-wait.mjs).
+  function waitForRelayQuestionAnswer(questionId, timeoutMs = null) {
+    return waitForRelayQuestion({
+      api,
+      questionId,
+      deadlineMs: resolveQuestionWaitTimeoutMs(timeoutMs),
+      pollMs: questionPollMs,
+      sleep,
+      trimAnswer: false,
+      dbg,
+    });
   }
 
   async function forwardRelayQuestion(request) {
@@ -112,11 +91,7 @@ export function createQuestionBridge({
       request: serializeRequest(request),
     };
 
-    const created = await api("POST", "/api/relay-question", questionPayload);
-    const questionId = created?.question?.id;
-    if (!questionId) {
-      throw new Error("Relay question could not be created");
-    }
+    const questionId = await createRelayQuestion({ api, payload: questionPayload, sleep, dbg });
 
     dbg(
       "relay question created",

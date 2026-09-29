@@ -6,7 +6,7 @@ import {
 } from "../runtime/send-and-wait-errors.mjs";
 import { getActiveSession } from "../runtime/session-registry.mjs";
 import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
-import { QUESTION_TIMEOUT_CONTINUATION_TEXT } from "../../../../shared/question-timeout.mjs";
+import { waitForRelayQuestion } from "../../../../shared/question-wait.mjs";
 import { EMPTY_TURN_COMPLETION_NOTE } from "../../../../shared/empty-turn-completion.mjs";
 import { stripPromptContextPrefix } from "../skills/prompt-context.mjs";
 
@@ -473,37 +473,17 @@ export function createPollingLoop({
     return null;
   };
 
-  async function waitForRelayQuestionAnswer(questionId, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS, pollIntervalMs = 1500) {
-    const started = Date.now();
-    while (true) {
-      const { question } = await api("GET", `/api/relay-question/${questionId}`);
-      if (!question) throw new Error("Relay question missing");
-      if (question.status === "answered") {
-        return {
-          answer: String(question.answer || "").trim(),
-          structuredAnswer: question.structuredAnswer && typeof question.structuredAnswer === "object"
-            ? question.structuredAnswer
-            : null,
-          timedOut: false,
-        };
-      }
-      if (question.status === "timed_out" || question.status === "cancelled") {
-        return {
-          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
-          structuredAnswer: null,
-          timedOut: true,
-        };
-      }
-      if (Date.now() - started >= timeoutMs) {
-        await api("POST", `/api/relay-question/${questionId}/timeout`, {}).catch(() => {});
-        return {
-          answer: QUESTION_TIMEOUT_CONTINUATION_TEXT,
-          structuredAnswer: null,
-          timedOut: true,
-        };
-      }
-      await sleep(pollIntervalMs);
-    }
+  // The wait survives a relay that is briefly not there
+  // (shared/question-wait.mjs).
+  function waitForRelayQuestionAnswer(questionId, timeoutMs = DEFAULT_QUESTION_TIMEOUT_MS, pollIntervalMs = 1500) {
+    return waitForRelayQuestion({
+      api,
+      questionId,
+      deadlineMs: timeoutMs,
+      pollMs: pollIntervalMs,
+      sleep,
+      dbg,
+    });
   }
 
   async function processPendingSdkSessionDeletes() {
