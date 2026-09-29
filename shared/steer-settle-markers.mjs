@@ -18,6 +18,14 @@ export const STEER_FOLDED_TEXT = '_(Handled together with the previous reply —
 export const STEER_STOPPED_TEXT = '_(Stopped with the turn — not answered.)_';
 
 /**
+ * A steer folded into a turn that then failed: never answered, and the
+ * failure itself is told once, on the reply of the turn. Stamped
+ * kind='stopped' like the steer of a stopped turn, so the client offers the
+ * same Resend.
+ */
+export const STEER_TURN_FAILED_TEXT = '_(Steered into the turn above, which failed — not answered.)_';
+
+/**
  * Not a steer: a message delivered between turns whose answer the worker
  * published on a background-continuation row, because it took the turn for one
  * the CLI had opened by itself. Stamped with a kind of its own: it is a

@@ -920,7 +920,8 @@ test('a continuation that stalls fails its own row rather than holding it open',
 
   const failed = responsesFor(stub, 'cont-1')[0];
   assert.equal(failed.terminalError.kind, 'copilot-turn-failed');
-  assert.match(failed.text, /Retry or send a new message/);
+  assert.equal(failed.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.match(failed.text, /sent nothing for 0s/);
   assert.equal(runner.isTurnActive(), false);
   await runner.dispose();
 });

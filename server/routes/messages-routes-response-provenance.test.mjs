@@ -203,6 +203,29 @@ test('a terminal failure records provenance and keeps the turn\'s thoughts', asy
   );
 });
 
+test('a terminal failure keeps what the turn had written above the failure note', async () => {
+  const { deps, calls } = makeDeps({ queueRow: { ...processingRow } });
+  const { status } = await invokeResponse(deps, {
+    messageId: 'q-1',
+    conversationId: 'conv-1',
+    text: 'System note: the turn ended.',
+    partialText: 'The first two files are updated.',
+    terminalError: {
+      code: 'turn-stalled',
+      stableCode: 'copilot.turn-stalled',
+      message: 'System note: the turn ended.',
+      guidance: 'Send a message to continue.',
+    },
+  });
+  assert.equal(status, 200);
+  const saved = calls.find((call) => call.stmt === 'insertMsg');
+  assert.equal(
+    saved.args[3],
+    'The first two files are updated.\n\n'
+      + 'System note: the turn ended. Error code: relay.copilot-turn-stalled. Send a message to continue.',
+  );
+});
+
 test('a worker answering another conversation\'s turn is flagged as a conversation mismatch', async (t) => {
   const warns = t.mock.method(console, 'warn', () => {});
   const { deps } = makeDeps({

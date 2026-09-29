@@ -302,5 +302,5 @@ test('a failed remote_relay call releases the hold, and the watchdog works again
   assert.equal(runner._getState().pendingRelayToolCalls, 0);
   // Nothing holds the silent runtime any more: the watchdog fails the row.
   assert.equal(await pending, true);
-  assert.match(stub.bodiesFor('/api/response')[0].text, /watchdog/);
+  assert.equal(stub.bodiesFor('/api/response')[0].terminalError.stableCode, 'copilot.turn-stalled');
 });

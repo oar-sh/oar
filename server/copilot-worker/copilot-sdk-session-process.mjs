@@ -48,10 +48,12 @@ import { randomUUID } from 'crypto';
 
 import {
   USER_INPUT_UNSUPPORTED_ANSWER,
+  COPILOT_TURN_CONTINUE_GUIDANCE,
   classifyCopilotSessionError,
   classifyCopilotTurnException,
   copilotAgentModeForRelayMode,
   createCopilotPermissionHandler,
+  createTurnStalledError,
   isReadOnlyPermissionRequest,
   isSessionNotFoundError,
   observeRuntimeExit,
@@ -102,7 +104,7 @@ import {
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/model-descriptors.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
-import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT } from '../../shared/steer-settle-markers.mjs';
+import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT, STEER_TURN_FAILED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { buildSteerSettleFailure } from '../../shared/steer-settle-failure.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
 import { withSteerNote } from '../../shared/steer-note.mjs';
@@ -188,6 +190,16 @@ const DEFAULT_TASK_PUBLISH_THROTTLE_MS = 2_000;
  * Claude worker's fold grace, for the same reason.
  */
 const DEFAULT_ORPHAN_GRACE_MS = 2_000;
+/**
+ * How long a runtime teardown may wait on the runtime itself. A healthy one
+ * answers `session.detach` and stops in well under a second; one whose model
+ * stream had stalled took 180 s to answer the detach alone (runtime 1.0.88,
+ * 2026-09-27), and the SDK puts no timeout on that request. Past the first
+ * window the session is left to the stop, past the second the process is
+ * killed (`forceStop`).
+ */
+const DEFAULT_RUNTIME_DETACH_TIMEOUT_MS = 10_000;
+const DEFAULT_RUNTIME_STOP_TIMEOUT_MS = 25_000;
 
 /**
  * Appended to the partial answer when the RUNTIME interrupted the turn on its
@@ -349,6 +361,8 @@ export function createCopilotSdkSessionRunner({
   maxTerminalSettleAttempts = DEFAULT_MAX_TERMINAL_SETTLE_ATTEMPTS,
   queueLaneRefreshMs = DEFAULT_QUEUE_LANE_REFRESH_MS,
   orphanGraceMs = DEFAULT_ORPHAN_GRACE_MS,
+  runtimeDetachTimeoutMs = DEFAULT_RUNTIME_DETACH_TIMEOUT_MS,
+  runtimeStopTimeoutMs = DEFAULT_RUNTIME_STOP_TIMEOUT_MS,
   // Register the relay's own `ask_user` (with `multi_select`) over the
   // runtime's built-in one. A runtime that refuses the override falls back
   // to the built-in for the rest of this worker's life.
@@ -415,6 +429,11 @@ export function createCopilotSdkSessionRunner({
   // test seam only: the turn path never awaits a snapshot.
   let modelSnapshotChain = Promise.resolve();
   let starting = null;
+  // The teardown of the previous runtime while it is still in flight. The next
+  // runtime waits for it: the relay session id IS the SDK session id, so a
+  // second runtime resuming the session while the first still holds it would
+  // have two processes writing one event log.
+  let runtimeStopping = null;
   let disposed = false;
   let detachRuntimeExit = () => {};
   // A compaction in progress (`session.compaction_start` seen, no `_complete`
@@ -906,7 +925,7 @@ export function createCopilotSdkSessionRunner({
    */
   async function publishResponse(message, {
     text, model, terminalError = null, modelOrigin, kind = null, consumedSteerIds = null,
-    requeueOnFailure = true,
+    requeueOnFailure = true, partialText = '',
   }) {
     const consumed = Array.isArray(consumedSteerIds)
       ? consumedSteerIds
@@ -922,6 +941,9 @@ export function createCopilotSdkSessionRunner({
         modelOrigin: modelOrigin
           || (String(message?.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual'),
         ...(terminalError ? { terminalError } : {}),
+        // What the turn had written before it failed; the relay keeps it
+        // above the failure note.
+        ...(terminalError && String(partialText || '').trim() ? { partialText: String(partialText).trim() } : {}),
         ...(kind ? { kind } : {}),
         ...(consumed.length ? { consumedSteerIds: consumed } : {}),
         ...attemptFields(message),
@@ -942,12 +964,24 @@ export function createCopilotSdkSessionRunner({
     }
   }
 
-  function terminalErrorRecord(message, classified) {
+  /**
+   * `toolCalls` is how many tool calls the failed turn had started. They ran,
+   * and what they changed stays changed, so the note says so: a failure that
+   * reads as if nothing happened sends the user back to the start of work
+   * that is mostly done.
+   */
+  function terminalErrorRecord(message, classified, { toolCalls = 0 } = {}) {
+    const worked = toolCalls > 0;
+    const work = worked
+      ? ` Before that the agent made ${toolCalls} tool call${toolCalls === 1 ? '' : 's'}; what they changed is still in place.`
+      : '';
+    const guidance = worked && classified.guidance ? COPILOT_TURN_CONTINUE_GUIDANCE : classified.guidance;
     return {
       kind: 'copilot-turn-failed',
       code: classified.code,
       stableCode: classified.stableCode,
-      message: classified.text,
+      message: `${classified.text}${classified.guidance ? work : ''}`,
+      ...(guidance ? { guidance } : {}),
       failedAt: new Date().toISOString(),
       queueMessageId: String(message.id || '') || null,
     };
@@ -1719,6 +1753,7 @@ export function createCopilotSdkSessionRunner({
       return;
     }
     turn.armStall?.();
+    if (String(event?.type || '') === 'tool.execution_start') turn.toolCalls += 1;
     // Root work ends on the runtime's own terminator, so a question-only
     // continuation it joins no longer closes itself (whileAwaitingHuman).
     if (isContinuationOpeningEvent(event)) turn.rootWork = true;
@@ -2088,6 +2123,7 @@ export function createCopilotSdkSessionRunner({
   }
 
   async function ensureClient() {
+    while (runtimeStopping) await runtimeStopping;
     if (client) return client;
     if (starting) return starting;
     starting = (async () => {
@@ -2284,14 +2320,60 @@ export function createCopilotSdkSessionRunner({
     sessionRpc = { queue: false, interruptMainTurn: false, tasks: false };
     askUserOverrideRejected = false;
     syncDeliveryReadiness();
-    if (!closingSession && !closingClient) return;
+    if (!closingSession && !closingClient) {
+      // Nothing of its own to close, but a caller that asked for a stopped
+      // runtime (the worker's shutdown) gets one.
+      if (runtimeStopping) await runtimeStopping;
+      return;
+    }
     dbg(`stopping the copilot runtime (${reason})`);
-    try { await closingSession?.disconnect?.(); } catch (error) {
-      dbg('session disconnect failed', error?.message || String(error));
+    const previous = runtimeStopping;
+    const closing = (async () => {
+      if (previous) await previous;
+      await closeRuntime(closingSession, closingClient);
+    })();
+    runtimeStopping = closing;
+    try {
+      await closing;
+    } finally {
+      if (runtimeStopping === closing) runtimeStopping = null;
     }
-    try { await closingClient?.stop?.(); } catch (error) {
-      dbg('client stop failed', error?.message || String(error));
+  }
+
+  /**
+   * Close a runtime whose handles were already dropped. Every step is bounded:
+   * the callers are the failure paths, where the runtime is the thing that
+   * stopped answering. Never rejects.
+   */
+  async function closeRuntime(closingSession, closingClient) {
+    const startedAt = Date.now();
+    const bounded = (work, ms) => withTimeout(
+      Promise.resolve().then(work).then((value) => {
+        // `client.stop()` reports what it could not close instead of throwing.
+        for (const error of Array.isArray(value) ? value : []) dbg('runtime stop reported', error?.message || String(error));
+        return 'done';
+      }, (error) => error),
+      ms,
+      'timeout',
+    );
+    if (closingSession?.disconnect) {
+      const detached = await bounded(() => closingSession.disconnect(), runtimeDetachTimeoutMs);
+      if (detached === 'timeout') dbg(`session disconnect did not answer within ${runtimeDetachTimeoutMs}ms; stopping the runtime without it`);
+      else if (detached !== 'done') dbg('session disconnect failed', detached?.message || String(detached));
     }
+    if (closingClient?.stop) {
+      const stopped = await bounded(() => closingClient.stop(), runtimeStopTimeoutMs);
+      if (stopped === 'timeout') {
+        dbg(`client stop did not finish within ${runtimeStopTimeoutMs}ms; killing the runtime`);
+        const killed = closingClient.forceStop
+          ? await bounded(() => closingClient.forceStop(), runtimeDetachTimeoutMs)
+          : 'done';
+        if (killed !== 'done') dbg('runtime kill did not finish', killed === 'timeout' ? 'timeout' : killed?.message || String(killed));
+      } else if (stopped !== 'done') {
+        dbg('client stop failed', stopped?.message || String(stopped));
+      }
+    }
+    dbg(`copilot runtime stopped after ${Date.now() - startedAt}ms`);
   }
 
   // -------------------------------------------------------------- lifecycle --
@@ -2488,6 +2570,11 @@ export function createCopilotSdkSessionRunner({
       // The row the user pressed Stop on (from the abort control), when known.
       abortedRowId: null,
       stallTimer: null,
+      // The runtime teardown a failure started (see `fail`).
+      teardown: null,
+      // Tool calls this turn started, whichever agent made them. Told in the
+      // failure note when the turn fails.
+      toolCalls: 0,
       planBoardPosted: false,
       // Set when a mutating tool was actually approved and run this turn.
       acted: false,
@@ -2596,6 +2683,22 @@ export function createCopilotSdkSessionRunner({
       if (turn.settled) return;
       turn.settled = true;
       turn.disarmStall();
+      // A delivered turn that failed (a stall, a runtime death, a setup
+      // failure) leaves a runtime nothing else can use. The teardown drops the
+      // handles in this very tick, before the turn gives up the event stream
+      // and the worker reads as ready again, so the next delivery rebuilds
+      // instead of sending into it. It is awaited only after the failure is
+      // published (driveTurn): a runtime that stopped answering also takes
+      // its time to stop, and the user waited three minutes for a failure
+      // that was already decided (2026-09-27).
+      //
+      // An UNCONFIRMED MODEL SWITCH is the exception: the session is healthy
+      // and merely still on its previous model, and tearing the runtime down
+      // over it would kill any live background work for a selection problem
+      // the user fixes by picking another model.
+      if (turn.kind === 'delivered' && !isModelSwitchUnconfirmedError(error) && (session || client)) {
+        turn.teardown = stopRuntime('turn-failure').catch(() => {});
+      }
       beginPublishing(turn);
       turn.resolvePrimaryReady();
       syncDeliveryReadiness();
@@ -2619,10 +2722,7 @@ export function createCopilotSdkSessionRunner({
           turn.armStall();
           return;
         }
-        turn.fail(new Error(
-          `copilot worker watchdog: the runtime produced no events for ${Math.round(turnStallTimeoutMs / 1000)}s; `
-          + 'the row is failed — resend the message to retry',
-        ));
+        turn.fail(createTurnStalledError(turnStallTimeoutMs));
       }, turnStallTimeoutMs);
       turn.stallTimer.unref?.();
     };
@@ -2830,17 +2930,26 @@ export function createCopilotSdkSessionRunner({
         }
         case 'error': {
           const { classified } = outcome;
-          await publishFinalStream(entry.message, entry.state.lastStreamedText);
+          const written = finalTextFor(turn, entry, turn.result);
+          const terminalError = terminalErrorRecord(entry.message, classified, { toolCalls: turn.toolCalls });
+          await publishFinalStream(entry.message, written || entry.state.lastStreamedText);
           await publishResponse(entry.message, {
-            text: classified.text,
+            text: terminalError.message,
             model,
-            terminalError: terminalErrorRecord(entry.message, classified),
+            terminalError,
+            partialText: written,
             consumedSteerIds: folded.map((other) => other.message),
           });
           break;
         }
         case 'folded':
           await publishSettleMarker(entry.message, { text: STEER_FOLDED_TEXT, model, kind: 'folded', variant: 'folded' });
+          break;
+        case 'failed-with-turn':
+          // The runtime had taken this steer into a run that failed. The
+          // failure is told on that run's reply; this row only says where to
+          // look, and offers Resend like the steer of a stopped turn.
+          await publishSettleMarker(entry.message, { text: STEER_TURN_FAILED_TEXT, model, kind: 'stopped', variant: 'turnFailed' });
           break;
         case 'stopped':
           await publishSettleMarker(entry.message, { text: STEER_STOPPED_TEXT, model, kind: 'stopped', variant: 'stopped' });
@@ -2866,7 +2975,7 @@ export function createCopilotSdkSessionRunner({
     for (const other of folded) {
       const foldOutcome = outcome.type === 'completed' || outcome.type === 'merged-note'
         ? { type: 'folded' }
-        : outcome.type === 'error' ? outcome : { type: 'stopped' };
+        : outcome.type === 'error' ? { type: 'failed-with-turn' } : { type: 'stopped' };
       await settleEntry(turn, other, foldOutcome);
     }
   }
@@ -3182,16 +3291,8 @@ export function createCopilotSdkSessionRunner({
         }
       }
     } catch (error) {
-      // A failure that killed the session (or came from starting it) leaves a
-      // handle nothing else can use; drop it so the next delivery rebuilds and
-      // resumes rather than sending into a dead runtime. An UNCONFIRMED MODEL
-      // SWITCH is the exception: the session is healthy and merely still on
-      // its previous model, and tearing the runtime down over it would kill
-      // any live background work for a selection problem the user fixes by
-      // picking another model.
-      if (!isModelSwitchUnconfirmedError(error)) {
-        await stopRuntime('turn-failure').catch(() => {});
-      }
+      // A failure that killed the session (or came from starting it); the
+      // turn's own `fail` drops the handles nothing else can use.
       turn.fail(error);
     }
     // `send()` resolving is NOT the turn's completion; the event stream is.
@@ -3237,11 +3338,6 @@ export function createCopilotSdkSessionRunner({
     if (!turn.aborted && !turn.failure && turn.humanRequests > 0) await turn.humansIdle;
     try {
       await quiesceTurn(turn);
-      if (turn.failure && turn.kind === 'delivered' && !isModelSwitchUnconfirmedError(turn.failure) && session) {
-        // A stall or a runtime death mid-turn (a setup failure already tore
-        // the runtime down in runTurn).
-        await stopRuntime('turn-failure').catch(() => {});
-      }
       if (turn.kind === 'continuation') {
         // Nothing can be published before the row exists. The buffer is
         // drained by the registration itself; this only covers actions that
@@ -3274,6 +3370,8 @@ export function createCopilotSdkSessionRunner({
       // Early settles still in flight must land before the rows stop being
       // reported (settleEntry never rejects, but this is the ordering guard).
       await Promise.allSettled(turn.settlePromises);
+      // The rows are settled; the runner is quiescent once the runtime is gone.
+      if (turn.teardown) await turn.teardown;
       controlPoller?.stop?.(turn.controlState);
       turn.controlState = null;
       // Every path through the turn — published, failed, aborted, threw — has

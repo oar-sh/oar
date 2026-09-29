@@ -17,6 +17,7 @@ import {
 } from './copilot-sdk-test-harness.mjs';
 import { USER_INPUT_UNSUPPORTED_ANSWER } from './copilot-sdk-adapter.mjs';
 import { RUNTIME_INTERRUPTED_NOTE } from './copilot-sdk-session-process.mjs';
+import { STEER_TURN_FAILED_TEXT } from '../../shared/steer-settle-markers.mjs';
 
 const bodyOf = (stub, route) => stub.bodiesFor(route)[0] || null;
 const lastBodyOf = (stub, route) => stub.bodiesFor(route).slice(-1)[0] || null;
@@ -906,8 +907,159 @@ test('the stall watchdog fails a silent turn terminally', async () => {
 
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
   const response = bodyOf(stub, '/api/response');
-  assert.equal(response.terminalError.stableCode, 'copilot.turn-error');
-  assert.match(response.text, /produced no events for 0s|watchdog/);
+  assert.equal(response.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.match(response.text, /the Copilot runtime sent nothing for 0s, so the relay ended the turn/);
+  // Nothing ran, so there is nothing to continue from: the advice is a retry,
+  // and never the relay's default ("restart the relay").
+  assert.equal(response.terminalError.guidance, 'Send the message again to retry.');
+});
+
+test('a failed turn keeps what the agent wrote and says that its tool calls ran', async () => {
+  // A long turn: prose, then tool calls, then silence. Publishing
+  // only the failure note made it read as if nothing had happened, while the
+  // files the tools wrote were already on disk.
+  const stub = makeApiStub();
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'assistant.message', data: { messageId: 'm1', content: 'The first file is done.' } },
+      { type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'view', arguments: { path: 'notes.md' } } },
+      { type: 'tool.execution_complete', data: { toolCallId: 'call-1', success: true, result: { content: 'ok' } } },
+      { type: 'tool.execution_start', data: { toolCallId: 'call-2', toolName: 'view', arguments: { path: 'plan.md' } } },
+      { type: 'tool.execution_complete', data: { toolCallId: 'call-2', success: true, result: { content: 'ok' } } },
+    ],
+  ]);
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 30 });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  const response = bodyOf(stub, '/api/response');
+  assert.equal(response.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.equal(response.partialText, 'The first file is done.');
+  assert.match(response.terminalError.message, /Before that the agent made 2 tool calls; what they changed is still in place\./);
+  assert.match(response.terminalError.guidance, /^Send a message to continue/);
+  assert.doesNotMatch(`${response.text} ${response.terminalError.guidance}`, /restart the relay/i);
+});
+
+test('a steer folded into a turn that fails gets a marker, not a second failure note', async () => {
+  const stub = makeApiStub();
+  const client = steeringClient([
+    (id) => [userMessage(id, 'idle', 'hello')],
+    (id) => [userMessage(id, 'steering', 'also check the footer')],
+  ]);
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 60 });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+
+  const responses = stub.bodiesFor('/api/response');
+  const failed = responses.find((r) => r.messageId === 'q-1');
+  assert.equal(failed.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.deepEqual(failed.consumedSteerIds.map((entry) => entry.id), ['q-2']);
+  const marker = responses.find((r) => r.messageId === 'q-2');
+  assert.equal(marker.kind, 'stopped');
+  assert.equal(marker.text, STEER_TURN_FAILED_TEXT);
+  assert.equal(marker.terminalError, undefined);
+});
+
+test('a failure is published before the runtime has finished stopping', async () => {
+  // A runtime that stopped answering also takes its time to stop: the detach
+  // of one whose model stream had stalled took 180 s, and the user was shown
+  // the failure only after it.
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient();
+  let releaseDetach = null;
+  const createSession = client.createSession.bind(client);
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    session.disconnect = () => new Promise((resolve) => { releaseDetach = resolve; });
+    return session;
+  };
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 20 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => stub.bodiesFor('/api/response').length === 1, { label: 'failure published' });
+  // Published, and the runtime is still detaching: the handles are dropped
+  // (nothing may be sent into it) but the runner is not quiescent yet.
+  assert.equal(typeof releaseDetach, 'function');
+  assert.equal(client.stopped, 0);
+  assert.equal(runner._getState().hasSession, false);
+  assert.equal(runner.isTurnActive(), true);
+
+  releaseDetach();
+  assert.equal(await pending, true);
+  assert.equal(client.stopped, 1);
+  assert.equal(runner.isTurnActive(), false);
+});
+
+test('a runtime that will not detach or stop is killed after the bounded waits', async () => {
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient();
+  const createSession = client.createSession.bind(client);
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    session.disconnect = () => new Promise(() => {});
+    return session;
+  };
+  client.stop = () => new Promise(() => {});
+  client.forceStopped = 0;
+  client.forceStop = async () => { client.forceStopped += 1; };
+  const { runner } = makeRunner({
+    stub, client, turnStallTimeoutMs: 20, runtimeDetachTimeoutMs: 20, runtimeStopTimeoutMs: 20,
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(client.forceStopped, 1);
+  assert.equal(runner.isTurnActive(), false);
+});
+
+test('the next delivery waits for the previous runtime to stop before it starts one', async () => {
+  // The relay session id is the SDK session id: a second runtime resuming the
+  // session while the first still holds it would have two processes writing
+  // one event log.
+  const stub = makeApiStub();
+  let releaseDetach = null;
+  const first = createFakeCopilotClient();
+  const createSession = first.createSession.bind(first);
+  first.createSession = async (config) => {
+    const session = await createSession(config);
+    session.disconnect = () => new Promise((resolve) => { releaseDetach = resolve; });
+    return session;
+  };
+  const second = createFakeCopilotClient({
+    resumeAvailable: true,
+    onSend: (session) => session.replay(loadFixture('happy-turn')),
+  });
+  const clients = [first, second];
+  const started = [];
+  const { runner } = makeRunner({
+    stub,
+    client: first,
+    turnStallTimeoutMs: 20,
+    startClientImpl: async (options) => {
+      const client = clients[started.length];
+      started.push(client);
+      return { sdk: {}, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
+    },
+  });
+
+  const failing = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => stub.bodiesFor('/api/response').length === 1, { label: 'failure published' });
+  const next = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await tick(30);
+  assert.equal(started.length, 1, 'no second runtime while the first is still stopping');
+
+  releaseDetach();
+  assert.equal(await failing, true);
+  assert.equal(await next, true);
+  assert.equal(started.length, 2);
+  assert.equal(first.stopped, 1);
+  const answered = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
+  assert.equal(answered.terminalError, undefined);
 });
 
 test('a stall that fires before anything awaits the turn is not an unhandled rejection', async () => {
@@ -936,7 +1088,7 @@ test('a stall that fires before anything awaits the turn is not an unhandled rej
     // failed terminally rather than held behind a send that never resolves.
     assert.equal(rejections.length, 0, `unhandled: ${rejections.map(String).join(', ')}`);
     await waitFor(() => stub.bodiesFor('/api/response').length === 1, { label: 'terminal failure published' });
-    assert.equal(bodyOf(stub, '/api/response').terminalError.stableCode, 'copilot.turn-error');
+    assert.equal(bodyOf(stub, '/api/response').terminalError.stableCode, 'copilot.turn-stalled');
     assert.equal(await pending, true);
   } finally {
     process.off('unhandledRejection', onRejection);
@@ -1363,7 +1515,7 @@ test('a turn that throws still settles the rows steered into it', async () => {
 
   const steeredResponse = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
   assert.ok(steeredResponse, 'the steered row must be settled');
-  assert.equal(steeredResponse.terminalError.stableCode, 'copilot.turn-error');
+  assert.equal(steeredResponse.terminalError.stableCode, 'copilot.turn-stalled');
 });
 
 // ------------------------------------------------------- previews / config --

@@ -6616,13 +6616,16 @@ export function registerMessagesRoutes(app, deps) {
         console.warn(`[${ts()}] CONVERSATION MISMATCH ${messageId?.slice(0, 8)} conv=${targetConversationId?.slice(0, 8)} responderConv=${terminalCrossConversation.responderConversationId?.slice(0, 8)} — terminal failure posted by another conversation's worker`);
       }
       const failureText = buildTerminalFailureTextForChat(terminalFailure, trimmedText);
+      // What the turn had written before it failed stays readable: the note
+      // goes below it instead of replacing it.
+      const partialText = String(req.body.partialText || '').trim();
       const failed = failQueueMessage({
         queueRow: q,
         messageId,
         conversationId: targetConversationId,
         relayMode,
         model: model || q?.model || null,
-        responseText: failureText,
+        responseText: partialText ? `${partialText}\n\n${failureText}` : failureText,
         executedProvider: terminalExecutedProvider,
         failureRecord: {
           kind: 'terminal',

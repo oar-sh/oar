@@ -41,6 +41,11 @@ const VARIANTS = Object.freeze({
     message: `This message was sent to ${label} just before you stopped the turn, so it was not answered.`,
     guidance: 'Resend it if you still want an answer.',
   }),
+  // Steered into a turn that then failed.
+  turnFailed: (label) => ({
+    message: `This message was sent to ${label} in a turn that then failed, so it was not answered.`,
+    guidance: 'Resend it if you still want an answer.',
+  }),
   // Not a steer: delivered between turns and answered on a background
   // continuation row (ANSWERED_ELSEWHERE_KIND in steer-settle-markers.mjs).
   answeredElsewhere: (label) => ({
