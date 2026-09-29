@@ -5,6 +5,7 @@
 import { AcpClient, extractGrokModelsFromInitialize, pickAllowOnceOptionId } from './acp-client.mjs';
 import { createAcpHostServices } from './acp-host-services.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
+import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
 
 export { extractGrokModelsFromInitialize };
 
@@ -44,6 +45,9 @@ export function classifyGrokError(error) {
     return {
       code: 'grok.turn-stalled',
       message: message || 'Grok turn stalled',
+      // The inactivity trip in the user's terms: how long, and what the agent
+      // was doing. The ceiling's own message already is.
+      ...(isTurnStalledError(error) ? { text: describeTurnStall(error) } : {}),
       isAuth: false,
       isBusy: false,
       isStalled: true,

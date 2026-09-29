@@ -778,13 +778,16 @@ export function createCursorTurnRunner({
       await publishResponse(message, {
         text: classified.isAuth
           ? `System note: the Cursor runtime could not authenticate (${classified.message}). Set or renew the Cursor API key in provider settings, then retry.`
-          : `System note: the Cursor turn failed (${classified.message}).`,
+          : classified.text || `System note: the Cursor turn failed (${classified.message}).`,
         model: null,
         terminalError: {
           kind: 'cursor-turn-failed',
           code: classified.code,
           stableCode: classified.stableCode,
-          message: classified.message,
+          // A stall is told in the user's terms, and with its own advice: the
+          // relay's default ("restart the relay") repairs nothing here.
+          message: classified.text || classified.message,
+          ...(classified.isStalled ? { guidance: 'Send the message again to retry.' } : {}),
           failedAt: new Date().toISOString(),
           queueMessageId: String(message.id || '') || null,
         },

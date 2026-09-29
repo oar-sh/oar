@@ -7,14 +7,24 @@ import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 
+import {
+  createTurnLiveness,
+  createTurnStalledError,
+  resolveTurnStallWindows,
+} from '../../shared/worker-runtime/turn-liveness.mjs';
+
 function whichCommand(command = 'grok') {
   const value = String(command || 'grok').trim() || 'grok';
   return value;
 }
 
-// Prompt watchdog defaults: a turn that produces no ACP traffic for the
-// inactivity window (while no client-side work is pending) is stalled; the
-// ceiling bounds a single prompt absolutely. Both are overridable per call.
+// Prompt watchdog defaults: a turn that produces no ACP traffic for too long
+// (while no client-side work is pending) is stalled; the ceiling bounds a
+// single prompt absolutely. Both are overridable per call. How long "too
+// long" is depends on what the agent is doing
+// (shared/worker-runtime/turn-liveness.mjs): a prompt in flight is a model
+// request unless one of the agent's own tool calls is open, and the
+// inactivity window below is the base the two are derived from.
 export const ACP_PROMPT_INACTIVITY_MS = 120_000;
 export const ACP_PROMPT_MAX_TURN_MS = 1_800_000;
 // How long the watchdog waits for its `holdStall` question before treating
@@ -352,12 +362,25 @@ export class AcpClient extends EventEmitter {
    * `holdCheckTimeoutMs` counts as `false`.
    *
    * @param {object} [extra] additional session/prompt params (e.g. `_meta`)
-   * @param {object} [watchdog] { inactivityMs, maxTurnMs, hasPendingWork, holdStall, holdCheckTimeoutMs }
+   * @param {object} [watchdog] { inactivityMs, modelMs, toolMs, env, maxTurnMs, hasPendingWork, holdStall, holdCheckTimeoutMs }
    */
   async sessionPrompt(sessionId, prompt, onUpdate, extra = {}, watchdog = {}) {
-    const inactivityMs = Number(watchdog?.inactivityMs) > 0
-      ? Number(watchdog.inactivityMs)
-      : ACP_PROMPT_INACTIVITY_MS;
+    const resolved = resolveTurnStallWindows({
+      env: watchdog?.env ?? process.env,
+      idleMs: Number(watchdog?.inactivityMs) > 0 ? Number(watchdog.inactivityMs) : undefined,
+      modelMs: watchdog?.modelMs,
+      toolMs: watchdog?.toolMs,
+    });
+    // An environment that turns the shared watchdog off does not turn this
+    // one off: it is the only thing that notices a dead transport. An idle
+    // window of 0 takes the two others to 0 with it, so all three are
+    // rebuilt from the default.
+    const stallWindows = resolved.idle > 0
+      ? resolved
+      : resolveTurnStallWindows({ env: {}, idleMs: ACP_PROMPT_INACTIVITY_MS });
+    const inactivityMs = stallWindows.idle;
+    const liveness = createTurnLiveness({ windows: stallWindows });
+    liveness.begin('model', 'prompt');
     // An explicit 0 means NO absolute ceiling (the user's "No limit"
     // setting); only an absent/invalid value falls back to the default. The
     // inactivity watchdog still catches dead transports either way.
@@ -375,7 +398,22 @@ export class AcpClient extends EventEmitter {
     const handler = (msg) => {
       if (msg.method !== 'session/update') return;
       if (msg.params?.sessionId && msg.params.sessionId !== sessionId) return;
-      onUpdate?.(msg.params?.update || msg.params);
+      const update = msg.params?.update || msg.params;
+      noteToolCall(update);
+      onUpdate?.(update);
+    };
+    // The agent's own tool calls (the ones it runs itself; client-hosted
+    // terminals are `hasPendingWork`). One that prints nothing sends nothing.
+    const noteToolCall = (update) => {
+      const kind = String(update?.sessionUpdate || update?.type || '').trim();
+      if (kind !== 'tool_call' && kind !== 'tool_call_update') return;
+      const id = String(update.toolCallId || update.tool_call_id || update.id || '').trim();
+      const status = String(update.status || (kind === 'tool_call' ? 'pending' : '')).trim().toLowerCase();
+      if (status === 'pending' || status === 'in_progress' || status === 'running') {
+        liveness.begin('tool', id, String(update.title || update.name || update.kind || '').trim());
+      } else if (status) {
+        liveness.end('tool', id);
+      }
     };
     this.on('notification', handler);
     let watchdogTimer = null;
@@ -386,10 +424,17 @@ export class AcpClient extends EventEmitter {
     const quietSince = () => Math.max(this.lastActivityAt, heldAt);
     const startedAt = Date.now();
     const stallPromise = new Promise((_, reject) => {
+      const quiet = () => liveness.check({ quietMs: Date.now() - quietSince() });
       const stall = () => {
         if (settled) return;
         try { this.sessionCancel(sessionId); } catch { /* ignore */ }
-        reject(new Error(`grok turn stalled: no ACP activity for ${Math.round(inactivityMs / 1000)}s`));
+        const verdict = quiet();
+        reject(createTurnStalledError({
+          agentLabel: 'Grok',
+          quietMs: verdict.quietMs,
+          phase: verdict.phase,
+          tools: liveness.toolsInFlight(),
+        }));
       };
       const askForHold = () => {
         let timer = null;
@@ -410,7 +455,7 @@ export class AcpClient extends EventEmitter {
               return;
             }
             // Traffic that arrived while the question ran re-armed it anyway.
-            if (Date.now() - quietSince() >= inactivityMs) stall();
+            if (quiet().stalled) stall();
           });
       };
       const pollMs = Math.max(250, Math.min(5000, Math.floor(inactivityMs / 4)));
@@ -422,7 +467,7 @@ export class AcpClient extends EventEmitter {
           return;
         }
         if (hasPendingWork()) return;
-        if (now - quietSince() < inactivityMs) return;
+        if (!quiet().stalled) return;
         if (!holdStall) {
           stall();
           return;

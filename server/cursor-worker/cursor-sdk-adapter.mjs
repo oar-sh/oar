@@ -1,6 +1,14 @@
 import path from 'node:path';
 import fs from 'node:fs';
 
+import {
+  createTurnLiveness,
+  createTurnStalledError,
+  describeTurnStall,
+  isTurnStalledError,
+  resolveTurnStallWindows,
+} from '../../shared/worker-runtime/turn-liveness.mjs';
+
 /**
  * The only module in the repo that imports `@cursor/sdk` (and its
  * `@cursor/sdk/sqlite` entry). All SDK access is injectable and the real
@@ -169,10 +177,16 @@ export function startCursorRun({
   // LocalSendOptions passthrough — `{ force: true }` is the SDK's documented
   // recovery for a local agent left wedged by a crashed process.
   sendLocal = null,
-  // Turn backstop: with no SDK traffic for this long (and no client-hosted
+  // Turn backstop: with no SDK traffic for too long (and no client-hosted
   // work pending, e.g. an open ask_user card) the run is failed as stalled
-  // instead of parking the merged iterator forever. 0 disables.
-  stallTimeoutMs = 120_000,
+  // instead of parking the merged iterator forever. How long depends on what
+  // the run is doing (shared/worker-runtime/turn-liveness.mjs):
+  // `stallTimeoutMs` until the run exists, the model window while it works,
+  // the tool window while a tool call is open. 0 disables.
+  stallTimeoutMs = undefined,
+  stallModelTimeoutMs = undefined,
+  stallToolTimeoutMs = undefined,
+  env = process.env,
   hasPendingClientWork = () => false,
   dbg = () => {},
 } = {}) {
@@ -181,8 +195,11 @@ export function startCursorRun({
   let failure = null;
   let notify = null;
   let run = null;
-  let lastEventAt = Date.now();
   let stallTimer = null;
+  const stallWindows = resolveTurnStallWindows({
+    env, idleMs: stallTimeoutMs, modelMs: stallModelTimeoutMs, toolMs: stallToolTimeoutMs,
+  });
+  const liveness = createTurnLiveness({ windows: stallWindows });
 
   const wake = () => {
     if (!notify) return;
@@ -190,9 +207,25 @@ export function startCursorRun({
     notify = null;
     resolve();
   };
+  // A tool call is reported on both surfaces (the delta hook and the message
+  // stream) under the same id; either one opens and closes it.
+  const observe = (event) => {
+    if (event.source === 'delta') {
+      const update = event.update || {};
+      liveness.traffic(update.type);
+      if (update.type === 'tool-call-started') liveness.begin('tool', update.callId, update.toolCall?.type);
+      else if (update.type === 'tool-call-completed') liveness.end('tool', update.callId);
+      return;
+    }
+    const message = event.message || {};
+    liveness.traffic(message.type);
+    if (message.type !== 'tool_call') return;
+    if (message.status === 'running') liveness.begin('tool', message.call_id, message.name);
+    else if (message.status) liveness.end('tool', message.call_id);
+  };
   const push = (event) => {
     if (ended) return;
-    lastEventAt = Date.now();
+    observe(event);
     queue.push(event);
     wake();
   };
@@ -216,21 +249,31 @@ export function startCursorRun({
     abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
-  if (!ended && Number(stallTimeoutMs) > 0) {
+  if (!ended && stallWindows.idle > 0) {
     stallTimer = setInterval(() => {
       if (ended) return;
       if (hasPendingClientWork()) {
         // A human is thinking about a question card; the clock restarts when
         // the tool settles and traffic resumes.
-        lastEventAt = Date.now();
+        liveness.traffic('client-work');
         return;
       }
-      if (Date.now() - lastEventAt >= Number(stallTimeoutMs)) {
-        failure = failure || new Error(`cursor turn stalled: no SDK traffic for ${Math.round(Number(stallTimeoutMs) / 1000)}s`);
-        dbg('cursor run stalled, ending merged stream');
-        end();
-      }
-    }, Math.min(15_000, Math.max(1_000, Math.floor(Number(stallTimeoutMs) / 4))));
+      const verdict = liveness.check();
+      if (!verdict.stalled) return;
+      failure = failure || createTurnStalledError({
+        agentLabel: 'Cursor',
+        quietMs: verdict.quietMs,
+        phase: verdict.phase,
+        tools: liveness.toolsInFlight(),
+      });
+      dbg('cursor run stalled, ending merged stream', liveness.describe());
+      // The run is still the agent's active one; left alone it made the next
+      // message wait for the busy retry.
+      Promise.resolve().then(() => run?.cancel?.()).catch((error) => {
+        dbg('cursor run cancel after a stall failed', error?.message || String(error));
+      });
+      end();
+    }, Math.min(15_000, Math.max(5, Math.floor(stallWindows.idle / 4))));
     stallTimer.unref?.();
   }
 
@@ -247,6 +290,17 @@ export function startCursorRun({
         ...(sendLocal && typeof sendLocal === 'object' ? { local: sendLocal } : {}),
         onDelta: ({ update }) => push({ source: 'delta', update }),
       });
+      if (ended) {
+        // Stalled (or aborted) before the run existed: nothing cancelled it
+        // then, and left active it makes the next message wait for it.
+        Promise.resolve().then(() => run?.cancel?.()).catch((error) => {
+          dbg('cursor run cancel after a late start failed', error?.message || String(error));
+        });
+        return;
+      }
+      // From here on the run is either waiting for the model or for a tool.
+      liveness.traffic('run-started');
+      liveness.begin('model', 'run');
       for await (const sdkMessage of run.stream()) {
         if (ended) break;
         push({ source: 'stream', message: sdkMessage });
@@ -314,6 +368,19 @@ export function classifyCursorError(error) {
   const message = String(error?.message || error);
   const isRetryable = error?.isRetryable === true;
   const name = String(error?.name || '');
+  if (isTurnStalledError(error)) {
+    return {
+      isAuth: false,
+      isBusy: false,
+      isStalled: true,
+      isRetryable,
+      code: 'turn-stalled',
+      stableCode: 'cursor.turn-stalled',
+      message,
+      // What the user reads; `message` is the log's wording.
+      text: describeTurnStall(error),
+    };
+  }
   if (name === 'AuthenticationError' || isCursorAuthErrorMessage(message)) {
     return {
       isAuth: true,

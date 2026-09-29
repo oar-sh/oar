@@ -12,6 +12,19 @@ All notable changes to OAR are documented here. The format follows
   subagent has taken and shows the latest one, as far as there is room. A tap
   on the header unfolds a subagent and folds it again; what you chose by hand
   stays. The Stop button of a finished subagent is gone.
+- **Copilot, Cursor, Grok:** how long a turn may stay quiet now depends on what
+  the agent is doing: 2 minutes with nothing in flight, 5 minutes during a model
+  request, 30 minutes while a tool runs. Until now every silence of 2 minutes
+  failed the turn, including a command that simply printed nothing. The failure
+  note says how long the silence was and what was running. The three windows can
+  be set with `OAR_TURN_STALL_IDLE_MS`, `OAR_TURN_STALL_MODEL_MS` and
+  `OAR_TURN_STALL_TOOL_MS`.
+- **Copilot:** a turn kept past 2 minutes of silence is checked: a runtime that
+  no longer answers fails the turn at once. The watchdog also covers the start of
+  a session, where a runtime that did not answer used to hold the message without
+  any failure, and a Stop during that start now takes effect at once.
+- **Cursor:** a stalled run is cancelled, so the next message does not wait for
+  it.
 
 ### Fixed
 
@@ -36,6 +49,7 @@ All notable changes to OAR are documented here. The format follows
   place, and it no longer advises restarting the relay. A message steered into
   the failed turn gets a short marker with Resend instead of a second copy of
   the failure.
+- **Copilot:** a slow relay no longer makes a busy runtime look silent.
 
 ## [0.9.5] — 2026-09-27
 

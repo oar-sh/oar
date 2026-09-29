@@ -353,7 +353,8 @@ node server/copilot-worker/copilot-sdk-session-worker.mjs --session-id <sdk-sess
 Useful overrides: `COPILOT_WEB_RELAY_CLI_EXECUTABLE` (explicit `copilot` binary for the runtime
 spawn), `COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH` (worker script location),
 `COPILOT_SDK_RELAY_IDLE_SHUTDOWN_MS` (runtime idle close, default 10 min),
-`COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS` (stall watchdog, default 120 s, `0` disables),
+`COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS` (stall watchdog with nothing in flight, default 120 s,
+`0` disables; see [The stall watchdog](#the-stall-watchdog)),
 `COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS` (an emergency override for how long live background
 agents and shells alone may hold the runtime open; `0` = no limit).
 
@@ -370,6 +371,37 @@ when no getter is supplied, i.e. in tests). Stopping the runtime still kills its
 Live testing spends real Copilot quota: **`gpt-5.4-mini` is the only sanctioned model for live
 relay tests**, per the standing live-testing policy, and only with the user's explicit go-ahead.
 Everything else belongs in the unit suites, which drive the worker against a fake SDK client.
+
+## The stall watchdog
+
+The Copilot, Cursor and Grok workers fail a turn whose runtime has sent nothing for too long. How
+long depends on what the runtime is doing, which the worker reads off the events it already gets
+(`shared/worker-runtime/turn-liveness.mjs`):
+
+| Phase | Default | Meaning |
+| ----- | ------- | ------- |
+| idle | 120 s | nothing is in flight: the session is opening, or the runtime is between steps |
+| model | 300 s | a model request has started and not finished |
+| tool | 30 min | a tool call has started and not finished |
+
+The windows differ because silence does. A command that prints nothing produces no event until it
+exits; a model request produces a delta every few seconds for as long as the provider streams, and
+none while it does not. The numbers behind this are in the module's header. Cursor and Grok have
+no idle phase inside a run: once the run has started it is a model request unless a tool call is
+open.
+
+Overrides, for every worker: `OAR_TURN_STALL_IDLE_MS`, `OAR_TURN_STALL_MODEL_MS`,
+`OAR_TURN_STALL_TOOL_MS` (`0` = no limit for that phase). When only the idle window is set, by
+this variable or by `COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS`, the other two keep their proportion
+to it.
+
+While a turn is kept past the idle window, the Copilot worker asks its runtime once per idle window
+whether it is still there (`ping`, 5 s to answer). A runtime that does not answer fails the turn at
+once. The other two runtimes have no such request; a dead Grok agent is noticed by its process
+exiting.
+
+A question card, a `remote_relay` call and a compaction hold the watchdog whatever the phase. What
+bounds a turn that stays quiet and alive is the relay's turn ceiling.
 
 ## Branches and landing
 

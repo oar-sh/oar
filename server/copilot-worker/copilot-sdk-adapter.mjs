@@ -30,6 +30,7 @@ import {
   isModelSwitchUnconfirmedError,
 } from './copilot-model-switch.mjs';
 import { copilotRuntimeEntry } from '../copilot-sdk-runtime.mjs';
+import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
 
 const VERSION_DIR_RE = /^\d+\.\d+\.\d+$/;
 
@@ -471,34 +472,17 @@ export function isCopilotAuthError(error) {
 
 /**
  * What the relay appends to a failed Copilot turn in place of its own default
- * ("restart the relay"): a failed turn already tore its runtime down, and the
- * next message starts a fresh one, so a relay restart repairs nothing here and
- * costs every other running session.
+ * ("restart the relay"). The worker deals with its runtime itself: a delivered
+ * turn that failed tore it down and the next message starts a fresh one, so a
+ * relay restart repairs nothing here and costs every other running session.
+ * Failures the runtime reports as a session error, and sign-in failures, keep
+ * the wording of their own.
  */
 export const COPILOT_TURN_FAILURE_GUIDANCE =
   'If this keeps failing, include the error code when you report it; the relay does not need a restart.';
 export const COPILOT_TURN_RETRY_GUIDANCE = 'Send the message again to retry.';
 export const COPILOT_TURN_CONTINUE_GUIDANCE =
   'Send a message to continue: the session keeps the work so far, so the agent carries on from there.';
-
-const TURN_STALLED_ERROR_CODE = 'copilot-turn-stalled';
-
-/**
- * The stall watchdog's failure: the runtime sent nothing for `silentMs`. A
- * type of its own because the turn is not known to be broken, only silent,
- * and the user is told that rather than "the turn failed".
- */
-export function createTurnStalledError(silentMs) {
-  const seconds = Math.round((Number(silentMs) || 0) / 1000);
-  const error = new Error(`copilot worker watchdog: the runtime produced no events for ${seconds}s`);
-  error.code = TURN_STALLED_ERROR_CODE;
-  error.silentSeconds = seconds;
-  return error;
-}
-
-export function isTurnStalledError(error) {
-  return error?.code === TURN_STALLED_ERROR_CODE;
-}
 
 /**
  * Classify a thrown error (client start, session create/resume, `send`) rather
@@ -534,11 +518,14 @@ export function classifyCopilotTurnException(error) {
   if (isCopilotAuthError(error)) {
     return copilotAuthClassification(detail);
   }
+  // The stall watchdog's failure: the turn is not known to be broken, only
+  // silent, and the user is told that — and what the runtime was doing —
+  // rather than "the turn failed".
   if (isTurnStalledError(error)) {
     return {
       code: 'turn-stalled',
       stableCode: 'copilot.turn-stalled',
-      text: `System note: the Copilot runtime sent nothing for ${error.silentSeconds}s, so the relay ended the turn.`,
+      text: describeTurnStall(error),
       guidance: COPILOT_TURN_RETRY_GUIDANCE,
       detail,
     };

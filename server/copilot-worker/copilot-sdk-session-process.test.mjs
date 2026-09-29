@@ -929,7 +929,7 @@ test('a failed turn keeps what the agent wrote and says that its tool calls ran'
       { type: 'tool.execution_complete', data: { toolCallId: 'call-2', success: true, result: { content: 'ok' } } },
     ],
   ]);
-  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 30 });
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 150 });
 
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
 
@@ -947,7 +947,7 @@ test('a steer folded into a turn that fails gets a marker, not a second failure 
     (id) => [userMessage(id, 'idle', 'hello')],
     (id) => [userMessage(id, 'steering', 'also check the footer')],
   ]);
-  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 60 });
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 300 });
 
   const first = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
@@ -979,7 +979,7 @@ test('a failure is published before the runtime has finished stopping', async ()
     session.disconnect = () => new Promise((resolve) => { releaseDetach = resolve; });
     return session;
   };
-  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 20 });
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 150 });
 
   const pending = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => stub.bodiesFor('/api/response').length === 1, { label: 'failure published' });
@@ -1009,7 +1009,7 @@ test('a runtime that will not detach or stop is killed after the bounded waits',
   client.forceStopped = 0;
   client.forceStop = async () => { client.forceStopped += 1; };
   const { runner } = makeRunner({
-    stub, client, turnStallTimeoutMs: 20, runtimeDetachTimeoutMs: 20, runtimeStopTimeoutMs: 20,
+    stub, client, turnStallTimeoutMs: 150, runtimeDetachTimeoutMs: 20, runtimeStopTimeoutMs: 20,
   });
 
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
@@ -1039,7 +1039,7 @@ test('the next delivery waits for the previous runtime to stop before it starts 
   const { runner } = makeRunner({
     stub,
     client: first,
-    turnStallTimeoutMs: 20,
+    turnStallTimeoutMs: 150,
     startClientImpl: async (options) => {
       const client = clients[started.length];
       started.push(client);
@@ -1050,7 +1050,7 @@ test('the next delivery waits for the previous runtime to stop before it starts 
   const failing = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => stub.bodiesFor('/api/response').length === 1, { label: 'failure published' });
   const next = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
-  await tick(30);
+  await tick(60);
   assert.equal(started.length, 1, 'no second runtime while the first is still stopping');
 
   releaseDetach();
@@ -1060,6 +1060,319 @@ test('the next delivery waits for the previous runtime to stop before it starts 
   assert.equal(first.stopped, 1);
   const answered = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
   assert.equal(answered.terminalError, undefined);
+});
+
+test('a tool that runs in silence does not fail the turn', async () => {
+  // Runtime 1.0.88 emits nothing between `tool.execution_start` and the
+  // completion of a command that prints nothing (150 s measured). With one
+  // fixed window the watchdog failed such a turn while it was healthy.
+  const stub = makeApiStub();
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'assistant.turn_start', data: { turnId: '0' } },
+      { type: 'assistant.message', data: { messageId: 'm1', content: '' } },
+      { type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'bash', arguments: { command: 'make' } } },
+    ],
+  ]);
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 100 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'prompt sent' });
+  // Four idle windows of silence, well inside the tool window (15 of them).
+  await tick(400);
+  assert.equal(runner.isTurnActive(), true);
+  assert.equal(stub.bodiesFor('/api/response').length, 0);
+
+  client.session.replay([
+    { type: 'tool.execution_complete', data: { toolCallId: 'call-1', success: true, result: { content: 'built' } } },
+    { type: 'assistant.message', data: { messageId: 'm2', content: 'The build passes.' } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(await pending, true);
+  const response = bodyOf(stub, '/api/response');
+  assert.equal(response.terminalError, undefined);
+  assert.equal(response.text, 'The build passes.');
+});
+
+test('a tool that stays silent past the tool window fails the turn, and the note names it', async () => {
+  const stub = makeApiStub();
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'bash', arguments: { command: 'make' } } },
+    ],
+  ]);
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 150, turnStallToolTimeoutMs: 300 });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  const response = bodyOf(stub, '/api/response');
+  assert.equal(response.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.match(response.text, /sent nothing for 0s while a tool was running \(bash\), so the relay ended the turn/);
+});
+
+test('a silent model request gets the model window, not the idle one', async () => {
+  const stub = makeApiStub();
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'assistant.turn_start', data: { turnId: '0' } },
+      { type: 'model.call_start', data: {} },
+    ],
+  ]);
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 100, turnStallModelTimeoutMs: 500 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'prompt sent' });
+  await tick(250);
+  assert.equal(stub.bodiesFor('/api/response').length, 0, 'two idle windows in, the request is still given time');
+
+  assert.equal(await pending, true);
+  const response = bodyOf(stub, '/api/response');
+  assert.equal(response.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.match(response.text, /while a model request was running/);
+});
+
+test('a runtime that no longer answers a ping is not given the longer window', async () => {
+  // The longer windows are for a runtime that is busy. One that does not
+  // answer when asked is not busy, it is gone.
+  const stub = makeApiStub();
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'bash', arguments: { command: 'make' } } },
+    ],
+  ]);
+  client.pings = 0;
+  client.ping = () => { client.pings += 1; return new Promise(() => {}); };
+  const { runner } = makeRunner({
+    stub, client, turnStallTimeoutMs: 150, turnStallToolTimeoutMs: 5_000, stallProbeTimeoutMs: 20,
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  // Asked twice: one ping that came at a bad moment is not a runtime that is gone.
+  assert.equal(client.pings, 2);
+  const response = bodyOf(stub, '/api/response');
+  assert.equal(response.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.match(response.text, /the Copilot runtime stopped answering while a tool was running \(bash\)/);
+});
+
+test('a runtime that answers the ping keeps its silent tool', async () => {
+  const stub = makeApiStub();
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'bash', arguments: { command: 'make' } } },
+    ],
+  ]);
+  client.pings = 0;
+  client.ping = async () => { client.pings += 1; return { message: 'stall-check' }; };
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 100, turnStallToolTimeoutMs: 5_000 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.pings >= 2, { label: 'asked once per idle window' });
+  assert.equal(runner.isTurnActive(), true);
+  client.session.replay([
+    { type: 'tool.execution_complete', data: { toolCallId: 'call-1', success: true, result: { content: 'built' } } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(await pending, true);
+  assert.equal(bodyOf(stub, '/api/response').terminalError, undefined);
+});
+
+test('a slow relay does not make a busy runtime look silent', async () => {
+  // The watchdog used to be fed from the dispatch chain, which awaits the
+  // relay's answer to every stream and activity POST: one POST slower than
+  // the window failed a turn whose runtime had never paused.
+  let releaseActivity = null;
+  const slowRelay = new Promise((resolve) => { releaseActivity = resolve; });
+  const stub = makeApiStub({
+    routeResponses: { '/api/activity': async () => { await slowRelay; return {}; } },
+  });
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'view', arguments: { path: 'notes.md' } } },
+      { type: 'tool.execution_complete', data: { toolCallId: 'call-1', success: true, result: { content: 'ok' } } },
+    ],
+  ]);
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 300 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => stub.bodiesFor('/api/activity').length === 1, { label: 'activity POST in flight' });
+  // The runtime keeps talking while the relay sits on that POST.
+  for (let beat = 0; beat < 8; beat += 1) {
+    await tick(60);
+    client.session.emit({ type: 'assistant.streaming_delta', data: { totalResponseSizeBytes: beat } });
+  }
+  assert.equal(runner.isTurnActive(), true);
+  assert.equal(stub.bodiesFor('/api/response').length, 0);
+
+  releaseActivity();
+  client.session.replay([
+    { type: 'assistant.message', data: { messageId: 'm1', content: 'Done.' } },
+    { type: 'session.idle', data: {} },
+  ]);
+  assert.equal(await pending, true);
+  assert.equal(bodyOf(stub, '/api/response').terminalError, undefined);
+});
+
+test('a session that never opens fails the turn instead of holding the row', async () => {
+  // None of the SDK's session requests has a timeout. Before the watchdog
+  // covered the bring-up, a runtime that did not answer the resume left the
+  // row in `processing` with no turn to fail and nothing for a Stop to stop.
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient();
+  client.createSession = () => new Promise(() => {});
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 100 });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  const response = bodyOf(stub, '/api/response');
+  assert.equal(response.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.equal(client.stopped, 1, 'the runtime that did not answer is stopped');
+  assert.equal(runner.isTurnActive(), false);
+});
+
+test('a Stop while the session is still opening settles the turn at once', async () => {
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient();
+  client.createSession = () => new Promise(() => {});
+  let abortTurn = null;
+  const controlPoller = {
+    start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return { id: 1 }; },
+    stop: () => {},
+  };
+  const { runner } = makeRunner({ stub, client, controlPoller, turnStallTimeoutMs: 0 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => runner.isTurnActive(), { label: 'turn active' });
+  await abortTurn({ queueMessageId: 'q-1' });
+
+  assert.equal(await pending, true);
+  // Still an abort: the server-side control settles the row, not this worker.
+  assert.equal(stub.bodiesFor('/api/response').length, 0);
+  assert.equal(lastBodyOf(stub, '/api/stream').done, true);
+});
+
+test('a session that opens after its runtime was stopped is let go, not adopted', async () => {
+  const stub = makeApiStub();
+  const first = createFakeCopilotClient();
+  let releaseCreate = null;
+  let lateSession = null;
+  const createSession = first.createSession.bind(first);
+  first.createSession = async (config) => {
+    await new Promise((resolve) => { releaseCreate = resolve; });
+    lateSession = await createSession(config);
+    return lateSession;
+  };
+  const second = createFakeCopilotClient({
+    resumeAvailable: true,
+    onSend: (session) => session.replay(loadFixture('happy-turn')),
+  });
+  const clients = [first, second];
+  const started = [];
+  const { runner } = makeRunner({
+    stub,
+    client: first,
+    turnStallTimeoutMs: 100,
+    startClientImpl: async (options) => {
+      const client = clients[started.length];
+      started.push(client);
+      return { sdk: {}, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
+    },
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(bodyOf(stub, '/api/response').terminalError.stableCode, 'copilot.turn-stalled');
+
+  // The stopped runtime answers after all.
+  releaseCreate();
+  await waitFor(() => lateSession?.disconnected === true, { label: 'late session let go' });
+  assert.equal(runner._getState().hasSession, false);
+
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } }), true);
+  assert.equal(started.length, 2, 'the next turn runs on a runtime of its own');
+  assert.equal(second.session.sends.length, 1);
+});
+
+test('a second turn waits for the session an earlier turn was still opening', async () => {
+  // A Stop during a slow bring-up settles the turn and leaves its open
+  // running. The next turn used to issue a second open of the same session
+  // on the same client, and whichever answered last won.
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay(loadFixture('happy-turn')) });
+  let releaseCreate = null;
+  const createSession = client.createSession.bind(client);
+  client.createSession = async (config) => {
+    await new Promise((resolve) => { releaseCreate = resolve; });
+    return createSession(config);
+  };
+  let abortTurn = null;
+  const controlPoller = {
+    start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return { id: 1 }; },
+    stop: () => {},
+  };
+  const { runner } = makeRunner({ stub, client, controlPoller, turnStallTimeoutMs: 0 });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => typeof releaseCreate === 'function', { label: 'first open in flight' });
+  await abortTurn({ queueMessageId: 'q-1' });
+  assert.equal(await first, true);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await tick(30);
+  assert.equal(client.resumeAttempts.length, 1, 'no second open while the first is in flight');
+
+  releaseCreate();
+  assert.equal(await second, true);
+  assert.equal(client.sessions.length, 1);
+  assert.equal(client.session.sends.length, 1);
+  assert.equal(stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2').terminalError, undefined);
+});
+
+test('events of a runtime that is being stopped do not reach the next turn', async () => {
+  const stub = makeApiStub();
+  const first = createFakeCopilotClient();
+  let releaseDetach = null;
+  const createSession = first.createSession.bind(first);
+  first.createSession = async (config) => {
+    const session = await createSession(config);
+    session.disconnect = () => new Promise((resolve) => { releaseDetach = resolve; });
+    return session;
+  };
+  const second = createFakeCopilotClient({
+    resumeAvailable: true,
+    onSend: (session) => session.replay(loadFixture('happy-turn')),
+  });
+  const clients = [first, second];
+  const started = [];
+  const { runner } = makeRunner({
+    stub,
+    client: first,
+    turnStallTimeoutMs: 100,
+    startClientImpl: async (options) => {
+      const client = clients[started.length];
+      started.push(client);
+      return { sdk: {}, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
+    },
+  });
+
+  const failing = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => stub.bodiesFor('/api/response').length === 1, { label: 'failure published' });
+  const next = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await tick(10);
+  // The old runtime still talks while it detaches: a late terminator of its own.
+  first.session.emit({ type: 'assistant.message', data: { messageId: 'late', content: 'from the runtime that is going' } });
+  first.session.emit({ type: 'session.idle', data: {} });
+  await tick(10);
+  assert.equal(stub.bodiesFor('/api/response').length, 1, 'the waiting turn was not settled by them');
+
+  releaseDetach();
+  assert.equal(await failing, true);
+  assert.equal(await next, true);
+  const answered = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
+  assert.equal(answered.terminalError, undefined);
+  assert.doesNotMatch(answered.text, /from the runtime that is going/);
 });
 
 test('a stall that fires before anything awaits the turn is not an unhandled rejection', async () => {

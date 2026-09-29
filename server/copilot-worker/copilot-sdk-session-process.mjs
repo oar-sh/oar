@@ -53,7 +53,6 @@ import {
   classifyCopilotTurnException,
   copilotAgentModeForRelayMode,
   createCopilotPermissionHandler,
-  createTurnStalledError,
   isReadOnlyPermissionRequest,
   isSessionNotFoundError,
   observeRuntimeExit,
@@ -108,6 +107,12 @@ import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT, STEER_TURN_FAILED_TEXT } from '.
 import { buildSteerSettleFailure } from '../../shared/steer-settle-failure.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
 import { withSteerNote } from '../../shared/steer-note.mjs';
+import {
+  createTurnLiveness,
+  createTurnStalledError,
+  probeRuntime,
+  resolveTurnStallWindows,
+} from '../../shared/worker-runtime/turn-liveness.mjs';
 
 // How long the runtime may sit with no session activity before the worker
 // closes it. The worker process itself stays up and reconnects lazily on the
@@ -116,11 +121,8 @@ import { withSteerNote } from '../../shared/steer-note.mjs';
 // holding a runtime subprocess per idle conversation is not.
 const DEFAULT_IDLE_SHUTDOWN_MS = 10 * 60_000;
 const DEFAULT_LIFECYCLE_POLL_MS = 5_000;
-// Mirrors the Cursor adapter's `stallTimeoutMs`. Emphatically NOT 0: the
-// worker's 10s heartbeat keeps renewing the relay's processing lease
-// (messages-routes.mjs), so without a stall ceiling a turn whose runtime went
-// quiet holds its queue row open indefinitely and no watchdog can free it.
-const DEFAULT_TURN_STALL_TIMEOUT_MS = 120_000;
+/** How long the runtime may take to answer the stall watchdog's ping. */
+const DEFAULT_STALL_PROBE_TIMEOUT_MS = 5_000;
 /**
  * How long live background shells ALONE may keep the runtime up (0 = no limit).
  *
@@ -337,11 +339,18 @@ export function createCopilotSdkSessionRunner({
   infiniteSessionConfig = DEFAULT_INFINITE_SESSION_CONFIG,
   idleShutdownMs = DEFAULT_IDLE_SHUTDOWN_MS,
   lifecyclePollMs = DEFAULT_LIFECYCLE_POLL_MS,
-  // 0 disables (matching the background-task timeout's 0 = no-limit
-  // convention). When set, a turn that goes this long without a single event
-  // fails terminally instead of holding the queue row until the relay's own
-  // delivery watchdog gives up.
-  turnStallTimeoutMs = DEFAULT_TURN_STALL_TIMEOUT_MS,
+  // How long a turn may go without a single event before it fails terminally
+  // (shared/worker-runtime/turn-liveness.mjs): `turnStallTimeoutMs` with
+  // nothing in flight, the two others while a model request or a tool is.
+  // 0 disables (the background-task timeout's 0 = no-limit convention).
+  // Emphatically NOT off by default: the worker's 10s heartbeat keeps renewing
+  // the relay's processing lease (messages-routes.mjs), so without a ceiling a
+  // turn whose runtime went quiet holds its queue row open until the relay's
+  // turn ceiling.
+  turnStallTimeoutMs = undefined,
+  turnStallModelTimeoutMs = undefined,
+  turnStallToolTimeoutMs = undefined,
+  stallProbeTimeoutMs = DEFAULT_STALL_PROBE_TIMEOUT_MS,
   // How long a `deferred: true` model switch may wait for its
   // `session.model_change` drain before the explicit selection counts as
   // unconfirmed and fails the row (`COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS`).
@@ -392,6 +401,12 @@ export function createCopilotSdkSessionRunner({
   let client = null;
   let session = null;
   let sdkPaths = null;
+  const stallWindows = resolveTurnStallWindows({
+    env,
+    idleMs: turnStallTimeoutMs,
+    modelMs: turnStallModelTimeoutMs,
+    toolMs: turnStallToolTimeoutMs,
+  });
   // The single owner of "what model/effort is the live session CONFIRMED to be
   // on" (audit #9/#13): tracks the last confirmed pair, caches the per-session
   // model catalog for effort validation, and observes `session.model_change`
@@ -434,6 +449,11 @@ export function createCopilotSdkSessionRunner({
   // second runtime resuming the session while the first still holds it would
   // have two processes writing one event log.
   let runtimeStopping = null;
+  // Counts runtime stops, so a session that finishes opening after its
+  // runtime was stopped is recognised and let go instead of adopted.
+  let runtimeGeneration = 0;
+  // The session open in flight, if any (see ensureSession).
+  let opening = null;
   let disposed = false;
   let detachRuntimeExit = () => {};
   // A compaction in progress (`session.compaction_start` seen, no `_complete`
@@ -1230,6 +1250,9 @@ export function createCopilotSdkSessionRunner({
     // days ago.
     if (replayGate.isReplay(event)) {
       dbg('dropping a replayed event', String(event?.type || ''), String(event?.timestamp || ''));
+      // History, but a sign of life all the same: a long resume replays for
+      // as long as it takes, and the turn waiting on it is not stalled.
+      activeTurn?.liveness?.traffic('replay');
       return;
     }
     touch();
@@ -1269,6 +1292,10 @@ export function createCopilotSdkSessionRunner({
       if (!isContinuationOpeningEvent(event)) return;
       turn = openContinuationTurn();
     }
+    // Liveness is noted on RECEIPT. The dispatch chain below awaits relay
+    // POSTs, and a watchdog fed from there measures the relay, not the
+    // runtime: one slow POST would fail a turn whose runtime never paused.
+    observeLiveness(turn, event);
     // The owner is captured HERE, synchronously, but settlement happens later
     // on the dispatch chain — so an event can be captured to a turn that is
     // settled by the time its link runs. `handleTurnEvent`'s settled guard
@@ -1279,6 +1306,53 @@ export function createCopilotSdkSessionRunner({
     dispatchChain = dispatchChain
       .then(() => handleTurnEvent(turn, event))
       .catch((error) => { dbg('event dispatch failed', error?.message || String(error)); });
+  }
+
+  /** A stage of the bring-up finished: the turn waiting on it is not stalled. */
+  function liveTurnTraffic(what) {
+    const turn = activeTurn;
+    if (turn && !turn.settled) turn.liveness.traffic(what);
+  }
+
+  /**
+   * What the runtime is busy with, for the stall watchdog: a tool or a model
+   * request that has started and not finished, per agent (a subagent's events
+   * carry its `agentId` on the envelope). `model.call_*` is what runtime
+   * 1.0.88 emits around a request; `assistant.turn_start`/`turn_end` bracket
+   * the same span on runtimes that do not.
+   */
+  function observeLiveness(turn, event) {
+    const liveness = turn?.liveness;
+    if (!liveness || turn.settled) return;
+    const type = String(event?.type || '');
+    const data = event?.data && typeof event.data === 'object' ? event.data : {};
+    const agent = String(event?.agentId || '').trim() || 'root';
+    liveness.traffic(type);
+    switch (type) {
+      case 'tool.execution_start':
+        liveness.begin('tool', `${agent}:${data.toolCallId || ''}`, data.toolName);
+        break;
+      case 'tool.execution_complete':
+        liveness.end('tool', `${agent}:${data.toolCallId || ''}`);
+        break;
+      case 'assistant.turn_start':
+      case 'model.call_start':
+        liveness.begin('model', agent);
+        break;
+      case 'assistant.message':
+      case 'assistant.turn_end':
+      case 'model.call_finished':
+      case 'model.call_failure':
+        liveness.end('model', agent);
+        break;
+      case 'subagent.completed':
+      case 'subagent.failed':
+        // Whatever the agent had open ended with it.
+        liveness.endAgent(agent);
+        break;
+      default:
+        break;
+    }
   }
 
   /**
@@ -1744,6 +1818,9 @@ export function createCopilotSdkSessionRunner({
         turn = openContinuationTurn();
       }
     }
+    // Noted at receipt on the turn that owned the stream then; the turn that
+    // takes the event over has to learn from it what is in flight.
+    observeLiveness(turn, event);
     await handleTurnEvent(turn, event);
   }
 
@@ -1752,7 +1829,6 @@ export function createCopilotSdkSessionRunner({
       await redispatchSettledEvent(event);
       return;
     }
-    turn.armStall?.();
     if (String(event?.type || '') === 'tool.execution_start') turn.toolCalls += 1;
     // Root work ends on the runtime's own terminator, so a question-only
     // continuation it joins no longer closes itself (whileAwaitingHuman).
@@ -1911,6 +1987,7 @@ export function createCopilotSdkSessionRunner({
   }
 
   function buildSessionConfig(model, reasoningEffort = null) {
+    const generation = runtimeGeneration;
     // Built once per session, not per request. Reads the mode off the LIVE turn
     // rather than closing over the one the session was built with, because one
     // session serves every turn and the user can switch modes between them.
@@ -1971,7 +2048,10 @@ export function createCopilotSdkSessionRunner({
       clientName,
       // The runtime's own defaults, pinned. See DEFAULT_INFINITE_SESSION_CONFIG.
       ...(infiniteSessionConfig ? { infiniteSessions: { ...infiniteSessionConfig } } : {}),
-      onEvent: routeEvent,
+      // Events of a runtime that is being stopped are not this session's any
+      // more: the SDK keeps delivering them until the detach is answered, and
+      // by then the next delivery may already be waiting as the active turn.
+      onEvent: (event) => { if (generation === runtimeGeneration) routeEvent(event); },
       // The relay's own tools (`relaySessionTools`); omitted when there are none.
       ...(tools.length ? { tools } : {}),
       // Permission policy follows the conversation's relay mode: agent and
@@ -2202,14 +2282,43 @@ export function createCopilotSdkSessionRunner({
     modelSwitch.reset();
     // Disconnect first so the runtime is not holding two handles on one
     // session id while the resume runs.
-    try { await closing?.disconnect?.(); } catch (error) {
-      dbg('session disconnect before model switch failed', error?.message || String(error));
-    }
-    return ensureSession(model, effort);
+    const detached = await withTimeout(
+      Promise.resolve().then(() => closing?.disconnect?.()).then(() => true, (error) => {
+        dbg('session disconnect before model switch failed', error?.message || String(error));
+        return true;
+      }),
+      runtimeDetachTimeoutMs,
+      false,
+    );
+    if (!detached) dbg(`session disconnect before model switch did not answer within ${runtimeDetachTimeoutMs}ms`);
+    return openSessionOnce(model, effort);
   }
 
+  /**
+   * One session open at a time. A turn can end before its bring-up does (the
+   * stall watchdog, a Stop), and the open it started goes on without it; the
+   * next turn must wait for that one rather than issue a second resume of the
+   * same session id on the same client.
+   */
   async function ensureSession(model, effort) {
+    while (opening) await opening.catch(() => {});
+    if (session) return applySelection(model, effort);
+    return openSessionOnce(model, effort);
+  }
+
+  async function openSessionOnce(model, effort) {
+    const open = openFreshSession(model, effort);
+    opening = open;
+    try {
+      return await open;
+    } finally {
+      if (opening === open) opening = null;
+    }
+  }
+
+  async function openFreshSession(model, effort) {
     await ensureClient();
+    liveTurnTraffic('client-ready');
     if (!session) {
       // The tool list is part of the session: wait for the worker's first
       // registration answer (bounded, and it fails closed).
@@ -2222,8 +2331,16 @@ export function createCopilotSdkSessionRunner({
       // deliberately not cached: once `createSession` succeeds, the state
       // exists and the NEXT reconnect must resume it.
       let resumed = false;
+      const generation = runtimeGeneration;
+      // The turn this session was being opened for can end first (the stall
+      // watchdog, a Stop), and its failure stops the runtime.
+      const adopt = (opened) => {
+        if (generation === runtimeGeneration) return opened;
+        Promise.resolve().then(() => opened?.disconnect?.()).catch(() => {});
+        throw new Error('the Copilot runtime was stopped while its session was opening');
+      };
       try {
-        session = await openSession((cfg) => client.resumeSession(sdkSessionId, cfg), config);
+        session = adopt(await openSession((cfg) => client.resumeSession(sdkSessionId, cfg), config));
         resumed = true;
         dbg(`resumed copilot session ${sdkSessionId.slice(0, 8)}`);
       } catch (error) {
@@ -2232,14 +2349,15 @@ export function createCopilotSdkSessionRunner({
         // transient, and starting fresh over live state would silently throw
         // the conversation's whole history away — so it fails the turn
         // instead, which is retryable and loses nothing.
-        if (!isSessionNotFoundError(error)) {
+        if (!isSessionNotFoundError(error) || generation !== runtimeGeneration) {
           dbg('copilot session resume failed transiently', error?.message || String(error));
           throw error;
         }
         dbg('copilot session state not found, creating', error?.message || String(error));
-        session = await openSession((cfg) => client.createSession(cfg), config);
+        session = adopt(await openSession((cfg) => client.createSession(cfg), config));
         dbg(`created copilot session ${sdkSessionId.slice(0, 8)}`);
       }
+      liveTurnTraffic('session-open');
       // Which experimental surfaces THIS runtime has (it auto-updates under
       // the relay): decides un-steer and the targeted Stop for the session.
       probeSessionRpc(session);
@@ -2279,6 +2397,7 @@ export function createCopilotSdkSessionRunner({
   }
 
   async function stopRuntime(reason) {
+    runtimeGeneration += 1;
     stopLifecycleTimer();
     // The next session is built from a fresh registration answer.
     void remoteRelayGate.refresh();
@@ -2570,6 +2689,8 @@ export function createCopilotSdkSessionRunner({
       // The row the user pressed Stop on (from the abort control), when known.
       abortedRowId: null,
       stallTimer: null,
+      stallChecking: false,
+      liveness: createTurnLiveness({ windows: stallWindows }),
       // The runtime teardown a failure started (see `fail`).
       teardown: null,
       // Tool calls this turn started, whichever agent made them. Told in the
@@ -2696,8 +2817,11 @@ export function createCopilotSdkSessionRunner({
       // and merely still on its previous model, and tearing the runtime down
       // over it would kill any live background work for a selection problem
       // the user fixes by picking another model.
-      if (turn.kind === 'delivered' && !isModelSwitchUnconfirmedError(error) && (session || client)) {
-        turn.teardown = stopRuntime('turn-failure').catch(() => {});
+      if (turn.kind === 'delivered' && !isModelSwitchUnconfirmedError(error)) {
+        if (session || client) turn.teardown = stopRuntime('turn-failure').catch(() => {});
+        // Nothing to stop yet: the runtime was still starting. What it opens
+        // for this turn from here on is let go rather than adopted.
+        else runtimeGeneration += 1;
       }
       beginPublishing(turn);
       turn.resolvePrimaryReady();
@@ -2709,24 +2833,81 @@ export function createCopilotSdkSessionRunner({
       clearTimeout(turn.stallTimer);
       turn.stallTimer = null;
     };
+    // The window restarts: the turn opens, or a hold on it ends.
     turn.armStall = () => {
-      if (!(turnStallTimeoutMs > 0) || turn.settled) return;
-      turn.disarmStall();
-      turn.stallTimer = setTimeout(() => {
-        // A human staring at a question card is not a stalled runtime. Re-arm
-        // rather than fail: the card has its own (much longer) timeout, and
-        // failing the row here would settle it while the answer is still coming.
-        // A remote_relay call waiting on another relay is the same kind of
-        // silence; the relay bounds that wait itself.
-        if (pendingHumanRequests > 0 || pendingRelayToolCalls > 0) {
-          turn.armStall();
-          return;
-        }
-        turn.fail(createTurnStalledError(turnStallTimeoutMs));
-      }, turnStallTimeoutMs);
-      turn.stallTimer.unref?.();
+      if (!(stallWindows.idle > 0) || turn.settled) return;
+      turn.liveness.traffic('armed');
+      // A check in progress schedules the next one itself.
+      if (!turn.stallTimer && !turn.stallChecking) scheduleStallCheck(turn, turn.liveness.check().waitMs);
     };
     return turn;
+  }
+
+  /**
+   * The stall watchdog. One timer per turn, never re-armed by traffic: an
+   * event only moves the turn's clock, and a check that comes early looks
+   * again when the window is due (a model request emits thousands of deltas).
+   */
+  function scheduleStallCheck(turn, waitMs) {
+    turn.stallTimer = setTimeout(() => {
+      turn.stallTimer = null;
+      turn.stallChecking = true;
+      void checkStall(turn)
+        .catch((error) => { dbg('stall check failed', error?.message || String(error)); })
+        .finally(() => {
+          turn.stallChecking = false;
+          // A check that ended without deciding (it threw) must not be the last.
+          if (!turn.settled && !turn.stallTimer) scheduleStallCheck(turn, turn.liveness.check().waitMs || stallWindows.idle);
+        });
+    }, Math.max(1, waitMs));
+    turn.stallTimer.unref?.();
+  }
+
+  async function checkStall(turn) {
+    if (turn.settled) return;
+    // A human staring at a question card is not a stalled runtime: the card
+    // has its own (much longer) timeout, and failing the row here would
+    // settle it while the answer is still coming. A remote_relay call waiting
+    // on another relay is the same kind of silence; the relay bounds that
+    // wait itself. So is a compaction, bounded by its stale cap, and the wait
+    // for the previous runtime to stop, bounded by the teardown's own limits.
+    if (pendingHumanRequests > 0 || pendingRelayToolCalls > 0 || isCompacting() || runtimeStopping) {
+      turn.liveness.traffic('held');
+      scheduleStallCheck(turn, turn.liveness.check().waitMs);
+      return;
+    }
+    let verdict = turn.liveness.check();
+    let unresponsive = false;
+    if (!verdict.stalled && verdict.quietMs >= stallWindows.idle) {
+      // Quiet for longer than a runtime with nothing to do may be, and kept
+      // only because a tool or a model request is in flight. That is worth
+      // one question: is the runtime still there?
+      const probing = client;
+      const ask = () => probeRuntime(
+        typeof probing?.ping === 'function' ? () => probing.ping('stall-check') : null,
+        stallProbeTimeoutMs,
+      );
+      let answer = await ask();
+      // Asked twice before a turn with minutes left is given up: one ping
+      // that came at a bad moment is not a runtime that is gone.
+      if (answer === 'gone' && !turn.settled) answer = await ask();
+      if (turn.settled) return;
+      verdict = turn.liveness.check();
+      unresponsive = answer === 'gone' && verdict.quietMs >= stallWindows.idle;
+      if (!unresponsive && !verdict.stalled) dbg('turn is quiet, the runtime answers; keeping it', turn.liveness.describe());
+    }
+    if (!verdict.stalled && !unresponsive) {
+      scheduleStallCheck(turn, verdict.waitMs);
+      return;
+    }
+    dbg(`turn stalled${unresponsive ? ' (runtime not answering)' : ''}`, turn.liveness.describe());
+    turn.fail(createTurnStalledError({
+      agentLabel: SETTLE_AGENT_LABEL,
+      quietMs: verdict.quietMs,
+      phase: verdict.phase,
+      tools: turn.liveness.toolsInFlight(),
+      unresponsive,
+    }));
   }
 
   // ----------------------------------------------------- prompt boundaries --
@@ -3193,9 +3374,16 @@ export function createCopilotSdkSessionRunner({
     // and stops waiting on the remote, and the watchdog hold is released.
     turn.remoteRelayStop?.abort();
     // While `ensureSession` is still connecting there is no session to abort
-    // and this would be a silent no-op; `runTurn` re-checks `turn.aborted`
-    // once the session exists and settles there instead.
-    if (!session) return;
+    // and no prompt was sent: the turn settles here, as stopped, and `runTurn`
+    // sends nothing once the session exists. Waiting for the session instead
+    // left the Stop without effect for as long as the runtime took to answer.
+    if (!session) {
+      if (!turn.primarySent) {
+        dbg('turn stopped before its session was ready', turn.message?.id || '');
+        turn.settle();
+      }
+      return;
+    }
     if (sessionRpc.interruptMainTurn) {
       try {
         const outcome = await session.rpc.interruptMainTurn({ flushQueued: false });
@@ -3243,8 +3431,23 @@ export function createCopilotSdkSessionRunner({
     }) || null;
     turn.drive = driveTurn(turn);
     try {
-      await ensureSession(model, effort);
-      if (turn.aborted) {
+      // The watchdog covers the bring-up as well. None of the requests that
+      // open a session (resume, create, the model switch) has a timeout in
+      // the SDK, and a runtime that never answered one held the row in
+      // `processing` with no turn to fail and nothing for a Stop to stop.
+      turn.armStall();
+      const settledFirst = Symbol('turn-settled');
+      const building = ensureSession(model, effort);
+      // Still observed when the turn ends first and nothing awaits it.
+      building.catch(() => {});
+      const built = await Promise.race([
+        building,
+        turn.done.then(() => settledFirst, () => settledFirst),
+      ]);
+      if (built === settledFirst) {
+        // Failed or stopped while the session was being built; nothing is sent.
+        dbg('turn ended before its session was ready', message.id);
+      } else if (turn.aborted) {
         // The abort landed while the session was still being built. Nothing
         // was sent, so there is no runtime turn to interrupt — settle locally
         // rather than sending a prompt the user just cancelled.
@@ -3270,7 +3473,6 @@ export function createCopilotSdkSessionRunner({
         // A send that never resolves (a wedged runtime) must not hold this
         // delivery hostage once the watchdog has failed the turn: the id is
         // still recorded if it ever arrives, but the wait ends with the turn.
-        const settledFirst = Symbol('turn-settled');
         const runtimeId = await Promise.race([
           sending,
           turn.done.then(() => settledFirst, () => settledFirst),

@@ -744,3 +744,142 @@ test('readModelContextWindow times out instead of gating the turn, and never cac
   );
   assert.equal(hangs, 1);
 });
+
+// A run whose stream yields what the test pushes, and ends when told to.
+function createScriptedRun() {
+  const pending = [];
+  let wake = null;
+  let finished = false;
+  const run = {
+    id: 'run-1',
+    cancelled: 0,
+    push(message) { pending.push(message); wake?.(); },
+    finish() { finished = true; wake?.(); },
+    async cancel() { run.cancelled += 1; run.finish(); },
+    async* stream() {
+      while (true) {
+        if (pending.length) { yield pending.shift(); continue; }
+        if (finished) return;
+        await new Promise((resolve) => { wake = resolve; });
+        wake = null;
+      }
+    },
+  };
+  return run;
+}
+
+async function drain(turn) {
+  const seen = [];
+  try {
+    for await (const event of turn) seen.push(event);
+    return { seen, error: null };
+  } catch (error) {
+    return { seen, error };
+  }
+}
+
+const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+test('a run that goes silent is failed as stalled, and cancelled', async () => {
+  const run = createScriptedRun();
+  const turn = startCursorRun({
+    agent: { send: async () => run },
+    message: { text: 'hi' },
+    model: 'composer-1',
+    stallTimeoutMs: 100,
+    env: {},
+  });
+  const { error } = await drain(turn);
+
+  const classified = classifyCursorError(error);
+  assert.equal(classified.stableCode, 'cursor.turn-stalled');
+  assert.equal(classified.isStalled, true);
+  // The run had started and no tool was open: the model window (2.5 idle
+  // windows), not the idle one.
+  assert.match(classified.text, /^System note: the Cursor runtime sent nothing for 0s while a model request was running/);
+  assert.equal(run.cancelled, 1);
+});
+
+test('a tool call that runs in silence does not stall the run', async () => {
+  // A shell command that prints nothing for longer than the old fixed window
+  // failed a healthy turn (2026-09-27).
+  const run = createScriptedRun();
+  const turn = startCursorRun({
+    agent: { send: async () => run },
+    message: { text: 'hi' },
+    model: 'composer-1',
+    stallTimeoutMs: 100,
+    env: {},
+  });
+  const draining = drain(turn);
+  run.push({ type: 'tool_call', call_id: 'tool-1', name: 'shell', status: 'running', args: { command: 'make' } });
+  // Three model windows of silence, well inside the tool window.
+  await pause(600);
+  assert.equal(run.cancelled, 0);
+  run.push({ type: 'tool_call', call_id: 'tool-1', name: 'shell', status: 'completed', args: { command: 'make' } });
+  run.finish();
+
+  const { seen, error } = await draining;
+  assert.equal(error, null);
+  assert.equal(seen.length, 2);
+});
+
+test('a tool call reported by the delta hook holds the run the same way', async () => {
+  const run = createScriptedRun();
+  let onDelta = null;
+  const turn = startCursorRun({
+    agent: { send: async (_message, options) => { onDelta = options.onDelta; return run; } },
+    message: { text: 'hi' },
+    model: 'composer-1',
+    stallTimeoutMs: 100,
+    env: {},
+  });
+  const draining = drain(turn);
+  await pause(20);
+  onDelta({ update: { type: 'tool-call-started', callId: 'tool-1', toolCall: { type: 'shell' } } });
+  await pause(600);
+  assert.equal(run.cancelled, 0);
+  onDelta({ update: { type: 'tool-call-completed', callId: 'tool-1', toolCall: { type: 'shell' } } });
+  run.finish();
+
+  const { error } = await draining;
+  assert.equal(error, null);
+});
+
+test('client-hosted work holds the run however long it takes', async () => {
+  const run = createScriptedRun();
+  let cardOpen = true;
+  const turn = startCursorRun({
+    agent: { send: async () => run },
+    message: { text: 'hi' },
+    model: 'composer-1',
+    stallTimeoutMs: 100,
+    env: {},
+    hasPendingClientWork: () => cardOpen,
+  });
+  const draining = drain(turn);
+  await pause(600);
+  assert.equal(run.cancelled, 0);
+  cardOpen = false;
+  run.finish();
+  assert.equal((await draining).error, null);
+});
+
+test('a run that starts after the stall is cancelled when it arrives', async () => {
+  const run = createScriptedRun();
+  let releaseSend = null;
+  const turn = startCursorRun({
+    agent: { send: () => new Promise((resolve) => { releaseSend = () => resolve(run); }) },
+    message: { text: 'hi' },
+    model: 'composer-1',
+    stallTimeoutMs: 40,
+    env: {},
+  });
+  const { error } = await drain(turn);
+  assert.equal(classifyCursorError(error).stableCode, 'cursor.turn-stalled');
+  assert.equal(run.cancelled, 0);
+
+  releaseSend();
+  await pause(20);
+  assert.equal(run.cancelled, 1);
+});

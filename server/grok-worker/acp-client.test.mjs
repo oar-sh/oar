@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream';
 
 import { AcpClient, toAcpStdioMcpServer, withAcpMcpServers } from './acp-client.mjs';
 import { createGrokAgentHandle } from './grok-sdk-adapter.mjs';
+import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
 
 function createFakeProc() {
   const proc = new EventEmitter();
@@ -141,6 +142,53 @@ test('sessionPrompt fails a silent turn via the inactivity watchdog', async () =
     }),
     /turn stalled/,
   );
+});
+
+test('a silent prompt stalls after the model window, and the failure says so', async () => {
+  const { client } = startClientWithCapturedWrites();
+  const startedAt = Date.now();
+  const error = await client.sessionPrompt('sess', [{ type: 'text', text: 'hi' }], null, {}, {
+    inactivityMs: 400,
+    maxTurnMs: 60_000,
+  }).then(() => null, (failure) => failure);
+
+  // A prompt in flight is the model working: 2.5 inactivity windows.
+  assert.ok(Date.now() - startedAt >= 1000, 'not failed at the inactivity window');
+  assert.equal(isTurnStalledError(error), true);
+  assert.equal(error.stall.phase, 'model');
+  assert.match(describeTurnStall(error), /^System note: the Grok runtime sent nothing for 0s while a model request was running/);
+});
+
+test('a tool call of the agent that runs in silence does not stall the prompt', async () => {
+  const { client, pushLine } = startClientWithCapturedWrites();
+  const promptPromise = client.sessionPrompt('sess', [{ type: 'text', text: 'hi' }], null, {}, {
+    inactivityMs: 40,
+    maxTurnMs: 60_000,
+  });
+  pushLine({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: 'sess', update: { sessionUpdate: 'tool_call', toolCallId: 'tool-1', title: 'make', kind: 'execute', status: 'in_progress' } },
+  });
+  // Three model windows of silence, well inside the tool window.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  pushLine({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: 'sess', update: { sessionUpdate: 'tool_call_update', toolCallId: 'tool-1', status: 'completed' } },
+  });
+  pushLine({ jsonrpc: '2.0', id: 1, result: { stopReason: 'end_turn' } });
+  assert.equal((await promptPromise).stopReason, 'end_turn');
+});
+
+test('an environment that turns the shared watchdog off leaves this one on', async () => {
+  const { client } = startClientWithCapturedWrites();
+  const error = await client.sessionPrompt('sess', [{ type: 'text', text: 'hi' }], null, {}, {
+    env: { OAR_TURN_STALL_IDLE_MS: '0' },
+    modelMs: 300,
+    maxTurnMs: 0,
+  }).then(() => null, (failure) => failure);
+  assert.equal(isTurnStalledError(error), true);
 });
 
 test('sessionPrompt watchdog defers to pending client-side work until the ceiling', async () => {

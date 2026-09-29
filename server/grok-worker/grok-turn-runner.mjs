@@ -63,7 +63,11 @@ function buildGrokTerminalError(classified, message) {
     kind: 'grok-turn-failed',
     code: classified.code,
     stableCode: classified.code,
-    message: classified.message,
+    message: classified.text || classified.message,
+    // A stalled turn was cancelled and its agent is restarted for the next
+    // message; the relay's default advice ("restart the relay") repairs
+    // nothing here.
+    ...(classified.isStalled ? { guidance: 'Send the message again to retry.' } : {}),
     failedAt: new Date().toISOString(),
     queueMessageId: String(message?.id || '') || null,
   };
@@ -584,7 +588,8 @@ export function createGrokTurnRunner({
       const noteText = classified.isAuth
         ? `System note: the Grok agent could not authenticate (${classified.message})`
         : classified.isStalled
-          ? `System note: the Grok turn stalled and was stopped (${classified.message}). Send a new message to retry.`
+          ? classified.text
+            || `System note: the Grok turn stalled and was stopped (${classified.message}). Send a new message to retry.`
           : `System note: the Grok turn failed (${classified.message}).`;
       await publishResponse(message, {
         text: noteText,
