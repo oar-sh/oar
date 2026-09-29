@@ -387,6 +387,54 @@ test('a dead upstream yields a readable 502, and the link keeps working after a 
   assert.equal((await fetchLane(lane.origin, preview.basePath)).body, 'back');
 });
 
+// A dev server that closes a kept connection when the next request arrives on
+// it: what a server does that exited or was restarted between two requests.
+async function startUpstreamThatDropsKeptConnections() {
+  const requestsOn = new WeakMap();
+  return startUpstream((req, res) => {
+    const count = (requestsOn.get(req.socket) || 0) + 1;
+    requestsOn.set(req.socket, count);
+    if (count > 1) {
+      req.socket.destroy();
+      return;
+    }
+    res.end(`answer to ${req.method} ${req.url}`);
+  });
+}
+
+// Long enough for the lane to put the connection of the last request back.
+const connectionIsKept = () => new Promise((resolve) => setTimeout(resolve, 50));
+
+test('a request on a connection the dev server closed meanwhile is sent again, once', async (t) => {
+  const upstream = await startUpstreamThatDropsKeptConnections();
+  const lane = await startLane();
+  t.after(async () => { await lane.close(); await upstream.close(); });
+
+  const { preview } = lane.registry.create({ port: upstream.port });
+  assert.equal((await fetchLane(lane.origin, `${preview.basePath}one`)).body, 'answer to GET /one');
+  await connectionIsKept();
+
+  const second = await fetchLane(lane.origin, `${preview.basePath}two`);
+  assert.equal(second.status, 200);
+  assert.equal(second.body, 'answer to GET /two');
+  assert.deepEqual(upstream.received.map((entry) => entry.url), ['/one', '/two', '/two']);
+});
+
+test('a request with a body is not sent a second time', async (t) => {
+  const upstream = await startUpstreamThatDropsKeptConnections();
+  const lane = await startLane();
+  t.after(async () => { await lane.close(); await upstream.close(); });
+
+  const { preview } = lane.registry.create({ port: upstream.port });
+  assert.equal((await fetchLane(lane.origin, `${preview.basePath}one`)).status, 200);
+  await connectionIsKept();
+
+  const posted = await fetchLane(lane.origin, `${preview.basePath}order`, { method: 'POST', body: 'one item' });
+  assert.equal(posted.status, 502);
+  assert.match(posted.body, /Preview upstream unreachable/);
+  assert.deepEqual(upstream.received.map((entry) => `${entry.method} ${entry.url}`), ['GET /one', 'POST /order']);
+});
+
 test('websocket upgrades are proxied through the prefix', async (t) => {
   // A minimal echo upgrade handler — enough to prove the handshake and both
   // pipe directions without pulling in a websocket library.

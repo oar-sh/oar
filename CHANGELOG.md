@@ -84,6 +84,12 @@ All notable changes to OAR are documented here. The format follows
   on, without the message that carries the plan out.
 - A finished subagent no longer turns back to "Running" in the running turn
   when another line of activity arrives or the page reloads.
+- **Previews:** the first page load after a dev server was restarted no longer
+  ends in "The upstream connection failed: ECONNRESET". The preview lane keeps
+  its connections to the dev server, and the one it had kept was closed by the
+  restart. A request without a body is now sent once more on a connection of
+  its own: it reaches the restarted server, or the page says that nothing is
+  listening on the port.
 - Links in the file viewer and in plan boards have a colour that can be read in
   dark mode; they used the browser's default blue.
 - A question or approval card no longer answers itself when the relay is

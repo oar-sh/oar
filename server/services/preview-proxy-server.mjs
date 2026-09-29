@@ -239,6 +239,11 @@ function guardConnectTimeout(upstreamReq, timeoutMs, onTimeout) {
   });
 }
 
+// Requests the lane sends a second time when the connection it kept to the
+// dev server turns out to be closed, and what such a connection fails with.
+const REPEATABLE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+const STALE_CONNECTION_CODES = new Set(['ECONNRESET', 'EPIPE']);
+
 export function createPreviewProxyServer({
   registry,
   logger = console,
@@ -327,46 +332,69 @@ export function createPreviewProxyServer({
       bearerTokens: relayBearerTokens,
     });
 
-    const upstreamReq = httpImpl.request({
-      host: entry.targetHost,
-      port: entry.targetPort,
-      method: req.method,
-      path: upstreamPath,
-      headers,
-      agent,
-    });
+    // A request without a body can be sent a second time.
+    const repeatable = REPEATABLE_METHODS.has(String(req.method || '').toUpperCase())
+      && !(Number(req.headers['content-length']) > 0)
+      && !req.headers['transfer-encoding'];
+    let upstreamReq = null;
 
-    let timedOut = false;
-    guardConnectTimeout(upstreamReq, connectTimeoutMs, () => { timedOut = true; });
-
-    upstreamReq.on('response', (upstreamRes) => {
-      const outHeaders = sanitizeResponseHeaders(upstreamRes.headers, {
-        basePath: entry.basePath,
-        targetHost: entry.targetHost,
-        targetPort: entry.targetPort,
+    const forward = ({ again = false } = {}) => {
+      const current = httpImpl.request({
+        host: entry.targetHost,
+        port: entry.targetPort,
+        method: req.method,
+        path: upstreamPath,
+        headers,
+        agent,
       });
-      res.writeHead(upstreamRes.statusCode || 502, outHeaders);
-      // 204/304 and HEAD carry no body; piping one would desync the connection.
-      if (req.method === 'HEAD' || upstreamRes.statusCode === 204 || upstreamRes.statusCode === 304) {
-        upstreamRes.resume();
-        res.end();
-        return;
-      }
-      upstreamRes.pipe(res);
-      upstreamRes.on('error', () => { try { res.destroy(); } catch {} });
-    });
+      upstreamReq = current;
 
-    upstreamReq.on('error', (error) => {
-      const refused = String(error?.code || '') === 'ECONNREFUSED';
-      const detail = refused || timedOut
-        ? `Nothing is listening on <code>${escapeHtml(entry.targetHost)}:${entry.targetPort}</code>. The dev server behind this preview has probably exited — restart it on the same port and reload; this link stays valid.`
-        : `The upstream connection failed: <code>${escapeHtml(error?.code || error?.message || 'unknown error')}</code>.`;
-      sendErrorPage(res, 502, { title: 'Preview upstream unreachable', detail });
-    });
+      let timedOut = false;
+      guardConnectTimeout(current, connectTimeoutMs, () => { timedOut = true; });
 
-    req.on('aborted', () => { try { upstreamReq.destroy(); } catch {} });
-    res.on('close', () => { try { upstreamReq.destroy(); } catch {} });
-    req.pipe(upstreamReq);
+      current.on('response', (upstreamRes) => {
+        const outHeaders = sanitizeResponseHeaders(upstreamRes.headers, {
+          basePath: entry.basePath,
+          targetHost: entry.targetHost,
+          targetPort: entry.targetPort,
+        });
+        res.writeHead(upstreamRes.statusCode || 502, outHeaders);
+        // 204/304 and HEAD carry no body; piping one would desync the connection.
+        if (req.method === 'HEAD' || upstreamRes.statusCode === 204 || upstreamRes.statusCode === 304) {
+          upstreamRes.resume();
+          res.end();
+          return;
+        }
+        upstreamRes.pipe(res);
+        upstreamRes.on('error', () => { try { res.destroy(); } catch {} });
+      });
+
+      current.on('error', (error) => {
+        if (upstreamReq !== current) return;
+        // The connection was kept from an earlier request, and the dev server
+        // has closed it since (it exited, or was restarted): that says nothing
+        // about the server now. One more try on a connection of its own either
+        // reaches the restarted server or says that nothing is listening.
+        if (!again && repeatable && current.reusedSocket && !res.headersSent && !res.destroyed
+          && STALE_CONNECTION_CODES.has(String(error?.code || ''))) {
+          forward({ again: true });
+          return;
+        }
+        const refused = String(error?.code || '') === 'ECONNREFUSED';
+        const detail = refused || timedOut
+          ? `Nothing is listening on <code>${escapeHtml(entry.targetHost)}:${entry.targetPort}</code>. The dev server behind this preview has probably exited — restart it on the same port and reload; this link stays valid.`
+          : `The upstream connection failed: <code>${escapeHtml(error?.code || error?.message || 'unknown error')}</code>.`;
+        sendErrorPage(res, 502, { title: 'Preview upstream unreachable', detail });
+      });
+
+      // The second try has nothing left to read from the request.
+      if (again) current.end();
+      else req.pipe(current);
+    };
+
+    req.on('aborted', () => { try { upstreamReq?.destroy(); } catch {} });
+    res.on('close', () => { try { upstreamReq?.destroy(); } catch {} });
+    forward();
   }
 
   // WebSocket upgrades (Vite HMR, an app's own socket) ride the same prefix.
