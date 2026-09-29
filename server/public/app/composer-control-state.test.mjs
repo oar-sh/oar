@@ -47,7 +47,7 @@ test('no state ever produces a stop action', () => {
         for (const sendInFlight of [false, true]) {
           for (const steeringHeld of [false, true]) {
             for (const attachmentsUploading of [false, true]) {
-              for (const steeringHoldReason of [null, 'question', 'compaction', 'adoption', 'delivery']) {
+              for (const steeringHoldReason of [null, 'question', 'compaction', 'adoption', 'delivery', 'tool']) {
                 combos.push({
                   hasActiveTurn, hasDraft, steeringSupported, sendInFlight,
                   steeringHeld, attachmentsUploading, steeringHoldReason,
@@ -98,6 +98,14 @@ test('a steering hold keeps the button enabled as Queue and explains why', () =>
   assert.equal(compaction.label, 'Queue');
   assert.equal(compaction.disabled, false);
   assert.match(compaction.title, /compact/i);
+
+  const tool = deriveComposerControlState({
+    hasActiveTurn: true, hasDraft: true, steeringSupported: true,
+    steeringHeld: true, steeringHoldReason: 'tool',
+  });
+  assert.equal(tool.label, 'Queue');
+  assert.equal(tool.disabled, false);
+  assert.match(tool.title, /running tool call finishes/i);
 
   const unknown = deriveComposerControlState({
     hasActiveTurn: true, hasDraft: true, steeringSupported: true,

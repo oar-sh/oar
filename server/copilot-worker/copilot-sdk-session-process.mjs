@@ -86,7 +86,7 @@ import {
   parseAskUserToolArguments,
 } from './copilot-ask-user-tool.mjs';
 import { buildCopilotRemoteRelayTool } from './copilot-remote-relay-tool.mjs';
-import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
+import { createRemoteRelayToolGate, isRemoteRelayToolName } from '../../shared/remote-relay-tool-core.mjs';
 import {
   EXIT_PLAN_BOARD_POSTED_FEEDBACK,
   EXIT_PLAN_NO_BOARD_FEEDBACK,
@@ -518,6 +518,10 @@ export function createCopilotSdkSessionRunner({
   // The last readiness value reported to `onDeliveryReadinessChange`, so the
   // link only hears about flips.
   let lastReportedDeliveryReady = null;
+  // Deliveries handed back because a tool of the main agent was running (see
+  // mainToolsInFlight), counted until that hold ends. Only for the log: the
+  // messages themselves wait in the relay's queue.
+  let heldForRunningTool = 0;
   // Rows whose prompt the runtime consumed and whose settle marker is being
   // saved (id → { message, variant }). Reported by the heartbeat WITH a
   // terminal error until the publish lands, so recovery can never re-run them
@@ -1456,6 +1460,10 @@ export function createCopilotSdkSessionRunner({
       default:
         break;
     }
+    // A tool of the main agent that starts or ends moves the steering gate
+    // (see mainToolsInFlight). Told on receipt, like the liveness itself: the
+    // relay must stop delivering before the next message is on its way.
+    if (agent === 'root' && type.startsWith('tool.execution_')) syncDeliveryReadiness();
   }
 
   /**
@@ -4117,6 +4125,11 @@ export function createCopilotSdkSessionRunner({
       dbg('turn settled while steering was preparing; running it as a fresh turn', message.id);
       return NOT_STEERED;
     }
+    // The same for a tool that started meanwhile: the message goes back to
+    // the queue and comes again when the tool has ended.
+    if (mainToolsInFlight(turn).length > 0 && canHandBackHeldDelivery() !== false) {
+      return handBackHeldDelivery(message);
+    }
     const entry = createEntry(turn, message, 'steer');
     dbg('steering a mid-turn delivery into the running turn', message.id);
     let runtimeId;
@@ -4164,7 +4177,8 @@ export function createCopilotSdkSessionRunner({
    * would settle the continuation's reply against no row while its buffered
    * output flushed into the steered one); a question card, ask-mode approval
    * or elicitation is open (the relay must not push past a card); a
-   * compaction is running.
+   * compaction is running; a tool of the main agent is running (see
+   * mainToolsInFlight).
    */
   function canAcceptSteering() {
     if (disposed || !session) return false;
@@ -4173,7 +4187,58 @@ export function createCopilotSdkSessionRunner({
     if (!turn.primarySent || awaitingRow(turn)) return false;
     if (pendingHumanRequests > 0) return false;
     if (isCompacting()) return false;
+    if (mainToolsInFlight(turn).length > 0) return false;
     return true;
+  }
+
+  /**
+   * The tool hold: the names of the tools the MAIN agent of this turn has
+   * started and not finished. While there is one, nothing is steered in.
+   *
+   * The runtime answers a steer that arrives while it waits for a foreground
+   * shell command by ending the tool call ("moved to background by the user")
+   * and asking the model again. Seen live twice (2026-09-29): the turn then
+   * ended with the answer to the steer alone, or failed on an empty reply
+   * ("No response was returned"), and the command's result came later in a
+   * continuation. Held back until the tool boundary, the steer lands where
+   * the runtime would have injected it anyway and the command is left alone.
+   *
+   * There is no time limit on purpose: steering in after a wait would be the
+   * same interruption, only later. A held message shows as queued, and the
+   * end of the turn releases it like every other hold.
+   *
+   * Not counted:
+   *  - tools of subagents (their events carry an `agentId`). A background
+   *    agent works beside the main turn and for much longer; the main agent
+   *    is not waiting for its tools, so a steer interrupts nothing. A
+   *    subagent the main agent runs in the foreground is covered by the main
+   *    agent's own tool call that started it.
+   *  - `remote_relay`, which holds the stall watchdog but never held steering
+   *    (see `pendingRelayToolCalls`).
+   */
+  function mainToolsInFlight(turn = activeTurn) {
+    if (!turn || turn.settled) return [];
+    return turn.liveness.toolsOf('root').filter((name) => !isRemoteRelayToolName(name));
+  }
+
+  /** Why the live turn takes no steer right now ('other': it is being stopped). */
+  function steeringHoldReason(turn) {
+    if (pendingHumanRequests > 0) return 'question';
+    if (isCompacting()) return 'compaction';
+    if (!turn.primarySent || awaitingRow(turn)) return 'delivery';
+    if (mainToolsInFlight(turn).length > 0) return 'tool';
+    return 'other';
+  }
+
+  /**
+   * The tool hold ended (the tool did, or the turn) and deliveries were
+   * handed back for it: say so once. The relay sends them again on the
+   * readiness `syncDeliveryReadiness` reports.
+   */
+  function noteRunningToolHoldEnd() {
+    if (heldForRunningTool < 1 || mainToolsInFlight().length > 0) return;
+    dbg('the running tool ended; steering no longer held for it', `handed back=${heldForRunningTool}`);
+    heldForRunningTool = 0;
   }
 
   /** A continuation whose synthetic row is still being minted (and not given up on). */
@@ -4196,6 +4261,7 @@ export function createCopilotSdkSessionRunner({
   }
 
   function syncDeliveryReadiness() {
+    noteRunningToolHoldEnd();
     const ready = !isDeliveryHeld();
     if (ready === lastReportedDeliveryReady) return;
     lastReportedDeliveryReady = ready;
@@ -4213,7 +4279,14 @@ export function createCopilotSdkSessionRunner({
    * hold instead would bypass the question card or land inside a compaction.
    */
   async function handBackHeldDelivery(message) {
-    dbg('steering held; handing the delivery back to the queue', message.id || '(no id)');
+    const turn = activeTurn;
+    if (turn && !turn.settled && steeringHoldReason(turn) === 'tool') {
+      heldForRunningTool += 1;
+      const tools = [...new Set(mainToolsInFlight(turn).map((name) => name || 'tool'))];
+      dbg('steering held while a tool runs; handing the delivery back to the queue', message.id || '(no id)', `tools=${tools.join(', ')}`);
+    } else {
+      dbg('steering held; handing the delivery back to the queue', message.id || '(no id)');
+    }
     if (!message.id) return false;
     await api('POST', '/api/requeue', {
       messageId: message.id,
@@ -4261,13 +4334,7 @@ export function createCopilotSdkSessionRunner({
     const turn = activeTurn;
     const turnActive = Boolean(turn && !turn.settled);
     const canSteer = canAcceptSteering();
-    let holdReason = null;
-    if (turnActive && !canSteer) {
-      if (pendingHumanRequests > 0) holdReason = 'question';
-      else if (isCompacting()) holdReason = 'compaction';
-      else if (!turn.primarySent || awaitingRow(turn)) holdReason = 'delivery';
-      else holdReason = 'other';
-    }
+    const holdReason = turnActive && !canSteer ? steeringHoldReason(turn) : null;
     const messageId = String(turn?.currentOwner?.message?.id || turn?.message?.id || '').trim() || null;
     return { turnActive, canSteer, holdReason, messageId, supported: true, cancellableIds: cancellableIds() };
   }
@@ -4415,12 +4482,12 @@ export function createCopilotSdkSessionRunner({
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
-    // Held (a card is open, a compaction is running, the turn-opening prompt
-    // is not sent yet): hand the row back with no retry penalty; the relay
-    // re-delivers it when the hold ends. An older relay (the worker updated on
-    // disk before the relay restarted) treats the hand-back as a failed
-    // delivery — retry, backoff, worker marked errored — so against one the
-    // message is pushed the legacy way.
+    // Held (a card is open, a compaction is running, a tool of the main agent
+    // is running, the turn-opening prompt is not sent yet): hand the row back
+    // with no retry penalty; the relay re-delivers it when the hold ends. An
+    // older relay (the worker updated on disk before the relay restarted)
+    // treats the hand-back as a failed delivery — retry, backoff, worker
+    // marked errored — so against one the message is pushed the legacy way.
     if (isDeliveryHeld() && canHandBackHeldDelivery() !== false) return handBackHeldDelivery(message);
     // Legacy path only: never send a second prompt before the turn-opening one
     // (it would invert the runs), and never start a second turn beside one

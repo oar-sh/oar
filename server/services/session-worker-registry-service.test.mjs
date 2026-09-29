@@ -140,6 +140,13 @@ test('the steering snapshot is normalized, stored, and survives spread-conventio
     cancellableIds: [],
   });
 
+  // A running tool call is a hold the Copilot SDK worker reports.
+  registry.upsertWorker({
+    ...registry.getWorker('sdk-1'),
+    steering: { turnActive: true, canSteer: false, holdReason: 'tool', messageId: 'q-7' },
+  });
+  assert.equal(registry.getWorker('sdk-1').steering.holdReason, 'tool');
+
   // Unknown hold reasons are dropped to null; junk shapes normalize to null.
   registry.upsertWorker({
     ...registry.getWorker('sdk-1'),

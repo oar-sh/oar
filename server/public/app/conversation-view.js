@@ -495,7 +495,7 @@ function cancellableSteerIdsForConversation(conversationId) {
 // and why. Two sources, freshest first: the client's own knowledge of an open
 // question card (instant — the worker's heartbeat snapshot lags up to ~10s),
 // then the worker-reported steering snapshot for the slower holds only it can
-// see (compaction, post-compaction adoption).
+// see (compaction, post-compaction adoption, a running tool call).
 function steeringHoldForConversation(conversationId) {
   const conversationKey = String(conversationId || '').trim();
   if (!conversationKey || !conversationSupportsSteering(conversationKey)) {

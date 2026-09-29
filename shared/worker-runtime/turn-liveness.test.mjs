@@ -100,6 +100,23 @@ test('reset closes everything in flight', () => {
   assert.equal(liveness.quietMs(), 0);
 });
 
+test('the tools of one agent are told apart from the tools of the others', () => {
+  const liveness = createTurnLiveness({ windows: WINDOWS });
+  liveness.begin('tool', 'root:call-1', 'bash');
+  liveness.begin('tool', 'root:call-2', 'bash');
+  liveness.begin('tool', 'root:call-3');
+  liveness.begin('tool', 'agent-7:call-1', 'view');
+  assert.deepEqual(liveness.toolsOf('root'), ['bash', 'bash', '']);
+  assert.deepEqual(liveness.toolsOf('agent-7'), ['view']);
+  assert.deepEqual(liveness.toolsOf('agent-8'), []);
+  assert.deepEqual(liveness.toolsOf(''), []);
+  liveness.end('tool', 'root:call-1');
+  liveness.end('tool', 'root:call-2');
+  liveness.end('tool', 'root:call-3');
+  assert.deepEqual(liveness.toolsOf('root'), []);
+  assert.deepEqual(liveness.toolsOf('agent-7'), ['view']);
+});
+
 test('describe names the phase, the silence and the tools in flight', () => {
   const time = clock();
   const liveness = createTurnLiveness({ windows: WINDOWS, now: time.now });

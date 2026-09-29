@@ -27,6 +27,7 @@ const STEERING_HOLD_TITLES = Object.freeze({
   compaction: 'Will steer in once the conversation finishes compacting',
   adoption: 'Will steer in once the compaction recovery finishes',
   delivery: 'Will steer in once the current delivery lands',
+  tool: 'Will steer in once the running tool call finishes',
 });
 
 export function deriveComposerControlState({
@@ -41,9 +42,9 @@ export function deriveComposerControlState({
   // not "Queue". Workers that do not advertise it keep the queue wording.
   steeringSupported = false,
   // The worker reports steering as momentarily held (open question card or
-  // plan approval, compaction, post-compaction adoption). A send stays allowed
-  // and reads "Queue": the relay holds the message and it steers in once the
-  // hold clears.
+  // plan approval, compaction, post-compaction adoption, a running tool call
+  // that a steer would cut short). A send stays allowed and reads "Queue":
+  // the relay holds the message and it steers in once the hold clears.
   steeringHeld = false,
   steeringHoldReason = null,
 } = {}) {

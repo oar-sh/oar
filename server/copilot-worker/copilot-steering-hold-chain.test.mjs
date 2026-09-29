@@ -83,7 +83,7 @@ const userMessage = (messageId, delivery, content = '') => ({ type: 'user.messag
  * Worker side wired exactly like copilot-sdk-session-worker.mjs: runner ⇄
  * bridge ⇄ real link, against the given relay. Resolves once q-1 is live.
  */
-async function bootLiveTurn(t, { WebSocketServerImpl } = {}) {
+async function bootLiveTurn(t, { WebSocketServerImpl, laterSends = null } = {}) {
   const offers = [{ ...baseMessage, id: 'q-1', text: 'hello' }];
   const relay = await startRelay({ offers, WebSocketServerImpl });
   const stub = makeApiStub();
@@ -96,6 +96,8 @@ async function bootLiveTurn(t, { WebSocketServerImpl } = {}) {
       sendIndex += 1;
       if (sendIndex === 1) {
         session.replay([userMessage(messageId, 'idle', 'hello'), { type: 'assistant.message', data: { messageId: 'm1', content: 'one question first' } }]);
+      } else if (laterSends) {
+        session.replay(laterSends(messageId, sendIndex));
       } else {
         session.replay([
           userMessage(messageId, 'steering', 'also do X'),
@@ -200,5 +202,77 @@ test('against a relay that predates the hold protocol the worker falls back to p
     () => stub.bodiesFor('/api/response').find((body) => body.messageId === 'q-2'),
     { label: 'q-2 answered' },
   );
+  await waitFor(() => runner.isTurnActive() === false, { label: 'turn released' });
+});
+
+test('a running command withdraws relay readiness over the socket, and its end draws the held messages in, oldest first', async (t) => {
+  const { offers, relay, stub, client, runner, delivered } = await bootLiveTurn(t, {
+    laterSends: (messageId, sendIndex) => (sendIndex === 2
+      ? [userMessage(messageId, 'steering', 'also do X'), { type: 'assistant.message', data: { messageId: 'm2', content: 'did X' } }]
+      : [
+          userMessage(messageId, 'steering', 'and then Y'),
+          { type: 'assistant.message', data: { messageId: 'm3', content: 'did Y' } },
+          { type: 'assistant.idle', data: {} },
+        ]),
+  });
+
+  // The command starts: the runner's flip reaches the relay as worker.unready.
+  client.session.emit({ type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'bash', arguments: { command: 'npm test' } } });
+  await waitFor(() => relay.service.status().readyCount === 0, { label: 'the relay withdrew readiness' });
+
+  // Two messages queued now are not delivered into the running command.
+  offers.push({ ...baseMessage, id: 'q-2', text: 'also do X' }, { ...baseMessage, id: 'q-3', text: 'and then Y' });
+  relay.service.emitQueueChanged('new-message');
+  await tick(600);
+  assert.deepEqual(delivered, ['q-1'], 'nothing delivered while the command runs');
+  assert.equal(client.session.sends.length, 1);
+  assert.equal(runner.steeringState().holdReason, 'tool');
+
+  // Its end re-arms the relay at once and both steer in, in queue order.
+  client.session.emit({ type: 'tool.execution_complete', data: { toolCallId: 'call-1', success: true, result: { content: 'ok' } } });
+  await waitFor(() => client.session.sends.length === 3, { label: 'both pushed' });
+  assert.deepEqual(delivered, ['q-1', 'q-2', 'q-3']);
+  assert.match(client.session.sends[1].prompt, /also do X/);
+  assert.match(client.session.sends[2].prompt, /and then Y/);
+  assert.equal(client.session.sends[1].mode, 'immediate');
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0, 'no hand-back was needed');
+  assert.equal(client.session.abortCalls, 0);
+  assert.deepEqual(client.session.interruptCalls, []);
+
+  await waitFor(
+    () => stub.bodiesFor('/api/response').find((body) => body.messageId === 'q-1'),
+    { label: 'q-1 settled' },
+  );
+  assert.deepEqual(
+    stub.bodiesFor('/api/response').find((body) => body.messageId === 'q-1').consumedSteerIds,
+    [{ id: 'q-2', attemptId: null }, { id: 'q-3', attemptId: null }],
+  );
+  await waitFor(() => runner.isTurnActive() === false, { label: 'turn released' });
+});
+
+test('a message held for a running command opens the next turn when the turn ends first', async (t) => {
+  const { offers, relay, stub, client, runner, delivered } = await bootLiveTurn(t, {
+    laterSends: (messageId) => [
+      userMessage(messageId, 'idle', 'also do X'),
+      { type: 'assistant.message', data: { messageId: 'm2', content: 'did X' } },
+      { type: 'assistant.idle', data: {} },
+    ],
+  });
+  client.session.emit({ type: 'tool.execution_start', data: { toolCallId: 'call-1', toolName: 'bash', arguments: { command: 'npm test' } } });
+  await waitFor(() => relay.service.status().readyCount === 0, { label: 'the relay withdrew readiness' });
+  offers.push({ ...baseMessage, id: 'q-2', text: 'also do X' });
+  relay.service.emitQueueChanged('new-message');
+
+  // The turn fails under the running command; the completion never comes.
+  client.session.emit({ type: 'session.error', data: { errorType: 'query', message: 'No response was returned' } });
+  await waitFor(() => delivered.includes('q-2'), { label: 'q-2 delivered once the turn was gone' });
+  await waitFor(
+    () => stub.bodiesFor('/api/response').find((body) => body.messageId === 'q-2'),
+    { label: 'q-2 answered' },
+  );
+  const answer = stub.bodiesFor('/api/response').find((body) => body.messageId === 'q-2');
+  assert.match(answer.text, /did X/);
+  assert.notEqual(answer.kind, 'folded');
+  assert.ok(stub.bodiesFor('/api/response').find((body) => body.messageId === 'q-1').terminalError, 'q-1 failed');
   await waitFor(() => runner.isTurnActive() === false, { label: 'turn released' });
 });

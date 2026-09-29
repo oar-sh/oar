@@ -60,7 +60,7 @@ function normalizeStatus(value) {
   return ALLOWED_STATUSES.has(mapped) ? mapped : 'new';
 }
 
-const STEERING_HOLD_REASONS = new Set(['question', 'compaction', 'adoption', 'delivery', 'other']);
+const STEERING_HOLD_REASONS = new Set(['question', 'compaction', 'adoption', 'delivery', 'tool', 'other']);
 const STEERING_MESSAGE_ID_MAX_LENGTH = 64;
 const STEERING_CANCELLABLE_IDS_MAX = 50;
 

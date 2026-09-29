@@ -140,6 +140,20 @@ export function createTurnLiveness({ windows = DEFAULT_TURN_STALL_WINDOWS_MS, no
     /** The labels of the tools in flight, without repeats. */
     toolsInFlight: () => [...new Set([...open.tool.values()].filter(Boolean))],
     /**
+     * The tools one agent has in flight (ids `<agent>:<call>`): one label per
+     * call, repeats kept, '' for a call without a name. For a caller that
+     * has to know what the main agent waits for, whatever its subagents do.
+     */
+    toolsOf(agent) {
+      const key = String(agent || '').trim();
+      if (!key) return [];
+      const labels = [];
+      for (const [id, label] of open.tool) {
+        if (id.startsWith(`${key}:`)) labels.push(label);
+      }
+      return labels;
+    },
+    /**
      * `stalled` once the silence has reached the window of the current phase;
      * otherwise `waitMs` is when to look again: when the window runs out, but
      * no later than the next multiple of the idle window, which is where a

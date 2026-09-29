@@ -44,6 +44,12 @@ All notable changes to OAR are documented here. The format follows
   and a worker whose creator was long gone could so look like a child of the
   session that was being stopped. A process older than its parent is no longer
   taken for its child, and the worker of another session never is.
+- **Copilot:** a message sent while a command is running no longer cuts the
+  command short. It waits until the running tool call has ended and is steered
+  in then; the composer reads "Queue" for as long. Sent at once, the message
+  made the runtime push the command to the background: the turn ended early
+  with the answer to the new message alone, or failed with "No response was
+  returned", and the command's result arrived later in a turn of its own.
 - A plan board's action ("Implement in autopilot" and the like) queues its
   follow-up again. It failed with an error and left the board marked as acted
   on, without the message that carries the plan out.
