@@ -5,6 +5,12 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A plan board's action ("Implement in autopilot" and the like) queues its
+  follow-up again. It failed with an error and left the board marked as acted
+  on, without the message that carries the plan out.
+
 ## [0.9.5] — 2026-09-27
 
 Highlights: a Claude reply on the wrong row no longer blocks the conversation,

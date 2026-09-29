@@ -222,7 +222,11 @@ export function registerRelayBoardRoutes(app, deps) {
           String(resolvedVariantModel || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual',
         );
         stmts.updateConvTime.run(now, convId);
-        stmts.insertQ.run(
+        // One value per placeholder of the queue insert: the context tier
+        // (none: the follow-up runs on the conversation's own) and, where the
+        // queue has the column, the image operation. Two short, the insert
+        // threw and the action answered 500 with the board already marked.
+        const queueArgs = [
           queuedMessageId,
           convId,
           runtimeSession?.id || null,
@@ -230,6 +234,7 @@ export function registerRelayBoardRoutes(app, deps) {
           resolvedBaseModel,
           resolvedVariantModel,
           resolvedReasoningEffort,
+          null,
           relayMode,
           followupPrompt,
           null,
@@ -238,7 +243,9 @@ export function registerRelayBoardRoutes(app, deps) {
           null,
           null,
           null,
-        );
+        ];
+        if (stmts.queueHasImageOperationId) queueArgs.push(null);
+        stmts.insertQ.run(...queueArgs);
         io.emit('user_message', {
           conversationId: convId,
           messageId: queuedMessageId,
