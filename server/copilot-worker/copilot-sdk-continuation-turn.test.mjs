@@ -586,6 +586,31 @@ test('the relay\'s own refusal of a continuation row still ends after three atte
   await runner.dispose();
 });
 
+test('a runtime that dies during a continuation does not leave its handles behind', async () => {
+  // The teardown used to be for delivered turns only, so the next message was
+  // sent into the dead runtime and failed.
+  const stub = makeContinuationApiStub();
+  const client = createFakeCopilotClient({
+    onSend: (session) => { if (session.sends.length === 1) session.replay(TIMER_TURN); },
+  });
+  let killRuntime = null;
+  client.processExitPromise = new Promise((_resolve, reject) => { killRuntime = reject; });
+  client.processExitPromise.catch(() => {});
+  const { runner } = makeRunner({ stub, client, continuationRetryDelayMs: 1, turnStallTimeoutMs: 0 });
+  await runner.handlePendingPayload({ message: baseMessage });
+
+  // A continuation opens and the runtime exits under it.
+  fireTimer(client, TIMER_CONTINUATION.slice(0, 3));
+  await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
+  killRuntime(new Error('CLI server exited with code 1'));
+
+  await waitFor(() => runner.isTurnActive() === false, { label: 'continuation failed' });
+  assert.equal(client.stopped, 1);
+  assert.equal(runner._getState().hasClient, false);
+  assert.equal(runner._getState().hasSession, false);
+  await runner.dispose();
+});
+
 test('a relay that answers without a message id is retried, then honoured', async () => {
   // A truthy-but-empty body must not end the retry loop early.
   let attempt = 0;

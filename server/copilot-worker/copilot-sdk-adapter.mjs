@@ -28,6 +28,7 @@ import {
   MODEL_SWITCH_UNCONFIRMED_CODE,
   MODEL_SWITCH_UNCONFIRMED_STABLE_CODE,
   isModelSwitchUnconfirmedError,
+  isRuntimeTransportError,
 } from './copilot-model-switch.mjs';
 import { copilotRuntimeEntry } from '../copilot-sdk-runtime.mjs';
 import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
@@ -539,11 +540,6 @@ export function classifyCopilotTurnException(error) {
   };
 }
 
-// JSON-RPC reserved codes the SDK's transport uses for a connection that went
-// away (`MessageWriteError` … `ConnectionInactive`), as opposed to a server
-// handler that threw.
-const TRANSPORT_ERROR_CODES = new Set([-32099, -32098, -32097, -32096]);
-
 /**
  * Did `resumeSession` fail because the session does not exist, or because the
  * call itself failed?
@@ -558,9 +554,7 @@ const TRANSPORT_ERROR_CODES = new Set([-32099, -32098, -32097, -32096]);
  * conversation history.
  */
 export function isSessionNotFoundError(error) {
-  const code = Number(error?.code);
-  if (Number.isFinite(code) && TRANSPORT_ERROR_CODES.has(code)) return false;
-  if (error?.name === 'ConnectionError') return false;
+  if (isRuntimeTransportError(error)) return false;
   const detail = String(error?.message || error || '').toLowerCase();
   if (!detail) return false;
   if (/\b(?:session|conversation)\b[^.]{0,40}\bnot found\b/.test(detail)) return true;

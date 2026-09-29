@@ -62,6 +62,18 @@ All notable changes to OAR are documented here. The format follows
   holds the turn: a live update waits 10 seconds at most, and after one that
   ran out, live updates are skipped for 30 seconds. Tool lines skipped then are
   missing from the transcript; the reply is not affected.
+- **Copilot:** Stop works on a turn that is stuck. A runtime that does not
+  answer the Stop within 10 seconds is ended with the turn, and a turn the user
+  stopped ends as stopped even when the runtime died or went silent after it.
+- **Copilot:** a runtime that exits, or stops answering, while the agent works
+  by itself after a background task is cleared away; the next message used to
+  fail on it. A lost connection during a model change is reported as that, not
+  as "pick another model".
+- **Copilot:** a failed turn tells its failure once. A message sent into the
+  turn that the agent had not started on gets the short marker with Resend,
+  like one it had taken in.
+- **Copilot:** background agents and shells are no longer closed with the
+  runtime because its list of them could not be read.
 
 ## [0.9.5] — 2026-09-27
 

@@ -204,6 +204,88 @@ test('live registry tasks pin the runtime; the cap cancels them instead of forge
   assert.deepEqual(runner._getState().backgroundTasks, []);
 });
 
+test('a registry the runtime does not answer for is not read as "nothing is running"', async () => {
+  // An idle shutdown on the strength of a failed read killed the shells and
+  // agents the read would have found. The test answers each read by hand and
+  // lets no timeout run, so what it sees does not depend on how fine the
+  // clock is: a read that is due, one under way and one that failed all hold.
+  const { client, runner } = setup({
+    taskList: [agentTask({ startedAt: startedAtIso(60_000) })],
+    idleShutdownMs: 1,
+    lifecyclePollMs: 1,
+    taskRefreshMs: 40,
+    runtimeRpcTimeoutMs: 60_000,
+    getBackgroundTaskTimeoutMs: () => 0,
+  });
+  const createSession = client.createSession.bind(client);
+  const unanswered = [];
+  let answers = false;
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    const list = session.rpc.tasks.list.bind(session.rpc.tasks);
+    session.rpc.tasks.list = () => (answers ? list() : new Promise((_resolve, reject) => { unanswered.push(reject); }));
+    return session;
+  };
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+
+  // The first read is due and, on any clock that is not far behind, has not
+  // asked yet.
+  await tick(5);
+  runner._evaluateLifecycle();
+  await tick(5);
+  assert.equal(client.stopped, 0, 'held while the first read is due');
+
+  // It asks, and the runtime does not answer.
+  await waitFor(() => unanswered.length === 1, { label: 'first read under way' });
+  runner._evaluateLifecycle();
+  await tick(5);
+  assert.equal(client.stopped, 0, 'held while the read is under way');
+
+  // The read fails: what is running is still not known. The lifecycle asks again.
+  unanswered.shift()(new Error('the runtime did not answer'));
+  await tick(5);
+  runner._evaluateLifecycle();
+  await tick(5);
+  assert.equal(client.stopped, 0, 'held while the registry cannot be read');
+  await waitFor(() => unanswered.length === 1, { label: 'second read under way' });
+
+  // The runtime answers again: the agent is found and keeps holding it.
+  answers = true;
+  unanswered.shift()(new Error('the runtime did not answer'));
+  await waitFor(() => {
+    runner._evaluateLifecycle();
+    return runner._getState().backgroundTasks.length === 1;
+  }, { label: 'registry read' });
+  runner._evaluateLifecycle();
+  await tick(5);
+  assert.equal(client.stopped, 0);
+  await runner.dispose();
+});
+
+test('a registry that never answers stops holding the runtime after its attempts', async () => {
+  const { client, runner } = setup({
+    taskList: [],
+    idleShutdownMs: 5,
+    lifecyclePollMs: 1,
+    runtimeRpcTimeoutMs: 5,
+    getBackgroundTaskTimeoutMs: () => 0,
+  });
+  const createSession = client.createSession.bind(client);
+  let reads = 0;
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    session.rpc.tasks.list = () => { reads += 1; return new Promise(() => {}); };
+    return session;
+  };
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  // Bounded by what happens, not by how long it takes on this clock.
+  await waitFor(() => {
+    runner._evaluateLifecycle();
+    return client.stopped === 1;
+  }, { timeoutMs: 10_000, label: 'runtime let go' });
+  assert.equal(reads, 5, 'it asked as often as it may before letting go');
+});
+
 test('a task older than the cap is cancelled by the lifecycle, not forgotten', async () => {
   const { client, runner } = setup({
     taskList: [agentTask({ startedAt: startedAtIso(60_000) }), shellTask({ startedAt: startedAtIso(100) })],
@@ -212,7 +294,7 @@ test('a task older than the cap is cancelled by the lifecycle, not forgotten', a
     getBackgroundTaskTimeoutMs: () => 30_000,
   });
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
-  await runner.whenTasksRefreshed();
+  await waitFor(() => runner._getState().backgroundTasks.length === 2, { label: 'registry read' });
   runner._evaluateLifecycle();
   await waitFor(() => client.session.cancelledTasks.includes(AGENT_ID), { label: 'expired agent cancelled' });
   assert.equal(client.session.cancelledTasks.includes('0'), false, 'the young shell stays');
@@ -281,7 +363,7 @@ test('a task the runtime will not cancel at the cap is abandoned after a few ref
     getBackgroundTaskTimeoutMs: () => 30_000,
   });
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
-  await runner.whenTasksRefreshed();
+  await waitFor(() => runner._getState().backgroundTasks.length === 1, { label: 'registry read' });
   // A shell whose process ignores the cancel: the registry keeps it running.
   client.session.rpc.tasks.cancel = async () => ({ cancelled: false });
   for (let poll = 0; poll < 3; poll += 1) {

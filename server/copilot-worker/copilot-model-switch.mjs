@@ -112,6 +112,22 @@ export function createModelSwitchUnconfirmedError({
   return error;
 }
 
+// JSON-RPC reserved codes the SDK's transport uses for a connection that went
+// away (`MessageWriteError` … `ConnectionInactive`), as opposed to a server
+// handler that threw.
+const TRANSPORT_ERROR_CODES = new Set([-32099, -32098, -32097, -32096]);
+
+/**
+ * The request failed because the connection to the runtime is gone, not
+ * because the runtime refused it.
+ */
+export function isRuntimeTransportError(error) {
+  const code = Number(error?.code);
+  if (Number.isFinite(code) && TRANSPORT_ERROR_CODES.has(code)) return true;
+  if (error?.name === 'ConnectionError') return true;
+  return /\bconnection (?:got |is |was )?(?:disposed|closed)\b/i.test(String(error?.message || ''));
+}
+
 export function isModelSwitchUnconfirmedError(error) {
   return error?.modelSwitchUnconfirmed === true;
 }
@@ -272,6 +288,16 @@ export function createCopilotModelSwitcher({
       });
     };
 
+    // A request that failed because the connection to the runtime is gone says
+    // nothing about the model: "pick an available model and resend it" sent
+    // the user to the model picker over a dead runtime, and because an
+    // unconfirmed switch keeps the runtime, every retry failed the same way.
+    // Thrown as it is, it fails the turn and the runtime is rebuilt.
+    const failOrRethrow = (error, requestedEffort = targetEffortRaw) => {
+      if (isRuntimeTransportError(error)) throw error;
+      return fail(error?.message || String(error), requestedEffort);
+    };
+
     // ---- resolve the effort actually sent on the wire -----------------------
     // `null` target = "the model's default": mapped to the catalog's
     // `defaultReasoningEffort` when known, otherwise omitted entirely (and the
@@ -347,7 +373,7 @@ export function createCopilotModelSwitcher({
         // the only signal left. Hosted trusts it; BYOK falls back to rebuild.
         if (byok || typeof session?.setModel !== 'function') return fail('the runtime exposes no model-switch RPC');
         await session.setModel(targetModel, effortToSend ? { reasoningEffort: effortToSend } : undefined)
-          .catch((error) => fail(error?.message || String(error)));
+          .catch((error) => failOrRethrow(error));
         applied = { model: targetModel, effort: trackedEffort };
         return { ok: true, changed: true };
       }
@@ -363,7 +389,7 @@ export function createCopilotModelSwitcher({
         });
       } catch (error) {
         drain.cancel();
-        return fail(error?.message || String(error));
+        return failOrRethrow(error);
       }
       if (result?.confirmation) {
         // A compaction preflight wants an interactive decision; a headless
@@ -404,7 +430,7 @@ export function createCopilotModelSwitcher({
     try {
       effortResult = await setEffort.call(session.rpc.model, { reasoningEffort: effortToSend });
     } catch (error) {
-      return fail(error?.message || String(error), effortToSend);
+      return failOrRethrow(error, effortToSend);
     }
     const recorded = String(effortResult?.reasoningEffort || '').trim().toLowerCase();
     if (recorded && recorded !== effortToSend) {

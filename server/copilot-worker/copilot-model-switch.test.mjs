@@ -7,6 +7,7 @@ import {
   createCopilotModelSwitcher,
   createModelSwitchUnconfirmedError,
   isModelSwitchUnconfirmedError,
+  isRuntimeTransportError,
   normalizeRelayEffort,
   supportedEffortsOf,
 } from './copilot-model-switch.mjs';
@@ -368,4 +369,13 @@ test('catalogEntries on a refused list is empty and cached, not retried', async 
   assert.deepEqual(await switcher.catalogEntries(session), []);
   // Cached-as-empty is the standing degradation policy for a failed list.
   assert.equal(listAttempts, 1);
+});
+
+test('a connection that is gone is recognised by code, name and wording', () => {
+  assert.equal(isRuntimeTransportError(Object.assign(new Error('write failed'), { code: -32099 })), true);
+  assert.equal(isRuntimeTransportError(Object.assign(new Error('boom'), { name: 'ConnectionError' })), true);
+  assert.equal(isRuntimeTransportError(new Error('Pending response rejected since connection got disposed')), true);
+  assert.equal(isRuntimeTransportError(new Error('Connection is closed.')), true);
+  assert.equal(isRuntimeTransportError(Object.assign(new Error('model not available'), { code: -32603 })), false);
+  assert.equal(isRuntimeTransportError(new Error('the model refused the connection string')), false);
 });

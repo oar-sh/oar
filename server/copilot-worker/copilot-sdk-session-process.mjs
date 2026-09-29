@@ -125,6 +125,16 @@ const DEFAULT_LIFECYCLE_POLL_MS = 5_000;
 /** How long the runtime may take to answer the stall watchdog's ping. */
 const DEFAULT_STALL_PROBE_TIMEOUT_MS = 5_000;
 /**
+ * How long the runtime may take to answer a request of the worker's own: a
+ * Stop, a read of its task registry or its message queue. None of them has a
+ * timeout in the SDK, and a healthy runtime answers within milliseconds even
+ * while it is busy (it answered a ping in 2 ms through a 150 s silent tool
+ * call, runtime 1.0.88).
+ */
+const DEFAULT_RUNTIME_RPC_TIMEOUT_MS = 10_000;
+/** Failed reads of the task registry in a row before its last answer stops counting. */
+const MAX_TASK_REFRESH_FAILURES = 5;
+/**
  * How long live background shells ALONE may keep the runtime up (0 = no limit).
  *
  * Deliberately not the relay's `background_task_timeout_minutes` slider, whose
@@ -389,6 +399,7 @@ export function createCopilotSdkSessionRunner({
   turnStallModelTimeoutMs = undefined,
   turnStallToolTimeoutMs = undefined,
   stallProbeTimeoutMs = DEFAULT_STALL_PROBE_TIMEOUT_MS,
+  runtimeRpcTimeoutMs = DEFAULT_RUNTIME_RPC_TIMEOUT_MS,
   // How long a `deferred: true` model switch may wait for its
   // `session.model_change` drain before the explicit selection counts as
   // unconfirmed and fails the row (`COPILOT_SDK_RELAY_MODEL_SWITCH_TIMEOUT_MS`).
@@ -590,6 +601,15 @@ export function createCopilotSdkSessionRunner({
   const agentDetails = new Map();
   let taskRefreshTimer = null;
   let taskRefreshChain = Promise.resolve();
+  // Reads of the registry that failed in a row. While there are some, "no
+  // live task" is not known but assumed, and the runtime is not closed over
+  // it: an idle shutdown on the strength of a failed read killed the shells
+  // and agents the read would have found.
+  let taskRefreshFailures = 0;
+  // A read that is on its way counts the same: its answer is not in yet.
+  let taskRefreshInFlight = false;
+  // Reads that are due but have not asked the runtime yet.
+  let taskRefreshQueued = 0;
   let lastTaskRefreshAt = 0;
   let taskPublishTimer = null;
   let lastPublishedTasksSignature = '';
@@ -1608,7 +1628,11 @@ export function createCopilotSdkSessionRunner({
     if (!sessionRpc.tasks || taskRefreshTimer) return;
     taskRefreshTimer = setTimeout(() => {
       taskRefreshTimer = null;
-      taskRefreshChain = taskRefreshChain.then(() => refreshBackgroundTasks()).catch(() => {});
+      taskRefreshQueued += 1;
+      taskRefreshChain = taskRefreshChain
+        .then(() => refreshBackgroundTasks())
+        .catch(() => {})
+        .finally(() => { taskRefreshQueued -= 1; });
     }, taskRefreshMs);
     taskRefreshTimer.unref?.();
   }
@@ -1625,13 +1649,18 @@ export function createCopilotSdkSessionRunner({
     if (!target || !sessionRpc.tasks) return;
     lastTaskRefreshAt = Date.now();
     let listed;
+    taskRefreshInFlight = true;
     try {
-      listed = await target.rpc.tasks.list();
+      listed = await askRuntime('tasks.list', () => target.rpc.tasks.list());
     } catch (error) {
       dbg('tasks.list failed', error?.message || String(error));
+      if (session === target) taskRefreshFailures += 1;
       return;
+    } finally {
+      taskRefreshInFlight = false;
     }
     if (session !== target) return;
+    taskRefreshFailures = 0;
     const next = new Map();
     for (const task of Array.isArray(listed?.tasks) ? listed.tasks : []) {
       const id = String(task?.id || '').trim();
@@ -1653,7 +1682,7 @@ export function createCopilotSdkSessionRunner({
     if (typeof target.rpc.tasks.getProgress === 'function') {
       for (const task of next.values()) {
         try {
-          const progress = (await target.rpc.tasks.getProgress({ id: task.id }))?.progress || null;
+          const progress = (await askRuntime('tasks.getProgress', () => target.rpc.tasks.getProgress({ id: task.id })))?.progress || null;
           task.progressSummary = summarizeTaskProgress(progress);
         } catch { /* a card without a progress line */ }
       }
@@ -1777,7 +1806,7 @@ export function createCopilotSdkSessionRunner({
     const target = session;
     if (!target || !sessionRpc.queue) return;
     try {
-      const snapshot = await target.rpc.queue.pendingItems();
+      const snapshot = await askRuntime('queue.pendingItems', () => target.rpc.queue.pendingItems());
       const next = new Map();
       for (const item of Array.isArray(snapshot?.items) ? snapshot.items : []) {
         const runtimeId = String(item?.messageId || '').trim();
@@ -2275,9 +2304,13 @@ export function createCopilotSdkSessionRunner({
     dbg('copilot runtime exited', detail);
     const turn = activeTurn;
     if (turn && !turn.settled) {
-      // driveTurn tears the runtime down and publishes the failure record
-      // onto every row the turn owns.
-      turn.fail(new Error(`the Copilot runtime exited before the turn completed (${detail})`));
+      // The turn's `fail` drops the dead handles, whatever kind of turn it
+      // is, and the drive path publishes the failure record onto every row
+      // the turn owns.
+      turn.fail(Object.assign(
+        new Error(`the Copilot runtime exited before the turn completed (${detail})`),
+        { runtimeGone: true },
+      ));
       return;
     }
     // No turn to fail: drop the dead handles so the next delivery rebuilds
@@ -2519,6 +2552,10 @@ export function createCopilotSdkSessionRunner({
     waitingSteers = 0;
     queuedItemCount = 0;
     steerSendsInFlight = 0;
+    taskRefreshFailures = 0;
+    taskRefreshInFlight = false;
+    // A removal this runtime never answered must not hold the next runtime's.
+    unsteerChain = Promise.resolve();
     sessionRpc = { queue: false, interruptMainTurn: false, tasks: false };
     askUserOverrideRejected = false;
     syncDeliveryReadiness();
@@ -2619,8 +2656,23 @@ export function createCopilotSdkSessionRunner({
       // re-read once per lifecycle poll catches state the events miss (a
       // shell that exited after a cancel emits no notification).
       const capMs = Number(getBackgroundTaskTimeoutMs()) || 0;
+      if (taskRefreshFailures >= MAX_TASK_REFRESH_FAILURES && backgroundTasks.size) {
+        // The runtime has not answered for its tasks for that many reads in a
+        // row: the set is what it was when it last did, and holds nothing.
+        dbg('the task registry cannot be read; its last answer no longer holds the runtime');
+        backgroundTasks = new Map();
+        publishBackgroundTasks({ immediate: true });
+      }
       const live = runningBackgroundTasks();
-      if (!live.length) return false;
+      if (!live.length) {
+        // Nothing live as far as the last read that worked. While a read is
+        // due or under way, or reads fail, that is not known: read again, and
+        // hold the runtime meanwhile.
+        if (taskRefreshTimer || taskRefreshQueued > 0 || taskRefreshInFlight) return true;
+        if (!taskRefreshFailures || taskRefreshFailures >= MAX_TASK_REFRESH_FAILURES) return false;
+        if (now - lastTaskRefreshAt >= lifecyclePollMs) scheduleTaskRefresh();
+        return true;
+      }
       if (capMs > 0) {
         for (const task of live) {
           const startedAt = Date.parse(String(task.startedAt || '')) || agentDetails.get(task.id)?.startedAt || 0;
@@ -2903,11 +2955,21 @@ export function createCopilotSdkSessionRunner({
       // and merely still on its previous model, and tearing the runtime down
       // over it would kill any live background work for a selection problem
       // the user fixes by picking another model.
-      if (turn.kind === 'delivered' && !isModelSwitchUnconfirmedError(error)) {
-        if (session || client) turn.teardown = stopRuntime('turn-failure').catch(() => {});
-        // Nothing to stop yet: the runtime was still starting. What it opens
-        // for this turn from here on is let go rather than adopted.
-        else runtimeGeneration += 1;
+      //
+      // A turn the runtime opened by itself keeps its runtime through a
+      // failure, because the background work that opened it may still be
+      // running there — unless the runtime itself is what went: it exited, or
+      // it no longer answers. Those handles served nobody, and the next
+      // message failed on them.
+      const runtimeGone = error?.runtimeGone === true || error?.stall?.unresponsive === true;
+      if ((turn.kind === 'delivered' || runtimeGone) && !isModelSwitchUnconfirmedError(error)) {
+        if (session || client) {
+          turn.teardown = stopRuntime(runtimeGone ? 'runtime-gone' : 'turn-failure').catch(() => {});
+        } else {
+          // Nothing to stop yet: the runtime was still starting. What it opens
+          // for this turn from here on is let go rather than adopted.
+          runtimeGeneration += 1;
+        }
       }
       beginPublishing(turn);
       turn.resolvePrimaryReady();
@@ -3277,7 +3339,8 @@ export function createCopilotSdkSessionRunner({
       const itemId = queuedLane.get(entry.runtimeId);
       if (!itemId) continue;
       try {
-        await session.rpc.queue.removeAt({ id: itemId });
+        const target = session;
+        await askRuntime('queue.removeAt', () => target.rpc.queue.removeAt({ id: itemId }));
         dbg('removed a stopped prompt from the runtime queue', entry.message.id);
       } catch (error) {
         dbg('queue.removeAt after Stop failed', entry.message.id, error?.message || String(error));
@@ -3315,21 +3378,36 @@ export function createCopilotSdkSessionRunner({
     const pending = turn.entries.filter((entry) => !entry.settled && entry.turn === turn);
     if (!pending.length) return;
 
-    if (failure) {
+    // A turn the user stopped ends as stopped, whatever happened to it
+    // afterwards: a runtime that died or went silent under a Stop used to put
+    // the watchdog's failure on every row instead.
+    if (failure && !turn.aborted) {
       const classified = classifyCopilotTurnException(failure);
       dbg('copilot turn failed', turn.message?.id || '(continuation)', classified.detail);
+      const running = turn.currentOwner || turn.primaryEntry;
       for (const entry of pending) {
         if (entry.settled) continue;
-        await settleEntry(turn, entry, { type: 'error', classified });
+        // The failure is told once, on the row whose run it ended. A message
+        // pushed into the turn gets the marker, whether the runtime had
+        // folded it in (settled with its run's row) or never started it.
+        const ownsRun = entry === running || entry.role !== 'steer' || (entry.consumed && !entry.foldedInto);
+        // A steer whose `send()` has not come back never reached the runtime
+        // as far as anyone knows. Its send is about to fail on the teardown
+        // and requeues the row from there; a marker now would end a message
+        // that can simply be delivered again.
+        if (!ownsRun && !entry.runtimeId && !entry.consumed) continue;
+        await settleEntry(turn, entry, ownsRun ? { type: 'error', classified } : { type: 'failed-with-turn' });
       }
       return;
     }
     if (result?.isError) {
       const classified = classifyCopilotSessionError(result.errorData || { message: result.errorMessage });
       dbg('turn failed', turn.message?.id || '(continuation)', classified.stableCode);
+      const running = turn.currentOwner || turn.primaryEntry;
       for (const entry of pending) {
         if (entry.settled) continue;
-        await settleEntry(turn, entry, { type: 'error', classified });
+        const ownsRun = entry === running || entry.role !== 'steer' || (entry.consumed && !entry.foldedInto);
+        await settleEntry(turn, entry, ownsRun ? { type: 'error', classified } : { type: 'failed-with-turn' });
       }
       return;
     }
@@ -3492,21 +3570,52 @@ export function createCopilotSdkSessionRunner({
       }
       return;
     }
+    // Both requests are bounded. A Stop is what the user reaches for when a
+    // turn is stuck, and a runtime that is stuck does not answer it either:
+    // the Stop then did nothing until the stall watchdog failed the turn.
+    const target = session;
+    const unanswered = Symbol('unanswered');
+    const bounded = (request) => withTimeout(Promise.resolve().then(request), runtimeRpcTimeoutMs, unanswered);
+    let answered = true;
     if (sessionRpc.interruptMainTurn) {
       try {
-        const outcome = await session.rpc.interruptMainTurn({ flushQueued: false });
-        if (outcome?.interrupted === false) {
-          // Nothing was processing: no aborted idle will come. The turn is
-          // over as far as the runtime is concerned.
-          dbg('interruptMainTurn found no main turn in flight; settling locally', turn.message?.id || '');
-          turn.settle();
+        const outcome = await bounded(() => target.rpc.interruptMainTurn({ flushQueued: false }));
+        if (outcome !== unanswered) {
+          if (outcome?.interrupted === false) {
+            // Nothing was processing: no aborted idle will come. The turn is
+            // over as far as the runtime is concerned.
+            dbg('interruptMainTurn found no main turn in flight; settling locally', turn.message?.id || '');
+            turn.settle();
+          }
+          return;
         }
-        return;
+        answered = false;
       } catch (error) {
         dbg('interruptMainTurn failed; falling back to abort()', error?.message || String(error));
       }
     }
-    await session.abort?.();
+    if (answered) {
+      // A rejection is an answer of a kind the turn cannot use either: the
+      // connection is gone (the runtime exited, or a teardown disposed it).
+      // Thrown on from here, it reached the relay as a Stop that failed, and
+      // the row was settled by nobody.
+      answered = (await bounded(async () => { await target.abort?.(); }).catch((error) => {
+        dbg('abort() failed', error?.message || String(error));
+        return unanswered;
+      })) !== unanswered;
+    }
+    if (answered || turn.settled) return;
+    // No aborted idle is coming from a runtime that does not take the
+    // request. The turn ends here, as stopped (finishTurn), and the runtime
+    // goes with it.
+    dbg('the runtime did not answer the Stop; ending the turn without it', turn.message?.id || '');
+    turn.fail(createTurnStalledError({
+      agentLabel: SETTLE_AGENT_LABEL,
+      quietMs: turn.liveness.quietMs(),
+      phase: turn.liveness.phase(),
+      tools: turn.liveness.toolsInFlight(),
+      unresponsive: true,
+    }));
   }
 
   /**
@@ -4204,6 +4313,18 @@ export function createCopilotSdkSessionRunner({
     } finally {
       if (recallWatches.get(entry.runtimeId) === watch) recallWatches.delete(entry.runtimeId);
     }
+  }
+
+  /**
+   * A request to the runtime that has to come back. Rejects when the runtime
+   * does not answer in time, so the caller's own failure path runs instead of
+   * a chain that waits for ever.
+   */
+  async function askRuntime(label, request) {
+    const unanswered = Symbol('unanswered');
+    const answer = await withTimeout(Promise.resolve().then(request), runtimeRpcTimeoutMs, unanswered);
+    if (answer === unanswered) throw new Error(`the runtime did not answer ${label} within ${runtimeRpcTimeoutMs}ms`);
+    return answer;
   }
 
   function withTimeout(promise, ms, fallback) {

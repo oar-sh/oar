@@ -1505,6 +1505,145 @@ test('a relay that takes a live post and never answers does not hold the turn', 
   assert.equal(streams[1].done, true);
 });
 
+test('a Stop the runtime does not answer ends the turn as stopped, and the runtime with it', async () => {
+  // A Stop is what the user reaches for when a turn is stuck, and a runtime
+  // that is stuck does not answer it either.
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient({ onSend: (session) => session.replay([
+    { type: 'assistant.message', data: { messageId: 'm1', content: 'Working on it.' } },
+  ]) });
+  const createSession = client.createSession.bind(client);
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    session.rpc.interruptMainTurn = () => new Promise(() => {});
+    session.abort = () => new Promise(() => {});
+    return session;
+  };
+  let abortTurn = null;
+  const controlPoller = {
+    start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return { id: 1 }; },
+    stop: () => {},
+  };
+  const { runner } = makeRunner({ stub, client, controlPoller, turnStallTimeoutMs: 0, runtimeRpcTimeoutMs: 20 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => stub.bodiesFor('/api/stream').length > 0, { label: 'partial text' });
+  await abortTurn({ queueMessageId: 'q-1' });
+
+  assert.equal(await pending, true);
+  // Stopped, not failed: the server-side control settles the row, and the
+  // partial answer is kept.
+  assert.equal(stub.bodiesFor('/api/response').length, 0);
+  const final = lastBodyOf(stub, '/api/stream');
+  assert.equal(final.done, true);
+  assert.equal(final.text, 'Working on it.');
+  assert.equal(client.stopped, 1);
+  assert.equal(runner._getState().hasSession, false);
+});
+
+test('a turn that fails after the user stopped it ends as stopped', async () => {
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient({ onSend: () => {} });
+  let killRuntime = null;
+  client.processExitPromise = new Promise((_resolve, reject) => { killRuntime = reject; });
+  client.processExitPromise.catch(() => {});
+  let abortTurn = null;
+  const controlPoller = {
+    start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return { id: 1 }; },
+    stop: () => {},
+  };
+  const { runner } = makeRunner({ stub, client, controlPoller, turnStallTimeoutMs: 0 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'prompt sent' });
+  // The interrupt is accepted, and the runtime dies before its aborted idle.
+  await abortTurn({ queueMessageId: 'q-1' });
+  killRuntime(new Error('CLI server exited with code 1'));
+
+  assert.equal(await pending, true);
+  assert.equal(stub.bodiesFor('/api/response').length, 0, 'no failure note over a Stop');
+  // Settled like any stopped turn, and the dead runtime is cleared away.
+  assert.equal(lastBodyOf(stub, '/api/stream').done, true);
+  assert.equal(runner._getState().hasClient, false);
+  assert.equal(runner.isTurnActive(), false);
+});
+
+test('a Stop on a runtime whose connection is gone is answered, not thrown', async () => {
+  // Both requests reject on a disposed connection. Thrown on, that reached
+  // the relay as a Stop that failed, and nobody settled the row.
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient({ onSend: () => {} });
+  const createSession = client.createSession.bind(client);
+  const disposed = () => Promise.reject(Object.assign(new Error('Pending response rejected since connection got disposed'), { code: -32097 }));
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    session.rpc.interruptMainTurn = disposed;
+    session.abort = disposed;
+    return session;
+  };
+  let abortTurn = null;
+  const controlPoller = {
+    start: ({ onAbortTurn }) => { abortTurn = onAbortTurn; return { id: 1 }; },
+    stop: () => {},
+  };
+  const { runner } = makeRunner({ stub, client, controlPoller, turnStallTimeoutMs: 0 });
+
+  const pending = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'prompt sent' });
+  await assert.doesNotReject(abortTurn({ queueMessageId: 'q-1' }));
+
+  assert.equal(await pending, true);
+  assert.equal(stub.bodiesFor('/api/response').length, 0);
+  assert.equal(lastBodyOf(stub, '/api/stream').done, true);
+  assert.equal(runner._getState().hasSession, false);
+});
+
+test('a steer that never reached the runtime is given back when the turn fails', async () => {
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient({ onSend: () => {} });
+  const createSession = client.createSession.bind(client);
+  let rejectSteer = null;
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    const send = session.send.bind(session);
+    session.send = (options) => (session.sends.length === 0
+      ? send(options)
+      : new Promise((_resolve, reject) => { session.sends.push(options); rejectSteer = reject; }));
+    // The teardown disposes the connection, and the request in flight fails.
+    session.disconnect = async () => { rejectSteer?.(new Error('Pending response rejected since connection got disposed')); };
+    return session;
+  };
+  const { runner } = makeRunner({ stub, client, turnStallTimeoutMs: 150 });
+
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+
+  await first;
+  await second;
+  const responses = stub.bodiesFor('/api/response');
+  assert.equal(responses.find((r) => r.messageId === 'q-1').terminalError.stableCode, 'copilot.turn-stalled');
+  assert.equal(responses.find((r) => r.messageId === 'q-2'), undefined, 'no marker and no failure on it');
+  assert.deepEqual(stub.bodiesFor('/api/requeue').map((body) => body.messageId), ['q-2']);
+});
+
+test('a dead connection during a model switch fails the turn as such and rebuilds the runtime', async () => {
+  // Relabelled as an unconfirmed switch, it told the user to pick another
+  // model, kept the dead runtime, and failed every retry the same way.
+  const disposed = Object.assign(new Error('Pending response rejected since connection got disposed'), { code: -32097 });
+  const { stub, client, runner } = setup({
+    clientOptions: { modelRpc: { switchTo: () => { throw disposed; } } },
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+  assert.equal(await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4' } }), true);
+
+  const failed = stub.bodiesFor('/api/response')[1];
+  assert.equal(failed.terminalError.stableCode, 'copilot.turn-error');
+  assert.match(failed.text, /connection got disposed/);
+  assert.equal(client.stopped, 1);
+  assert.equal(runner._getState().hasClient, false);
+});
+
 test('a stall that fires before anything awaits the turn is not an unhandled rejection', async () => {
   // The stall can reject `turn.done` while `send()` is still in flight. An
   // unhandled rejection there is escalated by the worker crash guard into a
@@ -1956,9 +2095,15 @@ test('a turn that throws still settles the rows steered into it', async () => {
   assert.equal(await first, true);
   assert.equal(await second, true);
 
-  const steeredResponse = stub.bodiesFor('/api/response').find((r) => r.messageId === 'q-2');
+  // The failure is told once, on the row whose run it ended. The message
+  // pushed into the turn, which the runtime never started, gets the marker.
+  const responses = stub.bodiesFor('/api/response');
+  assert.equal(responses.find((r) => r.messageId === 'q-1').terminalError.stableCode, 'copilot.turn-stalled');
+  const steeredResponse = responses.find((r) => r.messageId === 'q-2');
   assert.ok(steeredResponse, 'the steered row must be settled');
-  assert.equal(steeredResponse.terminalError.stableCode, 'copilot.turn-stalled');
+  assert.equal(steeredResponse.kind, 'stopped');
+  assert.equal(steeredResponse.text, STEER_TURN_FAILED_TEXT);
+  assert.equal(steeredResponse.terminalError, undefined);
 });
 
 // ------------------------------------------------------- previews / config --
