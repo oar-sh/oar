@@ -2021,6 +2021,14 @@
   }
   /* Claude-only thinking control (on/off + text visibility), under the
      auto-compact slider. */
+  /* The folder's commit attribution (attribution-control.mjs), styled like
+     the thinking rows above it. */
+  .ctx-attribution { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .ctx-attribution-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ctx-attribution-label { font-size: var(--fs-meta-sm); color: var(--muted); }
+  .ctx-attribution-select { font-size: var(--fs-meta-sm); max-width: 100%; }
+  .ctx-attribution-note { margin-top: 6px; font-size: var(--fs-meta-sm); color: var(--muted); line-height: 1.4; overflow-wrap: anywhere; }
+  .ctx-attribution-note code { font-size: inherit; }
   .ctx-thinking {
     margin-top: 14px;
     padding-top: 12px;
@@ -5982,6 +5990,13 @@
               placeholder="claude-sonnet-5"
               aria-label="Claude model ID"
             >
+            <label for="claude-attribution-select" style="margin-top: 8px;">Commit attribution</label>
+            <select id="claude-attribution-select" aria-label="Commit attribution" onchange="window.previewClaudeAttribution?.(this.value)">
+              <option value="oar">OAR — Co-authored-by: Open Agent Relay (model)</option>
+              <option value="vanilla">Vanilla — Claude Code's own attribution</option>
+              <option value="off">Off — no attribution</option>
+            </select>
+            <div id="claude-attribution-example" class="settings-help"></div>
             <div id="claude-settings-status" class="settings-help settings-provider-status">Loading Claude settings…</div>
             <div style="display: flex; gap: 8px; margin-top: 8px;">
               <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>

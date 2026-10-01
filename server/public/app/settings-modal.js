@@ -437,7 +437,7 @@ function ensureClaudeSettingsInputTracking() {
 }
 
 function setClaudeSettingsControlsDisabled(disabled) {
-  for (const id of ['claude-model-input', 'claude-enabled-toggle', 'claude-save-btn']) {
+  for (const id of ['claude-model-input', 'claude-enabled-toggle', 'claude-attribution-select', 'claude-save-btn']) {
     const element = document.getElementById(id);
     if (element) element.disabled = disabled;
   }
@@ -450,10 +450,15 @@ export function applyClaudeSettingsState(settings = {}, { resetInputs = false } 
     enabled: settings?.enabled === true,
     model: String(settings?.model || claudeSettingsState.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
     models: Array.isArray(settings?.models) ? settings.models : claudeSettingsState.models,
+    attributionMode: ['oar', 'vanilla', 'off'].includes(settings?.attributionMode) ? settings.attributionMode : (claudeSettingsState.attributionMode || 'oar'),
+    attributionExample: String(settings?.attributionExample || claudeSettingsState.attributionExample || '').trim(),
   };
   const modelInput = document.getElementById('claude-model-input');
   const toggle = document.getElementById('claude-enabled-toggle');
   const status = document.getElementById('claude-settings-status');
+  const attributionSelect = document.getElementById('claude-attribution-select');
+  if (attributionSelect && (!claudeSettingsInputsDirty || resetInputs)) attributionSelect.value = claudeSettingsState.attributionMode;
+  renderClaudeAttributionExample(attributionSelect?.value || claudeSettingsState.attributionMode);
   if (modelInput && (!claudeSettingsInputsDirty || resetInputs)) modelInput.value = claudeSettingsState.model;
   if (resetInputs) claudeSettingsInputsDirty = false;
   if (toggle) {
@@ -486,14 +491,36 @@ async function syncClaudeSettingsInputs() {
   }
 }
 
+// What commits will carry for the chosen mode: the example trailer the relay
+// rendered for the default model, Claude Code's own line, or nothing.
+export function claudeAttributionExampleText(mode, example = '') {
+  if (mode === 'vanilla') return 'Commits keep Claude Code\'s own attribution (Co-Authored-By: Claude … <noreply@anthropic.com>).';
+  if (mode === 'off') return 'Commits and pull requests carry no attribution line.';
+  const trailer = String(example || '').trim();
+  return trailer ? `Commits end with: ${trailer}` : 'Commits end with: Co-authored-by: Open Agent Relay (<model>) <no-reply@oar.sh>';
+}
+
+function renderClaudeAttributionExample(mode) {
+  const example = document.getElementById('claude-attribution-example');
+  if (!example) return;
+  example.textContent = claudeAttributionExampleText(mode, claudeSettingsState.attributionExample);
+}
+
+window.previewClaudeAttribution = (mode) => {
+  claudeSettingsInputsDirty = true;
+  renderClaudeAttributionExample(mode);
+};
+
 export async function saveClaudeSettings() {
   if (claudeSettingsUpdateInFlight) return;
   const modelInput = document.getElementById('claude-model-input');
   const model = String(modelInput?.value || '').trim() || 'claude-sonnet-5';
+  const attributionSelect = document.getElementById('claude-attribution-select');
+  const attributionMode = ['oar', 'vanilla', 'off'].includes(attributionSelect?.value) ? attributionSelect.value : undefined;
   claudeSettingsUpdateInFlight = true;
   setClaudeSettingsControlsDisabled(true);
   try {
-    const result = await updateClaudeSettings({ model });
+    const result = await updateClaudeSettings({ model, attributionMode });
     if (!result) throw new Error('Failed to save Claude settings.');
     applyClaudeSettingsState(result, { resetInputs: true });
     showTransientRelayNotice(

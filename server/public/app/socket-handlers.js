@@ -30,6 +30,8 @@ import {
   setConversationWatcherCount,
   setUpdateState,
   applySessionWorkerSteering,
+  refreshSummaryModal,
+  summaryModalState,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
@@ -497,6 +499,11 @@ export async function connectSocket(overrideDeps) {
     if (sourceMessageId) relayThoughts.delete(sourceMessageId);
     if (sourceMessageId) clearRelayStreamStateForMessage(sourceMessageId);
     refreshSessionWorkerStatus().catch(() => {});
+  });
+  // A folder's commit attribution changed (any client): an open context modal
+  // re-reads it so its row and effect text match.
+  socket.on('workspace_root_attribution_updated', () => {
+    if (summaryModalState.kind === 'context') refreshSummaryModal().catch(() => {});
   });
   socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
   socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));

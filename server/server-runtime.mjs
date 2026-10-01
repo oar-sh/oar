@@ -57,6 +57,7 @@ import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
 import { createHostSuspendService } from './services/host-suspend-service.mjs';
 import { USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, createUsageLimitPauseService } from './services/usage-limit-pause-service.mjs';
+import { buildClaudeAttributionSettings, normalizeClaudeAttributionMode, resolveClaudeAttributionMode, DEFAULT_CLAUDE_ATTRIBUTION_MODE } from '../shared/claude-attribution.mjs';
 import { createGitHubCiActivityService } from './services/github-ci-activity-service.mjs';
 import { runHostSuspendToRam } from './services/host-suspend-command.mjs';
 import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
@@ -442,6 +443,7 @@ function getClaudeProviderSettings() {
     enabledModels: models,
     effortsByModel,
     modelsDiscovered,
+    attributionMode: normalizeClaudeAttributionMode(readAppSettingValue(CLAUDE_ATTRIBUTION_SETTING_KEY)) || DEFAULT_CLAUDE_ATTRIBUTION_MODE,
     providerType: 'claude',
   };
 }
@@ -460,10 +462,19 @@ function setClaudeProviderSettings(update = {}) {
   if (!isSafeClaudeModelId(normalizedModel)) {
     return { ok: false, error: 'Invalid Claude model ID' };
   }
+  const attributionMode = payload.attributionMode === undefined
+    ? undefined
+    : normalizeClaudeAttributionMode(payload.attributionMode);
+  if (attributionMode === null) {
+    return { ok: false, error: 'Invalid Claude attribution mode' };
+  }
   const nowIso = new Date().toISOString();
   const nextEnabled = typeof enabled === 'boolean' ? enabled : existing.enabled;
   stmts.upsertAppSetting.run(CLAUDE_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
   stmts.upsertAppSetting.run(CLAUDE_MODEL_SETTING_KEY, normalizedModel, nowIso);
+  if (attributionMode) {
+    stmts.upsertAppSetting.run(CLAUDE_ATTRIBUTION_SETTING_KEY, attributionMode, nowIso);
+  }
   if (Array.isArray(models)) {
     const normalizedModels = models
       .map((value) => String(value || '').trim())
@@ -492,7 +503,34 @@ function setClaudeProviderSettings(update = {}) {
     model: current.model,
     models: current.models,
     availableModels: current.availableModels,
+    attributionMode: current.attributionMode,
   };
+}
+
+/** The folder override of a workspace root, or null (inherit); tolerant of a missing table. */
+function workspaceRootAttributionMode(rootPath) {
+  const root = String(rootPath || '').trim();
+  if (!root || typeof stmts?.getWorkspaceRootSettings?.get !== 'function') return null;
+  try {
+    return normalizeClaudeAttributionMode(stmts.getWorkspaceRootSettings.get(normalizeWorkspaceRootKey(root))?.attribution_mode);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What a Claude session's commits and PRs say: the provider setting, the
+ * folder override of the conversation's workspace root on top, and the
+ * model's name in the trailer. null = the CLI's own attribution.
+ */
+function claudeAttributionForConversation(conv, modelId) {
+  const root = String(conv?.runtime_workspace_root_path || conv?.configured_workspace_root_path || '').trim()
+    || currentWorkspaceRootPath();
+  const mode = resolveClaudeAttributionMode({
+    providerMode: getClaudeProviderSettings().attributionMode,
+    folderMode: workspaceRootAttributionMode(root),
+  });
+  return buildClaudeAttributionSettings({ mode, modelId });
 }
 
 const CLAUDE_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
@@ -1301,6 +1339,9 @@ const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
 const CLAUDE_ENABLED_MODELS_SETTING_KEY = 'claude_enabled_models';
 const CLAUDE_MODEL_EFFORTS_SETTING_KEY = 'claude_model_efforts';
+// oar | vanilla | off — what commits and PRs made in Claude sessions say
+// (shared/claude-attribution.mjs); absent means oar.
+const CLAUDE_ATTRIBUTION_SETTING_KEY = 'claude_attribution_mode';
 // The set of levels the SDK itself can report/accept as EffortLevel values.
 // Discovery results are filtered through this, so it must NOT contain the
 // relay's derived 'ultracode' sentinel — supportedModels() never reports it
@@ -5897,6 +5938,13 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
           // keys are always present here.
           thinkingEnabled: parseThinkingEnabled(conv?.thinking_enabled),
           thinkingDisplay: parseThinkingDisplay(conv?.thinking_display),
+          // What this session's commits and PRs say (Claude only): the
+          // finished settings object, or null for the CLI's own attribution.
+          // Always present on a Claude delivery, so the worker can tell "left
+          // as it was" (absent) from "vanilla" (null).
+          ...(String(out.providerType || '').trim().toLowerCase() === 'claude'
+            ? { attribution: claudeAttributionForConversation(conv, out.providerModel || out.model) }
+            : {}),
         };
       })()),
     },

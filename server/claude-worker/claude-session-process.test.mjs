@@ -6678,3 +6678,129 @@ test('a tool that runs in silence is given the tool window, not the model one', 
   turn.endInput();
   await settled(runner);
 });
+
+test('the commit attribution reaches the spawn and follows the delivery when it changes', async () => {
+  const stub = makeApiStub();
+  const capturedSpawns = [];
+  const turn = scriptedTurn({ echoPushes: true });
+  const flagCalls = [];
+  turn.applyFlagSettings = async (settings) => { flagCalls.push(settings); };
+  const oar = { commit: 'Co-authored-by: Open Agent Relay (Claude Sonnet 5) <no-reply@oar.sh>', pr: '🤖 Generated with [Open Agent Relay](https://oar.sh)', sessionUrl: false };
+  const renamed = { ...oar, commit: 'Co-authored-by: Open Agent Relay (Claude Opus 5.5) <no-reply@oar.sh>' };
+  let delivered = oar;
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      capturedSpawns.push(params);
+      return turn;
+    },
+    getAttribution: () => delivered,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+  assert.deepEqual(capturedSpawns[0].attribution, oar, 'the spawn carries the attribution');
+  assert.deepEqual(flagCalls, [], 'a spawn-time attribution needs no flag-settings call');
+
+  // The same value again (a fresh object with the same text): nothing is sent.
+  delivered = { ...oar };
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('second', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(flagCalls.length, 0);
+
+  // A model switch renames the trailer: one flag-settings call.
+  delivered = renamed;
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3' } });
+  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
+  turn.emit(resultMessage('third', 'native-1'));
+  assert.equal(await third, true);
+  assert.deepEqual(flagCalls, [{ attribution: renamed }]);
+
+  // Off: the empty strings are pushed, not dropped.
+  delivered = { commit: '', pr: '', sessionUrl: false };
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4' } });
+  await waitFor(() => turn.pushed.length === 4, { label: 'fourth push' });
+  turn.emit(resultMessage('fourth', 'native-1'));
+  assert.equal(await fourth, true);
+  assert.deepEqual(flagCalls[1], { attribution: { commit: '', pr: '', sessionUrl: false } });
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('back to vanilla means a fresh process without the key, taken when nothing is live', async () => {
+  // A value the CLI was spawned with cannot be unset through the flag layer
+  // (probe 2026-10-01), so the runner recycles the idle process instead.
+  const stub = makeApiStub();
+  const spawns = [];
+  const turns = [];
+  const flagCalls = [];
+  const oar = { commit: 'Co-authored-by: Open Agent Relay (Claude Sonnet 5) <no-reply@oar.sh>', pr: 'x', sessionUrl: false };
+  let delivered = oar;
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      spawns.push(params);
+      const turn = scriptedTurn({ echoPushes: true });
+      turn.applyFlagSettings = async (settings) => { flagCalls.push(settings); };
+      turns.push(turn);
+      return turn;
+    },
+    getAttribution: () => delivered,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(resultMessage('one', 'native-1'));
+  assert.equal(await first, true);
+  assert.deepEqual(spawns[0].attribution, oar);
+
+  delivered = null;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turns.length === 2, { label: 'recycled spawn' });
+  assert.equal(turns[0].endInputCalls >= 1, true, 'the idle process is released');
+  turns[1].emit(initMessage('native-1'));
+  turns[1].emit(resultMessage('two', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(spawns[1].attribution, null, 'the new process carries no attribution key');
+  assert.deepEqual(flagCalls, [], 'nothing was pushed through the flag layer');
+
+  // With a live task the process survives; the old text stays until it is idle.
+  delivered = oar;
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3' } });
+  await waitFor(() => turns[1].pushed.length === 2, { label: 'third push' });
+  turns[1].emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'suite' }]));
+  turns[1].emit(resultMessage('three', 'native-1'));
+  assert.equal(await third, true);
+  assert.deepEqual(flagCalls, [{ attribution: oar }], 'a value is pushed live');
+  delivered = null;
+  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4' } });
+  await waitFor(() => turns[1].pushed.length === 3, { label: 'fourth push on the same process' });
+  turns[1].emit(resultMessage('four', 'native-1'));
+  assert.equal(await fourth, true);
+  assert.equal(spawns.length, 2, 'a task-holding process is not recycled for vanilla');
+  turns[1].endInput();
+  await settled(runner);
+});
+
+test('a vanilla session spawns without an attribution key', async () => {
+  const stub = makeApiStub();
+  const capturedSpawns = [];
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => { capturedSpawns.push(params); return turn; },
+    getAttribution: () => null,
+  });
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(capturedSpawns[0].attribution, null);
+  turn.endInput();
+  await settled(runner);
+});

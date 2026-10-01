@@ -75,6 +75,9 @@ function collectTrackedTextFiles() {
 // Email addresses are allowed only on clearly fictional/reserved domains.
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const ALLOWED_EMAIL_RE = /@(?:(?:[A-Za-z0-9-]+\.)*example\.(?:com|org|net|test)|[A-Za-z0-9.-]*\.example|test\.invalid|localhost)$/i;
+// The relay's own commit-attribution address (shared/claude-attribution.mjs) is a
+// product constant the tests assert literally, not a person's address.
+const PRODUCT_EMAILS = new Set(['no-reply@oar.sh']);
 
 test('test files contain no personal data, machine fingerprints, or secrets', () => {
   const files = collectTestFiles(repoRoot);
@@ -91,7 +94,7 @@ test('test files contain no personal data, machine fingerprints, or secrets', ()
         if (re.test(line)) violations.push(`${relPath}:${idx + 1} — ${label}`);
       }
       for (const match of line.match(EMAIL_RE) || []) {
-        if (!ALLOWED_EMAIL_RE.test(match)) {
+        if (!ALLOWED_EMAIL_RE.test(match) && !PRODUCT_EMAILS.has(match.toLowerCase())) {
           violations.push(`${relPath}:${idx + 1} — non-fictional email address (${match})`);
         }
       }

@@ -6,6 +6,9 @@ import {
   buildModelCatalogWithOpenAIProvider,
   parseClaudeSettingsUpdateRequest,
   buildConversationMessages,
+  claudeAttributionSettingsFields,
+  parseWorkspaceRootAttributionUpdate,
+  buildWorkspaceRootAttributionPayload,
 } from './sessions-routes.mjs';
 
 test('parseClaudeSettingsUpdateRequest requires at least one field', () => {
@@ -231,4 +234,43 @@ test('buildConversationMessages prefers a transcript message\'s own workflowRuns
   });
   assert.equal(messages.find((message) => message.id === 'resp-1').workflowRuns[0].runId, 'wf_transcript');
   assert.equal(messages.find((message) => message.id === 'resp-2').workflowRuns[0].runId, 'wf_map');
+});
+
+test('parseClaudeSettingsUpdateRequest takes the attribution mode and refuses junk', () => {
+  assert.deepEqual(parseClaudeSettingsUpdateRequest({ attributionMode: 'vanilla' }), { ok: true, attributionMode: 'vanilla' });
+  assert.deepEqual(parseClaudeSettingsUpdateRequest({ attributionMode: ' OFF ' }), { ok: true, attributionMode: 'off' });
+  const bad = parseClaudeSettingsUpdateRequest({ attributionMode: 'anthropic' });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /Invalid Claude attribution mode \(one of oar, vanilla, off\)/);
+});
+
+test('claudeAttributionSettingsFields says what commits of the default model will carry', () => {
+  const fields = claudeAttributionSettingsFields({ model: 'claude-fable-5-1[1m]', attributionMode: 'oar' });
+  assert.equal(fields.attributionMode, 'oar');
+  assert.deepEqual(fields.attributionModes, ['oar', 'vanilla', 'off']);
+  assert.equal(fields.attributionExample, 'Co-authored-by: Open Agent Relay (Claude Fable 5.1) <no-reply@oar.sh>');
+  assert.equal(claudeAttributionSettingsFields({}).attributionMode, 'oar', 'absent means oar');
+  assert.equal(claudeAttributionSettingsFields({ attributionMode: 'junk' }).attributionMode, 'oar');
+});
+
+test('a folder attribution update takes a mode or null, and refuses the rest', () => {
+  assert.deepEqual(parseWorkspaceRootAttributionUpdate({ path: '/home/dev/demo', attributionMode: 'off' }), { ok: true, path: '/home/dev/demo', attributionMode: 'off' });
+  assert.deepEqual(parseWorkspaceRootAttributionUpdate({ path: ' /home/dev/demo ', attributionMode: null }), { ok: true, path: '/home/dev/demo', attributionMode: null });
+  assert.equal(parseWorkspaceRootAttributionUpdate({ path: '/home/dev/demo', attributionMode: '' }).attributionMode, null);
+  assert.match(parseWorkspaceRootAttributionUpdate({ attributionMode: 'off' }).error, /Missing path/);
+  assert.match(parseWorkspaceRootAttributionUpdate({ path: '/home/dev/demo' }).error, /Missing attributionMode/);
+  assert.match(parseWorkspaceRootAttributionUpdate({ path: '/home/dev/demo', attributionMode: 'anthropic' }).error, /Invalid attribution mode/);
+});
+
+test('the folder payload resolves the effective mode and the example trailer', () => {
+  const inherited = buildWorkspaceRootAttributionPayload({ path: '/home/dev/demo', folderMode: null, providerMode: 'oar', model: 'claude-opus-5-5[1m]' });
+  assert.equal(inherited.attributionMode, null);
+  assert.equal(inherited.effectiveMode, 'oar');
+  assert.equal(inherited.attributionExample, 'Co-authored-by: Open Agent Relay (Claude Opus 5.5) <no-reply@oar.sh>');
+  const overridden = buildWorkspaceRootAttributionPayload({ path: '/home/dev/demo', folderMode: 'off', providerMode: 'oar' });
+  assert.equal(overridden.effectiveMode, 'off');
+  assert.equal(overridden.attributionExample, '');
+  const vanilla = buildWorkspaceRootAttributionPayload({ path: '/home/dev/demo', folderMode: 'vanilla', providerMode: 'off' });
+  assert.equal(vanilla.effectiveMode, 'vanilla');
+  assert.equal(vanilla.attributionExample, null);
 });

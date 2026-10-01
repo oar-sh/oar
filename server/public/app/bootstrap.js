@@ -70,6 +70,7 @@ import {
   refreshConversationHistory,
   updateConversationTitle,
   updateConversationPreferences,
+  updateWorkspaceRootAttribution,
   createConversationShareLink,
   updateDefaultSessionWorkspaceRoot,
   scheduleContextUsageRefresh,
@@ -197,6 +198,7 @@ import {
   thinkingEnabledFromKey,
   thinkingEnabledToKey,
 } from './context-usage-view.mjs';
+import { renderAttributionControlHtml } from './attribution-control.mjs';
 import {
   autoCompactWindowFromIndex,
   autoCompactWindowToIndex,
@@ -2954,6 +2956,36 @@ function setThinkingControlValue({ enabled, display }) {
   }
 }
 
+// The folder's commit attribution select in the 🧠 modal: one request per
+// change, then the modal is re-read so the effect text matches the relay.
+let attributionControlUpdateInFlight = false;
+function initAttributionControl() {
+  const body = document.getElementById('summary-modal-body');
+  if (!body || body.dataset.attributionControlBound === 'true') return;
+  body.dataset.attributionControlBound = 'true';
+  body.addEventListener('change', async (event) => {
+    const select = event.target?.closest?.('#ctx-attribution-select');
+    if (!select) return;
+    const path = String(select.dataset.workspaceRoot || '').trim();
+    if (!path || attributionControlUpdateInFlight) return;
+    attributionControlUpdateInFlight = true;
+    select.disabled = true;
+    try {
+      const response = await updateWorkspaceRootAttribution(path, select.value || null);
+      if (!response || response.ok === false) throw new Error(String(response?.error || 'The relay refused the change'));
+      showTransientRelayNotice(select.value
+        ? `Commit attribution for this folder: ${select.value}.`
+        : 'Commit attribution for this folder follows the provider setting again.');
+      await refreshSummaryModal();
+    } catch (error) {
+      showTransientRelayNotice(`Could not change the commit attribution: ${error?.message || error}`);
+      select.disabled = false;
+    } finally {
+      attributionControlUpdateInFlight = false;
+    }
+  });
+}
+
 function initThinkingControl() {
   const body = document.getElementById('summary-modal-body');
   if (!body || body.dataset.thinkingBound === '1') return;
@@ -3086,6 +3118,10 @@ async function loadContextSummaryAndRender(convId) {
       thinkingDisplay: payload.thinkingDisplay ?? null,
     })
     : '';
+  // Claude-only too: what this folder's commits say, with the folder override.
+  const attributionHtml = payload.providerType === 'claude'
+    ? renderAttributionControlHtml(payload.attribution || null)
+    : '';
   // The slider's writes need the conversation id even when the modal was
   // opened through an sdk_session_id.
   autoCompactControlConversationId = String(
@@ -3102,10 +3138,10 @@ async function loadContextSummaryAndRender(convId) {
   // The structured breakdown is the answer; the runtime's own text dump stays
   // available underneath for the details it carries that categories don't.
   const bodyHtml = usageHtml
-    ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${detailText
+    ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${attributionHtml}${detailText
       ? `<details class="ctx-usage-raw"><summary>Raw details</summary><pre>${escHtml(detailText)}</pre></details>`
       : ''}`
-    : `${autoCompactHtml}${thinkingHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
+    : `${autoCompactHtml}${thinkingHtml}${attributionHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
 
   renderSummaryModalContent({
     title: 'Context usage',
@@ -4172,6 +4208,7 @@ async function initApp() {
   }
   initAutoCompactWindowControl();
   initThinkingControl();
+  initAttributionControl();
   initModeSelector();
   initModelSelector();
   initReasoningSelector();

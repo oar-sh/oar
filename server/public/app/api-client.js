@@ -273,11 +273,13 @@ export async function updateClaudeSettings({
   enabled = undefined,
   model = undefined,
   enabledModels = undefined,
+  attributionMode = undefined,
 } = {}) {
   const payload = {};
   if (typeof enabled === 'boolean') payload.enabled = enabled;
   if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (typeof attributionMode === 'string' && attributionMode.trim()) payload.attributionMode = attributionMode.trim();
   return settingsRequest('/api/settings/claude', payload, 'Failed to update Claude settings');
 }
 
@@ -782,6 +784,23 @@ export async function updateConversationTitle(id, title) {
   return apiFetch(`/api/conversation/${convId}`, {
     method: 'PATCH',
     body: JSON.stringify({ title }),
+  });
+}
+
+// The commit attribution a repo folder's Claude sessions use (null = the
+// provider setting). Keyed by the workspace root path.
+export async function loadWorkspaceRootAttribution(path) {
+  const root = String(path || '').trim();
+  if (!root) return null;
+  return apiFetch(`/api/workspace-root/attribution?path=${encodeURIComponent(root)}`);
+}
+
+export async function updateWorkspaceRootAttribution(path, attributionMode) {
+  const root = String(path || '').trim();
+  if (!root) return null;
+  return apiFetch('/api/workspace-root/attribution', {
+    method: 'POST',
+    body: JSON.stringify({ path: root, attributionMode: attributionMode || null }),
   });
 }
 

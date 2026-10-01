@@ -5,6 +5,19 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Commits made from OAR say so.** Claude sessions now end their commit
+  messages with `Co-authored-by: Open Agent Relay (<model>) <no-reply@oar.sh>`
+  — the model's name in the parentheses, e.g. `Claude Fable 5.1` — and pull
+  request bodies with `🤖 Generated with [Open Agent Relay](https://oar.sh)`,
+  instead of Claude Code's own lines. Settings → Providers → Claude has the
+  choice: **OAR** (the default), **vanilla** (Claude Code's own attribution)
+  or **off** (none); a repo folder can override it from the 🧠 context modal
+  of any of its Claude sessions. A change reaches running sessions with their
+  next message. Other providers are not touched: their tools have no such
+  setting.
+
 ## [0.9.6] — 2026-09-29
 
 Highlights: a Claude turn pauses at the usage limit and carries on after the

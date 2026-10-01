@@ -111,7 +111,7 @@ export function normalizeAutoCompactWindow(value) {
  * spreads of `settings` in the options literal would silently clobber each
  * other. Returns null when nothing needs to be set.
  */
-export function claudeSpawnSettings({ ultracode = false, autoCompactWindow = null, thinkingEnabled = null } = {}) {
+export function claudeSpawnSettings({ ultracode = false, autoCompactWindow = null, thinkingEnabled = null, attribution = null } = {}) {
   const window = normalizeAutoCompactWindow(autoCompactWindow);
   const thinking = strictThinkingEnabled(thinkingEnabled);
   const settings = {
@@ -122,8 +122,23 @@ export function claudeSpawnSettings({ ultracode = false, autoCompactWindow = nul
     // present; the omit path exists for direct callers that mean to say
     // nothing.
     ...(thinking !== null ? { alwaysThinkingEnabled: thinking } : {}),
+    // What commits and PRs say (shared/claude-attribution.mjs). null is
+    // vanilla: the key is left out and the CLI uses its own.
+    ...(attribution && typeof attribution === 'object' ? { attribution } : {}),
   };
   return Object.keys(settings).length ? settings : null;
+}
+
+/**
+ * Live twin of the attribution spawn setting, for a value (OAR or off). A
+ * running CLI takes a new text through the flag layer (it arrives as a fresh
+ * system-reminder on the next user turn) but cannot UNSET a value it was
+ * spawned with — `{}`, `null` and `true` all leave the spawn-time text in
+ * force (wire-logged probe, 2026-10-01). Back to vanilla therefore means a
+ * fresh process without the key; the session runner does that.
+ */
+export function claudeAttributionFlagSettings(attribution) {
+  return { attribution: attribution && typeof attribution === 'object' ? attribution : { commit: '', pr: '', sessionUrl: false } };
 }
 
 export function permissionModeForRelayMode(relayMode) {
@@ -228,6 +243,7 @@ export function startClaudeSession({
   reasoningEffort = '',
   autoCompactWindow = null,
   thinkingEnabled = null,
+  attribution = null,
   thinkingDisplay = '',
   abortController,
   canUseTool,
@@ -248,7 +264,7 @@ export function startClaudeSession({
   // only way to hand a fresh CLI the session-scoped ultracode flag, the
   // auto-compact window and the thinking pin, and all three share one
   // `settings` object.
-  const spawnSettings = claudeSpawnSettings({ ultracode, autoCompactWindow, thinkingEnabled });
+  const spawnSettings = claudeSpawnSettings({ ultracode, autoCompactWindow, thinkingEnabled, attribution });
   // Relay tools need the worker's authenticated API helper; a caller that
   // passes none (tests, probes) gets a session without them.
   const relayMcpServer = typeof api === 'function'

@@ -11,6 +11,7 @@ import { applySafeServedContentHeaders } from '../services/safe-served-content.m
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
+import { CLAUDE_ATTRIBUTION_MODES, DEFAULT_CLAUDE_ATTRIBUTION_MODE, claudeAttributionModelLabel, claudeAttributionTrailer, normalizeClaudeAttributionMode, resolveClaudeAttributionMode } from '../../shared/claude-attribution.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
 import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 import {
@@ -30,8 +31,7 @@ import { createGrokAuthService } from '../services/grok-auth-service.mjs';
 import {
   isWithinAllowedPrefix,
   readWorkspaceRootPathFromBody,
-  validateRequestedWorkspaceRoot,
-} from '../services/workspace-root-path-policy.mjs';
+  validateRequestedWorkspaceRoot, normalizeWorkspaceRootKey } from '../services/workspace-root-path-policy.mjs';
 import { workspaceRootDisplayName } from '../workspace-root.mjs';
 import { createKeyedMutex } from '../services/keyed-mutex-service.mjs';
 import { createFixedWindowRateLimiter } from '../services/rate-limit-service.mjs';
@@ -252,11 +252,16 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
   const model = hasModel ? (String(payload.model || '').trim() || 'claude-sonnet-5') : undefined;
   const hasModels = Array.isArray(payload.models);
   const hasEnabledModels = Array.isArray(payload.enabledModels);
-  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels) {
+  const hasAttributionMode = Object.prototype.hasOwnProperty.call(payload, 'attributionMode');
+  const attributionMode = hasAttributionMode ? normalizeClaudeAttributionMode(payload.attributionMode) : undefined;
+  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels && !hasAttributionMode) {
     return { ok: false, error: 'No Claude settings update provided' };
   }
   if (hasModel && !isSafeClaudeModelId(model)) {
     return { ok: false, error: 'Invalid Claude model ID' };
+  }
+  if (hasAttributionMode && !attributionMode) {
+    return { ok: false, error: `Invalid Claude attribution mode (one of ${CLAUDE_ATTRIBUTION_MODES.join(', ')})` };
   }
   return {
     ok: true,
@@ -264,6 +269,52 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
     ...(hasModel ? { model } : {}),
     ...(hasModels ? { models: payload.models } : {}),
     ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+    ...(hasAttributionMode ? { attributionMode } : {}),
+  };
+}
+
+/**
+ * A folder's attribution override update: `{ path, attributionMode }` with
+ * the mode one of the three, or null to inherit the provider setting again.
+ */
+export function parseWorkspaceRootAttributionUpdate(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const path = String(payload.path || '').trim();
+  if (!path) return { ok: false, error: 'Missing path' };
+  if (!Object.prototype.hasOwnProperty.call(payload, 'attributionMode')) {
+    return { ok: false, error: 'Missing attributionMode (oar, vanilla, off, or null to inherit)' };
+  }
+  if (payload.attributionMode === null || payload.attributionMode === '') return { ok: true, path, attributionMode: null };
+  const attributionMode = normalizeClaudeAttributionMode(payload.attributionMode);
+  if (!attributionMode) {
+    return { ok: false, error: `Invalid attribution mode (one of ${CLAUDE_ATTRIBUTION_MODES.join(', ')}, or null to inherit)` };
+  }
+  return { ok: true, path, attributionMode };
+}
+
+/** What a folder's Claude sessions will say, given the provider setting and the folder's own choice. */
+export function buildWorkspaceRootAttributionPayload({ path = '', folderMode = null, providerMode = null, model = '' } = {}) {
+  const effectiveMode = resolveClaudeAttributionMode({ providerMode, folderMode });
+  return {
+    path: String(path || '').trim(),
+    attributionMode: normalizeClaudeAttributionMode(folderMode),
+    providerMode: normalizeClaudeAttributionMode(providerMode) || DEFAULT_CLAUDE_ATTRIBUTION_MODE,
+    effectiveMode,
+    attributionModes: [...CLAUDE_ATTRIBUTION_MODES],
+    attributionExample: effectiveMode === 'oar'
+      ? claudeAttributionTrailer(claudeAttributionModelLabel(String(model || 'claude-sonnet-5')))
+      : (effectiveMode === 'off' ? '' : null),
+  };
+}
+
+/** The attribution fields every Claude settings payload carries, with the trailer the default model would get. */
+export function claudeAttributionSettingsFields(settings = {}) {
+  const attributionMode = normalizeClaudeAttributionMode(settings?.attributionMode) || DEFAULT_CLAUDE_ATTRIBUTION_MODE;
+  const model = String(settings?.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5';
+  return {
+    attributionMode,
+    attributionModes: [...CLAUDE_ATTRIBUTION_MODES],
+    attributionExample: claudeAttributionTrailer(claudeAttributionModelLabel(model)),
   };
 }
 
@@ -3148,6 +3199,10 @@ export function registerSessionsRoutes(app, deps) {
       autoCompactWindow: parseAutoCompactWindow(conversationRow?.auto_compact_window),
       thinkingEnabled: parseThinkingEnabled(conversationRow?.thinking_enabled),
       thinkingDisplay: parseThinkingDisplay(conversationRow?.thinking_display),
+      // What this folder's Claude commits say (the 🧠 modal's override row).
+      ...(usesStoredContextUsage && providerType === 'claude'
+        ? { attribution: workspaceRootAttributionFor(conversationRow) }
+        : {}),
       runtimeSessionId: runtimeSession?.id || null,
       copilotSessionId,
       providerType: usesStoredContextUsage ? providerType : 'github',
@@ -3167,6 +3222,55 @@ export function registerSessionsRoutes(app, deps) {
       }),
     };
   }
+
+  // --- Per-folder commit attribution (shared/claude-attribution.mjs) -----
+  function workspaceRootSettingsRow(rootPath) {
+    const root = String(rootPath || '').trim();
+    if (!root || typeof stmts?.getWorkspaceRootSettings?.get !== 'function') return null;
+    try {
+      return stmts.getWorkspaceRootSettings.get(normalizeWorkspaceRootKey(root)) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function workspaceRootAttributionFor(conversationRow, explicitPath = '') {
+    const path = String(explicitPath
+      || conversationRow?.runtime_workspace_root_path
+      || conversationRow?.configured_workspace_root_path
+      || '').trim();
+    const provider = typeof getClaudeProviderSettings === 'function' ? getClaudeProviderSettings() : {};
+    return buildWorkspaceRootAttributionPayload({
+      path,
+      folderMode: workspaceRootSettingsRow(path)?.attribution_mode || null,
+      providerMode: provider?.attributionMode,
+      model: provider?.model,
+    });
+  }
+
+  app.get('/api/workspace-root/attribution', auth, (req, res) => {
+    const path = String(req.query.path || '').trim();
+    if (!path) return res.status(400).json({ error: 'Missing path' });
+    res.json({ ok: true, ...workspaceRootAttributionFor(null, path) });
+  });
+
+  app.post('/api/workspace-root/attribution', auth, (req, res) => {
+    const parsed = parseWorkspaceRootAttributionUpdate(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    if (typeof stmts?.upsertWorkspaceRootAttribution?.run !== 'function') {
+      return res.status(503).json({ error: 'Folder settings are unavailable' });
+    }
+    const key = normalizeWorkspaceRootKey(parsed.path);
+    const now = new Date().toISOString();
+    if (parsed.attributionMode === null) {
+      stmts.deleteWorkspaceRootSettings.run(key);
+    } else {
+      stmts.upsertWorkspaceRootAttribution.run(key, parsed.path, parsed.attributionMode, now);
+    }
+    const payload = workspaceRootAttributionFor(null, parsed.path);
+    try { io.emit('workspace_root_attribution_updated', payload); } catch {}
+    res.json({ ok: true, ...payload });
+  });
 
   app.get('/api/context/:conversationId', auth, (req, res) => {
     const conversationId = String(req.params.conversationId || '').trim();
@@ -5262,6 +5366,7 @@ export function registerSessionsRoutes(app, deps) {
       model: String(settings?.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
       models: Array.isArray(settings?.models) ? settings.models : [],
       availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
+      ...claudeAttributionSettingsFields(settings),
     });
   });
 
@@ -5310,6 +5415,7 @@ export function registerSessionsRoutes(app, deps) {
       model: String(currentSettings?.model || result.model || 'claude-sonnet-5').trim() || 'claude-sonnet-5',
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
       availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
+      ...claudeAttributionSettingsFields(currentSettings),
       reconciliation,
     };
     io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));

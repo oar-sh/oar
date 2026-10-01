@@ -21,12 +21,14 @@ import {
   normalizeClaudeEffort,
   claudeUltracodeFlagSettings,
   claudeAutoCompactFlagSettings,
+  claudeAttributionFlagSettings,
   claudeThinkingFlagSettings,
   applyThinkingDisplay,
   normalizeAutoCompactWindow,
   permissionModeForRelayMode,
 } from './claude-sdk-adapter.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
+import { sameClaudeAttribution } from '../../shared/claude-attribution.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
 import {
   attemptFields,
@@ -448,6 +450,10 @@ export function createClaudeSessionRunner({
   // per turn rather than captured, so a slider change picked up on the next
   // delivery reaches a process that is already running.
   getAutoCompactWindow = () => null,
+  // What this session's commits say (shared/claude-attribution.mjs); null
+  // leaves the CLI's own attribution. Piggybacked on deliveries like the
+  // window above.
+  getAttribution = () => null,
   // The per-conversation thinking state ({enabled, display}); read per turn
   // like the window, so a settings change reaches a running process on its
   // next delivery.
@@ -3170,6 +3176,7 @@ export function createClaudeSessionRunner({
     const thinkingState = getThinking() || {};
     const thinkingEnabled = parseThinkingEnabled(thinkingState.enabled);
     const thinkingDisplay = parseThinkingDisplay(thinkingState.display);
+    const attribution = getAttribution() || null;
     const abortController = new AbortController();
     const processRef = {
       turn: null,
@@ -3178,6 +3185,7 @@ export function createClaudeSessionRunner({
       relayMode,
       effort,
       autoCompactWindow,
+      attribution,
       // Seeded from what the process is SPAWNED with, so the adapt diff is
       // against reality rather than against a delivered setting the CLI may
       // never have honored.
@@ -3335,6 +3343,7 @@ export function createClaudeSessionRunner({
       autoCompactWindow,
       thinkingEnabled,
       thinkingDisplay,
+      attribution,
       abortController,
       canUseTool,
       pathToClaudeCodeExecutable,
@@ -3442,6 +3451,30 @@ export function createClaudeSessionRunner({
         dbg('applyFlagSettings autoCompactWindow failed', error?.message || String(error));
       });
       proc.autoCompactWindow = autoCompactWindow;
+    }
+    // Attribution follows the window's pattern: a changed value (a settings
+    // change, a model switch that renames the trailer) reaches the live CLI
+    // through the flag layer, before the turn that may commit.
+    const attribution = getAttribution() || null;
+    if (!sameClaudeAttribution(attribution, proc.attribution)) {
+      if (attribution === null) {
+        // Back to the CLI's own attribution. A value the process was spawned
+        // with cannot be unset through the flag layer (probe 2026-10-01), so
+        // the honest way is a fresh process without the key — taken when
+        // nothing lives in the old one; a busy process keeps the old text and
+        // the next delivery tries again.
+        if (!hasLiveWork() && !proc.liveTasks.size) {
+          gracefulShutdown('attribution-vanilla');
+          await drainClosingProcess(10_000);
+          return null;
+        }
+      } else {
+        expectSettingsReinit();
+        await Promise.resolve(proc.turn.applyFlagSettings?.(claudeAttributionFlagSettings(attribution))).catch((error) => {
+          dbg('applyFlagSettings attribution failed', error?.message || String(error));
+        });
+        proc.attribution = attribution;
+      }
     }
     // Thinking is NOT a symmetric copy of the window block: the probe
     // (2026-08-26, docs/plans/claude-thinking-control.md) showed the two

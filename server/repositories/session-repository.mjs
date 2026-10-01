@@ -146,6 +146,19 @@ export function createSessionRepository(db) {
         `),
         deleteRecentWorkspaceRoots: db.prepare(`DELETE FROM recent_workspace_roots`),
 
+        // per-folder settings (migration 0006): the commit attribution
+        // override of a repo folder; keyed like the recent roots
+        getWorkspaceRootSettings: db.prepare(`SELECT * FROM workspace_root_settings WHERE path_key = ?`),
+        upsertWorkspaceRootAttribution: db.prepare(`
+          INSERT INTO workspace_root_settings (path_key, path, attribution_mode, updated_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(path_key) DO UPDATE SET
+            path = excluded.path,
+            attribution_mode = excluded.attribution_mode,
+            updated_at = excluded.updated_at
+        `),
+        deleteWorkspaceRootSettings: db.prepare(`DELETE FROM workspace_root_settings WHERE path_key = ?`),
+
         // app settings
         getAppSetting: db.prepare(`
           SELECT key, value, updated_at

@@ -11,6 +11,7 @@ import { rebuildRecentWorkspaceRootsTable } from './migrations/0002-recent-works
 import { ensurePushSubscriptionsTable } from './migrations/0003-push-subscriptions.mjs';
 import { migrateSteerSettleMarkers } from './migrations/0004-steer-settle-markers.mjs';
 import { migrateRemoteRelays } from './migrations/0005-remote-relays.mjs';
+import { migrateWorkspaceRootSettings } from './migrations/0006-workspace-root-settings.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -716,6 +717,13 @@ try {
   migrateRemoteRelays(db);
 } catch (error) {
   console.warn(`[remote-relays] migration 0005 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Per-folder settings (commit attribution override). Readers tolerate the
+// table's absence, so a failure is logged and retried next boot like 0005.
+try {
+  migrateWorkspaceRootSettings(db);
+} catch (error) {
+  console.warn(`[workspace-root-settings] migration 0006 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

@@ -17,6 +17,7 @@ import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-fil
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { resolveDeliveredAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import { resolveDeliveredThinking } from '../../shared/claude-thinking.mjs';
+import { resolveDeliveredAttribution } from '../../shared/claude-attribution.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { createRunnerLinkBridge, failSettlingRowsOnShutdown } from './claude-worker-link-wiring.mjs';
@@ -66,6 +67,9 @@ async function main() {
   // piggyback. enabled null = host default; display defaults to 'summarized'
   // (today's behavior — visible thought bubbles).
   let thinking = resolveDeliveredThinking(null, null);
+  // What this session's commits and PRs say; same piggyback. null = the
+  // CLI's own attribution (vanilla).
+  let attribution = null;
 
   const api = createApiClient({
     serverUrl,
@@ -111,6 +115,7 @@ async function main() {
     getBackgroundTaskTimeoutMs: () => backgroundTaskTimeoutMs,
     getAutoCompactWindow: () => autoCompactWindow,
     getThinking: () => thinking,
+    getAttribution: () => attribution,
     // A readiness flip is a hold starting or ending (question card,
     // compaction, a turn-opening delivery): the steering snapshot changed
     // with it, so it goes out now rather than on the next 10 s heartbeat.
@@ -176,6 +181,7 @@ async function main() {
       // keep the last known state; an explicit null on thinkingEnabled is the
       // user choosing Host default.
       thinking = resolveDeliveredThinking(thinking, pending?.settings);
+      attribution = resolveDeliveredAttribution(attribution, pending?.settings);
       try {
         return await turnRunner.handlePendingPayload(pending);
       } catch (error) {
