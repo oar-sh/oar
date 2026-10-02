@@ -6,6 +6,7 @@ import { createRelayQuestion } from '../../shared/question-wait.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../../shared/question-timeout.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
+import { resolveDeliveredAttribution, sameClaudeAttribution } from '../../shared/claude-attribution.mjs';
 import { buildClaudeAttachmentContent } from '../claude-worker/claude-attachments.mjs';
 import { classifyClaudeResultFailure } from '../claude-worker/claude-turn-failure.mjs';
 import {
@@ -28,6 +29,8 @@ const PERMISSION_DENIED_MESSAGE = 'The user denied this tool use.';
 // A catch-up after a worker restart reads the events of one unfinished turn;
 // the cap only stops a cursor that never advances.
 const MAX_CATCH_UP_PAGES = 200;
+const ATTRIBUTION_NOT_APPLIED_NOTE = 'Cloud: the commit attribution setting could not be applied; '
+  + 'commits of this turn may carry Claude Code\'s own attribution lines.';
 
 // Failures of the event stream that reconnecting cannot cure.
 const FATAL_STREAM_CODES = new Set([
@@ -186,6 +189,10 @@ export function createClaudeCloudSessionRunner({
   // - `sent`: user messages posted whose turn has not ended (uuid → sequence).
   // - `unfinishedTurns`: turns that ended here without their `result` and may
   //   still run in the cloud.
+  // - `attribution`: the commit attribution this process handed to the
+  //   sandbox (null: Claude Code's own); undefined while it does not know
+  //   what the sandbox has, as after a worker restart.
+  // - `attributionRequestId`: the request whose answer is still to come.
   let session = null;
   let turn = null;
   let stream = null;
@@ -221,6 +228,8 @@ export function createClaudeCloudSessionRunner({
       attached,
       sent: new Map(),
       unfinishedTurns: 0,
+      attribution: undefined,
+      attributionRequestId: null,
     };
   }
 
@@ -309,6 +318,10 @@ export function createClaudeCloudSessionRunner({
       message,
       uuid: claudeCloudMessageUuid(message.id),
       model: resolveModel(message),
+      // What the commits of this turn should say (shared/claude-attribution.mjs):
+      // the settings object, null for Claude Code's own lines, undefined when
+      // the delivery did not say.
+      attribution: undefined,
       // The sequence number the turn starts after (create: 0, send: the
       // number of the user event); null until the message is in the session.
       startSeq: null,
@@ -464,6 +477,18 @@ export function createClaudeCloudSessionRunner({
     const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
     const type = String(payload.type || event?.event_type || '');
     const t = turn && !turn.settled ? turn : null;
+
+    if (type === 'control_response' && session.attributionRequestId
+      && String(payload.response?.request_id || '') === session.attributionRequestId) {
+      session.attributionRequestId = null;
+      if (String(payload.response?.subtype || '') !== 'success') {
+        // Not taken: the next message tries again.
+        session.attribution = undefined;
+        dbg('cloud attribution refused by the sandbox', String(payload.response?.error || ''));
+        if (t) await publisher.postActivity(t.message, ATTRIBUTION_NOT_APPLIED_NOTE);
+      }
+      return;
+    }
 
     if (type === 'user' && t && t.startSeq === null && sequence !== null
       && (String(payload.uuid || '') === t.uuid || String(event?.event_id || '') === t.uuid)) {
@@ -800,6 +825,28 @@ export function createClaudeCloudSessionRunner({
     }
   }
 
+  /**
+   * Before a message goes into a session that exists: hand the sandbox the
+   * commit attribution the relay delivered, unless this process already did.
+   * The sandbox's Claude Code takes it as a session setting, the way a local
+   * one takes `applyFlagSettings`, and null takes it out again. A request the
+   * API refuses outright costs the setting, not the turn; every other failure
+   * would stop the message too and is left to the turn's own handling.
+   */
+  async function applyAttribution(t) {
+    if (t.attribution === undefined) return;
+    if (session.attribution !== undefined && sameClaudeAttribution(session.attribution, t.attribution)) return;
+    try {
+      const sent = await cloud.applyFlagSettings(session.id, { attribution: t.attribution });
+      session.attribution = t.attribution;
+      session.attributionRequestId = String(sent?.requestId || '').trim() || null;
+    } catch (error) {
+      if (String(error?.code || '').trim() !== 'bad_request') throw error;
+      dbg('cloud attribution request refused', error?.message || String(error));
+      await publisher.postActivity(t.message, ATTRIBUTION_NOT_APPLIED_NOTE);
+    }
+  }
+
   /** Put the delivered message into the cloud session, unless it is there already. */
   async function startCloudTurn(t, binding, content) {
     const message = t.message;
@@ -816,6 +863,8 @@ export function createClaudeCloudSessionRunner({
         branch: String(binding.branch || '').trim() || null,
         content,
         uuid: t.uuid,
+        // With the message, and before it: the first commit already carries it.
+        ...(t.attribution ? { flagSettings: { attribution: t.attribution } } : {}),
       });
       session = newSession(String(created?.id || '').trim(), {
         url: String(created?.sessionUrl || '').trim() || null,
@@ -828,6 +877,9 @@ export function createClaudeCloudSessionRunner({
       t.startSeq = 0;
       t.sent = true;
       session.sent.set(t.uuid, 0);
+      // A new sandbox without the setting writes Claude Code's own lines.
+      session.attribution = t.attribution ?? null;
+      session.attributionRequestId = String(created?.flagSettingsRequestId || '').trim() || null;
       await reportSession(message, t.model ? { model: t.model } : {});
       return;
     }
@@ -866,6 +918,7 @@ export function createClaudeCloudSessionRunner({
     if (session.unfinishedTurns > 0) await confirmUnfinishedTurns();
     let alreadyInSession = false;
     await enqueue(async () => {
+      await applyAttribution(t);
       const sent = await cloud.sendUserMessage(session.id, content, { uuid: t.uuid });
       const sequence = toCloudSequence(sent?.sequence);
       // No event is handled while the message is posted, so a new message is
@@ -1054,6 +1107,10 @@ export function createClaudeCloudSessionRunner({
     const t = openTurn(message);
     const relayHoldMs = Number(pending?.settings?.backgroundTaskTimeoutMs);
     if (Number.isFinite(relayHoldMs) && relayHoldMs > 0) t.holdMs = relayHoldMs;
+    const settings = pending?.settings;
+    if (settings && typeof settings === 'object' && Object.prototype.hasOwnProperty.call(settings, 'attribution')) {
+      t.attribution = resolveDeliveredAttribution(null, settings);
+    }
     turn = t;
     try {
       return await runTurn(t);

@@ -93,7 +93,12 @@ export function makeCloud({
     callsOf: (op) => calls.filter((call) => call.op === op),
     async createSession(args) {
       record('createSession', { args });
-      return { id: SESSION_ID, sessionUrl: SESSION_URL, deduplicated: false };
+      return {
+        id: SESSION_ID,
+        sessionUrl: SESSION_URL,
+        deduplicated: false,
+        flagSettingsRequestId: args?.flagSettings ? 'flag-settings-request-create' : null,
+      };
     },
     async sendUserMessage(id, content, options) {
       record('sendUserMessage', { id, content, options });
@@ -106,6 +111,10 @@ export function makeCloud({
     async sendInterrupt(id) {
       record('sendInterrupt', { id });
       return { requestId: 'interrupt-request-1' };
+    },
+    async applyFlagSettings(id, settings) {
+      record('applyFlagSettings', { id, settings });
+      return { eventId: null, sequence: null, duplicate: false, requestId: `flag-settings-request-${calls.filter((call) => call.op === 'applyFlagSettings').length}` };
     },
     async getSession(id) {
       record('getSession', { id });

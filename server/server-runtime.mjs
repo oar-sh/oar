@@ -533,9 +533,11 @@ function workspaceRootAttributionMode(rootPath) {
  * folder override of the conversation's workspace root on top, and the
  * model's name in the trailer. null = the CLI's own attribution.
  */
-function claudeAttributionForConversation(conv, modelId) {
+function claudeAttributionForConversation(conv, modelId, { relayFolderFallback = true } = {}) {
+  // A Claude Cloud chat works in a sandbox, not in the relay's folder: only
+  // the folder it was started from (if any) can speak for it.
   const root = String(conv?.runtime_workspace_root_path || conv?.configured_workspace_root_path || '').trim()
-    || currentWorkspaceRootPath();
+    || (relayFolderFallback ? currentWorkspaceRootPath() : '');
   const mode = resolveClaudeAttributionMode({
     providerMode: getClaudeProviderSettings().attributionMode,
     folderMode: workspaceRootAttributionMode(root),
@@ -6054,13 +6056,19 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
           // keys are always present here.
           thinkingEnabled: parseThinkingEnabled(conv?.thinking_enabled),
           thinkingDisplay: parseThinkingDisplay(conv?.thinking_display),
-          // What this session's commits and PRs say (Claude only): the
-          // finished settings object, or null for the CLI's own attribution.
-          // Always present on a Claude delivery, so the worker can tell "left
-          // as it was" (absent) from "vanilla" (null).
-          ...(String(out.providerType || '').trim().toLowerCase() === 'claude'
-            ? { attribution: claudeAttributionForConversation(conv, out.providerModel || out.model) }
-            : {}),
+          // What this session's commits and PRs say (Claude and Claude
+          // Cloud): the finished settings object, or null for the CLI's own
+          // attribution. Always present on such a delivery, so the worker can
+          // tell "left as it was" (absent) from "vanilla" (null).
+          ...((() => {
+            const deliveredProvider = String(out.providerType || '').trim().toLowerCase();
+            if (deliveredProvider !== 'claude' && deliveredProvider !== 'claude-cloud') return {};
+            return {
+              attribution: claudeAttributionForConversation(conv, out.providerModel || out.model, {
+                relayFolderFallback: deliveredProvider === 'claude',
+              }),
+            };
+          })()),
         };
       })()),
     },

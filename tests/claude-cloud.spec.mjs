@@ -8,6 +8,8 @@ import { expect, test } from "@playwright/test";
 
 import {
   FAKE_CLOUD_ENVIRONMENTS,
+  FAKE_CLOUD_NO_TRAILER,
+  FAKE_CLOUD_OWN_TRAILER,
   FAKE_CLOUD_PUSHED_BRANCH,
   FAKE_CLOUD_QUESTION,
   FAKE_CLOUD_SANDBOX_LINE,
@@ -15,6 +17,7 @@ import {
   FAKE_CLOUD_TOKEN,
   FAKE_CLOUD_TOOL_COMMAND,
   fakeCloudReplyFor,
+  fakeCloudTrailerReplyFor,
   startFakeClaudeCloudApi,
 } from "./fake-claude-cloud-api.mjs";
 import { startRelayServer } from "./relay-server-harness.mjs";
@@ -54,6 +57,8 @@ import { startRelayServer } from "./relay-server-harness.mjs";
 const DEFAULT_MODEL = "claude-sonnet-5-5";
 const FOLDER_REPO_URL = "https://github.com/example-org/sample-repo";
 const FOLDER_BRANCH = "main";
+// What the relay's commit attribution (mode OAR, the default) says for DEFAULT_MODEL.
+const OAR_TRAILER = "Co-authored-by: Open Agent Relay (Claude Sonnet 5.5) <no-reply@oar.sh>";
 
 const PROFILES = [
   {
@@ -176,6 +181,11 @@ async function expectFinishedReply(page, text) {
   const reply = page.locator(".msg.assistant", { hasText: text }).last();
   await expect(reply).toBeVisible({ timeout: TURN_TIMEOUT });
   return reply;
+}
+
+/** A "trailer" reply as the chat shows it: the code span without its backticks. */
+function shownTrailerReply(trailer) {
+  return fakeCloudTrailerReplyFor(trailer).replaceAll("`", "");
 }
 
 function createsFor(repoUrl) {
@@ -380,9 +390,17 @@ for (const profile of PROFILES) {
         model: DEFAULT_MODEL,
         sources: [{ type: "git_repository", url: profile.typedRepoUrl, revision: profile.typedBranch }],
       });
-      expect(create.body.events).toHaveLength(1);
-      expect(create.body.events[0].payload.type).toBe("user");
-      expect(userText(create.body.events[0].payload)).toContain(text);
+      // The relay's commit attribution reaches the sandbox before the message does.
+      expect(create.body.events).toHaveLength(2);
+      expect(create.body.events[0].event_type).toBe("control_request");
+      expect(create.body.events[0].payload.request).toEqual({
+        subtype: "apply_flag_settings",
+        settings: {
+          attribution: { commit: OAR_TRAILER, pr: "🤖 Generated with [Open Agent Relay](https://oar.sh)", sessionUrl: false },
+        },
+      });
+      expect(create.body.events[1].payload.type).toBe("user");
+      expect(userText(create.body.events[1].payload)).toContain(text);
 
       const session = fake.sessions().find((entry) => entry.source.url === profile.typedRepoUrl);
       cloudSessionId = session.id;
@@ -404,6 +422,44 @@ for (const profile of PROFILES) {
       expect(sent[0].payload.session_id).toBe(cloudSessionId);
       expect(userText(sent[0].payload)).toContain(text);
       await expect(page.locator("#cloud-session-line .cloud-line-cost")).toHaveText("$0.84");
+    });
+
+    test("commits in the sandbox follow the relay's attribution setting, and a change reaches it with the next message", async ({ page }) => {
+      const settingsRequests = () => fake.postedEvents("control_request")
+        .filter((event) => event.sessionId === cloudSessionId && event.payload?.request?.subtype === "apply_flag_settings")
+        .map((event) => event.payload.request.settings);
+      await openConversation(page, conversationId);
+
+      // In place since the session was created: nothing is sent again.
+      await sendFromComposer(page, `Which trailer does a ${profile.name} commit get?`);
+      await expectFinishedReply(page, shownTrailerReply(OAR_TRAILER));
+      expect(settingsRequests()).toEqual([]);
+
+      try {
+        expect((await relayApi("POST", "/api/settings/claude", { attributionMode: "off" })).status).toBe(200);
+        await sendFromComposer(page, `And which trailer now, ${profile.name}?`);
+        await expectFinishedReply(page, shownTrailerReply(FAKE_CLOUD_NO_TRAILER));
+
+        // Vanilla takes the setting out again: the sandbox writes its own lines.
+        expect((await relayApi("POST", "/api/settings/claude", { attributionMode: "vanilla" })).status).toBe(200);
+        await sendFromComposer(page, `One more ${profile.name} trailer, please`);
+        await expectFinishedReply(page, shownTrailerReply(FAKE_CLOUD_OWN_TRAILER));
+        expect(settingsRequests()).toEqual([
+          { attribution: { commit: "", pr: "", sessionUrl: false } },
+          { attribution: null },
+        ]);
+      } finally {
+        await relayApi("POST", "/api/settings/claude", { attributionMode: "oar" });
+      }
+
+      // The chat was started from a folder, so its 🧠 modal has that folder's override.
+      await page.evaluate(() => window.showContext());
+      const select = page.locator("#ctx-attribution-select");
+      await expect(select).toBeVisible({ timeout: TURN_TIMEOUT });
+      await expect(select).toHaveValue("");
+      await expect(page.locator(".ctx-attribution-note")).toContainText(OAR_TRAILER);
+      const noteBox = await page.locator(".ctx-attribution").boundingBox();
+      expect(noteBox.x + noteBox.width).toBeLessThanOrEqual(page.viewportSize().width + 1);
     });
 
     test("a question of the cloud agent is a card, and the answer resumes the turn", async ({ page }) => {

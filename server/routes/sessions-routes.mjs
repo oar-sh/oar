@@ -3240,8 +3240,17 @@ export function registerSessionsRoutes(app, deps) {
       thinkingEnabled: parseThinkingEnabled(conversationRow?.thinking_enabled),
       thinkingDisplay: parseThinkingDisplay(conversationRow?.thinking_display),
       // What this folder's Claude commits say (the 🧠 modal's override row).
-      ...(usesStoredContextUsage && providerType === 'claude'
+      // A Claude Cloud chat has the row when it was started from a folder,
+      // with its own model in the example.
+      ...(providerType === 'claude'
         ? { attribution: workspaceRootAttributionFor(conversationRow) }
+        : {}),
+      ...(providerType === 'claude-cloud' && cloudConversationFolder(conversationRow)
+        ? {
+          attribution: workspaceRootAttributionFor(conversationRow, '', {
+            model: runtimeSession?.provider_model || runtimeSession?.model || '',
+          }),
+        }
         : {}),
       runtimeSessionId: runtimeSession?.id || null,
       copilotSessionId,
@@ -3274,7 +3283,12 @@ export function registerSessionsRoutes(app, deps) {
     }
   }
 
-  function workspaceRootAttributionFor(conversationRow, explicitPath = '') {
+  /** The folder a Claude Cloud chat was started from, if it was started from one. */
+  function cloudConversationFolder(conversationRow) {
+    return String(conversationRow?.runtime_workspace_root_path || conversationRow?.configured_workspace_root_path || '').trim();
+  }
+
+  function workspaceRootAttributionFor(conversationRow, explicitPath = '', { model = '' } = {}) {
     const path = String(explicitPath
       || conversationRow?.runtime_workspace_root_path
       || conversationRow?.configured_workspace_root_path
@@ -3284,7 +3298,7 @@ export function registerSessionsRoutes(app, deps) {
       path,
       folderMode: workspaceRootSettingsRow(path)?.attribution_mode || null,
       providerMode: provider?.attributionMode,
-      model: provider?.model,
+      model: String(model || '').trim() || provider?.model,
     });
   }
 

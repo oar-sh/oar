@@ -16,11 +16,18 @@
  *   contains "push"  a pushed branch (system/vcs_state_changed), then a reply
  *   contains "slow"  a first line of reply, then nothing: the turn stays open
  *                    until it is interrupted
+ *   contains "trailer"  the reply is the attribution line the session's
+ *                    commits would end with: the one an `apply_flag_settings`
+ *                    control request set, else the sandbox's own
  *   anything else    a sandbox log line and a tool call (two activity lines),
  *                    a reply and a result with a cost
  *
  * An interrupt ends the running turn at once with the result a stopped turn
  * has (`error_during_execution`, `terminal_reason: "aborted_tools"`).
+ *
+ * An `apply_flag_settings` control request (in the create call before the
+ * first message, or posted later) is merged into the session's settings and
+ * answered with a `control_response`; a key set to null is taken out again.
  *
  * Every request is recorded (method, path, query, body, and whether it carried
  * the bearer token; never the token itself), and a request without the test
@@ -50,6 +57,14 @@ export const FAKE_CLOUD_TURN_COST_USD = 0.42;
 export const FAKE_CLOUD_SANDBOX_LINE = "Cloning the repository";
 export const FAKE_CLOUD_TOOL_COMMAND = "ls sample-dir";
 export const FAKE_CLOUD_SLOW_FIRST_LINE = "Starting the slow sample job.";
+/** What the fake sandbox ends a commit with while no attribution setting is in place. */
+export const FAKE_CLOUD_OWN_TRAILER = "Co-Authored-By: Sample Sandbox Agent <agent@example.com>";
+export const FAKE_CLOUD_NO_TRAILER = "(no attribution line)";
+
+/** The reply of a "trailer" turn for a commit attribution line (as code: it holds an address in angle brackets). */
+export function fakeCloudTrailerReplyFor(trailer) {
+  return `Commits here end with: \`${trailer}\``;
+}
 
 /** The reply of a default turn; the spec looks for this text. */
 export function fakeCloudReplyFor(text) {
@@ -234,6 +249,17 @@ export async function startFakeClaudeCloudApi({
       return;
     }
 
+    if (/\btrailer\b/i.test(text)) {
+      const attribution = session.flagSettings.attribution;
+      const trailer = attribution && typeof attribution === "object"
+        ? (String(attribution.commit || "") || FAKE_CLOUD_NO_TRAILER)
+        : FAKE_CLOUD_OWN_TRAILER;
+      const reply = fakeCloudTrailerReplyFor(trailer);
+      await emit(assistantText(session, reply));
+      await emit(successResult(session, reply));
+      return;
+    }
+
     if (/\bslow\b/i.test(text)) {
       await emit(assistantText(session, FAKE_CLOUD_SLOW_FIRST_LINE));
       await turn.interruption;
@@ -328,10 +354,34 @@ export async function startFakeClaudeCloudApi({
     return { event, duplicate: false };
   }
 
+  /** Settings for the sandbox's agent: logged, merged (null removes a key), answered. */
+  function acceptFlagSettings(session, payload) {
+    const event = appendEvent(session, { source: "client", eventType: "control_request", payload });
+    const settings = payload?.request?.settings && typeof payload.request.settings === "object" ? payload.request.settings : {};
+    for (const [key, value] of Object.entries(settings)) {
+      if (value === null) delete session.flagSettings[key];
+      else session.flagSettings[key] = value;
+    }
+    appendEvent(session, {
+      source: "worker",
+      eventType: "control_response",
+      payload: {
+        type: "control_response",
+        uuid: randomUUID(),
+        response: { subtype: "success", request_id: String(payload?.request_id || "") },
+      },
+    });
+    return event;
+  }
+
+  const isFlagSettingsRequest = (payload) => payload?.type === "control_request"
+    && payload?.request?.subtype === "apply_flag_settings";
+
   // ── Routes ──
 
   function createSession(res, body) {
-    const first = Array.isArray(body?.events) ? body.events[0]?.payload : null;
+    const initial = (Array.isArray(body?.events) ? body.events : []).map((event) => event?.payload);
+    const first = initial.find((payload) => payload?.type === "user") || null;
     const source = Array.isArray(body?.config?.sources) ? body.config.sources[0] : null;
     if (!body?.environment_id || !body?.config?.model || source?.type !== "git_repository" || !source?.url || !first) {
       return sendError(res, 400, "invalid_request_error", "environment_id, config.model, a git_repository source and a first event are required");
@@ -359,6 +409,7 @@ export async function startFakeClaudeCloudApi({
       streams: new Set(),
       queue: [],
       turn: null,
+      flagSettings: {},
     };
     sessions.set(id, session);
     // The first event of a real session is the client's own permission-mode
@@ -368,6 +419,9 @@ export async function startFakeClaudeCloudApi({
       eventType: "control_request",
       payload: { type: "control_request", request_id: nextId("req"), request: { subtype: "set_permission_mode", mode: "auto" } },
     });
+    for (const payload of initial) {
+      if (isFlagSettingsRequest(payload)) acceptFlagSettings(session, payload);
+    }
     acceptUserMessage(session, first);
     return sendJson(res, 200, { deduplicated: false, session: describeSession(session) });
   }
@@ -439,6 +493,11 @@ export async function startFakeClaudeCloudApi({
       if (eventType === "user") {
         const { event, duplicate } = acceptUserMessage(session, payload);
         results.push({ event_id: event.event_id, sequence_num: event.sequence_num, duplicate });
+        continue;
+      }
+      if (eventType === "control_request" && isFlagSettingsRequest(payload)) {
+        const event = acceptFlagSettings(session, payload);
+        results.push({ event_id: event.event_id, sequence_num: event.sequence_num, duplicate: false });
         continue;
       }
       const event = appendEvent(session, { source: "client", eventType, payload });

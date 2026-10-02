@@ -15,8 +15,10 @@ All notable changes to OAR are documented here. The format follows
   choice: **OAR** (the default), **vanilla** (Claude Code's own attribution)
   or **off** (none); a repo folder can override it from the 🧠 context modal
   of any of its Claude sessions. A change reaches running sessions with their
-  next message. Other providers are not touched: their tools have no such
-  setting.
+  next message. Claude Cloud chats follow the same setting: the sandbox gets
+  it with the first message and again when it changes, and in OAR mode the
+  `Claude-Session` link is left out of the commit as well. Other providers
+  are not touched: their tools have no such setting.
 - **Claude Cloud: chats that run in a sandbox at Anthropic.** A new provider,
   off by default. A Claude Cloud chat runs Claude Code in Anthropic's cloud,
   on its own clone of a GitHub repository instead of on the relay host. It is
@@ -36,9 +38,9 @@ All notable changes to OAR are documented here. The format follows
   restart in the middle of a turn picks the turn up again instead of sending
   your message twice; deleting or archiving the chat archives the cloud
   session. Not there: relay modes, a reasoning effort, steering during a
-  turn, files other than images and anything else from the relay host, the
-  relay's tools and previews inside the sandbox, and OAR's commit
-  attribution. **Before you switch it on:**
+  turn, files other than images and anything else from the relay host, and
+  the relay's tools and previews inside the sandbox. **Before you switch it
+  on:**
   the provider uses the Claude CLI's stored login to call the Anthropic API
   endpoints the CLI itself uses. These are not a documented public API and
   may change. OAR only reads the token: it never stores, logs or refreshes

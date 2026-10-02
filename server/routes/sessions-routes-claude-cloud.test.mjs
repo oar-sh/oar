@@ -382,7 +382,7 @@ test('the context reader serves what the cloud worker reported, as provider clau
   assert.equal(before.statusCode, 200);
   assert.equal(before.body.providerType, 'claude-cloud');
   assert.equal(before.body.snapshot, null);
-  assert.equal('attribution' in before.body, false, 'commit attribution is the Claude provider\'s own');
+  assert.equal('attribution' in before.body, false, 'a chat that was not started from a folder has no folder override');
 
   harness.stmts.updateRuntimeSessionContextUsage.run(JSON.stringify({
     model: 'claude-sonnet-5-5',
@@ -428,3 +428,27 @@ test('archiving a cloud conversation archives its cloud session, best effort', a
   await settle();
   assert.deepEqual(archived, [SESSION_ID]);
 });
+
+test('the context reader offers the folder\'s commit attribution to a cloud chat that was started from a folder', async () => {
+  const harness = setup();
+  const created = await harness.bootstrap(cloudRequest({ model: 'claude-opus-5' }));
+  const conversationId = created.body.conversationId;
+  // platform-agnostic: a stored folder path is an opaque key here.
+  harness.db.prepare('UPDATE conversations SET configured_workspace_root_path = ? WHERE id = ?').run('/home/dev/sample-repo', conversationId);
+
+  const inherited = await call(harness.app, 'GET /api/context/:conversationId', { params: { conversationId } });
+  assert.equal(inherited.body.attribution.path, '/home/dev/sample-repo');
+  assert.equal(inherited.body.attribution.attributionMode, null);
+  assert.equal(inherited.body.attribution.effectiveMode, 'oar');
+  // The example names the chat's own model, not the Claude tab's default.
+  assert.equal(inherited.body.attribution.attributionExample, 'Co-authored-by: Open Agent Relay (Claude Opus 5) <no-reply@oar.sh>');
+
+  const saved = await call(harness.app, 'POST /api/workspace-root/attribution', {
+    body: { path: '/home/dev/sample-repo', attributionMode: 'off' },
+  });
+  assert.equal(saved.statusCode, 200);
+  const overridden = await call(harness.app, 'GET /api/context/:conversationId', { params: { conversationId } });
+  assert.equal(overridden.body.attribution.attributionMode, 'off');
+  assert.equal(overridden.body.attribution.effectiveMode, 'off');
+});
+

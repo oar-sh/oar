@@ -156,6 +156,22 @@ export function buildClaudeCloudUserMessage({ content, sessionId = '', uuid = nu
   };
 }
 
+/**
+ * The control request that hands settings to the sandbox's Claude Code, as
+ * the SDK's `applyFlagSettings` does for a local one (session-scoped: the
+ * flag layer, nothing is written in the sandbox). A key set to null is taken
+ * out of that layer again.
+ */
+export function buildClaudeCloudFlagSettingsRequest({ settings, sessionId = '', requestId = null } = {}) {
+  return {
+    uuid: randomUUID(),
+    session_id: String(sessionId || ''),
+    type: 'control_request',
+    request_id: requestId || randomUUID(),
+    request: { subtype: 'apply_flag_settings', settings },
+  };
+}
+
 /** What an error body says about itself, wherever the API put it. */
 function readErrorBody(text) {
   let payload = null;
@@ -373,8 +389,11 @@ export function createClaudeCloudClient({
    * Create a session with its first message. `uuid` is the message's id: the
    * API answers a repeated create with the same uuid with the session it
    * already made (`deduplicated`), so a retried delivery should pass it again.
+   * `flagSettings` (optional) reach the sandbox's Claude Code before the
+   * message does; `flagSettingsRequestId` names the request its
+   * `control_response` on the event stream answers.
    */
-  async function createSession({ title, environmentId, model, repoUrl, branch, content, uuid } = {}) {
+  async function createSession({ title, environmentId, model, repoUrl, branch, content, uuid, flagSettings = null } = {}) {
     const environment = firstText(environmentId);
     if (!environment) throw failure('environment_missing');
     const url = firstText(repoUrl);
@@ -383,6 +402,9 @@ export function createClaudeCloudClient({
     if (!plainModel) throw failure('bad_request', { message: 'A model for the cloud session is required.' });
     requireContent(content);
     const revision = firstText(branch);
+    const settingsRequest = flagSettings && typeof flagSettings === 'object'
+      ? buildClaudeCloudFlagSettingsRequest({ settings: flagSettings })
+      : null;
     const { body } = await request('POST', '/v1/code/sessions', {
       body: {
         title: firstText(title) || DEFAULT_SESSION_TITLE,
@@ -391,7 +413,14 @@ export function createClaudeCloudClient({
           model: plainModel,
           sources: [{ type: 'git_repository', url, ...(revision ? { revision } : {}) }],
         },
-        events: [{ payload: buildClaudeCloudUserMessage({ content, sessionId: '', uuid }) }],
+        // In this order: the settings have to be in place when the agent
+        // reads the message.
+        events: settingsRequest
+          ? [
+            { event_type: 'control_request', payload: settingsRequest },
+            { event_type: 'user', payload: buildClaudeCloudUserMessage({ content, sessionId: '', uuid }) },
+          ]
+          : [{ payload: buildClaudeCloudUserMessage({ content, sessionId: '', uuid }) }],
       },
     });
     const id = firstText(body?.session?.id);
@@ -400,6 +429,7 @@ export function createClaudeCloudClient({
       id,
       sessionUrl: firstText(body.session.session_url) || null,
       deduplicated: body.deduplicated === true,
+      flagSettingsRequestId: settingsRequest?.request_id || null,
       raw: body,
     };
   }
@@ -483,6 +513,21 @@ export function createClaudeCloudClient({
       request: { subtype: 'interrupt' },
     });
     return { ...sent, requestId };
+  }
+
+  /**
+   * Hand settings to the sandbox's Claude Code (see
+   * buildClaudeCloudFlagSettingsRequest). Whether it took them is its
+   * `control_response` on the event stream, under the returned `requestId`.
+   */
+  async function applyFlagSettings(id, settings) {
+    const routeId = String(id ?? '').trim();
+    if (!settings || typeof settings !== 'object') {
+      throw failure('bad_request', { message: 'Flag settings for the cloud session are required.' });
+    }
+    const payload = buildClaudeCloudFlagSettingsRequest({ settings, sessionId: routeId });
+    const sent = await postEvent(routeId, 'control_request', payload);
+    return { ...sent, requestId: payload.request_id };
   }
 
   /** Archive the session. One that is archived already counts as done. */
@@ -658,6 +703,7 @@ export function createClaudeCloudClient({
     sendUserMessage,
     sendControlResponse,
     sendInterrupt,
+    applyFlagSettings,
     archiveSession,
     getAccountUsage,
     getPrepaidCredits,

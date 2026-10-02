@@ -356,6 +356,7 @@ test('createSession sends the repository, the branch as revision, the plain mode
     id: SESSION_ID,
     sessionUrl: 'https://claude.ai/code/cshk_01EXAMPLEcccccccccccccccc',
     deduplicated: false,
+    flagSettingsRequestId: null,
     raw: { deduplicated: false, session },
   });
   assert.equal(calls.length, 1);
@@ -378,6 +379,37 @@ test('createSession sends the repository, the branch as revision, the plain mode
       },
     }],
   });
+});
+
+test('createSession with flag settings puts their control request in front of the first message', async () => {
+  const session = { id: SESSION_ID, session_url: null, title: 'Fix the slug helper', status: 'active' };
+  const { client, calls } = setup([json({ deduplicated: false, session })]);
+  const attribution = { commit: 'Co-authored-by: Sample Relay (Sample Model) <relay@example.com>', pr: '', sessionUrl: false };
+  const created = await client.createSession({
+    title: 'Fix the slug helper',
+    environmentId: ENVIRONMENT_ID,
+    model: 'claude-sonnet-5-5',
+    repoUrl: REPO_URL,
+    content: 'Please fix slugify.',
+    uuid: '11111111-1111-4111-8111-111111111111',
+    flagSettings: { attribution },
+  });
+  const [settings, first] = calls[0].body.events;
+  assert.equal(calls[0].body.events.length, 2);
+  assert.equal(settings.event_type, 'control_request');
+  assert.match(settings.payload.uuid, UUID_PATTERN);
+  assert.match(settings.payload.request_id, UUID_PATTERN);
+  assert.deepEqual({ ...settings.payload, uuid: null, request_id: null }, {
+    uuid: null,
+    session_id: '',
+    type: 'control_request',
+    request_id: null,
+    request: { subtype: 'apply_flag_settings', settings: { attribution } },
+  });
+  assert.equal(first.event_type, 'user');
+  assert.equal(first.payload.uuid, '11111111-1111-4111-8111-111111111111');
+  assert.equal(first.payload.message.content, 'Please fix slugify.');
+  assert.equal(created.flagSettingsRequestId, settings.payload.request_id);
 });
 
 test('createSession without a branch sends no revision, and makes up a message uuid and a title', async () => {
@@ -561,6 +593,24 @@ test('sendInterrupt posts an interrupt control request of its own', async () => 
     uuid: null, session_id: SESSION_ID, type: 'control_request', request_id: null, request: { subtype: 'interrupt' },
   });
   assert.deepEqual(sent, { eventId: 'evt_01EXAMPLE0014', sequence: '14', duplicate: false, requestId: event.payload.request_id });
+});
+
+test('applyFlagSettings posts the settings as a control request; null for a key goes through as null', async () => {
+  const { client, calls } = setup([json({ results: [{ event_id: 'evt_01EXAMPLE0015', sequence_num: '15', duplicate: false }] })]);
+  const sent = await client.applyFlagSettings(SESSION_ID, { attribution: null });
+  const [event] = calls[0].body.events;
+  assert.equal(calls[0].body.events.length, 1);
+  assert.equal(event.event_type, 'control_request');
+  assert.deepEqual({ ...event.payload, uuid: null, request_id: null }, {
+    uuid: null,
+    session_id: SESSION_ID,
+    type: 'control_request',
+    request_id: null,
+    request: { subtype: 'apply_flag_settings', settings: { attribution: null } },
+  });
+  assert.deepEqual(sent, { eventId: 'evt_01EXAMPLE0015', sequence: '15', duplicate: false, requestId: event.payload.request_id });
+  await assert.rejects(client.applyFlagSettings(SESSION_ID, null), { code: 'bad_request' });
+  assert.equal(calls.length, 1);
 });
 
 test('archiveSession posts an empty body; an archived session counts as done', async () => {
@@ -1126,9 +1176,9 @@ test('the user message is the SDK shape the cloud takes', () => {
 test('the client offers exactly the calls of the contract', () => {
   const { client } = setup([]);
   assert.deepEqual(Object.keys(client).sort(), [
-    'archiveSession', 'createSession', 'getAccountUsage', 'getCreditGrantOffer', 'getOrganizationId', 'getPrepaidCredits',
-    'getSession', 'listEnvironments', 'listEvents', 'openEventStream', 'sendControlResponse', 'sendInterrupt',
-    'sendUserMessage',
+    'applyFlagSettings', 'archiveSession', 'createSession', 'getAccountUsage', 'getCreditGrantOffer', 'getOrganizationId',
+    'getPrepaidCredits', 'getSession', 'listEnvironments', 'listEvents', 'openEventStream', 'sendControlResponse',
+    'sendInterrupt', 'sendUserMessage',
   ]);
   for (const call of Object.values(client)) assert.equal(typeof call, 'function');
 });

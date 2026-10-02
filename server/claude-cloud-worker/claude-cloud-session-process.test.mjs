@@ -1063,3 +1063,181 @@ test('a failed result ends the turn even while background work runs', async () =
   assert.equal(api.posts('/api/response').length, 1);
   assert.ok(api.posts('/api/response')[0].terminalError);
 });
+
+// ---------------------------------------------------------------------------
+// Commit attribution
+
+const OAR_ATTRIBUTION = Object.freeze({
+  commit: 'Co-authored-by: Open Agent Relay (Claude Sonnet 5.5) <no-reply@oar.sh>',
+  pr: '🤖 Generated with [Open Agent Relay](https://oar.sh)',
+  sessionUrl: false,
+});
+const NO_ATTRIBUTION = Object.freeze({ commit: '', pr: '', sessionUrl: false });
+const flagSettingsResponse = (sequence, requestId, subtype = 'success') => cloudEvent(sequence, {
+  type: 'control_response',
+  response: { subtype, request_id: requestId, ...(subtype === 'success' ? {} : { error: 'unknown settings key' }) },
+});
+
+/** Run one delivery to its end on the runner's only stream; `events` are emitted once the message is in the cloud. */
+async function runDelivery({ runner, cloud, api }, pending, events) {
+  const responses = api.posts('/api/response').length;
+  const sends = cloud.callsOf('sendUserMessage').length + cloud.callsOf('createSession').length;
+  const done = runner.handlePendingPayload(pending);
+  await waitFor(() => cloud.streams.length === 1
+    && cloud.callsOf('sendUserMessage').length + cloud.callsOf('createSession').length > sends, 'message sent');
+  cloud.streams[0].emit(...events);
+  assert.equal(await done, true);
+  assert.equal(api.posts('/api/response').length, responses + 1);
+}
+
+test('the session is created with the delivered attribution, and a follow-up does not send it again', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12] });
+  const { runner } = makeRunner({ api, cloud });
+  const settings = { attribution: OAR_ATTRIBUTION };
+
+  await runDelivery({ runner, cloud, api }, { message: relayMessage(), settings }, [
+    flagSettingsResponse(2, 'flag-settings-request-create'),
+    assistantText(3, 'Committed.'),
+    turnResult(4, { result: 'Committed.' }),
+  ]);
+  assert.deepEqual(cloud.callsOf('createSession')[0].args.flagSettings, { attribution: OAR_ATTRIBUTION });
+  // The sandbox's answer to the settings request is no reply text and no card.
+  assert.deepEqual(api.posts('/api/response').map((body) => body.text), ['Committed.']);
+  assert.equal(api.posts('/api/question').length, 0);
+
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Again', ...boundTo('4') }),
+    settings,
+  }, [turnResult(13, { result: 'Committed again.' })]);
+  assert.equal(cloud.callsOf('applyFlagSettings').length, 0);
+  assert.deepEqual(activityTexts(api).filter((text) => /attribution/.test(text)), []);
+  await runner.dispose();
+});
+
+test('vanilla attribution creates the session without a settings request; a later change is sent before the message', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12, 22, 32] });
+  const { runner } = makeRunner({ api, cloud });
+
+  await runDelivery({ runner, cloud, api }, { message: relayMessage(), settings: { attribution: null } }, [
+    turnResult(4, { result: 'Done.' }),
+  ]);
+  assert.equal('flagSettings' in cloud.callsOf('createSession')[0].args, false);
+
+  // Switched to OAR on the relay: the next message carries it in front.
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Commit it', ...boundTo('4') }),
+    settings: { attribution: OAR_ATTRIBUTION },
+  }, [flagSettingsResponse(11, 'flag-settings-request-1'), turnResult(13, { result: 'Committed.' })]);
+  // Switched off, then back to Claude Code's own lines: null takes the setting out.
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-3', attemptId: 'attempt-3', text: 'And again', ...boundTo('13') }),
+    settings: { attribution: NO_ATTRIBUTION },
+  }, [turnResult(23, { result: 'Committed.' })]);
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-4', attemptId: 'attempt-4', text: 'Once more', ...boundTo('23') }),
+    settings: { attribution: null },
+  }, [turnResult(33, { result: 'Committed.' })]);
+
+  assert.deepEqual(cloud.callsOf('applyFlagSettings').map((call) => [call.id, call.settings]), [
+    [SESSION_ID, { attribution: OAR_ATTRIBUTION }],
+    [SESSION_ID, { attribution: NO_ATTRIBUTION }],
+    [SESSION_ID, { attribution: null }],
+  ]);
+  // Each settings request went out before the message it belongs to.
+  const order = cloud.calls.filter((call) => call.op === 'applyFlagSettings' || call.op === 'sendUserMessage').map((call) => call.op);
+  assert.deepEqual(order, [
+    'applyFlagSettings', 'sendUserMessage', 'applyFlagSettings', 'sendUserMessage', 'applyFlagSettings', 'sendUserMessage',
+  ]);
+  await runner.dispose();
+});
+
+test('a worker that does not know what the sandbox has sends the attribution once, vanilla included', async () => {
+  for (const attribution of [OAR_ATTRIBUTION, null]) {
+    const api = makeApi();
+    const cloud = makeCloud({ sendSequences: [12, 16] });
+    const { runner } = makeRunner({ api, cloud });
+    await runDelivery({ runner, cloud, api }, {
+      message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Commit it', ...boundTo('9') }),
+      settings: { attribution },
+    }, [turnResult(13, { result: 'Committed.' })]);
+    await runDelivery({ runner, cloud, api }, {
+      message: relayMessage({ id: 'queue-message-3', attemptId: 'attempt-3', text: 'Again', ...boundTo('13') }),
+      settings: { attribution },
+    }, [turnResult(17, { result: 'Committed.' })]);
+    assert.deepEqual(cloud.callsOf('applyFlagSettings').map((call) => call.settings), [{ attribution }]);
+    await runner.dispose();
+  }
+});
+
+test('a delivery that does not name an attribution sends no settings', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12] });
+  const { runner } = makeRunner({ api, cloud });
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Commit it', ...boundTo('9') }),
+    settings: { backgroundTaskTimeoutMs: 120_000 },
+  }, [turnResult(13, { result: 'Committed.' })]);
+  assert.equal(cloud.callsOf('applyFlagSettings').length, 0);
+  await runner.dispose();
+});
+
+test('a settings request the API refuses costs the setting, not the turn; the next message tries again', async () => {
+  const api = makeApi();
+  const failures = { applyFlagSettings: cloudError('bad_request', 'Claude Cloud refused the request (HTTP 400).') };
+  const cloud = makeCloud({ sendSequences: [12, 16], failures });
+  const { runner } = makeRunner({ api, cloud });
+  const settings = { attribution: OAR_ATTRIBUTION };
+
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Commit it', ...boundTo('9') }),
+    settings,
+  }, [turnResult(13, { result: 'Committed.' })]);
+  assert.equal(api.posts('/api/response')[0].terminalError ?? null, null);
+  assert.deepEqual(activityTexts(api).filter((text) => /attribution/.test(text)), [
+    'Cloud: the commit attribution setting could not be applied; commits of this turn may carry Claude Code\'s own attribution lines.',
+  ]);
+
+  delete failures.applyFlagSettings;
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-3', attemptId: 'attempt-3', text: 'Again', ...boundTo('13') }),
+    settings,
+  }, [turnResult(17, { result: 'Committed.' })]);
+  assert.equal(cloud.callsOf('applyFlagSettings').length, 2);
+  await runner.dispose();
+});
+
+test('a settings request that cannot be sent for another reason fails the turn like the message would', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12], failures: { applyFlagSettings: cloudError('transient') } });
+  const { runner } = makeRunner({ api, cloud });
+  const message = relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Commit it', ...boundTo('9') });
+  assert.equal(await runner.handlePendingPayload({ message, settings: { attribution: OAR_ATTRIBUTION } }), true);
+  // Nothing went into the session without its setting; the row is delivered again.
+  assert.equal(cloud.callsOf('sendUserMessage').length, 0);
+  assert.equal(api.posts('/api/requeue').length, 1);
+  assert.equal(api.posts('/api/response').length, 0);
+  await runner.dispose();
+});
+
+test('settings the sandbox does not take are noted in the turn and sent again with the next message', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12, 16] });
+  const { runner } = makeRunner({ api, cloud });
+  const settings = { attribution: OAR_ATTRIBUTION };
+
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Commit it', ...boundTo('9') }),
+    settings,
+  }, [flagSettingsResponse(11, 'flag-settings-request-1', 'error'), turnResult(13, { result: 'Committed.' })]);
+  assert.equal(activityTexts(api).filter((text) => /attribution setting could not be applied/.test(text)).length, 1);
+
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-3', attemptId: 'attempt-3', text: 'Again', ...boundTo('13') }),
+    settings,
+  }, [flagSettingsResponse(15, 'flag-settings-request-2'), turnResult(17, { result: 'Committed.' })]);
+  assert.equal(cloud.callsOf('applyFlagSettings').length, 2);
+  assert.equal(activityTexts(api).filter((text) => /attribution setting could not be applied/.test(text)).length, 1);
+  await runner.dispose();
+});

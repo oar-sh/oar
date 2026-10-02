@@ -45,7 +45,7 @@ checklist for a new provider (details per column in the per-SDK files).
 | Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) | Implemented (`session/load`, capability-checked; visible note on fallback) | Implemented (`claude_cloud_session_id` + `claude_cloud_last_sequence`; a message uuid derived from the queue row keeps a redelivery from sending twice) |
 | Context usage display | Implemented (server-derived from `events.jsonl`) | Implemented | Implemented (window from the model's `context` parameter; shared static fallback) | Implemented (`_meta` tokens; shared static fallback) | Implemented (the session's `context_usage`, read once after each turn; no categories) |
 | Auto-compact window control | Not applicable (no compaction primitive) | Implemented (2026-08-20) | Not applicable | Not applicable | Not applicable |
-| Commit attribution (OAR / vanilla / off, per-folder override) | Not applicable (no CLI setting) | Implemented (2026-10-01, `Settings.attribution`) | Not applicable | Not applicable | Not applicable (no setting reaches the sandbox) |
+| Commit attribution (OAR / vanilla / off, per-folder override) | Not applicable (no CLI setting) | Implemented (2026-10-01, `Settings.attribution`) | Not applicable | Not applicable | Implemented (2026-10-02; the same setting, handed to the sandbox as an `apply_flag_settings` control request) |
 | Auth model | Relay host's CLI login | Relay host's `claude` login, **switchable from the web UI** (`claude auth login/logout`, code pasted back; [claude-sdk.md](claude-sdk.md#account-authentication)) | API key via provider settings (secret-env-file delivery; key rotation respawns workers) | Relay host's `grok` login, **switchable from the web UI** (`grok login --device-auth`, no PTY and nothing pasted back; [grok-sdk.md](grok-sdk.md#account-authentication)) | Relay host's `claude` login (a claude.ai account), read from the CLI's credentials file, never refreshed or stored; the account is changed on the Claude tab ([claude-cloud.md](claude-cloud.md#account-and-authentication)) |
 | Provider CLI install / update | Detect-only (npm-global under a prefix the relay user cannot write) | Implemented — install / update / **switch to native installer** when the npm global folder is unwritable | n/a (pure npm SDK, no CLI is ever invoked) | Implemented — install / update ([grok-sdk.md](grok-sdk.md#cli-install)) | n/a (no CLI runs a turn; the Claude tab's CLI row covers the login) |
 
@@ -71,6 +71,13 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-10-02: **Commit attribution in Claude Cloud chats.** The sandbox's Claude Code takes the
+  relay's attribution setting as an `apply_flag_settings` control request over the session's event
+  API: in the create call in front of the first message, and before a later message when the
+  setting changed. `null` takes it out again (vanilla), so nothing has to be restarted. The relay
+  delivers `settings.attribution` to `claude-cloud` workers as it does to `claude` ones; a cloud
+  chat follows a folder override only when it was started from a folder. See the "Commit
+  attribution" row in [claude-cloud.md](claude-cloud.md).
 - 2026-10-02: **Agent sessions.** `remote_relay` now also targets the relay the agent runs on
   (its name or `this`), behind the setting "Agents may start and use sessions on this relay"
   (off by default): an in-process loopback client (`server/services/remote-relay-loopback.mjs`)

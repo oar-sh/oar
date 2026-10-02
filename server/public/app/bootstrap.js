@@ -3206,8 +3206,9 @@ async function loadContextSummaryAndRender(convId) {
       thinkingDisplay: payload.thinkingDisplay ?? null,
     })
     : '';
-  // Claude-only too: what this folder's commits say, with the folder override.
-  const attributionHtml = payload.providerType === 'claude'
+  // What this folder's commits say, with the folder override: Claude, and a
+  // Claude Cloud chat that was started from a folder (no path, no row).
+  const attributionHtml = payload.providerType === 'claude' || payload.providerType === 'claude-cloud'
     ? renderAttributionControlHtml(payload.attribution || null)
     : '';
   // The slider's writes need the conversation id even when the modal was
