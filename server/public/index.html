@@ -2873,6 +2873,11 @@
     background: rgba(63, 185, 80, 0.12); color: var(--relay-tone-online);
     border-radius: 6px; padding: 0 6px; font-size: var(--fs-meta-sm);
   }
+  /* The relay's note while a session's worker cannot be started
+     (worker-launch-note-service.mjs): a notice of the relay's, not a reply.
+     Amber while the relay keeps trying or has stopped, green once started. */
+  .msg.assistant.msg-worker-launch .msg-bubble { border-left: 3px solid #d29922; }
+  .msg.assistant.msg-worker-launch-started .msg-bubble { border-left-color: var(--relay-tone-online); }
   /* Mid-turn steering. The CLI usually FOLDS a steered message into the
      running turn and answers everything with one reply; the steered row then
      settles as a compact marker under its own message (kind='folded'). More

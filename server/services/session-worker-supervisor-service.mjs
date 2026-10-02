@@ -63,6 +63,19 @@ export function createSessionWorkerSupervisor({
   maxRestartRetries = 5,
   restartBackoffBaseMs = 1_000,
   restartBackoffMaxMs = 30_000,
+  // Exhausted is not for ever: what failed the launches can be gone — a
+  // process list the relay could not read for an hour was (2026-10-01) — and
+  // the pending work would otherwise wait for a hand-made launch or a relay
+  // restart. One more launch is allowed this long after the last failure; a
+  // failure exhausts the session again at once. 0 keeps it exhausted.
+  restartExhaustedRetryAfterMs = 60_000,
+  // ...and not for longer than this after the first exhaustion: then the
+  // session stays exhausted until a launch is asked for (the Retry button,
+  // the launch or kill route, a relay restart). 0 retries without end.
+  restartExhaustedRetryWindowMs = 10 * 60_000,
+  // Told about launch episodes, for the note in the conversation:
+  // ({ type: 'exhausted' | 'retry-failed' | 'stopped' | 'launched', sdkSessionId, lifecycle }).
+  onLaunchState = null,
   idleEvictionMs = 0,
   // Copilot-kind workers boot a full CLI (auth, model catalog, workspace scan)
   // before their extension can heartbeat; measured median is ~35s. A 30s
@@ -88,6 +101,8 @@ export function createSessionWorkerSupervisor({
   const retryLimit = Math.max(0, clampInt(maxRestartRetries, 5));
   const backoffBaseMs = Math.max(1, clampInt(restartBackoffBaseMs, 1_000));
   const backoffMaxMs = Math.max(backoffBaseMs, clampInt(restartBackoffMaxMs, 30_000));
+  const exhaustedRetryAfterMs = Math.max(0, clampInt(restartExhaustedRetryAfterMs, 60_000));
+  const exhaustedRetryWindowMs = Math.max(0, clampInt(restartExhaustedRetryWindowMs, 10 * 60_000));
   const idleTimeoutMs = clampInt(idleEvictionMs, 0);
   const heartbeatStaleAfterMs = Math.max(1_000, clampInt(heartbeatTimeoutMs, 90_000));
   const recoveryGraceMs = Math.max(0, clampInt(degradedRecoveryGraceMs, 10_000));
@@ -129,6 +144,10 @@ export function createSessionWorkerSupervisor({
       backoffMs: 0,
       nextRestartAtMs: null,
       restartExhausted: false,
+      // The launch episode: when the launches were first exhausted, and
+      // whether the relay has stopped trying again by itself.
+      exhaustedSinceMs: null,
+      retriesStopped: false,
       lastError: null,
       lastFailureAtMs: null,
       lastActivityAtMs: nowAtMs,
@@ -167,6 +186,11 @@ export function createSessionWorkerSupervisor({
       backoffMs: clampInt(lifecycle.backoffMs, 0),
       nextRestartAt: lifecycle.nextRestartAtMs ? new Date(lifecycle.nextRestartAtMs).toISOString() : null,
       restartExhausted: Boolean(lifecycle.restartExhausted),
+      exhaustedSince: lifecycle.exhaustedSinceMs ? new Date(lifecycle.exhaustedSinceMs).toISOString() : null,
+      retriesStopped: Boolean(lifecycle.retriesStopped),
+      retryAgainAt: lifecycle.restartExhausted && !lifecycle.retriesStopped && lifecycle.lastFailureAtMs && exhaustedRetryAfterMs > 0
+        ? new Date(lifecycle.lastFailureAtMs + exhaustedRetryAfterMs).toISOString()
+        : null,
       lastError: lifecycle.lastError || null,
       lastFailureAt: lifecycle.lastFailureAtMs ? new Date(lifecycle.lastFailureAtMs).toISOString() : null,
       lastActivityAt: lifecycle.lastActivityAtMs ? new Date(lifecycle.lastActivityAtMs).toISOString() : null,
@@ -187,6 +211,16 @@ export function createSessionWorkerSupervisor({
       diagnosticPlanReference: resolvePlanReference() || null,
       killedAt: lifecycle.killedAtMs ? new Date(lifecycle.killedAtMs).toISOString() : null,
     };
+  }
+
+  // The caller's listener must not break the supervisor.
+  function notifyLaunchState(type, sessionId) {
+    if (typeof onLaunchState !== 'function') return;
+    try {
+      onLaunchState({ type, sdkSessionId: sessionId, lifecycle: toLifecycleSnapshot(sessionId) });
+    } catch (error) {
+      try { log?.(`launch state listener failed (${type}, session=${String(sessionId).slice(0, 8)}): ${error?.message || error}`); } catch {}
+    }
   }
 
   function touchActivity(sessionId, atMs = nowMs()) {
@@ -394,16 +428,26 @@ export function createSessionWorkerSupervisor({
     const failedAtMs = nowMs();
 
     if (nextRetryCount > retryLimit) {
+      const firstExhaustion = !lifecycle.restartExhausted;
+      const exhaustedSinceMs = lifecycle.exhaustedSinceMs || failedAtMs;
+      const retriesStopped = exhaustedRetryAfterMs === 0
+        || (exhaustedRetryWindowMs > 0 && failedAtMs - exhaustedSinceMs >= exhaustedRetryWindowMs);
       const exhausted = setLifecycle(sessionId, {
         retryCount: nextRetryCount,
         backoffMs: 0,
         nextRestartAtMs: null,
         restartExhausted: true,
+        exhaustedSinceMs,
+        retriesStopped,
         lastError: message,
         lastFailureAtMs: failedAtMs,
         lastActivityAtMs: failedAtMs,
       });
       registerDegradedState(sessionId, 'restart-exhausted', { atMs: failedAtMs });
+      notifyLaunchState(
+        firstExhaustion ? 'exhausted' : (retriesStopped && !lifecycle.retriesStopped ? 'stopped' : 'retry-failed'),
+        sessionId,
+      );
       return { scheduled: false, exhausted: true, lifecycle: toLifecycleSnapshot(sessionId, exhausted) };
     }
 
@@ -432,6 +476,8 @@ export function createSessionWorkerSupervisor({
       backoffMs: 0,
       nextRestartAtMs: null,
       restartExhausted: false,
+      exhaustedSinceMs: null,
+      retriesStopped: false,
       lastError: null,
       lastFailureAtMs: null,
       lastActivityAtMs: nowAtMs,
@@ -454,7 +500,13 @@ export function createSessionWorkerSupervisor({
     const lifecycle = lifecycleBySession.get(sessionId);
     if (!lifecycle) return { allowed: true, reason: null, lifecycle: null };
     if (lifecycle.restartExhausted) {
-      return { allowed: false, reason: 'restart-exhausted', lifecycle: toLifecycleSnapshot(sessionId, lifecycle) };
+      const failedAtMs = Number(lifecycle.lastFailureAtMs || 0);
+      const dueAgain = !lifecycle.retriesStopped
+        && exhaustedRetryAfterMs > 0 && failedAtMs > 0 && nowMs() - failedAtMs >= exhaustedRetryAfterMs;
+      if (!dueAgain) {
+        return { allowed: false, reason: 'restart-exhausted', lifecycle: toLifecycleSnapshot(sessionId, lifecycle) };
+      }
+      return { allowed: true, reason: null, lifecycle: toLifecycleSnapshot(sessionId, lifecycle) };
     }
     if (lifecycle.nextRestartAtMs && nowMs() < lifecycle.nextRestartAtMs) {
       return { allowed: false, reason: 'restart-delayed', lifecycle: toLifecycleSnapshot(sessionId, lifecycle) };
@@ -545,6 +597,7 @@ export function createSessionWorkerSupervisor({
       // backoff/exhausted lifecycle state was left behind by earlier failures.
       clearRestartSchedule(sessionId, { resetDegradedState: false });
       assessSessionHealth(sessionId, reusedWorker, { nowAtMs, questionPending: false });
+      notifyLaunchState('launched', sessionId);
       return { ok: true, reused: true, worker: reusedWorker, lifecycle: toLifecycleSnapshot(sessionId) };
     }
 
@@ -609,6 +662,7 @@ export function createSessionWorkerSupervisor({
           });
           clearRestartSchedule(sessionId);
           assessSessionHealth(sessionId, readyState, { questionPending: false });
+          notifyLaunchState('launched', sessionId);
           return { ok: true, reused: false, worker: readyState, lifecycle: toLifecycleSnapshot(sessionId) };
         }
         const simulatedReady = setWorkerState(sessionId, {
@@ -625,6 +679,7 @@ export function createSessionWorkerSupervisor({
         });
         clearRestartSchedule(sessionId);
         assessSessionHealth(sessionId, simulatedReady, { questionPending: false });
+        notifyLaunchState('launched', sessionId);
         return { ok: true, reused: false, worker: simulatedReady, lifecycle: toLifecycleSnapshot(sessionId) };
       } catch (error) {
         const scheduled = scheduleRestart(sessionId, error, { incrementRetry: true });

@@ -58,6 +58,7 @@ import { createPushDispatchService, ensurePushVapidKeys } from './services/push-
 import { createHostSuspendService } from './services/host-suspend-service.mjs';
 import { USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, createUsageLimitPauseService } from './services/usage-limit-pause-service.mjs';
 import { buildClaudeAttributionSettings, normalizeClaudeAttributionMode, resolveClaudeAttributionMode, DEFAULT_CLAUDE_ATTRIBUTION_MODE } from '../shared/claude-attribution.mjs';
+import { createWorkerLaunchNoteService } from './services/worker-launch-note-service.mjs';
 import { createGitHubCiActivityService } from './services/github-ci-activity-service.mjs';
 import { runHostSuspendToRam } from './services/host-suspend-command.mjs';
 import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
@@ -2625,6 +2626,8 @@ const sessionWorkerRegistry = createSessionWorkerRegistry();
 const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
   platform: process.platform,
   execFileSyncImpl: execFileSync,
+  execFileImpl: execFile,
+  logger: console,
 });
 function buildSessionWorkerLaunchEnv() {
   const normalizePathValue = (value) => {
@@ -2814,8 +2817,18 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   if (!normalizedTargetSessionId) {
     throw new Error('missing-target-session-id');
   }
+  // An unreadable process list must not stop every launch on the relay
+  // (2026-10-01: a control byte in one command line did, for an hour).
+  const warnProcessListUnreadable = (error) => {
+    console.warn(`${runtimeLogPrefix()}worker launcher: process list unreadable, launching session=${normalizedTargetSessionId.slice(0, 8)} without the reuse check: ${error?.message || error}`);
+  };
   if (allowProcessReuse) {
-    const liveWorker = sessionWorkerProcessInspector.findProcessForSession(normalizedTargetSessionId);
+    let liveWorker = null;
+    try {
+      liveWorker = await sessionWorkerProcessInspector.findProcessForSessionAsync(normalizedTargetSessionId);
+    } catch (error) {
+      warnProcessListUnreadable(error);
+    }
     if (liveWorker?.processId) {
       const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
       console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
@@ -2833,6 +2846,7 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
     execFileSyncImpl: execFileSync,
     processInspector: sessionWorkerProcessInspector,
     allowProcessReuse,
+    onProcessListError: warnProcessListUnreadable,
   });
   const workerPid = Number.isInteger(Number(launched?.pid)) ? Number(launched.pid) : null;
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
@@ -2845,11 +2859,26 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   console.log(`${runtimeLogPrefix()}worker launcher: ${launchVerb} ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${workerPid || 'none'} mode=${launchMode}${tmuxSessionName ? ` tmux=${tmuxSessionName}` : ''}`);
   return { workerId, pid: workerPid, reused: launched?.reused === true };
 }
+// The note in the conversation while a session's worker cannot be started
+// (worker-launch-note-service.mjs). `io` exists only later in boot; the
+// supervisor reports launch episodes at run time, never during boot.
+const workerLaunchNoteService = createWorkerLaunchNoteService({
+  db,
+  stmts,
+  emit: (event, payload) => io.emit(event, payload),
+  resolveConversationId: (sdkSessionId) => (
+    stmts.getConvBySdkSessionId?.get?.(sdkSessionId)?.id
+    || sessionWorkerRegistry.getWorker(sdkSessionId)?.conversationId
+    || null
+  ),
+  logger: console,
+});
 const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   registry: sessionWorkerRegistry,
   spawnWorker: async (sdkSessionId, options = {}) => spawnSessionWorkerCli(sdkSessionId, options),
   diagnosticPlanReference: () => path.join(currentWorkspaceRootPath(), '.cursor', 'plans', 'worker-startup-monitoring-plan.md'),
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
+  onLaunchState: (event) => workerLaunchNoteService.handle(event),
 });
 // Feature flags moved from config.json into app_settings; adopt any legacy
 // `features` key once, then resolve the boot snapshot (defaults < stored rows
@@ -2917,14 +2946,11 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
   const currentWorker = sessionWorkerRegistry?.getWorker?.(sessionId) || null;
   sessionWorkerSupervisor?.markKilled?.(sessionId);
   const cancelledStart = await sessionWorkerSupervisor?.cancelPendingStart?.(sessionId, { wait: true });
+  // Read off the thread; an unreadable list throws, and this caller treats
+  // that as fatal (a rebind next to a process it could not see is worse).
   const discoveredProcesses = process.platform === 'win32'
-    ? (
-        sessionWorkerProcessInspector?.findWindowsProcessTreeForSession?.(sessionId)
-        || sessionWorkerProcessInspector?.findWindowsProcessesForSession?.(sessionId)
-        || sessionWorkerProcessInspector?.findProcessesForSession?.(sessionId)
-        || []
-      )
-    : (sessionWorkerProcessInspector?.findProcessesForSession?.(sessionId) || []);
+    ? await sessionWorkerProcessInspector.findWindowsProcessTreeForSessionAsync(sessionId, { fresh: true })
+    : await sessionWorkerProcessInspector.findProcessesForSessionAsync(sessionId, { fresh: true });
   const currentWorkerPid = Number(currentWorker?.pid);
   const hadActiveWorker = discoveredProcesses.some((entry) => isProcessAlive(Number(entry?.processId)))
     || (Number.isInteger(currentWorkerPid) && currentWorkerPid > 0 && isProcessAlive(currentWorkerPid))
@@ -3227,6 +3253,26 @@ function cancelRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
   return { cancelled: true, dropped, ...relayShutdownStatePayload() };
 }
 
+const countPendingRowsByOwnerSession = db.prepare(`
+  SELECT owner_sdk_session_id AS sdk_session_id, COUNT(*) AS n
+  FROM queue
+  WHERE status = 'pending' AND owner_sdk_session_id IS NOT NULL AND owner_sdk_session_id != ''
+  GROUP BY owner_sdk_session_id
+`);
+
+function countPendingRowsOfStoppedSessions() {
+  try {
+    let stalled = 0;
+    for (const row of countPendingRowsByOwnerSession.all()) {
+      const lifecycle = sessionWorkerSupervisor?.getLifecycleState?.(String(row.sdk_session_id || '').trim());
+      if (lifecycle?.retriesStopped === true) stalled += Number(row.n || 0);
+    }
+    return stalled;
+  } catch {
+    return 0;
+  }
+}
+
 function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localhost-api', restart = false } = {}) {
   const safeReason = String(reason || 'manual-request').trim().slice(0, 140) || 'manual-request';
   const safeRequestedBy = String(requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
@@ -3263,7 +3309,11 @@ function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localh
   const tryShutdownWhenIdle = () => {
     if (runtimeShutdownStarted) return;
     const counts = queueCounts();
-    const queueFree = (counts.pendingCount + counts.processingCount + counts.parkedCount) === 0;
+    // A row queued for a session whose launches the relay has stopped
+    // retrying makes no progress until somebody presses Retry; it must not
+    // hold the restart (which, fresh, is itself the next launch attempt).
+    const stalledPending = countPendingRowsOfStoppedSessions();
+    const queueFree = (counts.pendingCount - stalledPending + counts.processingCount + counts.parkedCount) <= 0;
     if (!queueFree) return;
     const requestInfo = pendingRelayShutdownRequest;
     pendingRelayShutdownRequest = null;
@@ -6003,19 +6053,21 @@ async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionI
 
 const WORKER_DEATH_GRACE_MS = 15_000;
 
-function isWorkerSessionProcessAlive(sessionId, hintPid = null) {
+async function isWorkerSessionProcessAlive(sessionId, hintPid = null) {
   // A merely-retained socket is not proof of life: a dead worker's socket
   // lingers until its close event lands, and counting it stalled recovery.
   // The socket only counts with a recent heartbeat or a PID that probes
   // alive; otherwise fall through to the process probes below.
   if (sessionWorkerWebSocketService?.hasLiveWorkerSocket?.(sessionId)) return true;
-  try {
-    if (sessionWorkerProcessInspector?.findProcessForSession?.(sessionId)) return true;
-  } catch {}
+  // The pids first: they cost nothing. The process list last: on win32 it is
+  // a PowerShell run (off the thread, shared and cached by the inspector).
   const registryPid = Number(sessionWorkerRegistry?.getWorker?.(sessionId)?.pid || 0);
   if (registryPid > 0 && isProcessAlive(registryPid)) return true;
   const pid = Number(hintPid || 0);
   if (pid > 0 && isProcessAlive(pid)) return true;
+  try {
+    if (await sessionWorkerProcessInspector?.findProcessForSessionAsync?.(sessionId)) return true;
+  } catch {}
   return false;
 }
 
@@ -6083,10 +6135,10 @@ function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
   // when it owned no rows (the hold can outlive them, e.g. a continuation's).
   const heldSteering = Boolean(sessionWorkerRegistry?.getWorker?.(sid)?.steering);
   if (!owned.length && !heldSteering) return;
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     try {
       if (runtimeShutdownStarted) return;
-      if (isWorkerSessionProcessAlive(sid, pid)) return; // reconnect or socket flap
+      if (await isWorkerSessionProcessAlive(sid, pid)) return; // reconnect or socket flap
       sessionWorkerRegistry?.clearSteering?.(sid);
       const stillOwned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
       if (!stillOwned.length) return;
@@ -6099,15 +6151,28 @@ function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
   timer.unref?.();
 }
 
-function sweepDeadWorkerProcessingRows() {
+// One sweep at a time: a slow process list must not pile sweeps up.
+let deadWorkerSweepInFlight = false;
+async function sweepDeadWorkerProcessingRows() {
   if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
   if (runtimeShutdownStarted) return 0;
+  if (deadWorkerSweepInFlight) return 0;
+  deadWorkerSweepInFlight = true;
+  try {
+    return await sweepDeadWorkerProcessingRowsOnce();
+  } finally {
+    deadWorkerSweepInFlight = false;
+  }
+}
+
+async function sweepDeadWorkerProcessingRowsOnce() {
   const owners = stmts.listProcessingOwnerSessionIds?.all?.(25) || [];
   let recovered = 0;
   for (const owner of owners) {
     const sid = String(owner?.sdk_session_id || '').trim();
     if (!sid) continue;
-    if (isWorkerSessionProcessAlive(sid)) continue;
+    // The owners share one list: the inspector caches it for a moment.
+    if (await isWorkerSessionProcessAlive(sid)) continue;
     console.warn(`${runtimeLogPrefix()}WORKER DEAD session=${sid.slice(0, 8)} trigger=sweep — recovering owned turns`);
     recovered += recoverDeadWorkerProcessingRows(sid, 'sweep');
   }
@@ -6131,7 +6196,11 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   pollIntervalMs: 500,
   logger: console,
 });
-runtimeTimers.deadWorkerSweep = setInterval(sweepDeadWorkerProcessingRows, 30_000);
+runtimeTimers.deadWorkerSweep = setInterval(() => {
+  sweepDeadWorkerProcessingRows().catch((error) => {
+    console.warn(`${runtimeLogPrefix()}WORKER SWEEP failed: ${error?.message || error}`);
+  });
+}, 30_000);
 if (typeof runtimeTimers.deadWorkerSweep.unref === 'function') runtimeTimers.deadWorkerSweep.unref();
 const tmuxInspectorAccessPolicy = createTmuxInspectorAccessPolicy({
   sessionWorkerRegistry,

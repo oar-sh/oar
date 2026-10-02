@@ -49,7 +49,7 @@ import {
   closeSummaryModal,
 } from './store.js';
 import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
-import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility } from './api-client.js';
+import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility, launchSessionWorker } from './api-client.js';
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, parseAppFileHref, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
 import { renderAttachmentMarkup, removeComposerAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo, openDriveFilePreview, openWorkspaceFilePreview, openUploadedAttachmentViewer } from './attachments-view.js';
@@ -1283,6 +1283,15 @@ function createMessageNode(msg, msgId = null, force = false) {
   const steerMarkerClass = msg.role === 'assistant' ? STEER_MARKER_CLASS_BY_KIND[messageKind] : null;
   if (steerMarkerClass) div.classList.add(steerMarkerClass);
   const isStoppedSteer = msg.role === 'assistant' && messageKind === 'stopped';
+  // The relay's note while this session's worker cannot be started
+  // (worker-launch-note-service.mjs), rewritten in place as the episode goes
+  // on. Once the relay has stopped trying, the note carries Retry: a launch
+  // for once the cause is fixed.
+  const isWorkerLaunchNote = msg.role === 'assistant' && messageKind.startsWith('worker-launch-');
+  if (isWorkerLaunchNote) div.classList.add('msg-worker-launch', `msg-${messageKind}`);
+  const workerLaunchActionsHtml = (!IS_SHARED_VIEW && msgId && messageKind === 'worker-launch-stopped')
+    ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn" data-action="retry-worker-launch" data-message-id="${escHtml(msgId)}" title="Start the worker for this conversation again now">Retry</button></div>`
+    : '';
   // A turn answered by a different provider than the conversation is bound to
   // (e.g. the Copilot relay answering a Cursor conversation) must be visible,
   // not silent: it ran on another plan than the header indicates.
@@ -1410,7 +1419,7 @@ function createMessageNode(msg, msgId = null, force = false) {
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${originBadgeHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}${stoppedSteerActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${originBadgeHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}${stoppedSteerActionsHtml}${workerLaunchActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -2773,6 +2782,55 @@ function releaseStoppedSteerResendsOf(messageId) {
   }
 }
 
+// Retry on the worker-launch note: ask the relay for a launch now. The relay
+// rewrites the note itself — the worker started, or the launches are
+// exhausted again — so the button only has to report a refused request.
+async function retryWorkerLaunch(conversationId, noteId) {
+  const conversationKey = String(conversationId || '').trim();
+  const id = String(noteId || '').trim();
+  if (!conversationKey || !id) return;
+  const btn = document.querySelector(`.bubble-action-btn[data-message-id="${CSS.escape(id)}"][data-action="retry-worker-launch"]`);
+  if (btn?.disabled) return;
+  const sdkSessionId = String(conversations[conversationKey]?.sdkSessionId || '').trim();
+  if (!sdkSessionId) {
+    showTransientRelayNotice('This conversation has no session to start a worker for.');
+    return;
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Retrying…';
+  }
+  try {
+    // apiFetch answers null for a refused request (the route says 409 with
+    // the reason) as for a network failure: both re-arm the button.
+    const result = await launchSessionWorker(sdkSessionId);
+    if (!result || result.ok === false) throw new Error(String(result?.error || 'the relay refused the launch'));
+  } catch (error) {
+    showTransientRelayNotice(`The worker could not be started: ${error?.message || error}`);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+    }
+  }
+}
+
+// A message the relay rewrote in place (the worker-launch note): the bubble is
+// rebuilt where it stands, so the transcript keeps its order. False when the
+// message is not on the page.
+export function replaceRenderedMessage(msg, msgId) {
+  const el = getMessagesElement();
+  const id = String(msgId || '').trim();
+  if (!el || !id) return false;
+  const existing = el.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
+  if (!existing) return false;
+  const placeholder = document.createComment('replacing');
+  existing.replaceWith(placeholder);
+  seenMessageIds.delete(id);
+  const fresh = createMessageNode(msg, id, true);
+  placeholder.replaceWith(fresh || existing);
+  return Boolean(fresh);
+}
+
 async function resendStoppedSteer(conversationId, markerId) {
   const conversationKey = String(conversationId || '').trim();
   const id = String(markerId || '').trim();
@@ -3110,6 +3168,12 @@ function handleBubbleActionClick(event) {
     event.preventDefault();
     event.stopPropagation();
     void resendStoppedSteer(currentConvId, messageId);
+  }
+
+  if (action === 'retry-worker-launch' && messageId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void retryWorkerLaunch(currentConvId, messageId);
   }
 
   if (action === 'stop-subagent' && subagentRunId) {

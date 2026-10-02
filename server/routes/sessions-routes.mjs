@@ -1220,6 +1220,9 @@ export function buildSessionWorkerStatusPayload({
   featureFlags = null,
   supervisorSnapshot = null,
   queueRows = [],
+  // What the last read of the process list did ({ at, durationMs, processes,
+  // error }); a slow box shows here before it shows as 502s.
+  processList = null,
 } = {}) {
   const snapshot = supervisorSnapshot && typeof supervisorSnapshot === 'object'
     ? supervisorSnapshot
@@ -1324,6 +1327,7 @@ export function buildSessionWorkerStatusPayload({
     workerCount: toSafeNonNegativeInt(snapshot.workerCount, workers.length),
     onlineCount,
     onlineProcessCount,
+    processList: processList && typeof processList === 'object' ? { ...processList } : null,
     onlineBoundProcessCount,
     onlineUnassignedProcessCount,
     counts: snapshot.counts && typeof snapshot.counts === 'object' ? snapshot.counts : {},
@@ -4282,7 +4286,14 @@ export function registerSessionsRoutes(app, deps) {
     // A session that is not 'ready' can still own a live process (status 'error',
     // or no registry entry at all). Detect that, or the stop is skipped and the
     // launch silently reuses the old process in the old directory.
-    const liveProcessDetected = !!sessionWorkerProcessInspector?.findProcessForSession?.(sdkSessionId);
+    let liveProcessDetected = false;
+    try {
+      liveProcessDetected = !!(await sessionWorkerProcessInspector?.findProcessForSessionAsync?.(sdkSessionId, { fresh: true }));
+    } catch (error) {
+      // An unreadable list must not pass for "no process": the relaunch would
+      // start a second CLI next to the one it could not see.
+      return { ok: false, statusCode: 409, error: `process-list-unreadable: ${error?.message || error}` };
+    }
     const eligibility = evaluateWorkspaceRootRelaunch({
       workerStatus: worker?.status,
       activeQueueCount,
@@ -5149,6 +5160,7 @@ export function registerSessionsRoutes(app, deps) {
       featureFlags,
       supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
       queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
+      processList: sessionWorkerProcessInspector?.getLastRead?.() || null,
     });
     const activeRuntimeSessionCount = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
       ? Number(sessionWorkerStatus?.onlineBoundProcessCount || 0)

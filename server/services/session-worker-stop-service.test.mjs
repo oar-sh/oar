@@ -19,9 +19,9 @@ function fakeProcesses(pids, aliveFor = {}) {
   const probes = new Map();
   return {
     inspector: {
-      findProcessesForSession: () => pids.map((processId) => ({ processId })),
-      findWindowsProcessTreeForSession: () => pids.map((processId) => ({ processId })),
-      stopWindowsPids: () => {},
+      findProcessesForSessionAsync: () => pids.map((processId) => ({ processId })),
+      findWindowsProcessTreeForSessionAsync: () => pids.map((processId) => ({ processId })),
+      stopWindowsPidsAsync: () => {},
     },
     isPidAliveImpl: (pid) => {
       const budget = Number(aliveFor[pid] ?? 0);
@@ -37,7 +37,7 @@ test('returns immediately when there are no processes to stop', async () => {
   const result = await stopSessionWorkerProcesses({
     sdkSessionId: SID,
     platform: 'linux',
-    processInspector: { findProcessesForSession: () => [] },
+    processInspector: { findProcessesForSessionAsync: () => [] },
     killImpl: (pid, signal) => calls.push([pid, signal]),
     ...fakeClock(),
   });
@@ -161,16 +161,16 @@ test('killTmuxSession runs on posix only', async () => {
   assert.equal(tmuxCalls, 0);
 });
 
-test('win32: survivors trigger re-enumeration and a second stopWindowsPids pass', async () => {
+test('win32: survivors trigger re-enumeration and a second stopWindowsPidsAsync pass', async () => {
   const stopCalls = [];
   let enumerations = 0;
   // The first snapshot sees pid 71; a child (72) appears only on re-enumeration.
   const inspector = {
-    findWindowsProcessTreeForSession: () => {
+    findWindowsProcessTreeForSessionAsync: () => {
       enumerations += 1;
       return enumerations === 1 ? [{ processId: 71 }] : [{ processId: 71 }, { processId: 72 }];
     },
-    stopWindowsPids: (pids) => stopCalls.push([...pids]),
+    stopWindowsPidsAsync: (pids) => stopCalls.push([...pids]),
   };
   const probes = new Map();
   const isPidAliveImpl = (pid) => {
@@ -194,4 +194,39 @@ test('win32: survivors trigger re-enumeration and a second stopWindowsPids pass'
   assert.ok(stopCalls[1].includes(72), 'the rediscovered child must be killed too');
   assert.equal(result.escalated, true);
   assert.equal(result.ok, true);
+});
+
+test('an unreadable process list stops nothing blind and says so', async () => {
+  const stopCalls = [];
+  const result = await stopSessionWorkerProcesses({
+    sdkSessionId: SID,
+    worker: { pid: 4242 },
+    platform: 'win32',
+    processInspector: {
+      findWindowsProcessTreeForSessionAsync: async () => { throw new Error('windows-process-snapshot-unreadable: Bad control character in string literal'); },
+      stopWindowsPidsAsync: async (pids) => stopCalls.push([...pids]),
+    },
+    isPidAliveImpl: () => true,
+    ...fakeClock(),
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /^process-list-unreadable: windows-process-snapshot-unreadable/);
+  assert.deepEqual(stopCalls, [], 'the known pid alone is not stopped: its tree would run on');
+  assert.deepEqual(result.pids, []);
+});
+
+test('the stop reads the list fresh, off the thread', async () => {
+  const options = [];
+  const result = await stopSessionWorkerProcesses({
+    sdkSessionId: SID,
+    platform: 'win32',
+    processInspector: {
+      findWindowsProcessTreeForSessionAsync: async (_sid, opts) => { options.push(opts); return [{ processId: 91 }]; },
+      stopWindowsPidsAsync: async () => {},
+    },
+    isPidAliveImpl: () => false,
+    ...fakeClock(),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(options, [{ fresh: true }]);
 });

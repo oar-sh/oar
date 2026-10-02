@@ -231,7 +231,7 @@ test('launchSessionCli spawns node for cursor workers when tmux is unavailable',
       return { pid: 4242, unref: () => {} };
     },
     execFileSyncImpl: () => { throw new Error('tmux missing'); },
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     allowProcessReuse: false,
   });
   assert.equal(launched.pid, 4242);
@@ -257,7 +257,7 @@ test('launchSessionCli opens a cursor-titled console for cursor workers on windo
       CURSOR_API_KEY: 'cursor-test-key',
     },
     platform: 'win32',
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     detachedPollAttempts: 1,
     detachedPollDelayMs: 1,
     spawnImpl(command, args, options) {
@@ -306,7 +306,7 @@ test('launchSessionCli scrubs the cursor api key from the tmux client env', asyn
       throw new Error(`unexpected tmux args: ${args.join(' ')}`);
     },
     processInspector: {
-      findProcessForSession: () => ({ processId: process.pid, commandLine: 'node cursor-session-worker.mjs --session-id session-6' }),
+      findProcessForSessionAsync: () => ({ processId: process.pid, commandLine: 'node cursor-session-worker.mjs --session-id session-6' }),
     },
     allowProcessReuse: false,
     tmuxPollAttempts: 1,

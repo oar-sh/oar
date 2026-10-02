@@ -18,6 +18,45 @@ All notable changes to OAR are documented here. The format follows
   next message. Other providers are not touched: their tools have no such
   setting.
 
+### Fixed
+
+- **Windows: no worker could start once an agent had run a command with an
+  arrow or a bullet in it.** Before every launch the relay reads the list of
+  all processes through PowerShell. Under the console's OEM code page
+  PowerShell wrote characters such as `→` and `•` as control bytes, the list
+  stopped being valid JSON, and every launch on the relay failed: each session
+  you wrote to turned yellow after six tries and stayed so, for every
+  provider, until the relay was restarted. The list is now written as UTF-8, a
+  control byte that still gets through is tolerated, a list the relay cannot
+  read no longer stops a launch, and a session whose launches were exhausted
+  is tried once more every minute instead of waiting for a restart.
+- **A session whose worker cannot be started now says so.** Until now such a
+  session showed a yellow dot and nothing else. The relay now writes one note
+  into the conversation — why the worker could not be started, in one
+  sentence plus the cause — and keeps that same note up to date: it tries
+  again every minute for ten minutes, then stops and the note gets a
+  **Retry** button for once the cause is fixed; when the worker starts, the
+  note says so. Your message stays queued the whole time, and a queued
+  restart of the relay no longer waits for a message the relay has stopped
+  trying to deliver.
+
+### Changed
+
+- **Windows: the relay no longer stops while it reads the process list.**
+  Before every launch, every kill and every check of a worker that went
+  quiet, the relay reads the list of all processes through PowerShell. It
+  did so synchronously: half a second to a second and a half on an idle
+  machine, several seconds under load, during which the relay answered
+  nothing — under CI load that was enough for the tunnel to report 502 for
+  the whole relay. The list is now read off the relay's thread; callers that
+  ask at the same time share one read, and a read is reused for 1.5 s. A
+  worker that went quiet is checked by its pid first and by the list last.
+  `GET /api/status` → `sessionWorker.processList` shows when the list was
+  last read, how long it took and whether it failed; a read slower than two
+  seconds is logged. A kill or a workspace relaunch that cannot read the
+  list answers 409 with the reason instead of failing with 500 or stopping
+  blind.
+
 ## [0.9.6] — 2026-09-29
 
 Highlights: a Claude turn pauses at the usage limit and carries on after the

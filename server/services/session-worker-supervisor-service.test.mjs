@@ -480,3 +480,114 @@ test('default kill block clears in seconds, not half a minute', async () => {
   nowMs += 2_500;
   assert.equal(supervisor.isKillBlocked('killed-session'), false);
 });
+
+test('an exhausted session is launched once more after the retry-after window', async () => {
+  // What failed the launches can be gone (an unreadable process list was,
+  // 2026-10-01); the pending work must not wait for a relay restart.
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 100_000;
+  let launchesFail = true;
+  let spawns = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    maxRestartRetries: 1,
+    restartBackoffBaseMs: 1_000,
+    restartExhaustedRetryAfterMs: 60_000,
+    spawnWorker: async () => {
+      spawns += 1;
+      if (launchesFail) throw new Error('windows-process-snapshot-unreadable: Bad control character in string literal');
+      return { workerId: 'worker-exhausted-1', pid: 777 };
+    },
+  });
+
+  const first = await supervisor.ensureWorker('exhausted-1');
+  assert.equal(first.error, 'spawn-failed');
+  nowMs += 1_000;
+  const second = await supervisor.ensureWorker('exhausted-1');
+  assert.equal(second.error, 'restart-exhausted');
+  assert.equal(spawns, 2);
+
+  nowMs += 59_000;
+  const tooEarly = await supervisor.ensureWorker('exhausted-1');
+  assert.equal(tooEarly.error, 'restart-exhausted');
+  assert.equal(spawns, 2, 'no launch inside the window');
+
+  nowMs += 1_000;
+  const dueAgain = await supervisor.ensureWorker('exhausted-1');
+  assert.equal(spawns, 3, 'one launch once the window has passed');
+  assert.equal(dueAgain.error, 'restart-exhausted', 'a failure exhausts the session again at once');
+
+  launchesFail = false;
+  nowMs += 60_000;
+  const healed = await supervisor.ensureWorker('exhausted-1');
+  assert.equal(healed.ok, true);
+  assert.equal(spawns, 4);
+  assert.equal(supervisor.getLifecycleState('exhausted-1')?.restartExhausted, false);
+  assert.equal(supervisor.getLifecycleState('exhausted-1')?.degradedReason, null);
+});
+
+test('after the retry window the relay stops trying, and reports the episode as it goes', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 100_000;
+  let spawns = 0;
+  let launchesFail = true;
+  const events = [];
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    maxRestartRetries: 0,
+    restartExhaustedRetryAfterMs: 60_000,
+    restartExhaustedRetryWindowMs: 150_000,
+    onLaunchState: (event) => events.push([event.type, event.lifecycle.retriesStopped, event.lifecycle.retryAgainAt]),
+    spawnWorker: async () => {
+      spawns += 1;
+      if (launchesFail) throw new Error('spawn failed');
+      return { workerId: 'worker-window-1', pid: 4242 };
+    },
+  });
+
+  await supervisor.ensureWorker('window-1');
+  for (let step = 0; step < 3; step += 1) {
+    nowMs += 60_000;
+    await supervisor.ensureWorker('window-1');
+  }
+  assert.equal(spawns, 4);
+  assert.deepEqual(events.map((event) => event[0]), ['exhausted', 'retry-failed', 'retry-failed', 'stopped']);
+  assert.deepEqual(events[0].slice(1), [false, new Date(160_000).toISOString()], 'the next try is announced');
+  assert.deepEqual(events[3].slice(1), [true, null], 'stopped: no next try');
+  assert.equal(supervisor.getLifecycleState('window-1')?.exhaustedSince, new Date(100_000).toISOString());
+
+  nowMs += 60 * 60_000;
+  assert.equal((await supervisor.ensureWorker('window-1')).error, 'restart-exhausted');
+  assert.equal(spawns, 4, 'stopped means stopped');
+
+  // Retry (the launch route): the episode is cleared and the launch reported.
+  supervisor.clearRestartSchedule('window-1', { resetKilledMarker: true });
+  launchesFail = false;
+  const launched = await supervisor.ensureWorker('window-1');
+  assert.equal(launched.ok, true);
+  assert.equal(events.at(-1)[0], 'launched');
+  assert.equal(supervisor.getLifecycleState('window-1')?.retriesStopped, false);
+});
+
+test('restartExhaustedRetryAfterMs 0 keeps an exhausted session exhausted', async () => {
+  const registry = createSessionWorkerRegistry();
+  let nowMs = 100_000;
+  let spawns = 0;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    now: () => nowMs,
+    maxRestartRetries: 0,
+    restartExhaustedRetryAfterMs: 0,
+    spawnWorker: async () => {
+      spawns += 1;
+      throw new Error('spawn failed');
+    },
+  });
+
+  assert.equal((await supervisor.ensureWorker('exhausted-2')).error, 'restart-exhausted');
+  nowMs += 24 * 60 * 60 * 1000;
+  assert.equal((await supervisor.ensureWorker('exhausted-2')).error, 'restart-exhausted');
+  assert.equal(spawns, 1);
+});

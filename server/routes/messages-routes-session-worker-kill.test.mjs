@@ -103,10 +103,10 @@ function makeDeps({
     },
     // No live processes: keeps the handler off every platform-specific kill path.
     sessionWorkerProcessInspector: processInspector || {
-      findWindowsProcessTreeForSession: () => [],
-      findWindowsProcessesForSession: () => [],
-      findProcessesForSession: () => [],
-      stopWindowsPids: () => [],
+      findWindowsProcessTreeForSessionAsync: () => [],
+      findWindowsProcessesForSessionAsync: () => [],
+      findProcessesForSessionAsync: () => [],
+      stopWindowsPidsAsync: () => [],
     },
     // Seams for stopSessionWorkerProcesses so the test never signals real
     // processes and behaves identically on Windows and POSIX.
@@ -182,10 +182,10 @@ test('a kill during a spawn waits for the cancellation to settle before enumerat
       return { cancelled: true, hadPending: true, waited: true };
     },
     processInspector: {
-      findWindowsProcessTreeForSession: () => [],
-      findWindowsProcessesForSession: () => [],
-      findProcessesForSession: () => { calls.push('enumerate'); return []; },
-      stopWindowsPids: () => [],
+      findWindowsProcessTreeForSessionAsync: () => [],
+      findWindowsProcessesForSessionAsync: () => [],
+      findProcessesForSessionAsync: () => { calls.push('enumerate'); return []; },
+      stopWindowsPidsAsync: () => [],
     },
   }));
 
@@ -216,10 +216,10 @@ test('a surviving process yields a degraded response and keeps queue ownership',
       model: 'gpt-5.4-mini',
     }],
     processInspector: {
-      findWindowsProcessTreeForSession: () => [],
-      findWindowsProcessesForSession: () => [],
-      findProcessesForSession: () => [{ processId: 4242 }],
-      stopWindowsPids: () => [],
+      findWindowsProcessTreeForSessionAsync: () => [],
+      findWindowsProcessesForSessionAsync: () => [],
+      findProcessesForSessionAsync: () => [{ processId: 4242 }],
+      stopWindowsPidsAsync: () => [],
     },
     stopOverrides: {
       platform: 'linux',
@@ -247,4 +247,21 @@ test('a surviving process yields a degraded response and keeps queue ownership',
   assert.deepEqual(spies.droppedContinuations, []);
   assert.equal(emitted.some((entry) => entry.event === 'session_worker_killed'), false);
   assert.equal(emitted.some((entry) => entry.event === 'message_status'), false);
+});
+
+test('a kill with an unreadable process list answers 409 with the reason and kills nothing', async () => {
+  const stopCalls = [];
+  const deps = makeDeps({
+    processingRows: [],
+    processInspector: {
+      findWindowsProcessTreeForSessionAsync: async () => { throw new Error('windows-process-snapshot-unreadable: Bad control character in string literal in JSON at position 144233'); },
+      findProcessesForSessionAsync: async () => { throw new Error('windows-process-snapshot-unreadable: Bad control character in string literal in JSON at position 144233'); },
+      stopWindowsPidsAsync: async (pids) => stopCalls.push([...pids]),
+    },
+  });
+  const handler = killHandler(deps);
+  const result = await invokeKill(handler);
+  assert.equal(result.status, 409);
+  assert.match(String(result.body?.error || ''), /process-list-unreadable: windows-process-snapshot-unreadable/);
+  assert.deepEqual(stopCalls, []);
 });

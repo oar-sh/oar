@@ -67,6 +67,7 @@ import {
   applyConversationTurnStatus,
   renderMessages,
   appendMessage,
+  replaceRenderedMessage,
   applyIncomingConversationDraftUpdate,
   getRenderedConversationMessageFingerprints,
   clearBubbleCancelState,
@@ -504,6 +505,15 @@ export async function connectSocket(overrideDeps) {
   // re-reads it so its row and effect text match.
   socket.on('workspace_root_attribution_updated', () => {
     if (summaryModalState.kind === 'context') refreshSummaryModal().catch(() => {});
+  });
+  // A message the relay rewrote in place (the note while a session's worker
+  // cannot be started): same id, new text or kind. Not on the page yet (the
+  // conversation was opened after it was written): appended like any other.
+  socket.on('message_updated', ({ conversationId, messageId, message }) => {
+    if (!messageId || conversationId !== currentConvId || !message) return;
+    if (!replaceRenderedMessage(message, messageId)) {
+      appendMessage(message, isMessagesAtBottom(), messageId, false);
+    }
   });
   socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
   socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));

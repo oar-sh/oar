@@ -63,6 +63,14 @@ function isRelaySessionWorker(proc) {
 }
 
 // Every process with its parent and the time it was created.
+//
+// The JSON is written to stdout as UTF-8 bytes, not through PowerShell's
+// console encoding. Under the OEM code page the relay's console has (437 or
+// 850), .NET's best-fit encoder turns characters such as → • ↑ ▲ § into the
+// control bytes whose glyphs they are in that code page (0x1A, 0x07, 0x18,
+// 0x1E, 0x15), and an agent's command line that carries one of them — a
+// `bash -c "echo → next"` — breaks the JSON of the whole list: no worker
+// could start on a relay for an hour (2026-10-01).
 const WINDOWS_PROCESS_SNAPSHOT_SCRIPT = [
   '$list = Get-CimInstance Win32_Process | ForEach-Object {',
   '  [pscustomobject]@{',
@@ -73,16 +81,176 @@ const WINDOWS_PROCESS_SNAPSHOT_SCRIPT = [
   '    createdAt = $(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalMilliseconds) } else { [int64]0 });',
   '  }',
   '};',
-  '$list | ConvertTo-Json -Depth 3 -Compress',
+  '$json = [string]($list | ConvertTo-Json -Depth 3 -Compress);',
+  '$bytes = [System.Text.Encoding]::UTF8.GetBytes($json);',
+  '$stdout = [Console]::OpenStandardOutput();',
+  '$stdout.Write($bytes, 0, $bytes.Length);',
+  '$stdout.Flush()',
 ].join(' ');
 
 /** How long the process list may take when a worker waits for it. */
 const WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS = 10_000;
 
-function parseWindowsProcessSnapshot(output) {
+// The list of every process with its full command line; 150 KB on a busy
+// desktop. Node's default of 1 MiB would end the read with ENOBUFS.
+const WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER = 64 * 1024 * 1024;
+
+export const WINDOWS_PROCESS_SNAPSHOT_UNREADABLE = 'windows-process-snapshot-unreadable';
+
+// Callers that arrive within this window after a read share its result; the
+// launch pid poll asks for a fresh one (it waits for a process that did not
+// exist a moment ago). Reading the list costs a PowerShell start (0.5-1.5 s
+// idle, seconds under load); a burst of launches or kills must not pay it
+// once per caller.
+const SNAPSHOT_CACHE_MS = 1_500;
+// A read slower than this is logged: the box is loaded, and every launch and
+// kill waits for it.
+const SLOW_READ_MS = 2_000;
+// Stop-Process over a whole tree; generous, so a loaded box is not told
+// "not stopped" while PowerShell still works.
+const WINDOWS_STOP_TIMEOUT_MS = 30_000;
+
+function parsePosixProcessSnapshot(output) {
   const text = String(output || '').trim();
   if (!text) return [];
-  const parsed = JSON.parse(text);
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      const match = String(line || '').match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+      if (!match) return null;
+      return {
+        processId: Number.parseInt(match[1], 10),
+        parentProcessId: Number.parseInt(match[2], 10),
+        name: String(match[3] || ''),
+        commandLine: String(match[4] || ''),
+      };
+    })
+    .filter(Boolean);
+}
+
+function sortWindowsCandidates(list) {
+  return list.sort((left, right) => {
+    const scoreDelta = scoreWindowsWorkerCandidate(right) - scoreWindowsWorkerCandidate(left);
+    if (scoreDelta !== 0) return scoreDelta;
+    return Number(right.processId || 0) - Number(left.processId || 0);
+  });
+}
+
+function isWindowsSessionMatch(proc, target, targetPattern) {
+  if (!proc?.processId) return false;
+  if (!looksLikeCopilotWorkerProcess(proc)) return false;
+  const parsedSessionId = parseSessionIdFromCommandLine(proc.commandLine);
+  if (parsedSessionId) return parsedSessionId === target;
+  return Boolean(targetPattern?.test(proc.commandLine));
+}
+
+// ─── Matchers over a snapshot that is already read ───────────────────────────
+// Shared by the synchronous finders (the legacy extension launcher) and the
+// asynchronous ones (everything else), so both see the same processes.
+
+/** The session's worker candidates on win32, best first (wrappers last). */
+export function selectWindowsProcessesForSession(snapshot, targetSessionId) {
+  const target = normalizeSessionId(targetSessionId);
+  if (!target) return [];
+  const targetPattern = buildSessionArgPattern(target, { includeResume: false });
+  return sortWindowsCandidates(
+    (Array.isArray(snapshot) ? snapshot : [])
+      .map(normalizeWindowsProcess)
+      .filter((proc) => proc.processId)
+      .filter((proc) => isWindowsSessionMatch(proc, target, targetPattern)),
+  );
+}
+
+/** The session's processes on win32 with their descendants and wrapper ancestors: what a kill must stop. */
+export function selectWindowsProcessTreeForSession(snapshot, targetSessionId) {
+  const target = normalizeSessionId(targetSessionId);
+  if (!target) return [];
+  const targetPattern = buildSessionArgPattern(target, { includeResume: false });
+  const processes = (Array.isArray(snapshot) ? snapshot : [])
+    .map(normalizeWindowsProcess)
+    .filter((proc) => proc.processId);
+  const byPid = new Map(processes.map((proc) => [proc.processId, proc]));
+
+  const related = new Map();
+  const addProcess = (proc) => {
+    if (proc?.processId) related.set(proc.processId, proc);
+  };
+  const addDescendants = (proc) => {
+    const found = collectProcessDescendants(processes, proc, {
+      accept: (child) => {
+        if (related.has(child.processId)) return false;
+        // The worker of another session is never part of this one's tree.
+        return !(isRelaySessionWorker(child) && !isWindowsSessionMatch(child, target, targetPattern));
+      },
+    });
+    for (const child of found) addProcess(child);
+  };
+  const addWrapperAncestors = (proc) => {
+    let current = proc;
+    const seen = new Set();
+    while (current?.parentProcessId && !seen.has(current.parentProcessId)) {
+      seen.add(current.parentProcessId);
+      const parent = byPid.get(current.parentProcessId);
+      if (!parent || !isWindowsWrapperProcess(parent)) return;
+      // Windows hands a pid out again: see `isChildProcessOf`.
+      if (!isChildProcessOf(current, parent)) return;
+      addProcess(parent);
+      current = parent;
+    }
+  };
+
+  for (const proc of processes.filter((candidate) => isWindowsSessionMatch(candidate, target, targetPattern))) {
+    addProcess(proc);
+    addDescendants(proc);
+    addWrapperAncestors(proc);
+  }
+
+  return sortWindowsCandidates(Array.from(related.values()));
+}
+
+/** The session's processes on POSIX (the tmux pane's children carry the id too). */
+export function selectPosixProcessesForSession(snapshot, targetSessionId) {
+  const target = normalizeSessionId(targetSessionId);
+  if (!target) return [];
+  const targetPattern = buildSessionArgPattern(target, { includeResume: true });
+  return (Array.isArray(snapshot) ? snapshot : [])
+    .map((proc) => ({
+      processId: Number.isInteger(Number(proc?.processId)) ? Number(proc.processId) : null,
+      parentProcessId: Number.isInteger(Number(proc?.parentProcessId)) ? Number(proc.parentProcessId) : null,
+      name: String(proc?.name || ''),
+      commandLine: String(proc?.commandLine || ''),
+    }))
+    .filter((proc) => proc.processId)
+    .filter((proc) => looksLikeCopilotWorkerProcess(proc))
+    .filter((proc) => {
+      const parsedSessionId = parseSessionIdFromCommandLine(proc.commandLine);
+      if (parsedSessionId) return parsedSessionId === target;
+      return targetPattern?.test(proc.commandLine);
+    });
+}
+
+function firstNonWrapper(candidates) {
+  return candidates.find((proc) => !isWindowsWrapperProcess(proc)) || null;
+}
+
+
+export function parseWindowsProcessSnapshot(output) {
+  const text = String(output || '').trim();
+  if (!text) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    // A raw control character inside a string (an encoding that is not the
+    // UTF-8 the script writes, or a PowerShell that is not 5.1) is blanked
+    // and the list read once more: a command line matters here only for the
+    // session id and the worker markers it carries.
+    try {
+      parsed = JSON.parse(text.replace(/[\x00-\x1f]/g, ' '));
+    } catch {
+      throw new SyntaxError(`${WINDOWS_PROCESS_SNAPSHOT_UNREADABLE}: ${String(error?.message || error)}`);
+    }
+  }
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
@@ -127,41 +295,80 @@ export function createSessionWorkerProcessInspector({
   platform = process.platform,
   execFileSyncImpl = execFileSync,
   execFileImpl = execFile,
+  now = () => Date.now(),
+  snapshotCacheMs = SNAPSHOT_CACHE_MS,
+  slowReadMs = SLOW_READ_MS,
+  logger = null,
 } = {}) {
+  const cacheMs = Math.max(0, Number(snapshotCacheMs) || 0);
+  const slowMs = Math.max(0, Number(slowReadMs) || 0);
+
+  // ─── Synchronous readers ──────────────────────────────────────────────────
+  // They hold the relay's thread for the whole PowerShell run (0.5-1.5 s idle,
+  // seconds under load) and stay only for the legacy extension launcher
+  // (relay-cli-launcher-service.mjs), which goes with the extension. Every
+  // other caller uses the asynchronous finders below.
+
   function getPosixProcessSnapshot() {
     if (platform === 'win32') return [];
     const output = execFileSyncImpl('ps', ['-eo', 'pid=,ppid=,comm=,args=', '-ww'], {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const text = String(output || '').trim();
-    if (!text) return [];
-    return text
-      .split(/\r?\n/)
-      .map((line) => {
-        const match = String(line || '').match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
-        if (!match) return null;
-        return {
-          processId: Number.parseInt(match[1], 10),
-          parentProcessId: Number.parseInt(match[2], 10),
-          name: String(match[3] || ''),
-          commandLine: String(match[4] || ''),
-        };
-      })
-      .filter(Boolean);
+    return parsePosixProcessSnapshot(output);
   }
 
   function getWindowsProcessSnapshot() {
     if (platform !== 'win32') return [];
     const output = execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT], {
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER,
     });
     return parseWindowsProcessSnapshot(output);
   }
 
+  function findWindowsProcessesForSession(targetSessionId) {
+    if (platform !== 'win32' || !normalizeSessionId(targetSessionId)) return [];
+    return selectWindowsProcessesForSession(getWindowsProcessSnapshot(), targetSessionId);
+  }
+
+  function findWindowsProcessForSession(targetSessionId) {
+    return firstNonWrapper(findWindowsProcessesForSession(targetSessionId));
+  }
+
+  function findWindowsProcessTreeForSession(targetSessionId) {
+    if (platform !== 'win32' || !normalizeSessionId(targetSessionId)) return [];
+    return selectWindowsProcessTreeForSession(getWindowsProcessSnapshot(), targetSessionId);
+  }
+
+  function findPosixProcessesForSession(targetSessionId) {
+    if (platform === 'win32' || !normalizeSessionId(targetSessionId)) return [];
+    return selectPosixProcessesForSession(getPosixProcessSnapshot(), targetSessionId);
+  }
+
+  function findPosixProcessForSession(targetSessionId) {
+    return findPosixProcessesForSession(targetSessionId)[0] || null;
+  }
+
+  function findProcessesForSession(targetSessionId) {
+    return platform === 'win32'
+      ? findWindowsProcessesForSession(targetSessionId)
+      : findPosixProcessesForSession(targetSessionId);
+  }
+
+  function findProcessForSession(targetSessionId) {
+    return platform === 'win32'
+      ? findWindowsProcessForSession(targetSessionId)
+      : findPosixProcessForSession(targetSessionId);
+  }
+
+  // ─── Asynchronous readers ─────────────────────────────────────────────────
+
   /**
-   * The same list without holding the caller's thread for it: a session
+   * The win32 list without holding the caller's thread for it: a session
    * worker reads it while it serves a conversation, and PowerShell takes about
-   * a second to start. Rejects when the list could not be read.
+   * a second to start. Rejects when the list could not be read. Raw: no
+   * dedupe, no cache (see readProcessSnapshot for those).
    */
   function readWindowsProcessSnapshot() {
     if (platform !== 'win32') return Promise.resolve([]);
@@ -169,7 +376,7 @@ export function createSessionWorkerProcessInspector({
       execFileImpl(
         'powershell.exe',
         ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT],
-        { windowsHide: true, timeout: WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 },
+        { windowsHide: true, timeout: WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS, maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER },
         (error, stdout) => {
           if (error) {
             reject(error);
@@ -185,106 +392,97 @@ export function createSessionWorkerProcessInspector({
     });
   }
 
-  function isWindowsSessionMatch(proc, target, targetPattern) {
-    if (!proc?.processId) return false;
-    if (!looksLikeCopilotWorkerProcess(proc)) return false;
-    const parsedSessionId = parseSessionIdFromCommandLine(proc.commandLine);
-    if (parsedSessionId) return parsedSessionId === target;
-    return Boolean(targetPattern?.test(proc.commandLine));
-  }
-
-  function findWindowsProcessesForSession(targetSessionId) {
-    const target = normalizeSessionId(targetSessionId);
-    if (platform !== 'win32' || !target) return [];
-    const targetPattern = buildSessionArgPattern(target, { includeResume: false });
-    return getWindowsProcessSnapshot()
-      .map(normalizeWindowsProcess)
-      .filter((proc) => proc.processId)
-      .filter((proc) => isWindowsSessionMatch(proc, target, targetPattern))
-      .sort((left, right) => {
-        const scoreDelta = scoreWindowsWorkerCandidate(right) - scoreWindowsWorkerCandidate(left);
-        if (scoreDelta !== 0) return scoreDelta;
-        return Number(right.processId || 0) - Number(left.processId || 0);
-      });
-  }
-
-  function findWindowsProcessForSession(targetSessionId) {
-    const candidates = findWindowsProcessesForSession(targetSessionId);
-    return candidates.find((proc) => !isWindowsWrapperProcess(proc)) || null;
-  }
-
-  function findWindowsProcessTreeForSession(targetSessionId) {
-    const target = normalizeSessionId(targetSessionId);
-    if (platform !== 'win32' || !target) return [];
-    const targetPattern = buildSessionArgPattern(target, { includeResume: false });
-    const snapshot = getWindowsProcessSnapshot()
-      .map(normalizeWindowsProcess)
-      .filter((proc) => proc.processId);
-    const byPid = new Map(snapshot.map((proc) => [proc.processId, proc]));
-
-    const related = new Map();
-    const addProcess = (proc) => {
-      if (proc?.processId) related.set(proc.processId, proc);
-    };
-    const addDescendants = (proc) => {
-      const found = collectProcessDescendants(snapshot, proc, {
-        accept: (child) => {
-          if (related.has(child.processId)) return false;
-          // The worker of another session is never part of this one's tree.
-          return !(isRelaySessionWorker(child) && !isWindowsSessionMatch(child, target, targetPattern));
+  function readPosixProcessSnapshot() {
+    if (platform === 'win32') return Promise.resolve([]);
+    return new Promise((resolve, reject) => {
+      execFileImpl(
+        'ps',
+        ['-eo', 'pid=,ppid=,comm=,args=', '-ww'],
+        { maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER },
+        (error, stdout) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          try {
+            resolve(parsePosixProcessSnapshot(stdout));
+          } catch (parseError) {
+            reject(parseError);
+          }
         },
-      });
-      for (const child of found) addProcess(child);
-    };
-    const addWrapperAncestors = (proc) => {
-      let current = proc;
-      const seen = new Set();
-      while (current?.parentProcessId && !seen.has(current.parentProcessId)) {
-        seen.add(current.parentProcessId);
-        const parent = byPid.get(current.parentProcessId);
-        if (!parent || !isWindowsWrapperProcess(parent)) return;
-        // Windows hands a pid out again: see `isChildProcessOf`.
-        if (!isChildProcessOf(current, parent)) return;
-        addProcess(parent);
-        current = parent;
-      }
-    };
-
-    for (const proc of snapshot.filter((candidate) => isWindowsSessionMatch(candidate, target, targetPattern))) {
-      addProcess(proc);
-      addDescendants(proc);
-      addWrapperAncestors(proc);
-    }
-
-    return Array.from(related.values()).sort((left, right) => {
-      const scoreDelta = scoreWindowsWorkerCandidate(right) - scoreWindowsWorkerCandidate(left);
-      if (scoreDelta !== 0) return scoreDelta;
-      return Number(right.processId || 0) - Number(left.processId || 0);
+      );
     });
   }
 
-  function findPosixProcessesForSession(targetSessionId) {
-    const target = normalizeSessionId(targetSessionId);
-    if (platform === 'win32' || !target) return [];
-    const targetPattern = buildSessionArgPattern(target, { includeResume: true });
-    return getPosixProcessSnapshot()
-      .map((proc) => ({
-        processId: Number.isInteger(Number(proc?.processId)) ? Number(proc.processId) : null,
-        parentProcessId: Number.isInteger(Number(proc?.parentProcessId)) ? Number(proc.parentProcessId) : null,
-        name: String(proc?.name || ''),
-        commandLine: String(proc?.commandLine || ''),
-      }))
-      .filter((proc) => proc.processId)
-      .filter((proc) => looksLikeCopilotWorkerProcess(proc))
-      .filter((proc) => {
-        const parsedSessionId = parseSessionIdFromCommandLine(proc.commandLine);
-        if (parsedSessionId) return parsedSessionId === target;
-        return targetPattern?.test(proc.commandLine);
-      });
+  // One read at a time; callers that arrive while it runs share it, and
+  // callers within the cache window after it share its result. What the
+  // last read did is kept for /api/status and the log.
+  let inFlightRead = null;
+  let cachedSnapshot = null;
+  let lastRead = { at: null, durationMs: null, processes: null, error: null };
+
+  function recordRead({ startedAtMs, processes = null, error = null }) {
+    const durationMs = Math.max(0, now() - startedAtMs);
+    lastRead = {
+      at: new Date(now()).toISOString(),
+      durationMs,
+      processes: Array.isArray(processes) ? processes.length : null,
+      error: error ? String(error?.message || error) : null,
+    };
+    if (slowMs > 0 && durationMs >= slowMs) {
+      try { logger?.warn?.(`process list: the read took ${durationMs} ms${Array.isArray(processes) ? ` for ${processes.length} processes` : ''}${error ? ` and failed: ${lastRead.error}` : ''}`); } catch {}
+    }
   }
 
-  function findPosixProcessForSession(targetSessionId) {
-    return findPosixProcessesForSession(targetSessionId)[0] || null;
+  /**
+   * The process list, read off the thread. `fresh: true` skips the cache (not
+   * a read that is already running: joining it is still a read that started
+   * after the caller's spawn only if the caller waited — the launch poll
+   * retries, so joining is fine). Rejects when the list could not be read.
+   */
+  function readProcessSnapshot({ fresh = false } = {}) {
+    if (!fresh && cachedSnapshot && cacheMs > 0 && now() - cachedSnapshot.atMs <= cacheMs) {
+      return Promise.resolve(cachedSnapshot.processes);
+    }
+    if (inFlightRead) return inFlightRead;
+    const startedAtMs = now();
+    const read = platform === 'win32' ? readWindowsProcessSnapshot() : readPosixProcessSnapshot();
+    inFlightRead = read.then(
+      (processes) => {
+        cachedSnapshot = { atMs: now(), processes };
+        recordRead({ startedAtMs, processes });
+        return processes;
+      },
+      (error) => {
+        recordRead({ startedAtMs, error });
+        throw error;
+      },
+    ).finally(() => {
+      inFlightRead = null;
+    });
+    return inFlightRead;
+  }
+
+  function getLastRead() {
+    return { ...lastRead };
+  }
+
+  async function findProcessesForSessionAsync(targetSessionId, options = {}) {
+    if (!normalizeSessionId(targetSessionId)) return [];
+    const snapshot = await readProcessSnapshot(options);
+    return platform === 'win32'
+      ? selectWindowsProcessesForSession(snapshot, targetSessionId)
+      : selectPosixProcessesForSession(snapshot, targetSessionId);
+  }
+
+  async function findProcessForSessionAsync(targetSessionId, options = {}) {
+    const candidates = await findProcessesForSessionAsync(targetSessionId, options);
+    return platform === 'win32' ? firstNonWrapper(candidates) : (candidates[0] || null);
+  }
+
+  async function findWindowsProcessTreeForSessionAsync(targetSessionId, options = {}) {
+    if (platform !== 'win32' || !normalizeSessionId(targetSessionId)) return [];
+    return selectWindowsProcessTreeForSession(await readProcessSnapshot(options), targetSessionId);
   }
 
   function parsePositiveInt(value) {
@@ -292,14 +490,8 @@ export function createSessionWorkerProcessInspector({
     return Number.isInteger(num) && num > 0 ? num : null;
   }
 
-  function stopWindowsPids(pids) {
-    const ids = Array.from(new Set(
-      (Array.isArray(pids) ? pids : [pids])
-        .map((value) => parsePositiveInt(value))
-        .filter(Boolean),
-    ));
-    if (!ids.length) return [];
-    const script = [
+  function buildStopWindowsPidsScript(ids) {
+    return [
       '$ErrorActionPreference = "Continue"',
       '$ids = @(' + ids.join(',') + ')',
       'try {',
@@ -336,22 +528,43 @@ export function createSessionWorkerProcessInspector({
       '}',
       'exit 0',
     ].join('; ');
-    execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', script], {
+  }
+
+  function uniquePids(pids) {
+    return Array.from(new Set(
+      (Array.isArray(pids) ? pids : [pids])
+        .map((value) => parsePositiveInt(value))
+        .filter(Boolean),
+    ));
+  }
+
+  function stopWindowsPids(pids) {
+    const ids = uniquePids(pids);
+    if (!ids.length) return [];
+    execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', buildStopWindowsPidsScript(ids)], {
       stdio: ['ignore', 'ignore', 'ignore'],
     });
     return ids;
   }
 
-  function findProcessesForSession(targetSessionId) {
-    return platform === 'win32'
-      ? findWindowsProcessesForSession(targetSessionId)
-      : findPosixProcessesForSession(targetSessionId);
-  }
-
-  function findProcessForSession(targetSessionId) {
-    return platform === 'win32'
-      ? findWindowsProcessForSession(targetSessionId)
-      : findPosixProcessForSession(targetSessionId);
+  /** stopWindowsPids off the thread. Resolves to the pids asked for; rejects when PowerShell failed or timed out. */
+  function stopWindowsPidsAsync(pids) {
+    const ids = uniquePids(pids);
+    if (!ids.length) return Promise.resolve([]);
+    return new Promise((resolve, reject) => {
+      execFileImpl(
+        'powershell.exe',
+        ['-NoProfile', '-Command', buildStopWindowsPidsScript(ids)],
+        { windowsHide: true, timeout: WINDOWS_STOP_TIMEOUT_MS, maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER },
+        (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(ids);
+        },
+      );
+    });
   }
 
   return {
@@ -367,6 +580,12 @@ export function createSessionWorkerProcessInspector({
     findWindowsProcessTreeForSession,
     getWindowsProcessSnapshot,
     readWindowsProcessSnapshot,
+    readProcessSnapshot,
+    getLastRead,
+    findProcessForSessionAsync,
+    findProcessesForSessionAsync,
+    findWindowsProcessTreeForSessionAsync,
     stopWindowsPids,
+    stopWindowsPidsAsync,
   };
 }

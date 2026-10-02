@@ -242,7 +242,7 @@ test('launchSessionCli uses tmux on posix and returns discovered worker pid', as
     throw new Error(`unexpected tmux args: ${args.join(' ')}`);
   };
   const processInspector = {
-    findProcessForSession() {
+    findProcessForSessionAsync() {
       finds += 1;
       return finds >= 2 ? { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' } : null;
     },
@@ -339,7 +339,7 @@ test('launchSessionCli falls back to detached spawn when tmux is unavailable', a
       throw new Error(`unexpected command: ${command}`);
     },
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return null;
       },
     },
@@ -385,7 +385,7 @@ test('launchSessionCli uses the configured host CLI executable', async () => {
       throw new Error(`unexpected command: ${command}`);
     },
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return null;
       },
     },
@@ -423,7 +423,7 @@ test('launchSessionCli uses the host CLI on posix when extension bootstrap is co
       throw new Error(`unexpected command: ${command}`);
     },
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return null;
       },
     },
@@ -460,7 +460,7 @@ test('launchSessionCli uses copilot command when bootstrap is set without cli ex
       throw new Error(`unexpected command: ${command}`);
     },
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return null;
       },
     },
@@ -497,7 +497,7 @@ test('launchSessionCli uses the configured host CLI when bootstrap is set withou
       throw new Error(`unexpected command: ${command}`);
     },
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return null;
       },
     },
@@ -533,7 +533,7 @@ test('launchSessionCli opens a visible detached console on windows', async () =>
     platform: 'win32',
     prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return null;
       },
     },
@@ -591,7 +591,7 @@ test('launchSessionCli returns unknown pid when windows console spawn has no pid
     platform: 'win32',
     prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return null;
       },
     },
@@ -622,7 +622,7 @@ test('launchSessionCli captures worker pid from windows process polling', async 
     platform: 'win32',
     prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         inspections += 1;
         if (inspections < 2) return null;
         return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
@@ -649,7 +649,7 @@ test('launchSessionCli reuses a live existing process before launching', async (
     platform: 'linux',
     prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
       },
     },
@@ -678,7 +678,7 @@ test('launchSessionCli bypasses process reuse when disabled', async () => {
     prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     allowProcessReuse: false,
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
       },
     },
@@ -715,7 +715,7 @@ test('launchSessionCli ignores a dead discovered pid and continues to launch', a
     platform: 'linux',
     prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
     processInspector: {
-      findProcessForSession() {
+      findProcessForSessionAsync() {
         return { processId: 99999999, commandLine: 'gh copilot -- --session-id abc-123' };
       },
     },
@@ -919,7 +919,7 @@ test('a launch without a config file starts the CLI without the flag', async () 
       if (command === 'tmux') throw new Error('missing tmux');
       throw new Error(`unexpected command: ${command}`);
     },
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     spawnImpl(command, args, options) {
       spawnCalls.push({ command, args, options });
       return { pid: 4242, unref() {} };
@@ -943,7 +943,7 @@ test('node workers never get the extension-engine MCP config', async () => {
     },
     platform: 'win32',
     prepareOarMcpConfigImpl: mcpConfig,
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     detachedPollAttempts: 1,
     detachedPollDelayMs: 1,
     spawnImpl(command, args, options) {
@@ -969,7 +969,7 @@ function launchOnWindowsConsole({ env = {}, prepareWorkerLogFileImpl } = {}) {
     platform: 'win32',
     prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
     prepareWorkerLogFileImpl,
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     detachedPollAttempts: 1,
     detachedPollDelayMs: 1,
     spawnImpl(command, args, options) {
@@ -1056,11 +1056,87 @@ test('an inherited worker log variable never reaches a redirected posix worker',
       if (command === 'tmux') throw new Error('missing tmux');
       throw new Error(`unexpected command: ${command}`);
     },
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     spawnImpl(command, args, options) {
       spawnCalls.push({ command, args, options });
       return { pid: 4242, unref() {} };
     },
   });
   assert.equal('COPILOT_WEB_RELAY_WORKER_LOG_FILE' in spawnCalls[0].options.env, false);
+});
+
+test('an unreadable process list does not stop a windows launch', async () => {
+  // 2026-10-01: a control byte in another process's command line made the
+  // list unreadable for an hour, and no worker could start on the relay.
+  const spawnCalls = [];
+  const reported = [];
+  let reads = 0;
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: 'C:\\relay',
+    workspaceRoot: 'C:\\repo',
+    env: {
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
+      COPILOT_WEB_RELAY_ROOT: 'C:\\srv\\oar',
+    },
+    platform: 'win32',
+    prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
+    prepareWorkerLogFileImpl: () => null,
+    processInspector: {
+      findProcessForSessionAsync() {
+        reads += 1;
+        throw new Error('windows-process-snapshot-unreadable: Bad control character in string literal in JSON at position 144233');
+      },
+    },
+    onProcessListError: (error) => reported.push(error.message),
+    detachedPollAttempts: 2,
+    detachedPollDelayMs: 1,
+    spawnImpl(command, args, options) {
+      spawnCalls.push({ command, args, options });
+      return { pid: 4242, unref() {} };
+    },
+  });
+
+  assert.equal(spawnCalls.length, 1, 'the worker is launched');
+  assert.equal(launched.reused, false);
+  assert.equal(launched.launchMode, 'console');
+  assert.equal(launched.pid, null, 'the pid is unknown until the worker heartbeats');
+  // The reuse check and both polls read the list; each failure is reported.
+  assert.equal(reads, 3);
+  assert.equal(reported.length, 3);
+  assert.match(reported[0], /^windows-process-snapshot-unreadable: /);
+});
+
+test('the launcher prefers the asynchronous finder and asks the pid poll for a fresh list', async () => {
+  const lookups = [];
+  let polls = 0;
+  const launched = await launchSessionCli({
+    targetSessionId: 'abc-123',
+    processCwd: 'C:\\relay',
+    workspaceRoot: 'C:\\repo',
+    env: {
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
+      COPILOT_WEB_RELAY_ROOT: 'C:\\srv\\oar',
+    },
+    platform: 'win32',
+    prepareOarMcpConfigImpl: fakeMcpConfig(WIN32_MCP_CONFIG),
+    prepareWorkerLogFileImpl: () => null,
+    processInspector: {
+      async findProcessForSessionAsync(target, options) {
+        lookups.push({ target, options });
+        if (!options?.fresh) return null;
+        polls += 1;
+        return polls >= 2 ? { processId: process.pid, commandLine: 'node claude-session-worker.mjs --session-id abc-123' } : null;
+      },
+    },
+    detachedPollAttempts: 3,
+    detachedPollDelayMs: 1,
+    spawnImpl() { return { pid: null, unref() {} }; },
+  });
+  assert.equal(launched.pid, process.pid);
+  assert.equal(launched.launchMode, 'console');
+  assert.deepEqual(lookups.map((entry) => entry.options), [{ fresh: false }, { fresh: true }, { fresh: true }]);
+  assert.ok(lookups.every((entry) => entry.target === 'abc-123'));
 });

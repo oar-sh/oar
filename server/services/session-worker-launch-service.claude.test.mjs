@@ -89,7 +89,7 @@ test('launchSessionCli spawns node for claude workers when tmux is unavailable',
       return { pid: 4242, unref: () => {} };
     },
     execFileSyncImpl: () => { throw new Error('tmux missing'); },
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     allowProcessReuse: false,
   });
   assert.equal(launched.pid, 4242);
@@ -114,7 +114,7 @@ test('launchSessionCli still spawns the copilot CLI for non-claude workers witho
       return { pid: 999, unref: () => {} };
     },
     execFileSyncImpl: () => { throw new Error('tmux missing'); },
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     allowProcessReuse: false,
     // The extension engine's OAR MCP config file; faked so nothing is written.
     prepareOarMcpConfigImpl: () => '/workspace/logs/worker-session-4.mcp.json',

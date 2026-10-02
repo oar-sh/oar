@@ -81,7 +81,7 @@ test('launchSessionCli spawns node for grok workers when tmux is unavailable', a
       return { pid: 4242, unref: () => {} };
     },
     execFileSyncImpl: () => { throw new Error('tmux missing'); },
-    processInspector: { findProcessForSession: () => null },
+    processInspector: { findProcessForSessionAsync: () => null },
     allowProcessReuse: false,
   });
   assert.equal(launched.pid, 4242);

@@ -183,10 +183,10 @@ function setup(overrides = {}) {
     },
     sessionWorkerRegistry: { getWorker: () => null, removeWorker: () => calls.push(['removeWorker']) },
     sessionWorkerProcessInspector: {
-      findProcessForSession: () => liveProcess,
-      findProcessesForSession: () => (liveProcess ? [liveProcess] : []),
-      findWindowsProcessTreeForSession: () => (liveProcess ? [liveProcess] : []),
-      stopWindowsPids: stopWindowsPidsImpl || ((pids) => calls.push(['stopWindowsPids', [...pids]])),
+      findProcessForSessionAsync: () => liveProcess,
+      findProcessesForSessionAsync: () => (liveProcess ? [liveProcess] : []),
+      findWindowsProcessTreeForSessionAsync: () => (liveProcess ? [liveProcess] : []),
+      stopWindowsPidsAsync: stopWindowsPidsImpl || ((pids) => calls.push(['stopWindowsPidsAsync', [...pids]])),
     },
     // Never let the stop service touch real processes: the mock PIDs may exist
     // on the host. Every seam records into `calls` instead.
@@ -258,7 +258,7 @@ test('two concurrent identical relaunches run the work once and coalesce', async
   const [a, b] = await Promise.all([first, second]);
 
   assert.equal(ensureCalls, 1, 'the duplicate must not drive a second spawn');
-  assert.equal(calls.filter(([name]) => name === 'stopWindowsPids').length, 1, 'the stop must run once');
+  assert.equal(calls.filter(([name]) => name === 'stopWindowsPidsAsync').length, 1, 'the stop must run once');
   assert.equal(a.statusCode, 200);
   assert.equal(b.statusCode, 200);
   assert.equal(b.body.coalesced, true);
@@ -427,7 +427,7 @@ test('the route disables process reuse and owns the kill-marker reset', async ()
   assert.equal(resets.length, 1, 'the kill block is cleared exactly once');
 
   const resetIndex = calls.findIndex(([name, didReset]) => name === 'clearRestartSchedule' && didReset === true);
-  const stopIndex = calls.findIndex(([name]) => name === 'stopWindowsPids');
+  const stopIndex = calls.findIndex(([name]) => name === 'stopWindowsPidsAsync');
   const ensureIndex = calls.findIndex(([name]) => name === 'ensureWorker');
   assert.ok(stopIndex >= 0 && stopIndex < resetIndex, 'reset happens after the stop verified the process died');
   assert.ok(resetIndex < ensureIndex, 'reset happens before the launch');
@@ -438,7 +438,7 @@ test('on POSIX the stop signals the PIDs and tmux session instead of the Windows
   const res = await relaunch(app, { rootPath: ROOT_A });
 
   assert.equal(res.statusCode, 200);
-  assert.equal(calls.filter(([name]) => name === 'stopWindowsPids').length, 0, 'the Windows path must stay cold');
+  assert.equal(calls.filter(([name]) => name === 'stopWindowsPidsAsync').length, 0, 'the Windows path must stay cold');
   assert.deepEqual(calls.find(([name]) => name === 'killPid'), ['killPid', 4242, 'SIGTERM']);
   assert.deepEqual(calls.find(([name]) => name === 'killTmuxSession'), ['killTmuxSession', SID]);
 
@@ -463,7 +463,7 @@ test('active work blocks a relaunch', async () => {
 test('a live process forces a stop even when the worker status is error', async () => {
   const { app, calls } = setup({ workerStatus: 'error' });
   await relaunch(app, { rootPath: ROOT_A });
-  assert.ok(calls.some(([name]) => name === 'stopWindowsPids'), 'a live process must be stopped first');
+  assert.ok(calls.some(([name]) => name === 'stopWindowsPidsAsync'), 'a live process must be stopped first');
 });
 
 // --- payload aliases ----------------------------------------------------------

@@ -169,7 +169,7 @@ function setup(state = {}) {
       },
     },
     sessionWorkerProcessInspector: {
-      findProcessesForSession: () => (state.processPids || []).map((processId) => ({ processId })),
+      findProcessesForSessionAsync: () => (state.processPids || []).map((processId) => ({ processId })),
     },
     sessionWorkerStopOverrides: {
       platform: 'linux',

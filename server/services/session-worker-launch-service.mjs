@@ -688,9 +688,29 @@ export async function launchSessionCli({
   // Windows console launch: resolves (and rotates) the worker log the worker
   // then writes itself; returns its path or null.
   prepareWorkerLogFileImpl = prepareWorkerLogFile,
+  // Told when the process list could not be read (the error); the launch
+  // goes on without it.
+  onProcessListError = null,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
+
+  // On win32 the process list comes from PowerShell and can be unreadable for
+  // a reason that has nothing to do with this session (2026-10-01: a control
+  // byte in another process's command line, for an hour). A launch is not
+  // stopped by that: an unreadable list counts as "no process found".
+  // The asynchronous finder reads the list off the relay's thread (shared
+  // between concurrent callers, cached for a moment); `fresh` is for the poll
+  // that waits for the process this launch just started.
+  const findLiveProcess = async ({ fresh = false } = {}) => {
+    if (typeof processInspector?.findProcessForSessionAsync !== 'function') return null;
+    try {
+      return (await processInspector.findProcessForSessionAsync(target, { fresh })) || null;
+    } catch (error) {
+      try { onProcessListError?.(error); } catch {}
+      return null;
+    }
+  };
 
   // Kill switch for test/e2e servers: a relay started with this env var must
   // never spawn real session workers (Copilot CLI clients or Claude workers).
@@ -699,9 +719,7 @@ export async function launchSessionCli({
   }
 
   if (allowProcessReuse) {
-    const liveProcess = typeof processInspector?.findProcessForSession === 'function'
-      ? processInspector.findProcessForSession(target)
-      : null;
+    const liveProcess = await findLiveProcess();
     const liveProcessPid = parsePositiveInt(liveProcess?.processId);
     if (liveProcessPid && isPidAlive(liveProcessPid)) {
       return {
@@ -785,9 +803,7 @@ export async function launchSessionCli({
     const attempts = Math.max(1, Number(tmuxPollAttempts) || 1);
     for (let index = 0; index < attempts; index += 1) {
       await sleep(Math.max(50, Number(tmuxPollDelayMs) || 200));
-      const processMatch = typeof processInspector?.findProcessForSession === 'function'
-        ? processInspector.findProcessForSession(target)
-        : null;
+      const processMatch = await findLiveProcess({ fresh: true });
       if (processMatch?.processId) {
         return {
           pid: Number(processMatch.processId),
@@ -886,9 +902,7 @@ export async function launchSessionCli({
     const attempts = Math.max(1, Number(detachedPollAttempts) || 1);
     for (let index = 0; index < attempts; index += 1) {
       await sleep(Math.max(50, Number(detachedPollDelayMs) || 200));
-      const processMatch = typeof processInspector?.findProcessForSession === 'function'
-        ? processInspector.findProcessForSession(target)
-        : null;
+      const processMatch = await findLiveProcess({ fresh: true });
       const processPid = parsePositiveInt(processMatch?.processId);
       if (processPid && isPidAlive(processPid)) {
         return {

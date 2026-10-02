@@ -135,7 +135,11 @@ test('process inspector ignores relay server process on windows path form', () =
         '    createdAt = $(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - [datetime]"1970-01-01").TotalMilliseconds) } else { [int64]0 });',
         '  }',
         '};',
-        '$list | ConvertTo-Json -Depth 3 -Compress',
+        '$json = [string]($list | ConvertTo-Json -Depth 3 -Compress);',
+        '$bytes = [System.Text.Encoding]::UTF8.GetBytes($json);',
+        '$stdout = [Console]::OpenStandardOutput();',
+        '$stdout.Write($bytes, 0, $bytes.Length);',
+        '$stdout.Flush()',
       ].join(' ')]);
       return Buffer.from(JSON.stringify([
         {
@@ -448,4 +452,162 @@ test('process inspector windows stop command expands descendants before stopping
   assert.match(stopScript, /if \(\$proc\.worker\) \{ continue \}/);
   assert.match(stopScript, /Stop-Process -Id \$id -Force/);
   assert.match(stopScript, /exit 0/);
+});
+
+test('a control byte in another command line does not make the windows process list unreadable', () => {
+  // Under an OEM console code page PowerShell writes "→" as 0x1A and "•" as
+  // 0x07 (2026-10-01: one such command line stopped every launch on a relay).
+  const json = JSON.stringify([
+    { processId: 501, parentProcessId: 1, name: 'bash.exe', commandLine: 'bash -c "echo @ next; echo # done"' },
+    { processId: 502, parentProcessId: 1, name: 'node.exe', commandLine: 'node C:\\repo\\server\\claude-worker\\claude-session-worker.mjs --session-id abc-123' },
+  ]).replace('@', '\u001a').replace('#', '\u0007');
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl: () => Buffer.from(json, 'latin1'),
+  });
+
+  assert.equal(inspector.findProcessForSession('abc-123')?.processId, 502);
+  assert.deepEqual(inspector.findWindowsProcessTreeForSession('abc-123').map((proc) => proc.processId), [502]);
+});
+
+test('a windows process list that is not JSON at all says so', () => {
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileSyncImpl: () => Buffer.from('[{"processId": 1, "name": '),
+  });
+
+  assert.throws(
+    () => inspector.findProcessForSession('abc-123'),
+    { message: /^windows-process-snapshot-unreadable: / },
+  );
+});
+
+// ─── the asynchronous readers (relay side) ───────────────────────────────────
+
+function windowsListJson(extra = []) {
+  return Buffer.from(JSON.stringify([
+    { processId: 7001, parentProcessId: 1, name: 'node.exe', commandLine: 'node C:\\repo\\server\\claude-worker\\claude-session-worker.mjs --session-id abc-123' },
+    ...extra,
+  ]));
+}
+
+function asyncWindowsInspector({ delayMs = 5, nowMs = () => Date.now(), output = windowsListJson(), fail = null, ...rest } = {}) {
+  const calls = [];
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    now: nowMs,
+    execFileSyncImpl() { throw new Error('the synchronous reader must not run'); },
+    execFileImpl(command, args, options, callback) {
+      calls.push({ command, args, options });
+      setTimeout(() => (fail ? callback(fail) : callback(null, typeof output === 'function' ? output() : output)), delayMs);
+    },
+    ...rest,
+  });
+  return { inspector, calls };
+}
+
+test('concurrent async readers share one PowerShell run, and the cache serves the next caller', async () => {
+  let clock = 1_000_000;
+  const { inspector, calls } = asyncWindowsInspector({ nowMs: () => clock, snapshotCacheMs: 1_500 });
+  const [a, b, tree] = await Promise.all([
+    inspector.findProcessForSessionAsync('abc-123'),
+    inspector.findProcessesForSessionAsync('abc-123'),
+    inspector.findWindowsProcessTreeForSessionAsync('abc-123'),
+  ]);
+  assert.equal(calls.length, 1, 'one run for three concurrent callers');
+  assert.equal(a?.processId, 7001);
+  assert.deepEqual(b.map((proc) => proc.processId), [7001]);
+  assert.deepEqual(tree.map((proc) => proc.processId), [7001]);
+  assert.equal(calls[0].options.windowsHide, true);
+  assert.ok(calls[0].options.timeout > 0, 'the read has a timeout');
+
+  clock += 1_000;
+  await inspector.findProcessForSessionAsync('abc-123');
+  assert.equal(calls.length, 1, 'inside the cache window the result is reused');
+  await inspector.findProcessForSessionAsync('abc-123', { fresh: true });
+  assert.equal(calls.length, 2, 'fresh: true reads again');
+  clock += 2_000;
+  await inspector.findProcessForSessionAsync('abc-123');
+  assert.equal(calls.length, 3, 'after the window the list is read again');
+});
+
+test('the async read keeps the event loop running and records what it did', async () => {
+  let clock = 5_000;
+  const warnings = [];
+  const { inspector, calls } = asyncWindowsInspector({
+    delayMs: 60,
+    nowMs: () => clock,
+    slowReadMs: 2_000,
+    logger: { warn: (line) => warnings.push(line) },
+  });
+  let ticks = 0;
+  const ticker = setInterval(() => { ticks += 1; }, 5);
+  const pending = inspector.findProcessForSessionAsync('abc-123');
+  clock += 2_500;
+  const found = await pending;
+  clearInterval(ticker);
+  assert.equal(found?.processId, 7001);
+  assert.ok(ticks >= 3, `the event loop ticked while PowerShell ran (${ticks})`);
+  assert.equal(calls.length, 1);
+  const last = inspector.getLastRead();
+  assert.equal(last.processes, 1);
+  assert.equal(last.durationMs, 2_500);
+  assert.equal(last.error, null);
+  assert.equal(warnings.length, 1, 'a slow read is logged once');
+  assert.match(warnings[0], /took 2500 ms for 1 processes/);
+});
+
+test('a timed-out or unreadable async read rejects and is recorded; the next call reads again', async () => {
+  const timeout = Object.assign(new Error('powershell.exe timed out'), { killed: true, code: null });
+  const { inspector, calls } = asyncWindowsInspector({ fail: timeout });
+  await assert.rejects(inspector.findProcessForSessionAsync('abc-123'), /timed out/);
+  assert.match(inspector.getLastRead().error, /timed out/);
+  await assert.rejects(inspector.findWindowsProcessTreeForSessionAsync('abc-123'), /timed out/);
+  assert.equal(calls.length, 2, 'a failure is not cached');
+
+  const garbled = asyncWindowsInspector({ output: Buffer.from('[{"processId": 1, "name": ') });
+  await assert.rejects(garbled.inspector.findProcessesForSessionAsync('abc-123'), { message: /^windows-process-snapshot-unreadable: / });
+});
+
+test('the async readers answer empty for a missing session id and on the other platform without a run', async () => {
+  const { inspector, calls } = asyncWindowsInspector();
+  assert.equal(await inspector.findProcessForSessionAsync(''), null);
+  assert.deepEqual(await inspector.findWindowsProcessTreeForSessionAsync(null), []);
+  assert.equal(calls.length, 0);
+
+  const posixCalls = [];
+  const posix = createSessionWorkerProcessInspector({
+    platform: 'linux',
+    execFileImpl(command, args, options, callback) {
+      posixCalls.push(command);
+      callback(null, Buffer.from('  501     1 node node /srv/oar/server/grok-worker/grok-session-worker.mjs --session-id abc-123\n  502   501 sh sh -c sleep 1\n'));
+    },
+  });
+  const found = await posix.findProcessForSessionAsync('abc-123');
+  assert.equal(found?.processId, 501);
+  assert.deepEqual(posixCalls, ['ps']);
+  assert.deepEqual(await posix.findWindowsProcessTreeForSessionAsync('abc-123'), [], 'no windows tree on posix');
+});
+
+test('stopWindowsPidsAsync runs the same stop script off the thread and reports a failure', async () => {
+  const calls = [];
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileImpl(command, args, options, callback) {
+      calls.push({ command, args, options });
+      callback(null, '');
+    },
+  });
+  assert.deepEqual(await inspector.stopWindowsPidsAsync([1001, '1002', 1001, 'x']), [1001, 1002]);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].args[2], /Stop-Process -Id \$id -Force/);
+  assert.match(calls[0].args[2], /\$ids = @\(1001,1002\)/);
+  assert.ok(calls[0].options.timeout >= 10_000);
+  assert.deepEqual(await inspector.stopWindowsPidsAsync([]), []);
+
+  const failing = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    execFileImpl(_command, _args, _options, callback) { callback(new Error('Access denied')); },
+  });
+  await assert.rejects(failing.stopWindowsPidsAsync([1001]), /Access denied/);
 });

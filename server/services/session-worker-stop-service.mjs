@@ -20,17 +20,21 @@ function toPidList(rows, extraPid) {
     .filter((pid) => Number.isInteger(pid) && pid > 0);
 }
 
-function enumeratePids({ sdkSessionId, worker, processInspector, platform }) {
+// The process list is read off the relay's thread, fresh (a stop must see
+// the children started a moment ago). Throws when the list could not be
+// read: the caller must not pretend it stopped what it could not see.
+async function enumeratePids({ sdkSessionId, worker, processInspector, platform }) {
   const rows = platform === 'win32'
-    ? (
-      processInspector?.findWindowsProcessTreeForSession?.(sdkSessionId)
-      || processInspector?.findWindowsProcessesForSession?.(sdkSessionId)
-      || processInspector?.findProcessesForSession?.(sdkSessionId)
-      || []
-    )
-    : (processInspector?.findProcessesForSession?.(sdkSessionId) || []);
-  return toPidList(rows, worker?.pid);
+    ? await processInspector?.findWindowsProcessTreeForSessionAsync?.(sdkSessionId, { fresh: true })
+    : await processInspector?.findProcessesForSessionAsync?.(sdkSessionId, { fresh: true });
+  return toPidList(rows || [], worker?.pid);
 }
+
+async function stopWindowsPids(processInspector, pids) {
+  await processInspector?.stopWindowsPidsAsync?.(pids);
+}
+
+export const PROCESS_LIST_UNREADABLE = 'process-list-unreadable';
 
 export async function stopSessionWorkerProcesses({
   sdkSessionId,
@@ -61,7 +65,14 @@ export async function stopSessionWorkerProcesses({
 
   if (!sid) return done({ ok: false, error: 'Missing session id' });
 
-  const pids = enumeratePids({ sdkSessionId: sid, worker, processInspector, platform });
+  let pids;
+  try {
+    pids = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform });
+  } catch (error) {
+    // Nothing is stopped blind: the known pid alone would leave the tree
+    // running, and the caller would relaunch next to it.
+    return done({ ok: false, pids: [], remainingPids: [], error: `${PROCESS_LIST_UNREADABLE}: ${error?.message || error}` });
+  }
   if (!pids.length) return done({ pids: [] });
 
   const survivors = (list) => list.filter((pid) => isPidAliveImpl(pid));
@@ -80,7 +91,7 @@ export async function stopSessionWorkerProcesses({
     if (platform === 'win32') {
       // stopWindowsPids already walks the descendant tree leaf-first and uses
       // Stop-Process -Force, so there is no gentler first pass to attempt.
-      processInspector?.stopWindowsPids?.(pids);
+      await stopWindowsPids(processInspector, pids);
     } else {
       for (const pid of pids) {
         try {
@@ -104,9 +115,9 @@ export async function stopSessionWorkerProcesses({
   try {
     if (platform === 'win32') {
       // Re-enumerate: children spawned after the first snapshot are invisible to it.
-      const rediscovered = enumeratePids({ sdkSessionId: sid, worker, processInspector, platform });
+      const rediscovered = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform });
       escalationTargets = [...new Set([...remainingPids, ...rediscovered.filter((pid) => isPidAliveImpl(pid))])];
-      processInspector?.stopWindowsPids?.(escalationTargets);
+      await stopWindowsPids(processInspector, escalationTargets);
     } else {
       for (const pid of escalationTargets) {
         try {
