@@ -280,6 +280,7 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 - A restart of the worker or the relay in the middle of a turn does not send your message twice: the new worker finds the turn in the session's event log and follows it, and a turn that finished in the meantime is answered from the log. A dropped connection to the session is reopened where it broke off
 - The **cloud line** above the composer: the repository, the branch, a link to the session on claude.ai, one **⇡ branch** link per branch the agent pushed (it opens GitHub's comparison with the branch the chat started from) and what the session has cost so far. The `⋯` menu has **☁️ Open on claude.ai**
 - [Commit attribution](#claude-agent-sdk): commits and pull requests the agent makes in the sandbox end with what the Claude tab's setting says (**OAR**, **vanilla** or **off**), from the first message on, and a change reaches the sandbox with the next message. In OAR mode the `Claude-Session` link to claude.ai is left out too. A chat started from a folder follows that folder's override, and its **🧠** modal has the select. The commit's author is still the sandbox's git identity (`Claude`); the setting covers the lines at the end
+- A turn the cloud refuses at the Claude usage limit is paused like a local Claude turn (a note with the reset time, the banner, and the work carries on by itself after the reset); the limit warning before it appears in the tool activity
 - Deleting or archiving the conversation archives the cloud session at Anthropic; nothing is deleted there
 - A **Claude Cloud** card in **Check Usage** with the account's cloud credit and the cost Anthropic reports for this relay's cloud sessions, and the **🧠** button for the session's context use (see [Usage and context](#usage-and-context))
 - A failure the relay can name says what to do: log in again, connect GitHub, give the Claude GitHub app access to the repository, choose an environment
@@ -290,7 +291,7 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 - No mid-turn steering: a message sent during a turn waits for the turn to end
 - Nothing from the relay host reaches the sandbox: attachments other than images are refused, there is no working directory to change and no **Session** folder to browse
 - No relay tools inside the sandbox: no `preview`, no `remote_relay`, no media embedded by host path
-- No background task panel, and no pause at the usage limit: a limit the cloud reports appears as a line in the tool activity
+- No background task panel
 
 **Started by an agent.** An agent in another session can start a cloud chat with the `remote_relay` tool, naming the repository and, if it wants one, the branch (`repo` and `branch`): an agent on a [paired relay](#remote-relays), under the rules for starting any session from there, or an agent on this relay once [agent sessions](#agent-sessions) are switched on. The same checks apply as in **New Chat** (the provider is on, an environment is set, the repository is on GitHub), and a chat without a requested model starts with the tab's default model. It can also read, prompt, wait for and stop a cloud chat you created.
 

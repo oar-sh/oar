@@ -7,6 +7,7 @@ import { DEFAULT_QUESTION_TIMEOUT_MS } from '../../shared/question-timeout.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
 import { resolveDeliveredAttribution, sameClaudeAttribution } from '../../shared/claude-attribution.mjs';
+import { buildUsageLimitFailure, createUsageLimitTracker } from '../../shared/claude-usage-limit.mjs';
 import { buildClaudeAttachmentContent } from '../claude-worker/claude-attachments.mjs';
 import { classifyClaudeResultFailure } from '../claude-worker/claude-turn-failure.mjs';
 import {
@@ -169,6 +170,11 @@ export function createClaudeCloudSessionRunner({
   backgroundQuietMs = 45_000,
 } = {}) {
   const publisher = createClaudeTurnPublisher({ api, dbg });
+  // The account's usage limit as the sandbox's Claude Code reports it: the
+  // same events as a local session's, so the same tracker decides when a
+  // failed turn was refused at the limit (the relay then pauses the
+  // conversation until the reset instead of failing the turn).
+  const usageLimit = createUsageLimitTracker({ now });
   const askUserBridge = createAskUserBridge({
     api,
     getActiveMessage: () => turn?.message || null,
@@ -333,6 +339,8 @@ export function createClaudeCloudSessionRunner({
       // Background work the cloud agent left running (see holdForBackground).
       backgroundTasks: 0,
       interim: null,
+      // The sandbox's line about the usage limit, when a turn is refused at it.
+      usageLimitLine: '',
       holdMs: backgroundHoldMs,
       holdTimer: null,
       quietTimer: null,
@@ -498,6 +506,18 @@ export function createClaudeCloudSessionRunner({
       return;
     }
 
+    if (inTurn(t, sequence) && session.unfinishedTurns === 0) {
+      const report = usageLimit.observe(payload);
+      if (report) publisher.publishUsageLimitReport({ conversationId: t.message.conversationId, sdkSessionId, report });
+      // The sandbox's own line about the limit arrives as an assistant
+      // message (the result carries no text): kept apart, so the relay's
+      // note does not repeat it under what the turn had written.
+      if (type === 'assistant' && String(payload.error || '') === 'rate_limit') {
+        t.usageLimitLine = (Array.isArray(payload.message?.content) ? payload.message.content : [])
+          .filter((block) => block?.type === 'text').map((block) => String(block.text || '')).join('').trim();
+      }
+    }
+
     if (type === 'result') {
       // One `result` per user message, in the order the messages were sent:
       // the first ones belong to turns that ended here without theirs.
@@ -507,6 +527,7 @@ export function createClaudeCloudSessionRunner({
       }
       if (!inTurn(t, sequence)) return;
       const result = readCloudResult(payload);
+      result.usageLimit = usageLimit.classifyResult(payload);
       if (t.backgroundTasks > 0 && !t.interrupted && !result.isError && !result.interrupted) {
         await holdForBackground(t, result);
         return;
@@ -953,6 +974,22 @@ export function createClaudeCloudSessionRunner({
       const text = streamed || 'System note: the cloud turn was stopped from another client before it wrote a reply.';
       await publisher.publishFinalStream(message, text);
       await publisher.publishResponse(message, { text, model: responseModel });
+      return;
+    }
+    if (result.usageLimit) {
+      // Refused at the usage limit: the relay pauses the turn until the reset.
+      // What the turn had written stays above the relay's note, without the
+      // sandbox's own line about the limit.
+      const refusalText = String(result.usageLimit.text || t.usageLimitLine || '').trim();
+      let written = streamed;
+      if (refusalText && written.endsWith(refusalText)) written = written.slice(0, -refusalText.length).trim();
+      await publisher.publishFinalStream(message, streamed);
+      await publisher.publishResponse(message, {
+        text: result.text || refusalText || result.errors[0] || 'Claude usage limit reached.',
+        model: responseModel,
+        terminalError: buildUsageLimitFailure(message, result.usageLimit),
+        partialText: written,
+      });
       return;
     }
     if (result.isError) {

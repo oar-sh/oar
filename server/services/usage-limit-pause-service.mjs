@@ -177,7 +177,9 @@ export function createUsageLimitPauseService({
    */
   function planPause({ terminalError, conversationId, providerType, queueRow = null, partialText = '' } = {}) {
     if (!isUsageLimitTerminalError(terminalError)) return null;
-    if (String(providerType || '').trim().toLowerCase() !== 'claude') return null;
+    // Claude sessions, local and in the cloud: both run Claude Code on the
+    // same account and report the same limit.
+    if (!['claude', 'claude-cloud'].includes(String(providerType || '').trim().toLowerCase())) return null;
     if (!String(conversationId || '').trim()) return null;
     const at = now();
     const rateLimitType = String(terminalError.rateLimitType || '').trim() || null;

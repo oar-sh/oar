@@ -567,6 +567,25 @@ for (const profile of PROFILES) {
       expect(createsFor(profile.typedRepoUrl)).toHaveLength(1);
     });
 
+    test("a turn refused at the usage limit is paused with the reset time, like a local Claude turn", async ({ page }) => {
+      await openConversation(page, conversationId);
+      try {
+        await sendFromComposer(page, `Hit the usage limit, ${profile.name}`);
+        const banner = page.locator("#usage-limit-banner");
+        await expect(banner).toBeVisible({ timeout: TURN_TIMEOUT });
+        await expect(banner.locator(".usage-limit-text")).toContainText("Paused at the Claude 5-hour limit");
+        await expect(banner.locator("button")).toHaveText(["Resume now", "Cancel"]);
+        // The row ends with the relay's note, and the held follow-up is queued.
+        await expect(page.locator(".msg.assistant", { hasText: "⏸ Paused: the Claude 5-hour limit is reached" }).last()).toBeVisible();
+        const status = await relayApi("GET", "/api/status");
+        expect(status.body.usageLimit.pauses.some((pause) => pause.conversationId === conversationId)).toBe(true);
+      } finally {
+        // Nothing may resume behind the next tests.
+        await relayApi("POST", "/api/usage-limit/cancel", { conversationId });
+      }
+      await expect(page.locator("#usage-limit-banner")).toBeHidden({ timeout: TURN_TIMEOUT });
+    });
+
     test("Check Usage has a Claude Cloud tab with the account's credit", async ({ page }) => {
       await openConversation(page, conversationId);
       await page.locator("#chat-actions-menu-btn").click();

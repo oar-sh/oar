@@ -17,6 +17,9 @@
  *   contains "push"  a pushed branch (system/vcs_state_changed), then a reply
  *   contains "slow"  a first line of reply, then nothing: the turn stays open
  *                    until it is interrupted
+ *   contains "limit" a usage-limit refusal: a rejected rate_limit_event (reset
+ *                    in 40 minutes), the sandbox's own line about the limit,
+ *                    and a failed result with status 429
  *   contains "trailer"  the reply is the attribution line the session's
  *                    commits would end with: the one an `apply_flag_settings`
  *                    control request set, else the sandbox's own
@@ -61,6 +64,10 @@ export const FAKE_CLOUD_SLOW_FIRST_LINE = "Starting the slow sample job.";
 /** What the fake sandbox ends a commit with while no attribution setting is in place. */
 export const FAKE_CLOUD_OWN_TRAILER = "Co-Authored-By: Sample Sandbox Agent <agent@example.com>";
 export const FAKE_CLOUD_NO_TRAILER = "(no attribution line)";
+
+/** How far ahead the fake puts the reset of a scripted usage-limit refusal. */
+export const FAKE_CLOUD_LIMIT_RESET_MS = 40 * 60_000;
+export const FAKE_CLOUD_LIMIT_LINE = "You've hit your session limit · resets soon";
 
 /** The reply of a "trailer" turn for a commit attribution line (as code: it holds an address in angle brackets). */
 export function fakeCloudTrailerReplyFor(trailer) {
@@ -285,6 +292,38 @@ export async function startFakeClaudeCloudApi({
       const reply = `Pushed ${FAKE_CLOUD_PUSHED_BRANCH}.`;
       await emit(assistantText(session, reply));
       await emit(successResult(session, reply));
+      return;
+    }
+
+    if (/\blimit\b/i.test(text)) {
+      const resetsAt = Math.round((Date.now() + FAKE_CLOUD_LIMIT_RESET_MS) / 1000);
+      await emit({
+        type: "rate_limit_event",
+        session_id: session.id,
+        uuid: randomUUID(),
+        rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt, utilization: 1, unifiedWindows: { five_hour: { resetsAt, utilization: 1 } } },
+      });
+      await emit({
+        type: "assistant",
+        uuid: randomUUID(),
+        session_id: session.id,
+        parent_tool_use_id: null,
+        error: "rate_limit",
+        is_api_error_message: true,
+        message: { id: nextId("msg"), role: "assistant", model: session.model, content: [{ type: "text", text: FAKE_CLOUD_LIMIT_LINE }] },
+      });
+      await emit({
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        api_error_status: 429,
+        terminal_reason: "api_error",
+        num_turns: 1,
+        duration_ms: 300,
+        total_cost_usd: 0,
+        session_id: session.id,
+        uuid: randomUUID(),
+      });
       return;
     }
 

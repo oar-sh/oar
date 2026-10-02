@@ -5470,12 +5470,13 @@ export function registerMessagesRoutes(app, deps) {
     touchCli();
     if (!usageLimitPauseService) return res.status(501).json({ error: 'Usage limit handling is unavailable' });
     // The report is the account's, so only a Claude-bound conversation's
-    // worker may write it (same validation as the plan usage card).
+    // worker may write it (same validation as the plan usage card); a Claude
+    // Cloud chat runs on the same account and reports the same limit.
     const conversationId = String(req.body?.conversationId || '').trim();
     if (conversationId) {
       const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
       const boundProvider = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
-      if (runtimeSession && boundProvider !== 'claude') {
+      if (runtimeSession && boundProvider !== 'claude' && boundProvider !== 'claude-cloud') {
         return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
       }
     }

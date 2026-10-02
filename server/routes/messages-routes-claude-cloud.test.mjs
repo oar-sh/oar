@@ -259,7 +259,7 @@ test('claude-plan-usage keeps a cloud report under its own key, away from the Cl
   assert.equal(planUsageService.saved.length, 2);
 });
 
-test('the routes that are the Claude provider\'s own stay closed to a cloud conversation', async () => {
+test('the routes that are the Claude provider\'s own stay closed to a cloud conversation, except the usage limit', async () => {
   const { stmts } = makeDb();
   seedConversation(stmts);
   const recorded = [];
@@ -272,9 +272,11 @@ test('the routes that are the Claude provider\'s own stay closed to a cloud conv
   assert.equal(native.status, 409);
   assert.equal(stmts.getRuntimeSessionByConversation.get('conv-cloud').claude_native_session_id, null);
 
+  // The usage limit is the account's: a cloud chat runs on the same account
+  // and reports the same limit, so its worker may write it.
   const limit = await invokePost('/api/claude-usage-limit', deps, { conversationId: 'conv-cloud', report: { status: 'rejected' } });
-  assert.equal(limit.status, 409);
-  assert.deepEqual(recorded, []);
+  assert.equal(limit.status, 200);
+  assert.deepEqual(recorded, [{ report: { status: 'rejected' } }]);
 
   const continuation = await invokePost('/api/continuation-turn', deps, { conversationId: 'conv-cloud' });
   assert.equal(continuation.status, 409);

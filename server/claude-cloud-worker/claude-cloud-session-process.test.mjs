@@ -1241,3 +1241,82 @@ test('settings the sandbox does not take are noted in the turn and sent again wi
   assert.equal(activityTexts(api).filter((text) => /attribution setting could not be applied/.test(text)).length, 1);
   await runner.dispose();
 });
+
+// ---------------------------------------------------------------------------
+// Usage limit
+
+const rateLimitEvent = (sequence, status, resetsAtMs) => cloudEvent(sequence, {
+  type: 'rate_limit_event',
+  session_id: SESSION_ID,
+  rate_limit_info: {
+    status,
+    rateLimitType: 'five_hour',
+    resetsAt: Math.round(resetsAtMs / 1000),
+    utilization: 1,
+    unifiedWindows: { five_hour: { resetsAt: Math.round(resetsAtMs / 1000), utilization: 1 } },
+  },
+});
+
+test('a turn the cloud refuses at the usage limit is reported as such, so the relay pauses it', async () => {
+  const api = makeApi();
+  const cloud = makeCloud();
+  const { runner } = makeRunner({ api, cloud });
+  // Whole seconds: the event carries unix seconds.
+  const resetsAt = Math.round((Date.now() + 40 * 60_000) / 1000) * 1000;
+
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(
+    sessionInit(1),
+    rateLimitEvent(2, 'allowed_warning', resetsAt),
+    assistantText(3, 'Working on the licence file.'),
+    rateLimitEvent(4, 'rejected', resetsAt),
+    cloudEvent(5, {
+      type: 'assistant',
+      error: 'rate_limit',
+      is_api_error_message: true,
+      session_id: SESSION_ID,
+      parent_tool_use_id: null,
+      message: { id: 'msg_example_5', role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10pm (UTC)" }] },
+    }),
+    turnResult(6, { subtype: 'success', is_error: true, api_error_status: 429, terminal_reason: 'api_error', result: undefined }),
+  );
+  assert.equal(await done, true);
+
+  // Both reports reached the relay (the warning and the refusal).
+  const reports = api.posts('/api/claude-usage-limit');
+  assert.deepEqual(reports.map((body) => [body.conversationId, body.report.status, body.report.rateLimitType]), [
+    [CONVERSATION_ID, 'allowed_warning', 'five_hour'],
+    [CONVERSATION_ID, 'rejected', 'five_hour'],
+  ]);
+  assert.equal(reports[1].report.resetsAt, new Date(resetsAt).toISOString());
+
+  // The response names the limit as the terminal error the relay pauses on,
+  // with what the turn had written kept apart from the limit line.
+  const [response] = api.posts('/api/response');
+  assert.equal(response.terminalError.kind, 'claude-usage-limit');
+  assert.equal(response.terminalError.rateLimitType, 'five_hour');
+  assert.equal(response.terminalError.resetsAt, new Date(resetsAt).toISOString());
+  assert.equal(response.partialText, 'Working on the licence file.');
+  await runner.dispose();
+});
+
+test('a failed turn without a rejected report is an ordinary failure', async () => {
+  const api = makeApi();
+  const cloud = makeCloud();
+  const { runner } = makeRunner({ api, cloud });
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(
+    sessionInit(1),
+    rateLimitEvent(2, 'allowed', Date.now() + 60_000),
+    turnResult(3, { subtype: 'error_during_execution', is_error: true, result: undefined, errors: ['Something else broke.'] }),
+  );
+  assert.equal(await done, true);
+  // The report is forwarded (the relay keeps the account's latest reading),
+  // but an allowed report refuses nothing.
+  assert.deepEqual(api.posts('/api/claude-usage-limit').map((body) => body.report.status), ['allowed']);
+  const [response] = api.posts('/api/response');
+  assert.notEqual(response.terminalError?.kind, 'claude-usage-limit');
+  await runner.dispose();
+});

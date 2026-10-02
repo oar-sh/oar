@@ -28,6 +28,12 @@ All notable changes to OAR are documented here. The format follows
   token is still good), reads the login again and retries; the "log in
   again" note comes only when that did not help. OAR still never uses the
   refresh token itself.
+- **Claude Cloud: a turn refused at the usage limit is paused, not failed.**
+  A cloud chat now pauses at the Claude usage limit the way a local Claude
+  chat does: the row ends with a note naming the reset time, the banner
+  shows the pause, and the work carries on by itself after the reset (or
+  waits for **Resume now**). Before, the limit was one line in the tool
+  activity and the turn failed.
 - **Check Usage opens at once.** The modal shows the reading it showed last
   time immediately and reads only the open tab's provider live (the card says
   "updating…" meanwhile), instead of fetching every provider and showing a
