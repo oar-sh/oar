@@ -245,3 +245,160 @@ test('the next open starts from empty cloud fields, and Copilot keeps its effort
   assert.match(el('new-conversation-cwd-status').textContent, /^This chat starts in /);
   journal.closeNewConversationModelModal();
 });
+
+// ── Repository and branch suggestions ──
+
+const REPO_LIST = {
+  ok: true,
+  complete: true,
+  source: 'anthropic',
+  repos: [
+    { slug: 'example-org/sample-repo', owner: 'example-org', name: 'sample-repo', repoUrl: REPO_URL, defaultBranch: 'main', private: true, archived: false, pushedAt: '2031-02-01T10:00:00Z', recentAt: '2031-03-01T10:00:00Z', accessible: true },
+    { slug: 'example-org/docs-site', owner: 'example-org', name: 'docs-site', repoUrl: 'https://github.com/example-org/docs-site', defaultBranch: 'trunk', private: false, archived: false, pushedAt: '2031-01-15T09:30:00Z', recentAt: null, accessible: true },
+    { slug: 'sample-user/tiny-tool', owner: 'sample-user', name: 'tiny-tool', repoUrl: 'https://github.com/sample-user/tiny-tool', defaultBranch: 'main', private: true, archived: false, pushedAt: '2030-12-20T18:00:00Z', recentAt: null, accessible: true },
+  ],
+};
+const BRANCHES = { 'example-org/docs-site': { defaultBranch: 'trunk', branches: ['trunk', 'dev/edits', 'release'] } };
+routes['/api/claude-cloud/repos'] = () => REPO_LIST;
+routes['/api/claude-cloud/branches'] = (entry) => {
+  const known = BRANCHES[entry.query.repo];
+  return known
+    ? { ok: true, slug: entry.query.repo, repoUrl: `https://github.com/${entry.query.repo}`, ...known }
+    : { ok: false, slug: entry.query.repo, error: { code: 'unreachable', message: 'could not read the branches' } };
+};
+const suggestionTexts = (field) => [...el(`new-conversation-cloud-${field}-list`).querySelectorAll('.new-conversation-cloud-suggest-item')]
+  .map((item) => [item.firstChild.textContent, item.querySelector('.new-conversation-cloud-suggest-meta')?.textContent || '']);
+const type = (field, value) => {
+  el(`new-conversation-cloud-${field}`).value = value;
+  el(`new-conversation-cloud-${field}`).dispatchEvent(new window.Event('input'));
+};
+const key = (field, name) => el(`new-conversation-cloud-${field}`).dispatchEvent(new window.KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true }));
+
+test('the Repository field offers the reachable repositories, filtered by what is typed, and a pick brings the default branch', async () => {
+  await journal.newConversation();
+  await selectProvider('claude-cloud');
+  await flush();
+  assert.equal(requestsTo('/api/claude-cloud/repos').length, 1, 'read once per open');
+
+  const repo = el('new-conversation-cloud-repo');
+  const list = el('new-conversation-cloud-repo-list');
+  assert.equal(list.hidden, true);
+  repo.focus();
+  repo.dispatchEvent(new window.Event('focus'));
+  assert.equal(list.hidden, false);
+  assert.equal(repo.getAttribute('aria-expanded'), 'true');
+  assert.deepEqual(suggestionTexts('repo'), [
+    ['example-org/sample-repo', 'used here · private'],
+    ['example-org/docs-site', 'public'],
+    ['sample-user/tiny-tool', 'private'],
+  ]);
+
+  type('repo', 'doc');
+  assert.deepEqual(suggestionTexts('repo').map(([label]) => label), ['example-org/docs-site']);
+  key('repo', 'ArrowDown');
+  assert.equal(list.children[0].getAttribute('aria-selected'), 'true');
+  key('repo', 'Enter');
+  assert.equal(repo.value, 'example-org/docs-site');
+  assert.equal(list.hidden, true);
+  // The repository's default branch is preselected, and the host is asked for the rest.
+  assert.equal(el('new-conversation-cloud-branch').value, 'trunk');
+  await sleep(20);
+  assert.deepEqual(requestsTo('/api/claude-cloud/branches').map((request) => request.query), [{ repo: 'example-org/docs-site' }]);
+
+  const branch = el('new-conversation-cloud-branch');
+  const branchList = el('new-conversation-cloud-branch-list');
+  branch.focus();
+  branch.dispatchEvent(new window.Event('focus'));
+  assert.equal(branchList.hidden, false);
+  assert.deepEqual(suggestionTexts('branch'), [['trunk', 'default'], ['dev/edits', ''], ['release', '']]);
+  type('branch', 'rel');
+  assert.deepEqual(suggestionTexts('branch').map(([label]) => label), ['release']);
+  branchList.children[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert.equal(branch.value, 'release');
+  assert.equal(branchList.hidden, true);
+  assert.deepEqual(warningKinds(), []);
+
+  // Another repository: the typed branch stays, and the branches of a
+  // repository the host cannot read leave the field as a text field.
+  repo.focus();
+  repo.dispatchEvent(new window.Event('focus'));
+  type('repo', 'tiny');
+  list.children[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert.equal(repo.value, 'sample-user/tiny-tool');
+  assert.equal(branch.value, 'release');
+  await sleep(20);
+  assert.equal(requestsTo('/api/claude-cloud/branches').at(-1).query.repo, 'sample-user/tiny-tool');
+  branch.focus();
+  branch.dispatchEvent(new window.Event('focus'));
+  assert.equal(branchList.hidden, true);
+  // Emptied, the field takes the default branch of the picked repository.
+  type('branch', '');
+  type('repo', 'example-org/docs-site');
+  await sleep(400);
+  assert.equal(branch.value, 'trunk');
+});
+
+test('a repository the Claude GitHub app cannot reach is flagged under the field', async () => {
+  type('repo', 'someone/else');
+  assert.deepEqual(warningKinds(), ['not-accessible']);
+  assert.match(el('new-conversation-cloud-warnings').textContent, /no access to someone\/else/);
+  type('repo', 'https://github.com/sample-user/tiny-tool');
+  assert.deepEqual(warningKinds(), []);
+});
+
+test('Escape closes the list and the fields are reset with the modal', async () => {
+  const repo = el('new-conversation-cloud-repo');
+  const list = el('new-conversation-cloud-repo-list');
+  repo.focus();
+  repo.dispatchEvent(new window.Event('focus'));
+  type('repo', '');
+  assert.equal(list.hidden, false);
+  key('repo', 'Escape');
+  assert.equal(list.hidden, true);
+  assert.equal(repo.getAttribute('aria-expanded'), 'false');
+  // The modal stays open: Escape closed only the list.
+  assert.equal(modalVisible(), true);
+  journal.closeNewConversationModelModal();
+
+  const before = requestsTo('/api/claude-cloud/repos').length;
+  await journal.newConversation();
+  await selectProvider('claude-cloud');
+  await flush();
+  assert.equal(requestsTo('/api/claude-cloud/repos').length, before + 1, 'read again for the next open');
+  assert.equal(el('new-conversation-cloud-repo').value, '');
+  assert.equal(el('new-conversation-cloud-branch').value, '');
+  assert.equal(el('new-conversation-cloud-branch-list').hidden, true);
+  journal.closeNewConversationModelModal();
+});
+
+test('when the list cannot be read, the recent repositories are offered with the reason under them', async () => {
+  routes['/api/claude-cloud/repos'] = () => ({
+    ok: false,
+    complete: false,
+    repos: [{ slug: 'example-org/sample-repo', defaultBranch: null, private: null, recentAt: '2031-03-01T10:00:00Z', accessible: null }],
+    error: { code: 'login_expired', message: 'The Claude login of this relay host has expired.' },
+  });
+  try {
+    await journal.newConversation();
+    await selectProvider('claude-cloud');
+    await flush();
+    const repo = el('new-conversation-cloud-repo');
+    const list = el('new-conversation-cloud-repo-list');
+    repo.focus();
+    repo.dispatchEvent(new window.Event('focus'));
+    assert.equal(list.hidden, false);
+    assert.deepEqual(suggestionTexts('repo').map(([label]) => label), ['example-org/sample-repo']);
+    assert.equal(list.querySelector('.new-conversation-cloud-suggest-note').textContent, 'The Claude login of this relay host has expired.');
+    // The note is not an entry: the arrow keys and Enter skip it.
+    key('repo', 'ArrowDown');
+    key('repo', 'ArrowDown');
+    key('repo', 'Enter');
+    assert.equal(repo.value, 'example-org/sample-repo');
+    // Nothing is known about access while the list is incomplete.
+    type('repo', 'someone/else');
+    assert.deepEqual(warningKinds(), []);
+    journal.closeNewConversationModelModal();
+  } finally {
+    routes['/api/claude-cloud/repos'] = () => REPO_LIST;
+  }
+});

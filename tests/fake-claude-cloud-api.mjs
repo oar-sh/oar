@@ -5,7 +5,8 @@
  * cloud client (shared/claude-cloud/api-client.mjs) was written against: the
  * profile and the environments, creating a session, its event log (paged, and
  * as a server-sent event stream with ids and keepalives), posting events into
- * it, archiving it, and the account usage reads. The relay under test and its
+ * it, archiving it, the account usage reads, and the repositories the Claude
+ * GitHub app can reach. The relay under test and its
  * cloud worker are pointed at it with OAR_CLAUDE_CLOUD_API_BASE_URL, so a turn
  * runs through the real client, worker and relay and never leaves the machine.
  *
@@ -70,6 +71,44 @@ export function fakeCloudTrailerReplyFor(trailer) {
 export function fakeCloudReplyFor(text) {
   return `Fake cloud reply to: ${text}`;
 }
+
+function fakeCloudRepository(owner, name, { defaultBranch, isPrivate, archived = false, disabled = false, pushedAt, description }) {
+  return Object.freeze({
+    repo: {
+      id: 100 + name.length,
+      name,
+      owner: { login: owner, type: owner.endsWith("-org") ? "Organization" : "User" },
+      default_branch: defaultBranch,
+      visibility: isPrivate ? "private" : "public",
+      private: isPrivate,
+      archived,
+      disabled,
+      fork: false,
+      permissions: { push: true, pull: true, admin: false },
+      size: 240,
+      description,
+      language: "JavaScript",
+      pushed_at: pushedAt,
+      topics: [],
+    },
+    status: "active",
+    ghe: false,
+    gitlab: false,
+    source_url: `https://github.com/${owner}/${name}`,
+  });
+}
+
+/**
+ * The repositories the fake's Claude GitHub app can reach, in the API's own
+ * shape and order: three the picker shows, and a disabled fourth one the
+ * client has to drop.
+ */
+export const FAKE_CLOUD_REPOSITORIES = Object.freeze([
+  fakeCloudRepository("example-org", "sample-repo", { defaultBranch: "main", isPrivate: true, pushedAt: "2031-02-01T10:00:00Z", description: "Sample service" }),
+  fakeCloudRepository("example-org", "docs-site", { defaultBranch: "trunk", isPrivate: false, pushedAt: "2031-01-15T09:30:00Z", description: "Documentation" }),
+  fakeCloudRepository("sample-user", "tiny-tool", { defaultBranch: "main", isPrivate: true, pushedAt: "2030-12-20T18:00:00Z", description: null }),
+  fakeCloudRepository("example-org", "retired", { defaultBranch: "main", isPrivate: true, archived: true, disabled: true, pushedAt: "2029-05-05T05:05:05Z", description: "Gone" }),
+]);
 
 /** The account usage body: two windows and one dollar credit. */
 export const FAKE_CLOUD_USAGE = Object.freeze({
@@ -544,6 +583,20 @@ export async function startFakeClaudeCloudApi({
     }
     if (req.method === "GET" && pathname === `${organizationPrefix}/overage_credit_grant`) {
       return sendJson(res, 200, { available: false, eligible: false, granted: true, amount_minor_units: 5000, currency: "USD" });
+    }
+    if (req.method === "GET" && pathname === `${organizationPrefix}/code/repos`) {
+      if (req.headers["x-organization-uuid"] !== FAKE_CLOUD_ORGANIZATION_ID) {
+        return sendError(res, 400, "invalid_request_error", "x-organization-uuid is required");
+      }
+      return sendJson(res, 200, {
+        repos: FAKE_CLOUD_REPOSITORIES.map((entry) => ({ ...entry, repo: { ...entry.repo } })),
+        is_complete: true,
+        next_cursor: null,
+        sso_required_orgs: [],
+        source_warnings: [],
+        skipped_nested: 0,
+        sources: ["github_app"],
+      });
     }
     if (req.method === "POST" && pathname === "/v1/code/sessions") return createSession(res, body);
 

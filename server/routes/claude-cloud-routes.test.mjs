@@ -9,6 +9,7 @@ import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createClaudeCloudSettingsService } from '../services/claude-cloud-settings-service.mjs';
 import { buildCloudSourceRecord, createClaudeCloudSessionService } from '../services/claude-cloud-session-service.mjs';
+import { createClaudeCloudRepoService, listRecentCloudSourcesFromStatements } from '../services/claude-cloud-repo-service.mjs';
 
 const ENVIRONMENT_ID = 'env_01EXAMPLEaaaaaaaaaaaaaaaa';
 const SESSION_ID = 'cse_01EXAMPLEaaaaaaaaaaaaaaaa';
@@ -26,7 +27,7 @@ function createMockApp() {
   };
 }
 
-async function callRoute(app, key, body = {}) {
+async function callRoute(app, key, body = {}, query = {}) {
   const handlers = app.routes.get(key);
   assert.ok(handlers, `${key} should be registered`);
   const res = {
@@ -37,16 +38,24 @@ async function callRoute(app, key, body = {}) {
   };
   for (const handler of handlers) {
     let nextCalled = false;
-    await handler({ body, query: {}, headers: {}, params: {} }, res, () => { nextCalled = true; });
+    await handler({ body, query, headers: {}, params: {} }, res, () => { nextCalled = true; });
     if (!nextCalled) break;
   }
   return res;
 }
 
-function createHarness({ hasToken = true, providerType = 'claude-cloud' } = {}) {
+function createHarness({
+  hasToken = true,
+  providerType = 'claude-cloud',
+  cloudEnabled = false,
+  listRepositories = async () => ({ repos: [], complete: true, raw: [{}] }),
+  execFileImpl = () => { throw new Error('git must not run in this test'); },
+  gitBranchLookup = true,
+} = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   const stmts = createSessionRepository(db);
+  if (cloudEnabled) stmts.upsertAppSetting.run('claude_cloud_enabled', 'true', NOW);
   stmts.insertConv.run('conv-1', 'Fix the slug helper', NOW, NOW);
   stmts.insertRuntimeSession.run('rs-1', 'conv-1', 'isolated', 'rs-1', 'claude-sonnet-5-5', NOW, NOW, 'conv-1', providerType, 'claude-sonnet-5-5');
   stmts.updateConvCloudSource.run(
@@ -83,6 +92,15 @@ function createHarness({ hasToken = true, providerType = 'claude-cloud' } = {}) 
       stmts,
       emit,
       now: () => new Date('2026-10-02T11:00:00.000Z'),
+      logger: { log() {}, warn() {} },
+    }),
+    claudeCloudRepoService: createClaudeCloudRepoService({
+      cloud: { listRepositories },
+      isEnabled: () => String(stmts.getAppSetting.get('claude_cloud_enabled')?.value || '') === 'true',
+      listRecentCloudSources: () => listRecentCloudSourcesFromStatements(stmts),
+      gitBranchLookup,
+      execFileImpl,
+      now: () => Date.parse('2026-10-02T11:00:00.000Z'),
       logger: { log() {}, warn() {} },
     }),
   });
@@ -187,6 +205,150 @@ test('POST /api/claude-cloud-session refuses what is not a cloud conversation', 
   assert.deepEqual(res.body, { error: 'Conversation is not bound to the Claude Cloud provider' });
   assert.equal(claude.stmts.getRuntimeSessionByConversation.get('conv-1').claude_cloud_session_id, null);
   assert.deepEqual(claude.events, []);
+});
+
+const REPOS_KEYS = ['complete', 'error', 'fetchedAt', 'ok', 'repos', 'source'];
+const REPO_KEYS = ['accessible', 'archived', 'defaultBranch', 'description', 'name', 'owner', 'private', 'pushedAt', 'recentAt', 'repoUrl', 'slug'];
+
+test('GET /api/claude-cloud/repos answers the united list; ?refresh=1 reads Anthropic again', async () => {
+  let reads = 0;
+  const { app, authCalls } = createHarness({
+    cloudEnabled: true,
+    listRepositories: async () => {
+      reads += 1;
+      return {
+        repos: [
+          { owner: 'example-org', name: 'docs-site', slug: 'example-org/docs-site', repoUrl: 'https://github.com/example-org/docs-site', defaultBranch: 'trunk', private: false, archived: false, pushedAt: '2031-01-15T09:30:00Z', description: 'Documentation' },
+          { owner: 'example-org', name: 'sample-repo', slug: 'example-org/sample-repo', repoUrl: REPO_URL, defaultBranch: 'main', private: true, archived: false, pushedAt: '2031-02-01T10:00:00Z', description: 'Sample service' },
+        ],
+        complete: true,
+        raw: [{}],
+      };
+    },
+  });
+  const res = await callRoute(app, 'GET /api/claude-cloud/repos');
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(Object.keys(res.body).sort(), REPOS_KEYS);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.source, 'anthropic');
+  assert.equal(res.body.error, null);
+  assert.equal(res.body.complete, true);
+  assert.equal(res.body.fetchedAt, '2026-10-02T11:00:00.000Z');
+  for (const repo of res.body.repos) assert.deepEqual(Object.keys(repo).sort(), REPO_KEYS);
+  // conv-1 (the harness's cloud conversation) clones sample-repo: it leads.
+  assert.deepEqual(res.body.repos.map((repo) => [repo.slug, repo.recentAt, repo.accessible]), [
+    ['example-org/sample-repo', NOW, true],
+    ['example-org/docs-site', null, true],
+  ]);
+  assert.equal(authCalls.length, 1, 'behind the relay auth');
+
+  await callRoute(app, 'GET /api/claude-cloud/repos');
+  assert.equal(reads, 1, 'cached');
+  await callRoute(app, 'GET /api/claude-cloud/repos', {}, { refresh: '1' });
+  assert.equal(reads, 2, 'refreshed');
+  await callRoute(app, 'GET /api/claude-cloud/repos', {}, { refresh: 'true' });
+  assert.equal(reads, 3);
+  await callRoute(app, 'GET /api/claude-cloud/repos', {}, { refresh: '0' });
+  assert.equal(reads, 3);
+});
+
+test('GET /api/claude-cloud/repos is 200 with ok:false while the provider is off, and when the read fails', async () => {
+  const off = createHarness({ listRepositories: async () => { throw new Error('must not be asked'); } });
+  const res = await callRoute(off.app, 'GET /api/claude-cloud/repos');
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.error.code, 'claude_cloud_disabled');
+  assert.deepEqual(res.body.repos, []);
+
+  const failing = createHarness({
+    cloudEnabled: true,
+    listRepositories: async () => { throw Object.assign(new Error(`refused ${TOKEN}`), { code: 'transient' }); },
+  });
+  const failed = await callRoute(failing.app, 'GET /api/claude-cloud/repos');
+  assert.equal(failed.statusCode, 200);
+  assert.deepEqual(Object.keys(failed.body).sort(), REPOS_KEYS);
+  assert.equal(failed.body.ok, false);
+  assert.equal(failed.body.source, 'recent');
+  assert.equal(failed.body.error.code, 'error', 'not a cloud error: its text is not passed on');
+  assert.equal(JSON.stringify(failed.body).includes(TOKEN), false);
+  assert.deepEqual(failed.body.repos.map((repo) => [repo.slug, repo.accessible]), [['example-org/sample-repo', null]]);
+});
+
+test('GET /api/claude-cloud/repos is 500 only when the service itself throws', async () => {
+  const app = createMockApp();
+  registerClaudeCloudRoutes(app, {
+    auth: (_req, _res, next) => next(),
+    claudeCloudRepoService: { listRepositories: async () => { throw new Error('boom'); }, listBranches: async () => { throw new Error('boom'); } },
+  });
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const repos = await callRoute(app, 'GET /api/claude-cloud/repos');
+    assert.equal(repos.statusCode, 500);
+    assert.deepEqual(repos.body, { error: 'Failed to list Claude Cloud repositories' });
+    const branches = await callRoute(app, 'GET /api/claude-cloud/branches', {}, { repo: REPO_URL });
+    assert.equal(branches.statusCode, 500);
+    assert.deepEqual(branches.body, { error: 'Failed to list the repository branches' });
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('GET /api/claude-cloud/branches answers the branches of the named repository, default first', async () => {
+  const gitCalls = [];
+  const { app } = createHarness({
+    execFileImpl: (file, args, options, callback) => {
+      gitCalls.push({ file, args, shell: options.shell, prompt: options.env.GIT_TERMINAL_PROMPT });
+      setImmediate(() => callback(null, [
+        'ref: refs/heads/main\tHEAD',
+        '1111111111111111111111111111111111111111\tHEAD',
+        '2222222222222222222222222222222222222222\trefs/heads/dev/fix-slugify',
+        '3333333333333333333333333333333333333333\trefs/heads/main',
+        '',
+      ].join('\n'), ''));
+    },
+  });
+  const res = await callRoute(app, 'GET /api/claude-cloud/branches', {}, { repo: 'example-org/sample-repo' });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, {
+    ok: true,
+    slug: 'example-org/sample-repo',
+    repoUrl: REPO_URL,
+    branches: ['main', 'dev/fix-slugify'],
+    defaultBranch: 'main',
+  });
+  assert.deepEqual(gitCalls, [{ file: 'git', args: ['ls-remote', '--symref', REPO_URL, 'HEAD', 'refs/heads/*'], shell: undefined, prompt: '0' }]);
+
+  const byUrl = await callRoute(app, 'GET /api/claude-cloud/branches', {}, { repo: `${REPO_URL}.git` });
+  assert.equal(byUrl.body.slug, 'example-org/sample-repo');
+});
+
+test('GET /api/claude-cloud/branches is 400 without a usable repository, 200 for every other refusal', async () => {
+  const { app } = createHarness({
+    execFileImpl: (_file, _args, _options, callback) => {
+      setImmediate(() => callback(Object.assign(new Error('Command failed'), { code: 128 }), '', 'fatal: could not read Username: terminal prompts disabled\n'));
+    },
+  });
+  for (const query of [{}, { repo: '' }, { repo: 'not a repository' }, { repo: ['https://gitlab.example.com/group/project'] }, { repo: 7 }]) {
+    const res = await callRoute(app, 'GET /api/claude-cloud/branches', {}, query);
+    assert.equal(res.statusCode, 400, JSON.stringify(query));
+    assert.equal(res.body.ok, false);
+    assert.equal(res.body.slug, null);
+    assert.equal(res.body.error.code, 'invalid_repo');
+    assert.equal(typeof res.body.error.message, 'string');
+  }
+  const unreachable = await callRoute(app, 'GET /api/claude-cloud/branches', {}, { repo: 'example-org/private-thing' });
+  assert.equal(unreachable.statusCode, 200);
+  assert.deepEqual(unreachable.body, {
+    ok: false,
+    slug: 'example-org/private-thing',
+    error: { code: 'unreachable', message: 'could not read Username: terminal prompts disabled' },
+  });
+
+  const off = createHarness({ gitBranchLookup: false });
+  const disabled = await callRoute(off.app, 'GET /api/claude-cloud/branches', {}, { repo: REPO_URL });
+  assert.equal(disabled.statusCode, 200);
+  assert.deepEqual(disabled.body, { ok: false, slug: 'example-org/sample-repo', error: { code: 'disabled', message: 'Branch lookup is switched off on this relay.' } });
 });
 
 test('the routes are only there when their service is', () => {

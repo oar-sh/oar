@@ -3438,6 +3438,50 @@
     overflow-wrap: anywhere;
   }
   #new-conversation-cloud-error[hidden] { display: none; }
+  /* Suggestions under Repository/Branch: a list in the flow of the modal
+     (not a floating one: the modal scrolls on a phone and a popover would
+     be clipped), at most a few rows high, scrolling inside itself. */
+  .new-conversation-cloud-suggest {
+    margin-top: 4px;
+    max-height: min(40vh, 220px);
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg3);
+  }
+  .new-conversation-cloud-suggest[hidden] { display: none; }
+  .new-conversation-cloud-suggest-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 38px;
+    padding: 8px 10px;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+  }
+  .new-conversation-cloud-suggest-item:last-child { border-bottom: 0; }
+  .new-conversation-cloud-suggest-item:hover,
+  .new-conversation-cloud-suggest-item[aria-selected="true"] { background: var(--bg2); }
+  .new-conversation-cloud-suggest-meta {
+    flex: 0 0 auto;
+    font-size: 0.72rem;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .new-conversation-cloud-suggest-note {
+    padding: 8px 10px;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
   /* Shared row/button recipe for the file-explorer CWD browse buttons in the
      New chat and Change CWD modals — one place to restyle both. */
   .cwd-browse-row {
@@ -6645,9 +6689,11 @@
            the cloud session clones, filled from the folder picked above. -->
       <div id="new-conversation-cloud-row" hidden>
         <label for="new-conversation-cloud-repo" style="display:block;margin-top:12px;">Repository</label>
-        <input id="new-conversation-cloud-repo" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="owner/repo or GitHub URL" aria-describedby="new-conversation-cloud-warnings new-conversation-cloud-error">
+        <input id="new-conversation-cloud-repo" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="new-conversation-cloud-repo-list" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="owner/repo or GitHub URL" aria-describedby="new-conversation-cloud-warnings new-conversation-cloud-error">
+        <div id="new-conversation-cloud-repo-list" class="new-conversation-cloud-suggest" role="listbox" aria-label="Repositories" hidden></div>
         <label for="new-conversation-cloud-branch" style="display:block;margin-top:12px;">Branch</label>
-        <input id="new-conversation-cloud-branch" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Default branch" aria-describedby="new-conversation-cloud-warnings new-conversation-cloud-error">
+        <input id="new-conversation-cloud-branch" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="new-conversation-cloud-branch-list" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Default branch" aria-describedby="new-conversation-cloud-warnings new-conversation-cloud-error">
+        <div id="new-conversation-cloud-branch-list" class="new-conversation-cloud-suggest" role="listbox" aria-label="Branches" hidden></div>
         <div id="new-conversation-cloud-warnings" role="status" aria-live="polite"></div>
         <div id="new-conversation-cloud-error" role="alert" hidden></div>
       </div>

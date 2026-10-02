@@ -28,8 +28,11 @@ All notable changes to OAR are documented here. The format follows
   model there; it needs the Claude CLI logged in with a claude.ai account on
   the relay host, GitHub connected to that account, and the Claude GitHub app
   allowed on the repository. New Chat → Claude Cloud fills **Repository** and
-  **Branch** from the folder you pick, lets you change both, and warns about
-  commits that are not pushed and changes that are not committed. In the chat
+  **Branch** from the folder you pick, offers the repositories the Claude
+  GitHub app can reach (the ones used here before first) and the branches of
+  the picked repository as suggestions, lets you type both, and warns about
+  commits that are not pushed, changes that are not committed and a
+  repository the app cannot reach. In the chat
   the reply streams in live, the agent's questions and permission prompts
   arrive as cards, **Stop** interrupts the turn, and images can be attached.
   A line above the composer links the session on claude.ai and every branch

@@ -42,6 +42,11 @@ export function createSessionRepository(db) {
         updateConvCloudSource: conversationsHaveCloudSource
           ? db.prepare(`UPDATE conversations SET cloud_source_json = ? WHERE id = ?`)
           : null,
+        // The repositories of earlier cloud chats, newest first: the suggestions
+        // of the New Chat repository picker.
+        listRecentCloudSources: conversationsHaveCloudSource
+          ? db.prepare(`SELECT cloud_source_json, updated_at FROM conversations WHERE cloud_source_json IS NOT NULL AND status != 'deleted' ORDER BY updated_at DESC LIMIT 200`)
+          : null,
         seedConvConfiguredWorkspaceRootIfMissing: db.prepare(`UPDATE conversations SET configured_workspace_root_path = ?, updated_at = ? WHERE id = ? AND (configured_workspace_root_path IS NULL OR configured_workspace_root_path = '')`),
         updateConvSeed: db.prepare(`UPDATE conversations SET summary_seed = ?, seed_pending = ?, compacted_from = ?, updated_at = ? WHERE id = ?`),
         markConvCompacted: db.prepare(`UPDATE conversations SET archived = 1, compacted_into = ?, updated_at = ? WHERE id = ?`),

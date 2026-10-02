@@ -9,6 +9,7 @@ import {
   createSseParser,
 } from './api-client.mjs';
 import { ClaudeCloudError as CredentialsError, createClaudeCloudCredentials } from './credentials.mjs';
+import { FAKE_CLOUD_REPOSITORIES, FAKE_CLOUD_TOKEN, startFakeClaudeCloudApi } from '../../tests/fake-claude-cloud-api.mjs';
 
 const SESSION_ID = 'cse_01EXAMPLEaaaaaaaaaaaaaaaa';
 const ENVIRONMENT_ID = 'env_01EXAMPLEbbbbbbbbbbbbbbbb';
@@ -336,6 +337,137 @@ test('a refused prepaid or offer call is an error with a code, like every other 
     assert.doesNotMatch(error.message, new RegExp(TOKEN));
     return true;
   });
+});
+
+/** One entry of the repository list in the API's own shape. */
+function repoEntry(owner, name, { defaultBranch = 'main', isPrivate = true, archived = false, disabled = false, pushedAt = '2031-02-01T10:00:00Z', description = null } = {}) {
+  return {
+    repo: {
+      id: 1000 + name.length,
+      name,
+      owner: { login: owner, type: 'Organization' },
+      default_branch: defaultBranch,
+      visibility: isPrivate ? 'private' : 'public',
+      private: isPrivate,
+      archived,
+      disabled,
+      fork: false,
+      permissions: { push: true, pull: true, admin: false },
+      size: 120,
+      description,
+      language: 'JavaScript',
+      pushed_at: pushedAt,
+      topics: [],
+    },
+    status: 'active',
+    ghe: false,
+    gitlab: false,
+    source_url: `https://github.com/${owner}/${name}`,
+  };
+}
+
+test('listRepositories reads the organisation list, renames the entries and drops the disabled ones', async () => {
+  const { client, calls } = setup([
+    json({ organization: { uuid: ORG_ID } }),
+    json({
+      repos: [
+        repoEntry('example-org', 'sample-repo', { description: 'Sample service' }),
+        repoEntry('example-org', 'docs-site', { defaultBranch: 'trunk', isPrivate: false, pushedAt: '2031-01-15T09:30:00Z', description: 'Documentation' }),
+        repoEntry('example-org', 'retired', { disabled: true, archived: true }),
+        repoEntry('example-org', 'sample-repo'),
+        { repo: { name: 'no-owner', owner: {} }, status: 'active' },
+        { status: 'active' },
+      ],
+      is_complete: true,
+      next_cursor: null,
+      sso_required_orgs: [],
+      source_warnings: [],
+      skipped_nested: 0,
+      sources: ['github_app'],
+    }),
+  ]);
+  const listed = await client.listRepositories();
+  assert.deepEqual(listed.repos, [
+    {
+      owner: 'example-org', name: 'sample-repo', slug: 'example-org/sample-repo', repoUrl: REPO_URL,
+      defaultBranch: 'main', private: true, archived: false, pushedAt: '2031-02-01T10:00:00Z', description: 'Sample service',
+    },
+    {
+      owner: 'example-org', name: 'docs-site', slug: 'example-org/docs-site', repoUrl: 'https://github.com/example-org/docs-site',
+      defaultBranch: 'trunk', private: false, archived: false, pushedAt: '2031-01-15T09:30:00Z', description: 'Documentation',
+    },
+  ]);
+  assert.equal(listed.complete, true);
+  assert.equal(listed.raw.length, 1);
+  assert.equal(listed.raw[0].sources[0], 'github_app');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].url, `https://api.anthropic.com/api/oauth/organizations/${ORG_ID}/code/repos`);
+  assert.equal(calls[1].method, 'GET');
+  assert.equal(calls[1].body, undefined);
+  assert.equal(calls[1].headers['x-organization-uuid'], ORG_ID);
+  assert.equal(calls[1].headers.Authorization, `Bearer ${TOKEN}`);
+});
+
+test('listRepositories follows the cursor and reports an incomplete list', async () => {
+  const { client, calls } = setup([
+    json({ organization: { uuid: ORG_ID } }),
+    json({ repos: [repoEntry('example-org', 'sample-repo')], is_complete: true, next_cursor: 'page-2 token' }),
+    json({ repos: [repoEntry('sample-user', 'tiny-tool')], is_complete: false, next_cursor: null }),
+  ]);
+  const listed = await client.listRepositories();
+  assert.deepEqual(listed.repos.map((repo) => repo.slug), ['example-org/sample-repo', 'sample-user/tiny-tool']);
+  assert.equal(listed.complete, false, 'the API said so on the last page');
+  assert.equal(listed.raw.length, 2);
+  assert.equal(calls[2].url, `https://api.anthropic.com/api/oauth/organizations/${ORG_ID}/code/repos?cursor=page-2+token`);
+  assert.equal(calls[1].url.includes('?'), false);
+});
+
+test('listRepositories stops after twenty pages and says the list is not complete', async () => {
+  const pages = Array.from({ length: 25 }, (_, index) => json({
+    repos: [repoEntry('example-org', `repo-${index}`)],
+    is_complete: true,
+    next_cursor: `cursor-${index + 1}`,
+  }));
+  const { client, calls } = setup([json({ organization: { uuid: ORG_ID } }), ...pages]);
+  const listed = await client.listRepositories();
+  assert.equal(listed.repos.length, 20);
+  assert.equal(listed.complete, false);
+  assert.equal(calls.length, 21);
+});
+
+test('an answer without repositories is an empty, complete list; a refusal is an error with a code', async () => {
+  const empty = setup([json({ organization: { uuid: ORG_ID } }), json({})]);
+  assert.deepEqual(await empty.client.listRepositories(), { repos: [], complete: true, raw: [{}] });
+
+  const refused = setup([
+    json({ organization: { uuid: ORG_ID } }),
+    json({ error: { type: 'permission_error', message: `github_not_connected for ${TOKEN}` } }, 403),
+  ]);
+  await assert.rejects(refused.client.listRepositories(), (error) => {
+    assert.ok(error instanceof ClaudeCloudError);
+    assert.equal(error.code, 'github_not_connected');
+    assert.doesNotMatch(error.message, new RegExp(TOKEN));
+    return true;
+  });
+});
+
+test('listRepositories reads the e2e fake\'s repository list: three repositories, the disabled one dropped', async () => {
+  const fake = await startFakeClaudeCloudApi();
+  try {
+    const client = createClaudeCloudClient({ credentials: fakeCredentials([FAKE_CLOUD_TOKEN]), baseUrl: fake.baseUrl });
+    const listed = await client.listRepositories();
+    assert.equal(FAKE_CLOUD_REPOSITORIES.length, 4);
+    assert.equal(FAKE_CLOUD_REPOSITORIES[3].repo.disabled, true);
+    assert.deepEqual(listed.repos.map((repo) => [repo.slug, repo.defaultBranch, repo.private, repo.pushedAt, repo.description]), [
+      ['example-org/sample-repo', 'main', true, '2031-02-01T10:00:00Z', 'Sample service'],
+      ['example-org/docs-site', 'trunk', false, '2031-01-15T09:30:00Z', 'Documentation'],
+      ['sample-user/tiny-tool', 'main', true, '2030-12-20T18:00:00Z', null],
+    ]);
+    assert.equal(listed.complete, true);
+    assert.equal(fake.requestsTo('GET', /\/code\/repos$/).length, 1);
+  } finally {
+    await fake.stop();
+  }
 });
 
 test('createSession sends the repository, the branch as revision, the plain model and the first message', async () => {
@@ -1177,8 +1309,8 @@ test('the client offers exactly the calls of the contract', () => {
   const { client } = setup([]);
   assert.deepEqual(Object.keys(client).sort(), [
     'applyFlagSettings', 'archiveSession', 'createSession', 'getAccountUsage', 'getCreditGrantOffer', 'getOrganizationId',
-    'getPrepaidCredits', 'getSession', 'listEnvironments', 'listEvents', 'openEventStream', 'sendControlResponse',
-    'sendInterrupt', 'sendUserMessage',
+    'getPrepaidCredits', 'getSession', 'listEnvironments', 'listEvents', 'listRepositories', 'openEventStream',
+    'sendControlResponse', 'sendInterrupt', 'sendUserMessage',
   ]);
   for (const call of Object.values(client)) assert.equal(typeof call, 'function');
 });

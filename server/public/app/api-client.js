@@ -416,6 +416,21 @@ export async function loadGitRemote(rootPath) {
   return quietGet(`/api/git/remote?root=${encodeURIComponent(root)}`);
 }
 
+// The repositories the Claude GitHub app can reach, plus the ones used in
+// earlier cloud chats here, for the New Chat Repository suggestions. null
+// when the relay could not say (the field is then typed, as before).
+export async function loadClaudeCloudRepos({ refresh = false } = {}) {
+  return quietGet(`/api/claude-cloud/repos${refresh ? '?refresh=1' : ''}`);
+}
+
+// The branches of a GitHub repository as the relay host's git sees them, for
+// the New Chat Branch suggestions. null when the relay could not say.
+export async function loadClaudeCloudBranches(repo) {
+  const text = String(repo || '').trim();
+  if (!text) return null;
+  return quietGet(`/api/claude-cloud/branches?repo=${encodeURIComponent(text)}`);
+}
+
 export async function updateOpenAISettings({
   apiKey = '',
   model = 'gpt-4o',

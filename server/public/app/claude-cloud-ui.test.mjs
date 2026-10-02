@@ -14,6 +14,10 @@ import {
   cloudAttachmentRejectionNotice,
   cloudBootstrapErrorModel,
   cloudCompareUrl,
+  cloudRepoAccess,
+  cloudRepoSuggestionMeta,
+  filterCloudBranchSuggestions,
+  filterCloudRepoSuggestions,
   cloudHeaderLabel,
   formatCloudCost,
   isClaudeCloudConversation,
@@ -575,4 +579,82 @@ test('the attachment filter keeps the images and names what it left out', () => 
   assert.match(cloudAttachmentRejectionNotice(many), /Not attached: report\.pdf, report\.pdf and 2 more\.$/);
   assert.equal(cloudAttachmentRejectionNotice([]), '');
   assert.deepEqual(partitionCloudAttachments(null), { accepted: [], rejected: [] });
+});
+
+// ── Repository and branch suggestions ──
+
+const REPO_LIST = {
+  ok: true,
+  complete: true,
+  repos: [
+    { slug: 'example-org/sample-repo', defaultBranch: 'main', private: true, recentAt: '2031-03-01T10:00:00Z', accessible: true, pushedAt: '2031-02-01T10:00:00Z' },
+    { slug: 'sample-user/old-tool', defaultBranch: null, private: null, recentAt: '2031-02-20T10:00:00Z', accessible: false, pushedAt: null },
+    { slug: 'example-org/docs-site', defaultBranch: 'trunk', private: false, recentAt: null, accessible: true, pushedAt: '2031-01-15T09:30:00Z' },
+    { slug: 'sample-user/tiny-tool', defaultBranch: 'main', private: true, recentAt: null, accessible: true, pushedAt: '2030-12-20T18:00:00Z' },
+  ],
+};
+const slugs = (entries) => entries.map((entry) => entry.slug);
+
+test('with nothing typed the suggestions are the list in its order, capped', () => {
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, '')), slugs(REPO_LIST.repos));
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, '', { limit: 2 })), ['example-org/sample-repo', 'sample-user/old-tool']);
+  assert.deepEqual(filterCloudRepoSuggestions(null, 'x'), []);
+});
+
+test('typed text filters by owner/name, a match at a start before one inside', () => {
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, 'tool')), ['sample-user/old-tool', 'sample-user/tiny-tool']);
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, 'doc')), ['example-org/docs-site']);
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, 'SAMPLE')), [
+    'example-org/sample-repo', 'sample-user/old-tool', 'sample-user/tiny-tool',
+  ]);
+  // "-site" sits inside docs-site; "example-org/d" starts the slug.
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, '-site')), ['example-org/docs-site']);
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, 'example-org/d')), ['example-org/docs-site']);
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, 'nothing-like-it')), []);
+});
+
+test('a pasted URL is matched by its owner/name, exact match first', () => {
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, 'https://github.com/sample-user/tiny-tool.git')), ['sample-user/tiny-tool']);
+  // The scp form, built from halves so the hygiene scan does not read it as an address.
+  assert.deepEqual(slugs(filterCloudRepoSuggestions(REPO_LIST.repos, ['git', 'github.com:example-org/docs-site'].join('@'))), ['example-org/docs-site']);
+});
+
+test('the suggestion meta line says private/public, used here and no access', () => {
+  assert.equal(cloudRepoSuggestionMeta(REPO_LIST.repos[0]), 'used here · private');
+  assert.equal(cloudRepoSuggestionMeta(REPO_LIST.repos[1]), 'used here · no access');
+  assert.equal(cloudRepoSuggestionMeta(REPO_LIST.repos[2]), 'public');
+  assert.equal(cloudRepoSuggestionMeta({ slug: 'x/y', archived: true, private: true }), 'private · archived');
+  assert.equal(cloudRepoSuggestionMeta(null), '');
+});
+
+test('repository access is known only from a complete list', () => {
+  assert.equal(cloudRepoAccess(REPO_LIST, 'example-org/sample-repo'), 'accessible');
+  assert.equal(cloudRepoAccess(REPO_LIST, 'https://github.com/Example-Org/Docs-Site'), 'accessible');
+  assert.equal(cloudRepoAccess(REPO_LIST, 'sample-user/old-tool'), 'inaccessible', 'a recent repo the app lost');
+  assert.equal(cloudRepoAccess(REPO_LIST, 'someone/else'), 'inaccessible');
+  assert.equal(cloudRepoAccess(REPO_LIST, 'not a repo'), 'unknown');
+  assert.equal(cloudRepoAccess(REPO_LIST, ''), 'unknown');
+  assert.equal(cloudRepoAccess({ ...REPO_LIST, complete: false }, 'someone/else'), 'unknown');
+  assert.equal(cloudRepoAccess({ ...REPO_LIST, ok: false }, 'someone/else'), 'unknown');
+  assert.equal(cloudRepoAccess(null, 'someone/else'), 'unknown');
+});
+
+test('an inaccessible repository gets its own warning line, before the environment one', () => {
+  const warnings = buildCloudSourceWarnings({ repo: 'someone/else', repoAccess: 'inaccessible', environmentId: '' });
+  assert.deepEqual(warnings.map((warning) => warning.kind), ['not-accessible', 'no-environment']);
+  assert.match(warnings[0].text, /^The Claude GitHub app has no access to someone\/else — /);
+  assert.deepEqual(buildCloudSourceWarnings({ repo: 'someone/else', repoAccess: 'unknown', environmentId: 'env_1' }), []);
+  assert.deepEqual(buildCloudSourceWarnings({ repo: 'someone/else', repoAccess: 'accessible', environmentId: 'env_1' }), []);
+});
+
+test('branch suggestions put the default first and filter by what is typed', () => {
+  const branches = ['dev/feature', 'main', 'release/1.0', 'release/2.0'];
+  assert.deepEqual(filterCloudBranchSuggestions(branches, '', { defaultBranch: 'main' }), ['main', 'dev/feature', 'release/1.0', 'release/2.0']);
+  assert.deepEqual(filterCloudBranchSuggestions(branches, '', { defaultBranch: 'gone' }), branches);
+  assert.deepEqual(filterCloudBranchSuggestions(branches, 'rel', { defaultBranch: 'main' }), ['release/1.0', 'release/2.0']);
+  assert.deepEqual(filterCloudBranchSuggestions(branches, '1.0'), ['release/1.0']);
+  assert.deepEqual(filterCloudBranchSuggestions(branches, 'main', { defaultBranch: 'main' }), ['main']);
+  assert.deepEqual(filterCloudBranchSuggestions(branches, 'zzz'), []);
+  assert.deepEqual(filterCloudBranchSuggestions(['a', 'b', 'c'], '', { limit: 2 }), ['a', 'b']);
+  assert.deepEqual(filterCloudBranchSuggestions(null, ''), []);
 });

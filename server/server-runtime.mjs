@@ -57,6 +57,7 @@ import { createClaudeCloudClient } from '../shared/claude-cloud/api-client.mjs';
 import { resolveClaudeCloudBaseUrl } from '../shared/claude-cloud/base-url.mjs';
 import { createClaudeCloudSettingsService } from './services/claude-cloud-settings-service.mjs';
 import { createClaudeCloudSessionService } from './services/claude-cloud-session-service.mjs';
+import { createClaudeCloudRepoService, listRecentCloudSourcesFromStatements } from './services/claude-cloud-repo-service.mjs';
 import { createClaudeAccountUsageService } from './services/claude-account-usage-service.mjs';
 import { createGitRemoteService } from './services/git-remote-service.mjs';
 import { createCliInstallService, writeCliBinariesToConfigFile } from './services/cli-install-service.mjs';
@@ -2571,6 +2572,14 @@ const claudeCloudSessionService = createClaudeCloudSessionService({
   stmts,
   getCloudClient: () => claudeCloudClient,
   emit: (event, payload) => io.emit(event, payload),
+});
+// The suggestions of the New Chat repository and branch fields: Anthropic's
+// list of what the Claude GitHub app can reach (while the provider is on),
+// the repositories of earlier cloud chats, and `git ls-remote` on the host.
+const claudeCloudRepoService = createClaudeCloudRepoService({
+  cloud: claudeCloudClient,
+  isEnabled: () => claudeCloudSettingsService.getSettings().enabled === true,
+  listRecentCloudSources: () => listRecentCloudSourcesFromStatements(stmts),
 });
 // The account's live usage for the Check Usage modal. The Claude Cloud switch
 // is the consent to use the Claude CLI's login, so nothing is read while it
@@ -6574,6 +6583,7 @@ const sharedRouteDeps = {
   getClaudeCloudProviderSettings,
   claudeCloudSettingsService,
   claudeCloudSessionService,
+  claudeCloudRepoService,
   reconcileUnstartedConversationProviders,
   rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,

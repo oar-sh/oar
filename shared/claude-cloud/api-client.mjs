@@ -31,6 +31,12 @@ const DEFAULT_USER_AGENT = 'oar-claude-cloud';
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const MAX_DETAIL_CHARS = 500;
 const DEFAULT_SESSION_TITLE = 'Untitled session';
+/**
+ * How many pages of the repository list are followed. One page held 61
+ * repositories with no next cursor when measured; the cap keeps a cursor that
+ * never ends from turning into an endless walk.
+ */
+const MAX_REPOSITORY_PAGES = 20;
 
 function abortError() {
   const error = new Error('The operation was aborted');
@@ -572,6 +578,67 @@ export function createClaudeCloudClient({
   }
 
   /**
+   * One entry of the repository list as OAR describes it, or null for one
+   * the cloud cannot clone (`disabled`) or that has no owner and name.
+   */
+  function describeRepository(entry) {
+    const repo = entry?.repo && typeof entry.repo === 'object' ? entry.repo : null;
+    if (!repo || repo.disabled === true) return null;
+    const owner = firstText(repo.owner?.login);
+    const name = firstText(repo.name);
+    if (!owner || !name) return null;
+    const slug = `${owner}/${name}`;
+    return {
+      owner,
+      name,
+      slug,
+      repoUrl: `https://github.com/${slug}`,
+      defaultBranch: firstText(repo.default_branch) || null,
+      private: repo.private === true,
+      archived: repo.archived === true,
+      pushedAt: firstText(repo.pushed_at) || null,
+      description: firstText(repo.description) || null,
+    };
+  }
+
+  /**
+   * The GitHub repositories the Claude GitHub app can reach for the
+   * organisation: `{ repos, complete, raw }`. `repos` are `{ owner, name,
+   * slug, repoUrl, defaultBranch, private, archived, pushedAt, description }`
+   * in the API's order, without the disabled ones and without duplicates;
+   * `complete` is false when the API said its list is not complete or when
+   * the page cap was reached first; `raw` is the list of page bodies as sent.
+   */
+  async function listRepositories() {
+    const organizationId = await getOrganizationId();
+    const repos = [];
+    const seen = new Set();
+    const raw = [];
+    let complete = true;
+    let cursor = null;
+    for (let page = 0; page < MAX_REPOSITORY_PAGES; page += 1) {
+      const query = cursor === null ? '' : `?${new URLSearchParams({ cursor })}`;
+      const { body } = await request('GET', organizationPath(organizationId, `/code/repos${query}`), {
+        headers: { 'x-organization-uuid': organizationId },
+      });
+      raw.push(body);
+      for (const entry of Array.isArray(body?.repos) ? body.repos : []) {
+        const repo = describeRepository(entry);
+        if (!repo || seen.has(repo.slug.toLowerCase())) continue;
+        seen.add(repo.slug.toLowerCase());
+        repos.push(repo);
+      }
+      if (body?.is_complete === false) complete = false;
+      const next = firstText(body?.next_cursor);
+      if (!next) break;
+      cursor = next;
+      // A cursor after the last page allowed: what follows it is missing.
+      if (page === MAX_REPOSITORY_PAGES - 1) complete = false;
+    }
+    return { repos, complete, raw };
+  }
+
+  /**
    * Follow the session's event stream. Calls `onOpen()` once the stream is
    * open and `onEvent({ kind, id, data })` for every frame, one after the
    * other (an async `onEvent` is awaited): `kind` is the `event:` name, `id`
@@ -708,6 +775,7 @@ export function createClaudeCloudClient({
     getAccountUsage,
     getPrepaidCredits,
     getCreditGrantOffer,
+    listRepositories,
     openEventStream,
   };
 }

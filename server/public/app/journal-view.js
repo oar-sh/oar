@@ -35,6 +35,8 @@ import {
   loadClaudeCloudSettings,
   loadCursorSettings,
   loadGitRemote,
+  loadClaudeCloudBranches,
+  loadClaudeCloudRepos,
   loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
@@ -68,8 +70,13 @@ import {
   claudeCloudModelIds,
   cloudBootstrapErrorModel,
   cloudFolderStatusText,
+  cloudRepoAccess,
+  cloudRepoSuggestionMeta,
+  filterCloudBranchSuggestions,
+  filterCloudRepoSuggestions,
   isClaudeCloudConversation,
   newChatRowVisibility,
+  normalizeCloudRepoInput,
   resolveCloudSourceAutoFill,
   validateCloudSourceInputs,
 } from './claude-cloud-ui.mjs';
@@ -133,6 +140,19 @@ let newConversationCloudLookupFolder = null;
 let newConversationCloudAutoFill = null;
 let newConversationCloudLookupSeq = 0;
 let newConversationCloudLookupTimer = null;
+// Suggestions under the two fields: the repositories the Claude GitHub app
+// can reach plus the ones used in earlier cloud chats here (one read per
+// open), and the branches of the repository in the field (read when it
+// changes). `branchAutoFill` is what a folder lookup or a pick wrote into
+// Branch, so a later pick may replace it while a typed branch stays.
+let newConversationCloudRepoList = null;
+let newConversationCloudRepoListPromise = null;
+let newConversationCloudBranchList = null;
+let newConversationCloudBranchSeq = 0;
+let newConversationCloudBranchTimer = null;
+let newConversationCloudBranchAutoFill = '';
+const newConversationCloudSuggestActive = { repo: -1, branch: -1 };
+const NEW_CHAT_CLOUD_SUGGEST_BLUR_MS = 150;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -935,6 +955,7 @@ function syncNewConversationProviderRows(providerType = 'github') {
   const rows = newChatRowVisibility(providerType);
   const cloudRow = document.getElementById('new-conversation-cloud-row');
   if (cloudRow) cloudRow.hidden = !rows.cloudSource;
+  if (rows.cloudSource) void ensureNewConversationCloudRepoList();
   const reasoningRow = document.getElementById('new-conversation-reasoning-row');
   if (reasoningRow) reasoningRow.hidden = !rows.reasoning;
   // The folder line reads differently for a chat that does not run in the folder.
@@ -959,6 +980,7 @@ function renderNewConversationCloudWarnings() {
       repo: repo?.value || '',
       branch: branch?.value || '',
       environmentId: newConversationClaudeCloudSettingsCache?.environmentId || '',
+      repoAccess: cloudRepoAccess(newConversationCloudRepoList, repo?.value || ''),
     })
     : [];
   container.replaceChildren(...warnings.map((warning) => {
@@ -995,11 +1017,249 @@ function resetNewConversationCloudState() {
   newConversationCloudLookupFailed = false;
   newConversationCloudLookupFolder = null;
   newConversationCloudAutoFill = null;
+  if (newConversationCloudBranchTimer) clearTimeout(newConversationCloudBranchTimer);
+  newConversationCloudBranchTimer = null;
+  newConversationCloudBranchSeq += 1;
+  newConversationCloudRepoList = null;
+  newConversationCloudRepoListPromise = null;
+  newConversationCloudBranchList = null;
+  newConversationCloudBranchAutoFill = '';
   const { repo, branch } = newConversationCloudInputs();
   if (repo) repo.value = '';
   if (branch) branch.value = '';
+  hideNewConversationCloudSuggestions('repo');
+  hideNewConversationCloudSuggestions('branch');
   showNewConversationCloudError('');
   renderNewConversationCloudWarnings();
+}
+
+// ── Repository and branch suggestions ──
+
+/** Read the repository list once per open; the warnings and an open list follow. */
+function ensureNewConversationCloudRepoList() {
+  if (newConversationCloudRepoList || newConversationCloudRepoListPromise) return newConversationCloudRepoListPromise;
+  const seq = newConversationCloudLookupSeq;
+  newConversationCloudRepoListPromise = loadClaudeCloudRepos().then((payload) => {
+    // A reset in the meantime (the modal closed) owns the fields now.
+    if (seq !== newConversationCloudLookupSeq) return;
+    newConversationCloudRepoList = payload && typeof payload === 'object' ? payload : { ok: false, repos: [] };
+    newConversationCloudRepoListPromise = null;
+    renderNewConversationCloudWarnings();
+    renderNewConversationCloudSuggestions('repo');
+  }).catch(() => {
+    newConversationCloudRepoListPromise = null;
+  });
+  return newConversationCloudRepoListPromise;
+}
+
+function newConversationCloudSuggestList(field) {
+  return document.getElementById(`new-conversation-cloud-${field}-list`);
+}
+
+/** The entries to offer for what the field holds: `{ value, label, meta }`. */
+function newConversationCloudSuggestions(field) {
+  const { repo, branch } = newConversationCloudInputs();
+  if (field === 'repo') {
+    const entries = Array.isArray(newConversationCloudRepoList?.repos) ? newConversationCloudRepoList.repos : [];
+    return filterCloudRepoSuggestions(entries, repo?.value || '')
+      .map((entry) => ({ value: entry.slug, label: entry.slug, meta: cloudRepoSuggestionMeta(entry) }));
+  }
+  const list = newConversationCloudBranchList;
+  const slug = normalizeCloudRepoInput(repo?.value || '')?.slug || '';
+  if (!list || !slug || list.slug !== slug) return [];
+  // A default branch the pick wrote in is not a filter: the whole list shows.
+  const typed = branch?.value || '';
+  const query = typed && typed === newConversationCloudBranchAutoFill ? '' : typed;
+  return filterCloudBranchSuggestions(list.branches, query, { defaultBranch: list.defaultBranch })
+    .map((name) => ({ value: name, label: name, meta: name === list.defaultBranch ? 'default' : '' }));
+}
+
+function hideNewConversationCloudSuggestions(field) {
+  const list = newConversationCloudSuggestList(field);
+  if (list) {
+    list.hidden = true;
+    list.replaceChildren();
+  }
+  newConversationCloudInputs()[field]?.setAttribute('aria-expanded', 'false');
+  newConversationCloudSuggestActive[field] = -1;
+}
+
+/**
+ * Show the suggestions for a focused field. The list lives in the modal's
+ * flow under the field (a popover would be clipped by the scrolling modal on
+ * a phone). Nothing to offer, or the field not focused: no list.
+ */
+function renderNewConversationCloudSuggestions(field) {
+  const input = newConversationCloudInputs()[field];
+  const list = newConversationCloudSuggestList(field);
+  if (!input || !list) return;
+  if (!isNewConversationCloudSelected() || document.activeElement !== input) {
+    hideNewConversationCloudSuggestions(field);
+    return;
+  }
+  const suggestions = newConversationCloudSuggestions(field);
+  // The list could not be read from Claude Cloud: the recent repositories
+  // are still offered, with the reason under them.
+  const listError = field === 'repo' && newConversationCloudRepoList && newConversationCloudRepoList.ok === false
+    ? String(newConversationCloudRepoList.error?.message || 'The repositories could not be read from Claude Cloud.').trim()
+    : '';
+  if (!suggestions.length && !listError) {
+    hideNewConversationCloudSuggestions(field);
+    return;
+  }
+  const active = Math.min(newConversationCloudSuggestActive[field], suggestions.length - 1);
+  newConversationCloudSuggestActive[field] = active;
+  list.replaceChildren(...suggestions.map((suggestion, index) => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'new-conversation-cloud-suggest-item';
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', index === active ? 'true' : 'false');
+    item.dataset.value = suggestion.value;
+    const label = document.createElement('span');
+    label.textContent = suggestion.label;
+    item.append(label);
+    if (suggestion.meta) {
+      const meta = document.createElement('span');
+      meta.className = 'new-conversation-cloud-suggest-meta';
+      meta.textContent = suggestion.meta;
+      item.append(meta);
+    }
+    return item;
+  }));
+  if (listError) {
+    const note = document.createElement('div');
+    note.className = 'new-conversation-cloud-suggest-note';
+    note.textContent = listError;
+    list.append(note);
+  }
+  list.hidden = false;
+  input.setAttribute('aria-expanded', 'true');
+}
+
+/** A suggestion taken: the field holds it, and a repository brings its default branch along. */
+function pickNewConversationCloudSuggestion(field, value) {
+  const { repo, branch } = newConversationCloudInputs();
+  const input = field === 'repo' ? repo : branch;
+  if (!input) return;
+  input.value = value;
+  hideNewConversationCloudSuggestions(field);
+  if (field === 'repo') {
+    const entries = Array.isArray(newConversationCloudRepoList?.repos) ? newConversationCloudRepoList.repos : [];
+    const entry = entries.find((candidate) => candidate?.slug === value) || null;
+    const defaultBranch = String(entry?.defaultBranch || '').trim();
+    // The default branch is preselected; a branch the user typed is kept.
+    if (branch && (!branch.value.trim() || branch.value === newConversationCloudBranchAutoFill)) {
+      branch.value = defaultBranch;
+      newConversationCloudBranchAutoFill = defaultBranch;
+    }
+    newConversationCloudBranchList = null;
+    scheduleNewConversationCloudBranchLookup(0);
+  }
+  showNewConversationCloudError('');
+  renderNewConversationCloudWarnings();
+  input.focus?.();
+}
+
+/** Read the branches of the repository in the field, unless they are known. */
+async function refreshNewConversationCloudBranches() {
+  const { repo, branch } = newConversationCloudInputs();
+  const slug = normalizeCloudRepoInput(repo?.value || '')?.slug || '';
+  if (!slug) {
+    newConversationCloudBranchList = null;
+    renderNewConversationCloudSuggestions('branch');
+    return;
+  }
+  if (newConversationCloudBranchList?.slug === slug) return;
+  const seq = ++newConversationCloudBranchSeq;
+  const payload = await loadClaudeCloudBranches(slug);
+  if (seq !== newConversationCloudBranchSeq) return;
+  // The host could not read them: the field stays a text field, and the
+  // default branch from the repository list is still offered.
+  const known = (Array.isArray(newConversationCloudRepoList?.repos) ? newConversationCloudRepoList.repos : [])
+    .find((entry) => entry?.slug === slug);
+  const branches = payload?.ok === true && Array.isArray(payload.branches) ? payload.branches : [];
+  const defaultBranch = String((payload?.ok === true && payload.defaultBranch) || known?.defaultBranch || '').trim();
+  newConversationCloudBranchList = { slug, branches, defaultBranch };
+  // Only an empty field takes the default here: the folder's branch belongs
+  // to the folder's repository and stays.
+  if (branch && defaultBranch && !branch.value.trim()) {
+    branch.value = defaultBranch;
+    newConversationCloudBranchAutoFill = defaultBranch;
+    renderNewConversationCloudWarnings();
+  }
+  renderNewConversationCloudSuggestions('branch');
+}
+
+function scheduleNewConversationCloudBranchLookup(delayMs = NEW_CHAT_CLOUD_LOOKUP_DEBOUNCE_MS) {
+  if (newConversationCloudBranchTimer) clearTimeout(newConversationCloudBranchTimer);
+  newConversationCloudBranchTimer = null;
+  if (!isNewConversationCloudSelected()) return;
+  newConversationCloudBranchTimer = setTimeout(() => {
+    newConversationCloudBranchTimer = null;
+    void refreshNewConversationCloudBranches();
+  }, delayMs);
+}
+
+/** Arrow keys walk the open list, Enter takes the marked entry, Escape closes it. */
+function handleNewConversationCloudSuggestKey(field, event) {
+  const list = newConversationCloudSuggestList(field);
+  const open = list && !list.hidden;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    if (!open) {
+      renderNewConversationCloudSuggestions(field);
+      if (!list || list.hidden) return;
+    }
+    const items = [...list.querySelectorAll('.new-conversation-cloud-suggest-item')];
+    if (!items.length) return;
+    const current = newConversationCloudSuggestActive[field];
+    const next = event.key === 'ArrowDown'
+      ? (current + 1) % items.length
+      : (current <= 0 ? items.length - 1 : current - 1);
+    newConversationCloudSuggestActive[field] = next;
+    items.forEach((item, index) => item.setAttribute('aria-selected', index === next ? 'true' : 'false'));
+    items[next]?.scrollIntoView?.({ block: 'nearest' });
+    event.preventDefault();
+    return;
+  }
+  if (!open) return;
+  if (event.key === 'Enter') {
+    const active = list.querySelectorAll('.new-conversation-cloud-suggest-item')[newConversationCloudSuggestActive[field]];
+    if (active) {
+      event.preventDefault();
+      pickNewConversationCloudSuggestion(field, active.dataset.value || '');
+    }
+    return;
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    event.stopPropagation();
+    hideNewConversationCloudSuggestions(field);
+  }
+}
+
+function bindNewConversationCloudSuggestions() {
+  const inputs = newConversationCloudInputs();
+  for (const [field, input] of Object.entries(inputs)) {
+    const list = newConversationCloudSuggestList(field);
+    if (!input || !list || list.dataset.cloudBound === '1') continue;
+    list.dataset.cloudBound = '1';
+    input.addEventListener('focus', () => renderNewConversationCloudSuggestions(field));
+    input.addEventListener('blur', () => {
+      // After the click on an entry, which takes the focus for a moment.
+      setTimeout(() => {
+        if (document.activeElement !== input) hideNewConversationCloudSuggestions(field);
+      }, NEW_CHAT_CLOUD_SUGGEST_BLUR_MS);
+    });
+    input.addEventListener('keydown', (event) => handleNewConversationCloudSuggestKey(field, event));
+    // The entries are buttons: a mousedown would move the focus off the
+    // field and close the list before the click lands.
+    list.addEventListener('mousedown', (event) => event.preventDefault());
+    list.addEventListener('click', (event) => {
+      const item = event.target?.closest?.('.new-conversation-cloud-suggest-item');
+      if (item) pickNewConversationCloudSuggestion(field, item.dataset.value || '');
+    });
+  }
 }
 
 // Reads origin + branch of the selected folder and fills the two fields.
@@ -1034,8 +1294,10 @@ async function refreshNewConversationCloudSource() {
   if (repo) repo.value = next.repo;
   if (branch) branch.value = next.branch;
   newConversationCloudAutoFill = next.autoFill;
+  newConversationCloudBranchAutoFill = next.branch;
   showNewConversationCloudError('');
   renderNewConversationCloudWarnings();
+  scheduleNewConversationCloudBranchLookup(0);
 }
 
 // Debounced: the manual path fires on every keystroke.
@@ -1050,7 +1312,7 @@ function scheduleNewConversationCloudLookup() {
 }
 
 function bindNewConversationCloudInputs() {
-  for (const input of Object.values(newConversationCloudInputs())) {
+  for (const [field, input] of Object.entries(newConversationCloudInputs())) {
     if (!input || input.dataset.cloudBound === '1') continue;
     input.dataset.cloudBound = '1';
     input.addEventListener('input', () => {
@@ -1058,8 +1320,14 @@ function bindNewConversationCloudInputs() {
       // repository and branch; an edit also answers the last error.
       showNewConversationCloudError('');
       renderNewConversationCloudWarnings();
+      newConversationCloudSuggestActive[field] = -1;
+      renderNewConversationCloudSuggestions(field);
+      // A typed branch is the user's own from here on.
+      if (field === 'branch') newConversationCloudBranchAutoFill = '';
+      else scheduleNewConversationCloudBranchLookup();
     });
   }
+  bindNewConversationCloudSuggestions();
 }
 
 function resolveNewConversationDefaultCwd() {

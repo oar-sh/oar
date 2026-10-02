@@ -71,6 +71,15 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-10-02: **Repository picker for Claude Cloud.** New Chat's Repository field suggests the
+  repositories the Claude GitHub app can reach (Anthropic's per-organisation list, `GET
+  /api/oauth/organizations/{org}/code/repos`, read by the relay and cached a minute) with the
+  repositories of earlier cloud chats on this relay first; the Branch field suggests the picked
+  repository's branches as the relay host's git reads them (`git ls-remote`, switchable off with
+  `OAR_CLAUDE_CLOUD_BRANCH_LOOKUP=off`), default branch preselected. A repository not on the list
+  is flagged before the first message. Routes `GET /api/claude-cloud/repos` and
+  `/api/claude-cloud/branches` (`server/services/claude-cloud-repo-service.mjs`); see the
+  "Repository and branch suggestions" row in [claude-cloud.md](claude-cloud.md).
 - 2026-10-02: **Commit attribution in Claude Cloud chats.** The sandbox's Claude Code takes the
   relay's attribution setting as an `apply_flag_settings` control request over the session's event
   API: in the create call in front of the first message, and before a later message when the

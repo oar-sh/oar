@@ -189,7 +189,8 @@ function commitCount(value) {
  * when no folder was looked up), `lookupFailed` a request that did not come
  * back. The folder's unpushed/dirty state only matters while the fields still
  * name that folder's repository and branch: once the user types another one,
- * the cloud clone has nothing to do with the local checkout.
+ * the cloud clone has nothing to do with the local checkout. `repoAccess` is
+ * what cloudRepoAccess said about the repository in the field.
  */
 export function buildCloudSourceWarnings({
   remote = null,
@@ -198,6 +199,7 @@ export function buildCloudSourceWarnings({
   branch = '',
   environmentId = '',
   checkEnvironment = true,
+  repoAccess = 'unknown',
 } = {}) {
   const warnings = [];
   if (lookupFailed || (remote && remote.ok === false)) {
@@ -243,6 +245,16 @@ export function buildCloudSourceWarnings({
       }
     }
   }
+  // A repository the Claude GitHub app cannot reach is refused by the cloud
+  // after the first message; the list of reachable ones says so before it.
+  if (repoAccess === 'inaccessible') {
+    const typedRepo = normalizeCloudRepoInput(repo);
+    warnings.push({
+      kind: 'not-accessible',
+      text: `The Claude GitHub app has no access to ${typedRepo?.slug || 'this repository'} — add it under `
+        + 'GitHub → Settings → Applications → Claude, or pick another repository.',
+    });
+  }
   if (checkEnvironment && !String(environmentId || '').trim()) {
     warnings.push({
       kind: 'no-environment',
@@ -250,6 +262,84 @@ export function buildCloudSourceWarnings({
     });
   }
   return warnings;
+}
+
+// ── Repository and branch suggestions ──
+
+const MAX_SUGGESTIONS = 8;
+
+/**
+ * Whether the Claude GitHub app can reach the repository in the field:
+ * 'accessible', 'inaccessible', or 'unknown' while the list has not loaded,
+ * is incomplete, or the field names no repository yet. `repos` is the payload
+ * of GET /api/claude-cloud/repos.
+ */
+export function cloudRepoAccess(repoList = null, repo = '') {
+  const typed = normalizeCloudRepoInput(repo);
+  if (!typed || !repoList || repoList.ok !== true || repoList.complete !== true) return 'unknown';
+  const entries = Array.isArray(repoList.repos) ? repoList.repos : [];
+  const match = entries.find((entry) => String(entry?.slug || '').toLowerCase() === typed.slug.toLowerCase());
+  if (!match) return 'inaccessible';
+  return match.accessible === false ? 'inaccessible' : 'accessible';
+}
+
+/**
+ * The repositories to offer under the Repository field for what is typed so
+ * far: with nothing typed, the ones used in earlier cloud chats first, then
+ * the rest as the list has them (most recently pushed first); with text,
+ * those whose `owner/name` contains it, a match at the start of the owner or
+ * the name before one in the middle. A URL typed or pasted is matched by its
+ * `owner/name`. At most `limit` entries.
+ */
+export function filterCloudRepoSuggestions(repos = [], query = '', { limit = MAX_SUGGESTIONS } = {}) {
+  const entries = (Array.isArray(repos) ? repos : []).filter((entry) => entry && String(entry.slug || '').trim());
+  const raw = String(query ?? '').trim();
+  const needle = (normalizeCloudRepoInput(raw)?.slug || raw).toLowerCase();
+  if (!needle) return entries.slice(0, limit);
+  const ranked = [];
+  for (const entry of entries) {
+    const slug = String(entry.slug).toLowerCase();
+    const index = slug.indexOf(needle);
+    if (index < 0) continue;
+    const atStart = index === 0 || slug[index - 1] === '/';
+    ranked.push({ entry, rank: slug === needle ? 0 : atStart ? 1 : 2 });
+  }
+  // A stable sort: the list's own order breaks ties.
+  return ranked.sort((left, right) => left.rank - right.rank).map(({ entry }) => entry).slice(0, limit);
+}
+
+/** The second line of a repository suggestion: visibility, and that it was used here before. */
+export function cloudRepoSuggestionMeta(entry = null) {
+  const parts = [];
+  if (entry?.recentAt) parts.push('used here');
+  if (entry?.accessible === false) parts.push('no access');
+  else if (entry?.private === true) parts.push('private');
+  else if (entry?.private === false) parts.push('public');
+  if (entry?.archived === true) parts.push('archived');
+  return parts.join(' · ');
+}
+
+/**
+ * The branches to offer under the Branch field: with nothing typed, the
+ * default branch first and the rest in the order the relay sent them (the
+ * default first, then alphabetical); with text, the names that contain it,
+ * a match at the start first.
+ */
+export function filterCloudBranchSuggestions(branches = [], query = '', { defaultBranch = '', limit = MAX_SUGGESTIONS } = {}) {
+  const names = [...new Set((Array.isArray(branches) ? branches : []).map((name) => String(name || '').trim()).filter(Boolean))];
+  const preferred = String(defaultBranch || '').trim();
+  const ordered = preferred && names.includes(preferred)
+    ? [preferred, ...names.filter((name) => name !== preferred)]
+    : names;
+  const needle = String(query ?? '').trim().toLowerCase();
+  if (!needle) return ordered.slice(0, limit);
+  const ranked = [];
+  for (const name of ordered) {
+    const index = name.toLowerCase().indexOf(needle);
+    if (index < 0) continue;
+    ranked.push({ name, rank: name.toLowerCase() === needle ? 0 : index === 0 ? 1 : 2 });
+  }
+  return ranked.sort((left, right) => left.rank - right.rank).map(({ name }) => name).slice(0, limit);
 }
 
 const BOOTSTRAP_ERROR_FALLBACKS = Object.freeze({

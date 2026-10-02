@@ -292,6 +292,9 @@ export function buildRelayServerEnv({
     // its own relay: the URL of its fake API and a token only the fake knows.
     OAR_CLAUDE_CLOUD_API_BASE_URL: "http://127.0.0.1:9",
     CLAUDE_CODE_OAUTH_TOKEN: "",
+    // The branch suggestions of New Chat → Claude Cloud come from
+    // `git ls-remote` against GitHub; no e2e run may talk to it.
+    OAR_CLAUDE_CLOUD_BRANCH_LOOKUP: "off",
 
     ...(disableCliSpawn ? { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: disableCliSpawn } : {}),
     ...overrides,

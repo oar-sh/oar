@@ -9,6 +9,8 @@ import { expect, test } from "@playwright/test";
 import {
   FAKE_CLOUD_ENVIRONMENTS,
   FAKE_CLOUD_NO_TRAILER,
+  FAKE_CLOUD_ORGANIZATION_ID,
+  FAKE_CLOUD_REPOSITORIES,
   FAKE_CLOUD_OWN_TRAILER,
   FAKE_CLOUD_PUSHED_BRANCH,
   FAKE_CLOUD_QUESTION,
@@ -332,6 +334,33 @@ for (const profile of PROFILES) {
       // The checkout was never pushed, and the cloud only sees GitHub.
       await expect(page.locator('#new-conversation-cloud-warnings [data-kind="no-upstream"]')).toContainText(FOLDER_BRANCH);
 
+      // The Repository field offers what the Claude GitHub app can reach
+      // (the fake's list, read through the relay once per open). The folder's
+      // repository is on it, so it is the one suggestion while the field
+      // names it; emptied, the field offers the whole list.
+      const repoList = page.locator("#new-conversation-cloud-repo-list");
+      const repoItems = repoList.locator(".new-conversation-cloud-suggest-item");
+      await repoInput.focus();
+      await expect(repoList).toBeVisible();
+      await expect(repoItems).toHaveText([/^example-org\/sample-repo/]);
+      await repoInput.fill("");
+      const listed = FAKE_CLOUD_REPOSITORIES.filter((entry) => !entry.repo.disabled).map((entry) => `${entry.repo.owner.login}/${entry.repo.name}`);
+      await expect(repoItems).toHaveCount(listed.length);
+      for (const slug of listed) await expect(repoItems.filter({ hasText: slug })).toHaveCount(1);
+      const listBox = await repoList.boundingBox();
+      expect(listBox.x + listBox.width).toBeLessThanOrEqual(page.viewportSize().width + 1);
+      await repoInput.fill("docs");
+      await expect(repoItems).toHaveText([/^example-org\/docs-site/]);
+      await repoItems.first().click();
+      await expect(repoInput).toHaveValue("example-org/docs-site");
+      await expect(repoList).toBeHidden();
+      // The default branch is preselected. The host's branch lookup is off
+      // in this harness, so the Branch field stays a plain text field.
+      await expect(branchInput).toHaveValue("trunk");
+      await branchInput.focus();
+      await expect(page.locator("#new-conversation-cloud-branch-list")).toBeHidden();
+      expect(fake.requestsTo("GET", `/api/oauth/organizations/${FAKE_CLOUD_ORGANIZATION_ID}/code/repos`).length).toBeGreaterThan(0);
+
       // A repository that is not on GitHub is refused in place.
       await repoInput.fill("https://gitlab.example.com/example-org/sample-repo");
       await confirm.click();
@@ -340,9 +369,12 @@ for (const profile of PROFILES) {
       await expect(repoInput).toHaveAttribute("aria-invalid", "true");
       await expect(modal).toHaveClass(/visible/);
 
-      // Typed by hand: another repository and branch than the folder's.
+      // Typed by hand: another repository and branch than the folder's. It is
+      // not on the list, which the modal says before the first message; the
+      // chat can still be started with it.
       await repoInput.fill(profile.typedRepoUrl);
       await expect(error).toBeHidden();
+      await expect(page.locator('#new-conversation-cloud-warnings [data-kind="not-accessible"]')).toContainText(typedSlug);
       await branchInput.fill(profile.typedBranch);
       const [bootstrap] = await Promise.all([
         page.waitForResponse((response) => response.url().endsWith("/api/conversation/bootstrap"), { timeout: TURN_TIMEOUT }),
