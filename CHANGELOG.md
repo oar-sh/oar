@@ -45,6 +45,9 @@ All notable changes to OAR are documented here. The format follows
   it, and sends it nowhere but to Anthropic. While the provider is off the
   relay fetches nothing with that login, except for cloud chats you created
   before. See "Claude Cloud" in the README.
+  When the cloud agent hands work to a subagent in the background and
+  pauses, the turn stays open and the reply is what the agent says once that
+  work is done.
 - **Check Usage: live Claude limits and a Claude Cloud card.** With Claude
   Cloud switched on, the Claude card reads the 5-hour, weekly and per-model
   limits live from the account when you open the modal, instead of showing

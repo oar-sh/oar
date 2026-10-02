@@ -959,3 +959,107 @@ test('without a model on the message the launch model is used', async () => {
 
   assert.equal(cloud.callsOf('createSession')[0].args.model, 'claude-sonnet-5-5');
 });
+
+// ---------------------------------------------------------------------------
+// Background work of the cloud agent
+
+const backgroundTasks = (sequence, ...descriptions) => cloudEvent(sequence, {
+  type: 'system',
+  subtype: 'background_tasks_changed',
+  tasks: descriptions.map((description, index) => ({ description, task_id: `task-${index + 1}`, task_type: 'local_agent' })),
+});
+
+async function startHeldTurn({ cloud = makeCloud(), runnerOptions = {}, pending = {} } = {}) {
+  const api = makeApi();
+  const { runner, timers } = makeRunner({ api, cloud, ...runnerOptions });
+  const message = relayMessage();
+  const done = runner.handlePendingPayload({ message, ...pending });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(
+    userPrompt(1, 'Add a licence file', claudeCloudMessageUuid(message.id)),
+    assistantToolUse(2, 'Agent', { description: 'Write the licence' }),
+    backgroundTasks(3, 'Write the licence'),
+    assistantText(4, 'The agent is still writing; I will check its work when it is done.'),
+    turnResult(5, { result: 'The agent is still writing; I will check its work when it is done.' }),
+  );
+  await waitFor(() => activityTexts(api).some((text) => /background task/.test(text)), 'hold announced');
+  return { api, cloud, runner, timers, message, done, stream };
+}
+
+test('a result while background work runs does not end the turn; the reply is the agent\'s closing turn', async () => {
+  const { api, runner, done, stream } = await startHeldTurn();
+
+  assert.equal(api.posts('/api/response').length, 0);
+  assert.equal(runner.isTurnActive(), true);
+  assert.ok(activityTexts(api).includes(
+    'Cloud: the agent paused while 1 background task is still running; waiting for the result.',
+  ));
+
+  stream.emit(
+    backgroundTasks(6),
+    assistantText(7, 'The licence file is in place and pushed.'),
+    turnResult(8, { result: 'The licence file is in place and pushed.' }),
+  );
+  await done;
+
+  const responses = api.posts('/api/response');
+  assert.equal(responses.length, 1);
+  assert.equal(responses[0].text, 'The licence file is in place and pushed.');
+  // The stored position is the closing turn's result, not the interim one.
+  assert.equal(api.posts('/api/claude-cloud-session').at(-1).lastSequence, '8');
+});
+
+test('background work that ends without a closing turn settles on the interim reply once the session is idle', async () => {
+  const { api, cloud, timers, done, stream } = await startHeldTurn();
+
+  stream.emit(backgroundTasks(6));
+  await waitFor(() => timers.pending(45_000).length === 1, 'quiet check scheduled');
+  assert.equal(timers.fire(45_000), 1);
+  await done;
+
+  assert.equal(api.posts('/api/response')[0].text, 'The agent is still writing; I will check its work when it is done.');
+  assert.ok(cloud.callsOf('getSession').length >= 1);
+});
+
+test('the quiet check waits while the session is still working', async () => {
+  const cloud = makeCloud({ session: cloudSession({ workerStatus: 'running' }) });
+  const { api, timers, runner, stream } = await startHeldTurn({ cloud });
+
+  stream.emit(backgroundTasks(6));
+  await waitFor(() => timers.pending(45_000).length === 1, 'quiet check scheduled');
+  timers.fire(45_000);
+  await waitFor(() => timers.pending(45_000).length === 1 && cloud.callsOf('getSession').length === 1, 'quiet check rescheduled');
+
+  assert.equal(api.posts('/api/response').length, 0);
+  assert.equal(runner.isTurnActive(), true);
+  await runner.dispose();
+});
+
+test('a held turn ends at the relay\'s background-task timeout with the interim reply and a note', async () => {
+  const { api, timers, done } = await startHeldTurn({ pending: { settings: { backgroundTaskTimeoutMs: 120_000 } } });
+
+  assert.equal(timers.fire(120_000), 1);
+  await done;
+
+  assert.equal(api.posts('/api/response')[0].text, 'The agent is still writing; I will check its work when it is done.');
+  assert.ok(activityTexts(api).some((text) => /background work is still running after 2 min/.test(text)));
+});
+
+test('a failed result ends the turn even while background work runs', async () => {
+  const api = makeApi();
+  const cloud = makeCloud();
+  const { runner } = makeRunner({ api, cloud });
+  const message = relayMessage();
+  const done = runner.handlePendingPayload({ message });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+
+  stream.emit(
+    userPrompt(1, 'Add a licence file', claudeCloudMessageUuid(message.id)),
+    backgroundTasks(2, 'Write the licence'),
+    turnResult(3, { subtype: 'error_max_turns', is_error: true, result: '' }),
+  );
+  await done;
+
+  assert.equal(api.posts('/api/response').length, 1);
+  assert.ok(api.posts('/api/response')[0].terminalError);
+});

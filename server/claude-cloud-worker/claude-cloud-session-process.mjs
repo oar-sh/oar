@@ -157,6 +157,13 @@ export function createClaudeCloudSessionRunner({
   // No byte for this long, keepalives included, and the stream is taken for
   // dead and reopened.
   streamIdleTimeoutMs = 120_000,
+  // How long a turn stays open for background work of the cloud agent (a
+  // subagent, a long command) after the agent ended its own turn; the relay's
+  // background-task timeout replaces it when a delivery carries one.
+  backgroundHoldMs = 60 * 60_000,
+  // Background work is over and nothing has moved for this long: ask the
+  // session whether the agent is still going to say something.
+  backgroundQuietMs = 45_000,
 } = {}) {
   const publisher = createClaudeTurnPublisher({ api, dbg });
   const askUserBridge = createAskUserBridge({
@@ -310,6 +317,12 @@ export function createClaudeCloudSessionRunner({
       interrupted: false,
       interruptSent: false,
       graceTimer: null,
+      // Background work the cloud agent left running (see holdForBackground).
+      backgroundTasks: 0,
+      interim: null,
+      holdMs: backgroundHoldMs,
+      holdTimer: null,
+      quietTimer: null,
       controlState: null,
       normalizer: createClaudeCloudEventNormalizer(),
       // The Claude worker's publisher reads and writes this.
@@ -339,6 +352,7 @@ export function createClaudeCloudSessionRunner({
     t.settled = true;
     if (t.graceTimer) clearTimeoutImpl(t.graceTimer);
     t.graceTimer = null;
+    clearBackgroundTimers(t);
     // The cloud cannot be told to forget a turn: one that ends here without
     // its `result` may still write, and its `result` still comes. A turn
     // given up for a lost stream is not one of them — it is delivered again
@@ -347,6 +361,92 @@ export function createClaudeCloudSessionRunner({
       session.unfinishedTurns += 1;
     }
     t.resolve(outcome);
+  }
+
+  function clearBackgroundTimers(t) {
+    if (t.holdTimer) clearTimeoutImpl(t.holdTimer);
+    if (t.quietTimer) clearTimeoutImpl(t.quietTimer);
+    t.holdTimer = null;
+    t.quietTimer = null;
+  }
+
+  /**
+   * The cloud agent ended its turn while work it started in the background
+   * (a subagent, a long command) still runs. When that work finishes the agent
+   * takes another turn of its own, with a `result` of its own, and that turn
+   * carries the real answer. The relay turn therefore stays open: ending it on
+   * the first `result` would publish "still working on it" as the reply and
+   * lose everything the agent says afterwards, because nothing listens between
+   * relay turns.
+   */
+  async function holdForBackground(t, result) {
+    const first = !t.interim;
+    t.interim = { result };
+    if (!t.holdTimer) {
+      t.holdTimer = setTimeoutImpl(() => {
+        t.holdTimer = null;
+        enqueue(() => endBackgroundHold(t, 'ceiling')).catch(() => {});
+      }, t.holdMs);
+      t.holdTimer?.unref?.();
+    }
+    if (first) {
+      const count = t.backgroundTasks;
+      await publisher.postActivity(
+        t.message,
+        `Cloud: the agent paused while ${count} background task${count === 1 ? '' : 's'} `
+          + `${count === 1 ? 'is' : 'are'} still running; waiting for the result.`,
+      );
+    }
+  }
+
+  /**
+   * The background work is over. Normally the agent now takes its closing
+   * turn; a background command that simply ends may leave it silent. Nothing
+   * new for a while and an idle session mean the interim reply was the last
+   * word.
+   */
+  function scheduleQuietCheck(t) {
+    if (t.quietTimer) clearTimeoutImpl(t.quietTimer);
+    const seenAt = session?.lastSeq ?? 0;
+    t.quietTimer = setTimeoutImpl(() => {
+      t.quietTimer = null;
+      enqueue(async () => {
+        if (t.settled || !t.interim || t.backgroundTasks > 0 || !session) return;
+        if (session.lastSeq !== seenAt) {
+          scheduleQuietCheck(t);
+          return;
+        }
+        let workerStatus = '';
+        try {
+          ({ workerStatus } = readCloudSessionUsage(await withTimeout(cloud.getSession(session.id), sessionReadTimeoutMs)));
+        } catch (error) {
+          dbg('cloud session read failed', error?.message || String(error));
+        }
+        if (t.settled) return;
+        if (workerStatus === 'idle' && session.lastSeq === seenAt) await endBackgroundHold(t, 'quiet');
+        else scheduleQuietCheck(t);
+      }).catch(() => {});
+    }, backgroundQuietMs);
+    t.quietTimer?.unref?.();
+  }
+
+  /** End a held turn on the reply the agent gave before it paused. */
+  async function endBackgroundHold(t, reason) {
+    if (t.settled || !t.interim || !session) return;
+    if (reason === 'ceiling') {
+      // The background work still runs and its closing turn is still to come:
+      // that `result` belongs to this turn, not to the next message.
+      session.unfinishedTurns += 1;
+      await publisher.postActivity(
+        t.message,
+        `Cloud: background work is still running after ${Math.round(t.holdMs / 60_000)} min. The turn ends here; `
+          + `send a message to see how it went${session.url ? ` (${session.url})` : ''}.`,
+      );
+    }
+    t.state.result = t.interim.result;
+    t.state.modelUsage = t.interim.result.modelUsage;
+    session.cursorSeq = Math.max(session.cursorSeq, session.lastSeq);
+    settleTurn(t, { kind: 'result' });
   }
 
   function inTurn(t, sequence) {
@@ -381,11 +481,28 @@ export function createClaudeCloudSessionRunner({
         return;
       }
       if (!inTurn(t, sequence)) return;
-      t.state.result = readCloudResult(payload);
-      t.state.modelUsage = t.state.result.modelUsage;
+      const result = readCloudResult(payload);
+      if (t.backgroundTasks > 0 && !t.interrupted && !result.isError && !result.interrupted) {
+        await holdForBackground(t, result);
+        return;
+      }
+      t.state.result = result;
+      t.state.modelUsage = result.modelUsage;
       session.cursorSeq = Math.max(session.cursorSeq, sequence ?? session.lastSeq);
       settleTurn(t, { kind: 'result' });
       return;
+    }
+
+    if (type === 'system' && String(payload.subtype || '') === 'background_tasks_changed'
+      && inTurn(t, sequence) && session.unfinishedTurns === 0) {
+      t.backgroundTasks = Array.isArray(payload.tasks) ? payload.tasks.length : 0;
+      if (t.interim) {
+        if (t.backgroundTasks === 0) scheduleQuietCheck(t);
+        else if (t.quietTimer) {
+          clearTimeoutImpl(t.quietTimer);
+          t.quietTimer = null;
+        }
+      }
     }
 
     // What an unfinished earlier turn still writes is not this turn's output.
@@ -911,6 +1028,7 @@ export function createClaudeCloudSessionRunner({
     controlPoller?.stop?.(t.controlState);
     if (t.graceTimer) clearTimeoutImpl(t.graceTimer);
     t.graceTimer = null;
+    clearBackgroundTimers(t);
     for (const entry of t.permissions.values()) {
       // The turn is over: a card still open is closed without an answer to
       // the cloud. One the Stop already closed still sends its denial.
@@ -934,6 +1052,8 @@ export function createClaudeCloudSessionRunner({
     }
     clearIdleClose();
     const t = openTurn(message);
+    const relayHoldMs = Number(pending?.settings?.backgroundTaskTimeoutMs);
+    if (Number.isFinite(relayHoldMs) && relayHoldMs > 0) t.holdMs = relayHoldMs;
     turn = t;
     try {
       return await runTurn(t);
