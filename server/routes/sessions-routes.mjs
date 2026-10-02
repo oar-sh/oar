@@ -6857,98 +6857,155 @@ export function registerSessionsRoutes(app, deps) {
   // token/cost diagnostics carried as collapsible detail sections. Each
   // provider is independent — a failing source yields an "unavailable" card
   // rather than a failed response — so the modal always renders something.
+  // The live reads behind the usage modal (GitHub quota and billing, Grok,
+  // Cursor, the Claude account) each take a second or more. The modal asks
+  // for the provider on screen only (`?providers=github,claude`); the other
+  // cards are built from the last live answer kept here, and the answer says
+  // which cards are live (`live`) and when each was read (`fetchedAt`). No
+  // parameter = everything live, as before.
+  const usageLiveCache = {
+    copilot: null, // { summary, error, at }
+    copilotBilling: null, // { value, at }
+    grokBilling: null,
+    cursorBilling: null,
+  };
+  const USAGE_PROVIDER_IDS = ['github', 'claude', 'claude-cloud', 'cursor', 'grok'];
+
+  function parseUsageProviders(raw) {
+    const text = Array.isArray(raw) ? raw.join(',') : String(raw ?? '');
+    if (!text.trim()) return null;
+    const ids = text.split(',').map((part) => part.trim().toLowerCase()).filter(Boolean);
+    if (ids.includes('all')) return null;
+    return new Set(ids.filter((id) => USAGE_PROVIDER_IDS.includes(id)));
+  }
+
   app.get('/api/usage', auth, async (req, res) => {
     const wantsLegacyOnly = String(req.query?.legacy || '').trim() === '1';
+    const requested = parseUsageProviders(req.query?.providers);
+    const live = (id) => requested === null || requested.has(id);
+    const nowIso = () => new Date().toISOString();
 
-    let summary = null;
-    let summaryError = null;
-    try {
-      summary = await fetchUsageSummaryPromise(fetchUsageSummary);
-    } catch (error) {
-      summaryError = String(error?.message || error || 'Failed to fetch usage data');
-    }
+    // The Copilot quota: live, or the last live answer.
+    const readCopilotSummary = async () => {
+      if (!live('github') && usageLiveCache.copilot) return usageLiveCache.copilot;
+      let summary = null;
+      let error = null;
+      try {
+        summary = await fetchUsageSummaryPromise(fetchUsageSummary);
+      } catch (fetchError) {
+        error = String(fetchError?.message || fetchError || 'Failed to fetch usage data');
+      }
+      const entry = { summary, error, at: nowIso() };
+      // A failure is not kept over a good answer.
+      if (summary || !usageLiveCache.copilot) usageLiveCache.copilot = entry;
+      return entry;
+    };
 
     if (wantsLegacyOnly || !planUsageService) {
-      if (!summary) return res.status(500).json({ error: summaryError || 'Usage is unavailable' });
+      const { summary, error } = await readCopilotSummary();
+      if (!summary) return res.status(500).json({ error: error || 'Usage is unavailable' });
       return res.json(summary);
     }
 
-    // Live Claude account usage: started now so that it runs beside the
-    // fetches below, and given three seconds at most. Best-effort like them:
-    // without it the Claude card shows the last turn's snapshot.
-    const claudeAccountPromise = typeof claudeAccountUsageService?.getAccountUsage === 'function'
-      ? Promise.resolve()
-        .then(() => claudeAccountUsageService.getAccountUsage({ timeoutMs: 3000 }))
-        .catch(() => null)
-      : Promise.resolve(null);
-
-    // Billing detail is best-effort and must never delay or fail the card.
-    let billing = null;
-    if (typeof fetchCopilotBillingUsage === 'function') {
+    // Each best-effort read: live when asked for, else the cached answer.
+    const cachedOrLive = async (key, wanted, read) => {
+      if (!wanted && usageLiveCache[key]) return usageLiveCache[key];
+      let value = null;
       try {
-        billing = await fetchCopilotBillingUsage();
-      } catch (error) {
-        billing = { items: [], timePeriod: null, scope: null, error: String(error?.message || error) };
+        value = await read();
+      } catch {
+        value = null;
       }
-    }
+      const entry = { value, at: nowIso() };
+      if (value !== null || !usageLiveCache[key]) usageLiveCache[key] = entry;
+      return entry;
+    };
 
     const claudeSettings = getClaudeProviderSettings();
     const cursorSettings = getCursorProviderSettings();
     const grokSettings = getGrokProviderSettings();
-    // Live Grok subscription quota is best-effort like Copilot billing.
-    let grokBilling = null;
-    if (grokSettings?.enabled === true && typeof fetchGrokBillingUsage === 'function') {
-      try {
-        grokBilling = await fetchGrokBillingUsage();
-      } catch {
-        grokBilling = null;
-      }
-    }
-    // Live Cursor plan quota (dashboard session token) — same best-effort rule.
-    let cursorBilling = null;
-    let cursorDashboardAuth = null;
-    if (cursorSettings?.enabled === true && typeof fetchCursorDashboardUsage === 'function') {
-      try {
-        cursorBilling = await fetchCursorDashboardUsage();
-      } catch {
-        cursorBilling = null;
-      }
-      // Whether a token exists at all decides which of the two very different
-      // "no live bars" explanations the card shows.
-      try {
-        cursorDashboardAuth = getCursorDashboardTokenSettings() || null;
-      } catch {
-        cursorDashboardAuth = null;
-      }
-    }
     let claudeCloudEnabled = false;
     try {
       claudeCloudEnabled = claudeCloudSettingsService?.getSettings?.()?.enabled === true;
     } catch {
       claudeCloudEnabled = false;
     }
+
+    // Live Claude account usage, three seconds at most; without it the
+    // Claude card shows the last turn's snapshot. The service keeps its own
+    // minute of cache; when the modal did not ask for a Claude card live,
+    // the last answer is used however old it is.
+    const wantsClaudeLive = live('claude') || live('claude-cloud');
+    const claudeAccountPromise = typeof claudeAccountUsageService?.getAccountUsage === 'function'
+      ? (wantsClaudeLive
+        ? Promise.resolve()
+          .then(() => claudeAccountUsageService.getAccountUsage({ timeoutMs: 3000 }))
+          .catch(() => null)
+        : Promise.resolve(claudeAccountUsageService.peekAccountUsage?.() ?? null))
+      : Promise.resolve(null);
+
+    // All reads side by side: the modal waits for the slowest, not the sum.
+    const [copilot, billingEntry, grokEntry, cursorEntry, claudeAccount] = await Promise.all([
+      readCopilotSummary(),
+      cachedOrLive('copilotBilling', live('github'), () => (
+        typeof fetchCopilotBillingUsage === 'function'
+          ? fetchCopilotBillingUsage().catch((error) => ({ items: [], timePeriod: null, scope: null, error: String(error?.message || error) }))
+          : null
+      )),
+      cachedOrLive('grokBilling', live('grok'), () => (
+        grokSettings?.enabled === true && typeof fetchGrokBillingUsage === 'function' ? fetchGrokBillingUsage() : null
+      )),
+      cachedOrLive('cursorBilling', live('cursor'), () => (
+        cursorSettings?.enabled === true && typeof fetchCursorDashboardUsage === 'function' ? fetchCursorDashboardUsage() : null
+      )),
+      claudeAccountPromise,
+    ]);
+
+    // Whether a token exists at all decides which of the two very different
+    // "no live bars" explanations the Cursor card shows.
+    let cursorDashboardAuth = null;
+    if (cursorSettings?.enabled === true) {
+      try {
+        cursorDashboardAuth = getCursorDashboardTokenSettings() || null;
+      } catch {
+        cursorDashboardAuth = null;
+      }
+    }
+
     const report = planUsageService.buildReport({
-      copilotSummary: summary,
-      copilotError: summaryError,
-      copilotBilling: billing,
+      copilotSummary: copilot.summary,
+      copilotError: copilot.error,
+      copilotCapturedAt: copilot.at,
+      copilotBilling: billingEntry.value,
       claudeConfigured: claudeSettings?.enabled === true,
-      claudeAccount: await claudeAccountPromise,
+      claudeAccount,
       claudeCloudConfigured: claudeCloudEnabled,
       // The conversation the modal was opened from: a cloud conversation gets
       // its own cost on the Claude Cloud card.
       conversationId: String(req.query?.conversationId || '').trim(),
       cursorConfigured: cursorSettings?.enabled === true,
       cursorAllowances: getCursorPlanAllowanceSettings(),
-      cursorBilling,
+      cursorBilling: cursorEntry.value,
       cursorDashboardAuth,
       grokConfigured: grokSettings?.enabled === true,
       grokAllowances: getGrokPlanAllowanceSettings(),
-      grokBilling,
+      grokBilling: grokEntry.value,
     });
 
     // Legacy top-level fields stay alongside `providers` so an older cached
     // client shell keeps working through a PWA update.
-    return res.json({ ...(summary || {}), ...report });
+    return res.json({
+      ...(copilot.summary || {}),
+      ...report,
+      live: USAGE_PROVIDER_IDS.filter(live),
+      fetchedAt: {
+        github: copilot.at,
+        claude: claudeAccount?.fetchedAt || null,
+        'claude-cloud': claudeAccount?.fetchedAt || null,
+        cursor: cursorEntry.at,
+        grok: grokEntry.at,
+      },
+    });
   });
 
   app.get('/api/settings/cursor-allowance', auth, (_req, res) => {

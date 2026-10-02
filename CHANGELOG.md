@@ -5,6 +5,16 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Check Usage opens at once.** The modal shows the reading it showed last
+  time immediately and reads only the open tab's provider live (the card says
+  "updating…" meanwhile), instead of fetching every provider and showing a
+  spinner until the slowest answered. A tab you switch to is read live when
+  its reading is older than a minute; **Refresh** reads the open tab only.
+  The relay keeps the last live answer of every provider, so the other cards
+  stay filled (`GET /api/usage?providers=…`).
+
 ### Added
 
 - **Commits made from OAR say so.** Claude sessions now end their commit

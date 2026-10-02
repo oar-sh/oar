@@ -52,7 +52,7 @@ async function getUsage(app, query = {}) {
   return res;
 }
 
-function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [] } = {}) {
+function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [], fetchUsageSummary, fetchCopilotBillingUsage, grokEnabled = false, fetchGrokBillingUsage } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   // Only the runtime session rows matter here, so they go in without their conversations.
@@ -73,7 +73,10 @@ function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [] 
     stmts: { ...createSessionRepository(db), ...createMessageRepository(db) },
     runtimeState: {},
     config: {},
-    fetchUsageSummary: (callback) => callback(null, COPILOT_SUMMARY),
+    fetchUsageSummary: fetchUsageSummary || ((callback) => callback(null, COPILOT_SUMMARY)),
+    ...(fetchCopilotBillingUsage ? { fetchCopilotBillingUsage } : {}),
+    ...(fetchGrokBillingUsage ? { fetchGrokBillingUsage } : {}),
+    getGrokProviderSettings: () => ({ enabled: grokEnabled }),
     planUsageService,
     getClaudeProviderSettings: () => ({ enabled: true }),
     claudeCloudSettingsService: { getSettings: () => ({ enabled: cloudEnabled }) },
@@ -150,4 +153,99 @@ test('the legacy answer never asks for the account usage', async () => {
   const res = await getUsage(app, { legacy: '1' });
   assert.deepEqual(res.body, COPILOT_SUMMARY);
   assert.equal(asked, 0);
+});
+
+// ---------------------------------------------------------------------------
+// One provider live, the rest from the last live answer
+
+test('every provider is live when nothing is asked for, and the answer says so', async () => {
+  const { app } = setup({ claudeAccountUsageService: { getAccountUsage: async () => ACCOUNT } });
+  const res = await getUsage(app);
+  assert.deepEqual(res.body.live, ['github', 'claude', 'claude-cloud', 'cursor', 'grok']);
+  assert.equal(typeof res.body.fetchedAt.github, 'string');
+  assert.equal(res.body.fetchedAt.claude, ACCOUNT.fetchedAt);
+  assert.equal(res.body.providers[0].capturedAt, res.body.fetchedAt.github);
+});
+
+test('asked for one provider, the others come from the last live answer without a read', async () => {
+  let quotaReads = 0;
+  let billingReads = 0;
+  let grokReads = 0;
+  const accountCalls = [];
+  const { app } = setup({
+    grokEnabled: true,
+    fetchUsageSummary: (callback) => {
+      quotaReads += 1;
+      callback(null, { ...COPILOT_SUMMARY, premiumInteractions: { remaining: 400 - quotaReads, entitlement: 1500 } });
+    },
+    fetchCopilotBillingUsage: async () => {
+      billingReads += 1;
+      return { items: [], timePeriod: null, scope: 'dev-example', error: null };
+    },
+    fetchGrokBillingUsage: async () => {
+      grokReads += 1;
+      return null;
+    },
+    claudeAccountUsageService: {
+      getAccountUsage: async (options) => { accountCalls.push(['live', options]); return ACCOUNT; },
+      peekAccountUsage: () => { accountCalls.push(['peek']); return { ...ACCOUNT, fetchedAt: '2026-10-02T09:00:00.000Z' }; },
+    },
+  });
+
+  // First open: Copilot live, Claude from the service's own cache.
+  const first = await getUsage(app, { providers: 'github' });
+  assert.deepEqual(first.body.live, ['github']);
+  // Grok has no earlier answer yet, so it is read once even though not asked for.
+  assert.deepEqual([quotaReads, billingReads, grokReads], [1, 1, 1]);
+  assert.deepEqual(accountCalls, [['peek']]);
+  assert.equal(first.body.providers[0].meters[0].used ?? first.body.providers[0].meters[0].remaining, first.body.providers[0].meters[0].used ?? 399);
+  assert.equal(first.body.fetchedAt.claude, '2026-10-02T09:00:00.000Z');
+  const copilotAt = first.body.fetchedAt.github;
+
+  // The Claude tab: only the account is read; Copilot is the earlier answer.
+  const second = await getUsage(app, { providers: 'claude,claude-cloud' });
+  assert.deepEqual(second.body.live, ['claude', 'claude-cloud']);
+  assert.deepEqual([quotaReads, billingReads, grokReads], [1, 1, 1]);
+  assert.deepEqual(accountCalls.at(-1), ['live', { timeoutMs: 3000 }]);
+  assert.equal(second.body.fetchedAt.github, copilotAt);
+  assert.equal(second.body.providers[0].capturedAt, copilotAt);
+  assert.equal(second.body.fetchedAt.claude, ACCOUNT.fetchedAt);
+
+  // Asked for Grok: read again; Copilot still not.
+  const third = await getUsage(app, { providers: 'grok' });
+  assert.deepEqual(third.body.live, ['grok']);
+  assert.deepEqual([quotaReads, billingReads, grokReads], [1, 1, 2]);
+
+  // Unknown ids are ignored; `all` means everything live.
+  const fourth = await getUsage(app, { providers: 'all' });
+  assert.equal(fourth.body.live.length, 5);
+  assert.deepEqual([quotaReads, billingReads, grokReads], [2, 2, 3]);
+});
+
+test('a provider never read live is read on its first request even when not asked for', async () => {
+  let quotaReads = 0;
+  const { app } = setup({
+    fetchUsageSummary: (callback) => { quotaReads += 1; callback(null, COPILOT_SUMMARY); },
+    claudeAccountUsageService: { getAccountUsage: async () => ACCOUNT, peekAccountUsage: () => null },
+  });
+  const res = await getUsage(app, { providers: 'claude' });
+  // Nothing cached for Copilot yet: it is read so the card is not empty.
+  assert.equal(quotaReads, 1);
+  assert.equal(res.body.providers[0].status !== 'unavailable', true);
+  await getUsage(app, { providers: 'claude' });
+  assert.equal(quotaReads, 1, 'and kept from then on');
+});
+
+test('a failed live read does not replace the last good answer', async () => {
+  let fail = false;
+  const { app } = setup({
+    fetchUsageSummary: (callback) => (fail ? callback(new Error('GitHub down')) : callback(null, COPILOT_SUMMARY)),
+    claudeAccountUsageService: { getAccountUsage: async () => ACCOUNT, peekAccountUsage: () => ACCOUNT },
+  });
+  await getUsage(app, { providers: 'github' });
+  fail = true;
+  const failed = await getUsage(app, { providers: 'github' });
+  assert.equal(failed.body.providers[0].status, 'error');
+  const cached = await getUsage(app, { providers: 'claude' });
+  assert.equal(cached.body.providers[0].status, 'ok', 'the good answer is what the cache serves');
 });

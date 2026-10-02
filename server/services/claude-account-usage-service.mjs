@@ -162,5 +162,15 @@ export function createClaudeAccountUsageService({
     return value;
   }
 
-  return { getAccountUsage };
+  /**
+   * The last answer without a read, however old, or null when there is none
+   * (or the provider is off): for a caller that wants the other providers
+   * live and this one as it was.
+   */
+  function peekAccountUsage() {
+    if (!enabled()) return null;
+    return cached?.value || null;
+  }
+
+  return { getAccountUsage, peekAccountUsage };
 }

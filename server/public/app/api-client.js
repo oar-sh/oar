@@ -685,11 +685,18 @@ export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, roo
   });
 }
 
-export async function loadUsageSummary() {
+export async function loadUsageSummary({ providers = null } = {}) {
   // The conversation the modal was opened from: the Claude Cloud card shows
-  // that conversation's own cost next to the totals.
+  // that conversation's own cost next to the totals. `providers` names the
+  // cards to read live (the rest come from the relay's last live answer);
+  // none means everything live.
   const conversationId = String(currentConvId || '').trim();
-  return apiFetch(conversationId ? `/api/usage?conversationId=${encodeURIComponent(conversationId)}` : '/api/usage');
+  const query = new URLSearchParams();
+  if (conversationId) query.set('conversationId', conversationId);
+  const ids = (Array.isArray(providers) ? providers : []).map((id) => String(id || '').trim()).filter(Boolean);
+  if (ids.length) query.set('providers', ids.join(','));
+  const text = query.toString();
+  return apiFetch(text ? `/api/usage?${text}` : '/api/usage');
 }
 
 export async function loadCursorAllowanceSettings() {

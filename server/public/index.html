@@ -2141,6 +2141,13 @@
   }
   .plan-usage-card[data-status="unavailable"],
   .plan-usage-card[data-status="not-configured"] { opacity: 0.72; }
+  /* A card whose provider is being read live while the kept reading shows. */
+  .plan-usage-card[data-updating] .plan-usage-card-title::after {
+    content: " · updating…";
+    font-weight: 400;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
   .plan-usage-card-head {
     display: flex;
     align-items: center;

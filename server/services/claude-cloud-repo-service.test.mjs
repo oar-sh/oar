@@ -311,7 +311,9 @@ test('listBranches runs git ls-remote on the https URL without a shell or a prom
   assert.equal(call.options.env.GIT_TERMINAL_PROMPT, '0');
   assert.equal(typeof call.options.env.GIT_ASKPASS, 'string');
   assert.equal(call.options.env.GCM_INTERACTIVE, 'never');
-  assert.equal(call.options.env.PATH, process.env.PATH, 'git is found as the relay finds it');
+  // platform note: Windows spells the variable `Path`; child processes read it case-insensitively.
+  const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === 'PATH');
+  assert.equal(call.options.env[pathKey], process.env[pathKey], 'git is found as the relay finds it');
 });
 
 test('listBranches accepts every spelling normalizeGitHubRepoUrl does and refuses the rest without running git', async () => {

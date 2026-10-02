@@ -2874,6 +2874,66 @@ async function saveSelectedModelsFromModal() {
 // click pins a provider so the modal's Refresh re-renders onto the same tab
 // instead of snapping back. Reset on every fresh open of the modal.
 let usageTabProviderOverride = null;
+// The last usage report, shown at once on the next open while the open tab's
+// provider is read live; kept across reloads in sessionStorage. `fetchedAt`
+// (per card id) decides whether a tab needs a live read when it is shown.
+const USAGE_REPORT_STORAGE_KEY = 'oar.usage.lastReport.v1';
+const USAGE_LIVE_FRESH_MS = 60_000;
+let lastUsageReport = null;
+let usageRefreshInFlight = null;
+
+function readStoredUsageReport() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(USAGE_REPORT_STORAGE_KEY) || 'null');
+    return parsed && Array.isArray(parsed.providers) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeUsageReport(report) {
+  lastUsageReport = report;
+  try {
+    sessionStorage.setItem(USAGE_REPORT_STORAGE_KEY, JSON.stringify(report));
+  } catch {
+    // Storage full or unavailable: the module copy still serves this page.
+  }
+}
+
+/**
+ * The next report: cards the answer read live replace the kept ones; a card
+ * the answer only served from its cache replaces nothing newer we hold (a
+ * restarted relay has an empty cache and would otherwise blank good cards).
+ */
+function mergeUsageReports(kept, answer) {
+  if (!kept || !Array.isArray(kept.providers)) return answer;
+  const live = new Set(Array.isArray(answer?.live) ? answer.live : []);
+  const fetchedAt = { ...(kept.fetchedAt || {}) };
+  const keptById = new Map(kept.providers.map((card) => [normalizeUsageProvider(card?.provider), card]));
+  const providers = (answer.providers || []).map((card) => {
+    const id = normalizeUsageProvider(card?.provider);
+    const previous = keptById.get(id);
+    if (live.has(id) || !previous) {
+      fetchedAt[id] = answer.fetchedAt?.[id] || new Date().toISOString();
+      return card;
+    }
+    // Unavailable from the cache but known from before: keep what we had.
+    return card?.status === 'unavailable' && previous.status !== 'unavailable' ? previous : card;
+  });
+  return { ...answer, providers, fetchedAt };
+}
+
+function usageCardIsFresh(provider) {
+  const at = Date.parse(String(lastUsageReport?.fetchedAt?.[provider] || ''));
+  return Number.isFinite(at) && Date.now() - at < USAGE_LIVE_FRESH_MS;
+}
+
+/** The "Updating…" marker on one card, while its live read runs. */
+function markUsageCardUpdating(provider, updating) {
+  const body = document.getElementById('summary-modal-body');
+  const card = body?.querySelector(`[data-usage-panel="${CSS.escape(provider)}"]`);
+  if (card) card.toggleAttribute('data-updating', !!updating);
+}
 
 /**
  * Delegated because #summary-modal-body's innerHTML is replaced on every render
@@ -2891,7 +2951,7 @@ function initUsageTabControl() {
   });
 }
 
-/** Pure DOM toggle: switching tabs never refetches `/api/usage`. */
+/** DOM toggle first; a tab whose card is older than a minute is then read live. */
 function selectUsageTab(root, provider) {
   const target = String(provider || '').trim();
   if (!target) return;
@@ -2907,6 +2967,78 @@ function selectUsageTab(root, provider) {
     panel.hidden = panel.dataset.usagePanel !== target;
   }
   usageTabProviderOverride = target;
+  if (!usageCardIsFresh(target)) {
+    refreshUsageProvider(target).catch(() => {});
+  }
+}
+
+/**
+ * Read one provider live and swap the result into the modal. Serialised: a
+ * second request while one runs waits for it and is then made if still
+ * needed (the tab may have changed).
+ */
+async function refreshUsageProvider(provider) {
+  const target = String(provider || '').trim();
+  if (!target) return;
+  if (usageRefreshInFlight) {
+    await usageRefreshInFlight.catch(() => {});
+    if (usageCardIsFresh(target)) return;
+  }
+  markUsageCardUpdating(target, true);
+  const run = (async () => {
+    const [usageResult, authResult] = await Promise.allSettled([
+      loadUsageSummary({ providers: [target] }),
+      getClaudeAuthStatus(),
+    ]);
+    if (usageResult.status === 'rejected') throw usageResult.reason;
+    const answer = usageResult.value;
+    if (!answer || !Array.isArray(answer.providers)) return;
+    if (summaryModalState.kind !== 'usage') {
+      storeUsageReport(mergeUsageReports(lastUsageReport, answer));
+      return;
+    }
+    const account = authResult.status === 'fulfilled' ? claudeAccountFromAuthStatus(authResult.value) : null;
+    renderUsageReport(mergeUsageReports(lastUsageReport, answer), account);
+  })();
+  usageRefreshInFlight = run;
+  try {
+    await run;
+  } finally {
+    if (usageRefreshInFlight === run) usageRefreshInFlight = null;
+    markUsageCardUpdating(target, false);
+  }
+}
+
+/** Render a report into the open modal and keep it for the next open. */
+function renderUsageReport(report, account, { updating = '' } = {}) {
+  storeUsageReport(report);
+  const activeProvider = usageTabProviderOverride
+    || normalizeUsageProvider(activeComposerProviderType());
+  const planHtml = renderPlanUsageHtml(withClaudeAccount(report, account), { activeProvider });
+  if (!planHtml) return false;
+  initUsageTabControl();
+  renderSummaryModalContent({
+    title: 'Plan usage',
+    subtitle: `${planUsageSubtitle(report)}${updating ? ' · updating…' : ''}`,
+    bodyHtml: planHtml,
+    refresh: refreshOpenUsageTab,
+    kind: 'usage',
+  });
+  if (updating) markUsageCardUpdating(updating, true);
+  return true;
+}
+
+/** The modal's Refresh button: the open tab live, nothing else. */
+async function refreshOpenUsageTab() {
+  const body = document.getElementById('summary-modal-body');
+  const active = body?.querySelector('[data-usage-tab].active')?.dataset.usageTab
+    || usageTabProviderOverride
+    || normalizeUsageProvider(activeComposerProviderType());
+  if (!lastUsageReport || !active) {
+    await loadUsageSummaryAndRender();
+    return;
+  }
+  await refreshUsageProvider(active);
 }
 
 /**
@@ -2936,11 +3068,18 @@ function withClaudeAccount(report, account) {
   };
 }
 
+/**
+ * The first open with nothing kept: the open tab's provider is read live and
+ * the other cards come from the relay's cache (or are read once when it has
+ * none). With a kept report, showUsage renders it first and only refreshes.
+ */
 async function loadUsageSummaryAndRender() {
+  const activeProvider = usageTabProviderOverride
+    || normalizeUsageProvider(activeComposerProviderType());
   // Usage is the point of the modal; the account line is a garnish, so the two
   // are settled independently and a failing auth probe cannot blank the cards.
   const [usageResult, authResult] = await Promise.allSettled([
-    loadUsageSummary(),
+    loadUsageSummary({ providers: activeProvider ? [activeProvider] : null }),
     getClaudeAuthStatus(),
   ]);
   if (usageResult.status === 'rejected') throw usageResult.reason;
@@ -2949,20 +3088,7 @@ async function loadUsageSummaryAndRender() {
   const account = authResult.status === 'fulfilled'
     ? claudeAccountFromAuthStatus(authResult.value)
     : null;
-  const activeProvider = usageTabProviderOverride
-    || normalizeUsageProvider(activeComposerProviderType());
-  const planHtml = renderPlanUsageHtml(withClaudeAccount(d, account), { activeProvider });
-  if (planHtml) {
-    initUsageTabControl();
-    renderSummaryModalContent({
-      title: 'Plan usage',
-      subtitle: planUsageSubtitle(d),
-      bodyHtml: planHtml,
-      refresh: loadUsageSummaryAndRender,
-      kind: 'usage',
-    });
-    return;
-  }
+  if (Array.isArray(d.providers) && renderUsageReport(mergeUsageReports(lastUsageReport, d), account)) return;
   // Legacy relay (or a relay without the plan-usage service): fall back to the
   // Copilot-only text summary rather than showing an empty modal.
   const pct = d.premiumInteractions?.percentRemaining != null
@@ -3250,15 +3376,27 @@ async function showUsage() {
     btn.textContent = '⏳';
     btn.disabled = true;
   }
+  // What was shown last time is shown again at once; only the open tab's
+  // provider is read live, and its card is swapped in when the answer comes.
+  const kept = lastUsageReport || readStoredUsageReport();
+  const activeProvider = normalizeUsageProvider(activeComposerProviderType());
   openSummaryModal({
     title: 'Plan usage',
     subtitle: 'Loading…',
-    bodyHtml: '<div class="summary-loading">Fetching plan usage across providers…</div>',
-    refresh: loadUsageSummaryAndRender,
+    bodyHtml: '<div class="summary-loading">Fetching plan usage…</div>',
+    refresh: refreshOpenUsageTab,
     kind: 'usage',
   });
-  setSummaryModalLoading(true);
   try {
+    if (kept && renderUsageReport(kept, null, { updating: activeProvider })) {
+      if (btn) {
+        btn.textContent = btn.id === 'chat-menu-usage' ? '📊 Check Usage' : '📊';
+        btn.disabled = false;
+      }
+      await refreshUsageProvider(activeProvider);
+      return;
+    }
+    setSummaryModalLoading(true);
     await loadUsageSummaryAndRender();
   } catch (e) {
     renderSummaryModalContent({

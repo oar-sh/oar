@@ -446,6 +446,9 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     copilotSummary = null,
     copilotError = null,
     copilotStale = false,
+    // When the quota answer is an earlier one served again (the modal asked
+    // for another provider live), the time it was really read.
+    copilotCapturedAt = null,
     copilotBilling = null,
     claudeConfigured = true,
     // Live account usage (claude-account-usage-service.mjs), or null: it is
@@ -484,7 +487,7 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
         billing: copilotBilling,
         workerUsage: copilotWorkerSnapshot?.payload || null,
         error: copilotError,
-        capturedAt: generatedAt,
+        capturedAt: copilotCapturedAt || generatedAt,
         stale: copilotStale === true,
       }),
       buildClaudePlanCard({
