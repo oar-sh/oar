@@ -9,9 +9,9 @@
  * while context usage describes one session's token window.
  *
  * Every provider normalizer in `plan-usage-<provider>.mjs` emits the same
- * `{ card: { meters, details, links } }` shape so the browser renderer stays
- * provider-agnostic, and so a provider that can only report *some* of its
- * limits degrades to fewer meters rather than to a special-cased layout.
+ * `{ card: { meters, details, notes, links } }` shape so the browser renderer
+ * stays provider-agnostic, and so a provider that can only report *some* of
+ * its limits degrades to fewer meters rather than to a special-cased layout.
  */
 
 export const PLAN_USAGE_VERSION = 2;
@@ -135,12 +135,24 @@ export function resolveMeterMath({
 }
 
 /**
+ * A provider's severity word as a plain lowercase token ("normal",
+ * "warning", …). The vocabulary is the provider's; anything that is not a
+ * simple word is dropped rather than shown.
+ */
+export function toSeverity(value) {
+  const text = String(value ?? '').trim().toLowerCase();
+  return /^[a-z][a-z0-9_-]{0,23}$/.test(text) ? text : null;
+}
+
+/**
  * @param {object} spec
  * @param {string} spec.id            stable key, used by tests and DOM ids
  * @param {string} spec.label         human label
  * @param {'credits'|'requests'|'usd'|'percent'|'tokens'} [spec.unit]
  * @param {boolean} [spec.unlimited]  plan grants unlimited use of this bucket
  * @param {boolean} [spec.estimated]  derived/manual rather than provider-authoritative
+ * @param {string} [spec.severity]    the provider's own word for how close the limit is
+ * @param {'expiry'} [spec.resetKind] `resetAt` is when the allowance ends for good, not when it refills
  * @returns {object|null} null when the meter carries no usable signal at all
  */
 export function buildMeter({
@@ -156,6 +168,8 @@ export function buildMeter({
   unlimited = false,
   estimated = false,
   emphasis = 'primary',
+  severity = null,
+  resetKind = null,
 } = {}) {
   const meterId = toTrimmedString(id);
   const meterLabel = toTrimmedString(label);
@@ -181,7 +195,26 @@ export function buildMeter({
     remaining: math.remaining,
     utilization: math.utilization,
     resetAt: toIsoTimestamp(resetAt),
+    resetKind: resetKind === 'expiry' ? 'expiry' : null,
+    severity: toSeverity(severity),
     note: toTrimmedString(note),
+  };
+}
+
+/**
+ * A line of text on the card itself (not inside a collapsed section), with an
+ * optional link behind it. Same link rule as the card's footer: https only.
+ */
+export function buildCardNote({ id, text, link = null } = {}) {
+  const noteId = toTrimmedString(id);
+  const noteText = toTrimmedString(text);
+  if (!noteId || !noteText) return null;
+  const linkLabel = toTrimmedString(link?.label);
+  const url = toTrimmedString(link?.url);
+  return {
+    id: noteId,
+    text: noteText,
+    link: linkLabel && url && /^https:\/\//i.test(url) ? { label: linkLabel, url } : null,
   };
 }
 
@@ -214,6 +247,7 @@ export function buildProviderCard({
   stale = false,
   meters = [],
   details = [],
+  notes = [],
   links = [],
 } = {}) {
   const providerId = toTrimmedString(provider);
@@ -222,6 +256,7 @@ export function buildProviderCard({
 
   const normalizedMeters = (Array.isArray(meters) ? meters : []).filter(Boolean);
   const normalizedDetails = (Array.isArray(details) ? details : []).filter(Boolean);
+  const normalizedNotes = (Array.isArray(notes) ? notes : []).map((note) => buildCardNote(note || {})).filter(Boolean);
   const normalizedLinks = (Array.isArray(links) ? links : [])
     .map((link) => {
       const linkLabel = toTrimmedString(link?.label);
@@ -245,6 +280,7 @@ export function buildProviderCard({
     stale: stale === true,
     meters: normalizedMeters,
     details: normalizedDetails,
+    notes: normalizedNotes,
     links: normalizedLinks,
   };
 }

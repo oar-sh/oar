@@ -187,6 +187,7 @@ test('the composer placeholder follows the model family', () => {
 
 test('Auto and unknown models fall back to the bound provider', () => {
   assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'claude' }), 'Message Claude…');
+  assert.equal(composerPlaceholderFor({ modelId: '', providerType: 'claude-cloud' }), 'Message Claude…');
   assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'grok' }), 'Message Grok…');
   assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'openai' }), 'Message OpenAI…');
   assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'cursor' }), 'Message Cursor…');

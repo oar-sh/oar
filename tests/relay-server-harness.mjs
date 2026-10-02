@@ -283,6 +283,16 @@ export function buildRelayServerEnv({
     // SetSuspendState.
     OAR_HOST_SUSPEND_DRY_RUN: "1",
 
+    // --- Claude Cloud -----------------------------------------------------
+    // A test relay must never reach the Anthropic API. The cloud client sends
+    // the Claude login to its base URL, so that URL is pinned to a loopback
+    // port nothing listens on, and a login token in the host's environment is
+    // not inherited (the credentials file is already isolated through
+    // CLAUDE_CONFIG_DIR above). tests/claude-cloud.spec.mjs overrides both for
+    // its own relay: the URL of its fake API and a token only the fake knows.
+    OAR_CLAUDE_CLOUD_API_BASE_URL: "http://127.0.0.1:9",
+    CLAUDE_CODE_OAUTH_TOKEN: "",
+
     ...(disableCliSpawn ? { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: disableCliSpawn } : {}),
     ...overrides,
   };
@@ -301,11 +311,28 @@ export async function startRelayServer({
   port,
   ownerPid = process.pid,
   allowCli = false,
+  // Session workers find their relay through the instance's config.json (port
+  // and token), not through the server's command line: `--token` and `--port`
+  // are never persisted. A spec whose relay really launches workers
+  // (tests/claude-cloud.spec.mjs) has both written there before boot.
+  persistWorkerConfig = false,
+  // Receives the state root paths (and the port) and returns the overrides;
+  // for a pin that has to name a path inside the state root.
   overrides = {},
 } = {}) {
   const resolvedPort = port || await reserveFreePort();
   const baseUrl = `http://127.0.0.1:${resolvedPort}`;
   const paths = createStateRoot();
+  if (persistWorkerConfig) {
+    fs.writeFileSync(
+      path.join(paths.stateRoot, "config.json"),
+      `${JSON.stringify({ authToken: token, port: resolvedPort, localhostOnly: true }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+  }
+  const resolvedOverrides = typeof overrides === "function"
+    ? overrides({ ...paths, port: resolvedPort })
+    : overrides;
 
   let stdout = "";
   let stderr = "";
@@ -315,7 +342,7 @@ export async function startRelayServer({
     [serverScript, "--token", token, "--port", String(resolvedPort), "--owner-pid", String(ownerPid)],
     {
       cwd: repoRoot,
-      env: buildRelayServerEnv({ ...paths, allowCli, overrides }),
+      env: buildRelayServerEnv({ ...paths, allowCli, overrides: resolvedOverrides }),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },

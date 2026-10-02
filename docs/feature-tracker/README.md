@@ -1,7 +1,7 @@
 # SDK Feature Tracker
 
-Updated: 2026-09-25
-Scope: `server/` + `server/claude-worker/` + `.github/extensions/web-relay/`
+Updated: 2026-10-02
+Scope: `server/` + `server/claude-worker/` + `server/claude-cloud-worker/` + `shared/claude-cloud/` + `.github/extensions/web-relay/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
 that live in the relay itself (and apply to every provider) are tracked here.
@@ -12,6 +12,7 @@ that live in the relay itself (and apply to every provider) are tracked here.
 | **Copilot (SDK engine)** | The same SDK driven headlessly by a per-conversation Node worker in `server/copilot-worker/` — *implemented, experimental, burn-in pending; opt in per relay* | [copilot-sdk-worker.md](copilot-sdk-worker.md) |
 | **OpenAI (BYOK)** | Rides the Copilot worker via `COPILOT_PROVIDER_*` env vars; image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md) + the core rows below |
 | **Claude** | `@anthropic-ai/claude-agent-sdk` in `server/claude-worker/` | [claude-sdk.md](claude-sdk.md) |
+| **Claude Cloud** | Claude Code cloud sessions (a sandbox at Anthropic on a clone of a GitHub repository), driven over the session API the Claude CLI itself uses by `server/claude-cloud-worker/` + `shared/claude-cloud/` — no SDK, no local agent; *not a documented public API, off by default* | [claude-cloud.md](claude-cloud.md) |
 | **Cursor** | `@cursor/sdk` in `server/cursor-worker/` — *implemented, pending live validation* | [cursor-sdk.md](cursor-sdk.md) |
 | **Grok** | Grok CLI ACP (`grok agent stdio`) in `server/grok-worker/` — host login, no npm agent SDK | [grok-sdk.md](grok-sdk.md) |
 
@@ -26,27 +27,27 @@ Status legend: **Implemented** | **Partial** | **Not implemented**
 The relay-facing contract a provider worker must deliver. This doubles as the implementation
 checklist for a new provider (details per column in the per-SDK files).
 
-| Relay capability | Copilot | Claude | Cursor | Grok |
-| ---------------- | ------- | ------ | ------ | ---- |
-| Turn execution + live reply streaming | Implemented | Implemented | Implemented (`run.stream()` + `onDelta` merged) | Implemented (ACP `session/update`) |
-| Thought / reasoning streaming | Implemented | Implemented | Implemented (`thinking-delta` / `thinking` events) | Implemented |
-| Stop (whole turn) | Implemented | Implemented | Implemented (`run.cancel()` + abort-signal race) | Implemented (`session/cancel`) |
-| Mid-turn steering (message into the live turn) | Implemented (2026-09-25, Claude parity: `immediate` sends, folded/own-run settle by `user.message.delivery`, question/compaction holds hand back `steering-held`, targeted Stop via `interruptMainTurn`, un-steer of queued-lane rows; see [copilot-sdk-worker.md](copilot-sdk-worker.md)) | Implemented — **unbounded per turn** ([claude-sdk.md](claude-sdk.md)); composer says "Steer", stopping lives on the bubbles | Not implemented (messages queue behind the turn) | Not implemented (messages queue behind the turn) |
-| Targeted subagent abort | Partial (capability-probed) | Implemented for backgrounded subagents (`stopTask` via the task↔tool_use_id map, 2026-08-16); in-turn subagents remain whole-turn Stop | Not implemented (SDK gap; button pins "Stop unavailable") | Not implemented (protocol gap) |
-| Question cards (ask user) | Implemented (`onUserInputRequest`) | Implemented (`AskUserQuestion` via `canUseTool`; between-turn background-agent questions ride a continuation turn) | Implemented (`ask_user` custom tool; 10/10 live compliance) | Not implemented — **protocol gap**: ACP has no free-form ask-user surface (only `session/request_permission`, which the relay auto-approves) |
-| Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | n/a | n/a |
-| Plan boards (`plan_ready`) | Implemented (tool detection + text fallback) | Implemented (`ExitPlanMode` + text fallback) | Implemented (text fallback only) | Implemented (text fallback only) |
-| Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | Implemented **with text/thinking attribution** via `tool-call-delta` nested frames (live-verified 2026-08-16) | Implemented (title/name-shaped detection; lifecycle chips) |
-| Per-message model switch | Implemented (both paths since 2026-08-16) | Implemented | Implemented (re-pinned every send — sticky overrides) | Not implemented (locked; 409 + composer pin) |
-| Model discovery / catalog | Implemented | Implemented | Implemented (`Cursor.models.list()`) | Implemented (initialize `_meta.modelState` + CLI fallback) |
-| Reasoning effort per turn | Implemented | Implemented (plus the derived **Ultracode** tier on xhigh-capable models — a settings flag, not an `EffortLevel`) | Implemented (model params; per-model discovery) | Partial (best-effort `_meta`) |
-| Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) | Partial (path notes only) |
-| Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) | Implemented (`session/load`, capability-checked; visible note on fallback) |
-| Context usage display | Implemented (server-derived from `events.jsonl`) | Implemented | Implemented (window from the model's `context` parameter; shared static fallback) | Implemented (`_meta` tokens; shared static fallback) |
-| Auto-compact window control | Not applicable (no compaction primitive) | Implemented (2026-08-20) | Not applicable | Not applicable |
-| Commit attribution (OAR / vanilla / off, per-folder override) | Not applicable (no CLI setting) | Implemented (2026-10-01, `Settings.attribution`) | Not applicable | Not applicable |
-| Auth model | Relay host's CLI login | Relay host's `claude` login, **switchable from the web UI** (`claude auth login/logout`, code pasted back; [claude-sdk.md](claude-sdk.md#account-authentication)) | API key via provider settings (secret-env-file delivery; key rotation respawns workers) | Relay host's `grok` login, **switchable from the web UI** (`grok login --device-auth`, no PTY and nothing pasted back; [grok-sdk.md](grok-sdk.md#account-authentication)) |
-| Provider CLI install / update | Detect-only (npm-global under a prefix the relay user cannot write) | Implemented — install / update / **switch to native installer** when the npm global folder is unwritable | n/a (pure npm SDK, no CLI is ever invoked) | Implemented — install / update ([grok-sdk.md](grok-sdk.md#cli-install)) |
+| Relay capability | Copilot | Claude | Cursor | Grok | Claude Cloud |
+| ---------------- | ------- | ------ | ------ | ---- | ------------ |
+| Turn execution + live reply streaming | Implemented | Implemented | Implemented (`run.stream()` + `onDelta` merged) | Implemented (ACP `session/update`) | Implemented (the session's SSE event stream; text arrives one complete block at a time, no partial frames) |
+| Thought / reasoning streaming | Implemented | Implemented | Implemented (`thinking-delta` / `thinking` events) | Implemented | Implemented (complete `thinking` blocks) |
+| Stop (whole turn) | Implemented | Implemented | Implemented (`run.cancel()` + abort-signal race) | Implemented (`session/cancel`) | Implemented (`interrupt` control request; the turn ends locally when no `result` follows within 30 s) |
+| Mid-turn steering (message into the live turn) | Implemented (2026-09-25, Claude parity: `immediate` sends, folded/own-run settle by `user.message.delivery`, question/compaction holds hand back `steering-held`, targeted Stop via `interruptMainTurn`, un-steer of queued-lane rows; see [copilot-sdk-worker.md](copilot-sdk-worker.md)) | Implemented — **unbounded per turn** ([claude-sdk.md](claude-sdk.md)); composer says "Steer", stopping lives on the bubbles | Not implemented (messages queue behind the turn) | Not implemented (messages queue behind the turn) | Not implemented (single-flight delivery; messages queue behind the turn) |
+| Targeted subagent abort | Partial (capability-probed) | Implemented for backgrounded subagents (`stopTask` via the task↔tool_use_id map, 2026-08-16); in-turn subagents remain whole-turn Stop | Not implemented (SDK gap; button pins "Stop unavailable") | Not implemented (protocol gap) | Not implemented (whole-turn Stop only) |
+| Question cards (ask user) | Implemented (`onUserInputRequest`) | Implemented (`AskUserQuestion` via `canUseTool`; between-turn background-agent questions ride a continuation turn) | Implemented (`ask_user` custom tool; 10/10 live compliance) | Not implemented — **protocol gap**: ACP has no free-form ask-user surface (only `session/request_permission`, which the relay auto-approves) | Implemented (`can_use_tool` control request: `AskUserQuestion` cards, an Allow / Deny card for any other tool; answered with a `control_response` event) |
+| Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | n/a | n/a | n/a |
+| Plan boards (`plan_ready`) | Implemented (tool detection + text fallback) | Implemented (`ExitPlanMode` + text fallback) | Implemented (text fallback only) | Implemented (text fallback only) | Not applicable (no relay modes) |
+| Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | Implemented **with text/thinking attribution** via `tool-call-delta` nested frames (live-verified 2026-08-16) | Implemented (title/name-shaped detection; lifecycle chips) | Implemented (inferred from tool blocks; thoughts and activity attributed, subagent text not published) |
+| Per-message model switch | Implemented (both paths since 2026-08-16) | Implemented | Implemented (re-pinned every send — sticky overrides) | Not implemented (locked; 409 + composer pin) | Not implemented (part of the session's configuration: 409 once the session exists, composer pin from the first message; see [claude-cloud.md](claude-cloud.md) for the launch-model caveat) |
+| Model discovery / catalog | Implemented | Implemented | Implemented (`Cursor.models.list()`) | Implemented (initialize `_meta.modelState` + CLI fallback) | No discovery of its own: the Claude provider's list under plain ids (`buildClaudeCloudModelList`) |
+| Reasoning effort per turn | Implemented | Implemented (plus the derived **Ultracode** tier on xhigh-capable models — a settings flag, not an `EffortLevel`) | Implemented (model params; per-model discovery) | Partial (best-effort `_meta`) | Not applicable (`none` only; `CLAUDE_CLOUD_REASONING_EFFORTS`) |
+| Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) | Partial (path notes only) | Partial (inline images only, jpeg/png/gif/webp ≤ 5 MB; any other attachment refuses the turn, there is no path fallback) |
+| Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) | Implemented (`session/load`, capability-checked; visible note on fallback) | Implemented (`claude_cloud_session_id` + `claude_cloud_last_sequence`; a message uuid derived from the queue row keeps a redelivery from sending twice) |
+| Context usage display | Implemented (server-derived from `events.jsonl`) | Implemented | Implemented (window from the model's `context` parameter; shared static fallback) | Implemented (`_meta` tokens; shared static fallback) | Implemented (the session's `context_usage`, read once after each turn; no categories) |
+| Auto-compact window control | Not applicable (no compaction primitive) | Implemented (2026-08-20) | Not applicable | Not applicable | Not applicable |
+| Commit attribution (OAR / vanilla / off, per-folder override) | Not applicable (no CLI setting) | Implemented (2026-10-01, `Settings.attribution`) | Not applicable | Not applicable | Not applicable (no setting reaches the sandbox) |
+| Auth model | Relay host's CLI login | Relay host's `claude` login, **switchable from the web UI** (`claude auth login/logout`, code pasted back; [claude-sdk.md](claude-sdk.md#account-authentication)) | API key via provider settings (secret-env-file delivery; key rotation respawns workers) | Relay host's `grok` login, **switchable from the web UI** (`grok login --device-auth`, no PTY and nothing pasted back; [grok-sdk.md](grok-sdk.md#account-authentication)) | Relay host's `claude` login (a claude.ai account), read from the CLI's credentials file, never refreshed or stored; the account is changed on the Claude tab ([claude-cloud.md](claude-cloud.md#account-and-authentication)) |
+| Provider CLI install / update | Detect-only (npm-global under a prefix the relay user cannot write) | Implemented — install / update / **switch to native installer** when the npm global folder is unwritable | n/a (pure npm SDK, no CLI is ever invoked) | Implemented — install / update ([grok-sdk.md](grok-sdk.md#cli-install)) | n/a (no CLI runs a turn; the Claude tab's CLI row covers the login) |
 
 ## Relay core (provider-agnostic)
 
@@ -68,6 +69,25 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-10-02: Added the **Claude Cloud** provider (`claude-cloud`, tracked in
+  [claude-cloud.md](claude-cloud.md)): Claude Code cloud sessions as OAR conversations. A provider
+  of its own, never an alias of `claude` (`shared/provider-routing.mjs` →
+  `SESSION_WORKER_PROVIDER_TYPES`), with a worker that runs no agent: it posts the user's messages
+  to the session API the Claude CLI itself uses and follows the session's SSE event stream
+  (`server/claude-cloud-worker/`, client and credentials reader in `shared/claude-cloud/`). The API
+  is not a documented public one, so every expectation about it lives in
+  `shared/claude-cloud/api-client.mjs`, the provider is off by default, and nothing is asked of
+  Anthropic by the settings tab or the usage modal while it is off. New Chat takes a GitHub
+  repository and branch, filled from the folder (`GET /api/git/remote`); the session is created by
+  the first message; the binding (`claude_cloud_session_id`, the sequence number of the last
+  finished turn, the cost) is reported through `POST /api/claude-cloud-session` and stored by
+  migration 0007's columns. Redelivery is safe because the message uuid is derived from the queue
+  row (`claudeCloudMessageUuid`). No steering, no relay modes, no effort, images as the only
+  attachments, and `remote_relay create_session` refuses the provider for now. Check Usage gained a
+  Claude Cloud card and, while the provider is on, live account windows on the Claude card
+  (`claude-account-usage-service.mjs`, `plan-usage-claude-cloud.mjs`, `normalizeClaudeAccountUsage`);
+  the Claude card's extra-usage amounts are now read as minor units (they showed 100 times too
+  high).
 - 2026-09-25: **Post-audit follow-ups.** Background-task panel: subagent rows show the API model the agent
   really runs on (from its `parent_tool_use_id` frames, not the spawn alias) beside the kind pill and the
   live tool call with the transcript's emoji (`recordSubagentActivity` → `model` + `lastToolCall`, published

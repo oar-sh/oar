@@ -322,3 +322,129 @@ test('the subtitle counts reporting providers and the nearest reset', () => {
     'No plan limits reported yet',
   );
 });
+
+// ─── Claude Cloud card, notes, severity, expiry ──────────────────────────────
+
+const CLOUD_CARD = () => ({
+  provider: 'claude-cloud',
+  label: 'Claude Cloud',
+  source: 'live',
+  planName: null,
+  meters: [meter({
+    id: 'claude-cloud-credit-sample',
+    label: 'Cloud sessions credit',
+    unit: 'usd',
+    used: 3.25,
+    allowance: 80,
+    remaining: 76.75,
+    utilization: 4.06,
+    resetAt: '2026-11-20T08:00:00.000Z',
+    resetKind: 'expiry',
+  })],
+  notes: [
+    {
+      id: 'claude-cloud-credit-offer',
+      text: 'A cloud credit of $120.00 is available to claim on claude.ai.',
+      link: { label: 'Open the usage page', url: 'https://claude.ai/settings/usage' },
+    },
+    { id: 'claude-cloud-billing', text: 'Cloud turns spend the cloud credit first.', link: null },
+  ],
+  links: [{ label: 'Claude Code on the web', url: 'https://claude.ai/code' }],
+});
+
+test('the Claude Cloud card gets its own tab and opens for a cloud conversation', () => {
+  const data = multiReport(
+    { provider: 'github', label: 'GitHub Copilot' },
+    { provider: 'claude', label: 'Claude' },
+    CLOUD_CARD(),
+  );
+  assert.equal(resolveActiveUsageProvider(data.providers, 'claude-cloud'), 'claude-cloud');
+  assert.equal(resolveActiveUsageProvider(data.providers, 'claude'), 'claude');
+  const html = renderPlanUsageHtml(data, { now: NOW, activeProvider: 'claude-cloud' });
+  assert.match(html, /id="plan-usage-tab-claude-cloud"[^>]*aria-selected="true"[^>]*>Claude Cloud<\/button>/);
+  assert.match(html, /id="plan-usage-tab-claude"[^>]*aria-selected="false"/);
+  const panel = panelHtml(html, 'claude-cloud');
+  assert.doesNotMatch(panel.slice(0, panel.indexOf('>')), /\shidden/);
+  assert.match(panel, /\$3\.25 of \$80\.00 used · \$76\.75 left/);
+});
+
+test('a credit’s date reads as an expiry, not as a reset', () => {
+  const html = renderPlanUsageHtml(multiReport(CLOUD_CARD()), { now: NOW });
+  assert.match(html, /\$76\.75 left · expires 2026-11-20/);
+  assert.doesNotMatch(html, /resets 2026-11-20/);
+
+  assert.equal(formatResetCountdown('2026-08-11T12:00:00.000Z', NOW, { expiry: true }), 'expires in 3 d');
+  assert.equal(formatResetCountdown('2026-08-08T12:30:00.000Z', NOW, { expiry: true }), 'expires in 30 min');
+  assert.equal(formatResetCountdown('2026-08-08T15:20:00.000Z', NOW, { expiry: true }), 'expires in 3 h 20 min');
+  assert.equal(formatResetCountdown('2026-08-08T11:00:00.000Z', NOW, { expiry: true }), 'expired');
+  assert.equal(formatResetCountdown(null, NOW, { expiry: true }), null);
+});
+
+test('an expiry is not offered as the next reset in the subtitle', () => {
+  assert.equal(planUsageSubtitle(multiReport(CLOUD_CARD())), '1 provider reporting');
+  const mixed = multiReport(CLOUD_CARD(), { provider: 'claude', label: 'Claude', meters: [meter({ resetAt: '2099-01-01T00:00:00.000Z' })] });
+  assert.equal(planUsageSubtitle(mixed), '2 providers reporting · next reset 2099-01-01');
+});
+
+test('card notes render above the details, with their link when they have one', () => {
+  const html = renderPlanUsageHtml(
+    multiReport({
+      ...CLOUD_CARD(),
+      details: [{ id: 'claude-cloud-spend', label: 'Cloud spend', note: null, rows: [{ label: 'All', value: '$1.00', hint: null }] }],
+    }),
+    { now: NOW },
+  );
+  assert.match(
+    html,
+    /<div class="plan-usage-detail-note plan-usage-note" data-note-id="claude-cloud-credit-offer">A cloud credit of \$120\.00 is available to claim on claude\.ai\. <a class="plan-usage-link" href="https:\/\/claude\.ai\/settings\/usage" target="_blank" rel="noopener noreferrer">Open the usage page<\/a><\/div>/,
+  );
+  assert.match(html, /data-note-id="claude-cloud-billing">Cloud turns spend the cloud credit first\.<\/div>/);
+  assert.ok(html.indexOf('data-note-id="claude-cloud-billing"') < html.indexOf('<details'));
+  assert.ok(html.indexOf('data-meter-id="claude-cloud-credit-sample"') < html.indexOf('data-note-id="claude-cloud-credit-offer"'));
+});
+
+test('a note is escaped, and a link that is not https stays text', () => {
+  const html = renderPlanUsageHtml(
+    report({
+      notes: [
+        { id: 'a"b', text: '<b>bold</b>', link: { label: '<i>go</i>', url: 'https://example.com/?a=1&b="2"' } },
+        { id: 'unsafe', text: 'no link here', link: { label: 'click', url: 'javascript:alert(1)' } },
+        { id: 'empty', text: '   ' },
+        null,
+      ],
+    }),
+    { now: NOW },
+  );
+  assert.doesNotMatch(html, /<b>bold<\/b>/);
+  assert.match(html, /&lt;b&gt;bold&lt;\/b&gt;/);
+  assert.match(html, /data-note-id="a&quot;b"/);
+  assert.match(html, /href="https:\/\/example\.com\/\?a=1&amp;b=&quot;2&quot;"/);
+  assert.match(html, /&lt;i&gt;go&lt;\/i&gt;<\/a>/);
+  assert.doesNotMatch(html, /javascript:/);
+  assert.match(html, /data-note-id="unsafe">no link here<\/div>/);
+  assert.doesNotMatch(html, /data-note-id="empty"/);
+});
+
+test('a card without notes renders none', () => {
+  assert.doesNotMatch(renderPlanUsageHtml(report(), { now: NOW }), /plan-usage-note/);
+});
+
+test('a severity other than normal is flagged on its meter', () => {
+  const html = renderPlanUsageHtml(
+    report({
+      meters: [
+        meter({ id: 'calm', severity: 'normal' }),
+        meter({ id: 'none', severity: null }),
+        meter({ id: 'hot', label: 'Weekly limit', severity: 'near_limit' }),
+      ],
+    }),
+    { now: NOW },
+  );
+  const flags = html.match(/plan-usage-flag-severity/g) || [];
+  assert.equal(flags.length, 1);
+  assert.match(html, /Weekly limit<span class="plan-usage-flag plan-usage-flag-severity" data-severity="near_limit">near limit<\/span>/);
+
+  const escaped = renderPlanUsageHtml(report({ meters: [meter({ severity: '<x>' })] }), { now: NOW });
+  assert.doesNotMatch(escaped, /<x>/);
+  assert.match(escaped, /data-severity="&lt;x&gt;"/);
+});

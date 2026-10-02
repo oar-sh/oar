@@ -211,7 +211,7 @@ function createFakeRemote() {
       if (method === 'GET' && path === '/api/relay/identity') return remote.identity;
       if (method === 'GET' && path === '/api/status') return remote.status;
       if (method === 'GET' && path === '/api/models') return remote.models;
-      const settingsMatch = /^\/api\/settings\/(\w+)$/.exec(path);
+      const settingsMatch = /^\/api\/settings\/([\w-]+)$/.exec(path);
       if (method === 'GET' && settingsMatch) {
         const settings = remote.settings[settingsMatch[1]];
         if (!settings) throw notFound();
@@ -1720,7 +1720,9 @@ test('relay_info describes providers, workspaces and modes, tolerating missing r
   assert.equal(result.body.platform, 'linux');
   assert.equal(result.body.protocol, 0, 'no identity route: an older relay');
   const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
-  assert.deepEqual(Object.keys(byName), ['github', 'openai', 'claude', 'cursor', 'grok']);
+  assert.deepEqual(Object.keys(byName), ['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud']);
+  assert.deepEqual(byName['claude-cloud'], { provider: 'claude-cloud', configured: false, defaultModel: null, models: [] },
+    'a relay without the Claude Cloud settings route has no such provider');
   assert.deepEqual(byName.github, {
     provider: 'github',
     configured: true,
@@ -1739,6 +1741,50 @@ test('relay_info describes providers, workspaces and modes, tolerating missing r
   });
   assert.deepEqual(result.body.relayModes, ['plan', 'ask', 'agent', 'autopilot']);
   assert.match(result.body.summary, /OAR 0\.9\.4, providers github, openai, claude/);
+});
+
+test('relay_info lists Claude Cloud when the remote has it switched on, without efforts', async () => {
+  const { run, remote } = setup();
+  remote.settings['claude-cloud'] = {
+    enabled: true,
+    defaultModel: 'claude-sonnet-5-5',
+    environmentId: 'env_01EXAMPLEaaaaaaaaaaaaaaaa',
+    models: ['claude-sonnet-5-5', 'claude-sonnet-5'],
+  };
+  // The cloud's ids are the Claude provider's: its efforts must not leak over.
+  remote.models.reasoningByModel = { 'claude-sonnet-5': ['none', 'low', 'high'] };
+  const result = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(result.status, 200);
+  const cloud = result.body.providers.find((entry) => entry.provider === 'claude-cloud');
+  assert.equal(cloud.configured, true);
+  assert.equal(cloud.defaultModel, 'claude-sonnet-5-5');
+  assert.deepEqual(cloud.models, ['claude-sonnet-5-5', 'claude-sonnet-5']);
+  assert.equal('efforts' in cloud, false);
+  assert.match(cloud.note, /create_session cannot open a Claude Cloud session yet/);
+  assert.equal(JSON.stringify(cloud).includes('env_01EXAMPLE'), false, 'the environment stays on its relay');
+
+  remote.settings['claude-cloud'] = { enabled: false, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
+  const off = await run('relay_info', { relay: 'linux-test' });
+  assert.deepEqual(off.body.providers.find((entry) => entry.provider === 'claude-cloud'), {
+    provider: 'claude-cloud',
+    configured: false,
+    defaultModel: 'claude-sonnet-5-5',
+    models: [],
+  });
+});
+
+test('create_session refuses Claude Cloud: it has no repository to pass, and nothing is created', async () => {
+  const { run, remote } = setup();
+  remote.settings['claude-cloud'] = { enabled: true, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
+  const result = await run('create_session', { relay: 'linux-test', text: PROMPT, provider: 'claude-cloud' });
+  assert.equal(result.status, 400);
+  assert.equal(result.body.ok, false);
+  assert.equal(result.body.code, CODES.invalidInput);
+  assert.match(result.body.error, /clones a GitHub repository/);
+  assert.match(result.body.error, /New Chat on relay "linux-test"/);
+  assert.deepEqual(result.body.providers, ['github', 'openai', 'claude']);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
 });
 
 test('list_sessions maps the remote list; query and active scan pages to fill one', async () => {

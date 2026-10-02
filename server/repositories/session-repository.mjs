@@ -14,6 +14,16 @@ export function createSessionRepository(db) {
     const conversationsHaveOrigin = db.prepare(`PRAGMA table_info(conversations)`).all()
       .some((column) => String(column?.name || '').trim() === 'origin_json');
     const conversationOriginSelect = conversationsHaveOrigin ? 'c.origin_json' : 'NULL AS origin_json';
+    // Claude Cloud conversations (migration 0007): what the cloud session
+    // clones, and what it has cost. NULL on a schema that predates it.
+    const conversationsHaveCloudSource = db.prepare(`PRAGMA table_info(conversations)`).all()
+      .some((column) => String(column?.name || '').trim() === 'cloud_source_json');
+    const conversationCloudSelect = [
+      conversationsHaveCloudSource ? 'c.cloud_source_json' : 'NULL AS cloud_source_json',
+      runtimeSessionColumns.has('claude_cloud_cost_usd')
+        ? 'rs.claude_cloud_cost_usd AS runtime_claude_cloud_cost_usd'
+        : 'NULL AS runtime_claude_cloud_cost_usd',
+    ].join(', ');
     return {
         // conversations
         getConv:        db.prepare(`SELECT * FROM conversations WHERE id = ? AND status != 'deleted'`),
@@ -21,13 +31,17 @@ export function createSessionRepository(db) {
         getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? AND status != 'deleted' ORDER BY updated_at DESC LIMIT 1`),
         listConvIdsMissingRuntimeSession: db.prepare(`SELECT c.id AS id FROM conversations c LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE rs.id IS NULL AND c.status != 'deleted'`),
         runtimeSessionsSupportProviders,
-        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.draft_attachments, ${conversationOriginSelect}, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
+        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.draft_attachments, ${conversationOriginSelect}, ${conversationCloudSelect}, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = 0) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
         insertConv:     db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
         updateConvTime: db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`),
         updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`),
         updateConvPreferences: db.prepare(`UPDATE conversations SET preferred_relay_mode = ?, preferred_model = ?, preferred_reasoning_effort = ?, updated_at = ? WHERE id = ?`),
         updateConvConfiguredWorkspaceRoot: db.prepare(`UPDATE conversations SET configured_workspace_root_path = ?, updated_at = ? WHERE id = ?`),
         updateConvRuntimeWorkspaceRoot: db.prepare(`UPDATE conversations SET runtime_workspace_root_path = ?, updated_at = ? WHERE id = ?`),
+        // Claude Cloud: the repository, branch and environment of the cloud session.
+        updateConvCloudSource: conversationsHaveCloudSource
+          ? db.prepare(`UPDATE conversations SET cloud_source_json = ? WHERE id = ?`)
+          : null,
         seedConvConfiguredWorkspaceRootIfMissing: db.prepare(`UPDATE conversations SET configured_workspace_root_path = ?, updated_at = ? WHERE id = ? AND (configured_workspace_root_path IS NULL OR configured_workspace_root_path = '')`),
         updateConvSeed: db.prepare(`UPDATE conversations SET summary_seed = ?, seed_pending = ?, compacted_from = ?, updated_at = ? WHERE id = ?`),
         markConvCompacted: db.prepare(`UPDATE conversations SET archived = 1, compacted_into = ?, updated_at = ? WHERE id = ?`),
@@ -94,6 +108,19 @@ export function createSessionRepository(db) {
           ? db.prepare(`
               UPDATE runtime_sessions
               SET grok_native_session_id = ?, last_used_at = ?
+              WHERE conversation_id = ?
+            `)
+          : null,
+        // What a Claude Cloud worker reports: the cloud session id, the last
+        // handled event sequence and the cost so far. The caller merges a
+        // report with what is stored (claude-cloud-session-service.mjs).
+        updateRuntimeSessionClaudeCloudSession: runtimeSessionColumns.has('claude_cloud_session_id')
+          ? db.prepare(`
+              UPDATE runtime_sessions
+              SET claude_cloud_session_id = ?,
+                  claude_cloud_last_sequence = ?,
+                  claude_cloud_cost_usd = ?,
+                  last_used_at = ?
               WHERE conversation_id = ?
             `)
           : null,

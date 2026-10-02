@@ -32,6 +32,7 @@ const SOURCE_LABELS = Object.freeze(Object.assign(Object.create(null), {
 const TAB_LABELS = Object.freeze(Object.assign(Object.create(null), {
   github: 'Copilot',
   claude: 'Claude',
+  'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor',
   grok: 'Grok',
 }));
@@ -96,26 +97,32 @@ export function formatAmount(value, unit) {
   return String(Math.round(n * 100) / 100);
 }
 
-export function formatResetCountdown(resetAt, now = new Date()) {
+/**
+ * @param {object} [options]
+ * @param {boolean} [options.expiry] the date is when the allowance ends for
+ *   good (a credit), so it reads "expires …" instead of "resets …"
+ */
+export function formatResetCountdown(resetAt, now = new Date(), { expiry = false } = {}) {
   if (!resetAt) return null;
   const target = new Date(resetAt);
   if (Number.isNaN(target.getTime())) return null;
   const reference = now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date();
+  const verb = expiry ? 'expires' : 'resets';
   const diffMs = target.getTime() - reference.getTime();
-  if (diffMs <= 0) return 'resets now';
+  if (diffMs <= 0) return expiry ? 'expired' : 'resets now';
   const minutes = Math.floor(diffMs / 60000);
-  if (minutes < 60) return `resets in ${Math.max(1, minutes)} min`;
+  if (minutes < 60) return `${verb} in ${Math.max(1, minutes)} min`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) {
     const remainderMinutes = minutes % 60;
-    return remainderMinutes ? `resets in ${hours} h ${remainderMinutes} min` : `resets in ${hours} h`;
+    return remainderMinutes ? `${verb} in ${hours} h ${remainderMinutes} min` : `${verb} in ${hours} h`;
   }
   const days = Math.floor(hours / 24);
   if (days <= 14) {
     const remainderHours = hours % 24;
-    return remainderHours ? `resets in ${days} d ${remainderHours} h` : `resets in ${days} d`;
+    return remainderHours ? `${verb} in ${days} d ${remainderHours} h` : `${verb} in ${days} d`;
   }
-  return `resets ${target.toISOString().slice(0, 10)}`;
+  return `${verb} ${target.toISOString().slice(0, 10)}`;
 }
 
 /**
@@ -153,12 +160,17 @@ function renderMeter(meter, now) {
   const width = meter.unlimited ? 100 : Math.max(0, Math.min(100, utilization ?? 0));
   const color = meter.unlimited ? '#3fb950' : utilizationColor(utilization);
   const summary = meterSummaryText(meter);
-  const countdown = formatResetCountdown(meter.resetAt, now);
+  const countdown = formatResetCountdown(meter.resetAt, now, { expiry: meter.resetKind === 'expiry' });
   const percentLabel = meter.unlimited
     ? '∞'
     : (utilization === null ? '—' : `${Math.round(utilization)}%`);
+  // The provider's own severity word; "normal" is the absence of a warning.
+  const severity = String(meter.severity ?? '').trim().toLowerCase();
   const flags = [
     meter.estimated ? '<span class="plan-usage-flag">estimated</span>' : '',
+    severity && severity !== 'normal'
+      ? `<span class="plan-usage-flag plan-usage-flag-severity" data-severity="${escapeHtml(severity)}">${escapeHtml(severity.replace(/[_-]+/g, ' '))}</span>`
+      : '',
   ].filter(Boolean).join('');
   const meta = [summary, countdown].filter(Boolean).join(' · ');
 
@@ -193,6 +205,19 @@ function renderDetailSection(section) {
   `;
 }
 
+/** A line of text on the card itself, with an optional link behind it. */
+function renderNote(note) {
+  const text = String(note?.text ?? '').trim();
+  if (!text) return '';
+  const url = String(note?.link?.url ?? '').trim();
+  const label = String(note?.link?.label ?? '').trim();
+  // Same rule as the server's: only an absolute https link becomes an href.
+  const link = label && /^https:\/\//i.test(url)
+    ? ` <a class="plan-usage-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`
+    : '';
+  return `<div class="plan-usage-detail-note plan-usage-note" data-note-id="${escapeHtml(note?.id ?? '')}">${escapeHtml(text)}${link}</div>`;
+}
+
 /**
  * The signed-in account under the card title. Three distinct states, because
  * "we could not ask" must not be drawn as "you are logged out": no `account`
@@ -218,6 +243,7 @@ function renderAccountLine(account) {
 function renderCard(card, now, { active = true } = {}) {
   const meters = Array.isArray(card.meters) ? card.meters : [];
   const details = Array.isArray(card.details) ? card.details : [];
+  const notes = Array.isArray(card.notes) ? card.notes.filter(Boolean) : [];
   const links = Array.isArray(card.links) ? card.links : [];
 
   const statusBadge = STATUS_BADGES[card.status];
@@ -255,6 +281,7 @@ function renderCard(card, now, { active = true } = {}) {
       </header>
       ${card.message ? `<div class="plan-usage-message">${escapeHtml(card.message)}</div>` : ''}
       ${metersHtml}
+      ${notes.map(renderNote).join('')}
       ${details.map(renderDetailSection).join('')}
       <div class="plan-usage-card-foot">
         ${capturedLabel ? `<span class="plan-usage-captured">${capturedLabel}</span>` : ''}
@@ -296,8 +323,9 @@ export function planUsageSubtitle(report) {
   if (!providers.length) return 'No usage data available';
   const available = providers.filter((card) => Array.isArray(card.meters) && card.meters.length);
   if (!available.length) return 'No plan limits reported yet';
+  // A credit's expiry is not a reset: nothing refills on that date.
   const soonest = available
-    .flatMap((card) => card.meters.map((meter) => meter.resetAt))
+    .flatMap((card) => card.meters.map((meter) => (meter?.resetKind === 'expiry' ? null : meter?.resetAt)))
     .filter(Boolean)
     .sort()[0];
   const countdown = formatResetCountdown(soonest);

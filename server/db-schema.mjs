@@ -12,6 +12,7 @@ import { ensurePushSubscriptionsTable } from './migrations/0003-push-subscriptio
 import { migrateSteerSettleMarkers } from './migrations/0004-steer-settle-markers.mjs';
 import { migrateRemoteRelays } from './migrations/0005-remote-relays.mjs';
 import { migrateWorkspaceRootSettings } from './migrations/0006-workspace-root-settings.mjs';
+import { migrateClaudeCloud } from './migrations/0007-claude-cloud.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -724,6 +725,14 @@ try {
   migrateWorkspaceRootSettings(db);
 } catch (error) {
   console.warn(`[workspace-root-settings] migration 0006 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Claude Cloud conversations: the cloud session binding and what it clones.
+// Additive columns whose readers tolerate their absence, so a failure is
+// logged and retried next boot like 0006.
+try {
+  migrateClaudeCloud(db);
+} catch (error) {
+  console.warn(`[claude-cloud] migration 0007 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

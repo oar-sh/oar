@@ -60,7 +60,7 @@ export const REMOTE_RELAY_PROMPT_ACTIONS = Object.freeze(['send', 'create_sessio
 export const REMOTE_RELAY_APPROVAL_MODES = Object.freeze(['ask', 'plan']);
 
 export const REMOTE_RELAY_SESSION_SCOPES = Object.freeze(['active', 'recent', 'all']);
-export const REMOTE_RELAY_PROVIDERS = Object.freeze(['github', 'openai', 'claude', 'cursor', 'grok']);
+export const REMOTE_RELAY_PROVIDERS = Object.freeze(['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud']);
 export const REMOTE_RELAY_MODES = Object.freeze(['plan', 'ask', 'agent', 'autopilot']);
 export const REMOTE_RELAY_IF_BUSY = Object.freeze(['queue', 'fail']);
 // Reasoning efforts differ per provider and model (none, low, medium, high,

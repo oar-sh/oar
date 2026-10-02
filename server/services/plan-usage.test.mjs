@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  buildCardNote,
   buildMeter,
   buildProviderCard,
   buildDetailSection,
   resolveMeterMath,
   clampPercent,
+  toSeverity,
 } from './plan-usage-contract.mjs';
 import {
   buildCopilotPlanCard,
@@ -17,8 +19,12 @@ import {
 } from './plan-usage-copilot.mjs';
 import {
   buildClaudePlanCard,
+  buildClaudeSessionSections,
   claudePlanUsageFromResult,
+  formatClaudeMoney,
+  normalizeClaudeAccountUsage,
   normalizeClaudePlanUsage,
+  normalizeClaudePrepaidCredits,
 } from './plan-usage-claude.mjs';
 import {
   applyCursorUsageDelta,
@@ -83,6 +89,44 @@ test('buildDetailSection keeps a real zero and drops empty rows', () => {
     rows: [{ label: 'Zero', value: 0 }, { label: 'Empty', value: '' }, { value: 'orphan' }],
   });
   assert.deepEqual(section.rows, [{ label: 'Zero', value: '0', hint: null }]);
+});
+
+test('a meter carries the provider’s severity word and whether its date is an expiry', () => {
+  const plain = buildMeter({ id: 'm', label: 'Weekly', utilization: 10 });
+  assert.equal(plain.severity, null);
+  assert.equal(plain.resetKind, null);
+  const flagged = buildMeter({ id: 'm', label: 'Weekly', utilization: 95, severity: ' Warning ', resetKind: 'expiry' });
+  assert.equal(flagged.severity, 'warning');
+  assert.equal(flagged.resetKind, 'expiry');
+  assert.equal(buildMeter({ id: 'm', label: 'Weekly', utilization: 1, resetKind: 'whenever' }).resetKind, null);
+});
+
+test('toSeverity keeps a simple word and drops everything else', () => {
+  assert.equal(toSeverity('normal'), 'normal');
+  assert.equal(toSeverity('NEAR_LIMIT'), 'near_limit');
+  assert.equal(toSeverity('<b>bad</b>'), null);
+  assert.equal(toSeverity(''), null);
+  assert.equal(toSeverity(null), null);
+  assert.equal(toSeverity({ level: 3 }), null);
+});
+
+test('card notes keep their text and only an https link', () => {
+  assert.deepEqual(
+    buildCardNote({ id: 'n1', text: ' Shown elsewhere. ', link: { label: 'Open', url: 'https://example.com/usage' } }),
+    { id: 'n1', text: 'Shown elsewhere.', link: { label: 'Open', url: 'https://example.com/usage' } },
+  );
+  assert.equal(buildCardNote({ id: 'n2', text: 'x', link: { label: 'bad', url: 'javascript:alert(1)' } }).link, null);
+  assert.equal(buildCardNote({ id: 'n3', text: 'x' }).link, null);
+  assert.equal(buildCardNote({ id: '', text: 'x' }), null);
+  assert.equal(buildCardNote({ id: 'n4', text: '  ' }), null);
+
+  const card = buildProviderCard({
+    provider: 'claude',
+    label: 'Claude',
+    notes: [{ id: 'a', text: 'kept' }, null, { id: 'b' }],
+  });
+  assert.deepEqual(card.notes, [{ id: 'a', text: 'kept', link: null }]);
+  assert.deepEqual(buildProviderCard({ provider: 'claude', label: 'Claude' }).notes, []);
 });
 
 // ─── Copilot ─────────────────────────────────────────────────────────────────
@@ -320,7 +364,8 @@ const claudeUsageResponse = {
     seven_day: { utilization: 61.5, resets_at: '2026-08-12T00:00:00.000Z' },
     seven_day_opus: { utilization: 12, resets_at: '2026-08-12T00:00:00.000Z' },
     model_scoped: [{ display_name: 'Fable', utilization: 5, resets_at: '2026-08-12T00:00:00.000Z' }],
-    extra_usage: { is_enabled: true, monthly_limit: 50, used_credits: 12.5, utilization: 25, currency: 'USD' },
+    // Minor units of the currency (cents), as the SDK's response schema says.
+    extra_usage: { is_enabled: true, monthly_limit: 5000, used_credits: 1250, utilization: 25, currency: 'USD' },
   },
   behaviors: {
     day: {
@@ -400,6 +445,234 @@ test('a Claude session with no captured usage explains that no hidden turn is ru
   const card = buildClaudePlanCard({ usage: null });
   assert.equal(card.status, 'unavailable');
   assert.match(card.message, /never from a hidden extra turn/);
+});
+
+test('extra-usage amounts are minor units and show as dollars', () => {
+  const usage = normalizeClaudePlanUsage({
+    rate_limits_available: true,
+    rate_limits: { extra_usage: { is_enabled: true, monthly_limit: 8000, used_credits: 250, utilization: null, currency: 'USD' } },
+  });
+  const extra = buildClaudePlanCard({ usage }).meters.find((meter) => meter.id === 'claude-extra-usage');
+  assert.equal(extra.unit, 'usd');
+  assert.equal(extra.used, 2.5);
+  assert.equal(extra.allowance, 80);
+  assert.equal(extra.utilization, 3.13);
+});
+
+// ─── Claude: live account usage ──────────────────────────────────────────────
+
+// The body of the account usage endpoint, with invented readings. Buckets the
+// account does not have arrive as null.
+function accountUsageBody(overrides = {}) {
+  return {
+    five_hour: { utilization: 7, resets_at: '2026-10-02T15:00:00Z', limit_dollars: null, used_dollars: null, remaining_dollars: null, locked_reason: null },
+    seven_day: { utilization: 44, resets_at: '2026-10-06T09:00:00Z', limit_dollars: null, used_dollars: null, remaining_dollars: null, locked_reason: null },
+    seven_day_oauth_apps: null,
+    seven_day_opus: null,
+    seven_day_sonnet: null,
+    extra_usage: { is_enabled: false, monthly_limit: null, used_credits: null, utilization: null, currency: null, decimal_places: null },
+    limits: [
+      { kind: 'session', group: 'session', percent: 7, severity: 'normal', resets_at: '2026-10-02T15:00:00Z', scope: null, is_active: false },
+      { kind: 'weekly_all', group: 'weekly', percent: 44, severity: 'warning', resets_at: '2026-10-06T09:00:00Z', scope: null, is_active: true },
+      {
+        kind: 'weekly_scoped', group: 'weekly', percent: 21, severity: 'normal', resets_at: '2026-10-06T09:00:00Z',
+        scope: { model: { id: null, display_name: 'Fable' }, surface: null }, is_active: false,
+      },
+    ],
+    spend: { used: { amount_minor: 0, currency: 'USD', exponent: 2 }, limit: null, percent: 0, enabled: false, balance: null },
+    seven_day_breakdown: {
+      as_of: '2026-10-02T10:00:00Z',
+      window_started_at: '2026-09-29T09:00:00Z',
+      rows: [
+        { key: 'claude_code', display_name: 'Claude Code', percent: 82.5 },
+        { key: 'chat', display_name: 'Chats', percent: 17.5 },
+        { key: 'cowork', display_name: 'Cowork', percent: 0 },
+        { key: 'other', percent: 0 },
+      ],
+    },
+    ...overrides,
+  };
+}
+
+function liveAccount(overrides = {}) {
+  return { usage: accountUsageBody(), prepaid: null, offer: null, fetchedAt: '2026-10-02T10:00:30.000Z', error: null, ...overrides };
+}
+
+test('live account usage normalizes to windows with severity, the scoped weekly window and the breakdown', () => {
+  const live = normalizeClaudeAccountUsage(accountUsageBody());
+  assert.deepEqual(live.windows, [
+    { id: 'five_hour', label: 'Current session (5 h)', emphasis: 'primary', utilization: 7, resetsAt: '2026-10-02T15:00:00.000Z', severity: 'normal' },
+    { id: 'seven_day', label: 'Weekly limit', emphasis: 'primary', utilization: 44, resetsAt: '2026-10-06T09:00:00.000Z', severity: 'warning' },
+    { id: 'model_scoped:fable', label: 'Weekly Fable', emphasis: 'secondary', utilization: 21, resetsAt: '2026-10-06T09:00:00.000Z', severity: 'normal' },
+  ]);
+  assert.deepEqual(live.breakdown, [
+    { name: 'Claude Code', percent: 82.5 },
+    { name: 'Chats', percent: 17.5 },
+    { name: 'Cowork', percent: 0 },
+    { name: 'other', percent: 0 },
+  ]);
+  assert.equal(live.extraUsage.isEnabled, false);
+});
+
+test('a scoped weekly limit that already has its window only adds the severity', () => {
+  const live = normalizeClaudeAccountUsage(accountUsageBody({
+    seven_day_sonnet: { utilization: 30, resets_at: '2026-10-06T09:00:00Z' },
+    limits: [
+      { kind: 'weekly_scoped', percent: 31, severity: 'critical', resets_at: '2026-10-06T09:00:00Z', scope: { model: { display_name: 'Sonnet' } } },
+      { kind: 'weekly_scoped', percent: 5, severity: 'normal', resets_at: null, scope: { model: null, surface: { display_name: 'Cowork' } } },
+      { kind: 'weekly_scoped', percent: 9, severity: 'normal', scope: null },
+      { kind: 'something_new', percent: 50, severity: 'normal' },
+      null,
+    ],
+  }));
+  assert.deepEqual(live.windows.map((window) => [window.id, window.utilization, window.severity]), [
+    ['five_hour', 7, null],
+    ['seven_day', 44, null],
+    ['seven_day_sonnet', 30, 'critical'],
+    ['model_scoped:cowork', 5, 'normal'],
+  ]);
+});
+
+test('normalizeClaudeAccountUsage rejects bodies with nothing usable', () => {
+  assert.equal(normalizeClaudeAccountUsage(null), null);
+  assert.equal(normalizeClaudeAccountUsage([]), null);
+  assert.equal(normalizeClaudeAccountUsage({ five_hour: null, limits: [], member_dashboard_available: false }), null);
+});
+
+test('with live account usage the Claude card is live, and the snapshot only supplies the session details', () => {
+  const snapshot = normalizeClaudePlanUsage(claudeUsageResponse);
+  const card = buildClaudePlanCard({
+    usage: snapshot,
+    capturedAt: '2026-10-01T08:00:00.000Z',
+    stale: true,
+    account: liveAccount(),
+  });
+  assert.equal(card.status, 'ok');
+  assert.equal(card.source, 'live');
+  assert.equal(card.stale, false);
+  assert.equal(card.capturedAt, '2026-10-02T10:00:30.000Z');
+  assert.equal(card.planName, 'Max');
+  // The snapshot's windows (opus, its own extra usage) are gone: the live body has none.
+  assert.deepEqual(card.meters.map((meter) => [meter.id, meter.label, meter.utilization, meter.severity]), [
+    ['claude-five_hour', 'Current session (5 h)', 7, 'normal'],
+    ['claude-seven_day', 'Weekly limit', 44, 'warning'],
+    ['claude-model_scoped:fable', 'Weekly Fable', 21, 'normal'],
+  ]);
+  assert.equal(card.meters[1].resetAt, '2026-10-06T09:00:00.000Z');
+  assert.equal(card.meters[2].emphasis, 'secondary');
+  assert.deepEqual(card.details.map((section) => section.id), [
+    'claude-week-by-product',
+    'claude-session',
+    'claude-models',
+    'claude-behaviors-day',
+    'claude-agents-day',
+  ]);
+  const byProduct = card.details[0];
+  assert.equal(byProduct.label, 'This week by product');
+  assert.deepEqual(byProduct.rows, [
+    { label: 'Claude Code', value: '82.5%', hint: null },
+    { label: 'Chats', value: '17.5%', hint: null },
+    { label: 'Cowork', value: '0%', hint: null },
+    { label: 'other', value: '0%', hint: null },
+  ]);
+  assert.deepEqual(card.notes, [{
+    id: 'claude-limit-resets',
+    text: 'Limit resets (full / 5-hour) are shown on claude.ai only.',
+    link: { label: 'Open the usage page', url: 'https://claude.ai/settings/usage' },
+  }]);
+});
+
+test('live account usage makes a card without any SDK snapshot', () => {
+  const card = buildClaudePlanCard({ usage: null, account: liveAccount() });
+  assert.equal(card.status, 'ok');
+  assert.equal(card.source, 'live');
+  assert.equal(card.planName, null);
+  assert.equal(card.meters.length, 3);
+  assert.deepEqual(card.details.map((section) => section.id), ['claude-week-by-product']);
+});
+
+test('a non-zero prepaid balance gets a credits row, a zero one does not', () => {
+  const withBalance = buildClaudePlanCard({ account: liveAccount({ prepaid: { amount: 1875, currency: 'USD' } }) });
+  const credits = withBalance.details.find((section) => section.id === 'claude-credits');
+  assert.deepEqual(credits.rows, [{ label: 'Prepaid credits', value: '$18.75', hint: 'Balance of the organisation' }]);
+
+  const euro = buildClaudePlanCard({ account: liveAccount({ prepaid: { amount: 500, currency: 'eur' } }) });
+  assert.equal(euro.details.find((section) => section.id === 'claude-credits').rows[0].value, '5.00 EUR');
+
+  for (const prepaid of [{ amount: 0, currency: 'USD' }, { currency: 'USD' }, null, 'nope']) {
+    const card = buildClaudePlanCard({ account: liveAccount({ prepaid }) });
+    assert.equal(card.details.some((section) => section.id === 'claude-credits'), false);
+  }
+  assert.deepEqual(normalizeClaudePrepaidCredits({ amount: 1875, currency: 'USD' }), { amount: 18.75, currency: 'USD' });
+  assert.equal(formatClaudeMoney(3), '$3.00');
+  assert.equal(formatClaudeMoney(null), null);
+});
+
+test('the account endpoint names the exponent of the extra-usage amounts', () => {
+  // A zero-decimal currency is not divided.
+  const usage = accountUsageBody({
+    extra_usage: { is_enabled: true, monthly_limit: 9000, used_credits: 450, utilization: 5, currency: 'JPY', decimal_places: 0 },
+  });
+  const meter = buildClaudePlanCard({ account: liveAccount({ usage }) }).meters.find((entry) => entry.id === 'claude-extra-usage');
+  assert.equal(meter.unit, 'credits');
+  assert.equal(meter.used, 450);
+  assert.equal(meter.allowance, 9000);
+});
+
+test('a failed live read falls back to the snapshot and says why', () => {
+  const snapshot = normalizeClaudePlanUsage(claudeUsageResponse);
+  const card = buildClaudePlanCard({
+    usage: snapshot,
+    capturedAt: '2026-10-01T08:00:00.000Z',
+    stale: true,
+    account: { usage: null, prepaid: null, offer: null, fetchedAt: '2026-10-02T10:00:30.000Z', error: 'The Claude login has expired.' },
+  });
+  assert.equal(card.source, 'cache');
+  assert.equal(card.stale, true);
+  assert.equal(card.capturedAt, '2026-10-01T08:00:00.000Z');
+  assert.equal(card.meters[0].id, 'claude-five_hour');
+  assert.equal(card.meters[0].utilization, 32);
+  assert.equal(card.notes.length, 1);
+  assert.equal(card.notes[0].id, 'claude-live-unavailable');
+  assert.match(card.notes[0].text, /The Claude login has expired\./);
+  assert.equal(card.notes[0].link, null);
+
+  // No live read at all (Claude Cloud is off): the card is what it always was.
+  const plain = buildClaudePlanCard({ usage: snapshot, stale: true, account: null });
+  assert.deepEqual(plain.notes, []);
+  assert.equal(plain.source, 'cache');
+});
+
+test('a live body without a single window leaves the snapshot in place', () => {
+  const snapshot = normalizeClaudePlanUsage(claudeUsageResponse);
+  const card = buildClaudePlanCard({
+    usage: snapshot,
+    stale: true,
+    account: liveAccount({ usage: { five_hour: null, seven_day: null, limits: [] } }),
+  });
+  assert.equal(card.source, 'cache');
+  assert.equal(card.meters[0].utilization, 32);
+  const none = buildClaudePlanCard({ usage: null, account: liveAccount({ usage: { five_hour: null } }) });
+  assert.equal(none.status, 'unavailable');
+});
+
+test('a disabled Claude provider stays not configured whatever the account says', () => {
+  const card = buildClaudePlanCard({ configured: false, account: liveAccount() });
+  assert.equal(card.status, 'not-configured');
+  assert.equal(card.meters.length, 0);
+});
+
+test('the session sections can be issued under another id and wording', () => {
+  const session = claudePlanUsageFromResult({
+    modelUsage: { 'claude-sonnet-5': { inputTokens: 1200, outputTokens: 300, costUSD: 0.04 } },
+    totalCostUsd: 0.04,
+  }).session;
+  const sections = buildClaudeSessionSections(session, {
+    idPrefix: 'sample', sessionLabel: 'Totals', modelsLabel: 'Models', costLabel: 'Cost', costHint: 'as reported',
+  });
+  assert.deepEqual(sections.map((section) => [section.id, section.label]), [['sample-session', 'Totals'], ['sample-models', 'Models']]);
+  assert.deepEqual(sections[0].rows, [{ label: 'Cost', value: '$0.04', hint: 'as reported' }]);
+  assert.deepEqual(buildClaudeSessionSections(null), []);
 });
 
 // ─── Cursor ──────────────────────────────────────────────────────────────────

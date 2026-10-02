@@ -150,7 +150,9 @@ test('tmux shell command never embeds the cursor api key', () => {
 });
 
 test('worker secret env vars cover the copilot provider and cursor keys', () => {
-  assert.deepEqual([...WORKER_SECRET_ENV_VARS], ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY']);
+  // The Claude login token is the third; it goes to the Claude Cloud worker
+  // only (session-worker-launch-service.claude-cloud.test.mjs).
+  assert.deepEqual([...WORKER_SECRET_ENV_VARS], ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
 });
 
 function createRecordingFsImpl(calls) {

@@ -43,6 +43,8 @@ import { ANSWERED_ELSEWHERE_KIND, STEER_FOLDED_TEXT } from '../../shared/steer-s
 import { isLiveResend } from '../services/steer-resend.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
+import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
+import { buildClaudeCloudDelivery, isClaudeCloudProviderType } from '../services/claude-cloud-session-service.mjs';
 import {
   admitRemoteRelayRequest,
   findMentionedRemoteRelays,
@@ -114,6 +116,8 @@ function normalizeRequestedProviderType(value = '') {
   // "no provider stated" and the guards below could never fire.
   if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
   if (normalized === 'claude' || normalized === 'anthropic') return 'claude';
+  // Its own provider, never read as `claude`.
+  if (normalized === 'claude-cloud') return 'claude-cloud';
   return '';
 }
 
@@ -121,6 +125,7 @@ const BOOTSTRAP_ONLY_PROVIDER_LABELS = Object.freeze({
   cursor: 'Cursor',
   grok: 'Grok',
   claude: 'Claude',
+  'claude-cloud': 'Claude Cloud',
 });
 
 function deriveModelOrigin(model) {
@@ -1121,6 +1126,7 @@ export function buildDequeuedRelayMessage({
   defaultRelayMode,
   defaultModel,
   getCursorProviderSettings = () => null,
+  getClaudeCloudProviderSettings = () => null,
 } = {}) {
   if (!msg) return null;
   const attachments = parseAttachments(msg.attachments).map(hydrateAttachment).filter(Boolean);
@@ -1150,6 +1156,17 @@ export function buildDequeuedRelayMessage({
       .map((value) => String(value || '').trim())
       .filter(Boolean);
   }
+  // A Claude Cloud worker creates its session from the first delivered
+  // message and sends into it afterwards: the repository, the branch and the
+  // binding it reported ride on every message, so a restarted worker needs
+  // nothing but the delivery. Other providers never get the field.
+  const claudeCloud = isClaudeCloudProviderType(providerType)
+    ? buildClaudeCloudDelivery({
+        conversation: stmts.getConvAnyStatus?.get?.(msg.conversation_id) || null,
+        runtimeSession,
+        fallbackEnvironmentId: getClaudeCloudProviderSettings()?.environmentId || '',
+      })
+    : null;
   return {
     id: msg.id,
     conversationId: msg.conversation_id,
@@ -1163,6 +1180,7 @@ export function buildDequeuedRelayMessage({
     cursorAgentId: String(runtimeSession?.cursor_agent_id || '').trim() || null,
     cursorSubagentModels,
     grokNativeSessionId: String(runtimeSession?.grok_native_session_id || '').trim() || null,
+    ...(isClaudeCloudProviderType(providerType) ? { claudeCloud } : {}),
     reasoningEffort: String(msg.reasoning_effort || '').trim() || null,
     contextTier: String(msg.context_tier || '').trim() || 'default',
     quality: normalizeOpenAIImageQuality(msg.reasoning_effort),
@@ -1783,6 +1801,7 @@ export function registerMessagesRoutes(app, deps) {
     getClaudeProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     getCursorProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     getGrokProviderSettings = () => ({ enabled: false, model: '', models: [] }),
+    getClaudeCloudProviderSettings = () => ({ enabled: false, defaultModel: '', environmentId: '', models: [] }),
     rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
@@ -4166,7 +4185,8 @@ export function registerMessagesRoutes(app, deps) {
     const runtimeBoundToExplicitProvider = runtimeProviderType === 'openai'
       || runtimeProviderType === 'claude'
       || runtimeProviderType === 'cursor'
-      || runtimeProviderType === 'grok';
+      || runtimeProviderType === 'grok'
+      || runtimeProviderType === 'claude-cloud';
     const configuredOpenAIModel = String(configuredOpenAI?.model || '').trim();
     const availableOpenAIModels = new Set(
       (Array.isArray(configuredOpenAI?.models) ? configuredOpenAI.models : [])
@@ -4289,6 +4309,17 @@ export function registerMessagesRoutes(app, deps) {
           code: 'GROK_MODEL_REQUIRES_NEW_CONVERSATION',
         });
       }
+    }
+    // Claude Cloud conversations are bootstrap-created only as well: each
+    // carries the repository its cloud session clones. Only an explicit
+    // provider counts here — the cloud's model ids are the Claude provider's
+    // own, so an id alone never means "cloud".
+    const runtimeUsesClaudeCloud = runtimeProviderType === 'claude-cloud';
+    if (!shouldCreateConversation && !runtimeUsesClaudeCloud && requestedProviderType === 'claude-cloud') {
+      return res.status(409).json({
+        error: 'Claude Cloud requires creating a new Claude Cloud conversation',
+        code: 'CLAUDE_CLOUD_REQUIRES_NEW_CONVERSATION',
+      });
     }
     if (
       useOpenAIProvider
@@ -4422,6 +4453,40 @@ export function registerMessagesRoutes(app, deps) {
     const grokModel = runtimeUsesGrok
       ? (pinnedGrokModel || String(configuredGrok?.model || '').trim())
       : '';
+    // Claude Cloud conversations resolve models against the cloud provider's
+    // own list (plain ids, no "[1m]" tier). The model is part of the cloud
+    // session's configuration: it can still change before the first message
+    // creates that session, and is locked afterwards.
+    const configuredClaudeCloud = runtimeUsesClaudeCloud ? getClaudeCloudProviderSettings() : null;
+    const pinnedClaudeCloudModel = runtimeUsesClaudeCloud
+      ? stripModelTierSuffix(existingRuntimeSession?.provider_model)
+      : '';
+    const claudeCloudModelSelection = runtimeUsesClaudeCloud
+      ? resolveProviderModelSelection({
+          requestedModel: stripModelTierSuffix(model),
+          configuredModel: pinnedClaudeCloudModel || String(configuredClaudeCloud?.defaultModel || '').trim(),
+          availableModels: Array.isArray(configuredClaudeCloud?.models) ? configuredClaudeCloud.models : [],
+        })
+      : null;
+    if (claudeCloudModelSelection && !claudeCloudModelSelection.ok) {
+      return res.status(400).json({
+        error: `Claude Cloud model "${claudeCloudModelSelection.requestedModel}" is not available`,
+        code: 'CLAUDE_CLOUD_MODEL_UNAVAILABLE',
+        supportedModels: claudeCloudModelSelection.availableModels || [],
+      });
+    }
+    const claudeCloudModel = claudeCloudModelSelection ? claudeCloudModelSelection.model : '';
+    if (
+      runtimeUsesClaudeCloud
+      && String(existingRuntimeSession?.claude_cloud_session_id || '').trim()
+      && pinnedClaudeCloudModel
+      && claudeCloudModel.toLowerCase() !== pinnedClaudeCloudModel.toLowerCase()
+    ) {
+      return res.status(409).json({
+        error: 'Claude Cloud model switching requires creating a new Claude Cloud conversation',
+        code: 'CLAUDE_CLOUD_MODEL_REQUIRES_NEW_CONVERSATION',
+      });
+    }
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -4454,7 +4519,15 @@ export function registerMessagesRoutes(app, deps) {
                 reasoningEffort: null,
                 error: grokModel ? null : 'Grok model is not configured',
               }
-            : resolveRequestedModel(model))));
+            : (runtimeUsesClaudeCloud
+              ? {
+                  ok: !!claudeCloudModel,
+                  model: claudeCloudModel,
+                  modelVariantId: claudeCloudModel,
+                  reasoningEffort: null,
+                  error: claudeCloudModel ? null : 'Claude Cloud model is not configured',
+                }
+              : resolveRequestedModel(model)))));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -4523,10 +4596,13 @@ export function registerMessagesRoutes(app, deps) {
           ? resolveCursorReasoningEffort()
           : (runtimeUsesGrok
             ? resolveGrokReasoningEffort()
-            : resolveRequestedReasoningEffort(
-                requestedModel,
-                explicitReasoningEffort || modelResolution.reasoningEffort || null,
-              ))));
+            // A cloud session takes no effort: whatever was asked, it is none.
+            : (runtimeUsesClaudeCloud
+              ? { ok: true, effort: 'none', supported: ['none'] }
+              : resolveRequestedReasoningEffort(
+                  requestedModel,
+                  explicitReasoningEffort || modelResolution.reasoningEffort || null,
+                )))));
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
@@ -4553,6 +4629,9 @@ export function registerMessagesRoutes(app, deps) {
       }
     } else if (!['default', 'long_context'].includes(requestedContextTier)) {
       return res.status(400).json({ error: 'Unsupported context tier' });
+    } else if (runtimeUsesClaudeCloud) {
+      // The cloud has no long-context tier to pick.
+      normalizedContextTier = 'default';
     }
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
     const conversationWorkspaceState = (!shouldCreateConversation && typeof resolveConversationWorkspaceState === 'function')
@@ -4783,6 +4862,17 @@ export function registerMessagesRoutes(app, deps) {
         && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
       ) {
         stmts.updateRuntimeSessionProvider.run('claude', claudeModel, claudeModel, now, runtimeSession.id);
+      }
+      // A cloud conversation whose session does not exist yet follows the
+      // composer too (afterwards the model is locked, see above).
+      if (
+        runtimeUsesClaudeCloud
+        && claudeCloudModel
+        && runtimeSession?.id
+        && claudeCloudModel !== String(existingRuntimeSession?.provider_model || '').trim()
+        && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
+      ) {
+        stmts.updateRuntimeSessionProvider.run('claude-cloud', claudeCloudModel, claudeCloudModel, now, runtimeSession.id);
       }
       // Another relay's agent picks the model and mode of its own turn; the
       // composer keeps restoring the user's choice for this conversation.
@@ -5285,7 +5375,10 @@ export function registerMessagesRoutes(app, deps) {
     if (!runtimeSession) {
       return res.status(404).json({ error: 'Runtime session not found for conversation' });
     }
-    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'claude') {
+    // The Claude Cloud worker reports the same shape (the cloud session's
+    // context and token usage), so both providers are taken here.
+    const contextUsageProvider = String(runtimeSession.provider_type || 'github').trim().toLowerCase();
+    if (contextUsageProvider !== 'claude' && contextUsageProvider !== 'claude-cloud') {
       return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
     }
     if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
@@ -5345,13 +5438,17 @@ export function registerMessagesRoutes(app, deps) {
     // Claude-bound conversation's worker may write the Claude card. The
     // snapshot itself is global, so a misrouted poster would corrupt it for
     // everyone.
+    // A Claude Cloud worker posts here too; its report is kept under its own
+    // snapshot key, so the Claude card stays what the Claude workers wrote.
     const conversationId = String(req.body?.conversationId || '').trim();
+    let snapshotProvider = 'claude';
     if (conversationId) {
       const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
       const boundProvider = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
-      if (runtimeSession && boundProvider !== 'claude') {
+      if (runtimeSession && boundProvider !== 'claude' && boundProvider !== 'claude-cloud') {
         return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
       }
+      if (runtimeSession && boundProvider === 'claude-cloud') snapshotProvider = 'claude-cloud';
     }
     const usage = normalizeClaudePlanUsage(req.body?.usage)
       || claudePlanUsageFromResult({
@@ -5359,7 +5456,7 @@ export function registerMessagesRoutes(app, deps) {
         totalCostUsd: req.body?.totalCostUsd,
       });
     if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
-    planUsageService.saveSnapshot('claude', usage, {
+    planUsageService.saveSnapshot(snapshotProvider, usage, {
       source: 'worker',
       error: String(req.body?.error || '').trim() || null,
     });
@@ -5982,6 +6079,7 @@ export function registerMessagesRoutes(app, deps) {
         defaultRelayMode: DEFAULT_RELAY_MODE,
         defaultModel: DEFAULT_MODEL,
         getCursorProviderSettings,
+        getClaudeCloudProviderSettings,
       });
       
       if (out.attachments.length) {

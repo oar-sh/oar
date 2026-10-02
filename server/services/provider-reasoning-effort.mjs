@@ -12,6 +12,7 @@ import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mj
 export const CLAUDE_ULTRACODE_EFFORT = 'ultracode';
 export const DEFAULT_CLAUDE_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max', CLAUDE_ULTRACODE_EFFORT]);
 export const DEFAULT_GROK_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high']);
+export const CLAUDE_CLOUD_REASONING_EFFORTS = Object.freeze(['none']);
 
 // Ultracode requires an xhigh-capable model (the SDK's stated gate), so the
 // tier is derived from a model's discovered efforts rather than discovery —
@@ -54,6 +55,8 @@ export function supportedReasoningEffortsForProviderModel({
   if (provider === 'grok') {
     return effortsForModel(grokSettings?.effortsByModel, model) || [...DEFAULT_GROK_REASONING_EFFORTS];
   }
+  // A cloud session takes no effort choice: the only tier is the default one.
+  if (provider === 'claude-cloud') return [...CLAUDE_CLOUD_REASONING_EFFORTS];
   if (provider === 'openai' || provider === 'openai-image') {
     const efforts = openAIReasoningEffortsForModel(model);
     return Array.isArray(efforts) && efforts.length ? efforts.map(normalizeEffort).filter(Boolean) : null;

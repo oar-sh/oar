@@ -372,6 +372,50 @@ export async function updateGrokSettings({
   return settingsRequest('/api/settings/grok', payload, 'Failed to update Grok settings');
 }
 
+// Claude Cloud (provider `claude-cloud`). A relay without these routes answers
+// 404, and a folder outside the workspace roots is refused: both must read as
+// "nothing to show" (the New Chat option stays hidden, the fields stay empty),
+// so these reads skip apiFetch's error logging.
+async function quietGet(path) {
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}${path}`, {
+      signal: requestTimeoutSignal(),
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    });
+    if (!response.ok) return null;
+    noteFetchSuccess();
+    return await response.json().catch(() => null);
+  } catch (error) {
+    noteFetchFailure(path, error);
+    return null;
+  }
+}
+
+export async function loadClaudeCloudSettings() {
+  return quietGet('/api/settings/claude-cloud');
+}
+
+export async function updateClaudeCloudSettings({
+  enabled = undefined,
+  defaultModel = undefined,
+  environmentId = undefined,
+} = {}) {
+  const payload = {};
+  if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (typeof defaultModel === 'string' && defaultModel.trim()) payload.defaultModel = defaultModel.trim();
+  if (typeof environmentId === 'string' && environmentId.trim()) payload.environmentId = environmentId.trim();
+  return settingsRequest('/api/settings/claude-cloud', payload, 'Failed to update Claude Cloud settings');
+}
+
+// origin + current branch of a folder on the relay host, for the New Chat
+// Repository and Branch fields. null when the relay could not say.
+export async function loadGitRemote(rootPath) {
+  const root = String(rootPath || '').trim();
+  if (!root) return null;
+  return quietGet(`/api/git/remote?root=${encodeURIComponent(root)}`);
+}
+
 export async function updateOpenAISettings({
   apiKey = '',
   model = 'gpt-4o',
@@ -610,7 +654,10 @@ export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, roo
 }
 
 export async function loadUsageSummary() {
-  return apiFetch('/api/usage');
+  // The conversation the modal was opened from: the Claude Cloud card shows
+  // that conversation's own cost next to the totals.
+  const conversationId = String(currentConvId || '').trim();
+  return apiFetch(conversationId ? `/api/usage?conversationId=${encodeURIComponent(conversationId)}` : '/api/usage');
 }
 
 export async function loadCursorAllowanceSettings() {

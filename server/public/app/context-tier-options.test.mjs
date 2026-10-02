@@ -207,6 +207,20 @@ test('providers other than claude ignore the claude tier map', () => {
   }
 });
 
+test('a cloud conversation has one blank tier, whatever the metadata says', () => {
+  // The cloud session picks its own window; neither Copilot's numbers nor the
+  // Claude SDK's "[1m]" tier apply to it.
+  assert.deepEqual(
+    buildContextTierOptions({
+      modelId: 'claude-opus-5',
+      providerType: 'claude-cloud',
+      metadata: COPILOT_OPUS_METADATA,
+      claudeTiers: CLAUDE_TIERS,
+    }),
+    [{ value: 'default', label: '—' }],
+  );
+});
+
 test('a model with no metadata offers an unknown default tier only', () => {
   assert.deepEqual(
     buildContextTierOptions({ modelId: 'gpt-5.4-mini', providerType: 'github' }),

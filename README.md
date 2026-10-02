@@ -8,13 +8,14 @@ curl -fsSL oar.sh/install | sh
 
 On Windows, run `irm oar.sh/install.ps1 | iex` in PowerShell. Landing page: [oar.sh](https://oar.sh). npm and git-checkout installs are covered under [Install](#install).
 
-OAR relays six runtimes: **GitHub Copilot**, **OpenAI (BYOK)**, **OpenAI Image (BYOK)**, **Claude (Agent SDK)**, **Cursor (Agent SDK)**, and **Grok (CLI ACP)**. You pick one per conversation, and all of them share the same chat UI, queue, history, file browser, and question cards.
+OAR relays seven runtimes: **GitHub Copilot**, **OpenAI (BYOK)**, **OpenAI Image (BYOK)**, **Claude (Agent SDK)**, **Claude Cloud**, **Cursor (Agent SDK)**, and **Grok (CLI ACP)**. You pick one per conversation, and all of them share the same chat UI, queue, history, file browser, and question cards.
 
 ```text
                                              ┌── Copilot       SDK worker, or Copilot CLI + extension
                                              ├── OpenAI        Copilot runtime, your API key
-[Browser] <--WebSocket--> [OAR relay :3333]  ┼── OpenAI Image  Images API, called by the relay
-                                             ├── Claude        Agent SDK worker, host's Claude login
+                                             ├── OpenAI Image  Images API, called by the relay
+[Browser] <--WebSocket--> [OAR relay :3333]  ┼── Claude        Agent SDK worker, host's Claude login
+                                             ├── Claude Cloud  sandbox at Anthropic, host's Claude login
                                              ├── Cursor        Agent SDK worker, your Cursor API key
                                              └── Grok          Grok CLI over ACP, host's Grok login
 ```
@@ -65,6 +66,7 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 | GitHub CLI (`gh`), signed in | the `oar` launcher command; Extension-engine sessions on Windows; the Copilot card in **Check Usage** | `gh copilot` is built into current GitHub CLI releases, so there is no extension to install. The usage card also accepts a token in `GH_TOKEN` or `GITHUB_TOKEN` |
 | OpenAI API key | OpenAI and OpenAI Image chats | Entered in **⚙️ Settings**, stored in the relay database |
 | A Claude login on the relay host | Claude chats | Log in from **⚙️ Settings → Providers → Claude → Relogin** (the panel can install the Claude Code CLI first), or run `claude` once on the host. The relay stores no Claude key |
+| The same Claude login, from a claude.ai account with GitHub connected | Claude Cloud chats | The Claude GitHub app must be allowed on each repository a cloud chat works on (see [Claude Cloud](#claude-cloud)) |
 | Cursor API key | Cursor chats | Entered in **⚙️ Settings**, stored in the relay database |
 | Grok CLI, signed in | Grok chats | Install it and sign in from **⚙️ Settings → Providers → Grok**, or set `XAI_API_KEY` in the relay's environment |
 | tmux (optional) | Linux and macOS | Session workers run in detached tmux sessions you can watch from the browser (**🖥️ Inspect tmux console**). Without tmux they run as plain background processes |
@@ -172,9 +174,9 @@ A global install keeps its state in `~/.oar` (`%APPDATA%\oar` on Windows; `OAR_S
 
 ## Runtimes
 
-The runtime (called the *provider* in the UI) is chosen in **New Chat** and then fixed for that conversation: once a conversation has sent its first message it keeps that provider, and its composer is locked to that provider's models. The composer states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / Cursor SDK / Grok models.`, colour-coded per provider. OpenAI sessions also pin one exact model, which the note names in parentheses and the model dropdown shows as a disabled `🔒` entry.
+The runtime (called the *provider* in the UI) is chosen in **New Chat** and then fixed for that conversation: once a conversation has sent its first message it keeps that provider, and its composer is locked to that provider's models. The composer states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / ☁ Claude Cloud / Cursor SDK / Grok models.`, colour-coded per provider. OpenAI sessions also pin one exact model, which the note names in parentheses and the model dropdown shows as a disabled `🔒` entry.
 
-Turning a provider **off** (or removing the OpenAI key) rebinds conversations that have not sent a message yet back to Copilot, so you are never left with a conversation pointing at a runtime that can no longer start. Conversations already in flight, and conversations belonging to a different provider, are left alone.
+Turning a provider **off** (or removing the OpenAI key) rebinds conversations that have not sent a message yet back to Copilot, so you are never left with a conversation pointing at a runtime that can no longer start. Conversations already in flight, and conversations belonging to a different provider, are left alone. Claude Cloud is the exception: switching it off only takes it out of **New Chat**, and its conversations stay as they are.
 
 | Runtime | Enable via | Auth | Notes |
 | ------- | ---------- | ---- | ----- |
@@ -182,6 +184,7 @@ Turning a provider **off** (or removing the OpenAI key) rebinds conversations th
 | **OpenAI (BYOK)** | ⚙️ Settings → Providers → OpenAI | your API key, stored in the relay database | Runs the Copilot runtime, on either engine, against an OpenAI-compatible endpoint |
 | **OpenAI Image (BYOK)** | ⚙️ Settings → Providers → OpenAI | the same key | The relay calls the OpenAI Images API itself; a chat whose replies are images |
 | **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude | the relay host's Claude login, **switchable from the panel** | A dedicated Node worker per conversation. The Claude Code CLI can be installed and updated from the panel |
+| **Claude Cloud** | ⚙️ Settings → Providers → Claude Cloud (off by default) | the relay host's Claude login (a claude.ai account), read from the Claude CLI | Claude Code in a sandbox at Anthropic, on a clone of a GitHub repository. Results come back as pushed branches; billed to that Claude account. Uses API endpoints that are not a documented public API (see [Claude Cloud](#claude-cloud)) |
 | **Cursor (Agent SDK)** | ⚙️ Settings → Providers → Cursor | your Cursor API key, stored in the relay database | A dedicated Node worker per conversation through the Cursor Agent SDK |
 | **Grok (CLI ACP)** | ⚙️ Settings → Providers → Grok | the relay host's Grok CLI login, **sign in and out from the panel** | Drives the Grok CLI's `grok agent stdio` over ACP. The CLI can be installed and updated from the panel |
 
@@ -241,6 +244,64 @@ Differences from Copilot conversations:
 - Cancelling one individual subagent works only for backgrounded ones; a subagent running inside the current turn can be stopped only by stopping the whole turn
 - Claude turns are not included in the Copilot usage line, and no usage line is attached to their replies (Claude's own plan limits appear in **Check Usage**)
 - The browsable **Session** root points at the Agent SDK's project directory rather than a Copilot session-state folder
+
+### Claude Cloud
+
+A Claude Cloud chat runs Claude Code in a sandbox at Anthropic instead of on the relay host. The sandbox works on its own clone of a GitHub repository: it sees what is pushed to GitHub and nothing on the host, and its results come back as branches the agent pushes. The chat is billed to the Claude account the relay host's Claude CLI is logged in to. In OAR it is a conversation like the others: the reply streams in, questions arrive as cards, and it works from the phone.
+
+**What it needs.**
+
+- The Claude CLI on the relay host, logged in with a claude.ai account (**⚙️ Settings → Providers → Claude → Relogin**, or `claude` on the host). The same login serves Claude chats.
+- GitHub connected to that Claude account: [claude.ai/connect-github](https://claude.ai/connect-github).
+- The Claude GitHub app allowed on every repository a cloud chat should work on (GitHub → Settings → Applications → Claude → Configure).
+
+**Enabling.** Turn on **⚙️ Settings → Providers → Claude Cloud → Enable Claude Cloud for New Chat**. It is off by default, and it is refused while the host has no Claude login. The tab then shows:
+
+- the account the chats are billed to, and where the relay reads the login from and until when it is valid. The login itself is changed on the Claude tab (**Claude login** jumps there);
+- **Cloud environment**: the environments of the account. With none saved, the relay takes the first active one and saves it. An account without any gets its default one when you open [claude.ai/code](https://claude.ai/code) once;
+- **Default model** for new cloud chats (`claude-sonnet-5-5` until you change it). The list is the Claude provider's models without their `[1m]` variants, plus the default.
+
+Switching Claude Cloud off takes it out of **New Chat**. Cloud conversations that already exist keep working.
+
+**Starting a chat.** Choose **+ New Chat → Provider → Claude Cloud**. The folder picker stays, but here it only fills in two fields, which you can also type yourself:
+
+- **Repository**: read from the folder's `origin` remote (or the remote of its upstream branch). `owner/repo` or a GitHub URL, https or ssh; only GitHub repositories are accepted.
+- **Branch**: the folder's current branch. Leave it empty for the repository's default branch.
+
+Under the fields OAR warns about what the cloud clone will not have: commits that are not pushed, a branch without an upstream, uncommitted changes. It also says when the folder is no git repository or has no GitHub remote, and when no cloud environment is set. There is no reasoning effort to choose. The cloud session itself is created by the first message.
+
+**What works.**
+
+- The reply streams in as the agent writes it, with thoughts, tool activity, subagent bubbles and the steps of the sandbox starting up
+- Questions from the agent (`AskUserQuestion`) as question cards, multi-select included; a tool that asks for permission gets an **Allow** / **Deny** card. A card answered on claude.ai closes in OAR
+- **Stop** interrupts the cloud turn. If the cloud does not confirm within 30 seconds, the turn ends in OAR with a note that the agent may still be working there
+- Image attachments (JPEG, PNG, GIF or WebP, up to 5 MB each), sent inline
+- Follow-up messages go into the same cloud session, also after it has been idle for a long time
+- A restart of the worker or the relay in the middle of a turn does not send your message twice: the new worker finds the turn in the session's event log and follows it, and a turn that finished in the meantime is answered from the log. A dropped connection to the session is reopened where it broke off
+- The **cloud line** above the composer: the repository, the branch, a link to the session on claude.ai, one **⇡ branch** link per branch the agent pushed (it opens GitHub's comparison with the branch the chat started from) and what the session has cost so far. The `⋯` menu has **☁️ Open on claude.ai**
+- Deleting or archiving the conversation archives the cloud session at Anthropic; nothing is deleted there
+- A **Claude Cloud** card in **Check Usage** with the account's cloud credit and the cost Anthropic reports for this relay's cloud sessions, and the **🧠** button for the session's context use (see [Usage and context](#usage-and-context))
+- A failure the relay can name says what to do: log in again, connect GitHub, give the Claude GitHub app access to the repository, choose an environment
+
+**What does not.**
+
+- No relay modes, no reasoning effort and no context size: the three selectors are hidden. Choose the model in **New Chat**: the picker is locked from the first message on
+- No mid-turn steering: a message sent during a turn waits for the turn to end
+- Nothing from the relay host reaches the sandbox: attachments other than images are refused, there is no working directory to change and no **Session** folder to browse
+- No relay tools inside the sandbox: no `preview`, no `remote_relay`, no media embedded by host path
+- No background task panel, and no pause at the usage limit: a limit the cloud reports appears as a line in the tool activity
+- OAR's commit attribution setting does not reach the sandbox; commits there carry what Claude Code in the cloud writes
+- An agent on a [paired relay](#remote-relays) cannot create a cloud chat yet. It can read, prompt, wait for and stop one you created
+
+**What OAR does with the Claude login.** Claude Cloud uses the login the Claude CLI keeps on the relay host (`.credentials.json` in `~/.claude`, or in `CLAUDE_CONFIG_DIR`) to call the Anthropic API endpoints the Claude CLI itself uses for cloud sessions and account usage. **These endpoints are not a documented public API.** Anthropic can change them without notice; cloud chats and the live usage figures then fail with a note until OAR is updated. If you are not comfortable with a program other than the CLI using its login this way, leave the provider off.
+
+- The relay and its cloud workers only **read** the access token. It is sent as the bearer token to `https://api.anthropic.com` and to no other host. (OAR's own tests point the client at a fake API on the same machine; that setting accepts a loopback address and nothing else.)
+- It is held in memory only. It is never written to the database or to a log, never sent to the browser and never put into an error message. Each cloud worker reads the credentials file itself, so nothing is passed along at launch.
+- It is never refreshed by OAR, and the refresh token is never used. The CLI keeps its own login fresh; when the token has run out, the relay reads the file again and at most once in five minutes has the CLI check its own login (`claude auth status`). A login that is still expired ends the turn with a note to log in again.
+- While the switch is off, the relay asks Anthropic for nothing with this login: it lists no environments and reads no account usage. Only a cloud conversation from before still talks to its session, when you write to it, delete it or archive it.
+- The provider is off by default. Switching it on is the consent for all of the above.
+
+`CLAUDE_CODE_OAUTH_TOKEN` in the relay's environment is used instead of the credentials file when it is set. That is the one case in which the relay passes the login on: a cloud worker started under tmux gets the variable through a file only the relay's user can read, which the worker's shell reads once and deletes; workers of other providers are not given it that way (see [Environment variables](#environment-variables)).
 
 ### Cursor (Agent SDK)
 
@@ -321,10 +382,11 @@ The composer's model picker is the union of every enabled provider's catalog, fi
 - **Copilot** models are discovered from the installed Copilot CLI runtime a few seconds after the relay starts, and refreshed by the sessions that run on it. Each model shows the reasoning efforts and context window the runtime reports. The list starts with `auto`, then groups models by vendor (OpenAI, Anthropic, Google, xAI, Microsoft, Azure OpenAI, Moonshot AI, then any others alphabetically), newest version first. Before the first discovery, a fresh relay offers a curated set: `gpt-5.4`, `gpt-5.4-mini` (the default), `gpt-5.3-codex`, `claude-sonnet-4.6`, and `claude-haiku-4.5`.
 - **OpenAI (BYOK)** models are discovered from `/v1/models` when the key is saved or re-enabled.
 - **Claude** models are discovered from the Agent SDK when the provider is enabled. Bracketed `[1m]` long-context variants (such as `claude-opus-5[1m]`) do not appear as separate entries; they surface as a 1M option in the composer's context-size dropdown for the base model.
+- **Claude Cloud** has no discovery of its own: its picker offers the Claude provider's models under their plain ids, plus the tab's default model.
 - **Cursor** models (and their per-model reasoning-effort tiers) are discovered when the API key is saved or the provider is re-enabled.
 - **Grok** models are discovered from the Grok CLI over ACP when the provider is enabled, after a sign-in, and after a CLI install from the panel.
 
-Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation.
+Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation. Claude Cloud has no tab there.
 
 ## Highlights
 
@@ -365,7 +427,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 - Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
 - **Context usage** modal with a per-category token breakdown of the model's context window, plus a per-conversation **auto-compact window** slider for Claude sessions
 - **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context, and matching dots beside the scrollbar
-- **Plan usage** modal with subscription credits, rate-limit windows, and reset countdowns for Copilot, Claude, Cursor, and Grok
+- **Plan usage** modal with subscription credits, rate-limit windows, and reset countdowns for Copilot, Claude, Claude Cloud, Cursor, and Grok
 - **Image conversations** (OpenAI Image): generate images in chat and iterate on a generated image with **Edit this image**
 - Agents can embed **images, video, and audio** in a reply by their absolute path, on every runtime; clicking an embedded image opens the file viewer with zoom, download, and copy
 - **Screenshot annotations**: mark up an uploaded screenshot with highlighter strokes before or after sending; the original upload is never modified
@@ -382,7 +444,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 
 ### Starting a conversation
 
-- Start a chat with **+ New Chat**, which asks for the **Working directory**, **Provider**, **Model**, and **Reasoning effort** (or **Quality** and **Size**, for image chats; **Context window** where a model offers several) before the conversation exists. The working-directory list offers the known directories (current session, relay workspace, browser folder, recent roots), a **Custom path…** entry, and a 📁 folder picker; it defaults to the directory you picked last, and the chosen directory is applied before the session worker first launches. With Copilot as the only provider the provider row is hidden.
+- Start a chat with **+ New Chat**, which asks for the **Working directory**, **Provider**, **Model**, and **Reasoning effort** (or **Quality** and **Size**, for image chats; **Context window** where a model offers several) before the conversation exists. The working-directory list offers the known directories (current session, relay workspace, browser folder, recent roots), a **Custom path…** entry, and a 📁 folder picker; it defaults to the directory you picked last, and the chosen directory is applied before the session worker first launches. With Copilot as the only provider the provider row is hidden. For **Claude Cloud** the modal asks for a **Repository** and a **Branch** instead of a reasoning effort, filled in from the chosen folder (see [Claude Cloud](#claude-cloud)).
 - Choose the **mode** and **model** per message in the composer.
 - The composer knows two slash commands, with autocomplete: **`/compact`** branches to a fresh conversation seeded with summary context, and **`/preview`** publishes a local dev server or directory on the public preview host without involving the agent (`/preview 5173 [label]`, `/preview ./dist [label]`, `/preview list`, `/preview close`). Agents can do the same through the `preview` tool (Claude and Cursor) or the documented API (see [docs/preview-servers.md](docs/preview-servers.md)). Any other single-line text starting with `/` is held back once with an *Unknown command* notice; press send again to send it as text.
 
@@ -404,7 +466,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 
 ### Question cards
 
-- Agents ask clarifying questions through question cards: `ask_user` on Copilot and Cursor, `AskUserQuestion` on Claude. A choice answers with one click; a question that allows several answers shows checkmarks and one **Reply with selection** button, whose reply lists every ticked choice plus anything you typed. Structured requests render as multi-field forms.
+- Agents ask clarifying questions through question cards: `ask_user` on Copilot and Cursor, `AskUserQuestion` on Claude and Claude Cloud. A choice answers with one click; a question that allows several answers shows checkmarks and one **Reply with selection** button, whose reply lists every ticked choice plus anything you typed. Structured requests render as multi-field forms.
 - On Copilot's SDK engine, the model gets OAR's own `ask_user` tool, which can mark a question as multi-select; a question worded "select all that apply" counts too, and every Copilot choice card that accepts free text has a **Select several** switch.
 - A card waits 8 hours for an answer (2 hours on Copilot's Extension engine). After that the agent is told nobody answered and continues according to the conversation's mode. A turn that is waiting on a card is never treated as stuck.
 - Grok has no question cards: ACP has no ask-user surface.
@@ -425,13 +487,13 @@ The composer draft, attachments included, is saved per conversation on the relay
 - **Filter conversations…** above the list matches titles, ignoring case. It clears with **×** or Escape, and while it is active it loads older pages, so it searches every conversation, not just the loaded ones.
 - **🔍** in the conversation header searches message text across all conversations.
 - On startup, the relay imports the Copilot sessions stored on the host (through the installed Copilot runtime) into its database, so they appear in the list with their history. If the runtime is unavailable, the import is reported as failed rather than guessed from the filesystem.
-- Deleting a conversation stops its session worker and removes its CLI session too (Copilot through the runtime, Claude by deleting that session's transcript). An imported Copilot session the relay never ran is only hidden: its CLI session stays, and nothing is stopped for it. A conversation that is still working — a running turn, one waiting on a question card or approval, or live background tasks — is not deleted, and the sidebar says why so you can stop it first.
+- Deleting a conversation stops its session worker and removes its CLI session too (Copilot through the runtime, Claude by deleting that session's transcript). A Claude Cloud conversation's session at Anthropic is archived, not deleted. An imported Copilot session the relay never ran is only hidden: its CLI session stays, and nothing is stopped for it. A conversation that is still working — a running turn, one waiting on a question card or approval, or live background tasks — is not deleted, and the sidebar says why so you can stop it first.
 
 ### Files, git, and previews
 
 - Use **📁 Browse files** to inspect the workspace (💼), drives (📀), or the session's own folder (🕵️), and to open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.
 - Click the file and folder copy controls to insert `@file:...` / `@folder:...` tokens.
-- Workspace browsing follows the selected session's effective working directory. Running sessions keep their learned runtime directory, **🗂️ Change CWD** in the `⋯` menu changes the directory for the next launch, and `cd ...` typed in chat does not retarget the browser.
+- Workspace browsing follows the selected session's effective working directory. Running sessions keep their learned runtime directory, **🗂️ Change CWD** in the `⋯` menu changes the directory for the next launch, and `cd ...` typed in chat does not retarget the browser. A Claude Cloud chat has no **Change CWD**: it works on a clone at Anthropic.
 - Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **⬇ Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes** and **Full file** modes; closing it returns to the still-open list.
 - Agents can embed images, video, and audio in a reply by absolute path; they render inline.
 - Tap an image attachment in the composer (it carries a 🖍️ badge), or use **🖍️ Annotate** in the file viewer, to mark it up with highlighter strokes. The annotated copy is uploaded; the original stays untouched.
@@ -441,11 +503,12 @@ The composer draft, attachments included, is saved per conversation on the relay
 
 - Use **📊 Check Usage** in the conversation `⋯` menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Each provider gets its own tab, opening on the conversation's own provider, and the card names the signed-in account (email and plan) beneath its title. Sources differ per provider:
   - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing. Conversations on the SDK engine add a **Last SDK worker turn** section (AI credits actually spent, tokens, model calls, overage) with the model and how long ago it was captured; it is one turn's numbers rather than a running total, and it stops being shown once it is more than seven days old.
-  - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn.
+  - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn. With **Claude Cloud** switched on, the limits are read live from the account each time the modal opens (kept for a minute), with no turn involved: the card then carries a **Live** badge, a limit that is getting close carries Anthropic's own warning word, and it adds **This week by product** (Claude Code, chats and the other products as shares of the week) and the organisation's **Prepaid credits** when there are any. Limit resets (full and 5-hour) are shown on claude.ai only; the card links there. When the live read fails, the card falls back to the last turn's reading and says why.
+  - **Claude Cloud** — shown while the provider is on. A meter per dollar credit the account holds, with what is used, what is left and when it expires; **Cloud spend (OAR sessions)**, the cost Anthropic reports per cloud session, summed over the cloud conversations this relay still has, with this conversation's own cost when the modal was opened from a cloud chat; and the latest cloud session report (its cost, and cost and tokens by model). These figures are Anthropic's reported cost, not a billing statement, and sessions started elsewhere are not counted. A credit that is offered but not yet claimed is mentioned with a link to claude.ai. Cloud turns spend the cloud credit first; without a credit they count against the Claude limits above.
   - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools; these figures are estimates, and Cursor's Spending dashboard remains authoritative. With a dashboard session token, the card adds live *Included in plan* bars.
   - **Grok** — the live weekly subscription quota, read with the host's Grok CLI login, plus per-turn tokens and estimated cost from the agent's prompt result. An optional monthly USD allowance in Settings adds an estimated remaining meter; the card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
-- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
-- Use the **🧠** context button for a per-category breakdown of the conversation's context window (Claude sessions also show the auto-compact window, the thinking controls and the folder's commit attribution there): a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets.
+- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Claude Cloud, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
+- Use the **🧠** context button for a per-category breakdown of the conversation's context window (Claude sessions also show the auto-compact window, the thinking controls and the folder's commit attribution there): a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets. A Claude Cloud session reports how much of its window is used after each turn, without categories.
 - Claude conversations additionally get an **auto-compact window** slider in that modal. Claude Code compacts a session once it approaches a model-tuned window (around 967k tokens on a 1M-context model), which is why long conversations rarely compact at all; setting a smaller window makes it happen sooner and keeps turns cheaper. *Auto* hands the choice back to the CLI. The smallest window is 100k, because the CLI silently ignores anything below that and falls back to its own default. The line beneath the slider reports the window actually in force and where it came from — your setting, the model default, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment override — and fills in once the conversation's first turn completes. The change reaches a running session on its next message.
 - The transcript marks day boundaries, and marks the point where a Claude session compacted its context with the tokens before and after. Both appear as dots beside the scrollbar for the messages currently loaded.
 
@@ -460,7 +523,7 @@ Use **➡️ Share conversation** in the `⋯` menu to publish a read-only link.
 
 ### The conversation menu
 
-Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title**, **🖥️ Inspect tmux console** (a read-only view of the session's tmux pane), **🤗 Select Models**, **⚙️ Settings**, **🌄 Restart web relay** (queued until the current turn is idle), **💤 Suspend host** (Windows; see below), and **☠️ Kill session** (stops the conversation's worker; an active turn then needs a retry or a new message). Its header shows the queue counts with **🚮 Empty queue**.
+Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title**, **🖥️ Inspect tmux console** (a read-only view of the session's tmux pane), **🤗 Select Models**, **☁️ Open on claude.ai** (Claude Cloud chats, once their session exists), **⚙️ Settings**, **🌄 Restart web relay** (queued until the current turn is idle), **💤 Suspend host** (Windows; see below), and **☠️ Kill session** (stops the conversation's worker; an active turn then needs a retry or a new message). Its header shows the queue counts with **🚮 Empty queue**.
 
 **💤 Suspend host** puts the machine the relay runs on to sleep, once the work is done. The confirmation lists what is still active. The relay then queues the suspend and fires it after 2 minutes with nothing active: no queued, running or parked turn, no background task of a live worker, and no open GitHub Actions run in the repository of a conversation that was busy since the request (read through `gh`; a repository whose state cannot be read blocks for 15 minutes, then is ignored). With nothing running when you confirm, it fires after a 30-second countdown. While a suspend is queued, every device shows a banner with the blockers or the countdown and a **Cancel** button, and a push notification reports the suspend. A relay restart drops a queued suspend and says so. **Show Suspend host action** in Settings hides the entry per browser.
 
@@ -468,7 +531,7 @@ Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title
 
 ### Settings (⚙️ in the web UI)
 
-The modal is organised into six tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Grok**, and **Cursor** sub-tab), **Relays**, **Previews**, **Notifications**, and **Features** — and reopens on the tab you used last. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
+The modal is organised into six tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Claude Cloud**, **Grok**, and **Cursor** sub-tab), **Relays**, **Previews**, **Notifications**, and **Features** — and reopens on the tab you used last. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
 
 | Tab | Setting | Default | What it does |
 | --- | ------- | ------- | ------------ |
@@ -484,6 +547,8 @@ The modal is organised into six tabs — **General**, **Providers** (with a **Co
 | Providers | OpenAI API key / model / base URL | — / `gpt-4o` / `https://api.openai.com/v1` | Enables the OpenAI and OpenAI Image providers |
 | Providers | Claude (Agent SDK) | off | Enables Claude as a New Chat provider and runs model discovery; default model `claude-sonnet-5` |
 | Providers | Claude account (Relogin / Logout) | host login | Switches the Claude account the relay host's CLI uses, from the browser (see [Claude (Agent SDK)](#claude-agent-sdk)) |
+| Providers | Claude Cloud | off | Enables Claude Cloud as a New Chat provider, and the live account figures in **Check Usage**; the switch is the consent to use the Claude CLI's login (see [Claude Cloud](#claude-cloud)) |
+| Providers | Claude Cloud environment / default model | first active environment of the account / `claude-sonnet-5-5` | The cloud environment new cloud sessions run in, and the model a new cloud chat starts with |
 | Providers | Cursor API key / model | — / `composer-2.5` | Enables Cursor; plus monthly plan allowances and the optional dashboard session token |
 | Providers | Grok | off | Enables Grok; default model `grok-4.5`; **Sign in** / **Sign out**; optional monthly allowance |
 | Relays | Public address, Accept prompts from other relays' agents | browser address / on | How paired relays reach this one, and whether their agents may prompt sessions here (see [Remote relays](#remote-relays)) |
@@ -566,7 +631,8 @@ The config file is `server/config.json` in a git checkout and `~/.oar/config.jso
 | `GH_TOKEN`, `GITHUB_TOKEN` | GitHub token for the Copilot usage card, instead of `gh auth token` |
 | `XAI_API_KEY` | Grok authentication instead of the Grok CLI login |
 | `CURSOR_SESSION_TOKEN` | Cursor dashboard session token for live plan bars |
-| `CLAUDE_CONFIG_DIR` | Claude configuration directory, instead of `~/.claude` |
+| `CLAUDE_CONFIG_DIR` | Claude configuration directory, instead of `~/.claude`; Claude Cloud reads the CLI's login (`.credentials.json`) from it |
+| `CLAUDE_CODE_OAUTH_TOKEN` | A Claude login token for Claude Cloud, used instead of the CLI's credentials file, by the relay (settings tab, **Check Usage**, archiving) and by its cloud workers. Under tmux the relay hands it to cloud workers only, through an owner-only file; a worker started without tmux inherits the relay's environment as it is |
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Overrides the Claude auto-compact window |
 | `COPILOT_CLOUDFLARED_MODE`, `COPILOT_CLOUDFLARED_TOKEN`, `COPILOT_CLOUDFLARED_BINARY` | Override `cloudflaredTunnel.mode`, `.token`, and `.binary` |
 | `COPILOT_WORKSPACE_ROOT_ALLOW_LIST` | Same as `workspaceRootAllowList` |
@@ -704,7 +770,10 @@ relay, **Agents may** limits it to *read only*, *read and prompt* (existing sess
 (also create sessions, answer questions, stop turns, archive). In the *ask* and *plan* relay
 modes, every write action first asks you with a question card. For a session it starts, an agent
 can set the provider, model, relay mode and reasoning effort; what it leaves out follows the
-session it works in, as far as the other relay offers it.
+session it works in, as far as the other relay offers it. A [Claude Cloud](#claude-cloud) session
+cannot be started this way yet, because the tool has no field for its GitHub repository: the agent
+is told to ask you to open the chat from **New Chat** on that relay. A cloud session that exists
+can be read, prompted, waited for and stopped like any other.
 
 When an agent prompts a session on another relay, that relay shows a **↗ from …** badge with the
 sending relay, session and model on the message, and marks sessions an agent created in the
@@ -726,6 +795,7 @@ SSH port forward, for example) and private network ranges.
 - Shared conversation links and preview links are public by design: anyone with the URL can read the shared transcript or reach the previewed app, without signing in.
 - A [paired relay](#remote-relays) holds a token that opens the other relay completely. The per-relay "Agents may" limit and the "Accept prompts from other relays' agents" switch are honoured by OAR's own traffic, but anyone holding the token can still use the full API: the token is the real boundary. A token entered for a paired relay is stored like the API keys below and never sent to browsers or agents.
 - API keys you enter (OpenAI, Cursor) are stored in the relay database on the host and never sent to browsers. Claude and Grok credentials stay with their CLIs on the host.
+- Claude Cloud, when you switch it on, reads the Claude CLI's login and uses it against Anthropic API endpoints that are not a documented public API. The token is only read and held in memory, and goes to `api.anthropic.com` only (see [Claude Cloud](#claude-cloud)). A cloud agent works in Anthropic's sandbox, not on your host.
 - OAR has no telemetry. Its only request to oar.sh is the update check, which is off until you enable it.
 
 ## Troubleshooting
@@ -741,6 +811,9 @@ SSH port forward, for example) and private network ranges.
 | File links fail                    | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
 | Claude missing from New Chat       | Enable it in **⚙️ Settings → Providers → Claude**; the toggle is off by default   |
 | Claude reply says it cannot authenticate | Press **Claude settings** on the failed reply, then **Relogin** (or run `claude` on the relay host), and retry the turn |
+| Claude Cloud missing from New Chat | Enable it in **⚙️ Settings → Providers → Claude Cloud**; it is off by default and needs a Claude login on the relay host |
+| Claude Cloud reply says GitHub is not connected, or the Claude GitHub app has no access | Connect GitHub to the Claude account at [claude.ai/connect-github](https://claude.ai/connect-github), or add the repository to the Claude GitHub app's repository access on GitHub; then send the message again |
+| New Chat says *No cloud environment is set* | Choose one in **⚙️ Settings → Providers → Claude Cloud**; an account without any gets its default one when you open claude.ai/code once |
 | Grok reply says the CLI was not found | Press **Install Grok CLI** on the failed reply, or install it from **⚙️ Settings → Providers → Grok**; no relay restart is needed afterwards |
 | Grok reply says authentication failed | Press **Sign in to Grok** on the failed reply and confirm the device code in a browser |
 | Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
@@ -749,7 +822,7 @@ SSH port forward, for example) and private network ranges.
 | A conversation seems wedged        | **☠️ Kill session** in the `⋯` menu stops its worker; retry the turn or send a new message |
 | **🌄 Restart web relay** fails with *localhost-only* | The restart endpoint accepts loopback connections only: use it on the relay host or through a tunnel, not over a direct LAN connection |
 | `npm install -g @oar-sh/oar` fails with node-gyp or prebuild errors | `better-sqlite3` has no prebuilt binary for your platform; install a C/C++ build toolchain and Python, then retry |
-| No usage line under a reply        | Expected for OpenAI, Claude, Cursor, and Grok turns; only Copilot turns record plan usage |
+| No usage line under a reply        | Expected for OpenAI, Claude, Claude Cloud, Cursor, and Grok turns; only Copilot turns record plan usage |
 
 ## Repository layout
 
@@ -759,6 +832,7 @@ oar/
 ├── bin/                            # The `oar` command (oar.js) and a Windows cmd shim for checkouts (bat/oar.bat)
 ├── docs/                           # Preview-server guide, Copilot BYOK notes, SDK feature tracker
 ├── server/
+│   ├── claude-cloud-worker/        # Claude Cloud session worker (follows a cloud session's event stream; runs no agent itself)
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
 │   ├── copilot-worker/             # Copilot SDK engine session worker (steering, background tasks, questions)
 │   ├── cursor-worker/              # Cursor Agent SDK session worker (turn runner, mode nudges, auth retry)
@@ -772,6 +846,7 @@ oar/
 │   ├── server.js                   # Entry point: supervisor plus relay runtime
 │   └── server-runtime.mjs          # Express + Socket.IO relay server
 ├── shared/                         # Code shared by the server, the extension, and the workers
+│   ├── claude-cloud/               # Claude Cloud API client, credentials reader, repository and branch rules
 │   └── worker-runtime/             # Common worker plumbing (relay API client, heartbeat, worker link)
 ├── tests/                          # Playwright end-to-end suite and its isolated relay harness
 ├── CHANGELOG.md

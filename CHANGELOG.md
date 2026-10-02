@@ -17,6 +17,48 @@ All notable changes to OAR are documented here. The format follows
   of any of its Claude sessions. A change reaches running sessions with their
   next message. Other providers are not touched: their tools have no such
   setting.
+- **Claude Cloud: chats that run in a sandbox at Anthropic.** A new provider,
+  off by default. A Claude Cloud chat runs Claude Code in Anthropic's cloud,
+  on its own clone of a GitHub repository instead of on the relay host. It is
+  billed to the Claude account the host's Claude CLI is logged in to, and its
+  results come back as branches the agent pushes. Switch it on in Settings →
+  Providers → Claude Cloud and choose the cloud environment and a default
+  model there; it needs the Claude CLI logged in with a claude.ai account on
+  the relay host, GitHub connected to that account, and the Claude GitHub app
+  allowed on the repository. New Chat → Claude Cloud fills **Repository** and
+  **Branch** from the folder you pick, lets you change both, and warns about
+  commits that are not pushed and changes that are not committed. In the chat
+  the reply streams in live, the agent's questions and permission prompts
+  arrive as cards, **Stop** interrupts the turn, and images can be attached.
+  A line above the composer links the session on claude.ai and every branch
+  the agent pushed to its comparison on GitHub, and shows the cost so far. A
+  follow-up goes into the same session, also after it has been idle; a
+  restart in the middle of a turn picks the turn up again instead of sending
+  your message twice; deleting or archiving the chat archives the cloud
+  session. Not there: relay modes, a reasoning effort, steering during a
+  turn, files other than images and anything else from the relay host, the
+  relay's tools and previews inside the sandbox, OAR's commit attribution,
+  and starting a cloud chat from a paired relay. **Before you switch it on:**
+  the provider uses the Claude CLI's stored login to call the Anthropic API
+  endpoints the CLI itself uses. These are not a documented public API and
+  may change. OAR only reads the token: it never stores, logs or refreshes
+  it, and sends it nowhere but to Anthropic. While the provider is off the
+  relay fetches nothing with that login, except for cloud chats you created
+  before. See "Claude Cloud" in the README.
+- **Check Usage: live Claude limits and a Claude Cloud card.** With Claude
+  Cloud switched on, the Claude card reads the 5-hour, weekly and per-model
+  limits live from the account when you open the modal, instead of showing
+  the reading of your last Claude turn, and a limit that is getting close
+  carries Anthropic's warning. The card also shows which product the week
+  went to (Claude Code, chats and the others) and the organisation's prepaid
+  credits. The new Claude Cloud card shows the account's cloud credit (used,
+  left, and when it expires) and what the cloud chats on this relay have
+  cost as Anthropic reports it, in total and for the chat you opened the
+  modal from; a credit that is offered but not yet claimed is mentioned with
+  a link. The limit-reset vouchers (full reset, 5-hour reset) stay
+  claude.ai-only: no endpoint the CLI's login reaches carries them, so the
+  card links to the usage page instead. With Claude Cloud off, the Claude
+  card is what it was.
 
 ### Fixed
 
@@ -39,6 +81,10 @@ All notable changes to OAR are documented here. The format follows
   note says so. Your message stays queued the whole time, and a queued
   restart of the relay no longer waits for a message the relay has stopped
   trying to deliver.
+- **The Claude usage card showed extra-usage credits 100 times too high.**
+  Claude reports these amounts in the currency's minor units (cents), and
+  the card showed them as dollars: 12.50 used of a 50.00 limit read as 1250
+  of 5000. The percentage was right.
 
 ### Changed
 

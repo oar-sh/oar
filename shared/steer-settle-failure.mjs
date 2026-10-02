@@ -84,6 +84,7 @@ export function steerAgentLabelForProvider(providerType) {
     case 'openai': return 'Copilot';
     case 'cursor': return 'Cursor';
     case 'grok': return 'Grok';
+    case 'claude-cloud': return 'Claude Cloud';
     default: return DEFAULT_STEER_AGENT_LABEL;
   }
 }

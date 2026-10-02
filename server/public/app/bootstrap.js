@@ -332,6 +332,16 @@ import {
   confirmGrokLogout,
 } from './grok-auth-ui.js';
 import {
+  getClaudeCloudSettings,
+  openClaudeCloudLoginTab,
+  refreshClaudeCloudSettingsState,
+  saveClaudeCloudSettings,
+  subscribeClaudeCloudSettings,
+  toggleClaudeCloudProvider,
+} from './claude-cloud-settings-ui.js';
+import { openCurrentCloudSession, syncClaudeCloudConversationUi } from './claude-cloud-conversation-ui.js';
+import { CLAUDE_CLOUD_PROVIDER, claudeCloudComposerModelIds } from './claude-cloud-ui.mjs';
+import {
   confirmCliInstall,
   runCliInstall,
   cancelCliInstallRun,
@@ -362,6 +372,7 @@ const PROVIDER_LABELS = {
   openai: 'OpenAI',
   'openai-byok': 'OpenAI (BYOK)',
   claude: 'Claude SDK',
+  'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor SDK',
   grok: 'Grok',
   'github-copilot': 'GitHub Copilot',
@@ -1199,8 +1210,30 @@ function currentGrokModelLock() {
   };
 }
 
+// A cloud session is created with its model and nothing can change it
+// afterwards (follow-up messages carry no model), so the picker is pinned from
+// the first message on rather than offering a switch that would do nothing.
+function currentClaudeCloudModelLock() {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const providerType = String(
+    conversation?.runtimeProviderType
+    || conversation?.runtime_provider_type
+    || '',
+  ).trim().toLowerCase();
+  if (providerType !== CLAUDE_CLOUD_PROVIDER || !currentConversationHasMessages()) return null;
+  return {
+    model: String(
+      conversation?.runtimeProviderModel
+      || conversation?.runtime_provider_model
+      || conversation?.runtimeModel
+      || conversation?.runtime_model
+      || '',
+    ).trim(),
+  };
+}
+
 function currentRuntimeModelLock() {
-  return currentOpenAIModelLock() || currentGrokModelLock();
+  return currentOpenAIModelLock() || currentGrokModelLock() || currentClaudeCloudModelLock();
 }
 
 // The runtime model decides the OpenAI/OpenAI Image distinction. Before the
@@ -1353,6 +1386,7 @@ function normalizeModelSelectorProviderType(providerType = '') {
   const normalized = String(providerType || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'claude') return 'claude';
+  if (normalized === CLAUDE_CLOUD_PROVIDER) return CLAUDE_CLOUD_PROVIDER;
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok') return 'grok';
   return 'github';
@@ -1382,18 +1416,43 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
   const hasClaude = providers.includes('claude');
   const hasCursor = providers.includes('cursor');
   const hasGrok = providers.includes('grok');
+  // Only present if a relay tags catalog rows for Claude Cloud; such a row is
+  // then as exclusive as the other runtimes' rows.
+  const hasClaudeCloud = providers.includes(CLAUDE_CLOUD_PROVIDER);
   const hasNonExclusiveProvider = providers.some((provider) => (
     provider !== 'openai-byok'
     && provider !== 'claude'
     && provider !== 'cursor'
     && provider !== 'grok'
+    && provider !== CLAUDE_CLOUD_PROVIDER
   ));
   const activeProvider = normalizeModelSelectorProviderType(activeProviderType);
   if (activeProvider === 'openai') return hasOpenAIByok;
   if (activeProvider === 'claude') return hasClaude;
   if (activeProvider === 'cursor') return hasCursor;
   if (activeProvider === 'grok') return hasGrok;
-  return !((hasOpenAIByok || hasClaude || hasCursor || hasGrok) && !hasNonExclusiveProvider);
+  return !((hasOpenAIByok || hasClaude || hasCursor || hasGrok || hasClaudeCloud) && !hasNonExclusiveProvider);
+}
+
+// A Claude Cloud conversation does not pick from the shared catalog: its
+// models are the list of its settings tab (plain ids, no Auto), plus the model
+// the conversation is bound to.
+function buildClaudeCloudModelSelectorOptions(models, providersByModel, metadataByModel) {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const cloudModels = claudeCloudComposerModelIds({
+    settings: getClaudeCloudSettings(),
+    catalogModels: models,
+    providersByModel,
+    conversationModel: conversation?.runtimeProviderModel
+      || conversation?.runtime_provider_model
+      || conversation?.preferredModel
+      || '',
+  });
+  return buildCatalogModelOptions(cloudModels, {
+    autoValue: AUTO_MODEL_OPTION,
+    metadataByModel,
+    annotateContextWindow: false,
+  }).filter((option) => option.value.toLowerCase() !== AUTO_MODEL_OPTION);
 }
 
 // metadataByModel is a parameter because the catalog refresh builds the next
@@ -1405,6 +1464,9 @@ function buildModelSelectorOptions(
   activeProviderType = '',
   metadataByModel = modelCatalogState.modelMetadataByModel,
 ) {
+  if (normalizeModelSelectorProviderType(activeProviderType) === CLAUDE_CLOUD_PROVIDER) {
+    return buildClaudeCloudModelSelectorOptions(models, providersByModel, metadataByModel);
+  }
   const normalizedOptions = buildCatalogModelOptions(models.length ? models : [FALLBACK_MODEL], {
     autoValue: AUTO_MODEL_OPTION,
     metadataByModel,
@@ -1421,6 +1483,11 @@ function reasoningOptionsForModel(modelId = '') {
   if (!isModelMetadataHealthy()) return [];
   const key = String(modelId || '').trim().toLowerCase();
   const provider = activeComposerProviderType();
+  // A cloud session has no effort choice; the catalog's efforts for the same
+  // model id belong to the local Claude and Copilot runtimes. The one value is
+  // still listed: the (hidden) select must hold it, because a send without an
+  // effort is refused as "model metadata missing".
+  if (provider === CLAUDE_CLOUD_PROVIDER) return ['none'];
   const providerOptions = modelCatalogState.reasoningByProvider?.[provider]?.[key];
   if (Array.isArray(providerOptions)) return normalizeReasoningEffortList(providerOptions);
   return normalizeReasoningEffortList(modelCatalogState.reasoningByModel?.[key] || []);
@@ -1759,7 +1826,11 @@ function updateModelPricingDetails(modelId, tier) {
   const grid = document.getElementById('model-pricing-grid');
   if (!details || !summary || !grid) return;
   const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
-  const pricing = metadata?.pricing?.[tier === 'long_context' ? 'longContext' : 'default'];
+  // The catalog's prices are Copilot credits; a cloud session is billed to the
+  // Claude account, so they would be the wrong numbers for it.
+  const pricing = activeComposerProviderType() === CLAUDE_CLOUD_PROVIDER
+    ? null
+    : metadata?.pricing?.[tier === 'long_context' ? 'longContext' : 'default'];
   if (!pricing || typeof pricing !== 'object') {
     details.open = false;
     details.style.display = 'none';
@@ -1786,12 +1857,14 @@ function updateModelPricingDetails(modelId, tier) {
   details.style.display = grid.childElementCount ? '' : 'none';
 }
 
-// Relay modes each provider backend actually honors. All four providers
-// currently support the full set — Copilot/OpenAI via prompt-context
+// Relay modes each provider backend actually honors. The local providers
+// support the full set — Copilot/OpenAI via prompt-context
 // injection, Claude via permissionMode + system-prompt appends, Cursor via
 // native plan mode plus message-text nudges for ask/autopilot — but the
 // composer builds its options from this table so a provider that loses (or
-// gains) a mode only needs a change here.
+// gains) a mode only needs a change here. A Claude Cloud session runs in the
+// cloud's own permission mode and ignores relay modes, so it has the one
+// entry and its selector is hidden (body.claude-cloud-conversation).
 const RELAY_MODE_LABELS = { agent: 'Agent', ask: 'Ask', plan: 'Plan', autopilot: 'Autopilot' };
 const RELAY_MODES_BY_PROVIDER = {
   github: ['agent', 'ask', 'plan', 'autopilot'],
@@ -1799,6 +1872,7 @@ const RELAY_MODES_BY_PROVIDER = {
   claude: ['agent', 'ask', 'plan', 'autopilot'],
   cursor: ['agent', 'ask', 'plan', 'autopilot'],
   grok: ['agent', 'ask', 'plan', 'autopilot'],
+  'claude-cloud': ['agent'],
 };
 
 function relayModesForProvider(providerType = '') {
@@ -1850,8 +1924,9 @@ async function persistCurrentConversationPreferences() {
   // record an effort the user never picked when they only changed the mode.
   const reasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
   // These keys hold the last explicit choice, so they are not rolled back when
-  // the write below fails: the user did make the choice either way.
-  localStorage.setItem(MODE_STORAGE_KEY, mode);
+  // the write below fails: the user did make the choice either way. A cloud
+  // chat has no mode to choose, so its fixed "agent" is not such a choice.
+  if (activeComposerProviderType() !== CLAUDE_CLOUD_PROVIDER) localStorage.setItem(MODE_STORAGE_KEY, mode);
   if (model) localStorage.setItem(MODEL_STORAGE_KEY, model);
   if (reasoningEffort) localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
 
@@ -2339,6 +2414,9 @@ function renderModelVariantCatalogBody() {
     // shows Claude-SDK rows exclusively, the Cursor SDK tab Cursor rows, the
     // Grok tab Grok rows, and Copilot never shows rows that a different runtime
     // contributed (there is no cross-runtime switching).
+    // Claude Cloud has no rows of its own to select: its picker is fed by the
+    // Claude Cloud settings tab, so a row tagged for it belongs to no tab.
+    if (entryProvider === CLAUDE_CLOUD_PROVIDER) return false;
     if (activeTab === 'anthropic') {
       return entryProvider === 'claude';
     }
@@ -2362,6 +2440,7 @@ function renderModelVariantCatalogBody() {
         && provider !== 'claude'
         && provider !== 'cursor'
         && provider !== 'grok'
+        && provider !== CLAUDE_CLOUD_PROVIDER
       ));
     }
     return true;
@@ -3087,9 +3166,11 @@ async function loadContextSummaryAndRender(convId) {
   const refreshLookupId = sessionId || trimmedConvId || null;
   const providerLabel = payload.providerType === 'claude'
     ? 'Claude'
-    : (payload.providerType === 'cursor'
-      ? 'Cursor'
-      : (payload.providerType === 'grok' ? 'Grok' : 'Copilot'));
+    : (payload.providerType === CLAUDE_CLOUD_PROVIDER
+      ? 'Claude Cloud'
+      : (payload.providerType === 'cursor'
+        ? 'Cursor'
+        : (payload.providerType === 'grok' ? 'Grok' : 'Copilot')));
   const subtitle = sessionId
     ? `${providerLabel} session ${sessionId.slice(0, 8)}`
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
@@ -3798,6 +3879,9 @@ function syncChatTitleControls() {
   if (!isStatusViewActive()) {
     syncChatHeaderWorkspaceLabel();
   }
+  // Cloud line, hidden controls and the image-only attach button all follow
+  // the conversation on screen, like the header does.
+  syncClaudeCloudConversationUi();
   syncChatTitleWatcherIndicator();
 }
 
@@ -3954,6 +4038,21 @@ initTmuxInspectorView({
   lockChatActionsMenuShield,
   closeChatActionsMenu,
 });
+
+// The composer's model list of a cloud conversation comes from the Claude
+// Cloud settings, which load (and change) independently of the catalog.
+function refreshClaudeCloudComposerModels() {
+  if (isSharedReaderMode()) return;
+  if (normalizeModelSelectorProviderType(activeComposerProviderType()) !== CLAUDE_CLOUD_PROVIDER) return;
+  const select = document.getElementById('model-select');
+  // Without a healthy catalog there is nothing to rebuild from (and a rebuild
+  // would raise the metadata blocker); the next catalog load builds the list
+  // with whatever settings have arrived by then.
+  if (!select || !isModelMetadataHealthy()) return;
+  // Dropping the scope makes syncAutoModelAvailability rebuild the options.
+  delete select.dataset.providerScope;
+  syncAutoModelAvailability();
+}
 
 function showAuthGate(error = '') {
   document.getElementById('startup-loading')?.remove();
@@ -4118,6 +4217,14 @@ async function initApp() {
       closeChatActionsMenu();
       openGitChangesModal();
     });
+    const chatMenuOpenCloudSessionBtn = document.getElementById('chat-menu-open-cloud-session');
+    bindMenuAction(chatMenuOpenCloudSessionBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      openCurrentCloudSession(showExternalLinkFallback);
+    });
     const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
     bindMenuAction(chatMenuSettingsBtn, (event) => {
       event.preventDefault();
@@ -4227,6 +4334,11 @@ async function initApp() {
   await refreshOpenAISettingsState();
   await refreshCursorSettingsState();
   await refreshGrokSettingsState();
+  // Not awaited: only a Claude Cloud conversation needs it (its model list),
+  // and the subscription below rebuilds that list when the answer arrives. A
+  // relay without the provider answers nothing and nothing changes.
+  subscribeClaudeCloudSettings(refreshClaudeCloudComposerModels);
+  void refreshClaudeCloudSettingsState();
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
@@ -4348,6 +4460,9 @@ window.dismissAvailableUpdate = dismissAvailableUpdate;
 window.dismissUpdateOutcome = dismissUpdateOutcome;
 window.saveGrokSettings = saveGrokSettings;
 window.toggleGrokProvider = toggleGrokProvider;
+window.saveClaudeCloudSettings = saveClaudeCloudSettings;
+window.toggleClaudeCloudProvider = toggleClaudeCloudProvider;
+window.openClaudeCloudLoginTab = openClaudeCloudLoginTab;
 window.saveCursorSettings = saveCursorSettings;
 window.removeCursorSettings = removeCursorSettings;
 window.saveCursorAllowanceSettings = saveCursorAllowanceSettings;

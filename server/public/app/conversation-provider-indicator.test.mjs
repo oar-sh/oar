@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   conversationProviderIndicatorKey,
   conversationProviderIndicatorLabel,
+  isConversationUsingClaudeCloudProvider,
+  isConversationUsingClaudeProvider,
   isConversationUsingCursorProvider,
   isConversationUsingGrokProvider,
   isConversationUsingOpenAIProvider,
@@ -46,10 +48,20 @@ test('identifies Grok conversations only', () => {
   assert.equal(isConversationUsingGrokProvider(null), false);
 });
 
+test('a cloud conversation is its own provider, never a Claude one', () => {
+  assert.equal(isConversationUsingClaudeCloudProvider({ runtimeProviderType: 'claude-cloud' }), true);
+  assert.equal(isConversationUsingClaudeCloudProvider({ runtime_provider_type: ' Claude-Cloud ' }), true);
+  assert.equal(isConversationUsingClaudeCloudProvider({ runtimeProviderType: 'claude' }), false);
+  assert.equal(isConversationUsingClaudeCloudProvider(null), false);
+  assert.equal(isConversationUsingClaudeProvider({ runtimeProviderType: 'claude-cloud' }), false);
+  assert.equal(isConversationUsingClaudeProvider({ runtimeProviderType: 'claude' }), true);
+});
+
 test('labels provider indicator per provider type', () => {
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'cursor' }), 'Cursor');
   assert.equal(conversationProviderIndicatorLabel({ runtime_provider_type: 'CURSOR' }), 'Cursor');
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'claude' }), 'Claude');
+  assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'claude-cloud' }), '☁ Claude Cloud');
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'grok' }), 'Grok');
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'openai' }), 'OpenAI');
   assert.equal(conversationProviderIndicatorLabel({ runtimeProviderType: 'github' }), 'Copilot');
@@ -62,6 +74,7 @@ test('labels provider indicator per provider type', () => {
 test('keys the provider pill to the composer palette', () => {
   assert.equal(conversationProviderIndicatorKey({ runtimeProviderType: 'cursor' }), 'cursor');
   assert.equal(conversationProviderIndicatorKey({ runtime_provider_type: 'CLAUDE' }), 'claude');
+  assert.equal(conversationProviderIndicatorKey({ runtimeProviderType: 'claude-cloud' }), 'claude-cloud');
   assert.equal(conversationProviderIndicatorKey({ runtimeProviderType: 'grok' }), 'grok');
   assert.equal(conversationProviderIndicatorKey({ runtimeProviderType: 'github-copilot' }), 'github');
   assert.equal(
@@ -97,6 +110,7 @@ test('maps session lock provider keys, including the derived image variant', () 
   assert.equal(sessionLockProviderKey({ providerType: 'openai-image' }), 'openai-image');
   assert.equal(sessionLockProviderKey({ providerType: ' Claude ' }), 'claude');
   assert.equal(sessionLockProviderKey({ providerType: 'anthropic' }), 'claude');
+  assert.equal(sessionLockProviderKey({ providerType: ' Claude-Cloud ' }), 'claude-cloud');
   assert.equal(sessionLockProviderKey({ providerType: 'cursor' }), 'cursor');
   assert.equal(sessionLockProviderKey({ providerType: 'grok' }), 'grok');
   assert.equal(sessionLockProviderKey({ providerType: 'xai' }), 'grok');
@@ -109,6 +123,7 @@ test('labels every supported session lock provider', () => {
   assert.equal(sessionLockProviderLabel({ providerType: 'openai', model: 'gpt-5' }), 'OpenAI');
   assert.equal(sessionLockProviderLabel({ providerType: 'openai', model: 'dall-e-3' }), 'OpenAI Image');
   assert.equal(sessionLockProviderLabel({ providerType: 'claude' }), 'Claude SDK');
+  assert.equal(sessionLockProviderLabel({ providerType: 'claude-cloud' }), '☁ Claude Cloud');
   assert.equal(sessionLockProviderLabel({ providerType: 'cursor' }), 'Cursor SDK');
   assert.equal(sessionLockProviderLabel({ providerType: 'grok' }), 'Grok');
   assert.equal(sessionLockProviderLabel({ providerType: '' }), '');
@@ -131,6 +146,10 @@ test('builds the composer session lock note', () => {
     sessionLockNoteText({ providerType: 'openai', model: 'gpt-image-1', pinnedModel: ' gpt-image-1 ' }),
     '🔒 Session locked to OpenAI Image models (gpt-image-1).',
   );
+  assert.equal(
+    sessionLockNoteText({ providerType: 'claude-cloud', model: 'claude-sonnet-5-5' }),
+    '🔒 Session locked to ☁ Claude Cloud models.',
+  );
   assert.equal(sessionLockNoteText({ providerType: 'unknown', pinnedModel: 'gpt-4o' }), '');
   assert.equal(sessionLockNoteText(), '');
 });
@@ -140,6 +159,8 @@ test('question cards name the runtime that asks, not always Copilot', () => {
   assert.equal(questionCardHeadLabel({ runtimeProviderType: 'github' }), 'Copilot question');
   assert.equal(questionCardHeadLabel({ runtime_provider_type: 'cursor' }), 'Cursor question');
   assert.equal(questionCardHeadLabel({ runtimeProviderType: 'openai' }), 'OpenAI question');
+  // The cloud marker belongs to the pill; a sentence reads better without it.
+  assert.equal(questionCardHeadLabel({ runtimeProviderType: 'claude-cloud' }), 'Claude Cloud question');
   // A conversation the client has not resolved yet claims no provider.
   assert.equal(questionCardHeadLabel(null), 'Question');
   assert.equal(questionCardHeadLabel({}), 'Question');

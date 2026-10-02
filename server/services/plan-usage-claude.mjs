@@ -13,10 +13,18 @@
  * When the experimental call is unavailable the worker still reports the
  * stable `modelUsage` / `total_cost_usd` result fields, which render as session
  * cost details with no plan meters.
+ *
+ * A second, live source exists while the Claude Cloud provider is switched on
+ * (the switch is the consent to use the Claude CLI's login): the account's
+ * usage as claude.ai's own endpoint reports it, read without a model turn
+ * (`claude-account-usage-service.mjs`). It carries the same window keys, so
+ * the meters are then built from it and the SDK snapshot only supplies the
+ * session details.
  */
 
 import {
   SOURCE_CACHE,
+  SOURCE_LIVE,
   SOURCE_WORKER,
   STATUS_NOT_CONFIGURED,
   STATUS_OK,
@@ -30,13 +38,14 @@ import {
   roundCurrency,
   toFiniteNumber,
   toIsoTimestamp,
+  toSeverity,
   toTrimmedString,
 } from './plan-usage-contract.mjs';
 
 export const CLAUDE_PROVIDER_ID = 'claude';
 export const CLAUDE_LABEL = 'Claude';
 
-const CLAUDE_USAGE_URL = 'https://claude.ai/settings/usage';
+export const CLAUDE_USAGE_URL = 'https://claude.ai/settings/usage';
 
 // Fixed windows, in display order. Model-scoped windows are appended after
 // these from the server-supplied `model_scoped[]` array.
@@ -139,7 +148,7 @@ export function normalizeClaudePlanUsage(raw) {
       const displayName = toTrimmedString(entry?.display_name);
       if (!normalized || !displayName) continue;
       windows.push({
-        id: `model_scoped:${displayName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+        id: modelScopedWindowId(displayName),
         label: `Weekly ${displayName}`,
         emphasis: 'secondary',
         ...normalized,
@@ -157,6 +166,7 @@ export function normalizeClaudePlanUsage(raw) {
       usedCredits: toFiniteNumber(rawExtra.used_credits),
       utilization: clampPercent(rawExtra.utilization),
       currency: toTrimmedString(rawExtra.currency),
+      decimalPlaces: toFiniteNumber(rawExtra.decimal_places),
     }
     : null;
 
@@ -182,6 +192,75 @@ export function normalizeClaudePlanUsage(raw) {
     || payload.behaviors
     || payload.subscriptionType;
   return hasSignal ? payload : null;
+}
+
+function modelScopedWindowId(displayName) {
+  return `model_scoped:${displayName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+}
+
+// `limits[]` of the account endpoint names the two fixed windows by kind.
+const LIMIT_KIND_WINDOW_IDS = Object.freeze({ session: 'five_hour', weekly_all: 'seven_day' });
+
+/**
+ * Normalize the live account usage (the body of claude.ai's usage endpoint).
+ *
+ * Its top level is what the SDK response carries under `rate_limits`, so the
+ * windows and the extra usage come from the same normalizer. On top of that:
+ * `limits[]` adds a severity per window and the model-scoped weekly windows,
+ * and `seven_day_breakdown.rows` says which product the week went to.
+ * Returns `{ windows, extraUsage, breakdown }`, or null when nothing usable
+ * is present.
+ */
+export function normalizeClaudeAccountUsage(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const base = normalizeClaudePlanUsage({ rate_limits: body, rate_limits_available: true });
+  const windows = (base?.windows || []).map((window) => ({ ...window, severity: null }));
+
+  for (const entry of (Array.isArray(body.limits) ? body.limits : [])) {
+    if (!entry || typeof entry !== 'object') continue;
+    const kind = toTrimmedString(entry.kind);
+    let target = null;
+    if (kind === 'weekly_scoped') {
+      const displayName = toTrimmedString(entry.scope?.model?.display_name)
+        || toTrimmedString(entry.scope?.surface?.display_name);
+      if (!displayName) continue;
+      const label = `Weekly ${displayName}`;
+      target = windows.find((window) => window.label.toLowerCase() === label.toLowerCase()) || null;
+      if (!target) {
+        const reading = normalizeWindow({ utilization: entry.percent, resets_at: entry.resets_at });
+        if (!reading) continue;
+        target = { id: modelScopedWindowId(displayName), label, emphasis: 'secondary', ...reading, severity: null };
+        windows.push(target);
+      }
+    } else if (kind && LIMIT_KIND_WINDOW_IDS[kind]) {
+      target = windows.find((window) => window.id === LIMIT_KIND_WINDOW_IDS[kind]) || null;
+    }
+    if (target) target.severity = toSeverity(entry.severity);
+  }
+
+  const breakdown = (Array.isArray(body.seven_day_breakdown?.rows) ? body.seven_day_breakdown.rows : [])
+    .map((row) => {
+      const name = toTrimmedString(row?.display_name) || toTrimmedString(row?.key);
+      const percent = clampPercent(row?.percent);
+      return name && percent !== null ? { name, percent } : null;
+    })
+    .filter(Boolean);
+
+  const extraUsage = base?.extraUsage || null;
+  if (!windows.length && !extraUsage && !breakdown.length) return null;
+  return { windows, extraUsage, breakdown };
+}
+
+/**
+ * The prepaid credits of the organisation as `{ amount, currency }` in major
+ * units, or null. The API sends the balance as `amount` in minor units (the
+ * Claude CLI reads it as cents).
+ */
+export function normalizeClaudePrepaidCredits(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const minor = toFiniteNumber(raw.amount);
+  if (minor === null) return null;
+  return { amount: minor / 100, currency: toTrimmedString(raw.currency) };
 }
 
 /** Build the fallback payload from the stable result-message fields. */
@@ -232,6 +311,68 @@ function formatUsd(value) {
   return numeric === null ? null : `$${numeric.toFixed(2)}`;
 }
 
+/** "$12.50" for dollars (or an unnamed currency), "12.50 EUR" for any other. */
+export function formatClaudeMoney(amount, currency = null) {
+  const numeric = roundCurrency(amount);
+  if (numeric === null) return null;
+  const code = toTrimmedString(currency)?.toUpperCase() || 'USD';
+  return code === 'USD' ? `$${numeric.toFixed(2)}` : `${numeric.toFixed(2)} ${code}`;
+}
+
+/**
+ * Extra-usage amounts arrive in minor units of the currency (cents for USD;
+ * the SDK's response schema says so, and the account endpoint names the
+ * exponent in `decimal_places`).
+ */
+function extraUsageAmount(value, decimalPlaces) {
+  const numeric = toFiniteNumber(value);
+  if (numeric === null) return null;
+  const places = Number.isInteger(decimalPlaces) && decimalPlaces >= 0 && decimalPlaces <= 4 ? decimalPlaces : 2;
+  return numeric / (10 ** places);
+}
+
+/**
+ * The detail sections for one session's totals (`session` as
+ * `normalizeClaudePlanUsage` / `claudePlanUsageFromResult` store it). The
+ * Claude Cloud card shows its own latest snapshot through the same sections,
+ * under its own ids and wording.
+ */
+export function buildClaudeSessionSections(session, {
+  idPrefix = 'claude',
+  sessionLabel = 'Latest session totals',
+  modelsLabel = 'By model (session)',
+  costLabel = 'Session cost (estimate)',
+  costHint = 'Client-side estimate, not a billing statement',
+} = {}) {
+  if (!session || typeof session !== 'object') return [];
+  const sections = [];
+  const rows = [];
+  const cost = formatUsd(session.totalCostUsd);
+  if (cost) rows.push({ label: costLabel, value: cost, hint: costHint });
+  const apiDuration = formatDuration(session.totalApiDurationMs);
+  if (apiDuration) rows.push({ label: 'API time', value: apiDuration });
+  const wallDuration = formatDuration(session.totalDurationMs);
+  if (wallDuration) rows.push({ label: 'Wall-clock time', value: wallDuration });
+  if (toFiniteNumber(session.totalLinesAdded) !== null) rows.push({ label: 'Lines added', value: String(session.totalLinesAdded) });
+  if (toFiniteNumber(session.totalLinesRemoved) !== null) rows.push({ label: 'Lines removed', value: String(session.totalLinesRemoved) });
+  const sessionSection = buildDetailSection({ id: `${idPrefix}-session`, label: sessionLabel, rows });
+  if (sessionSection) sections.push(sessionSection);
+
+  const modelRows = (Array.isArray(session.modelUsage) ? session.modelUsage : []).map((entry) => ({
+    label: entry.model,
+    value: formatUsd(entry.costUsd) ?? '—',
+    hint: [
+      formatTokens(entry.inputTokens) ? `in ${formatTokens(entry.inputTokens)}` : null,
+      formatTokens(entry.outputTokens) ? `out ${formatTokens(entry.outputTokens)}` : null,
+      formatTokens(entry.cacheReadTokens) ? `cache r ${formatTokens(entry.cacheReadTokens)}` : null,
+      formatTokens(entry.cacheWriteTokens) ? `cache w ${formatTokens(entry.cacheWriteTokens)}` : null,
+    ].filter(Boolean).join(' · ') || null,
+  }));
+  const modelSection = buildDetailSection({ id: `${idPrefix}-models`, label: modelsLabel, rows: modelRows });
+  if (modelSection) sections.push(modelSection);
+  return sections;
+}
+
 function attributionRows(entries, limit = 6) {
   return entries.slice(0, limit).map((entry) => ({
     label: entry.name,
@@ -280,12 +421,20 @@ function behaviorSections(behaviors) {
   return sections;
 }
 
+/**
+ * @param {object} options
+ * @param {object|null} options.usage     the stored snapshot of the last SDK turn
+ * @param {object|null} options.account   live account usage
+ *   (`{ usage, prepaid, offer, fetchedAt, error }` from
+ *   claude-account-usage-service.mjs), or null when it was not read
+ */
 export function buildClaudePlanCard({
   usage = null,
   capturedAt = null,
   stale = false,
   configured = true,
   message = null,
+  account = null,
 } = {}) {
   if (!configured) {
     return buildUnavailableCard({
@@ -295,7 +444,11 @@ export function buildClaudePlanCard({
       message: 'Claude is not enabled in provider settings.',
     });
   }
-  if (!usage) {
+  const live = normalizeClaudeAccountUsage(account?.usage);
+  // Live windows replace the snapshot's; a live answer without a single
+  // window (it should not happen for a plan login) leaves the snapshot in place.
+  const hasLive = !!live && live.windows.length > 0;
+  if (!usage && !hasLive) {
     return buildUnavailableCard({
       provider: CLAUDE_PROVIDER_ID,
       label: CLAUDE_LABEL,
@@ -307,7 +460,8 @@ export function buildClaudePlanCard({
   }
 
   const meters = [];
-  for (const window of (Array.isArray(usage.windows) ? usage.windows : [])) {
+  const windows = hasLive ? live.windows : (Array.isArray(usage.windows) ? usage.windows : []);
+  for (const window of windows) {
     meters.push(buildMeter({
       id: `claude-${window.id}`,
       label: window.label,
@@ -315,17 +469,18 @@ export function buildClaudePlanCard({
       utilization: window.utilization,
       resetAt: window.resetsAt,
       emphasis: window.emphasis === 'secondary' ? 'secondary' : 'primary',
+      severity: window.severity,
     }));
   }
 
-  const extra = usage.extraUsage;
+  const extra = hasLive ? live.extraUsage : usage.extraUsage;
   if (extra && (extra.isEnabled || extra.usedCredits !== null || extra.monthlyLimit !== null)) {
     meters.push(buildMeter({
       id: 'claude-extra-usage',
       label: 'Extra usage credits',
       unit: extra.currency && extra.currency.toUpperCase() !== 'USD' ? 'credits' : 'usd',
-      used: extra.usedCredits,
-      allowance: extra.monthlyLimit,
+      used: extraUsageAmount(extra.usedCredits, extra.decimalPlaces),
+      allowance: extraUsageAmount(extra.monthlyLimit, extra.decimalPlaces),
       utilization: extra.utilization,
       note: extra.isEnabled ? null : 'Extra usage is disabled for this account',
       emphasis: 'secondary',
@@ -333,55 +488,62 @@ export function buildClaudePlanCard({
   }
 
   const details = [];
-  const session = usage.session;
-  if (session) {
-    const rows = [];
-    const cost = formatUsd(session.totalCostUsd);
-    if (cost) rows.push({ label: 'Session cost (estimate)', value: cost, hint: 'Client-side estimate, not a billing statement' });
-    const apiDuration = formatDuration(session.totalApiDurationMs);
-    if (apiDuration) rows.push({ label: 'API time', value: apiDuration });
-    const wallDuration = formatDuration(session.totalDurationMs);
-    if (wallDuration) rows.push({ label: 'Wall-clock time', value: wallDuration });
-    if (session.totalLinesAdded !== null) rows.push({ label: 'Lines added', value: String(session.totalLinesAdded) });
-    if (session.totalLinesRemoved !== null) rows.push({ label: 'Lines removed', value: String(session.totalLinesRemoved) });
-    const sessionSection = buildDetailSection({ id: 'claude-session', label: 'Latest session totals', rows });
-    if (sessionSection) details.push(sessionSection);
-
-    const modelRows = (session.modelUsage || []).map((entry) => ({
-      label: entry.model,
-      value: formatUsd(entry.costUsd) ?? '—',
-      hint: [
-        formatTokens(entry.inputTokens) ? `in ${formatTokens(entry.inputTokens)}` : null,
-        formatTokens(entry.outputTokens) ? `out ${formatTokens(entry.outputTokens)}` : null,
-        formatTokens(entry.cacheReadTokens) ? `cache r ${formatTokens(entry.cacheReadTokens)}` : null,
-        formatTokens(entry.cacheWriteTokens) ? `cache w ${formatTokens(entry.cacheWriteTokens)}` : null,
-      ].filter(Boolean).join(' · ') || null,
+  if (hasLive && live.breakdown.length) {
+    details.push(buildDetailSection({
+      id: 'claude-week-by-product',
+      label: 'This week by product',
+      note: 'Share of this week’s usage per product, as claude.ai reports it. Cloud sessions count under Claude Code.',
+      rows: live.breakdown.map((row) => ({ label: row.name, value: `${Math.round(row.percent * 10) / 10}%` })),
     }));
-    const modelSection = buildDetailSection({ id: 'claude-models', label: 'By model (session)', rows: modelRows });
-    if (modelSection) details.push(modelSection);
   }
+  const prepaid = normalizeClaudePrepaidCredits(account?.prepaid);
+  if (prepaid && prepaid.amount !== 0) {
+    details.push(buildDetailSection({
+      id: 'claude-credits',
+      label: 'Credits',
+      rows: [{ label: 'Prepaid credits', value: formatClaudeMoney(prepaid.amount, prepaid.currency), hint: 'Balance of the organisation' }],
+    }));
+  }
+  details.push(...buildClaudeSessionSections(usage?.session));
+  details.push(...behaviorSections(usage?.behaviors));
 
-  details.push(...behaviorSections(usage.behaviors).filter(Boolean));
+  const notes = [];
+  if (hasLive) {
+    // The claude.ai usage page also lists limit-reset vouchers; no endpoint
+    // the CLI login reaches has a field for them.
+    notes.push({
+      id: 'claude-limit-resets',
+      text: 'Limit resets (full / 5-hour) are shown on claude.ai only.',
+      link: { label: 'Open the usage page', url: CLAUDE_USAGE_URL },
+    });
+  } else if (toTrimmedString(account?.error)) {
+    notes.push({
+      id: 'claude-live-unavailable',
+      text: `Live account usage could not be read, so this is the reading of the last Claude turn. ${toTrimmedString(account.error)}`,
+    });
+  }
 
   const resolvedMeters = meters.filter(Boolean);
   const planLimitsMissing = !resolvedMeters.length;
+  const subscriptionType = toTrimmedString(usage?.subscriptionType);
   return buildProviderCard({
     provider: CLAUDE_PROVIDER_ID,
     label: CLAUDE_LABEL,
     status: planLimitsMissing ? STATUS_PARTIAL : STATUS_OK,
-    planName: usage.subscriptionType
-      ? `${usage.subscriptionType.charAt(0).toUpperCase()}${usage.subscriptionType.slice(1)}`
+    planName: subscriptionType
+      ? `${subscriptionType.charAt(0).toUpperCase()}${subscriptionType.slice(1)}`
       : null,
     message: planLimitsMissing
-      ? (usage.rateLimitsAvailable
+      ? (hasLive || usage?.rateLimitsAvailable
         ? 'Plan rate limits were not reported for this session.'
         : 'This session authenticates without claude.ai plan limits (API key or third-party provider), so only session cost is available.')
       : null,
-    source: stale ? SOURCE_CACHE : SOURCE_WORKER,
-    stale,
-    capturedAt,
+    source: hasLive ? SOURCE_LIVE : (stale ? SOURCE_CACHE : SOURCE_WORKER),
+    stale: hasLive ? false : stale,
+    capturedAt: hasLive ? (toIsoTimestamp(account?.fetchedAt) || capturedAt) : capturedAt,
     meters: resolvedMeters,
-    details,
+    details: details.filter(Boolean),
+    notes,
     links: [{ label: 'Claude usage settings', url: CLAUDE_USAGE_URL }],
   });
 }

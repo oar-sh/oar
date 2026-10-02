@@ -47,7 +47,9 @@ Operator and developer detail moved here from the README.
 2. **Session workers** (`server/copilot-worker/`, `server/claude-worker/`, `server/cursor-worker/`,
    `server/grok-worker/`): one Node process per conversation that runs its turns through the
    Copilot SDK engine, the Claude Agent SDK, the Cursor Agent SDK, or the Grok CLI over ACP, and
-   speaks the same relay contracts as the Copilot workers.
+   speaks the same relay contracts as the Copilot workers. The Claude Cloud worker
+   (`server/claude-cloud-worker/`) speaks them too but runs no agent: it sends messages to a
+   session in Anthropic's cloud and follows that session's event stream.
 3. **Copilot CLI extension** (`.github/extensions/web-relay/`): the Extension engine. It polls the
    relay, executes turns, streams activity, and bridges `ask_user` questions into web question
    cards.
@@ -182,10 +184,11 @@ If the same extension is available both project-local (`.github/extensions/web-r
 Common routes:
 
 - Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`, `/api/context/:conversationId`
-- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
+- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/claude-cloud`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
 - Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
 - Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
+- Claude Cloud worker: `/api/claude-cloud-session`, plus the Claude worker's `/api/claude-context-usage` and `/api/claude-plan-usage`
 - Claude account auth: `/api/claude/auth/status`, `/api/claude/auth/login/start`, `/api/claude/auth/login/code`, `/api/claude/auth/login/cancel`, `/api/claude/auth/logout`
 - Grok account auth: `/api/grok/auth/status`, `/api/grok/auth/login/start`, `/api/grok/auth/login/cancel`, `/api/grok/auth/logout`
 - Provider CLI install: `/api/cli/status`, `/api/cli/install`, `/api/cli/install/cancel`
@@ -194,7 +197,7 @@ Common routes:
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
 - Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
-- Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`
+- Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`, `/api/git/remote` (the New Chat modal of a Claude Cloud chat)
 - Previews: `/api/previews`, `/api/previews/:token` (publish a local dev server; see `docs/preview-servers.md`)
 - Remote relays: `/api/relay/identity`, `/api/remote-relays`, `/api/remote-relays/:id`, `/api/remote-relays/:id/check`, `/api/remote-relays/pair`, `/api/settings/remote-relays`; agent tool calls go through `/api/remote-relays/tool`, and workers read `/api/remote-relays/summary` and `/api/remote-relays/inflight`
 - Uploads: `/api/upload`, `/api/upload/:sha256/content`
@@ -283,7 +286,7 @@ tmux attach -t <sdk-session-id>
 
 ### Worker logs
 
-Every Node session worker (Claude, Cursor, Grok, Copilot SDK) appends its stdout and stderr to
+Every Node session worker (Claude, Claude Cloud, Cursor, Grok, Copilot SDK) appends its stdout and stderr to
 `worker-<sdk-session-id>.log` in the relay's log directory (`COPILOT_WEB_RELAY_LOG_DIR`; `oar doctor`
 prints it), across restarts of the worker. At each launch a file over 10 MB is moved to
 `worker-<sdk-session-id>.log.1`, replacing the previous one.
@@ -323,6 +326,89 @@ node server/claude-worker/claude-session-worker.mjs --session-id <sdk-session-id
 Useful overrides: `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary),
 `COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH` (worker script location),
 `COPILOT_WEB_RELAY_CONFIG` (relay config used to resolve the server URL and auth token).
+
+### Claude Cloud workers
+
+Claude Cloud conversations run `server/claude-cloud-worker/claude-cloud-session-worker.mjs`, a
+plain Node process like the Claude worker, with `[claude-cloud-worker <time>]` log lines under
+`tmux attach` and in `worker-<sdk-session-id>.log`. It runs no agent and no CLI. The agent lives in
+a session at Anthropic; the worker posts the user's messages there and follows the session's event
+stream (`claude-cloud-session-process.mjs`). So the log is where to look for what the worker did,
+and the session's page on claude.ai (the link in the conversation's cloud line) for what the agent
+did.
+
+The provider adds `COPILOT_WEB_RELAY_WORKER_KIND=claude-cloud` and `CLAUDE_CLOUD_RELAY_MODEL` to
+the launch environment, and no credential. The worker reads the Claude CLI's login itself
+(`shared/claude-cloud/credentials.mjs`; `CLAUDE_CONFIG_DIR` says where), and the token is in no log
+line and no error text. Only a relay that runs on `CLAUDE_CODE_OAUTH_TOKEN` passes that variable
+on, to cloud workers only and, under tmux, through the secret env file (`workerSecretEnvVarsFor`).
+Overrides: `COPILOT_WEB_RELAY_CLAUDE_CLOUD_WORKER_PATH` (worker script location),
+`COPILOT_WEB_RELAY_CONFIG`, and for tests `OAR_CLAUDE_CLOUD_API_BASE_URL`, which points the relay's
+and the worker's cloud client at a fake API on the same machine; a value that is not a loopback
+`http(s)` URL is ignored (`shared/claude-cloud/base-url.mjs`).
+
+**The event stream.** `GET /v1/code/sessions/<id>/events/stream` is server-sent events. The worker
+only reads `client_event` frames: the frame's `id:` is the event's sequence number, its data is
+`{ event_type, source, sequence_num, payload }`, and `payload` is a plain Claude Code SDK message
+(`assistant`, `user`, `system`, `result`, `control_request`, `control_response`,
+`rate_limit_event`, `env_manager_log`, …). `session_update`, `delivery_update` and `ephemeral_event`
+frames and the keepalive comments carry nothing a turn needs.
+`claude-cloud-event-normalizer.mjs` maps events to relay actions; its header lists the channels.
+The same events can be read as a paged log (`GET …/events?sort_order=asc&cursor=<sequence>`),
+which is what a restarted worker does. Every expectation about these shapes lives in
+`shared/claude-cloud/api-client.mjs`, because the API is measured, not documented.
+
+A turn is everything after its user event up to the first `result`. In the log, look for:
+
+- `queue.deliver received … msgId=…`: a delivery arrived;
+- `cloud event stream dropped mid-turn; reconnecting reason=… after=<sequence> in=<ms>`: the
+  stream ended or could not be opened, and is reopened after the last event handled, with a pause
+  growing from 1 s to 15 s. No byte for 120 s, keepalives included, counts as a drop. After five
+  minutes without a stream the row is requeued;
+- `closing the idle cloud event stream`: ten minutes without a turn; the next delivery reopens it;
+- `cloud turn failed <code> …`: the code is one of the client's (`login_expired`,
+  `github_not_connected`, `repo_access_denied`, `environment_missing`, `rate_limited`, `not_found`,
+  `transient`, …). `transient` requeues the row; the others answer it with what to do.
+
+**Why a redelivery is safe.** Two things keep a queue row that is delivered a second time from
+becoming a second prompt in the cloud:
+
+- *The resume cursor.* `runtime_sessions.claude_cloud_last_sequence` is the sequence number of the
+  last finished turn's `result`. The worker reports it through `POST /api/claude-cloud-session`
+  after every `result`; it is never a point inside a turn, and the relay never moves it back. It
+  rides on every delivery as `claudeCloud.lastSequence`, next to the session id, so a worker that
+  starts cold needs nothing but the delivery: it reads the session's event log on from the cursor
+  (`catchUp`) before it sends anything.
+- *The deterministic message uuid.* The user event's `uuid` is derived from the queue row id
+  (`claudeCloudMessageUuid`), not random. A row that is delivered again names the same message, so
+  the worker finds it in the log (or, in the same process, in `session.sent`), takes the turn that
+  message already started as its own, and publishes that turn's events again under the new
+  attempt. A turn that finished while no worker ran is answered from the log alone. The first
+  message works the same way: the create call carries the uuid, and a repeated create is answered
+  with the session that already exists.
+
+**Re-running a turn.** To watch a turn being published again without spending a new cloud turn,
+end the worker *process* while the turn runs (`tmux kill-session -t <sdk-session-id>`, or kill the
+pid). The relay's dead-worker recovery returns the row to the queue (it counts as a retry), and
+the worker that gets it next follows the turn from the log as described above. **☠️ Kill session**
+(`POST /api/session-worker/<sdkSessionId>/kill`) is not that: it fails the rows the worker owned,
+and whatever is sent afterwards is a new queue row, so a new user event and a new, billed turn at
+Anthropic. The unit suites replay scripted event sequences against the runner
+(`claude-cloud-session-process.test.mjs`, harness `claude-cloud-test-harness.mjs`), and
+`tests/claude-cloud.spec.mjs` runs whole turns through a relay and a worker of its own against a
+fake API on a loopback port (`tests/fake-claude-cloud-api.mjs`). Both cost nothing; prefer them.
+
+**Never run the worker entry bare from an agent's shell.** The entry starts at import, takes its
+session id from `--session-id` *or from `SESSION_ID` in the environment*, and its relay from
+`COPILOT_WEB_RELAY_CONFIG`. A shell inside a relay session inherits both from the live relay, so
+`node server/claude-cloud-worker/claude-cloud-session-worker.mjs` there registers a second worker
+for the very session the agent is running in, against the live relay. To check that the file
+parses, use `node --check server/claude-cloud-worker/claude-cloud-session-worker.mjs`; to exercise
+the logic, run the tests. The Claude, Cursor and Grok worker entries read `SESSION_ID` the same
+way.
+
+A live cloud turn costs real money on the relay host's Claude account. Run one only with the
+user's explicit go-ahead.
 
 ### Copilot SDK workers
 
@@ -406,6 +492,14 @@ long its silent stretches get in real sessions is not known (a compaction, the b
 retry), and failing a turn there means killing the CLI and its background tasks. So a running
 turn the CLI has said nothing in for 10 minutes (30 minutes with a tool open) is written to the
 worker's log with what was in flight, `running turn quiet for …`, and left running.
+
+The Claude Cloud worker has no stall watchdog either, and does not use `turn-liveness.mjs`. What
+it watches is its connection, not the agent: an event stream that delivers no byte for 120 s,
+keepalives included, is reopened after the last event handled, and a stream that stays away for
+five minutes hands the row back to the queue, where the next delivery follows the same turn
+instead of sending it again (see [Claude Cloud workers](#claude-cloud-workers)). A cloud turn that
+is quiet while its stream is alive is left running; the worker cannot stop the sandbox, only ask
+it to (`interrupt`).
 
 A question card, a `remote_relay` call and a compaction hold the watchdog whatever the phase. What
 bounds a turn that stays quiet and alive is the relay's turn ceiling.
@@ -639,8 +733,18 @@ same helper rather than copying the env block — `tests/copilot-engine.spec.mjs
 the Copilot SDK engine's accept path, which the shared server's routing pin makes unreachable, and
 `tests/cli-install.spec.mjs` because a successful install rewrites that relay's `config.json`, binds
 `GROK_CLI_COMMAND` into its process env and hoists its `PATH` — none of which the shared server's
-other specs should inherit.
+other specs should inherit. `tests/claude-cloud.spec.mjs` does it because it needs what the shared
+server forbids: worker launches and session-worker routing, for a real Claude Cloud worker (in a
+tmux server of its own, so the spec is skipped on Windows).
 Keep that rare: it costs a server boot per relay.
+
+**A test relay must never reach the Anthropic API.** The Claude Cloud client sends the Claude
+login to its base URL, so the harness pins `OAR_CLAUDE_CLOUD_API_BASE_URL` to a loopback port
+nothing listens on and clears `CLAUDE_CODE_OAUTH_TOKEN` for every test relay (the credentials file
+is already out of reach through `CLAUDE_CONFIG_DIR`). The cloud spec overrides both for its own
+relay: the URL of `tests/fake-claude-cloud-api.mjs`, and a token only that fake accepts. The
+variable cannot name another host: `shared/claude-cloud/base-url.mjs` ignores everything but a
+loopback `http(s)` URL.
 
 ### Live smoke tests
 

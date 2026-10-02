@@ -442,7 +442,7 @@ test.describe.serial("Copilot SDK worker usage snapshot", () => {
       },
       workerUsage,
     });
-    await page.route("**/api/usage", async (route) => {
+    await page.route(/\/api\/usage(\?.*)?$/, async (route) => {
       await route.fulfill({
         status: 200,
         contentType: "application/json",

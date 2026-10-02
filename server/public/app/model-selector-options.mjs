@@ -12,7 +12,7 @@ export function composerPlaceholderFor({ modelId = '', providerType = '' } = {})
   const provider = String(providerType || '').trim().toLowerCase();
   const id = String(modelId || '').trim().toLowerCase().replace(/\[[^\]]*\]$/, '');
   const providerFallback = () => {
-    if (provider === 'claude') return 'Message Claude…';
+    if (provider === 'claude' || provider === 'claude-cloud') return 'Message Claude…';
     if (provider === 'grok') return 'Message Grok…';
     if (provider === 'openai' || provider === 'openai-byok') return 'Message OpenAI…';
     if (provider === 'cursor') return 'Message Cursor…';

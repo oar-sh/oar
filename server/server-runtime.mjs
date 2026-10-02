@@ -39,6 +39,7 @@ import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { registerGitRoutes } from './routes/git-routes.mjs';
+import { registerClaudeCloudRoutes } from './routes/claude-cloud-routes.mjs';
 import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
 import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
@@ -50,6 +51,13 @@ import { createRemoteRelayDispatcher } from './services/remote-relay-dispatcher.
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
 import { createStatusEventService } from './services/status-event-service.mjs';
 import { createClaudeAuthService } from './services/claude-auth-service.mjs';
+import { createClaudeCloudCredentials } from '../shared/claude-cloud/credentials.mjs';
+import { createClaudeCloudClient } from '../shared/claude-cloud/api-client.mjs';
+import { resolveClaudeCloudBaseUrl } from '../shared/claude-cloud/base-url.mjs';
+import { createClaudeCloudSettingsService } from './services/claude-cloud-settings-service.mjs';
+import { createClaudeCloudSessionService } from './services/claude-cloud-session-service.mjs';
+import { createClaudeAccountUsageService } from './services/claude-account-usage-service.mjs';
+import { createGitRemoteService } from './services/git-remote-service.mjs';
 import { createCliInstallService, writeCliBinariesToConfigFile } from './services/cli-install-service.mjs';
 import { createGrokAuthService } from './services/grok-auth-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
@@ -95,7 +103,7 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
-import { applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
 import {
@@ -2524,6 +2532,51 @@ const claudeAuthService = createClaudeAuthService();
 // group.
 const grokAuthService = createGrokAuthService();
 
+// ─── Claude Cloud (provider `claude-cloud`) ───────────────────────────────────
+// One credentials reader and one cloud client for the whole relay: the
+// settings tab (environments), and the archive of a deleted or archived
+// conversation's cloud session. The reader hands the Claude CLI's login to
+// the client only; nothing here stores, logs or forwards it, and the workers
+// read the credentials file themselves (the launch service hands a cloud
+// worker the login only where the relay itself runs on an environment token,
+// and then through the secret file, never a plain launch environment).
+// An expired login is nudged by letting the CLI look at its own status.
+const claudeCloudCredentials = createClaudeCloudCredentials({
+  nudge: async () => { await claudeAuthService.getStatus({ force: true }); },
+});
+// The Anthropic API, unless OAR_CLAUDE_CLOUD_API_BASE_URL names a fake one on
+// this machine (tests): base-url.mjs ignores every host that is not loopback.
+const claudeCloudClient = createClaudeCloudClient({
+  credentials: claudeCloudCredentials,
+  baseUrl: resolveClaudeCloudBaseUrl(process.env),
+});
+const claudeCloudSettingsService = createClaudeCloudSettingsService({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, String(value), new Date().toISOString()),
+  deleteSetting: (key) => stmts.deleteAppSetting.run(key),
+  getClaudeProviderSettings,
+  claudeAuthService,
+  credentials: claudeCloudCredentials,
+  cloud: claudeCloudClient,
+  // A closure: the socket server is created further down the file.
+  emit: (event, payload) => io.emit(event, payload),
+});
+function getClaudeCloudProviderSettings() {
+  return claudeCloudSettingsService.getSettings();
+}
+const claudeCloudSessionService = createClaudeCloudSessionService({
+  stmts,
+  getCloudClient: () => claudeCloudClient,
+  emit: (event, payload) => io.emit(event, payload),
+});
+// The account's live usage for the Check Usage modal. The Claude Cloud switch
+// is the consent to use the Claude CLI's login, so nothing is read while it
+// is off.
+const claudeAccountUsageService = createClaudeAccountUsageService({
+  cloudClient: claudeCloudClient,
+  isEnabled: () => claudeCloudSettingsService.getSettings().enabled === true,
+});
+
 // ─── Provider CLI install / binary binding ────────────────────────────────────
 // A resolved CLI path is host state, not conversation state, so it lives beside
 // the port and the token in config.json rather than in the app_settings table
@@ -2744,7 +2797,18 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
   // Clear every provider's variables first (the appliers' kind-guarded deletes
   // keep the chained clears order-independent), then apply only the bound one.
-  const cleared = applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv)))));
+  const cleared = applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv))))));
+  // A Claude Cloud conversation gets its own worker and nothing else: it must
+  // never reach the Copilot CLI fall-through at the end of this function. The
+  // environment names the worker and the model, no credential.
+  if (providerType === 'claude-cloud') {
+    const cloudSettings = getClaudeCloudProviderSettings();
+    const cloudModel = String(runtimeSession?.provider_model || runtimeSession?.model || cloudSettings.defaultModel).trim();
+    return applyClaudeCloudProviderEnvironment(cleared, {
+      enabled: true,
+      model: cloudModel,
+    });
+  }
   if (providerType === 'claude') {
     const claudeSettings = getClaudeProviderSettings();
     const claudeModel = String(runtimeSession?.provider_model || runtimeSession?.model || claudeSettings.model).trim();
@@ -5949,6 +6013,7 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     defaultRelayMode: DEFAULT_RELAY_MODE,
     defaultModel: DEFAULT_MODEL,
     getCursorProviderSettings,
+    getClaudeCloudProviderSettings,
   });
   if (out?.ownerSessionId) {
     const worker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;
@@ -6344,6 +6409,8 @@ const windowsBootAutostartService = createWindowsBootAutostartService({
 });
 
 const gitChangesService = createGitChangesService();
+// GET /api/git/remote: where a folder lives on GitHub (New Chat, Claude Cloud).
+const gitRemoteService = createGitRemoteService({ gitChangesService });
 
 // ─── Remote Relays ────────────────────────────────────────────────────────────
 // Other OAR relays this one is paired with, so its agents can work there. Built
@@ -6423,6 +6490,7 @@ const remoteRelayDispatcher = createRemoteRelayDispatcher({
 const sharedRouteDeps = {
   auth,
   gitChangesService,
+  gitRemoteService,
   currentWorkspaceRootPath,
   io,
   db,
@@ -6485,6 +6553,9 @@ const sharedRouteDeps = {
   getGrokProviderSettings,
   setGrokProviderSettings,
   refreshGrokProviderModels,
+  getClaudeCloudProviderSettings,
+  claudeCloudSettingsService,
+  claudeCloudSessionService,
   reconcileUnstartedConversationProviders,
   rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,
@@ -6572,6 +6643,7 @@ const sharedRouteDeps = {
   getCursorDashboardTokenSettings,
   setCursorDashboardTokenSettings,
   planUsageService,
+  claudeAccountUsageService,
   getCursorPlanAllowanceSettings,
   setCursorPlanAllowanceSettings,
   getGrokPlanAllowanceSettings,
@@ -6630,6 +6702,7 @@ registerAskUserRoutes(app, sharedRouteDeps);
 registerRelayBoardRoutes(app, sharedRouteDeps);
 registerCacheRoutes(app, sharedRouteDeps);
 registerGitRoutes(app, sharedRouteDeps);
+registerClaudeCloudRoutes(app, sharedRouteDeps);
 registerPushRoutes(app, {
   auth,
   pushDispatchService,
@@ -6832,10 +6905,14 @@ function ensureRuntimeSessionBinding(
         ? 'cursor'
         : (normalizedRequestedProviderType === 'grok'
           ? 'grok'
-          : (normalizedRequestedProviderType === 'github'
-            ? 'github'
-            : (openAISettings?.enabled ? 'openai' : 'github')))));
-  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor' || resolvedProviderType === 'grok')
+          // Without this entry a `claude-cloud` request would fall to the
+          // default below and bind a GitHub (Copilot CLI) session.
+          : (normalizedRequestedProviderType === 'claude-cloud'
+            ? 'claude-cloud'
+            : (normalizedRequestedProviderType === 'github'
+              ? 'github'
+              : (openAISettings?.enabled ? 'openai' : 'github'))))));
+  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor' || resolvedProviderType === 'grok' || resolvedProviderType === 'claude-cloud')
     ? (String(providerModel || normalizedModel || '').trim() || null)
     : null;
   try {

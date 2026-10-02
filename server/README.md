@@ -431,6 +431,135 @@ On Windows it opens a `Claude Worker <id>` terminal window.
 turns. Those replies carry no usage line rather than displaying Copilot premium-request numbers under
 a reply that never touched Copilot.
 
+## Claude Cloud provider
+
+Provider type `claude-cloud`: a provider of its own, never an alias of `claude`. Its conversations
+run Claude Code in a sandbox at Anthropic, on a clone of a GitHub repository. The worker,
+`server/claude-cloud-worker/claude-cloud-session-worker.mjs`, is a plain Node process per
+conversation that speaks the usual worker contracts (WebSocket link, heartbeat, control poller,
+crash guard) but runs no agent: it sends the user's messages to the cloud session and follows the
+session's event stream (`claude-cloud-session-process.mjs`, `claude-cloud-event-normalizer.mjs`).
+The user-facing description, including what the provider does with the Claude CLI's login, is in
+the [README](../README.md#claude-cloud); the tracker is
+[docs/feature-tracker/claude-cloud.md](../docs/feature-tracker/claude-cloud.md).
+
+### The cloud client and the login
+
+`shared/claude-cloud/api-client.mjs` (`createClaudeCloudClient`) is the only code that knows the
+cloud API: paths, headers and bodies were measured from what the Claude CLI sends, not taken from
+a documented API, so every expectation about them lives in that one file. It is SDK-free (Node's
+`fetch`), turns every failure into a `ClaudeCloudError` with a `code` (`login_missing`,
+`login_expired`, `github_not_connected`, `repo_access_denied`, `environment_missing`, `not_found`,
+`rate_limited`, `bad_request`, `transient`), and never reconnects or retries on a timer by itself.
+
+`shared/claude-cloud/credentials.mjs` (`createClaudeCloudCredentials`) is the only code that reads
+the login: `CLAUDE_CODE_OAUTH_TOKEN` from the environment, else `claudeAiOauth.accessToken` in
+`<CLAUDE_CONFIG_DIR | ~/.claude>/.credentials.json`. The token is cached until a minute before it
+expires and then read again; the refresh token is never used. The relay process has one reader and
+one client (`server-runtime.mjs`), whose `nudge` lets the CLI look at its own status
+(`claudeAuthService.getStatus({ force: true })`) at most once in five minutes; each worker builds
+its own reader, without a nudge. `applyClaudeCloudProviderEnvironment` adds no credential to the
+launch environment (`COPILOT_WEB_RELAY_WORKER_KIND=claude-cloud` and `CLAUDE_CLOUD_RELAY_MODEL`,
+nothing else). Only a relay that itself runs on `CLAUDE_CODE_OAUTH_TOKEN` passes a login on: the
+variable is one of `WORKER_SECRET_ENV_VARS`, restricted to the `claude-cloud` worker kind
+(`workerSecretEnvVarsFor`), so under tmux it reaches a cloud worker through the owner-only secret
+env file, never as an `export` and never in the environment tmux is started with, and no other
+worker kind gets it that way. `redact()` takes the token out of every error text.
+
+The client's base URL is the Anthropic API. `shared/claude-cloud/base-url.mjs`
+(`resolveClaudeCloudBaseUrl`) lets `OAR_CLAUDE_CLOUD_API_BASE_URL` replace it for tests, and only
+with an `http(s)` URL of `127.0.0.1`, `[::1]` or `localhost` without credentials; any other value
+is ignored, because the client sends the login to whatever its base URL is. The relay's client and
+the worker's both resolve it there.
+
+### Settings
+
+`services/claude-cloud-settings-service.mjs` keeps three `app_settings` rows:
+`claude_cloud_enabled` (default off), `claude_cloud_default_model` (default `claude-sonnet-5-5`)
+and `claude_cloud_environment_id`. Everything else the tab shows is read, not stored: the account
+from `claude auth status`, the login's source and expiry from `credentials.describe()`, the
+environments from the cloud (cached for a minute). **While the provider is off, nothing is asked of
+Anthropic**: the environments are listed only when it is on and a login exists. With no
+environment stored, `resolveEnvironmentId` takes the account's first active one and stores it.
+`models` is the Claude provider's model list with the `[…]` tier suffix dropped, deduplicated, the
+default first (`buildClaudeCloudModelList`). Every change is broadcast as the socket event
+`claude_cloud_settings_updated` with the GET body.
+
+Switching the provider off does not rebind anything: there is no reconciliation as for the other
+providers, and an existing cloud conversation still launches its worker.
+
+### Creating a conversation
+
+`POST /api/conversation/bootstrap` takes `providerType: 'claude-cloud'` with
+`cloudSource: { repoUrl, branch? }`. The provider is only ever asked for by name (its model ids are
+the Claude provider's own, so a model never selects it). Refusals are `400` with a `code`:
+`claude_cloud_disabled`, `claude_cloud_repo_invalid`, `claude_cloud_branch_invalid`,
+`claude_cloud_environment_missing`, and `CLAUDE_CLOUD_MODEL_UNAVAILABLE` for a model outside the
+list. The repository is normalized to `https://github.com/<owner>/<repo>`
+(`shared/claude-cloud/repo-url.mjs` → `normalizeGitHubRepoUrl`; https, ssh and scp forms of
+github.com only), the branch is checked against git's ref rules (`isValidBranchName`; empty = the
+default branch), and the result is stored in `conversations.cloud_source_json` in the same
+transaction as the conversation. Nothing is created at Anthropic here. `POST /api/message` with
+`providerType: 'claude-cloud'` on a conversation of another provider is `409
+CLAUDE_CLOUD_REQUIRES_NEW_CONVERSATION`.
+
+`POST /api/message` accepts another model of the list until the first message has created the
+cloud session, and stores it on the runtime session; after that a different model is `409
+CLAUDE_CLOUD_MODEL_REQUIRES_NEW_CONVERSATION`. The worker, however, creates the session with the
+model it was launched with: `resolveModel` prefers `CLAUDE_CLOUD_RELAY_MODEL` over the delivered
+`providerModel`, so a change made after the worker started only takes effect if the worker is
+launched again before the first message. Reasoning effort is always `none` and the context tier
+always `default`, whatever the request says.
+
+### Delivery, binding and resume
+
+`buildDequeuedRelayMessage` adds a `claudeCloud` field to every message delivered to a cloud
+worker (`buildClaudeCloudDelivery`): `{ sessionId, lastSequence, repoUrl, branch, environmentId,
+title }`. A restarted worker therefore needs nothing but the delivery. The worker reports the
+binding with `POST /api/claude-cloud-session` (`{ conversationId, cloudSessionId, sessionUrl?,
+lastSequence, pushedBranch?, costUsd?, model? }`) after it created the session, after every
+`result`, and on a push. `recordWorkerReport` (`services/claude-cloud-session-service.mjs`) stores
+the session id, the sequence (never moved back) and the cost on the runtime session row, keeps the
+session link and the list of pushed branches (the newest 20) in `cloud_source_json`, and emits the
+socket event `claude_cloud_session` with `{ conversationId, cloud }`. A report that names another
+cloud session than the stored one starts sequence, cost and pushed branches again.
+
+The conversation list, the conversation payload and the bootstrap answer carry the same `cloud`
+field: `{ repoUrl, slug, branch, sessionUrl, pushedBranches: [{ branch, at }], costUsd }`, or
+`null` for a conversation that is not a cloud one. There is no session root for a cloud
+conversation (`buildConversationSessionRootPayload` returns `null`).
+
+### Usage
+
+The worker posts to the Claude worker's two usage routes. `POST /api/claude-context-usage` accepts
+a `claude-cloud` conversation and stores the session's context occupancy (used and maximum tokens,
+no categories) in `runtime_sessions.context_usage_json`, which `GET /api/context/:id` serves.
+`POST /api/claude-plan-usage` keeps a cloud worker's report under its own snapshot key
+(`claude-cloud`), so the Claude card stays what the Claude workers wrote.
+
+`GET /api/usage` builds two things from the cloud client while the provider is on
+(`services/claude-account-usage-service.mjs`: the usage body, the prepaid credits and the credit
+offer, read without a model turn, cached for 60 s, a failed read for 15 s; the route waits at most
+3 s for them and falls back to the last turn's snapshot. Nothing is read and nothing cached is
+handed out while the provider is off):
+
+- the **Claude card's** live windows (`normalizeClaudeAccountUsage` in
+  `services/plan-usage-claude.mjs`): the 5-hour, weekly and model-scoped windows with the
+  account's own severity word, the week by product, and the organisation's prepaid credits;
+- the **Claude Cloud card** (`services/plan-usage-claude-cloud.mjs` → `buildClaudeCloudPlanCard`):
+  one meter per top-level bucket of the usage body that carries a dollar limit (the cloud credit,
+  with its expiry), the relay's own cloud spend (`readClaudeCloudSpend`: the sum of
+  `runtime_sessions.claude_cloud_cost_usd` over the cloud conversations that still exist, plus the
+  cost of the conversation named by `?conversationId=`), the latest cloud snapshot's session
+  detail, and a note when a credit is offered but not claimed.
+
+### Archive
+
+`DELETE /api/conversation/:id` and `POST /api/conversation/:id/archive` call
+`archiveSessionInBackground` for a cloud conversation: the cloud session is archived at Anthropic,
+best effort and not waited for, so neither action ever depends on Anthropic. Nothing is deleted
+there.
+
 ## Cursor Agent SDK provider
 
 Cursor conversations run through `server/cursor-worker/cursor-session-worker.mjs`, a per-conversation
@@ -792,13 +921,14 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/git/status` | Git status for the conversation's workspace root (`branch`, `upstream`, `ahead`, `behind`, `files[]` incl. untracked); a non-repo root returns `isRepo: false` rather than an error |
 | GET | `/api/git/diff` | Full-context unified diff for one changed file (`path`, optional `untracked=1`); the client renders both "changes only" and "full file" views from this single patch |
 | POST | `/api/git/pull` | Run `git pull` in the conversation's workspace root and return the combined output |
+| GET | `/api/git/remote` | Where a folder lives on GitHub, for the New Chat modal of a Claude Cloud chat: `?root=<absolute path>` → `{ ok, root, hasGit, remoteUrl, repoUrl, slug, branch, upstream, ahead, behind, dirty }`. The one git route that takes a path from the client; it passes the same policy as a requested CWD (`403` outside `workspaceRootAllowList`, `400` otherwise). Read-only (`git status`, `git remote get-url`) |
 | GET | `/api/conversations` | List all conversations |
 | GET | `/api/sessions` | List runtime sessions bound 1:1 to conversations |
 | GET | `/api/conversation/:id` | Get conversation message windows (`before*`, `after*`, or `aroundMessageId`) plus session-root metadata |
 | GET | `/api/search/messages` | Search message text across all conversations (`q`, `limit`, `offset`) |
 | PATCH | `/api/conversation/:id` | Update a conversation title |
 | POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
-| DELETE | `/api/conversation/:id` | Delete a conversation: stops its session worker, deletes its CLI session, removes its rows. A Copilot session the relay only imported and never ran is hidden and tombstoned instead: nothing is stopped and its CLI session is kept. `409 conversation-active` (`reason: turn-running` / `background-tasks`) while it is still working; `409 worker-stop-failed` when its worker survives the stop (nothing deleted) |
+| DELETE | `/api/conversation/:id` | Delete a conversation: stops its session worker, deletes its CLI session, removes its rows. A Claude Cloud conversation's cloud session is archived at Anthropic in the background (never waited for). A Copilot session the relay only imported and never ran is hidden and tombstoned instead: nothing is stopped and its CLI session is kept. `409 conversation-active` (`reason: turn-running` / `background-tasks`) while it is still working; `409 worker-stop-failed` when its worker survives the stop (nothing deleted) |
 | GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |
 | POST | `/api/sdk-session-delete/result` | (CLI relay) Report SDK session delete result |
 | POST | `/api/session-sync` | (CLI relay) Sync conversation↔SDK binding and optionally confirm orchestrator rebind completion |
@@ -822,20 +952,23 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/models` | Live/cached model catalog used by the UI picker |
 | POST | `/api/models/snapshot` | (CLI/relay) Publish discovered model snapshot |
 | POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
-| GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored. Both return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
+| GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored, and so are Cursor, Grok and Claude Cloud sessions. All return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
 | GET | `/api/context` | Same payload when a `conversationId` query is provided; otherwise returns a missing-selection response |
-| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
+| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
 | GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
 | POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`) |
 | POST | `/api/settings/claude` | Enable/disable Claude, set the default model or the enabled model subset; triggers discovery and unstarted-conversation reconciliation |
+| GET | `/api/settings/claude-cloud` | Read Claude Cloud settings: `{ enabled, defaultModel, environmentId, environments: [{ id, name }] \| null, environmentsError, account: { loggedIn, email, orgName, subscriptionType } \| null, token: { source, hasToken, expiresAt }, models }`. `token` says where the login is read from (`env`, `file`, `none`) and when it runs out, never the token. `environments` is `null` while the provider is off or the host has no login: nothing is asked of Anthropic then |
+| POST | `/api/settings/claude-cloud` | `{ enabled?, defaultModel?, environmentId? }` → `{ ok: true, …the GET body }`. Enabling without a Claude login on the host is `400` with `code: 'claude_cloud_login_missing'`; an empty `environmentId` clears the stored one. Emits `claude_cloud_settings_updated` |
 | GET | `/api/settings/cursor` | Read Cursor provider settings — same shape as Claude's: `models` is the enabled subset, `availableModels` the full discovered list, plus per-model `efforts` |
 | POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
 | POST | `/api/claude-native-session` | (Claude worker) Persist the native Agent SDK session id for resume |
-| POST | `/api/claude-context-usage` | (Claude worker) Report the session's context-window breakdown after a turn |
-| POST | `/api/claude-plan-usage` | (Claude worker) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot |
+| POST | `/api/claude-context-usage` | (Claude and Claude Cloud workers) Report the session's context-window breakdown after a turn; `409` for a conversation of any other provider |
+| POST | `/api/claude-plan-usage` | (Claude and Claude Cloud workers) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot; a Claude Cloud conversation's report is stored under its own snapshot key, `claude-cloud` |
+| POST | `/api/claude-cloud-session` | (Claude Cloud worker) Report the cloud session a conversation is bound to: `{ conversationId, cloudSessionId, sessionUrl?, lastSequence, pushedBranch?, costUsd?, model? }` → `{ ok, cloud }`. Sent after the session was created, after every `result` and on a push; emits `claude_cloud_session`. `404` without a runtime session, `409` for a conversation that is not a cloud one |
 | POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run for the active turn |
 | POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Request cancellation of one subagent run (unsupported by the Claude runtime) |
@@ -1014,6 +1147,14 @@ workspace root, backed by `services/git-changes-service.mjs` and `routes/git-rou
 
 File paths passed to `/api/git/diff` go through the same `resolveWorkspaceFilePath` containment
 check as the file bridge, so traversal outside the workspace root is rejected.
+
+`GET /api/git/remote?root=…` belongs to the New Chat modal, not to this one: it reads the `origin`
+remote (else the remote of the upstream branch), the current branch, ahead/behind and whether the
+checkout is dirty, for the Repository and Branch fields of a Claude Cloud chat
+(`services/git-remote-service.mjs`). There is no conversation yet at that point, so it is the one
+git route that takes a path from the client, validated like a requested CWD
+(`validateRequestedWorkspaceRoot`). Credentials in a remote URL are dropped before it is returned,
+and a remote that is not a github.com repository comes back with `repoUrl: null`.
 
 ### Changing the launch CWD
 
@@ -1418,6 +1559,19 @@ and on `messages`:
 prompts and sessions another relay's agent created) and the table
 `conversation_remote_relay_unlocks` (the remote relays the user mentioned per conversation).
 
+`0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
+It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next
+one:
+
+- `runtime_sessions.claude_cloud_session_id` (TEXT) — the cloud session the conversation runs in,
+  reported by its worker after the first message
+- `runtime_sessions.claude_cloud_last_sequence` (TEXT) — the event sequence number of the last
+  finished turn's `result`: where a restarted worker reads the session's event log on from
+- `runtime_sessions.claude_cloud_cost_usd` (REAL) — what the session has cost so far, as the cloud
+  reports it
+- `conversations.cloud_source_json` (TEXT/JSON) — `{ repoUrl, branch, environmentId, sessionUrl,
+  pushedBranches: [{ branch, at }] }`
+
 New tables are likewise created at startup with `CREATE TABLE IF NOT EXISTS` in both the fresh-schema
 and migration blocks — most recently `workflow_runs` (final workflow digest per assistant message,
 keyed on `response_message_id`, cascade-deleted with the conversation; see
@@ -1449,6 +1603,12 @@ working with the corresponding feature inert rather than crashing at startup.
 | `data/copilot.db` | Persisted conversations, settings, and queue storage (gitignored) |
 | `relay-tools.md` | Markdown tool guidance loaded by the relay extension |
 | `claude-worker/` | Claude Agent SDK session worker (turn runner, ask-user bridge, attachments, SDK message normalizer) |
+| `claude-cloud-worker/` | Claude Cloud session worker (turn runner over the cloud session's event stream, event normalizer) |
+| `../shared/claude-cloud/` | Claude Cloud API client, the reader of the Claude CLI's login, repository/branch/model string rules |
+| `services/claude-cloud-settings-service.mjs` | Claude Cloud switch, default model and environment |
+| `services/claude-cloud-session-service.mjs` | What the relay keeps per cloud conversation: worker reports, the `cloud` payload field, archiving |
+| `services/claude-account-usage-service.mjs` | Live Claude account usage for Check Usage (only while Claude Cloud is on) |
+| `services/git-remote-service.mjs` | GitHub remote and branch of a folder, for the New Chat modal |
 | `services/claude-session-root-service.mjs` | Resolves the browsable session folder for Claude conversations |
 | `services/context-usage-view.mjs` | Normalizes Copilot and Claude context data into one payload |
 | `services/cloudflared-tunnel-service.mjs` | Supervises the `cloudflared` child process for the Cloudflare Tunnel mode |

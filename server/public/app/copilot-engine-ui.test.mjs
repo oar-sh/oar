@@ -32,7 +32,7 @@ test('the Copilot sub-tab leads the provider strip and is selected by default', 
   const strip = document.querySelector('#settings-modal .settings-subtab-strip');
   const order = Array.from(strip.querySelectorAll('[data-settings-provider-tab]'))
     .map((button) => button.dataset.settingsProviderTab);
-  assert.deepEqual(order, ['copilot', 'openai', 'claude', 'grok', 'cursor']);
+  assert.deepEqual(order, ['copilot', 'openai', 'claude', 'claude-cloud', 'grok', 'cursor']);
   // Copilot is the default provider, so its panel is the one a first-time
   // visitor lands on — which means it, and only it, ships un-hidden.
   assert.equal(el('settings-provider-panel-copilot').hidden, false);

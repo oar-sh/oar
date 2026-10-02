@@ -13,6 +13,7 @@ import {
   showTransientRelayNotice,
   getConversationCurrentWorkspaceRootPath,
   IS_SHARED_VIEW,
+  conversations,
 } from './store.js';
 import { openAnnotateEditor } from './annotate-editor.js';
 import {
@@ -61,6 +62,11 @@ import {
   writeRepoBrowserHiddenPreference,
 } from './repo-browser-preferences.mjs';
 import { joinLaunchCwdPath } from './launch-cwd-path.mjs';
+import {
+  cloudAttachmentRejectionNotice,
+  isClaudeCloudConversation,
+  partitionCloudAttachments,
+} from './claude-cloud-ui.mjs';
 
 function currentConversationId() {
   return String(currentConvId || '').trim();
@@ -509,7 +515,7 @@ export async function ingestFiles(files, { source = 'picker' } = {}) {
   // conversations, and the result must never land in the wrong composer.
   const ownerConversationId = currentConversationId();
   const now = new Date();
-  const prepared = [];
+  let prepared = [];
   for (let index = 0; index < inputFiles.length; index += 1) {
     prepared.push(await prepareIncomingFile(inputFiles[index], { source, now, index }));
   }
@@ -517,6 +523,19 @@ export async function ingestFiles(files, { source = 'picker' } = {}) {
   if (currentConversationId() !== ownerConversationId) {
     for (const item of prepared) releaseAttachmentPreviewUrl(item);
     return [];
+  }
+
+  // A Claude Cloud session takes inline images only; anything else would be
+  // refused by its worker with the whole turn. Checked after the re-encode
+  // above, which is what brings a large photo under the size limit.
+  if (isClaudeCloudConversation(conversations[ownerConversationId])) {
+    const { accepted, rejected } = partitionCloudAttachments(prepared);
+    if (rejected.length) {
+      for (const { attachment } of rejected) releaseAttachmentPreviewUrl(attachment);
+      showTransientRelayNotice(cloudAttachmentRejectionNotice(rejected), 7000);
+      prepared = accepted;
+      if (!prepared.length) return [];
+    }
   }
 
   const plan = planAttachmentMerge(selectedAttachments, prepared, MAX_UPLOAD_ATTACHMENTS);

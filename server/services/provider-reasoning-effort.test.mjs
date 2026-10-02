@@ -113,3 +113,24 @@ test('no requested effort takes the same default the first send would', () => {
     '',
   );
 });
+
+test('a claude cloud session has no effort choice, whatever the Claude provider offers', () => {
+  const claudeSettings = { effortsByModel: { 'claude-sonnet-5-5': ['none', 'low', 'high', 'xhigh'] } };
+  const supported = supportedReasoningEffortsForProviderModel({
+    providerType: 'claude-cloud',
+    model: 'claude-sonnet-5-5',
+    claudeSettings,
+    reasoningByModel: { 'claude-sonnet-5-5': ['none', 'low', 'high'] },
+  });
+  assert.deepEqual(supported, ['none']);
+  // A requested tier clamps to the default instead of being stored.
+  assert.deepEqual(
+    resolveProviderReasoningEffort({ requestedEffort: 'high', supportedEfforts: supported }),
+    { ok: true, effort: 'none', supported: ['none'] },
+  );
+  // The Claude provider's own ladder is untouched.
+  assert.deepEqual(
+    supportedReasoningEffortsForProviderModel({ providerType: 'claude', model: 'claude-sonnet-5-5', claudeSettings }),
+    ['none', 'low', 'high', 'xhigh'],
+  );
+});

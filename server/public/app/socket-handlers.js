@@ -48,6 +48,8 @@ import { setRemoteRelaysSnapshot } from './remote-relays-store.mjs';
 import { REMOTE_RELAY_SOCKET_EVENT } from './remote-relay-shared.mjs';
 import { applyClaudeAuthState } from './claude-auth-ui.js';
 import { applyGrokAuthState } from './grok-auth-ui.js';
+import { applyClaudeCloudSettingsState, refreshClaudeCloudSettingsState } from './claude-cloud-settings-ui.js';
+import { applyClaudeCloudSessionEvent } from './claude-cloud-conversation-ui.js';
 import { applyCliInstallState } from './cli-install-ui.js';
 import { renderUpdateSection } from './update-ui.js';
 import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
@@ -410,6 +412,18 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('claude_usage_limit', (payload) => {
     applyClaudeUsageLimit(payload || null);
+  });
+  // Claude Cloud settings (enable, default model, environment). The event
+  // carries the same shape as GET /api/settings/claude-cloud; one without a
+  // body is read as "something changed" and answered with a fresh read.
+  socket.on('claude_cloud_settings_updated', (payload) => {
+    if (payload && typeof payload === 'object') applyClaudeCloudSettingsState(payload);
+    else void refreshClaudeCloudSettingsState();
+  });
+  // A cloud session got its id, pushed a branch or reported a new cost: the
+  // conversation's `cloud` field changed, and with it the cloud line.
+  socket.on('claude_cloud_session', (payload) => {
+    if (applyClaudeCloudSessionEvent(payload || null)) deps?.syncChatTitleControls?.();
   });
   socket.on('grok_settings_updated', (payload) => {
     deps?.applyGrokSettingsState?.(payload || {});

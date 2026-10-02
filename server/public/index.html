@@ -256,6 +256,7 @@
     --provider-claude: #e0855a;
     --provider-cursor: #a78bfa;
     --provider-grok: #e879f9;
+    --provider-claude-cloud: #7dd3fc;
     --viewport-top-offset: 0px;
     --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     --chat-header-top-base-desktop: 14px;
@@ -317,6 +318,7 @@
     --provider-claude: #b4531f;
     --provider-cursor: #6b3fd4;
     --provider-grok: #a21caf;
+    --provider-claude-cloud: #0369a1;
     --inline-code-bg: #eff1f3;
   }
   :root {
@@ -724,6 +726,7 @@
   .conv-provider-indicator[data-provider="claude"] { color: var(--provider-claude); }
   .conv-provider-indicator[data-provider="cursor"] { color: var(--provider-cursor); }
   .conv-provider-indicator[data-provider="grok"] { color: var(--provider-grok); }
+  .conv-provider-indicator[data-provider="claude-cloud"] { color: var(--provider-claude-cloud); }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
   .conv-item.worker-ui-ready .conv-title,
@@ -2524,6 +2527,40 @@
   #model-lock-note[data-provider="claude"] { color: var(--provider-claude); }
   #model-lock-note[data-provider="cursor"] { color: var(--provider-cursor); }
   #model-lock-note[data-provider="grok"] { color: var(--provider-grok); }
+  #model-lock-note[data-provider="claude-cloud"] { color: var(--provider-claude-cloud); }
+  /* Claude Cloud conversations (claude-cloud-conversation-ui.js): where the
+     session runs and what it pushed, above the composer like the lock note.
+     The items wrap instead of scrolling, so a long branch name can never push
+     the composer wider than a phone. */
+  #cloud-session-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 10px;
+    margin-bottom: 6px;
+    min-width: 0;
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    line-height: 1.4;
+  }
+  #cloud-session-line[hidden] { display: none; }
+  .cloud-line-item {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  a.cloud-line-item { color: var(--accent); text-decoration: none; }
+  a.cloud-line-item:hover { text-decoration: underline; }
+  .cloud-line-repo { color: var(--provider-claude-cloud); font-weight: 600; }
+  a.cloud-line-repo { color: var(--provider-claude-cloud); }
+  /* No relay modes, no effort choice and no context tier in a cloud chat. */
+  body.claude-cloud-conversation #mode-select,
+  body.claude-cloud-conversation #context-tier-select,
+  body.claude-cloud-conversation #reasoning-effort-select {
+    display: none;
+  }
   #model-select:disabled,
   #reasoning-effort-select:disabled {
     opacity: 0.55;
@@ -2939,6 +2976,7 @@
   body.shared-reader-mode #reasoning-effort-select,
   body.shared-reader-mode #send-btn,
   body.shared-reader-mode #model-lock-note,
+  body.shared-reader-mode #cloud-session-line,
   body.shared-reader-mode #model-pricing-details {
     display: none !important;
   }
@@ -3311,12 +3349,16 @@
   #new-conversation-context-select,
   #new-conversation-size-select,
   #new-conversation-cwd-select,
-  #new-conversation-cwd-manual {
+  #new-conversation-cwd-manual,
+  #new-conversation-cloud-repo,
+  #new-conversation-cloud-branch {
     width: 100%;
     min-height: 42px;
     margin-top: 8px;
   }
-  #new-conversation-cwd-manual {
+  #new-conversation-cwd-manual,
+  #new-conversation-cloud-repo,
+  #new-conversation-cloud-branch {
     box-sizing: border-box;
     padding: 0 10px;
     border-radius: 8px;
@@ -3325,6 +3367,26 @@
     color: var(--text);
   }
   #new-conversation-cwd-manual[hidden] { display: none; }
+  #new-conversation-cloud-repo[aria-invalid="true"],
+  #new-conversation-cloud-branch[aria-invalid="true"] { border-color: var(--danger); }
+  /* Warning lines under Repository/Branch: what the cloud clone will not see. */
+  #new-conversation-cloud-warnings {
+    margin-top: 8px;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--warn);
+    overflow-wrap: anywhere;
+  }
+  #new-conversation-cloud-warnings:empty { display: none; }
+  .new-conversation-cloud-warning::before { content: "⚠ "; }
+  #new-conversation-cloud-error {
+    margin-top: 8px;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--danger);
+    overflow-wrap: anywhere;
+  }
+  #new-conversation-cloud-error[hidden] { display: none; }
   /* Shared row/button recipe for the file-explorer CWD browse buttons in the
      New chat and Change CWD modals — one place to restyle both. */
   .cwd-browse-row {
@@ -5053,6 +5115,12 @@
       font-size: var(--fs-meta-md);
     }
     #attach-btn { order: 4; flex: 0 0 40px; }
+    /* A cloud chat hides mode, context tier and effort: the model select
+       takes the room they leave. */
+    body.claude-cloud-conversation #model-select {
+      flex: 1 1 0;
+      width: auto;
+    }
     #context-tier-select {
       order: 5;
       flex: 0 0 70px;
@@ -5405,6 +5473,7 @@
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
+            <button id="chat-menu-open-cloud-session" class="chat-actions-menu-item" type="button" role="menuitem" hidden>☁️ Open on claude.ai</button>
             <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
@@ -5427,6 +5496,7 @@
       <div id="model-banner"></div>
       <div id="usage-limit-banner" role="status" aria-live="polite" hidden></div>
       <div id="model-lock-note" hidden></div>
+      <div id="cloud-session-line" aria-label="Cloud session" hidden></div>
       <div id="model-metadata-blocker" aria-live="polite">
         <span id="model-metadata-blocker-text">Model metadata is unavailable. Refresh to choose a model and reasoning effort.</span>
         <button type="button" id="model-metadata-retry-btn">Refresh models</button>
@@ -5808,6 +5878,16 @@
             data-settings-provider-tab="claude"
           >Claude</button>
           <button
+            id="settings-provider-tab-claude-cloud"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-claude-cloud"
+            tabindex="-1"
+            data-settings-provider-tab="claude-cloud"
+          >Claude Cloud</button>
+          <button
             id="settings-provider-tab-grok"
             class="settings-tab settings-subtab"
             type="button"
@@ -6007,6 +6087,42 @@
               <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
             </div>
             <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
+          </div>
+        </div>
+        <!-- Claude Cloud (claude-cloud-settings-ui.js). The login itself is managed on
+             the Claude tab; this panel only says which account pays. -->
+        <div
+          id="settings-provider-panel-claude-cloud"
+          class="settings-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-claude-cloud"
+          data-settings-provider-panel="claude-cloud"
+          hidden
+        >
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="claude-cloud-enabled-toggle">Claude Cloud</label>
+            <div class="settings-help">Cloud chats run Claude Code in a sandbox at Anthropic, on its own clone of a GitHub repository, instead of on the relay host. They are billed to the Claude account below. The relay reads that account's login from the Claude CLI on the relay host; it does not store it or refresh it.</div>
+            <div class="settings-row" style="width: 100%; margin-top: 8px; margin-bottom: 8px;">
+              <label for="claude-cloud-enabled-toggle">Enable Claude Cloud for New Chat</label>
+              <input id="claude-cloud-enabled-toggle" type="checkbox" onchange="toggleClaudeCloudProvider(this.checked)" disabled>
+            </div>
+            <div id="claude-cloud-account-row" class="settings-row" style="width: 100%; margin-bottom: 0;" hidden>
+              <div id="claude-cloud-account" class="settings-help settings-provider-status" style="min-width: 0; overflow-wrap: anywhere;"></div>
+              <button id="claude-cloud-login-btn" type="button" class="summary-btn" style="flex: 0 0 auto;" onclick="openClaudeCloudLoginTab()">Claude login</button>
+            </div>
+            <div id="claude-cloud-token" class="settings-help settings-provider-status" style="margin-top: 6px;" hidden></div>
+            <label for="claude-cloud-environment-select" style="margin-top: 12px;">Cloud environment</label>
+            <select id="claude-cloud-environment-select" aria-label="Cloud environment" style="max-width: 100%;" disabled></select>
+            <div id="claude-cloud-environment-note" class="settings-help" hidden></div>
+            <label for="claude-cloud-model-select" style="margin-top: 8px;">Default model</label>
+            <select id="claude-cloud-model-select" aria-label="Default model for cloud chats" style="max-width: 100%;" disabled></select>
+            <div id="claude-cloud-settings-status" class="settings-help settings-provider-status">Loading Claude Cloud settings…</div>
+            <div style="display: flex; gap: 8px 12px; margin-top: 8px; flex-wrap: wrap; align-items: center;">
+              <button id="claude-cloud-save-btn" type="button" class="summary-btn" onclick="saveClaudeCloudSettings()" disabled>Save Claude Cloud settings</button>
+              <a id="claude-cloud-open-link" class="plan-usage-link" href="https://claude.ai/code" target="_blank" rel="noopener noreferrer" style="font-size: var(--fs-meta-sm);">Open claude.ai/code</a>
+            </div>
+            <div class="settings-help">A cloud chat works on what is pushed to GitHub, and its results come back as pushed branches. It has no relay modes, no reasoning effort choice and no mid-turn steering, and it takes images as its only attachments.</div>
           </div>
         </div>
         <div
@@ -6434,11 +6550,23 @@
         </select>
         <div id="new-conversation-provider-help" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Copilot models use your GitHub Copilot runtime.</div>
       </div>
+      <!-- Claude Cloud only (journal-view.js): the GitHub repository and branch
+           the cloud session clones, filled from the folder picked above. -->
+      <div id="new-conversation-cloud-row" hidden>
+        <label for="new-conversation-cloud-repo" style="display:block;margin-top:12px;">Repository</label>
+        <input id="new-conversation-cloud-repo" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="owner/repo or GitHub URL" aria-describedby="new-conversation-cloud-warnings new-conversation-cloud-error">
+        <label for="new-conversation-cloud-branch" style="display:block;margin-top:12px;">Branch</label>
+        <input id="new-conversation-cloud-branch" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Default branch" aria-describedby="new-conversation-cloud-warnings new-conversation-cloud-error">
+        <div id="new-conversation-cloud-warnings" role="status" aria-live="polite"></div>
+        <div id="new-conversation-cloud-error" role="alert" hidden></div>
+      </div>
       <label for="new-conversation-model-select" style="display:block;margin-top:12px;">Model</label>
       <select id="new-conversation-model-select"></select>
-      <label for="new-conversation-reasoning-select" style="display:block;margin-top:12px;">Reasoning effort</label>
-      <select id="new-conversation-reasoning-select"></select>
-      <div id="new-conversation-reasoning-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Choose the effort used when this conversation starts.</div>
+      <div id="new-conversation-reasoning-row">
+        <label for="new-conversation-reasoning-select" style="display:block;margin-top:12px;">Reasoning effort</label>
+        <select id="new-conversation-reasoning-select"></select>
+        <div id="new-conversation-reasoning-status" style="margin-top:8px;font-size:0.78rem;color:var(--muted);">Choose the effort used when this conversation starts.</div>
+      </div>
       <div id="new-conversation-context-row" style="display:none;">
         <label for="new-conversation-context-select" style="display:block;margin-top:12px;">Context window</label>
         <select id="new-conversation-context-select" disabled aria-readonly="true"></select>

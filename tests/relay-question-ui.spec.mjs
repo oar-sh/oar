@@ -1032,7 +1032,7 @@ test("shows Copilot usage from the usage modal", async ({ page, request }) => {
   let conversationId = "";
   let usageRequests = 0;
 
-  await page.route("**/api/usage", async (route) => {
+  await page.route(/\/api\/usage(\?.*)?$/, async (route) => {
     usageRequests += 1;
     await route.fulfill({
       status: 200,

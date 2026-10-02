@@ -23,6 +23,7 @@ import {
   buildKnownCwdOptions as buildKnownCwdOptionsFromInputs,
   normalizeKnownCwdPath,
 } from './known-cwd-options.mjs';
+import { buildCloudLineModel, cloudHeaderLabel, isClaudeCloudConversation } from './claude-cloud-ui.mjs';
 
 export { normalizeKnownCwdPath };
 
@@ -462,6 +463,17 @@ export function syncChatHeaderWorkspaceLabel() {
   const labelEl = document.getElementById('chat-title-cwd');
   if (!labelEl) return;
   const convId = String(currentConvId || '').trim();
+  const conversation = convId ? (conversations?.[convId] || null) : null;
+  if (isClaudeCloudConversation(conversation)) {
+    // A cloud chat runs on a clone at Anthropic, so the line names the
+    // repository instead of a folder on the relay host.
+    const label = cloudHeaderLabel(conversation.cloud);
+    labelEl.hidden = !label;
+    labelEl.textContent = label;
+    if (label) labelEl.title = buildCloudLineModel(conversation.cloud)?.repoUrl || label;
+    else labelEl.removeAttribute('title');
+    return;
+  }
   const cwd = getSelectedConversationCurrentCwd();
   if (!convId || !cwd) {
     labelEl.hidden = true;

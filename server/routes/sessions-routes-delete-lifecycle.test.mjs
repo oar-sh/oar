@@ -10,6 +10,7 @@ import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { claudeProjectDirSlug, createClaudeSessionRootResolver } from '../services/claude-session-root-service.mjs';
 import { createSdkSessionImportService } from '../services/sdk-session-import-service.mjs';
+import { createClaudeCloudSessionService } from '../services/claude-cloud-session-service.mjs';
 
 // DELETE /api/conversation/:id — a conversation that is still working cannot
 // be deleted; an idle one has its worker stopped first, then its CLI session
@@ -185,6 +186,7 @@ function setup(state = {}) {
       pollIntervalMs: 1,
     },
     sdkSessionImportService: state.sdkSessionImportService || null,
+    claudeCloudSessionService: state.claudeCloudSessionService || null,
     resolveClaudeSessionRoot: state.resolveClaudeSessionRoot || null,
     resolveSessionStateRoot: () => state.sessionStateRoot || path.join(os.tmpdir(), 'oar-delete-lifecycle-state'),
     markSharedViewerPresence: () => ({ ok: true, watcherCount: 0 }),
@@ -623,4 +625,91 @@ test('a session another live conversation shares keeps its worker and CLI sessio
   assert.ok(!events.some((event) => event.startsWith('kill:') || event.startsWith('registry-removed:')));
   assert.deepEqual(deleted, []);
   assert.ok(events.includes('sql:DELETE FROM conversations'));
+});
+
+// ─── Claude Cloud: the cloud session is archived, best effort ────────────────
+
+const CLOUD_SESSION_ID = 'cse_01EXAMPLEaaaaaaaaaaaaaaaa';
+const settleBackground = () => new Promise((resolve) => setImmediate(resolve));
+
+function cloudArchiver({ archiveSession }) {
+  const logs = [];
+  const service = createClaudeCloudSessionService({
+    stmts: {},
+    getCloudClient: () => ({ archiveSession }),
+    logger: { log: (line) => logs.push(line), warn: (line) => logs.push(line) },
+  });
+  return { service, logs };
+}
+
+test('deleting a cloud conversation archives its cloud session without waiting for it', async () => {
+  const archived = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const { service, logs } = cloudArchiver({
+    archiveSession: async (id) => { archived.push(id); await gate; },
+  });
+  const { del, events } = setup({
+    runtimeSession: { provider_type: 'claude-cloud', claude_cloud_session_id: CLOUD_SESSION_ID },
+    claudeCloudSessionService: service,
+  });
+  // The delete answers while the cloud has not: nothing here depends on it.
+  const response = await del();
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.cliSessionDeleted, null, 'there is no CLI session on this host');
+  assert.deepEqual(archived, [CLOUD_SESSION_ID]);
+  assert.equal(events.includes('emit:conversation_deleted:conv-1'), true);
+  assert.equal(events.some((event) => event.startsWith('queued-sdk-delete')), false, 'never handed to the Copilot delete queue');
+  assert.equal(logs.length, 0);
+  release();
+  await settleBackground();
+  assert.equal(logs.some((line) => /archived the cloud session/.test(line)), true);
+});
+
+test('a cloud archive that fails does not fail the delete', async () => {
+  const failure = Object.assign(new Error('The Claude login has expired.'), { code: 'login_expired' });
+  const { service, logs } = cloudArchiver({ archiveSession: async () => { throw failure; } });
+  const { del, events } = setup({
+    runtimeSession: { provider_type: 'claude-cloud', claude_cloud_session_id: CLOUD_SESSION_ID },
+    claudeCloudSessionService: service,
+  });
+  const response = await del();
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(deletedRows(events).length > 0, true);
+  await settleBackground();
+  await settleBackground();
+  assert.equal(logs.some((line) => /was not archived: login_expired/.test(line)), true);
+});
+
+test('no cloud archive for a Claude conversation, or for a cloud one that never got a session', async () => {
+  const archived = [];
+  const { service } = cloudArchiver({ archiveSession: async (id) => { archived.push(id); } });
+  const claude = setup({
+    runtimeSession: { provider_type: 'claude', claude_cloud_session_id: CLOUD_SESSION_ID },
+    claudeCloudSessionService: service,
+  });
+  assert.equal((await claude.del()).statusCode, 200);
+  const unstarted = setup({
+    runtimeSession: { provider_type: 'claude-cloud', claude_cloud_session_id: null },
+    claudeCloudSessionService: service,
+  });
+  assert.equal((await unstarted.del()).statusCode, 200);
+  await settleBackground();
+  assert.deepEqual(archived, []);
+});
+
+test('a cloud conversation that is still working is not archived, because it is not deleted', async () => {
+  const archived = [];
+  const { service } = cloudArchiver({ archiveSession: async (id) => { archived.push(id); } });
+  const { del } = setup({
+    worker: { status: 'processing', pid: process.pid },
+    processingCount: 1,
+    runtimeSession: { provider_type: 'claude-cloud', claude_cloud_session_id: CLOUD_SESSION_ID },
+    claudeCloudSessionService: service,
+  });
+  assert.equal((await del()).statusCode, 409);
+  await settleBackground();
+  assert.deepEqual(archived, []);
 });

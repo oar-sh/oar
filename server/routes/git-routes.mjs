@@ -4,6 +4,8 @@
 // resolved server-side from the conversation scope (mirroring the file
 // preview routes) — the client never sends absolute paths.
 
+import { validateRequestedWorkspaceRoot } from '../services/workspace-root-path-policy.mjs';
+
 export function resolveGitScopedRootPath(req, {
   resolveConversationWorkspaceState,
   currentWorkspaceRootPath,
@@ -40,7 +42,42 @@ export function registerGitRoutes(app, deps) {
     currentWorkspaceRootPath,
     normalizeWorkspaceRelativePath,
     resolveWorkspaceFilePath,
+    gitRemoteService = null,
+    workspaceRootAllowList = [],
+    validateWorkspaceRoot = validateRequestedWorkspaceRoot,
   } = deps;
+
+  // GET /api/git/remote?root=<abs path> — where a folder lives on GitHub, for
+  // the New Chat modal (the repository and branch of a Claude Cloud chat).
+  // There is no conversation yet, so this is the one git route that takes a
+  // path from the client: it passes the same policy as a requested CWD (an
+  // existing directory, absolute, inside the workspace allow list).
+  if (gitRemoteService) {
+    app.get('/api/git/remote', auth, async (req, res) => {
+      res.setHeader?.('Cache-Control', 'no-store');
+      const validated = validateWorkspaceRoot(req.query?.root, { allowList: workspaceRootAllowList });
+      if (!validated.ok) {
+        return res.status(validated.code === 'root-path-not-allowed' ? 403 : 400)
+          .json({ ok: false, code: validated.code, error: validated.error });
+      }
+      const root = validated.realPath;
+      const payload = await gitRemoteService.describe(root);
+      if (!payload.ok) return res.status(500).json({ ok: false, error: payload.error || 'Failed to read the git remote' });
+      return res.json({
+        ok: true,
+        root,
+        hasGit: payload.hasGit,
+        remoteUrl: payload.remoteUrl,
+        repoUrl: payload.repoUrl,
+        slug: payload.slug,
+        branch: payload.branch,
+        upstream: payload.upstream,
+        ahead: payload.ahead,
+        behind: payload.behind,
+        dirty: payload.dirty,
+      });
+    });
+  }
 
   if (!gitChangesService) return;
 

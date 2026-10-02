@@ -55,6 +55,10 @@ export function buildContextTierOptions({
   const meta = metadata && typeof metadata === 'object' ? metadata : {};
   const defaultLabel = tokenLabel(defaultWindowTokens(meta));
   const provider = String(providerType || '').trim().toLowerCase();
+  // A cloud session has no tier to choose and its window is not in the merged
+  // metadata either (that number is Copilot's): one blank default, as for a
+  // Claude model whose window is unknown.
+  if (provider === 'claude-cloud') return [{ value: 'default', label: UNKNOWN_WINDOW_LABEL }];
   const claudeTierList = provider === 'claude' ? claudeTiersForModel(modelId, claudeTiers) : null;
   if (claudeTierList) {
     return claudeTierList

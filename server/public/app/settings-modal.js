@@ -41,6 +41,7 @@ import { refreshPushSettingsSection } from './push-settings.js';
 import { selectSettingsTab } from './settings-tabs.js';
 import { refreshClaudeAuthSection } from './claude-auth-ui.js';
 import { refreshGrokAuthSection } from './grok-auth-ui.js';
+import { openClaudeCloudSettingsSection } from './claude-cloud-settings-ui.js';
 import { refreshCliInstallSections } from './cli-install-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
 import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
@@ -1682,6 +1683,7 @@ export function openSettingsModal(tab, providerTab) {
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();
   void refreshClaudeAuthSection();
+  void openClaudeCloudSettingsSection();
   void refreshGrokAuthSection();
   // Forced: the cached rows can be 30s stale, and a CLI installed from a shell
   // in the meantime should show up the moment the panel opens. Sockets keep it

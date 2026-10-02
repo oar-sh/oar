@@ -160,6 +160,23 @@ export function applyGrokProviderEnvironment(env = {}, {
   return next;
 }
 
+export function applyClaudeCloudProviderEnvironment(env = {}, {
+  enabled = false,
+  model = '',
+} = {}) {
+  const next = { ...env };
+  if (resolveWorkerKind(next) === 'claude-cloud') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
+  delete next.CLAUDE_CLOUD_RELAY_MODEL;
+  if (!enabled) return next;
+  // No credential is added here: the worker reads the Claude CLI's login
+  // itself. A relay that runs on CLAUDE_CODE_OAUTH_TOKEN instead has it in its
+  // own environment; workerSecretEnvVarsFor hands that to the cloud worker.
+  next.COPILOT_WEB_RELAY_WORKER_KIND = 'claude-cloud';
+  const normalizedModel = normalizeText(model);
+  if (normalizedModel) next.CLAUDE_CLOUD_RELAY_MODEL = normalizedModel;
+  return next;
+}
+
 /**
  * The Copilot SDK engine: the same `github`/`openai` providers the extension
  * serves, run as a plain Node worker against the CLI's headless runtime.
@@ -245,6 +262,10 @@ export function isGrokWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'grok';
 }
 
+export function isClaudeCloudWorkerEnvironment(env = {}) {
+  return resolveWorkerKind(env) === 'claude-cloud';
+}
+
 export function isCopilotSdkWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'copilot-sdk';
 }
@@ -279,6 +300,16 @@ export function resolveGrokWorkerScriptPath(env = {}) {
   return path.join(process.cwd(), 'server', 'grok-worker', 'grok-session-worker.mjs');
 }
 
+export function resolveClaudeCloudWorkerScriptPath(env = {}) {
+  const explicit = normalizeText(env?.COPILOT_WEB_RELAY_CLAUDE_CLOUD_WORKER_PATH);
+  if (explicit) return explicit;
+  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
+  if (repoRoot) return path.join(repoRoot, 'server', 'claude-cloud-worker', 'claude-cloud-session-worker.mjs');
+  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
+  if (serverDir) return path.join(serverDir, 'claude-cloud-worker', 'claude-cloud-session-worker.mjs');
+  return path.join(process.cwd(), 'server', 'claude-cloud-worker', 'claude-cloud-session-worker.mjs');
+}
+
 export function resolveCopilotSdkWorkerScriptPath(env = {}) {
   const explicit = normalizeText(env?.COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH);
   if (explicit) return explicit;
@@ -293,11 +324,16 @@ export function resolveCopilotSdkWorkerScriptPath(env = {}) {
 // `copilot` kind is intentionally absent: that is the extension engine, whose
 // launch path (the real TUI under a `script` pseudo-TTY) must stay exactly
 // as-is. `copilot-sdk` is the SAME provider on the headless SDK engine, and it
-// belongs here with Claude/Cursor/Grok.
+// belongs here with Claude/Cursor/Grok. `claude-cloud` is a provider of its
+// own: its worker follows a session in Anthropic's cloud and runs no CLI.
 const NODE_WORKER_DESCRIPTORS = Object.freeze({
   claude: Object.freeze({ resolveScriptPath: resolveClaudeWorkerScriptPath, windowsTitle: 'Claude Worker' }),
   cursor: Object.freeze({ resolveScriptPath: resolveCursorWorkerScriptPath, windowsTitle: 'Cursor Worker' }),
   grok: Object.freeze({ resolveScriptPath: resolveGrokWorkerScriptPath, windowsTitle: 'Grok Worker' }),
+  'claude-cloud': Object.freeze({
+    resolveScriptPath: resolveClaudeCloudWorkerScriptPath,
+    windowsTitle: 'Claude Cloud Worker',
+  }),
   'copilot-sdk': Object.freeze({
     resolveScriptPath: resolveCopilotSdkWorkerScriptPath,
     windowsTitle: 'Copilot SDK Worker',
@@ -472,14 +508,38 @@ export function getTmuxPanePid(sessionName, {
   }
 }
 
-export const WORKER_SECRET_ENV_VARS = Object.freeze(['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY']);
+export const WORKER_SECRET_ENV_VARS = Object.freeze(['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
+
+// Secrets that are not every worker's. The two API keys are put into the
+// launch environment by their own provider's applier and cleared for every
+// other one, so they need no entry. The Claude login token is different: it
+// sits in the relay's own environment (a relay run on CLAUDE_CODE_OAUTH_TOKEN
+// instead of the CLI's credentials file), so it would otherwise travel with
+// every launch. Only the Claude Cloud worker gets it: its cloud client reads
+// the login from there exactly as the relay's does (credentials.mjs).
+const WORKER_SECRET_ENV_VAR_KINDS = Object.freeze({
+  CLAUDE_CODE_OAUTH_TOKEN: Object.freeze(['claude-cloud']),
+});
+
+/**
+ * The secret variables the worker of this launch environment is handed, and
+ * only through the secret env file: never as a tmux `export`, never in the
+ * environment tmux itself is started with.
+ */
+export function workerSecretEnvVarsFor(env = {}) {
+  const kind = resolveWorkerKind(env);
+  return WORKER_SECRET_ENV_VARS.filter((key) => {
+    const kinds = WORKER_SECRET_ENV_VAR_KINDS[key];
+    return !kinds || kinds.includes(kind);
+  });
+}
 
 export function createWorkerSecretEnvFile(env = {}, {
   fsImpl = fs,
   tempRoot = os.tmpdir(),
 } = {}) {
   const secretLines = [];
-  for (const key of WORKER_SECRET_ENV_VARS) {
+  for (const key of workerSecretEnvVarsFor(env)) {
     const value = String(env?.[key] || '').trim();
     if (!value) continue;
     secretLines.push(`export ${key}=${shellQuote(value)}\n`);
@@ -555,7 +615,7 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     ...env,
     SESSION_ID: String(targetSessionId || '').trim() || String(env?.SESSION_ID || '').trim(),
   };
-  const hasSecretEnvValue = WORKER_SECRET_ENV_VARS
+  const hasSecretEnvValue = workerSecretEnvVarsFor(launchEnv)
     .some((key) => String(launchEnv[key] || '').trim());
   const normalizedSecretEnvFilePath = String(secretEnvFilePath || '').trim();
   if (hasSecretEnvValue && !normalizedSecretEnvFilePath) {
@@ -602,6 +662,16 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     // counterpart, has always been on this list.
     'CLAUDE_CODE_EXECUTABLE',
     'CLAUDE_RELAY_MODEL',
+    // The Claude Cloud worker's model. Its login is not listed here: the
+    // worker reads the CLI's credentials file (CLAUDE_CONFIG_DIR above tells
+    // it where), and a relay-level CLAUDE_CODE_OAUTH_TOKEN is a secret
+    // (workerSecretEnvVarsFor), so it comes through the secret file.
+    'CLAUDE_CLOUD_RELAY_MODEL',
+    // Tests point the relay's cloud client at a fake API on this machine;
+    // the worker's client has to follow, or the relay would talk to the fake
+    // and its worker to the real API. Not a secret, and harmless as a value:
+    // shared/claude-cloud/base-url.mjs ignores everything but a loopback URL.
+    'OAR_CLAUDE_CLOUD_API_BASE_URL',
     'CURSOR_RELAY_MODEL',
     'CURSOR_AGENT_STORE_DIR',
     'GROK_RELAY_MODEL',
@@ -759,8 +829,9 @@ export async function launchSessionCli({
     const tmuxEnv = { ...launchSessionEnv };
     delete tmuxEnv.TMUX;
     delete tmuxEnv.TMUX_PANE;
-    delete tmuxEnv.COPILOT_PROVIDER_API_KEY;
-    delete tmuxEnv.CURSOR_API_KEY;
+    // What the secret file carries is in no environment tmux is started with
+    // (a tmux server started by this call would keep it as its global one).
+    for (const key of workerSecretEnvVarsFor(launchSessionEnv)) delete tmuxEnv[key];
     if (allowProcessReuse) {
       const existingPanePid = getTmuxPanePid(sessionName, { execFileSyncImpl });
       if (existingPanePid && isPidAlive(existingPanePid)) {

@@ -4,7 +4,7 @@ const SETTINGS_PROVIDER_TAB_STORAGE_KEY = 'copilot_settings_provider_tab';
 const SETTINGS_TABS = ['general', 'providers', 'relays', 'previews', 'notifications', 'features'];
 // Copilot leads: it is the default provider, and `SETTINGS_PROVIDER_TABS[0]`
 // is also the sub-tab a first-time visitor lands on.
-const SETTINGS_PROVIDER_TABS = ['copilot', 'openai', 'claude', 'grok', 'cursor'];
+const SETTINGS_PROVIDER_TABS = ['copilot', 'openai', 'claude', 'claude-cloud', 'grok', 'cursor'];
 
 let settingsTabsBound = false;
 

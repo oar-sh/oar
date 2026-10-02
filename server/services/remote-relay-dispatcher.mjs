@@ -73,7 +73,12 @@ const TITLE_MAX = 80;
 
 // The provider settings routes a relay serves; github (Copilot) has none with
 // models — its catalogue is /api/models plus /api/status defaultModel.
-const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai']);
+const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai', 'claude-cloud']);
+// A Claude Cloud session clones a GitHub repository, and create_session has
+// no field for one yet: the provider is listed (send, read and stop work on
+// its sessions) but cannot be created from another relay.
+const CLOUD_PROVIDER = 'claude-cloud';
+const CLOUD_CREATE_NOTE = 'create_session cannot open a Claude Cloud session yet (it needs a GitHub repository); its existing sessions take send, wait, read_session and stop.';
 // How /api/models `providersByModel` names each provider.
 const CATALOG_PROVIDER_LABELS = Object.freeze({
   github: 'github-copilot',
@@ -81,6 +86,7 @@ const CATALOG_PROVIDER_LABELS = Object.freeze({
   claude: 'claude',
   cursor: 'cursor',
   grok: 'grok',
+  'claude-cloud': 'claude-cloud',
 });
 // Worker statuses that mean "working on something right now" (scope active).
 const WORKING_WORKER_STATUSES = new Set(['starting', 'processing']);
@@ -908,6 +914,9 @@ export function createRemoteRelayDispatcher({
    */
   function buildProviders(catalog) {
     return listProviders(catalog).map((entry) => {
+      // A cloud session takes no effort; without this its models would be
+      // listed with the Claude provider's efforts (the ids are the same).
+      if (entry.provider === CLOUD_PROVIDER) return entry;
       const efforts = groupEffortsByModel(catalog.models, entry.provider, entry.models);
       return efforts.length ? { ...entry, efforts } : entry;
     });
@@ -939,6 +948,21 @@ export function createRemoteRelayDispatcher({
       }
       const settings = catalog.settings[provider];
       if (!settings) return { provider, configured: false, defaultModel: null, models: [] };
+      if (provider === CLOUD_PROVIDER) {
+        // Its settings route has its own shape: a switch and a default model.
+        // A relay that predates the provider answers 404 and lands above.
+        const enabled = settings.enabled === true;
+        const cloudDefault = toText(settings.defaultModel) || null;
+        return {
+          provider,
+          configured: enabled,
+          defaultModel: cloudDefault,
+          models: enabled
+            ? uniqueTexts([...(cloudDefault ? [cloudDefault] : []), ...(Array.isArray(settings.models) ? settings.models : [])])
+            : [],
+          ...(enabled ? { note: CLOUD_CREATE_NOTE } : {}),
+        };
+      }
       // What POST /api/conversation/bootstrap requires, plus "not switched off".
       const configured = settings.enabled === true
         && (provider === 'claude' || provider === 'grok' || settings.configured === true);
@@ -1355,6 +1379,13 @@ export function createRemoteRelayDispatcher({
     const providers = buildProviders(catalog);
     const configured = providers.filter((entry) => entry.configured).map((entry) => entry.provider);
     const provider = args.provider || normalizeProvider(ctx.caller.provider) || 'github';
+    if (provider === CLOUD_PROVIDER) {
+      // Refused here rather than by the remote's bootstrap (which would answer
+      // "repository missing"): the agent learns what to do instead.
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+        `A Claude Cloud session clones a GitHub repository, and create_session cannot name one yet. Ask the user to open the chat from New Chat on relay "${ctx.relay.name}" (then use send with its session id), or pass another provider. Providers there: ${configured.filter((name) => name !== CLOUD_PROVIDER).join(', ') || 'none'}.`,
+        { providers: configured.filter((name) => name !== CLOUD_PROVIDER) });
+    }
     const entry = providers.find((candidate) => candidate.provider === provider);
     if (!entry?.configured) {
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.providerUnavailable,

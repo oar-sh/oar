@@ -32,7 +32,9 @@ import {
   scheduleContextUsageRefresh,
   loadModelCatalog,
   loadClaudeSettings,
+  loadClaudeCloudSettings,
   loadCursorSettings,
+  loadGitRemote,
   loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
@@ -59,6 +61,18 @@ import {
   conversationProviderIndicatorLabel,
 } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
+import {
+  CLAUDE_CLOUD_PROVIDER,
+  buildCloudSourceWarnings,
+  claudeCloudDefaultModel,
+  claudeCloudModelIds,
+  cloudBootstrapErrorModel,
+  cloudFolderStatusText,
+  isClaudeCloudConversation,
+  newChatRowVisibility,
+  resolveCloudSourceAutoFill,
+  validateCloudSourceInputs,
+} from './claude-cloud-ui.mjs';
 import { renderConversationOriginMarkerHtml } from './remote-relay-origin-view.mjs';
 import {
   normalizeConversationFilter,
@@ -108,6 +122,17 @@ let newConversationOpenAISettingsCache = null;
 let newConversationClaudeSettingsCache = null;
 let newConversationCursorSettingsCache = null;
 let newConversationGrokSettingsCache = null;
+let newConversationClaudeCloudSettingsCache = null;
+// Claude Cloud fields of the New Chat modal: what the selected folder's git
+// remote said, and what was written into Repository/Branch from it (so a later
+// lookup can tell its own fill from something the user typed).
+const NEW_CHAT_CLOUD_LOOKUP_DEBOUNCE_MS = 350;
+let newConversationCloudRemote = null;
+let newConversationCloudLookupFailed = false;
+let newConversationCloudLookupFolder = null;
+let newConversationCloudAutoFill = null;
+let newConversationCloudLookupSeq = 0;
+let newConversationCloudLookupTimer = null;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -410,6 +435,10 @@ export function applyLoadedConversationState(id, response, {
       ?? existingConversation.runtimeModel
       ?? null,
     sessionUsageSummary: response.sessionUsageSummary ?? existingConversation.sessionUsageSummary ?? null,
+    // Claude Cloud only: repository, branch, session link, pushed branches.
+    // An explicit null is a real answer ("not a cloud chat"); only a payload
+    // without the field (an older relay) keeps what the list said.
+    cloud: 'cloud' in response ? (response.cloud ?? null) : (existingConversation.cloud ?? null),
     messageCount: Array.isArray(response.messages)
       ? Math.max(existingConversation.messageCount || 0, response.messages.length)
       : (existingConversation.messageCount || 0),
@@ -559,6 +588,7 @@ function normalizeNewConversationProviderType(value = '') {
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude') return 'claude';
+  if (normalized === CLAUDE_CLOUD_PROVIDER) return CLAUDE_CLOUD_PROVIDER;
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok') return 'grok';
   return 'github';
@@ -639,11 +669,18 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   if (cursorOnly) return false;
   const grokOnly = hasGrok && providers.every((provider) => provider === 'grok');
   if (grokOnly) return false;
+  // Should a relay ever tag catalog rows for Claude Cloud, they are no more
+  // Copilot's than the other runtimes' rows are.
+  const exclusiveOnly = providers.length > 0 && providers.every((provider) => (
+    provider === 'claude' || provider === 'cursor' || provider === 'grok' || provider === CLAUDE_CLOUD_PROVIDER
+  ));
+  if (exclusiveOnly) return false;
   return providers.some((provider) => (
     provider !== 'openai-byok'
     && provider !== 'claude'
     && provider !== 'cursor'
     && provider !== 'grok'
+    && provider !== CLAUDE_CLOUD_PROVIDER
   )) || !hasOpenAIByok;
 }
 
@@ -727,6 +764,13 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
   const provider = normalizeNewConversationProviderType(
     String(document.getElementById('new-conversation-provider-select')?.value || '').trim().toLowerCase(),
   );
+  // A cloud session has no effort choice; its row is hidden, and an empty
+  // select is what the Start button reads as "send none".
+  if (!newChatRowVisibility(provider).reasoning) {
+    select.innerHTML = '';
+    select.disabled = true;
+    return;
+  }
   syncNewConversationReasoningLabel(provider);
   const catalog = newConversationCatalogCache || await loadModelCatalog() || {};
   const efforts = reasoningChoicesForProviderModel(catalog || {}, {
@@ -785,6 +829,10 @@ function updateNewConversationProviderHelp(provider = 'github') {
     help.textContent = "Claude chats run through the Claude Agent SDK with the relay host's Claude login.";
     return;
   }
+  if (normalizedProvider === CLAUDE_CLOUD_PROVIDER) {
+    help.textContent = "Claude Cloud chats run in a sandbox at Anthropic on a clone of a GitHub repository, billed to the relay host's Claude account.";
+    return;
+  }
   if (normalizedProvider === 'cursor') {
     help.textContent = 'Cursor chats run through the Cursor Agent SDK using your saved Cursor API key.';
     return;
@@ -803,12 +851,16 @@ async function populateNewConversationModelSelect(providerType = 'github') {
   const catalog = newConversationCatalogCache || await loadModelCatalog();
   if (!catalog || !Array.isArray(catalog.models)) return false;
   const normalizedProvider = normalizeNewConversationProviderType(providerType);
-  const eligibleModels = catalog.models
-    .map((modelId) => String(modelId || '').trim())
-    .filter((modelId) => modelMatchesNewConversationProvider(catalog, modelId, normalizedProvider))
-    .filter((modelId) => (
-      normalizedProvider !== 'openai-image' || isOpenAIImageModelId(modelId)
-    ));
+  const isCloud = normalizedProvider === CLAUDE_CLOUD_PROVIDER;
+  // Claude Cloud brings its own list (the tab's models), not catalog rows.
+  const eligibleModels = isCloud
+    ? claudeCloudModelIds(newConversationClaudeCloudSettingsCache)
+    : catalog.models
+      .map((modelId) => String(modelId || '').trim())
+      .filter((modelId) => modelMatchesNewConversationProvider(catalog, modelId, normalizedProvider))
+      .filter((modelId) => (
+        normalizedProvider !== 'openai-image' || isOpenAIImageModelId(modelId)
+      ));
   // The same builder the composer's #model-select uses, on the same catalog,
   // so the two pickers agree on order and wording by construction. The modal
   // used to borrow labels from the composer, which is scoped to the OPEN
@@ -817,7 +869,8 @@ async function populateNewConversationModelSelect(providerType = 'github') {
   const choices = buildNewConversationModelChoices(
     buildCatalogModelOptions(eligibleModels, {
       metadataByModel: catalog.modelMetadataByModel || {},
-      annotateContextWindow: normalizedProvider !== 'claude',
+      // The merged metadata knows Copilot's windows, not Claude's or the cloud's.
+      annotateContextWindow: normalizedProvider !== 'claude' && !isCloud,
     }).filter((option) => hasAuto || option.value.toLowerCase() !== 'auto'),
   );
   for (const choice of choices) {
@@ -826,9 +879,16 @@ async function populateNewConversationModelSelect(providerType = 'github') {
     option.textContent = choice.label;
     target.appendChild(option);
   }
+  // The rows follow the provider even when it has no model to offer, so a
+  // provider switch never leaves another provider's fields on screen.
+  syncNewConversationProviderRows(normalizedProvider);
   if (!target.options.length) return false;
   const storedModel = storedComposerModel();
-  if (storedModel && Array.from(target.options).some((option) => option.value === storedModel)) {
+  if (isCloud) {
+    // The tab's default, not the last model another provider's chat used.
+    const cloudDefault = claudeCloudDefaultModel(newConversationClaudeCloudSettingsCache, eligibleModels);
+    if (cloudDefault) target.value = cloudDefault;
+  } else if (storedModel && Array.from(target.options).some((option) => option.value === storedModel)) {
     target.value = storedModel;
   } else if (normalizedProvider !== 'openai-image' && Array.from(target.options).some((option) => option.value === 'auto')) {
     target.value = 'auto';
@@ -839,6 +899,147 @@ async function populateNewConversationModelSelect(providerType = 'github') {
   populateNewConversationContextRow(normalizedProvider, target.value);
   await populateNewConversationReasoningSelect(target.value);
   return true;
+}
+
+function selectedNewConversationProvider() {
+  return normalizeNewConversationProviderType(
+    String(document.getElementById('new-conversation-provider-select')?.value || '').trim(),
+  );
+}
+
+function isNewConversationCloudSelected() {
+  return selectedNewConversationProvider() === CLAUDE_CLOUD_PROVIDER;
+}
+
+function syncNewConversationProviderRows(providerType = 'github') {
+  const rows = newChatRowVisibility(providerType);
+  const cloudRow = document.getElementById('new-conversation-cloud-row');
+  if (cloudRow) cloudRow.hidden = !rows.cloudSource;
+  const reasoningRow = document.getElementById('new-conversation-reasoning-row');
+  if (reasoningRow) reasoningRow.hidden = !rows.reasoning;
+  // The folder line reads differently for a chat that does not run in the folder.
+  syncNewConversationCwdControls();
+}
+
+function newConversationCloudInputs() {
+  return {
+    repo: document.getElementById('new-conversation-cloud-repo'),
+    branch: document.getElementById('new-conversation-cloud-branch'),
+  };
+}
+
+function renderNewConversationCloudWarnings() {
+  const container = document.getElementById('new-conversation-cloud-warnings');
+  if (!container) return;
+  const { repo, branch } = newConversationCloudInputs();
+  const warnings = isNewConversationCloudSelected()
+    ? buildCloudSourceWarnings({
+      remote: newConversationCloudRemote,
+      lookupFailed: newConversationCloudLookupFailed,
+      repo: repo?.value || '',
+      branch: branch?.value || '',
+      environmentId: newConversationClaudeCloudSettingsCache?.environmentId || '',
+    })
+    : [];
+  container.replaceChildren(...warnings.map((warning) => {
+    const line = document.createElement('div');
+    line.className = 'new-conversation-cloud-warning';
+    line.dataset.kind = warning.kind;
+    line.textContent = warning.text;
+    return line;
+  }));
+}
+
+// `fields` marks the inputs the message is about; none means a general error.
+function showNewConversationCloudError(text = '', fields = []) {
+  const errorEl = document.getElementById('new-conversation-cloud-error');
+  if (errorEl) {
+    errorEl.textContent = text;
+    errorEl.hidden = !text;
+  }
+  const inputs = newConversationCloudInputs();
+  for (const [name, input] of Object.entries(inputs)) {
+    if (!input) continue;
+    if (fields.includes(name)) input.setAttribute('aria-invalid', 'true');
+    else input.removeAttribute('aria-invalid');
+  }
+  const firstInvalid = fields.map((name) => inputs[name]).find(Boolean);
+  if (text && firstInvalid) firstInvalid.focus?.();
+}
+
+function resetNewConversationCloudState() {
+  if (newConversationCloudLookupTimer) clearTimeout(newConversationCloudLookupTimer);
+  newConversationCloudLookupTimer = null;
+  newConversationCloudLookupSeq += 1;
+  newConversationCloudRemote = null;
+  newConversationCloudLookupFailed = false;
+  newConversationCloudLookupFolder = null;
+  newConversationCloudAutoFill = null;
+  const { repo, branch } = newConversationCloudInputs();
+  if (repo) repo.value = '';
+  if (branch) branch.value = '';
+  showNewConversationCloudError('');
+  renderNewConversationCloudWarnings();
+}
+
+// Reads origin + branch of the selected folder and fills the two fields.
+async function refreshNewConversationCloudSource() {
+  if (!isNewConversationCloudSelected()) return;
+  const pickedFolder = getNewConversationSelectedCwd();
+  const folder = pickedFolder || resolveNewConversationDefaultCwd();
+  if (folder === newConversationCloudLookupFolder) {
+    renderNewConversationCloudWarnings();
+    return;
+  }
+  const seq = ++newConversationCloudLookupSeq;
+  newConversationCloudLookupFolder = folder;
+  let remote = folder ? await loadGitRemote(folder) : null;
+  // A newer folder choice (or a closed modal) owns the fields by now.
+  if (seq !== newConversationCloudLookupSeq) return;
+  let lookupFailed = !!folder && !remote;
+  // Nobody picked the relay's default folder: when it has no repository to
+  // offer there is nothing to warn about, the fields are simply typed.
+  if (!pickedFolder && !String(remote?.repoUrl || '').trim()) {
+    remote = null;
+    lookupFailed = false;
+  }
+  newConversationCloudRemote = remote;
+  newConversationCloudLookupFailed = lookupFailed;
+  const { repo, branch } = newConversationCloudInputs();
+  const next = resolveCloudSourceAutoFill({
+    current: { repo: repo?.value || '', branch: branch?.value || '' },
+    lastAutoFill: newConversationCloudAutoFill,
+    remote,
+  });
+  if (repo) repo.value = next.repo;
+  if (branch) branch.value = next.branch;
+  newConversationCloudAutoFill = next.autoFill;
+  showNewConversationCloudError('');
+  renderNewConversationCloudWarnings();
+}
+
+// Debounced: the manual path fires on every keystroke.
+function scheduleNewConversationCloudLookup() {
+  if (newConversationCloudLookupTimer) clearTimeout(newConversationCloudLookupTimer);
+  newConversationCloudLookupTimer = null;
+  if (!isNewConversationCloudSelected()) return;
+  newConversationCloudLookupTimer = setTimeout(() => {
+    newConversationCloudLookupTimer = null;
+    void refreshNewConversationCloudSource();
+  }, NEW_CHAT_CLOUD_LOOKUP_DEBOUNCE_MS);
+}
+
+function bindNewConversationCloudInputs() {
+  for (const input of Object.values(newConversationCloudInputs())) {
+    if (!input || input.dataset.cloudBound === '1') continue;
+    input.dataset.cloudBound = '1';
+    input.addEventListener('input', () => {
+      // The warnings depend on whether the fields still name the folder's
+      // repository and branch; an edit also answers the last error.
+      showNewConversationCloudError('');
+      renderNewConversationCloudWarnings();
+    });
+  }
 }
 
 function resolveNewConversationDefaultCwd() {
@@ -861,6 +1062,12 @@ function syncNewConversationCwdControls() {
   if (!select) return;
   const isCustom = select.value === NEW_CHAT_CUSTOM_CWD_VALUE;
   if (manual) manual.hidden = !isCustom;
+  if (isNewConversationCloudSelected()) {
+    // The folder only supplies the repository and branch for a cloud chat.
+    scheduleNewConversationCloudLookup();
+    if (status) status.textContent = cloudFolderStatusText(getNewConversationSelectedCwd());
+    return;
+  }
   if (!status) return;
   if (isCustom) {
     const manualPath = normalizeKnownCwdPath(manual?.value || '');
@@ -949,18 +1156,24 @@ function populateNewConversationCwdSelect() {
 }
 
 async function openNewConversationModelModal() {
-  const [catalog, settings, claudeSettings, cursorSettings, grokSettings] = await Promise.all([
+  const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
     loadClaudeSettings(),
     loadCursorSettings(),
     loadGrokSettings(),
+    // null on a relay without Claude Cloud: the option is simply not offered.
+    loadClaudeCloudSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
   newConversationClaudeSettingsCache = claudeSettings || null;
   newConversationCursorSettingsCache = cursorSettings || null;
   newConversationGrokSettingsCache = grokSettings || null;
+  newConversationClaudeCloudSettingsCache = claudeCloudSettings || null;
+  // Every open starts from empty cloud fields; the folder lookup refills them.
+  resetNewConversationCloudState();
+  bindNewConversationCloudInputs();
   const providerSelect = document.getElementById('new-conversation-provider-select');
   if (providerSelect) {
     const options = [{ value: 'github', label: 'Copilot' }];
@@ -970,6 +1183,9 @@ async function openNewConversationModelModal() {
     }
     if (claudeSettings?.enabled === true) {
       options.push({ value: 'claude', label: 'Claude SDK' });
+    }
+    if (claudeCloudSettings?.enabled === true) {
+      options.push({ value: CLAUDE_CLOUD_PROVIDER, label: 'Claude Cloud' });
     }
     if (cursorSettings?.enabled === true) {
       options.push({ value: 'cursor', label: 'Cursor SDK' });
@@ -1063,8 +1279,10 @@ async function openBootstrappedConversation({
   hideNewConversationModelModal();
   // The server echoes what it actually bound and stored; the composer picks
   // those up from the conversation row when it opens, so only the shared
-  // "last used" storage is updated here.
-  rememberBootstrappedSelection(payload);
+  // "last used" storage is updated here. A cloud chat starts from its tab's
+  // default model and has no effort, so it must not become what the next
+  // local chat starts with.
+  if (selectedProvider !== CLAUDE_CLOUD_PROVIDER) rememberBootstrappedSelection(payload);
   await refreshConversations();
   await openConversation(conversationId);
   if (selectedProvider === 'openai-image') {
@@ -1077,12 +1295,26 @@ async function openBootstrappedConversation({
 
 async function createNewConversation(selectedModel, selectedReasoningEffort = '', selectedCwd = '') {
   if (newConversationInFlight) return;
+  const selectedProvider = selectedNewConversationProvider();
+  const isCloud = selectedProvider === CLAUDE_CLOUD_PROVIDER;
+  let cloudSource;
+  if (isCloud) {
+    // Checked before anything is sent: both fields can be fixed in place.
+    const { repo, branch } = newConversationCloudInputs();
+    const validation = validateCloudSourceInputs({ repo: repo?.value || '', branch: branch?.value || '' });
+    if (!validation.ok) {
+      showNewConversationCloudError(
+        [validation.errors.repo, validation.errors.branch].filter(Boolean).join(' '),
+        Object.keys(validation.errors),
+      );
+      return;
+    }
+    showNewConversationCloudError('');
+    cloudSource = validation.cloudSource;
+  }
   setNewConversationInFlight(true);
   const confirmButton = document.getElementById('new-conversation-model-confirm');
   if (confirmButton) confirmButton.disabled = true;
-  const selectedProvider = normalizeNewConversationProviderType(
-    String(document.getElementById('new-conversation-provider-select')?.value || '').trim(),
-  );
   const selectedSize = String(document.getElementById('new-conversation-size-select')?.value || '').trim().toLowerCase();
   if (selectedProvider === 'openai-image' && selectedSize) {
     localStorage.setItem(OPENAI_IMAGE_SIZE_STORAGE_KEY, selectedSize);
@@ -1091,17 +1323,26 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
     const result = await bootstrapConversationSession({
       model: selectedModel || undefined,
       providerType: bootstrapProviderType(selectedProvider),
-      reasoningEffort: String(selectedReasoningEffort || '').trim().toLowerCase() || undefined,
+      reasoningEffort: isCloud
+        ? undefined
+        : (String(selectedReasoningEffort || '').trim().toLowerCase() || undefined),
       // Bootstrap writes the conversation's preferences, so the current mode has
       // to travel with it or every new chat would come back as the default one.
       // The composer's selector wins over storage: storage holds the last
       // explicit choice, which is not the mode of the conversation on screen.
-      relayMode: String(
-        document.getElementById('mode-select')?.value
-        || localStorage.getItem(MODE_STORAGE_KEY)
-        || '',
-      ).trim() || undefined,
+      // A cloud session has no relay modes, so it never inherits Plan or Ask.
+      relayMode: isCloud
+        ? 'agent'
+        : (String(
+          // With a cloud chat on screen the selector is hidden and pinned to
+          // "agent": that is not a choice, so the last explicit one applies.
+          (isClaudeCloudConversation(conversations[currentConvId]) ? '' : document.getElementById('mode-select')?.value)
+          || localStorage.getItem(MODE_STORAGE_KEY)
+          || '',
+        ).trim() || undefined),
       workspaceRootPath: selectedCwd || undefined,
+      // Claude Cloud only: the repository (and branch) the session clones.
+      cloudSource,
       title: 'New Conversation',
     });
     const nextConversationId = String(result?.conversationId || '').trim();
@@ -1147,6 +1388,15 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
         // Fall through to the failure notice below with the modal closed; the
         // conversation exists and the sidebar refresh will show it.
       }
+    }
+    // A Claude Cloud rejection (bad repository or branch, provider switched
+    // off, no environment) belongs next to the fields it is about.
+    const cloudError = isCloud && !recovered
+      ? cloudBootstrapErrorModel({ code: error?.payload?.code, message: error?.payload?.error })
+      : null;
+    if (cloudError) {
+      showNewConversationCloudError(cloudError.text, cloudError.field ? [cloudError.field] : []);
+      return;
     }
     showTransientRelayNotice(recovered
       // The chat is usable, but its worker did not start, so say what broke.

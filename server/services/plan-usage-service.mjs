@@ -20,6 +20,7 @@ import {
 } from './plan-usage-contract.mjs';
 import { buildCopilotPlanCard } from './plan-usage-copilot.mjs';
 import { buildClaudePlanCard } from './plan-usage-claude.mjs';
+import { CLAUDE_CLOUD_PROVIDER_ID, buildClaudeCloudPlanCard } from './plan-usage-claude-cloud.mjs';
 import {
   CURSOR_POOLS,
   applyCursorUsageDelta,
@@ -383,6 +384,59 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     return { cycle };
   }
 
+  // Claude Cloud conversations keep their reported cost on the runtime
+  // session row (migration 0007). That table is the relay's, not this
+  // service's, so the statements are prepared on first use, and only once
+  // the table and the column are there (an older database has neither).
+  let claudeCloudSpendStmts = null;
+  function claudeCloudSpendStatements() {
+    if (claudeCloudSpendStmts) return claudeCloudSpendStmts;
+    const columns = new Set(db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((column) => String(column.name)));
+    if (!columns.has('claude_cloud_cost_usd') || !columns.has('provider_type')) return null;
+    claudeCloudSpendStmts = {
+      totals: db.prepare(`
+        SELECT COUNT(*) AS conversation_count, COALESCE(SUM(claude_cloud_cost_usd), 0) AS total_usd
+        FROM runtime_sessions
+        WHERE LOWER(TRIM(provider_type)) = '${CLAUDE_CLOUD_PROVIDER_ID}'
+      `),
+      byConversation: db.prepare(`
+        SELECT claude_cloud_cost_usd AS cost_usd
+        FROM runtime_sessions
+        WHERE conversation_id = ? AND LOWER(TRIM(provider_type)) = '${CLAUDE_CLOUD_PROVIDER_ID}'
+      `),
+    };
+    return claudeCloudSpendStmts;
+  }
+
+  /**
+   * What the relay's cloud conversations have cost: the sum of the latest
+   * cost each one reported and how many there are, plus the cost of
+   * `conversationId` when that is a cloud conversation (`conversation` is
+   * null for any other). Only conversations that still exist count: a deleted
+   * one takes its row with it. There are no dates on these figures, so no
+   * per-day or per-week sum is offered. Null when the storage is not there.
+   */
+  function readClaudeCloudSpend({ conversationId = '' } = {}) {
+    try {
+      const statements = claudeCloudSpendStatements();
+      if (!statements) return null;
+      const totals = statements.totals.get();
+      const id = toTrimmedString(conversationId);
+      const row = id ? statements.byConversation.get(id) : null;
+      const cost = row ? Number(row.cost_usd) : null;
+      return {
+        totalUsd: Number(totals?.total_usd) || 0,
+        conversationCount: Number(totals?.conversation_count) || 0,
+        conversation: row
+          ? { costUsd: row.cost_usd !== null && Number.isFinite(cost) ? cost : null }
+          : null,
+      };
+    } catch (error) {
+      dbg('claude cloud spend read failed', error?.message || String(error));
+      return null;
+    }
+  }
+
   /**
    * Assemble the full multi-provider report. Every provider is independent:
    * one failing source produces an unavailable card instead of failing the
@@ -394,6 +448,12 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     copilotStale = false,
     copilotBilling = null,
     claudeConfigured = true,
+    // Live account usage (claude-account-usage-service.mjs), or null: it is
+    // only ever read while Claude Cloud is switched on.
+    claudeAccount = null,
+    claudeCloudConfigured = false,
+    // The conversation the modal was opened from, for its own cloud cost.
+    conversationId = '',
     cursorConfigured = true,
     cursorAllowances = null,
     cursorBilling = null,
@@ -404,6 +464,9 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
   } = {}) {
     const generatedAt = nowIso();
     const claudeSnapshot = readSnapshot('claude');
+    // What the cloud workers post to /api/claude-plan-usage is kept under its
+    // own key, so the Claude card stays what the Claude workers wrote.
+    const claudeCloudSnapshot = claudeCloudConfigured === true ? readSnapshot(CLAUDE_CLOUD_PROVIDER_ID) : null;
     const allowances = normalizeCursorAllowanceSettings(cursorAllowances || {});
     const cursorCycle = readCursorCycleTotals({ resetDay: allowances.resetDay });
     const grokSettings = normalizeGrokAllowanceSettings(grokAllowances || {});
@@ -431,9 +494,22 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
         message: claudeSnapshot?.error || null,
         // A stored snapshot is by definition from an earlier turn; the SDK's
         // usage control call only works while a session transport is open, and
-        // the relay never opens a billable turn just to refresh this.
+        // the relay never opens a billable turn just to refresh this. Live
+        // account usage, where there is any, takes the meters over.
         stale: !!claudeSnapshot?.payload,
+        account: claudeAccount,
       }),
+      // Opt-in like Grok (no card while the provider is off), and placed next
+      // to the Claude card because both are the same account.
+      claudeCloudConfigured === true
+        ? buildClaudeCloudPlanCard({
+          account: claudeAccount,
+          spend: readClaudeCloudSpend({ conversationId }),
+          usage: claudeCloudSnapshot?.payload || null,
+          capturedAt: claudeCloudSnapshot?.capturedAt || null,
+          configured: true,
+        })
+        : null,
       buildCursorPlanCard({
         totals: cursorCycle.totals,
         allowances,
@@ -481,6 +557,7 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     recordGrokUsageReport,
     readGrokCycleTotals,
     resetGrokAccounting,
+    readClaudeCloudSpend,
     buildReport,
     pools: CURSOR_POOLS,
   };
