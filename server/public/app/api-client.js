@@ -778,8 +778,9 @@ export async function loadConversations(options = {}) {
   if (beforeConversationId) params.set('beforeConversationId', beforeConversationId);
   const beforeUpdatedAt = String(options.beforeUpdatedAt || '').trim();
   if (beforeUpdatedAt) params.set('beforeUpdatedAt', beforeUpdatedAt);
-  const includeArchived = String(options.archived || '').trim().toLowerCase();
-  if (includeArchived === 'true') params.set('archived', 'true');
+  // 'true' lists live and archived chats, 'only' the archived ones.
+  const archivedMode = String(options.archived || '').trim().toLowerCase();
+  if (archivedMode === 'true' || archivedMode === 'only') params.set('archived', archivedMode);
   const query = params.toString();
   return apiFetch(`/api/conversations${query ? `?${query}` : ''}`);
 }
@@ -831,6 +832,39 @@ export async function searchMessages(options = {}) {
 // Raw fetch instead of apiFetch: a refused delete (the conversation is still
 // working, or its session would not stop) must surface the server's reason.
 // The long timeout covers stopping the session and deleting its CLI session.
+// Archive and unarchive answer `{ ok }`, or `{ ok: false, message }` when the
+// relay refuses (a chat still working on a reply is not archived).
+export async function archiveConversation(id) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return conversationActionRequest(`/api/conversation/${encodeURIComponent(convId)}/archive`);
+}
+
+export async function unarchiveConversation(id) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return conversationActionRequest(`/api/conversation/${encodeURIComponent(convId)}/unarchive`);
+}
+
+async function conversationActionRequest(url) {
+  if (!areNetworkRequestsEnabled()) return null;
+  try {
+    const response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: '{}',
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) return { ...(payload || {}), ok: false, status: response.status };
+    noteFetchSuccess();
+    return payload || { ok: true };
+  } catch (error) {
+    noteFetchFailure(url, error);
+    return null;
+  }
+}
+
 export async function deleteConversation(id) {
   const convId = String(id || '').trim();
   if (!convId || !areNetworkRequestsEnabled()) return null;

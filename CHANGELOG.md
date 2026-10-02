@@ -5,6 +5,19 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Archive conversations, and a context menu in the list.** Every
+  conversation row has an **Archive** button beside Delete (and the chat's
+  `⋯` menu an **Archive conversation** entry). An archived chat leaves the
+  list and its session worker is stopped; the 🗄 toggle at the top of the
+  sidebar shows the archived chats, each with **Unarchive**. A Claude Cloud
+  chat's cloud session is archived and unarchived at Anthropic with it. A
+  message into an archived chat (an agent's, say) brings it back by itself;
+  the composer of an archived chat says so instead of sending. A right-click
+  on a row — a long press on a phone — opens a menu with Open, Edit title,
+  Stop turn, Kill session, Archive/Unarchive and Delete.
+
 ### Changed
 
 - **Check Usage opens at once.** The modal shows the reading it showed last

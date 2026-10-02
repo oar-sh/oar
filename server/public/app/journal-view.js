@@ -28,6 +28,8 @@ import {
   loadConversations as loadConversationsApi,
   loadConversation,
   deleteConversation as deleteConversationApi,
+  archiveConversation as archiveConversationApi,
+  unarchiveConversation as unarchiveConversationApi,
   bootstrapConversationSession,
   scheduleContextUsageRefresh,
   loadModelCatalog,
@@ -40,7 +42,8 @@ import {
   loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
-import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch } from './conversation-view.js';
+import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn } from './conversation-view.js';
+import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
 import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setUsageLimitConversation } from './usage-limit-ui.js';
 import { mergeConversationPreviews } from './preview-cards.mjs';
@@ -223,6 +226,7 @@ const conversationListLoader = createInfiniteLoader({
       limit: CONVERSATION_LIST_PAGE_SIZE,
       beforeConversationId: String(cursor?.beforeConversationId || '').trim(),
       beforeUpdatedAt: String(cursor?.beforeUpdatedAt || '').trim(),
+      archived: conversationListArchivedView ? 'only' : '',
     });
     if (!response) throw new Error('Could not load conversations');
     return {
@@ -312,7 +316,10 @@ export async function loadConversations() {
 
 export async function refreshConversations(options = {}) {
   const preservePagination = options?.preservePagination !== false;
-  const r = await loadConversationsApi({ limit: CONVERSATION_LIST_PAGE_SIZE });
+  const r = await loadConversationsApi({
+    limit: CONVERSATION_LIST_PAGE_SIZE,
+    archived: conversationListArchivedView ? 'only' : '',
+  });
   if (!r) return;
   if (Array.isArray(r.knownConversationIds)) {
     const knownConversationIds = new Set(
@@ -345,7 +352,9 @@ export function renderConvList() {
     return String(b?.id || '').trim().localeCompare(String(a?.id || '').trim());
   });
   const activeFilter = normalizeConversationFilter(conversationListFilterText);
-  const visible = activeFilter ? filterConversations(sorted, activeFilter) : sorted;
+  // The live list and the Archived view are two views of the same records.
+  const inView = sorted.filter((conversation) => (conversation?.archived === true) === conversationListArchivedView);
+  const visible = activeFilter ? filterConversations(inView, activeFilter) : inView;
   const pendingByConversation = getPendingQuestionCountsByConversation();
   let hasProcessingConversation = false;
   const footerHtml = (() => {
@@ -367,9 +376,9 @@ export function renderConvList() {
   })();
   if (visible.length === 0) {
     ensureProcessingDotTimer(false);
-    const emptyText = activeFilter && sorted.length > 0
+    const emptyText = activeFilter && inView.length > 0
       ? 'No conversations match your filter'
-      : 'No conversations yet';
+      : (conversationListArchivedView ? 'No archived conversations' : 'No conversations yet');
     list.innerHTML = `<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">${emptyText}</div>${footerHtml}`;
     lastConvListHtml = '';
     scheduleConversationListBoundaryCheck();
@@ -400,9 +409,12 @@ export function renderConvList() {
     // "via agent · “title”": an agent in that conversation on this relay did.
     const originMarkerHtml = renderConversationOriginMarkerHtml(c, { conversations });
     return `
-    <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}" onclick="openConversation('${c.id}')">
-      <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${c.archived ? ' <span style="font-size:0.68rem;color:var(--muted)">(archived)</span>' : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
+    <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}" data-conversation-id="${c.id}" onclick="openConversation('${c.id}')">
+      <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
       <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${originMarkerHtml}${providerIndicatorHtml}</div>
+      ${c.archived
+        ? `<button class="conv-archive" onclick="unarchiveConv(event,'${c.id}')" title="Unarchive" aria-label="Unarchive">📂</button>`
+        : `<button class="conv-archive" onclick="archiveConv(event,'${c.id}')" title="Archive" aria-label="Archive">🗄</button>`}
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
   }).join('')}${footerHtml}`;
@@ -410,6 +422,7 @@ export function renderConvList() {
     list.innerHTML = listHtml;
     lastConvListHtml = listHtml;
   }
+  bindConversationContextMenu(list);
   ensureProcessingDotTimer(hasProcessingConversation);
   window.syncChatTitleControls?.();
   scheduleConversationListBoundaryCheck();
@@ -1826,6 +1839,106 @@ export function initConversationFilter() {
     input.focus();
   });
   syncClearButton();
+}
+
+// ── Archive, and the row's context menu ──
+
+// Which of the two views the sidebar shows: the live conversations, or the
+// archived ones (the 🗄 toggle in the filter row).
+let conversationListArchivedView = false;
+
+export function isArchivedConversationsView() {
+  return conversationListArchivedView;
+}
+
+export async function toggleArchivedConversations(next = !conversationListArchivedView) {
+  conversationListArchivedView = next === true;
+  const toggle = document.getElementById('conv-archived-toggle');
+  if (toggle) {
+    toggle.setAttribute('aria-pressed', conversationListArchivedView ? 'true' : 'false');
+    toggle.title = conversationListArchivedView ? 'Back to the conversations' : 'Show archived conversations';
+    toggle.setAttribute('aria-label', toggle.title);
+  }
+  const banner = document.getElementById('conv-archived-banner');
+  if (banner) banner.hidden = !conversationListArchivedView;
+  renderConvList();
+  // The other view's pages come from the relay; the records already known
+  // (an archived chat that was open, say) show at once.
+  await refreshConversations({ preservePagination: false });
+}
+
+async function setConversationArchived(id, archived) {
+  const result = await (archived ? archiveConversationApi(id) : unarchiveConversationApi(id));
+  if (!result) return false;
+  if (result.ok === false) {
+    showTransientRelayNotice(
+      String(result.message || '').trim() || `This conversation could not be ${archived ? 'archived' : 'unarchived'}.`,
+      6000,
+    );
+    return false;
+  }
+  if (conversations[id]) conversations[id].archived = archived;
+  renderConvList();
+  window.syncChatTitleControls?.();
+  window.syncComposerButtonState?.();
+  return true;
+}
+
+export async function archiveConv(e, id) {
+  e?.stopPropagation?.();
+  closeContextMenu();
+  await setConversationArchived(id, true);
+}
+
+export async function unarchiveConv(e, id) {
+  e?.stopPropagation?.();
+  closeContextMenu();
+  await setConversationArchived(id, false);
+}
+
+/** The entries of a conversation row's menu. */
+function conversationMenuItems(id) {
+  const conversation = conversations[id];
+  if (!conversation) return [];
+  const isCurrent = currentConvId === id;
+  const sdkSessionId = String(conversation.sdkSessionId || '').trim();
+  const workerState = sdkSessionId ? getSessionWorkerState(sdkSessionId) : null;
+  const running = conversationHasActiveTurn(id) || isConversationProcessing(conversation, workerState);
+  const openFirst = async (then) => {
+    if (!isCurrent) await openConversation(id);
+    then();
+  };
+  return [
+    { id: 'open', label: 'Open', onSelect: () => { void openConversation(id); } },
+    { id: 'edit-title', label: 'Edit title', onSelect: () => { void openFirst(() => window.openChatTitleEditor?.()); } },
+    MENU_SEPARATOR,
+    { id: 'stop-turn', label: 'Stop turn', disabled: !running, onSelect: () => { void openFirst(() => openStopTurnConfirmationForConversation(id)); } },
+    { id: 'kill-session', label: 'Kill session', disabled: !workerState && !sdkSessionId, onSelect: () => { void openFirst(() => window.openKillSessionConfirmation?.()); } },
+    MENU_SEPARATOR,
+    conversation.archived === true
+      ? { id: 'unarchive', label: 'Unarchive', onSelect: () => { void unarchiveConv(null, id); } }
+      : { id: 'archive', label: 'Archive', onSelect: () => { void archiveConv(null, id); } },
+    { id: 'delete', label: 'Delete', danger: true, onSelect: () => { void deleteConv({ stopPropagation() {} }, id); } },
+  ];
+}
+
+/** Right-click (and long press on touch) on a row opens its menu. Bound once; the list's rows are re-rendered freely. */
+function bindConversationContextMenu(list) {
+  if (!list || list.dataset.contextMenuBound === '1') return;
+  list.dataset.contextMenuBound = '1';
+  const openFor = (row, x, y) => {
+    const id = String(row?.dataset?.conversationId || '').trim();
+    if (!id) return;
+    const items = conversationMenuItems(id);
+    if (items.length) openContextMenu(x, y, items);
+  };
+  list.addEventListener('contextmenu', (event) => {
+    const row = event.target?.closest?.('.conv-item');
+    if (!row || !list.contains(row)) return;
+    event.preventDefault();
+    openFor(row, event.clientX, event.clientY);
+  });
+  bindLongPress(list, '.conv-item', (row, x, y) => openFor(row, x, y));
 }
 
 export async function deleteConv(e, id) {

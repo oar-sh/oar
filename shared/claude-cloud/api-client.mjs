@@ -542,6 +542,12 @@ export function createClaudeCloudClient({
     return { archived: true, alreadyArchived: status === 409 };
   }
 
+  /** Bring an archived session back; one that is active already counts as done. */
+  async function unarchiveSession(id) {
+    const { status } = await request('POST', sessionPath(id, '/unarchive'), { body: {}, okStatuses: [409] });
+    return { unarchived: true, alreadyActive: status === 409 };
+  }
+
   /** The account's usage windows and dollar buckets, as the API sends them. */
   async function getAccountUsage() {
     const { body } = await request('GET', '/api/oauth/usage');
@@ -772,6 +778,7 @@ export function createClaudeCloudClient({
     sendInterrupt,
     applyFlagSettings,
     archiveSession,
+    unarchiveSession,
     getAccountUsage,
     getPrepaidCredits,
     getCreditGrantOffer,

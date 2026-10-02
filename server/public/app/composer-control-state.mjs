@@ -47,7 +47,18 @@ export function deriveComposerControlState({
   // the relay holds the message and it steers in once the hold clears.
   steeringHeld = false,
   steeringHoldReason = null,
+  // An archived conversation: its worker is stopped and it is out of the
+  // live list; sending would start it again behind the user's back.
+  archived = false,
 } = {}) {
+  if (archived) {
+    return {
+      action: 'send',
+      label: 'Send',
+      title: 'This conversation is archived. Unarchive it to continue.',
+      disabled: true,
+    };
+  }
   const active = !!hasActiveTurn;
   const draft = !!hasDraft;
   const metadataBlocked = !!modelMetadataBlocked;

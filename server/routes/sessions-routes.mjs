@@ -2806,11 +2806,13 @@ export function registerSessionsRoutes(app, deps) {
 
   // GET /api/conversations — list all conversations
   app.get('/api/conversations', auth, (req, res) => {
-    const includeArchived = String(req.query.archived || '').trim().toLowerCase() === 'true';
+    // `archived=true` lists both, `archived=only` the archived ones (the
+    // sidebar's Archived view), nothing: the live ones.
+    const archivedMode = String(req.query.archived || '').trim().toLowerCase();
     const limit = normalizeConversationListLimit(req.query.limit, DEFAULT_CONVERSATION_LIST_LIMIT);
     const beforeConversationId = String(req.query.beforeConversationId || '').trim();
     const beforeUpdatedAt = String(req.query.beforeUpdatedAt || '').trim();
-    const rows = stmts.listConvs.all(includeArchived ? 1 : 0);
+    const rows = stmts.listConvs.all(archivedMode === 'true' ? 1 : 0, archivedMode === 'only' ? 1 : 0);
     const page = selectConversationListPage(rows, {
       limit,
       beforeConversationId,
@@ -4741,7 +4743,11 @@ export function registerSessionsRoutes(app, deps) {
     return { statusCode: 200, body: { ok: true, workerStopped, cliSessionDeleted: cliSession.deleted } };
   }
 
-  // POST /api/conversation/:id/archive — archive conversation
+  // POST /api/conversation/:id/archive — archive conversation. The chat
+  // leaves the sidebar's live list (it is kept, and comes back with
+  // /unarchive); its idle worker is stopped like a deleted chat's; a Claude
+  // Cloud chat's cloud session is archived with it. A chat that is working
+  // is not archived: stop it first.
   app.post('/api/conversation/:id/archive', auth, async (req, res) => {
     if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     const id = String(req.params.id || '').trim();
@@ -4751,22 +4757,115 @@ export function registerSessionsRoutes(app, deps) {
       if (!existing || String(existing.status || '').trim() === 'deleted') {
         return res.json({ ok: true, alreadyDeleted: true });
       }
-      db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
-      io.emit('conversation_archived', { conversationId: id });
-      // The cloud session of a Claude Cloud conversation is archived with it;
-      // best effort and not waited for.
+      if (Number(existing.archived || 0) === 1) return res.json({ ok: true, alreadyArchived: true });
+      const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
+      const workerSessionId = sdkSessionId || id;
+      const outcome = await sessionLaunchMutex.runExclusive(workerSessionId, async () => {
+        const activity = describeConversationActivity(id, workerSessionId);
+        if (activity.turnRunning) {
+          return {
+            statusCode: 409,
+            body: {
+              ok: false,
+              error: 'conversation-active',
+              reason: 'turn-running',
+              message: 'This conversation is still working on a reply. Stop it, then archive it.',
+            },
+          };
+        }
+        if (activity.backgroundTaskCount > 0) {
+          return {
+            statusCode: 409,
+            body: {
+              ok: false,
+              error: 'conversation-active',
+              reason: 'background-tasks',
+              message: activity.unstoppableTaskCount > 0
+                ? 'Background tasks are still running in this conversation, and some have no Stop button. Use Kill session in its ⋯ menu, then archive it.'
+                : 'Background tasks are still running in this conversation. Stop them in the task panel, then archive it.',
+            },
+          };
+        }
+        // A worker another live conversation still uses stays.
+        const sharedWithConversationId = sdkSessionId
+          ? String(findOtherLiveConversationForSdkSession.get(sdkSessionId, id)?.id || '').trim() || null
+          : null;
+        const importedOnly = !!sdkSessionId && sdkSessionImportService?.isImportedOnly?.(sdkSessionId) === true;
+        let workerStopped = false;
+        if (!sharedWithConversationId && !importedOnly) {
+          const stopped = await stopIdleWorkspaceRootSession({
+            sdkSessionId: workerSessionId,
+            worker: sessionWorkerRegistry?.getWorker?.(workerSessionId) || null,
+            sessionWorkerSupervisor,
+            sessionWorkerRegistry,
+            sessionWorkerProcessInspector,
+            stopOverrides: sessionWorkerStopOverrides,
+          });
+          if (!stopped.ok) {
+            return {
+              statusCode: 409,
+              body: {
+                ok: false,
+                error: 'worker-stop-failed',
+                message: "Couldn't stop this conversation's session, so it was not archived. Try again in a moment.",
+                remainingPids: stopped.remainingPids || [],
+              },
+            };
+          }
+          workerStopped = (stopped.stoppedPids || []).length > 0;
+          // Nothing may respawn a worker for an archived chat.
+          sessionWorkerSupervisor?.markKilled?.(workerSessionId);
+        }
+        db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
+        io.emit('conversation_archived', { conversationId: id, archived: true });
+        // The cloud session of a Claude Cloud conversation is archived with it;
+        // best effort and not waited for.
+        if (!sharedWithConversationId) {
+          try {
+            claudeCloudSessionService?.archiveSessionInBackground?.({
+              conversationId: id,
+              runtimeSession: stmts.getRuntimeSessionByConversation?.get?.(id) || null,
+            });
+          } catch (error) {
+            console.warn(`[archive] Cloud session archive not started for ${id}: ${error?.message || error}`);
+          }
+        }
+        return { statusCode: 200, body: { ok: true, workerStopped } };
+      });
+      return res.status(outcome.statusCode).json(outcome.body);
+    } catch (error) {
+      console.warn(`[archive] Archive failed for ${id}: ${error?.message || error}`);
+      return res.status(500).json({ error: 'Failed to archive conversation' });
+    }
+  });
+
+  // POST /api/conversation/:id/unarchive — back to the live list. A Claude
+  // Cloud chat's cloud session is brought back too, so the next message
+  // reaches it; a stopped worker is launched again by the next delivery.
+  app.post('/api/conversation/:id/unarchive', auth, (req, res) => {
+    if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing conversation id' });
+    try {
+      const existing = stmts.getConvAnyStatus.get(id);
+      if (!existing || String(existing.status || '').trim() === 'deleted') {
+        return res.status(404).json({ ok: false, error: 'Conversation not found' });
+      }
+      if (Number(existing.archived || 0) !== 1) return res.json({ ok: true, alreadyLive: true });
+      db.prepare(`UPDATE conversations SET archived = 0, updated_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
+      io.emit('conversation_archived', { conversationId: id, archived: false });
       try {
-        claudeCloudSessionService?.archiveSessionInBackground?.({
+        claudeCloudSessionService?.unarchiveSessionInBackground?.({
           conversationId: id,
           runtimeSession: stmts.getRuntimeSessionByConversation?.get?.(id) || null,
         });
       } catch (error) {
-        console.warn(`[archive] Cloud session archive not started for ${id}: ${error?.message || error}`);
+        console.warn(`[archive] Cloud session unarchive not started for ${id}: ${error?.message || error}`);
       }
       return res.json({ ok: true });
     } catch (error) {
-      console.warn(`[archive] Archive failed for ${id}: ${error?.message || error}`);
-      return res.status(500).json({ error: 'Failed to archive conversation' });
+      console.warn(`[archive] Unarchive failed for ${id}: ${error?.message || error}`);
+      return res.status(500).json({ error: 'Failed to unarchive conversation' });
     }
   });
 

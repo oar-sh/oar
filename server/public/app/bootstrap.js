@@ -84,6 +84,10 @@ import {
   confirmNewConversationModel,
   closeNewConversationModelModal,
   deleteConv,
+  archiveConv,
+  unarchiveConv,
+  toggleArchivedConversations,
+  isArchivedConversationsView,
   openOriginConversation,
 } from './journal-view.js';
 import {
@@ -4010,6 +4014,11 @@ function syncChatTitleControls() {
     killBtn.disabled = sharedMode || !convId || !sdkSessionId;
     killBtn.hidden = sharedMode || !convId;
   }
+  const archiveBtn = document.getElementById('chat-menu-archive');
+  if (archiveBtn) {
+    archiveBtn.hidden = sharedMode || !convId;
+    archiveBtn.textContent = conversation?.archived === true ? '📂 Unarchive conversation' : '🗄 Archive conversation';
+  }
   if (editor) {
     editor.hidden = !editing;
   }
@@ -4306,6 +4315,17 @@ async function initApp() {
         });
       });
     }
+    const chatMenuArchiveBtn = document.getElementById('chat-menu-archive');
+    bindMenuAction(chatMenuArchiveBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      const convId = String(currentConvId || '').trim();
+      if (!convId) return;
+      const archived = conversations[convId]?.archived === true;
+      void (archived ? unarchiveConv(null, convId) : archiveConv(null, convId));
+    });
     const chatMenuShareConversationBtn = document.getElementById('chat-menu-share-conversation');
     bindMenuAction(chatMenuShareConversationBtn, (event) => {
       event.preventDefault();
@@ -4673,6 +4693,9 @@ window.newConversation = newConversation;
 window.confirmNewConversationModel = confirmNewConversationModel;
 window.closeNewConversationModelModal = closeNewConversationModelModal;
 window.deleteConv = deleteConv;
+window.archiveConv = archiveConv;
+window.unarchiveConv = unarchiveConv;
+window.toggleArchivedConversations = toggleArchivedConversations;
 window.openConversation = openConversation;
 window.openOriginConversation = openOriginConversation;
 window.toggleStatusView = toggleStatusView;
@@ -4732,6 +4755,9 @@ window.syncChatTitleControls = syncChatTitleControls;
 window.closeChatActionsMenu = closeChatActionsMenu;
 window.openSuspendHostConfirmation = openSuspendHostConfirmation;
 window.confirmKillCurrentSession = confirmKillCurrentSession;
+// The conversation list's context menu reaches these for the open conversation.
+window.openKillSessionConfirmation = openKillSessionConfirmation;
+window.openChatTitleEditor = openChatTitleEditor;
 window.confirmRestartWebRelay = confirmRestartWebRelay;
 window.confirmSuspendHost = confirmSuspendHost;
 window.cancelQueuedHostSuspend = cancelQueuedHostSuspend;

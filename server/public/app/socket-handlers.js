@@ -777,6 +777,17 @@ export async function connectSocket(overrideDeps) {
     }
     renderConvList();
   });
+  socket.on('conversation_archived', ({ conversationId, archived }) => {
+    const id = String(conversationId || '').trim();
+    if (!id) return;
+    const conversation = conversations[id];
+    if (conversation) conversation.archived = archived !== false;
+    renderConvList();
+    if (currentConvId === id) {
+      syncChatTitleControls();
+      syncComposerButtonState();
+    }
+  });
   socket.on('conversation_deleted', ({ conversationId }) => {
     delete conversations[conversationId];
     for (const [id, question] of relayQuestions.entries()) {

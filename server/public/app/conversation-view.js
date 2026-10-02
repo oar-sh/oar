@@ -546,6 +546,7 @@ function syncSendButtonState() {
     steeringSupported: conversationSupportsSteering(currentConvId),
     steeringHeld: steeringHold.held,
     steeringHoldReason: steeringHold.reason,
+    archived: conversations[String(currentConvId || '').trim()]?.archived === true,
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
@@ -1820,6 +1821,19 @@ function openStopTurnConfirmation(conversationId, messageId) {
     event.preventDefault();
     closeSummaryModal();
   }, { once: true });
+}
+
+/** The Stop confirmation for a conversation's running turn, from outside the bubble (the sidebar menu). */
+export function openStopTurnConfirmationForConversation(conversationId) {
+  const turn = getActiveTurnForConversation(conversationId);
+  if (!turn?.messageId) return false;
+  openStopTurnConfirmation(conversationId, turn.messageId);
+  return true;
+}
+
+/** Whether a turn of this conversation is running as far as this page knows. */
+export function conversationHasActiveTurn(conversationId) {
+  return !!getActiveTurnForConversation(conversationId);
 }
 
 export function collapseThinkingThoughts() {

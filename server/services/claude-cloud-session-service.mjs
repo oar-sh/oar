@@ -294,5 +294,33 @@ export function createClaudeCloudSessionService({
     return true;
   }
 
-  return { cloudPayloadFor, recordWorkerReport, archiveSessionInBackground };
+  /**
+   * The reverse, for a conversation that is unarchived here: the cloud
+   * session comes back so the next message reaches it. Same best-effort rule.
+   */
+  function unarchiveSessionInBackground({ conversationId = '', runtimeSession = null } = {}) {
+    if (!isClaudeCloudProviderType(runtimeSession?.provider_type)) return false;
+    const cloudSessionId = toText(runtimeSession?.claude_cloud_session_id);
+    if (!isSafeClaudeCloudId(cloudSessionId)) return false;
+    let client = null;
+    try {
+      client = getCloudClient();
+    } catch {
+      client = null;
+    }
+    if (typeof client?.unarchiveSession !== 'function') return false;
+    const label = toText(conversationId).slice(0, 8) || 'unknown';
+    Promise.resolve()
+      .then(() => client.unarchiveSession(cloudSessionId))
+      .then(() => {
+        logger?.log?.(`[claude-cloud] unarchived the cloud session of conversation ${label}`);
+      })
+      .catch((error) => {
+        const reason = toText(error?.code) || toText(error?.message).slice(0, 200) || 'unknown error';
+        logger?.warn?.(`[claude-cloud] the cloud session of conversation ${label} was not unarchived: ${reason}`);
+      });
+    return true;
+  }
+
+  return { cloudPayloadFor, recordWorkerReport, archiveSessionInBackground, unarchiveSessionInBackground };
 }

@@ -122,7 +122,7 @@ export const FAKE_CLOUD_USAGE = Object.freeze({
 });
 
 const INTERRUPTED = Symbol("interrupted");
-const SESSION_ROUTE = /^\/v1\/code\/sessions\/([^/]+)(\/events\/stream|\/events|\/archive)?$/;
+const SESSION_ROUTE = /^\/v1\/code\/sessions\/([^/]+)(\/events\/stream|\/events|\/archive|\/unarchive)?$/;
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -614,6 +614,11 @@ export async function startFakeClaudeCloudApi({
         session.status = "archived";
         session.turn?.interrupt();
         return sendJson(res, 200, {});
+      }
+      if (req.method === "POST" && suffix === "/unarchive") {
+        if (session.status !== "archived") return sendError(res, 409, "invalid_request_error", "session is not archived");
+        session.status = "active";
+        return sendJson(res, 200, { session: describeSession(session) });
       }
     }
     return sendError(res, 404, "not_found_error", `no route for ${req.method} ${pathname}`);

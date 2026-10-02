@@ -543,7 +543,7 @@
     border-radius: 8px;
     background: var(--bg2);
     color: var(--text);
-    padding: 0 38px 0 10px;
+    padding: 0 76px 0 10px;
     font-size: var(--fs-meta-md);
   }
   /* iOS Safari zooms the page on focus for inputs under 16px, and the mobile
@@ -747,6 +747,70 @@
   }
   .conv-item:hover .conv-delete { opacity: 1; }
   .conv-delete:hover { color: var(--danger); }
+  /* Archive / unarchive sits left of the bin, shown on hover like it. */
+  .conv-archive {
+    position: absolute; right: 34px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; color: var(--muted); cursor: pointer; font-size: var(--fs-ui-icon);
+    opacity: 0; transition: opacity 0.15s; padding: 4px;
+  }
+  .conv-item:hover .conv-archive { opacity: 1; }
+  .conv-archive:hover { color: var(--text); }
+  .conv-item.archived .conv-title { color: var(--muted); }
+  /* The Archived view: a toggle in the filter row, a banner above the list. */
+  #conv-archived-toggle {
+    position: absolute;
+    top: 50%;
+    right: 46px;
+    transform: translateY(-50%);
+    height: 28px;
+    min-width: 28px;
+    padding: 0 6px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: var(--fs-meta-md);
+  }
+  #conv-archived-toggle:hover { color: var(--text); border-color: var(--border); }
+  #conv-archived-toggle[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+  #conv-archived-banner {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    margin: 0 16px 6px; padding: 6px 10px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--bg2);
+    font-size: var(--fs-meta-sm); color: var(--muted);
+  }
+  #conv-archived-banner[hidden] { display: none; }
+  .conv-archived-back {
+    border: 1px solid var(--border); border-radius: 6px; background: var(--bg3); color: var(--text);
+    font-size: var(--fs-meta-xs); padding: 2px 8px; cursor: pointer;
+  }
+  /* The conversation context menu (context-menu.mjs): right-click / long press. */
+  .context-menu {
+    position: fixed;
+    z-index: 1200;
+    min-width: 200px;
+    max-width: min(320px, calc(100vw - 8px));
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+  .context-menu-item {
+    display: flex; align-items: center; gap: 8px; width: 100%; min-height: 34px;
+    border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--text);
+    padding: 0 10px; font: inherit; font-size: var(--fs-meta-md); text-align: left; cursor: pointer;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  }
+  .context-menu-item:hover, .context-menu-item:focus-visible { background: var(--bg3); border-color: var(--border); outline: none; }
+  .context-menu-item:disabled { opacity: 0.5; cursor: not-allowed; }
+  .context-menu-item-danger { color: var(--danger); }
+  .context-menu-sep { height: 1px; margin: 3px 6px; background: var(--border); }
+  #conv-list .conv-item { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
   .conv-open-questions {
     display: inline-flex;
     margin-left: 6px;
@@ -5003,6 +5067,7 @@
     #status-btn { min-width: 72px; padding: 9px 10px; font-size: var(--fs-meta-md); }
     #conv-filter-row { padding: 8px 12px; }
     #conv-filter-clear { right: 16px; }
+    #conv-archived-toggle { right: 42px; }
     #conv-list { padding: 0 5px 8px; }
     .conv-item { padding: 6px 11px; border-radius: 8px; }
     .conv-title {
@@ -5544,8 +5609,10 @@
     <div id="conv-filter-row">
       <input id="conv-filter-input" type="text" placeholder="Filter conversations…" autocomplete="off" spellcheck="false" aria-label="Filter conversations by title">
       <button id="conv-filter-clear" type="button" title="Clear filter" aria-label="Clear filter" hidden>×</button>
+      <button id="conv-archived-toggle" type="button" title="Show archived conversations" aria-label="Show archived conversations" aria-pressed="false" onclick="toggleArchivedConversations()">🗄</button>
       <div id="conv-filter-status" role="status" aria-live="polite"></div>
     </div>
+    <div id="conv-archived-banner" hidden>Archived conversations <button type="button" class="conv-archived-back" onclick="toggleArchivedConversations()">Back to the list</button></div>
     <div id="conv-list"></div>
   </div>
   <div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize conversations sidebar"></div>
@@ -5574,6 +5641,7 @@
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🗜️ Compact</button>
             <button id="chat-menu-share-conversation" class="chat-actions-menu-item" type="button" role="menuitem">➡️ Share conversation</button>
+            <button id="chat-menu-archive" class="chat-actions-menu-item" type="button" role="menuitem">🗄 Archive conversation</button>
             <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🔄️ Refresh history</button>
             <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>

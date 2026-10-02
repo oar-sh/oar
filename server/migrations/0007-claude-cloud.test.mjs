@@ -64,7 +64,7 @@ test('a fresh schema carries the columns and the repository statements for them'
   assert.equal(runtime.claude_cloud_cost_usd, 0.25);
   assert.equal(stmts.getConvAnyStatus.get('conv-1').cloud_source_json, '{"repoUrl":"https://github.com/example-org/sample-repo"}');
 
-  const listed = stmts.listConvs.all(0).find((row) => row.id === 'conv-1');
+  const listed = stmts.listConvs.all(0, 0).find((row) => row.id === 'conv-1');
   assert.equal(listed.cloud_source_json, '{"repoUrl":"https://github.com/example-org/sample-repo"}');
   assert.equal(listed.runtime_claude_cloud_cost_usd, 0.25);
 });

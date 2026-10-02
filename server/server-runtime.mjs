@@ -6883,7 +6883,16 @@ function auth(req, res, next) {
 function getOrCreateConversation(id, firstLine) {
   const now = new Date().toISOString();
   stmts.insertConv.run(id, (firstLine || 'Untitled').slice(0, 80), now, now);
-  return stmts.getConv.get(id);
+  const conv = stmts.getConv.get(id);
+  // A message into an archived conversation (an agent's, through a paired
+  // relay, say) brings it back to the live list: its worker starts again
+  // for the delivery, and an archived chat must not work unseen.
+  if (conv && Number(conv.archived || 0) === 1 && typeof stmts.unarchiveConv?.run === 'function') {
+    stmts.unarchiveConv.run(now, id);
+    io.emit('conversation_archived', { conversationId: id, archived: false });
+    return stmts.getConv.get(id);
+  }
+  return conv;
 }
 
 function ensureRuntimeSessionBinding(

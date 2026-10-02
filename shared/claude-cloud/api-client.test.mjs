@@ -745,6 +745,18 @@ test('applyFlagSettings posts the settings as a control request; null for a key 
   assert.equal(calls.length, 1);
 });
 
+test('unarchiveSession posts an empty body; a session that is active already counts as done', async () => {
+  const { client, calls } = setup([
+    json({ session: { id: SESSION_ID, status: 'active' } }),
+    json({ error: { type: 'conflict_error', message: 'session is not archived' } }, 409),
+  ]);
+  assert.deepEqual(await client.unarchiveSession(SESSION_ID), { unarchived: true, alreadyActive: false });
+  assert.equal(calls[0].method, 'POST');
+  assert.equal(calls[0].url, `https://api.anthropic.com/v1/code/sessions/${SESSION_ID}/unarchive`);
+  assert.deepEqual(calls[0].body, {});
+  assert.deepEqual(await client.unarchiveSession(SESSION_ID), { unarchived: true, alreadyActive: true });
+});
+
 test('archiveSession posts an empty body; an archived session counts as done', async () => {
   const { client, calls } = setup([
     json({}),
@@ -1310,7 +1322,7 @@ test('the client offers exactly the calls of the contract', () => {
   assert.deepEqual(Object.keys(client).sort(), [
     'applyFlagSettings', 'archiveSession', 'createSession', 'getAccountUsage', 'getCreditGrantOffer', 'getOrganizationId',
     'getPrepaidCredits', 'getSession', 'listEnvironments', 'listEvents', 'listRepositories', 'openEventStream',
-    'sendControlResponse', 'sendInterrupt', 'sendUserMessage',
+    'sendControlResponse', 'sendInterrupt', 'sendUserMessage', 'unarchiveSession',
   ]);
   for (const call of Object.values(client)) assert.equal(typeof call, 'function');
 });

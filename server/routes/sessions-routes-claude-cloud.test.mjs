@@ -60,6 +60,7 @@ function setup({
   withCloudServices = true,
   claudeSettings = { configured: true, enabled: true, model: 'claude-sonnet-5', models: ['claude-sonnet-5', 'claude-opus-5[1m]', 'claude-opus-5'] },
   archiveSession = async () => {},
+  unarchiveSession = async () => {},
 } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
@@ -89,7 +90,7 @@ function setup({
   });
   const claudeCloudSessionService = createClaudeCloudSessionService({
     stmts,
-    getCloudClient: () => ({ archiveSession }),
+    getCloudClient: () => ({ archiveSession, unarchiveSession }),
     emit,
     logger: { log: (line) => logs.push(line), warn: (line) => logs.push(line) },
   });
@@ -413,9 +414,10 @@ test('archiving a cloud conversation archives its cloud session, best effort', a
   await settle();
   assert.deepEqual(archived, []);
 
+  await call(harness.app, 'POST /api/conversation/:id/unarchive', { params: { id: conversationId } });
   harness.claudeCloudSessionService.recordWorkerReport({ conversationId, cloudSessionId: SESSION_ID });
   const res = await call(harness.app, 'POST /api/conversation/:id/archive', { params: { id: conversationId } });
-  assert.deepEqual(res.body, { ok: true }, 'the cloud failing changes nothing for the user');
+  assert.deepEqual(res.body, { ok: true, workerStopped: false }, 'the cloud failing changes nothing for the user');
   assert.equal(harness.stmts.getConvAnyStatus.get(conversationId).archived, 1);
   await settle();
   await settle();
@@ -452,3 +454,52 @@ test('the context reader offers the folder\'s commit attribution to a cloud chat
   assert.equal(overridden.body.attribution.effectiveMode, 'off');
 });
 
+
+// ---------------------------------------------------------------------------
+// Archive and unarchive
+
+test('archive and unarchive move a conversation between the live list and the archived view', async () => {
+  const unarchived = [];
+  const harness = setup({ unarchiveSession: async (id) => { unarchived.push(id); } });
+  const created = await harness.bootstrap(cloudRequest());
+  const conversationId = created.body.conversationId;
+  const listed = async (mode) => (await call(harness.app, 'GET /api/conversations', { query: mode ? { archived: mode } : {} }))
+    .body.conversations.map((row) => row.id);
+
+  assert.deepEqual(await listed(''), [conversationId]);
+  assert.deepEqual(await listed('only'), []);
+
+  const archived = await call(harness.app, 'POST /api/conversation/:id/archive', { params: { id: conversationId } });
+  assert.equal(archived.statusCode, 200);
+  assert.deepEqual(archived.body, { ok: true, workerStopped: false });
+  assert.deepEqual(harness.emitted.filter(([event]) => event === 'conversation_archived').map(([, payload]) => payload), [
+    { conversationId, archived: true },
+  ]);
+  assert.deepEqual(await listed(''), []);
+  assert.deepEqual(await listed('only'), [conversationId]);
+  assert.deepEqual(await listed('true'), [conversationId]);
+  const again = await call(harness.app, 'POST /api/conversation/:id/archive', { params: { id: conversationId } });
+  assert.deepEqual(again.body, { ok: true, alreadyArchived: true });
+
+  // Back: the live list again; the cloud session is brought back once it exists.
+  const early = await call(harness.app, 'POST /api/conversation/:id/unarchive', { params: { id: conversationId } });
+  assert.deepEqual(early.body, { ok: true });
+  assert.deepEqual(await listed(''), [conversationId]);
+  assert.deepEqual(harness.emitted.filter(([event]) => event === 'conversation_archived').at(-1), [
+    'conversation_archived', { conversationId, archived: false },
+  ]);
+  await settle();
+  assert.deepEqual(unarchived, [], 'no cloud session yet');
+  const live = await call(harness.app, 'POST /api/conversation/:id/unarchive', { params: { id: conversationId } });
+  assert.deepEqual(live.body, { ok: true, alreadyLive: true });
+
+  harness.claudeCloudSessionService.recordWorkerReport({ conversationId, cloudSessionId: SESSION_ID });
+  await call(harness.app, 'POST /api/conversation/:id/archive', { params: { id: conversationId } });
+  await call(harness.app, 'POST /api/conversation/:id/unarchive', { params: { id: conversationId } });
+  await settle();
+  await settle();
+  assert.deepEqual(unarchived, [SESSION_ID]);
+
+  const missing = await call(harness.app, 'POST /api/conversation/:id/unarchive', { params: { id: 'conv-does-not-exist' } });
+  assert.equal(missing.statusCode, 404);
+});
