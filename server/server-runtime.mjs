@@ -6584,6 +6584,8 @@ const sharedRouteDeps = {
   claudeCloudSettingsService,
   claudeCloudSessionService,
   claudeCloudRepoService,
+  // The login's state for the workers' nudge route (never the token).
+  claudeCloudLoginStatus: { describe: () => claudeCloudCredentials.describe() },
   reconcileUnstartedConversationProviders,
   rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,

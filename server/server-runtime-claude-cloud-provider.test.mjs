@@ -123,7 +123,9 @@ test('the cloud services are built once and handed to the routes', () => {
   assert.match(depsSource, /\n  getClaudeCloudProviderSettings,\n  claudeCloudSettingsService,\n  claudeCloudSessionService,\n/);
   assert.match(depsSource, /\n  gitRemoteService,\n/);
   // The client itself is not a route dependency: no route can reach the login.
-  assert.doesNotMatch(depsSource, /claudeCloudClient|claudeCloudCredentials/);
+  // The nudge route gets the reader's `describe` only.
+  assert.doesNotMatch(depsSource.replace(/claudeCloudLoginStatus: \{ describe: \(\) => claudeCloudCredentials\.describe\(\) \},/, ''), /claudeCloudClient|claudeCloudCredentials/);
+  assert.match(depsSource, /claudeCloudLoginStatus: \{ describe: \(\) => claudeCloudCredentials\.describe\(\) \},/);
   assert.match(source, /\nregisterClaudeCloudRoutes\(app, sharedRouteDeps\);\n/);
 });
 

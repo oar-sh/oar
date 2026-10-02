@@ -298,7 +298,7 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 
 - The relay and its cloud workers only **read** the access token. It is sent as the bearer token to `https://api.anthropic.com` and to no other host. (OAR's own tests point the client at a fake API on the same machine; that setting accepts a loopback address and nothing else.)
 - It is held in memory only. It is never written to the database or to a log, never sent to the browser and never put into an error message. Each cloud worker reads the credentials file itself, so nothing is passed along at launch.
-- It is never refreshed by OAR, and the refresh token is never used. The CLI keeps its own login fresh; when the token has run out, the relay reads the file again and at most once in five minutes has the CLI check its own login (`claude auth status`). A login that is still expired ends the turn with a note to log in again.
+- It is never refreshed by OAR, and the refresh token is never used. The CLI keeps its own login fresh; when the token has run out, the relay — and a cloud chat's worker, through the relay — reads the file again and at most once in five minutes has the CLI check its own login (`claude auth status`, which refreshes a login whose refresh token is still good), then retries. A login that is still expired ends the turn with a note to log in again.
 - While the switch is off, the relay asks Anthropic for nothing with this login: it lists no environments and reads no account usage. Only a cloud conversation from before still talks to its session, when you write to it, delete it or archive it.
 - The provider is off by default. Switching it on is the consent for all of the above.
 

@@ -51,6 +51,7 @@ function createHarness({
   listRepositories = async () => ({ repos: [], complete: true, raw: [{}] }),
   execFileImpl = () => { throw new Error('git must not run in this test'); },
   gitBranchLookup = true,
+  loginNudge = null,
 } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
@@ -103,6 +104,7 @@ function createHarness({
       now: () => Date.parse('2026-10-02T11:00:00.000Z'),
       logger: { log() {}, warn() {} },
     }),
+    ...(loginNudge ? { claudeCloudLoginStatus: loginNudge.credentials, claudeAuthService: loginNudge.authService } : {}),
   });
   return { app, stmts, events, touched, authCalls };
 }
@@ -355,4 +357,40 @@ test('the routes are only there when their service is', () => {
   const app = createMockApp();
   registerClaudeCloudRoutes(app, { auth: (_req, _res, next) => next() });
   assert.deepEqual([...app.routes.keys()], []);
+});
+
+// ---------------------------------------------------------------------------
+// Login nudge
+
+test('POST /api/claude-cloud/login-nudge runs the CLI probe and answers what the login file says, never the token', async () => {
+  const probes = [];
+  let expiresAt = '2026-10-02T09:00:00.000Z';
+  const { app } = createHarness({
+    loginNudge: {
+      authService: { getStatus: async (options) => { probes.push(options); expiresAt = '2026-10-02T19:00:00.000Z'; return { ok: true }; } },
+      credentials: { describe: () => ({ source: 'file', hasToken: true, expiresAt, expired: expiresAt < '2026-10-02T11:00:00.000Z', accessToken: TOKEN }) },
+    },
+  });
+  const res = await callRoute(app, 'POST /api/claude-cloud/login-nudge', {});
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, nudged: true, hasToken: true, expiresAt: '2026-10-02T19:00:00.000Z', expired: false });
+  assert.deepEqual(probes, [{ force: true }]);
+  assert.equal(JSON.stringify(res.body).includes(TOKEN), false);
+});
+
+test('a failing probe is no error: the answer says the login was not refreshed', async () => {
+  const { app } = createHarness({
+    loginNudge: {
+      authService: { getStatus: async () => { throw new Error('the CLI is missing'); } },
+      credentials: { describe: () => ({ source: 'file', hasToken: true, expiresAt: '2026-10-02T09:00:00.000Z', expired: true }) },
+    },
+  });
+  const res = await callRoute(app, 'POST /api/claude-cloud/login-nudge', {});
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, nudged: false, hasToken: true, expiresAt: '2026-10-02T09:00:00.000Z', expired: true });
+});
+
+test('without the login status there is no nudge route', async () => {
+  const { app } = createHarness();
+  assert.equal(app.routes.has('POST /api/claude-cloud/login-nudge'), false);
 });

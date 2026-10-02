@@ -20,6 +20,14 @@ All notable changes to OAR are documented here. The format follows
 
 ### Changed
 
+- **Claude Cloud: an expired Claude login is refreshed before a chat gives
+  up.** The Claude CLI's login lasts eight hours and is refreshed only when
+  the CLI runs; a cloud chat used after a quiet night found an expired token
+  and asked you to log in again. The cloud worker now asks the relay to run
+  the CLI's own status probe first (which refreshes a login whose refresh
+  token is still good), reads the login again and retries; the "log in
+  again" note comes only when that did not help. OAR still never uses the
+  refresh token itself.
 - **Check Usage opens at once.** The modal shows the reading it showed last
   time immediately and reads only the open tab's provider live (the card says
   "updating…" meanwhile), instead of fetching every provider and showing a

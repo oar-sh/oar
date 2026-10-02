@@ -68,10 +68,18 @@ async function main() {
 
   // The Claude CLI's login, read by the client's own module (the credentials
   // file, or CLAUDE_CODE_OAUTH_TOKEN where the relay runs on one): this
-  // process never logs it. The base URL is the Anthropic API unless a test
-  // names a fake one on this machine (base-url.mjs takes nothing else).
+  // process never logs it. A login that has run out is nudged through the
+  // relay, which can run the CLI (`claude auth status` refreshes a login
+  // whose refresh token is still good); the file is read again afterwards.
+  // The base URL is the Anthropic API unless a test names a fake one on this
+  // machine (base-url.mjs takes nothing else).
   const cloud = createClaudeCloudClient({
-    credentials: createClaudeCloudCredentials(),
+    credentials: createClaudeCloudCredentials({
+      nudge: async () => {
+        const answer = await api('POST', '/api/claude-cloud/login-nudge', {});
+        dbg('login nudge', answer?.nudged ? 'ran' : 'skipped', answer?.expired ? 'still expired' : `expires ${answer?.expiresAt || '?'}`);
+      },
+    }),
     baseUrl: resolveClaudeCloudBaseUrl(process.env),
   });
 
