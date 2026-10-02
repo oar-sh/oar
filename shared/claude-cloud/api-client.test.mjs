@@ -757,6 +757,23 @@ test('unarchiveSession posts an empty body; a session that is active already cou
   assert.deepEqual(await client.unarchiveSession(SESSION_ID), { unarchived: true, alreadyActive: true });
 });
 
+test('setModel posts a set_model control request with the plain model id', async () => {
+  const { client, calls } = setup([json({ results: [{ event_id: 'evt_01EXAMPLE0016', sequence_num: '16', duplicate: false }] })]);
+  const sent = await client.setModel(SESSION_ID, 'claude-opus-5-5[1m]');
+  const [event] = calls[0].body.events;
+  assert.equal(event.event_type, 'control_request');
+  assert.deepEqual({ ...event.payload, uuid: null, request_id: null }, {
+    uuid: null,
+    session_id: SESSION_ID,
+    type: 'control_request',
+    request_id: null,
+    request: { subtype: 'set_model', model: 'claude-opus-5-5' },
+  });
+  assert.deepEqual(sent, { eventId: 'evt_01EXAMPLE0016', sequence: '16', duplicate: false, requestId: event.payload.request_id, model: 'claude-opus-5-5' });
+  await assert.rejects(client.setModel(SESSION_ID, ''), { code: 'bad_request' });
+  assert.equal(calls.length, 1);
+});
+
 test('archiveSession posts an empty body; an archived session counts as done', async () => {
   const { client, calls } = setup([
     json({}),
@@ -1322,7 +1339,7 @@ test('the client offers exactly the calls of the contract', () => {
   assert.deepEqual(Object.keys(client).sort(), [
     'applyFlagSettings', 'archiveSession', 'createSession', 'getAccountUsage', 'getCreditGrantOffer', 'getOrganizationId',
     'getPrepaidCredits', 'getSession', 'listEnvironments', 'listEvents', 'listRepositories', 'openEventStream',
-    'sendControlResponse', 'sendInterrupt', 'sendUserMessage', 'unarchiveSession',
+    'sendControlResponse', 'sendInterrupt', 'sendUserMessage', 'setModel', 'unarchiveSession',
   ]);
   for (const call of Object.values(client)) assert.equal(typeof call, 'function');
 });

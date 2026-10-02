@@ -573,6 +573,18 @@ export async function startFakeClaudeCloudApi({
         results.push({ event_id: event.event_id, sequence_num: event.sequence_num, duplicate });
         continue;
       }
+      if (eventType === "control_request" && payload?.type === "control_request" && payload?.request?.subtype === "set_model") {
+        // The sandbox takes the model for the turns to come and re-initialises.
+        const event = appendEvent(session, { source: "client", eventType, payload });
+        session.model = String(payload.request.model || session.model);
+        appendEvent(session, {
+          source: "worker",
+          eventType: "control_response",
+          payload: { type: "control_response", uuid: randomUUID(), response: { subtype: "success", request_id: String(payload?.request_id || "") } },
+        });
+        results.push({ event_id: event.event_id, sequence_num: event.sequence_num, duplicate: false });
+        continue;
+      }
       if (eventType === "control_request" && isFlagSettingsRequest(payload)) {
         const event = acceptFlagSettings(session, payload);
         results.push({ event_id: event.event_id, sequence_num: event.sequence_num, duplicate: false });

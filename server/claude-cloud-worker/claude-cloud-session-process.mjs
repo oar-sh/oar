@@ -199,6 +199,8 @@ export function createClaudeCloudSessionRunner({
   //   sandbox (null: Claude Code's own); undefined while it does not know
   //   what the sandbox has, as after a worker restart.
   // - `attributionRequestId`: the request whose answer is still to come.
+  // - `model`: the model this process last gave the sandbox (the create's,
+  //   or a later set_model); undefined while it does not know.
   let session = null;
   let turn = null;
   let stream = null;
@@ -236,6 +238,7 @@ export function createClaudeCloudSessionRunner({
       unfinishedTurns: 0,
       attribution: undefined,
       attributionRequestId: null,
+      model: undefined,
     };
   }
 
@@ -868,6 +871,27 @@ export function createClaudeCloudSessionRunner({
     }
   }
 
+  /**
+   * Before a message goes into a session that exists: switch the sandbox's
+   * model when the conversation's model is not the one this process last
+   * gave it (a `set_model` control request; the sandbox re-initialises with
+   * the new model and the next turn runs on it). A request the API refuses
+   * outright costs the switch, not the turn.
+   */
+  async function applyModel(t) {
+    const model = String(t.model || '').trim();
+    if (!model) return;
+    if (session.model !== undefined && session.model === model) return;
+    try {
+      await cloud.setModel(session.id, model);
+      session.model = model;
+    } catch (error) {
+      if (String(error?.code || '').trim() !== 'bad_request') throw error;
+      dbg('cloud set_model refused', error?.message || String(error));
+      await publisher.postActivity(t.message, `Cloud: the model could not be switched to ${model}; the turn runs on the session's model.`);
+    }
+  }
+
   /** Put the delivered message into the cloud session, unless it is there already. */
   async function startCloudTurn(t, binding, content) {
     const message = t.message;
@@ -900,6 +924,7 @@ export function createClaudeCloudSessionRunner({
       session.sent.set(t.uuid, 0);
       // A new sandbox without the setting writes Claude Code's own lines.
       session.attribution = t.attribution ?? null;
+      session.model = t.model;
       session.attributionRequestId = String(created?.flagSettingsRequestId || '').trim() || null;
       await reportSession(message, t.model ? { model: t.model } : {});
       return;
@@ -940,6 +965,7 @@ export function createClaudeCloudSessionRunner({
     let alreadyInSession = false;
     await enqueue(async () => {
       await applyAttribution(t);
+      await applyModel(t);
       const sent = await cloud.sendUserMessage(session.id, content, { uuid: t.uuid });
       const sequence = toCloudSequence(sent?.sequence);
       // No event is handled while the message is posted, so a new message is

@@ -536,6 +536,26 @@ export function createClaudeCloudClient({
     return { ...sent, requestId: payload.request_id };
   }
 
+  /**
+   * Switch the model of the sandbox's Claude Code for the turns to come: a
+   * `set_model` control request, answered on the event stream like
+   * applyFlagSettings (the sandbox re-initialises with the new model).
+   */
+  async function setModel(id, model) {
+    const routeId = String(id ?? '').trim();
+    const plainModel = stripModelTierSuffix(model);
+    if (!plainModel) throw failure('bad_request', { message: 'A model for the cloud session is required.' });
+    const payload = {
+      uuid: randomUUID(),
+      session_id: routeId,
+      type: 'control_request',
+      request_id: randomUUID(),
+      request: { subtype: 'set_model', model: plainModel },
+    };
+    const sent = await postEvent(routeId, 'control_request', payload);
+    return { ...sent, requestId: payload.request_id, model: plainModel };
+  }
+
   /** Archive the session. One that is archived already counts as done. */
   async function archiveSession(id) {
     const { status } = await request('POST', sessionPath(id, '/archive'), { body: {}, okStatuses: [409] });
@@ -777,6 +797,7 @@ export function createClaudeCloudClient({
     sendControlResponse,
     sendInterrupt,
     applyFlagSettings,
+    setModel,
     archiveSession,
     unarchiveSession,
     getAccountUsage,

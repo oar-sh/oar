@@ -1221,30 +1221,11 @@ function currentGrokModelLock() {
   };
 }
 
-// A cloud session is created with its model and nothing can change it
-// afterwards (follow-up messages carry no model), so the picker is pinned from
-// the first message on rather than offering a switch that would do nothing.
-function currentClaudeCloudModelLock() {
-  const conversation = currentConvId ? conversations[currentConvId] : null;
-  const providerType = String(
-    conversation?.runtimeProviderType
-    || conversation?.runtime_provider_type
-    || '',
-  ).trim().toLowerCase();
-  if (providerType !== CLAUDE_CLOUD_PROVIDER || !currentConversationHasMessages()) return null;
-  return {
-    model: String(
-      conversation?.runtimeProviderModel
-      || conversation?.runtime_provider_model
-      || conversation?.runtimeModel
-      || conversation?.runtime_model
-      || '',
-    ).trim(),
-  };
-}
-
+// A cloud session's model is switched between turns like a local Claude
+// chat's (the worker sends set_model before the message), so there is no
+// cloud lock on the picker.
 function currentRuntimeModelLock() {
-  return currentOpenAIModelLock() || currentGrokModelLock() || currentClaudeCloudModelLock();
+  return currentOpenAIModelLock() || currentGrokModelLock();
 }
 
 // The runtime model decides the OpenAI/OpenAI Image distinction. Before the

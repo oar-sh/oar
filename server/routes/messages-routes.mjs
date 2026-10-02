@@ -4475,18 +4475,10 @@ export function registerMessagesRoutes(app, deps) {
         supportedModels: claudeCloudModelSelection.availableModels || [],
       });
     }
+    // A cloud session's model can be switched between turns (the worker
+    // sends set_model before the message), so a changed model is taken as
+    // for a local Claude chat.
     const claudeCloudModel = claudeCloudModelSelection ? claudeCloudModelSelection.model : '';
-    if (
-      runtimeUsesClaudeCloud
-      && String(existingRuntimeSession?.claude_cloud_session_id || '').trim()
-      && pinnedClaudeCloudModel
-      && claudeCloudModel.toLowerCase() !== pinnedClaudeCloudModel.toLowerCase()
-    ) {
-      return res.status(409).json({
-        error: 'Claude Cloud model switching requires creating a new Claude Cloud conversation',
-        code: 'CLAUDE_CLOUD_MODEL_REQUIRES_NEW_CONVERSATION',
-      });
-    }
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -4863,8 +4855,8 @@ export function registerMessagesRoutes(app, deps) {
       ) {
         stmts.updateRuntimeSessionProvider.run('claude', claudeModel, claudeModel, now, runtimeSession.id);
       }
-      // A cloud conversation whose session does not exist yet follows the
-      // composer too (afterwards the model is locked, see above).
+      // A cloud conversation follows the composer like a Claude one: the
+      // worker switches the sandbox's model before the message.
       if (
         runtimeUsesClaudeCloud
         && claudeCloudModel

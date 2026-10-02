@@ -186,19 +186,19 @@ test('a model the cloud does not offer is refused with the list', async () => {
   assert.deepEqual(body.supportedModels, ['claude-sonnet-5-5', 'claude-opus-5']);
 });
 
-test('the model can change until the cloud session exists, and is locked afterwards', async () => {
+test('the model can change before and after the cloud session exists; the runtime session follows', async () => {
   const { stmts } = makeDb();
   seedConversation(stmts);
   const before = await send(messageDeps(stmts), { conversationId: 'conv-cloud', model: 'claude-opus-5' });
   assert.equal(before.body?.code, undefined);
   assert.equal(before.status, 404);
 
+  // With a session: the worker switches the sandbox before the message, so
+  // the relay takes the change as for a local Claude chat (no 409).
   stmts.updateRuntimeSessionClaudeCloudSession.run(SESSION_ID, '4', null, NOW, 'conv-cloud');
   const after = await send(messageDeps(stmts), { conversationId: 'conv-cloud', model: 'claude-opus-5' });
-  assert.equal(after.status, 409);
-  assert.equal(after.body.code, 'CLAUDE_CLOUD_MODEL_REQUIRES_NEW_CONVERSATION');
-  const same = await send(messageDeps(stmts), { conversationId: 'conv-cloud', model: 'claude-sonnet-5-5' });
-  assert.equal(same.status, 404);
+  assert.equal(after.body?.code, undefined);
+  assert.equal(after.status, before.status);
 });
 
 // ─── worker report routes ────────────────────────────────────────────────────

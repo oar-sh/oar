@@ -112,6 +112,10 @@ export function makeCloud({
       record('sendInterrupt', { id });
       return { requestId: 'interrupt-request-1' };
     },
+    async setModel(id, model) {
+      record('setModel', { id, model });
+      return { eventId: null, sequence: null, duplicate: false, requestId: `set-model-request-${calls.filter((call) => call.op === 'setModel').length}`, model };
+    },
     async applyFlagSettings(id, settings) {
       record('applyFlagSettings', { id, settings });
       return { eventId: null, sequence: null, duplicate: false, requestId: `flag-settings-request-${calls.filter((call) => call.op === 'applyFlagSettings').length}` };

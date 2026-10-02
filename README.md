@@ -287,7 +287,7 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 
 **What does not.**
 
-- No relay modes, no reasoning effort and no context size: the three selectors are hidden. Choose the model in **New Chat**: the picker is locked from the first message on
+- No relay modes, no reasoning effort and no context size: the three selectors are hidden. The model is chosen in **New Chat** and can be changed between turns in the composer like a local Claude chat's (the sandbox switches before the next message)
 - No mid-turn steering: a message sent during a turn waits for the turn to end
 - Nothing from the relay host reaches the sandbox: attachments other than images are refused, there is no working directory to change and no **Session** folder to browse
 - No relay tools inside the sandbox: no `preview`, no `remote_relay`, no media embedded by host path

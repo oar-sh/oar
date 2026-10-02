@@ -20,6 +20,10 @@ All notable changes to OAR are documented here. The format follows
 
 ### Changed
 
+- **Claude Cloud: the model can be changed between turns.** The composer's
+  model picker is no longer locked once a cloud chat has started; a change
+  reaches the sandbox before the next message (Claude Code there switches
+  and re-initialises on the new model), as in a local Claude chat.
 - **Claude Cloud: an expired Claude login is refreshed before a chat gives
   up.** The Claude CLI's login lasts eight hours and is refreshed only when
   the CLI runs; a cloud chat used after a quiet night found an expired token

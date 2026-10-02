@@ -1320,3 +1320,61 @@ test('a failed turn without a rejected report is an ordinary failure', async () 
   assert.notEqual(response.terminalError?.kind, 'claude-usage-limit');
   await runner.dispose();
 });
+
+// ---------------------------------------------------------------------------
+// Model switching
+
+test('a follow-up with another model switches the sandbox before the message; the same model again does not', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12, 22, 32] });
+  const { runner } = makeRunner({ api, cloud });
+
+  await runDelivery({ runner, cloud, api }, { message: relayMessage() }, [turnResult(4, { result: 'Done.' })]);
+  assert.equal(cloud.callsOf('createSession')[0].args.model, MODEL);
+
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Again, but on Opus', providerModel: 'claude-opus-5-5[1m]', ...boundTo('4') }),
+  }, [turnResult(13, { result: 'On Opus.' })]);
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-3', attemptId: 'attempt-3', text: 'Still Opus', providerModel: 'claude-opus-5-5', ...boundTo('13') }),
+  }, [turnResult(23, { result: 'Still on Opus.' })]);
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-4', attemptId: 'attempt-4', text: 'Back', providerModel: MODEL, ...boundTo('23') }),
+  }, [turnResult(33, { result: 'Back.' })]);
+
+  assert.deepEqual(cloud.callsOf('setModel').map((call) => [call.id, call.model]), [
+    [SESSION_ID, 'claude-opus-5-5'],
+    [SESSION_ID, MODEL],
+  ]);
+  const order = cloud.calls.filter((call) => call.op === 'setModel' || call.op === 'sendUserMessage').map((call) => call.op);
+  assert.deepEqual(order, ['setModel', 'sendUserMessage', 'sendUserMessage', 'setModel', 'sendUserMessage']);
+  // The reply's model follows the switch.
+  assert.deepEqual(api.posts('/api/claude-cloud-session').filter((body) => body.model).map((body) => body.model).slice(-3), ['claude-opus-5-5', 'claude-opus-5-5', MODEL]);
+  await runner.dispose();
+});
+
+test("a worker that does not know the sandbox's model sends it once", async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12, 16] });
+  const { runner } = makeRunner({ api, cloud });
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Hello', ...boundTo('9') }),
+  }, [turnResult(13, { result: 'Hi.' })]);
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-3', attemptId: 'attempt-3', text: 'Again', ...boundTo('13') }),
+  }, [turnResult(17, { result: 'Hi again.' })]);
+  assert.deepEqual(cloud.callsOf('setModel').map((call) => call.model), [MODEL]);
+  await runner.dispose();
+});
+
+test('a set_model the API refuses costs the switch, not the turn', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [12], failures: { setModel: cloudError('bad_request', 'Claude Cloud refused the request (HTTP 400).') } });
+  const { runner } = makeRunner({ api, cloud });
+  await runDelivery({ runner, cloud, api }, {
+    message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Hello', providerModel: 'claude-opus-5-5', ...boundTo('9') }),
+  }, [turnResult(13, { result: 'Hi.' })]);
+  assert.equal(api.posts('/api/response')[0].terminalError ?? null, null);
+  assert.ok(activityTexts(api).some((text) => /model could not be switched to claude-opus-5-5/.test(text)));
+  await runner.dispose();
+});

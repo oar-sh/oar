@@ -44,13 +44,14 @@ test('a cloud conversation resolves to its own provider scope, not to Copilot', 
   assert.equal(normalize('something-new'), 'github');
 });
 
-test('a cloud conversation gets the one effort "none", a pinned model and no catalog prices', () => {
+test('a cloud conversation gets the one effort "none", a switchable model and no catalog prices', () => {
   const reasoningSource = sliceBetween('function reasoningOptionsForModel(', '\nfunction reasoningProviderKey(');
   // Not an empty list: the send path refuses a message without an effort, so
   // an empty (hidden) select made every cloud message unsendable.
   assert.match(reasoningSource, /if \(provider === CLAUDE_CLOUD_PROVIDER\) return \['none'\];/);
+  // The model of a cloud chat is switched between turns (set_model): no lock.
   const lockSource = sliceBetween('function currentRuntimeModelLock() {', '\n// The runtime model decides');
-  assert.match(lockSource, /currentClaudeCloudModelLock\(\)/);
+  assert.doesNotMatch(lockSource, /ClaudeCloud/);
   const optionsSource = sliceBetween('function buildModelSelectorOptions(', '\nfunction reasoningOptionsForModel(');
   assert.match(optionsSource, /=== CLAUDE_CLOUD_PROVIDER\) \{\s+return buildClaudeCloudModelSelectorOptions\(/);
   const pricingSource = sliceBetween('function updateModelPricingDetails(', '\n// Relay modes each provider');
