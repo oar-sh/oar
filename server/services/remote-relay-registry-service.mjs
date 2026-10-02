@@ -3,6 +3,7 @@
 import { randomUUID as nodeRandomUUID } from 'crypto';
 
 import {
+  AGENT_SESSIONS_SOCKET_EVENT,
   REMOTE_RELAY_LIMITS,
   REMOTE_RELAY_PERMISSIONS,
   REMOTE_RELAY_PROTOCOL,
@@ -11,6 +12,7 @@ import {
   REMOTE_RELAY_ERROR_CODES,
   checkRemoteRelayUrlPolicy,
   normalizeRemoteRelayLink,
+  normalizeRemoteRelayMaxWaitSeconds,
   normalizeRemoteRelayPermission,
 } from '../../shared/remote-relay-contract.mjs';
 import { remoteRelayAliases } from '../../shared/remote-relay-mentions.mjs';
@@ -23,6 +25,9 @@ import { remoteRelayAliases } from '../../shared/remote-relay-mentions.mjs';
 //   remote_relays                the entries, tokens included
 //   relay_public_url             how other relays reach this one
 //   remote_relay_inbound_enabled accept prompts from other relays' agents
+//   agent_sessions_enabled       this relay's own agents may start and use
+//                                sessions on it (the local target; off by default)
+//   remote_relay_max_wait_seconds the longest wait of one remote_relay call
 //
 // Tokens never leave through listPublic(), the socket event or any route; only
 // the outbound client reads them (list()/get()/resolve() are server-internal).
@@ -258,6 +263,51 @@ export function createRemoteRelayRegistry({
     if (input.inboundEnabled !== undefined) writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.inboundEnabled, input.inboundEnabled);
     emitChange();
     return { ok: true, ...getSelfSettings() };
+  }
+
+  // ─── Agent sessions ────────────────────────────────────────────────────────
+
+  /** The payload of GET /api/settings/agent-sessions and of the socket event. */
+  function getAgentSessionsSettings() {
+    const enabled = readJsonSetting(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled);
+    return {
+      enabled: enabled === true || enabled === 1 || ['true', '1', 'on'].includes(toText(enabled).toLowerCase()),
+      maxWaitSeconds: normalizeRemoteRelayMaxWaitSeconds(readJsonSetting(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds)),
+      limits: {
+        minWaitSeconds: REMOTE_RELAY_LIMITS.waitMaxFloorSeconds,
+        maxWaitSeconds: REMOTE_RELAY_LIMITS.waitMaxCeilingSeconds,
+        stepSeconds: REMOTE_RELAY_LIMITS.waitMaxStepSeconds,
+      },
+      maxActiveSessions: REMOTE_RELAY_LIMITS.localActiveSessions,
+    };
+  }
+
+  /**
+   * `{ enabled?, maxWaitSeconds? }`. Nothing is rounded or clamped here: a
+   * value outside the range, or off the slider's step, is refused, so what the
+   * settings page shows is what was stored.
+   */
+  function setAgentSessionsSettings(patch = {}) {
+    const input = patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+    if (input.enabled !== undefined && typeof input.enabled !== 'boolean') {
+      return invalid('enabled must be true or false');
+    }
+    if (input.maxWaitSeconds !== undefined) {
+      const { waitMaxFloorSeconds: min, waitMaxCeilingSeconds: max, waitMaxStepSeconds: step } = REMOTE_RELAY_LIMITS;
+      const seconds = input.maxWaitSeconds;
+      if (typeof seconds !== 'number' || !Number.isInteger(seconds) || seconds < min || seconds > max || seconds % step !== 0) {
+        return invalid(`maxWaitSeconds must be a whole number of seconds from ${min} to ${max}, in steps of ${step}`);
+      }
+    }
+    if (input.enabled !== undefined) writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled, input.enabled);
+    if (input.maxWaitSeconds !== undefined) writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds, input.maxWaitSeconds);
+    const settings = getAgentSessionsSettings();
+    try {
+      emit(AGENT_SESSIONS_SOCKET_EVENT, settings);
+    } catch (error) {
+      logger?.warn?.(`[remote-relays] agent sessions event failed: ${error?.message || error}`);
+    }
+    return { ok: true, ...settings };
   }
 
   // ─── Remote relays ─────────────────────────────────────────────────────────
@@ -562,6 +612,8 @@ export function createRemoteRelayRegistry({
     selfIdentity,
     getSelfSettings,
     setSelfSettings,
+    getAgentSessionsSettings,
+    setAgentSessionsSettings,
     list,
     listPublic,
     get,

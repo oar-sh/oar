@@ -124,7 +124,7 @@ Claude-only, and the type is listed where it needs the same treatment
 | Surface | Status | Notes / evidence |
 | ------- | ------ | ---------------- |
 | Listed as a provider | Implemented | `REMOTE_RELAY_PROVIDERS` and the dispatcher's `SETTINGS_PROVIDERS` include it; the provider list names it without efforts and with a note (`CLOUD_CREATE_NOTE`). |
-| `create_session` | Not implemented | The tool has no field for the repository, so the dispatcher refuses the provider with a message telling the agent to ask the user to open the chat from New Chat (`remote-relay-dispatcher.mjs`). Existing cloud sessions take `send`, `wait`, `read_session` and `stop`. |
+| `create_session` | Implemented (2026-10-02) | `repo` (a GitHub URL or `owner/repo`, canonicalised by `normalizeRemoteRelayRepo`) and an optional `branch` (`isValidBranchName`) in the tool schema; `validateRemoteRelayToolInput` requires `repo` with `provider: "claude-cloud"`, refuses `cwd` with it, and refuses `repo`/`branch` with any other provider. The dispatcher's `createSession` posts them as `cloudSource: { repoUrl, branch? }` to `POST /api/conversation/bootstrap`, which applies New Chat's checks and codes (a provider that is off comes back as `REMOTE_RELAY_PROVIDER_UNAVAILABLE` with `remoteCode: claude_cloud_disabled`). No model and no effort are mirrored from the caller: without `model` the bootstrap takes the tab's default. A caller that is itself a cloud session and names neither provider nor `repo` is refused before any approval card (`createSessionProblem`). The result carries `repo` and `branch`. Works on a paired relay and, with agent sessions on, on this relay itself (see the "Agent sessions" row in [README.md](README.md)). Existing cloud sessions take `send`, `wait`, `read_session` and `stop`. |
 
 ## Not wired
 
@@ -132,7 +132,7 @@ Claude-only, and the type is listed where it needs the same treatment
 | ------- | ------ | ----- |
 | Renaming the cloud session | Not implemented | The session is created with the conversation's title at that moment; later title changes are not mirrored. |
 | Creating environments | Not implemented | The tab lists the account's environments and picks the first active one; none is created from the relay. |
-| A `cloud_session` tool for local agents | Not implemented | No agent-facing tool starts cloud sessions. |
+| A `cloud_session` tool for local agents | Not implemented, superseded | There is no tool of its own: an agent starts a cloud session with `remote_relay` `create_session` on this relay or a paired one (see [Remote relays](#remote-relays)). |
 | A live check against the real API | Not implemented | No script in the repository talks to Anthropic; a live cloud turn is a manual test and costs money. |
 
 ## Tests
@@ -158,3 +158,6 @@ Claude-only, and the type is listed where it needs the same treatment
   env file. Skipped on Windows (it isolates its workers in a tmux server of its own). The shared
   e2e relay (`tests/relay-server-harness.mjs`) pins the base URL to a loopback port nothing
   listens on and clears the token, so no other spec can reach Anthropic.
+  `tests/agent-sessions.spec.mjs` uses the same fake for a cloud session an agent creates through
+  `remote_relay` (`repo`, `branch`, the tab's default model, the local origin, no nesting); the
+  paired-relay path is covered by `remote-relay-dispatcher.test.mjs`.

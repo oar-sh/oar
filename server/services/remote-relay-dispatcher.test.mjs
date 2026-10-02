@@ -395,12 +395,30 @@ function setup({
   remote = createFakeRemote(),
   getCallerContext,
   resolveConversationId,
+  // This relay's own API, as the loopback client reaches it (the local target).
+  local = createFakeRemote(),
+  // `{ enabled, maxWaitSeconds }` (null: a relay that never saved the settings).
+  agentSessions = null,
+  // Conversations (by id) whose agent the user already allowed to start sessions here.
+  localApproved = [],
+  withLocalClient = true,
 } = {}) {
   const unlocks = new Set(unlocked.map((relayId) => `c-1:${relayId}`));
+  const approvedLocal = new Set(localApproved);
   const repository = {
     hasUnlock: (conversationId, relayId) => unlocks.has(`${conversationId}:${relayId}`),
     hasContactFrom: (conversationId, instanceId) => conversationId === 'c-1' && contacts.includes(instanceId),
     latestHumanMessageId: () => humans.latest,
+    // The local target's storage, read off the fake of this relay's own API.
+    getConversationOrigin: (conversationId) => local.conversations.get(conversationId)?.origin || null,
+    listActiveLocalSessions: (conversationId) => [...local.conversations.values()]
+      .filter((conv) => conv.origin?.local === true && conv.origin.conversationId === conversationId && conv.activeTurn === true)
+      .map((conv) => conv.id),
+    hasLocalSessionApproval: (conversationId) => approvedLocal.has(conversationId),
+    recordLocalSessionApproval: (conversationId) => {
+      approvedLocal.add(conversationId);
+      return true;
+    },
   };
   const logs = [];
   const events = [];
@@ -411,6 +429,8 @@ function setup({
   const dispatcher = createRemoteRelayDispatcher({
     registry: createRegistry(relays),
     client: { request: (...args) => remote.request(...args) },
+    ...(withLocalClient ? { localClient: { request: (...args) => local.request(...args) } } : {}),
+    getAgentSessionsSettings: () => agentSessions,
     repository,
     getCallerContext: getCallerContext || (async (conversationId) => ({
       conversationId,
@@ -439,7 +459,7 @@ function setup({
     ...(resolveConversationId ? { resolveConversationId } : {}),
   });
   const run = (action, args = {}, conversationId = 'c-1') => dispatcher.dispatch({ conversationId, action, args });
-  return { remote, dispatcher, run, logs, events, approvals, sleeps, clock, unlocks };
+  return { remote, local, dispatcher, run, logs, events, approvals, sleeps, clock, unlocks, approvedLocal };
 }
 
 function withSession(remote, overrides = {}) {
@@ -1760,7 +1780,8 @@ test('relay_info lists Claude Cloud when the remote has it switched on, without 
   assert.equal(cloud.defaultModel, 'claude-sonnet-5-5');
   assert.deepEqual(cloud.models, ['claude-sonnet-5-5', 'claude-sonnet-5']);
   assert.equal('efforts' in cloud, false);
-  assert.match(cloud.note, /create_session cannot open a Claude Cloud session yet/);
+  assert.match(cloud.note, /create_session needs repo/);
+  assert.match(cloud.note, /self-contained prompt and name the branch/);
   assert.equal(JSON.stringify(cloud).includes('env_01EXAMPLE'), false, 'the environment stays on its relay');
 
   remote.settings['claude-cloud'] = { enabled: false, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
@@ -1773,17 +1794,106 @@ test('relay_info lists Claude Cloud when the remote has it switched on, without 
   });
 });
 
-test('create_session refuses Claude Cloud: it has no repository to pass, and nothing is created', async () => {
+test('create_session opens a Claude Cloud session on a paired relay from repo and branch', async () => {
+  const { run, remote } = setup({ caller: { model: 'claude-sonnet-5', effort: 'high' } });
+  remote.settings['claude-cloud'] = { enabled: true, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5', 'claude-sonnet-5'] };
+  const result = await run('create_session', {
+    relay: 'linux-test',
+    text: PROMPT,
+    provider: 'claude-cloud',
+    repo: 'example-org/sample-repo',
+    branch: 'feature/banner',
+    wait_seconds: 0,
+  });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const [bootstrap] = remote.callsTo('POST', '/api/conversation/bootstrap');
+  assert.equal(bootstrap.body.providerType, 'claude-cloud');
+  assert.deepEqual(bootstrap.body.cloudSource, { repoUrl: 'https://github.com/example-org/sample-repo', branch: 'feature/banner' });
+  // What New Chat does: the tab's default model unless one is asked for, and no effort.
+  assert.equal('model' in bootstrap.body, false, 'this session\'s model is not mirrored into the cloud');
+  assert.equal('reasoningEffort' in bootstrap.body, false);
+  assert.equal('cwd' in bootstrap.body, false);
+  assert.equal(bootstrap.body.origin.relayName, 'win-test');
+  assert.equal('local' in bootstrap.body.origin, false, 'a paired relay is told nothing is local');
+  assert.equal(bootstrap.hops, 1);
+  assert.equal(result.body.provider, 'claude-cloud');
+  assert.equal(result.body.repo, 'https://github.com/example-org/sample-repo');
+  assert.equal(result.body.branch, 'feature/banner');
+  assert.equal(result.body.modelSource, 'remote default');
+  assert.equal('effort' in result.body, false);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 1);
+
+  const asked = await run('create_session', {
+    relay: 'linux-test', text: PROMPT, provider: 'claude-cloud', repo: 'example-org/sample-repo', model: 'claude-sonnet-5', wait_seconds: 0,
+  });
+  const second = remote.callsTo('POST', '/api/conversation/bootstrap')[1];
+  assert.equal(second.body.model, 'claude-sonnet-5');
+  assert.deepEqual(second.body.cloudSource, { repoUrl: 'https://github.com/example-org/sample-repo' }, 'no branch: the default one');
+  assert.equal(asked.body.modelSource, 'requested');
+  assert.equal(asked.body.branch, null);
+});
+
+test('create_session for Claude Cloud needs repo, takes it with that provider alone, and nothing is created otherwise', async () => {
   const { run, remote } = setup();
   remote.settings['claude-cloud'] = { enabled: true, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
-  const result = await run('create_session', { relay: 'linux-test', text: PROMPT, provider: 'claude-cloud' });
-  assert.equal(result.status, 400);
-  assert.equal(result.body.ok, false);
-  assert.equal(result.body.code, CODES.invalidInput);
-  assert.match(result.body.error, /clones a GitHub repository/);
-  assert.match(result.body.error, /New Chat on relay "linux-test"/);
-  assert.deepEqual(result.body.providers, ['github', 'openai', 'claude']);
+  const noRepo = await run('create_session', { relay: 'linux-test', text: PROMPT, provider: 'claude-cloud' });
+  assert.equal(noRepo.status, 400);
+  assert.equal(noRepo.body.code, CODES.invalidInput);
+  assert.match(noRepo.body.error, /needs repo/);
+  const wrongProvider = await run('create_session', { relay: 'linux-test', text: PROMPT, provider: 'claude', repo: 'example-org/sample-repo' });
+  assert.equal(wrongProvider.status, 400);
+  assert.match(wrongProvider.body.error, /provider "claude-cloud" only/);
+  const badBranch = await run('create_session', { relay: 'linux-test', text: PROMPT, provider: 'claude-cloud', repo: 'example-org/sample-repo', branch: 'no good' });
+  assert.equal(badBranch.status, 400);
+  assert.match(badBranch.body.error, /not a valid branch name/);
+  assert.equal(remote.calls.length, 0, 'refused before the relay is asked anything');
+
+  // A cloud session that names no provider would get its own: repo is asked for then.
+  const cloudCaller = setup({ caller: { provider: 'claude-cloud' } });
+  cloudCaller.remote.settings['claude-cloud'] = { enabled: true, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
+  const inherited = await cloudCaller.run('create_session', { relay: 'linux-test', text: PROMPT });
+  assert.equal(inherited.status, 400);
+  assert.equal(inherited.body.code, CODES.invalidInput);
+  assert.match(inherited.body.error, /This session's provider is claude-cloud/);
+  assert.equal(cloudCaller.remote.calls.length, 0);
+
+  // The user is not asked to approve a call that cannot run: not in ask mode,
+  // and not with the once-per-conversation card of this relay.
+  for (const relay of ['linux-test', 'this']) {
+    const asking = setup({ caller: { provider: 'claude-cloud', mode: 'ask' }, agentSessions: { enabled: true, maxWaitSeconds: 600 } });
+    const refused = await asking.run('create_session', { relay, text: PROMPT });
+    assert.equal(refused.status, 400, relay);
+    assert.match(refused.body.error, /This session's provider is claude-cloud/);
+    assert.equal(asking.approvals.length, 0, relay);
+    assert.equal(asking.approvedLocal.size, 0);
+  }
+});
+
+test('create_session for Claude Cloud says when the provider is off there, and passes the bootstrap\'s own refusals on', async () => {
+  const { run, remote } = setup();
+  const args = { relay: 'linux-test', text: PROMPT, provider: 'claude-cloud', repo: 'example-org/sample-repo' };
+  // A relay that predates the provider: no settings route.
+  const absent = await run('create_session', args);
+  assert.equal(absent.body.code, CODES.providerUnavailable);
+  assert.equal('remoteCode' in absent.body, false);
+  // Switched off: the code New Chat's bootstrap would answer with.
+  remote.settings['claude-cloud'] = { enabled: false, defaultModel: 'claude-sonnet-5-5', models: [] };
+  const off = await run('create_session', args);
+  assert.equal(off.status, 400);
+  assert.equal(off.body.code, CODES.providerUnavailable);
+  assert.equal(off.body.remoteCode, 'claude_cloud_disabled');
   assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  // No environment set: the bootstrap's refusal, with its code.
+  remote.settings['claude-cloud'] = { enabled: true, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
+  remote.fail('POST', '/api/conversation/bootstrap', remoteError(`${CODES.httpPrefix}400`, 'Relay "linux-test" answered HTTP 400: No cloud environment is set.', 400, {
+    ok: false,
+    code: 'claude_cloud_environment_missing',
+    error: 'No cloud environment is set.',
+  }));
+  const noEnvironment = await run('create_session', args);
+  assert.equal(noEnvironment.status, 400);
+  assert.equal(noEnvironment.body.remoteCode, 'claude_cloud_environment_missing');
+  assert.match(noEnvironment.body.error, /No cloud environment is set/);
   assert.equal(remote.callsTo('POST', '/api/message').length, 0);
 });
 
@@ -2156,4 +2266,498 @@ test('write actions log one line and one status event each; prompt text never ap
   const recorded = JSON.stringify({ logs, events });
   assert.ok(!recorded.includes('rebuild'), 'no prompt text');
   assert.ok(!recorded.includes('Rebuilt'), 'no reply text');
+});
+
+// ─── The local target: sessions on this relay itself ────────────────────────
+
+const AGENT_SESSIONS_ON = Object.freeze({ enabled: true, maxWaitSeconds: 600 });
+
+/** A setup with the local target on and no paired relay unlocked (it needs none). */
+function setupLocal(options = {}) {
+  return setup({ agentSessions: AGENT_SESSIONS_ON, unlocked: [], ...options });
+}
+
+function withLocalSession(local, overrides = {}) {
+  local.addConversation({ id: 'conv-1', title: 'sidebar polish', ...overrides });
+  local.addMessage('conv-1', { id: 'm-old-user', role: 'user', text: 'Earlier question' });
+  local.addMessage('conv-1', { id: 'm-old-reply', role: 'assistant', text: 'Earlier answer', sourceMessageId: 'm-old-user', model: 'claude-sonnet-5' });
+  return local.conversations.get('conv-1');
+}
+
+test('while the setting is off this relay is no target: not listed, and refused by name and as "this"', async () => {
+  for (const agentSessions of [null, { enabled: false, maxWaitSeconds: 600 }]) {
+    const { run, local, remote } = setup({ agentSessions });
+    const listed = await run('list_relays');
+    assert.deepEqual(listed.body.relays.map((relay) => relay.name), ['linux-test', 'spare-test']);
+    assert.equal(listed.body.relays.some((relay) => relay.self), false);
+    assert.doesNotMatch(listed.body.hint, /marked self/);
+    for (const name of ['this', 'THIS', '@this', 'win-test']) {
+      const refused = await run('list_sessions', { relay: name });
+      assert.equal(refused.status, 403, name);
+      assert.equal(refused.body.code, CODES.localDisabled);
+      assert.match(refused.body.error, /Agents may start and use sessions on this relay/);
+      assert.match(refused.body.error, /Ask the user to turn it on/);
+    }
+    const create = await run('create_session', { relay: 'this', text: PROMPT });
+    assert.equal(create.body.code, CODES.localDisabled);
+    assert.equal(local.calls.length, 0);
+    assert.equal(remote.calls.length, 0);
+  }
+});
+
+test('without the loopback client the local target does not exist, whatever the setting says', async () => {
+  const { run } = setupLocal({ withLocalClient: false });
+  assert.equal((await run('list_relays')).body.relays.some((relay) => relay.self), false);
+  assert.equal((await run('relay_info', { relay: 'this' })).body.code, CODES.localDisabled);
+});
+
+test('list_relays puts this relay first, marked self, with the limits that apply here', async () => {
+  const { run, local, remote } = setupLocal();
+  const result = await run('list_relays');
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.relays[0], { name: 'win-test', self: true, online: true, version: '0.9.4', permission: 'full', unlocked: true });
+  assert.deepEqual(result.body.relays.slice(1).map((relay) => [relay.name, relay.unlocked]), [['linux-test', false], ['spare-test', false]]);
+  assert.deepEqual(result.body.limits, { maxWaitSeconds: 600, maxActiveSessions: 4 });
+  assert.match(result.body.summary, /3 relays, 1 unlocked/);
+  assert.match(result.body.hint, /marked self is the one you run on/);
+  assert.match(result.body.hint, /"this"/);
+  assert.equal(local.calls.length + remote.calls.length, 0, 'list_relays asks nobody');
+});
+
+test('the local target needs no mention, no permission and no hop, and is reached through the loopback', async () => {
+  const { run, local, remote } = setupLocal({ caller: { hops: 2, originRelayIds: ['relay-linux-id'] } });
+  withLocalSession(local);
+  const info = await run('relay_info', { relay: 'this' });
+  assert.equal(info.status, 200, JSON.stringify(info.body));
+  assert.equal(info.body.relay, 'win-test');
+  assert.equal(info.body.self, true);
+  assert.equal(info.body.acceptsAgentPrompts, true);
+  assert.match(info.body.sessionRules, /at most 4 sessions/);
+
+  const sessions = await run('list_sessions', { relay: 'win-test' });
+  assert.equal(sessions.status, 200);
+  assert.deepEqual(sessions.body.sessions.map((session) => session.id), ['conv-1']);
+  const read = await run('read_session', { relay: '@this', session: 'conv-1' });
+  assert.equal(read.status, 200);
+  assert.equal(read.body.messages.length, 2);
+
+  // A turn that acts on a prompt two relays away may still write here.
+  const sent = await run('send', { relay: 'this', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  const [message] = local.callsTo('POST', '/api/message');
+  assert.equal(message.hops, 2, 'a call on this relay adds no hop');
+  assert.equal(message.body.origin.hops, 2);
+  assert.equal(message.body.origin.local, true);
+  assert.equal(message.body.origin.conversationId, 'c-1');
+  assert.equal(message.body.origin.conversationTitle, 'report builder');
+  assert.match(message.body.text, REMOTE_PROMPT_HEADER_PATTERN);
+  assert.equal(remote.calls.length, 0, 'no paired relay was asked');
+  assert.ok(local.calls.every((call) => call.relay === 'win-test'));
+});
+
+test('a paired relay that shares this relay\'s name keeps the name; "this" still means this relay', async () => {
+  const twin = { ...LINUX, name: 'win-test' };
+  const { run, local, remote } = setupLocal({ relays: [twin], unlocked: ['rr_linux'] });
+  const byName = await run('list_sessions', { relay: 'win-test' });
+  assert.equal(byName.status, 200);
+  assert.equal(remote.callsTo('GET', '/api/conversations').length, 1);
+  assert.equal(local.calls.length, 0);
+  const byAlias = await run('list_sessions', { relay: 'this' });
+  assert.equal(byAlias.status, 200);
+  assert.equal(local.callsTo('GET', '/api/conversations').length, 1);
+});
+
+test('an unknown name says how this relay is addressed when it is a target', async () => {
+  const unknown = await setupLocal().run('relay_info', { relay: 'nowhere' });
+  assert.equal(unknown.status, 404);
+  assert.equal(unknown.body.code, CODES.unknown);
+  assert.match(unknown.body.error, /this relay itself is "win-test" \(or "this"\)/);
+  assert.doesNotMatch((await setup().run('relay_info', { relay: 'nowhere' })).body.error, /this relay itself/);
+});
+
+test('the first create_session here asks the user once; after Allow the conversation creates without a card', async () => {
+  const { run, local, approvals, approvedLocal, events } = setupLocal();
+  const first = await run('create_session', { relay: 'this', text: PROMPT, cwd: '/home/dev/work', wait_seconds: 0 });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.relay, 'win-test');
+  assert.equal(first.body.status, 'queued');
+  assert.equal(first.body.session, 'conv-new-1');
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].localSessions, true);
+  assert.equal(approvals[0].action, 'create_session');
+  assert.deepEqual(approvals[0].relay, { id: 'self', name: 'win-test', url: 'https://relay-a.example.test', local: true });
+  assert.equal(approvals[0].args.cwd, '/home/dev/work');
+  assert.deepEqual([...approvedLocal], ['c-1'], 'the Allow is stored for the conversation');
+
+  // The session is created the way a paired relay's request creates one, with the local origin.
+  const [bootstrap] = local.callsTo('POST', '/api/conversation/bootstrap');
+  assert.equal(bootstrap.body.providerType, 'claude');
+  assert.equal(bootstrap.body.cwd, '/home/dev/work');
+  assert.deepEqual(bootstrap.body.origin, {
+    kind: 'agent',
+    relayId: 'relay-self-id',
+    relayName: 'win-test',
+    relayUrl: 'https://relay-a.example.test',
+    conversationId: 'c-1',
+    conversationTitle: 'report builder',
+    provider: 'claude',
+    model: 'claude-sonnet-5',
+    hops: 0,
+    local: true,
+  });
+  assert.equal(bootstrap.hops, 0);
+  assert.equal(local.callsTo('POST', '/api/message')[0].body.origin.local, true);
+
+  const second = await run('create_session', { relay: 'this', text: 'Check the export too', wait_seconds: 0 });
+  assert.equal(second.status, 200);
+  assert.equal(second.body.session, 'conv-new-2');
+  assert.equal(approvals.length, 1, 'no second card');
+  // send to a session it created needs none either.
+  const sent = await run('send', { relay: 'this', session: 'conv-new-1', text: 'And the numbers?', wait_seconds: 0 });
+  assert.equal(sent.status, 200);
+  assert.equal(approvals.length, 1);
+  assert.deepEqual(events.map((event) => [event.action, event.relay, event.relayId, event.ok]), [
+    ['create_session', 'win-test', 'self', true],
+    ['create_session', 'win-test', 'self', true],
+    ['send', 'win-test', 'self', true],
+  ]);
+
+  // Another conversation has its own approval to get.
+  const other = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 }, 'c-2');
+  assert.equal(other.status, 200);
+  assert.equal(approvals.length, 2);
+  assert.equal(approvals[1].conversationId, 'c-2');
+});
+
+test('an Allow given earlier (before a restart) is read from storage: no card', async () => {
+  const { run, approvals } = setupLocal({ localApproved: ['c-1'] });
+  const result = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 });
+  assert.equal(result.status, 200);
+  assert.equal(approvals.length, 0);
+});
+
+test('Deny refuses that call only: nothing is created, nothing is remembered, the next create asks again', async () => {
+  const answers = [false, { approved: false, code: CODES.noTurn, error: 'no running turn to ask on' }, true];
+  const asked = [];
+  const { run, local, approvedLocal } = setupLocal({
+    requestApproval: async (request) => {
+      asked.push(request);
+      return answers.shift();
+    },
+  });
+  const denied = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.code, CODES.approvalDenied);
+  assert.match(denied.body.error, /did not allow this agent to start a session on this relay/);
+  assert.equal(local.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(approvedLocal.size, 0);
+
+  const noTurn = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 });
+  assert.equal(noTurn.body.code, CODES.noTurn, 'the card\'s own refusal is passed on');
+  assert.equal(approvedLocal.size, 0);
+
+  const allowed = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 });
+  assert.equal(allowed.status, 200);
+  assert.equal(asked.length, 3);
+  assert.deepEqual([...approvedLocal], ['c-1']);
+});
+
+test('first creates that arrive together share one card and its answer', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const asked = [];
+  const { run, local } = setupLocal({
+    requestApproval: async (request) => {
+      asked.push(request);
+      await gate;
+      return true;
+    },
+  });
+  const calls = [1, 2, 3].map((index) => run('create_session', { relay: 'this', text: `Part ${index} of the report`, wait_seconds: 0 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(asked.length, 1, 'one card for the three calls');
+  release();
+  const results = await Promise.all(calls);
+  assert.deepEqual(results.map((result) => result.status), [200, 200, 200]);
+  assert.equal(asked.length, 1);
+  assert.equal(local.callsTo('POST', '/api/conversation/bootstrap').length, 3);
+
+  // And a shared Deny refuses all of them.
+  const denied = [];
+  let deny;
+  const denyGate = new Promise((resolve) => { deny = resolve; });
+  const refusing = setupLocal({
+    requestApproval: async (request) => {
+      denied.push(request);
+      await denyGate;
+      return false;
+    },
+  });
+  const refusedCalls = [1, 2].map(() => refusing.run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  deny();
+  assert.deepEqual((await Promise.all(refusedCalls)).map((result) => result.body.code), [CODES.approvalDenied, CODES.approvalDenied]);
+  assert.equal(denied.length, 1);
+  assert.equal(refusing.local.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+});
+
+test('one level only: a session an agent created cannot create sessions, and nobody is asked', async () => {
+  for (const origin of [
+    { relayId: 'relay-self-id', relayName: 'win-test', conversationId: 'c-0', hops: 0, local: true },
+    // Created from a paired relay: the same rule.
+    { relayId: 'relay-linux-id', relayName: 'linux-test', conversationId: 'conv-elsewhere', hops: 1 },
+  ]) {
+    const { run, local, approvals } = setupLocal();
+    local.addConversation({ id: 'c-1', title: 'report builder', origin });
+    const refused = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.code, CODES.nestedSession);
+    assert.match(refused.body.error, /^A session that an agent created cannot create sessions\./);
+    assert.equal(approvals.length, 0);
+    assert.equal(local.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+    // Everything else stays open to it.
+    local.addConversation({ id: 'conv-9', title: 'sidebar polish' });
+    assert.equal((await run('read_session', { relay: 'this', session: 'conv-9' })).status, 200);
+    assert.equal((await run('send', { relay: 'this', session: 'conv-9', text: 'Done with my part', wait_seconds: 0 })).status, 200);
+  }
+});
+
+test('the one-level rule is the local target\'s: a created session may still create on a paired relay it may use', async () => {
+  const { run, local, remote } = setupLocal({ unlocked: ['rr_linux'] });
+  local.addConversation({ id: 'c-1', title: 'report builder', origin: { relayId: 'relay-self-id', relayName: 'win-test', conversationId: 'c-0', hops: 0, local: true } });
+  const result = await run('create_session', { relay: 'linux-test', text: PROMPT, wait_seconds: 0 });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 1);
+});
+
+test('the fifth session at work is refused until one of the four finishes', async () => {
+  const { run, local, approvals } = setupLocal({ localApproved: ['c-1'] });
+  for (let index = 1; index <= 4; index += 1) {
+    const created = await run('create_session', { relay: 'this', text: `Part ${index} of the report`, wait_seconds: 0 });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+  }
+  const fifth = await run('create_session', { relay: 'this', text: 'Part 5 of the report', wait_seconds: 0 });
+  assert.equal(fifth.status, 409);
+  assert.equal(fifth.body.code, CODES.sessionLimit);
+  assert.equal(fifth.body.error, '4 sessions you started are still working; wait for one to finish.');
+  assert.equal(fifth.body.limit, 4);
+  assert.deepEqual(fifth.body.sessions, ['conv-new-1', 'conv-new-2', 'conv-new-3', 'conv-new-4']);
+  assert.match(fifth.body.note, /Use wait/);
+  assert.equal(local.callsTo('POST', '/api/conversation/bootstrap').length, 4);
+  assert.equal(approvals.length, 0);
+
+  // Sessions another conversation started, or a human, do not count against this one.
+  const elsewhere = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 }, 'c-2');
+  assert.equal(elsewhere.status, 200);
+  // Sending to one of the four is not creating.
+  assert.equal((await run('send', { relay: 'this', session: 'conv-new-1', text: 'One more thing', wait_seconds: 0 })).status, 200);
+
+  local.conversations.get('conv-new-2').activeTurn = false;
+  const again = await run('create_session', { relay: 'this', text: 'Part 5 of the report', wait_seconds: 0 });
+  assert.equal(again.status, 200, JSON.stringify(again.body));
+});
+
+test('creates that arrive together cannot slip past the cap', async () => {
+  const { run, local } = setupLocal({ localApproved: ['c-1'] });
+  const results = await Promise.all([1, 2, 3, 4, 5, 6].map((index) => run('create_session', {
+    relay: 'this', text: `Part ${index} of the report`, wait_seconds: 0,
+  })));
+  assert.deepEqual(results.map((result) => result.status).sort(), [200, 200, 200, 200, 409, 409]);
+  assert.equal(local.callsTo('POST', '/api/conversation/bootstrap').length, 4);
+  for (const result of results.filter((entry) => entry.status === 409)) assert.equal(result.body.code, CODES.sessionLimit);
+});
+
+test('a create that fails gives its place under the cap back', async () => {
+  const { run, local } = setupLocal({ localApproved: ['c-1'] });
+  local.fail('POST', '/api/conversation/bootstrap', remoteError(`${CODES.httpPrefix}400`, 'Relay "win-test" answered HTTP 400: Model is not available', 400, { error: 'Model is not available' }));
+  for (let index = 0; index < 6; index += 1) {
+    const failed = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 });
+    assert.equal(failed.status, 400);
+    assert.equal(failed.body.code, `${CODES.httpPrefix}400`);
+  }
+  local.failures.clear();
+  assert.equal((await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 })).status, 200);
+});
+
+test('the cap does not apply to sessions created on a paired relay', async () => {
+  const { run, remote } = setupLocal({ unlocked: ['rr_linux'] });
+  for (let index = 1; index <= 6; index += 1) {
+    const created = await run('create_session', { relay: 'linux-test', text: `Part ${index}`, wait_seconds: 0 });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+  }
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 6);
+});
+
+test('an agent cannot send to, stop, archive or wait on the conversation it runs in', async () => {
+  const { run, local } = setupLocal({
+    // The OAR MCP server names its session by SDK session id.
+    resolveConversationId: (id) => (id === 'sdk-c-1' ? 'c-1' : id),
+  });
+  local.addConversation({ id: 'c-1', title: 'report builder' });
+  local.addMessage('c-1', { id: 'm-own', role: 'user', text: 'Build the report' });
+  for (const [action, extra] of [
+    ['send', { text: PROMPT }],
+    ['stop', {}],
+    ['archive', {}],
+    ['wait', { message_id: 'm-own' }],
+  ]) {
+    for (const session of ['c-1', 'sdk-c-1']) {
+      const refused = await run(action, { relay: 'this', session, ...extra });
+      assert.equal(refused.status, 400, `${action} ${session}`);
+      assert.equal(refused.body.code, CODES.ownSession);
+      assert.match(refused.body.error, /the conversation you are running in/);
+    }
+  }
+  assert.equal(local.calls.length, 0, 'refused before this relay\'s API is touched');
+  // Reading itself is harmless and stays allowed.
+  assert.equal((await run('read_session', { relay: 'this', session: 'c-1' })).status, 200);
+});
+
+test('an agent cannot answer a question of its own conversation; another session\'s it can', async () => {
+  const { run, local } = setupLocal();
+  local.addConversation({ id: 'c-1', title: 'report builder' });
+  local.addConversation({ id: 'conv-2', title: 'sidebar polish' });
+  local.addQuestion({ id: 'q-own', conversationId: 'c-1', prompt: 'Which colour?', choices: ['Teal', 'Amber'] });
+  local.addQuestion({ id: 'q-other', conversationId: 'conv-2', prompt: 'Which colour?', choices: ['Teal', 'Amber'] });
+  const own = await run('answer_question', { relay: 'this', question_id: 'q-own', choices: ['Teal'] });
+  assert.equal(own.status, 400);
+  assert.equal(own.body.code, CODES.ownSession);
+  assert.equal(local.questions.get('q-own').status, 'pending');
+  const other = await run('answer_question', { relay: 'this', question_id: 'q-other', choices: ['Teal'] });
+  assert.equal(other.status, 200, JSON.stringify(other.body));
+  assert.equal(local.questions.get('q-other').answer, 'Teal');
+});
+
+test('the same session id on a paired relay is another conversation: no own-session refusal there', async () => {
+  const { run, remote } = setupLocal({ unlocked: ['rr_linux'] });
+  remote.addConversation({ id: 'c-1', title: 'a session that happens to share the id' });
+  const sent = await run('send', { relay: 'linux-test', session: 'c-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+});
+
+test('in ask mode the first create shows the one card; later writes here get the ordinary one', async () => {
+  const { run, approvals } = setupLocal({ caller: { mode: 'ask' } });
+  const first = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 0 });
+  assert.equal(first.status, 200);
+  assert.equal(approvals.length, 1, 'not two cards for one call');
+  assert.equal(approvals[0].localSessions, true);
+
+  const second = await run('create_session', { relay: 'this', text: 'Check the export too', wait_seconds: 0 });
+  assert.equal(second.status, 200);
+  assert.equal(approvals.length, 2);
+  assert.equal(approvals[1].localSessions, undefined);
+  assert.equal(approvals[1].relay.local, true);
+  const stop = await run('stop', { relay: 'this', session: 'conv-new-1' });
+  assert.equal(stop.status, 200);
+  assert.equal(approvals.length, 3);
+  // Reads never ask.
+  await run('read_session', { relay: 'this', session: 'conv-new-1' });
+  assert.equal(approvals.length, 3);
+});
+
+test('create_session here opens a Claude Cloud session from repo and branch', async () => {
+  const { run, local } = setupLocal({ localApproved: ['c-1'] });
+  local.settings['claude-cloud'] = { enabled: true, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
+  // As the real routes answer for a cloud conversation.
+  local.efforts.supported = ['none'];
+  const result = await run('create_session', {
+    relay: 'this',
+    text: 'Fix the sample banner on the branch feature/banner and push it.',
+    provider: 'claude-cloud',
+    repo: 'https://github.com/example-org/sample-repo.git',
+    branch: 'feature/banner',
+    wait_seconds: 0,
+  });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const [bootstrap] = local.callsTo('POST', '/api/conversation/bootstrap');
+  assert.equal(bootstrap.body.providerType, 'claude-cloud');
+  assert.deepEqual(bootstrap.body.cloudSource, { repoUrl: 'https://github.com/example-org/sample-repo', branch: 'feature/banner' });
+  assert.equal(bootstrap.body.origin.local, true);
+  assert.equal('model' in bootstrap.body, false);
+  assert.equal(result.body.repo, 'https://github.com/example-org/sample-repo');
+  assert.equal(result.body.branch, 'feature/banner');
+  assert.equal(result.body.provider, 'claude-cloud');
+  // The cloud names an effort of its own ("none"): not this call's business.
+  assert.equal('effort' in result.body, false);
+  assert.equal('effortSource' in result.body, false);
+});
+
+test('list_sessions here says which sessions an agent created, and which of them this one did', async () => {
+  const { run, local } = setupLocal();
+  local.addConversation({ id: 'conv-mine', title: 'part one', origin: { relayName: 'win-test', conversationId: 'c-1', local: true } });
+  local.addConversation({ id: 'conv-theirs', title: 'part two', origin: { relayName: 'win-test', conversationId: 'c-7', local: true } });
+  local.addConversation({ id: 'conv-remote', title: 'part three', origin: { relayName: 'linux-test', conversationId: 'c-1' } });
+  local.addConversation({ id: 'conv-human', title: 'part four' });
+  const result = await run('list_sessions', { relay: 'this' });
+  const byId = Object.fromEntries(result.body.sessions.map((session) => [session.id, session]));
+  assert.equal(byId['conv-mine'].createdBy, 'c-1');
+  assert.equal(byId['conv-mine'].startedByYou, true);
+  assert.equal(byId['conv-theirs'].createdBy, 'c-7');
+  assert.equal('startedByYou' in byId['conv-theirs'], false);
+  assert.equal('createdBy' in byId['conv-remote'], false);
+  assert.equal(byId['conv-remote'].via, 'linux-test');
+  assert.equal('createdBy' in byId['conv-human'], false);
+});
+
+test('the rate limit and the loop guard count calls on this relay like any other', async () => {
+  const { run, local, approvals } = setupLocal({ localApproved: ['c-1'], humans: { latest: 'm-human-1' } });
+  withLocalSession(local);
+  for (let index = 0; index < REMOTE_RELAY_LIMITS.writesPerMinute; index += 1) {
+    assert.equal((await run('stop', { relay: 'this', session: 'conv-1' })).status, 200);
+  }
+  const limited = await run('stop', { relay: 'this', session: 'conv-1' });
+  assert.equal(limited.status, 429);
+  assert.equal(limited.body.code, CODES.rateLimited);
+  assert.equal(approvals.length, 0);
+});
+
+// ─── The longest wait ────────────────────────────────────────────────────────
+
+test('wait_seconds follows the relay\'s setting: an hour really waits an hour', async () => {
+  const { run, remote, clock, sleeps } = setup({ agentSessions: { enabled: false, maxWaitSeconds: 3600 } });
+  withSession(remote);
+  remote.onMessage = (conv, body) => { conv.inFlight = { messageId: body.messageId, streamEvents: [], activities: [] }; };
+  const started = clock.now;
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 3600 });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.status, 'running');
+  assert.equal(clock.now - started, 3600 * 1000, 'polled until the hour was over');
+  assert.equal(sleeps.length, 1800);
+  assert.doesNotMatch(result.body.note, /more than this relay allows/);
+});
+
+test('a wait longer than the setting is cut to it, and the result says so', async () => {
+  for (const [agentSessions, expected] of [
+    [null, 600],
+    [{ enabled: false, maxWaitSeconds: 600 }, 600],
+    [{ enabled: true, maxWaitSeconds: 120 }, 120],
+    [{ enabled: false, maxWaitSeconds: 1800 }, 1800],
+  ]) {
+    const { run, remote, clock } = setup({ agentSessions });
+    withSession(remote);
+    remote.onMessage = (conv, body) => { conv.inFlight = { messageId: body.messageId, streamEvents: [], activities: [] }; };
+    const started = clock.now;
+    const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 3600 });
+    assert.equal(result.body.status, 'running');
+    assert.equal(clock.now - started, expected * 1000, `waited ${expected} s`);
+    assert.match(result.body.note, new RegExp(`wait_seconds 3600 is more than this relay allows per call \\(${expected}, set by its owner\\)`));
+    assert.match(result.body.note, /Call wait with this session and message_id/, 'the outcome\'s own note is kept');
+  }
+});
+
+test('the wait action and the local target follow the same limit', async () => {
+  const { run, local, clock } = setupLocal({ agentSessions: { enabled: true, maxWaitSeconds: 1200 }, localApproved: ['c-1'] });
+  local.onMessage = (conv, body) => { conv.inFlight = { messageId: body.messageId, streamEvents: [], activities: [] }; };
+  const started = clock.now;
+  const created = await run('create_session', { relay: 'this', text: PROMPT, wait_seconds: 5000 });
+  assert.equal(created.body.status, 'running');
+  assert.equal(clock.now - started, 1200 * 1000);
+  assert.match(created.body.note, /wait_seconds 5000 is more than this relay allows per call \(1200/);
+
+  const before = clock.now;
+  const waited = await run('wait', { relay: 'this', session: created.body.session, message_id: created.body.message_id, wait_seconds: 900 });
+  assert.equal(waited.body.status, 'running');
+  assert.equal(clock.now - before, 900 * 1000, 'inside the limit: as asked');
+  assert.doesNotMatch(waited.body.note, /more than this relay allows/);
+  assert.deepEqual((await run('list_relays')).body.limits, { maxWaitSeconds: 1200, maxActiveSessions: 4 });
 });

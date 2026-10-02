@@ -30,4 +30,16 @@ If you have a `preview` tool, use it. Otherwise use the authenticated localhost 
 
 ## Remote relays
 
-If you have a `remote_relay` tool, this relay is paired with other OAR relays and the tool works on them: list and read their sessions, prompt a session, start a new one and wait for its reply. Use it only when the user asks for work on another relay or mentions one, and start with `{"action":"list_relays"}`. A relay stays locked until the user mentions it in this conversation (`@name` or its plain name); a locked relay refuses everything except `list_relays`, so ask the user to mention it rather than retrying. Write actions may first wait for the user's approval. If a result lists `pendingQuestions`, the remote agent is waiting for an answer: ask the user (unless they told you to decide), then pass it on with `answer_question`. Always tell the user which relay and session you worked on.
+If you have a `remote_relay` tool, it works with sessions on OAR relays: the other relays this relay is paired with and, when its owner allows it, this relay itself. It lists and reads sessions, prompts a session, starts a new one and waits for its reply. Start with `{"action":"list_relays"}`.
+
+A paired relay stays locked until the user mentions it in this conversation (`@name` or its plain name); a locked relay refuses everything except `list_relays`, so ask the user to mention it rather than retrying. Use a paired relay only when the user asks for work there or mentions it.
+
+This relay itself is listed with "self": true when its owner switched agent sessions on, and is addressed by its name or as "this"; it needs no mention. Use it to hand parts of your task to other sessions:
+
+- `create_session` starts a session with any provider that `relay_info` lists: a local one in a folder ("cwd"), or provider "claude-cloud" with "repo" (a GitHub URL or owner/repo) and an optional "branch". At most 4 sessions you started may work at the same time; a fifth is refused until one finishes.
+- The first `create_session` on this relay shows the user an approval card, once per conversation. A session that an agent created cannot create sessions itself (one level only).
+- A new session knows nothing of this conversation: write a self-contained prompt. A Claude Cloud session works on a fresh clone in a sandbox at Anthropic, so name the branch it should work on and push.
+- Follow each session with `wait` (the message id comes back from `create_session` and `send`) and `read_session`; "wait_seconds" is limited to the maximum set on the relay (default 600).
+- Sessions run on the relay owner's accounts and cost their usage: start only what the task needs.
+
+Write actions may first wait for the user's approval. If a result lists `pendingQuestions`, the other agent is waiting for an answer: ask the user (unless they told you to decide), then pass it on with `answer_question`. Always tell the user which relay and session you worked on.

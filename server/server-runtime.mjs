@@ -44,6 +44,7 @@ import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
 import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
 import { createRemoteRelayClient } from './services/remote-relay-client.mjs';
+import { createRemoteRelayLoopbackClient } from './services/remote-relay-loopback.mjs';
 import { createRemoteRelayRegistry } from './services/remote-relay-registry-service.mjs';
 import { createRemoteRelayPairing } from './services/remote-relay-pairing.mjs';
 import { createRemoteRelayCallerContext } from './services/remote-relay-caller-context.mjs';
@@ -6476,9 +6477,18 @@ const remoteRelayCallerContext = createRemoteRelayCallerContext({
   uuid: uuidv4,
   logger: console,
 });
+// Agent sessions: this relay as a target of its own agents. Their calls reach
+// the routes below in-process, the way a paired relay's reach them over HTTP.
+const remoteRelayLoopbackClient = createRemoteRelayLoopbackClient({
+  handle: (req, res) => app(req, res),
+  getOwnRelayId: () => remoteRelayRegistry.instanceId(),
+  getOwnToken: () => config.authToken,
+});
 const remoteRelayDispatcher = createRemoteRelayDispatcher({
   registry: remoteRelayRegistry,
   client: remoteRelayClient,
+  localClient: remoteRelayLoopbackClient,
+  getAgentSessionsSettings: () => remoteRelayRegistry.getAgentSessionsSettings(),
   repository: remoteRelayRepository,
   getCallerContext: (conversationId) => remoteRelayCallerContext.getCallerContext(conversationId),
   requestApproval: (request) => remoteRelayCallerContext.requestApproval(request),

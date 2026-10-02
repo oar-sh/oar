@@ -42,6 +42,7 @@ const store = await import('./store.js');
 const view = await import('./conversation-view.js');
 const journal = await import('./journal-view.js');
 const relays = await import('./remote-relays-store.mjs');
+const originUi = await import('./conversation-origin-ui.js');
 const { initSlashAutocomplete, isSlashAutocompleteOpen, closeSlashAutocomplete } = await import('./slash-autocomplete.mjs');
 const { initMentionAutocomplete, isMentionAutocompleteOpen, closeMentionAutocomplete } = await import('./mention-autocomplete.mjs');
 
@@ -139,6 +140,157 @@ test('the sidebar marks conversations another relay created', () => {
   const local = items.find((item) => item.querySelector('.conv-title').textContent.startsWith('sidebar polish'));
   assert.equal(remote.querySelector('.conv-meta .conv-origin-marker').textContent, '↗ win-test');
   assert.equal(local.querySelector('.conv-origin-marker'), null);
+});
+
+// ─── Sessions an agent on this relay started (origin.local) ──────────────────
+
+const LOCAL_ORIGIN = {
+  kind: 'agent',
+  local: true,
+  relayId: 'relay-a',
+  relayName: 'win-test',
+  conversationId: 'c-lead',
+  conversationTitle: 'release checklist',
+  provider: 'claude',
+  model: 'claude-sonnet-5',
+};
+const sidebarItem = (title) => [...document.querySelectorAll('#conv-list .conv-item')]
+  .find((item) => item.querySelector('.conv-title').textContent.startsWith(title));
+const headerOrigin = () => document.getElementById('chat-title-origin');
+
+function seedAgentSessions() {
+  for (const key of Object.keys(conversations)) delete conversations[key];
+  conversations['c-lead'] = {
+    id: 'c-lead', title: 'release checklist', updatedAt: '2026-09-27T10:00:00.000Z', messageCount: 6,
+  };
+  conversations['c-made'] = {
+    id: 'c-made', title: 'docs pass', updatedAt: '2026-09-27T10:05:00.000Z', messageCount: 2, origin: LOCAL_ORIGIN,
+  };
+  conversations['c-remote'] = {
+    id: 'c-remote', title: 'report builder', updatedAt: '2026-09-27T09:00:00.000Z', messageCount: 2, origin: ORIGIN,
+  };
+}
+
+test('the sidebar marks a session an agent here started, and the marker opens that agent\'s conversation', async () => {
+  seedAgentSessions();
+  setCurrentConv('c-made');
+  journal.renderConvList();
+
+  const marker = sidebarItem('docs pass').querySelector('.conv-meta button.conv-origin-marker');
+  assert.ok(marker, 'the marker is a button inside the row');
+  assert.equal(marker.textContent, 'via agent · “release checklist”');
+  assert.equal(marker.dataset.originConversationId, 'c-lead');
+  // The other rows are as before.
+  assert.equal(sidebarItem('report builder').querySelector('.conv-origin-marker').textContent, '↗ win-test');
+  assert.equal(sidebarItem('report builder').querySelector('button.conv-origin-marker'), null);
+  assert.equal(sidebarItem('release checklist').querySelector('.conv-origin-marker'), null);
+
+  // JSDOM does not run the inline handler; call what it names. The row's own
+  // click (open THIS conversation) must not fire as well.
+  assert.equal(marker.getAttribute('onclick'), 'openOriginConversation(event, this)');
+  let stopped = false;
+  await journal.openOriginConversation({ stopPropagation() { stopped = true; }, preventDefault() {} }, marker);
+  assert.equal(stopped, true);
+  assert.equal(store.currentConvId, 'c-lead');
+  assert.equal(document.getElementById('chat-title').textContent, 'release checklist');
+  assert.ok(sidebarItem('release checklist').classList.contains('active'));
+});
+
+test('the sidebar marker follows a rename and turns into plain text when that conversation is deleted', async () => {
+  seedAgentSessions();
+  setCurrentConv('c-made');
+  conversations['c-lead'] = { ...conversations['c-lead'], title: 'release 2 checklist' };
+  journal.renderConvList();
+  const stale = sidebarItem('docs pass').querySelector('button.conv-origin-marker');
+  assert.equal(stale.textContent, 'via agent · “release 2 checklist”');
+
+  delete conversations['c-lead'];
+  // A click on a marker drawn before the deletion goes nowhere.
+  await journal.openOriginConversation({ stopPropagation() {}, preventDefault() {} }, stale);
+  assert.equal(store.currentConvId, 'c-made');
+
+  const item = sidebarItem('docs pass');
+  assert.equal(item.querySelector('button.conv-origin-marker'), null);
+  const plain = item.querySelector('span.conv-origin-marker');
+  // The title the conversation had when the session was created.
+  assert.equal(plain.textContent, 'via agent · “release checklist”');
+});
+
+test('the header shows "via agent" for a local origin only', () => {
+  seedAgentSessions();
+  assert.equal(headerOrigin().hasAttribute('hidden'), true, 'the markup ships hidden');
+
+  setCurrentConv('c-made');
+  originUi.syncConversationOriginHeader();
+  assert.equal(headerOrigin().hidden, false);
+  const button = headerOrigin().querySelector('button.conv-origin-agent');
+  assert.equal(button.textContent, 'via agent · “release checklist”');
+  assert.equal(button.dataset.originConversationId, 'c-lead');
+  // Synced again with nothing changed: the same node, so a tap is never lost.
+  originUi.syncConversationOriginHeader();
+  assert.equal(headerOrigin().querySelector('button'), button);
+
+  // Another relay's agent, a person, no conversation: no header line.
+  for (const id of ['c-remote', 'c-lead', null]) {
+    setCurrentConv(id);
+    originUi.syncConversationOriginHeader();
+    assert.equal(headerOrigin().hidden, true);
+    assert.equal(headerOrigin().textContent, '');
+  }
+
+  // The orchestrating conversation is gone: text, no button.
+  delete conversations['c-lead'];
+  setCurrentConv('c-made');
+  originUi.syncConversationOriginHeader();
+  assert.equal(headerOrigin().hidden, false);
+  assert.equal(headerOrigin().querySelector('button'), null);
+  assert.equal(headerOrigin().textContent, 'via agent · “release checklist”');
+});
+
+test('a conversation opened before the list knew it takes its origin from the detail answer', () => {
+  seedAgentSessions();
+  delete conversations['c-made'];
+  setCurrentConv('c-made');
+  journal.applyLoadedConversationState('c-made', { title: 'docs pass', messages: [], origin: LOCAL_ORIGIN });
+  assert.deepEqual(conversations['c-made'].origin, LOCAL_ORIGIN);
+  originUi.syncConversationOriginHeader();
+  assert.equal(headerOrigin().querySelector('button').textContent, 'via agent · “release checklist”');
+
+  // An answer without the field (an older relay) keeps what the list said; an
+  // explicit null is a real "nobody but a person".
+  journal.applyLoadedConversationState('c-made', { title: 'docs pass', messages: [] });
+  assert.deepEqual(conversations['c-made'].origin, LOCAL_ORIGIN);
+  journal.applyLoadedConversationState('c-made', { title: 'docs pass', messages: [], origin: null });
+  assert.equal(conversations['c-made'].origin, null);
+  originUi.syncConversationOriginHeader();
+  assert.equal(headerOrigin().hidden, true);
+});
+
+test('the header line sits between the title and the folder, and the app keeps it in sync', () => {
+  const slot = document.getElementById('chat-title-slot');
+  assert.deepEqual([...slot.children].map((node) => node.id), [
+    'chat-title-primary', 'chat-title-origin', 'chat-title-cwd', 'chat-title-session-usage',
+  ]);
+  // bootstrap.js cannot be loaded here as a whole: its header sync has to call
+  // this one, and the marker's inline handler has to exist on window.
+  const bootstrap = fs.readFileSync(new URL('./bootstrap.js', import.meta.url), 'utf8');
+  assert.match(bootstrap, /\n {2}syncConversationOriginHeader\(\);\n/);
+  assert.ok(bootstrap.includes('window.openOriginConversation = openOriginConversation;'));
+});
+
+test('a prompt from an agent on this relay carries a "via agent" badge that opens its conversation', () => {
+  seedAgentSessions();
+  messagesEl.innerHTML = '';
+  setCurrentConv('c-made');
+  view.renderMessages([
+    { id: 'u9', role: 'user', text: 'check the docs build', origin: LOCAL_ORIGIN, timestamp: '2026-09-27T10:05:00.000Z' },
+  ], false, { conversationId: 'c-made' });
+  const bubble = row('u9').querySelector('.msg-bubble');
+  assert.equal(bubble.querySelector('.msg-origin a'), null);
+  const badge = bubble.querySelector('.msg-origin button.msg-origin-badge');
+  assert.equal(badge.textContent, 'via agent · “release checklist” · claude-sonnet-5');
+  assert.equal(badge.dataset.originConversationId, 'c-lead');
+  assert.match(bubble.textContent, /check the docs build/);
 });
 
 // ─── Composer: slash menu and @relay popup share the keyboard ────────────────

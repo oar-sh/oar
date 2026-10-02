@@ -1413,9 +1413,10 @@ function createMessageNode(msg, msgId = null, force = false) {
     ? `<div class="msg-bubble-actions"><button type="button" class="bubble-action-btn" data-action="resend-stopped-steer" data-message-id="${escHtml(msgId)}" title="Send this message again as a new turn"${resendState ? ' disabled' : ''}>${resendLabel}</button></div>`
     : '';
 
-  // Shared viewers get the badge without the link to the other relay.
+  // Shared viewers get the badge without the link to the other relay (or, for
+  // an agent on this relay, to the conversation it runs in).
   const originBadgeHtml = remoteOrigin
-    ? renderRemoteOriginBadgeHtml(remoteOrigin, { linkable: !IS_SHARED_VIEW })
+    ? renderRemoteOriginBadgeHtml(remoteOrigin, { linkable: !IS_SHARED_VIEW, conversations })
     : '';
 
   div.innerHTML = `

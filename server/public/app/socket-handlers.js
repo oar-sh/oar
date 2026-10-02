@@ -46,6 +46,8 @@ import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
 import { setRemoteRelaysSnapshot } from './remote-relays-store.mjs';
 import { REMOTE_RELAY_SOCKET_EVENT } from './remote-relay-shared.mjs';
+import { AGENT_SESSIONS_SOCKET_EVENT } from './agent-sessions-settings.mjs';
+import { applyAgentSessionsSettingsState, refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
 import { applyClaudeAuthState } from './claude-auth-ui.js';
 import { applyGrokAuthState } from './grok-auth-ui.js';
 import { applyClaudeCloudSettingsState, refreshClaudeCloudSettingsState } from './claude-cloud-settings-ui.js';
@@ -551,6 +553,13 @@ export async function connectSocket(overrideDeps) {
   // tokens) whenever a remote is added, removed, renamed or changes status.
   socket.on(REMOTE_RELAY_SOCKET_EVENT, (payload) => {
     setRemoteRelaysSnapshot(payload || null);
+  });
+  // Agent sessions (Settings → Relays): the event carries the same shape as
+  // GET /api/settings/agent-sessions; one without a body is answered with a
+  // fresh read.
+  socket.on(AGENT_SESSIONS_SOCKET_EVENT, (payload) => {
+    if (payload && typeof payload === 'object') applyAgentSessionsSettingsState(payload);
+    else void refreshAgentSessionsSection();
   });
   socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId, metadata }) => {
     if (!messageId || !text) return;

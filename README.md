@@ -291,7 +291,8 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 - No relay tools inside the sandbox: no `preview`, no `remote_relay`, no media embedded by host path
 - No background task panel, and no pause at the usage limit: a limit the cloud reports appears as a line in the tool activity
 - OAR's commit attribution setting does not reach the sandbox; commits there carry what Claude Code in the cloud writes
-- An agent on a [paired relay](#remote-relays) cannot create a cloud chat yet. It can read, prompt, wait for and stop one you created
+
+**Started by an agent.** An agent in another session can start a cloud chat with the `remote_relay` tool, naming the repository and, if it wants one, the branch (`repo` and `branch`): an agent on a [paired relay](#remote-relays), under the rules for starting any session from there, or an agent on this relay once [agent sessions](#agent-sessions) are switched on. The same checks apply as in **New Chat** (the provider is on, an environment is set, the repository is on GitHub), and a chat without a requested model starts with the tab's default model. It can also read, prompt, wait for and stop a cloud chat you created.
 
 **What OAR does with the Claude login.** Claude Cloud uses the login the Claude CLI keeps on the relay host (`.credentials.json` in `~/.claude`, or in `CLAUDE_CONFIG_DIR`) to call the Anthropic API endpoints the Claude CLI itself uses for cloud sessions and account usage. **These endpoints are not a documented public API.** Anthropic can change them without notice; cloud chats and the live usage figures then fail with a note until OAR is updated. If you are not comfortable with a program other than the CLI using its login this way, leave the provider off.
 
@@ -424,7 +425,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 - Nested **subagent bubbles**: each subagent gets its own live bubble with its own thoughts, activity, and streamed text, kept as collapsible sections after the turn finishes
 - **Background task panel** with live per-task state, model, and token use; Claude workflow tasks fold out into a progress tree of phases and agents, and leave a *Finished background task* card in the transcript when they complete
 - Question cards for clarification: one-click choices, multi-select checkmarks, free text, and multi-field structured forms validated against their JSON schema
-- Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas
+- Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas, written as `$…$`, `\(…\)`, `$$…$$` or `\[…\]`. A single `$` opens a formula only when a non-space character follows it directly and the next `$` has a non-space character directly before it and no digit directly after it (a digit is allowed after something that looks like TeX, as in `$x^2$3`), so prices such as `$5 and $9` stay text
 - **Context usage** modal with a per-category token breakdown of the model's context window, plus a per-conversation **auto-compact window** slider for Claude sessions
 - **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context, and matching dots beside the scrollbar
 - **Plan usage** modal with subscription credits, rate-limit windows, and reset countdowns for Copilot, Claude, Claude Cloud, Cursor, and Grok
@@ -552,6 +553,8 @@ The modal is organised into six tabs — **General**, **Providers** (with a **Co
 | Providers | Cursor API key / model | — / `composer-2.5` | Enables Cursor; plus monthly plan allowances and the optional dashboard session token |
 | Providers | Grok | off | Enables Grok; default model `grok-4.5`; **Sign in** / **Sign out**; optional monthly allowance |
 | Relays | Public address, Accept prompts from other relays' agents | browser address / on | How paired relays reach this one, and whether their agents may prompt sessions here (see [Remote relays](#remote-relays)) |
+| Relays | Agent sessions: Agents may start and use sessions on this relay | off | Lets agents on this relay start and use other sessions here with the `remote_relay` tool; the first session an agent starts in a conversation asks for your approval (see [Agent sessions](#agent-sessions)) |
+| Relays | Agent sessions: Longest wait per tool call | `10 min` | How long one `remote_relay` call may wait for a reply (2 to 60 minutes), on this relay and on paired ones; adjustable whether or not the switch above is on |
 | Relays | Remote relays | — | Pair a relay by pasting its web address; per relay **Agents may** read only, read and prompt, or do everything |
 | Previews | Live previews | — | Lists the published previews, each of which you can close |
 | Notifications | Push notifications | off | Per device: which events notify, and whether titles and message previews are included |
@@ -765,15 +768,22 @@ conversation has sent 30 prompts to agents on other relays without a message fro
 one asks you first with a question card; **Allow** starts the count again.
 
 **What agents can do.** Every provider gets the same `remote_relay` tool (Claude, Cursor and
-Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Per paired
+Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Sessions get it
+while at least one relay is paired or [agent sessions](#agent-sessions) are switched on. Per paired
 relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
 (also create sessions, answer questions, stop turns, archive). In the *ask* and *plan* relay
 modes, every write action first asks you with a question card. For a session it starts, an agent
 can set the provider, model, relay mode and reasoning effort; what it leaves out follows the
 session it works in, as far as the other relay offers it. A [Claude Cloud](#claude-cloud) session
-cannot be started this way yet, because the tool has no field for its GitHub repository: the agent
-is told to ask you to open the chat from **New Chat** on that relay. A cloud session that exists
-can be read, prompted, waited for and stopped like any other.
+is started with `provider: "claude-cloud"`, a `repo` (a GitHub URL or `owner/repo`, for example
+`example-org/sample-repo`) and an optional `branch` instead of a folder; without a model it gets
+the default model of the other relay's Claude Cloud tab. Claude Cloud must be switched on there.
+A cloud session that exists can be read, prompted, waited for and stopped like any other.
+
+A `send`, `create_session` or `wait` call waits for the reply for as long as the agent asks, up to
+**Longest wait per tool call** of the relay the agent runs on (10 minutes unless you changed it,
+see [Agent sessions](#agent-sessions)). When the time is up the agent gets what there is so far
+and can call `wait` again.
 
 When an agent prompts a session on another relay, that relay shows a **↗ from …** badge with the
 sending relay, session and model on the message, and marks sessions an agent created in the
@@ -785,6 +795,58 @@ switches incoming agent prompts off.
 The calls go through your own relay, which holds the other relay's token: agents never see a
 token. Remote addresses must use `https://`; plain `http://` is accepted only for loopback (an
 SSH port forward, for example) and private network ranges.
+
+### Agent sessions
+
+The same `remote_relay` tool can also work on the relay the agent itself runs on. An agent can
+then hand parts of its task to other sessions: it starts them, waits for them and reads their
+replies. Every session it starts is an ordinary conversation in your list. No relay has to be
+paired for this.
+
+**Switching it on.** It is off by default. Turn on **Settings → Relays → Agent sessions →
+Agents may start and use sessions on this relay**. From then on this relay is the first entry of
+the relay list an agent sees, marked as its own; the agent names it by its **Relay name** or as
+`this`. It needs no mention, and **Agents may** and **Accept prompts from other relays' agents**
+do not apply to it. On this relay an agent can do what *full* allows on a paired one: list and
+read every session here, prompt one, start one, wait for it, answer its question, stop its turn
+and archive it. Switching the setting off closes this relay to the tool again.
+
+**The rules.**
+
+- **Approval once per conversation.** The first time the agent of a conversation wants to start
+  a session here, a question card (**Agent sessions**) shows the provider, the folder or
+  repository and the prompt. **Allow** covers every session that conversation's agent starts
+  later, also after a relay restart; **Deny** refuses that one call. In the *ask* and *plan*
+  relay modes, every other write action still asks, as it does for a paired relay.
+- **At most 4 at work.** Of the sessions one conversation's agent started, 4 may have a turn
+  queued or running at the same time. A fifth is refused until one of them has finished.
+- **One level only.** A session that an agent created, here or from a paired relay, cannot start
+  sessions on this relay.
+- **Not on itself.** An agent cannot prompt, stop, archive, wait for or answer the conversation
+  it runs in.
+- The count of 30 prompts without a message from you (see above) includes prompts to sessions
+  on this relay.
+
+**What it can start.** A session with any provider that is enabled on this relay (Copilot,
+OpenAI, Claude, Cursor, Grok or Claude Cloud; not an OpenAI Image chat): in a folder
+(the relay's default folder when the agent names none), or a [Claude Cloud](#claude-cloud) chat
+with `provider: "claude-cloud"`, `repo` and an optional `branch`. A new session knows nothing of
+the conversation it was started from. Sessions an agent starts use this relay's accounts and
+count against their usage.
+
+**In the conversation list.** A session an agent on this relay started carries **via agent ·
+“title”** in the sidebar and under the title in the header, with the title of the conversation
+the agent runs in; clicking it opens that conversation while it is still in the list. The
+agent's prompts carry the same marker, with its model, as a badge on the message. The relay never
+archives these sessions by itself: they stay in the list until you archive or delete them, or the
+agent archives one with the tool.
+
+**Longest wait per tool call.** The slider under the switch sets how long one `send`,
+`create_session` or `wait` call may wait for a reply: 10 minutes by default, from 2 to 60 minutes
+in steps of one minute. The agent can call `wait` again to keep waiting. The limit also applies
+to this relay's agents when they wait for a session on a paired relay, so the slider can be moved
+whether or not the switch above it is on. A turn that waits is still subject to **Max turn duration**
+under **General** (60 minutes by default), which does not know about the wait.
 
 ## Security notes
 

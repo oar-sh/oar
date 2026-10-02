@@ -45,6 +45,7 @@ import { openClaudeCloudSettingsSection } from './claude-cloud-settings-ui.js';
 import { refreshCliInstallSections } from './cli-install-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
 import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
+import { refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -1707,6 +1708,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshPushSettingsSection();
   void refreshPreviewsSection();
   void refreshRemoteRelaysSection();
+  void refreshAgentSessionsSection();
   void refreshFeatureFlagsSection();
   void refreshUpdateSection();
   modal?.classList.add('visible');

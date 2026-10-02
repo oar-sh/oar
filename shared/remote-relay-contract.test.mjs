@@ -6,16 +6,22 @@ import {
   REMOTE_RELAY_ACTION_PERMISSION,
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_LIMITS,
+  REMOTE_RELAY_PROVIDERS,
+  REMOTE_RELAY_SETTING_KEYS,
+  REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_INPUT_SCHEMA,
   REMOTE_RELAY_TOOL_NAME,
   REMOTE_RELAY_APPROVAL_SOURCE,
+  AGENT_SESSIONS_SOCKET_EVENT,
   checkRemoteRelayUrlPolicy,
   formatRemotePromptHeader,
   isRemoteRelayApprovalQuestion,
   isRemoteRelayWriteAction,
   normalizeRemoteRelayLink,
+  normalizeRemoteRelayMaxWaitSeconds,
   normalizeRemoteRelayOrigin,
   normalizeRemoteRelayPermission,
+  normalizeRemoteRelayRepo,
   remoteConversationUrl,
   remoteRelayPermissionAllows,
   stripRemotePromptHeader,
@@ -72,14 +78,121 @@ test('read_session defaults: last 10, 12000 chars, no activity', () => {
   assert.equal(more.args.include_activity, true);
 });
 
-test('send needs text, waits 120 s by default and never more than 600 s', () => {
+test('send needs text, waits 120 s by default and never more than the ceiling of an hour', () => {
   assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's' }).ok, false);
   const result = validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: ' run the tests ' });
   assert.deepEqual(result.args, { relay: 'r', session: 's', text: 'run the tests', wait_seconds: 120, if_busy: 'queue' });
-  assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: 'x', wait_seconds: 5000 }).args.wait_seconds, 600);
+  // An adapter does not know the relay's setting: it clamps to the ceiling only.
+  assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: 'x', wait_seconds: 5000 }).args.wait_seconds, 3600);
+  assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: 'x', wait_seconds: 900 }).args.wait_seconds, 900);
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.wait_seconds.maximum, 3600);
   assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: 'x', wait_seconds: 0 }).args.wait_seconds, 0);
   assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: 'x', wait_seconds: 'soon' }).ok, false);
   assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: 'x', if_busy: 'panic' }).ok, false);
+});
+
+test('the relay clamps wait_seconds to its own setting and says what was asked for', () => {
+  const send = (wait, maxWaitSeconds) => validateRemoteRelayToolInput(
+    { action: 'send', relay: 'r', session: 's', text: 'x', wait_seconds: wait },
+    { maxWaitSeconds },
+  );
+  const cut = send(5000, 600);
+  assert.equal(cut.args.wait_seconds, 600);
+  assert.equal(cut.waitLimitedFrom, 5000);
+  const within = send(500, 600);
+  assert.equal(within.args.wait_seconds, 500);
+  assert.equal('waitLimitedFrom' in within, false);
+  assert.equal(send(3600, 3600).args.wait_seconds, 3600);
+  assert.equal('waitLimitedFrom' in send(3600, 3600), false);
+  assert.equal(send(2400, 1800).args.wait_seconds, 1800);
+  // A stored setting outside the range is read as the nearest bound, a broken one as the default.
+  assert.equal(send(3000, 99999).args.wait_seconds, 3000);
+  assert.equal(send(3000, 5).args.wait_seconds, 120);
+  assert.equal(send(3000, 'soon').args.wait_seconds, 600);
+  // wait and create_session follow the same limit; other actions carry no wait at all.
+  assert.equal(validateRemoteRelayToolInput({ action: 'wait', relay: 'r', session: 's', message_id: 'm', wait_seconds: 900 }, { maxWaitSeconds: 300 }).args.wait_seconds, 300);
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'r', text: 'x', wait_seconds: 900 }, { maxWaitSeconds: 300 }).waitLimitedFrom, 900);
+  const read = validateRemoteRelayToolInput({ action: 'read_session', relay: 'r', session: 's', wait_seconds: 900 }, { maxWaitSeconds: 300 });
+  assert.equal('wait_seconds' in read.args, false);
+  assert.equal('waitLimitedFrom' in read, false);
+});
+
+test('the longest-wait setting has a range, a step and a default', () => {
+  assert.equal(REMOTE_RELAY_LIMITS.waitMaxSeconds, 600);
+  assert.equal(REMOTE_RELAY_LIMITS.waitMaxFloorSeconds, 120);
+  assert.equal(REMOTE_RELAY_LIMITS.waitMaxCeilingSeconds, 3600);
+  assert.equal(REMOTE_RELAY_LIMITS.waitMaxStepSeconds, 60);
+  assert.equal(REMOTE_RELAY_LIMITS.localActiveSessions, 4);
+  assert.equal(normalizeRemoteRelayMaxWaitSeconds(undefined), 600);
+  assert.equal(normalizeRemoteRelayMaxWaitSeconds(''), 600);
+  assert.equal(normalizeRemoteRelayMaxWaitSeconds('1800'), 1800);
+  assert.equal(normalizeRemoteRelayMaxWaitSeconds(10), 120);
+  assert.equal(normalizeRemoteRelayMaxWaitSeconds(86400), 3600);
+  assert.equal(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled, 'agent_sessions_enabled');
+  assert.equal(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds, 'remote_relay_max_wait_seconds');
+  assert.equal(AGENT_SESSIONS_SOCKET_EVENT, 'agent_sessions_settings_updated');
+});
+
+test('create_session takes repo and branch with provider claude-cloud, and with no other', () => {
+  assert.ok(REMOTE_RELAY_PROVIDERS.includes('claude-cloud'));
+  assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.provider.enum.includes('claude-cloud'));
+  assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.repo);
+  assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.branch);
+  const create = (extra) => validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'fix the banner', ...extra });
+
+  const cloud = create({ provider: 'claude-cloud', repo: 'example-org/sample-repo', branch: 'feature/banner' });
+  assert.equal(cloud.ok, true);
+  assert.equal(cloud.args.repo, 'https://github.com/example-org/sample-repo');
+  assert.equal(cloud.args.branch, 'feature/banner');
+  assert.equal(create({ provider: 'claude-cloud', repo: 'https://github.com/example-org/sample-repo.git' }).args.repo, 'https://github.com/example-org/sample-repo');
+  assert.equal('branch' in create({ provider: 'claude-cloud', repo: 'example-org/sample-repo' }).args, false, 'the branch is optional');
+
+  assert.match(create({ provider: 'claude-cloud' }).error, /needs repo/);
+  assert.match(create({ provider: 'claude-cloud', repo: 'not a repository' }).error, /GitHub repository/);
+  assert.match(create({ provider: 'claude-cloud', repo: 'https://git.example.test/example-org/sample-repo' }).error, /GitHub repository/);
+  assert.match(create({ provider: 'claude-cloud', repo: 'example-org/sample-repo', branch: 'bad..name' }).error, /not a valid branch name/);
+  assert.match(create({ provider: 'claude-cloud', repo: 'example-org/sample-repo', cwd: '/home/dev/work' }).error, /cwd does not apply/);
+  // With any other provider, and with none named, they are a validation error.
+  for (const extra of [{ provider: 'claude' }, { provider: 'github' }, {}]) {
+    assert.match(create({ ...extra, repo: 'example-org/sample-repo' }).error, /provider "claude-cloud" only/);
+    assert.match(create({ ...extra, branch: 'main' }).error, /provider "claude-cloud" only/);
+  }
+  assert.equal(create({ ...{ provider: 'claude' }, repo: 'example-org/sample-repo' }).code, REMOTE_RELAY_ERROR_CODES.invalidInput);
+  // send has no such fields: they are ignored there.
+  assert.equal('repo' in validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text: 'x', repo: 'example-org/sample-repo' }).args, false);
+});
+
+test('a repository is taken as a GitHub URL or as owner/repo', () => {
+  assert.equal(normalizeRemoteRelayRepo('example-org/sample-repo'), 'https://github.com/example-org/sample-repo');
+  assert.equal(normalizeRemoteRelayRepo('github.com/example-org/sample-repo'), 'https://github.com/example-org/sample-repo');
+  assert.equal(normalizeRemoteRelayRepo(['git', 'github.com:example-org/sample-repo.git'].join('@')), 'https://github.com/example-org/sample-repo');
+  assert.equal(normalizeRemoteRelayRepo('sample-repo'), '');
+  assert.equal(normalizeRemoteRelayRepo('example-org/sample-repo/tree/main'), '');
+  assert.equal(normalizeRemoteRelayRepo(''), '');
+});
+
+test('the description tells an agent how to orchestrate sessions on its own relay', () => {
+  for (const part of [
+    /self:true/,
+    /"this"/,
+    /create_session up to 4 sessions/,
+    /approval card once per\s+conversation/,
+    /cannot create sessions itself/,
+    /relay owner's accounts/,
+    /"claude-cloud" with repo/,
+    /self-contained prompt/,
+    /name the branch/,
+    /max set on the relay, default 600/,
+  ]) {
+    assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, part);
+  }
+});
+
+test('the local target has its own error codes', () => {
+  assert.equal(REMOTE_RELAY_ERROR_CODES.localDisabled, 'REMOTE_RELAY_LOCAL_DISABLED');
+  assert.equal(REMOTE_RELAY_ERROR_CODES.nestedSession, 'REMOTE_RELAY_NESTED_SESSION');
+  assert.equal(REMOTE_RELAY_ERROR_CODES.sessionLimit, 'REMOTE_RELAY_SESSION_LIMIT');
+  assert.equal(REMOTE_RELAY_ERROR_CODES.ownSession, 'REMOTE_RELAY_OWN_SESSION');
 });
 
 test('create_session accepts provider, model, cwd, mode and title', () => {
@@ -218,6 +331,18 @@ test('an origin is sanitised: capped strings, no newlines, hops bounded', () => 
   assert.equal(origin.hops, 10);
   assert.equal('extra' in origin, false);
   assert.equal(normalizeRemoteRelayOrigin({ relayId: 'r', hops: -1 }).hops, 1);
+});
+
+test('an origin keeps local: true and nothing else that is truthy there', () => {
+  const local = normalizeRemoteRelayOrigin({ relayId: 'r-1', relayName: 'win-test', conversationId: 'c-1', conversationTitle: 'report builder', hops: 0, local: true });
+  assert.equal(local.local, true);
+  assert.equal(local.hops, 0);
+  assert.equal(local.conversationId, 'c-1');
+  assert.equal(local.conversationTitle, 'report builder');
+  for (const value of ['true', 1, 'yes', {}]) {
+    assert.equal('local' in normalizeRemoteRelayOrigin({ relayName: 'win-test', local: value }), false);
+  }
+  assert.equal('local' in normalizeRemoteRelayOrigin({ relayName: 'win-test' }), false);
 });
 
 test('the prompt header names the relay, the session and the model, and strips cleanly', () => {

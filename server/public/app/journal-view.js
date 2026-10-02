@@ -377,7 +377,8 @@ export function renderConvList() {
       ? `<span class="conv-provider-indicator"${providerIndicatorKey ? ` data-provider="${providerIndicatorKey}"` : ''}>${providerIndicatorLabel}</span>`
       : '';
     // "↗ win-test": another relay's agent created this conversation.
-    const originMarkerHtml = renderConversationOriginMarkerHtml(c);
+    // "via agent · “title”": an agent in that conversation on this relay did.
+    const originMarkerHtml = renderConversationOriginMarkerHtml(c, { conversations });
     return `
     <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}" onclick="openConversation('${c.id}')">
       <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${c.archived ? ' <span style="font-size:0.68rem;color:var(--muted)">(archived)</span>' : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
@@ -439,6 +440,8 @@ export function applyLoadedConversationState(id, response, {
     // An explicit null is a real answer ("not a cloud chat"); only a payload
     // without the field (an older relay) keeps what the list said.
     cloud: 'cloud' in response ? (response.cloud ?? null) : (existingConversation.cloud ?? null),
+    // Who created the conversation, when an agent did (the "via agent" marker).
+    origin: 'origin' in response ? (response.origin ?? null) : (existingConversation.origin ?? null),
     messageCount: Array.isArray(response.messages)
       ? Math.max(existingConversation.messageCount || 0, response.messages.length)
       : (existingConversation.messageCount || 0),
@@ -483,6 +486,23 @@ export function applyLoadedConversationState(id, response, {
   }
   el.scrollTop = el.scrollHeight;
   saveConversationScrollTop(id, el.scrollTop);
+}
+
+// The "via agent" marker (sidebar row, header, message badge): opens the
+// conversation whose agent started this one. The marker sits inside a sidebar
+// row that opens on click itself, so the click stops here.
+export function openOriginConversation(event, element) {
+  event?.stopPropagation?.();
+  event?.preventDefault?.();
+  const id = String(element?.dataset?.originConversationId || '').trim();
+  if (!id) return null;
+  if (!conversations[id]) {
+    // Deleted since the marker was drawn; the next render makes it plain text.
+    showTransientRelayNotice('That conversation is no longer in the list.');
+    renderConvList();
+    return null;
+  }
+  return openConversation(id);
 }
 
 export async function openConversation(id, options = {}) {

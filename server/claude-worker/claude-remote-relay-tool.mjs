@@ -62,6 +62,8 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   provider: choice('provider', REMOTE_RELAY_PROVIDERS),
   model: text('model'),
   cwd: text('cwd'),
+  repo: text('repo'),
+  branch: text('branch'),
   mode: choice('mode', REMOTE_RELAY_MODES),
   effort: text('effort'),
   title: text('title'),

@@ -1437,6 +1437,17 @@
     overflow-wrap: normal;
     word-break: normal;
   }
+  /* An inline formula breaks only between its terms: one long term is a box
+     wider than the bubble and made the whole bubble scroll sideways. It
+     scrolls inside itself instead. */
+  .msg-bubble :not(.katex-display) > .katex {
+    display: inline-block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    vertical-align: bottom;
+    -webkit-overflow-scrolling: touch;
+  }
   .katex-error {
     color: var(--danger);
     white-space: pre-wrap;
@@ -2867,6 +2878,46 @@
     flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: var(--muted); font-size: var(--fs-ui-chip);
   }
+  /* "via agent · “title”": an agent on this relay started the conversation.
+     A button while the conversation it runs in can be opened, a span when it
+     is gone. The title is long, so in the sidebar the date keeps its share. */
+  .conv-origin-marker.conv-origin-agent { max-width: 60%; }
+  button.conv-origin-agent,
+  button.msg-origin-badge {
+    font-family: inherit; cursor: pointer; text-align: left;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  }
+  button.conv-origin-agent {
+    background: none; border: none; padding: 0; margin: 0; line-height: inherit;
+    color: var(--accent);
+  }
+  /* A finger needs more than one line of chip text: the padding grows the
+     button, the negative margin keeps the row's height. */
+  button.conv-origin-marker.conv-origin-agent { padding: 6px 0; margin: -6px 0; }
+  button.conv-origin-agent:hover,
+  button.msg-origin-badge:hover { text-decoration: underline; }
+  button.msg-origin-badge { color: inherit; }
+  #chat-title-origin {
+    display: block; margin-top: 2px; min-width: 0;
+    font-size: var(--fs-meta-xs); line-height: 1.2; color: var(--muted);
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
+  #chat-title-origin[hidden] { display: none; }
+  #chat-title-origin .conv-origin-agent {
+    display: block; max-width: 100%; font-size: inherit;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
+  #chat-title-origin button.conv-origin-agent { padding: 3px 0; }
+  /* Agent sessions (Settings → Relays). The slider spans the row so a thumb
+     has room to travel at phone width, with a taller touch area than the
+     track itself. */
+  #agent-sessions-section[hidden] { display: none; }
+  #agent-sessions-max-wait-slider {
+    width: min(420px, 100%); min-height: 32px; margin: 0; box-sizing: border-box;
+    accent-color: var(--accent); touch-action: pan-y;
+  }
+  #agent-sessions-max-wait-slider:disabled { opacity: 0.5; }
+  #agent-sessions-status { overflow-wrap: anywhere; }
   /* Transcript card: a preview published during this turn, pinned into the
      response bubble. Compact single row; closed previews keep the label but
      lose the dead link. */
@@ -4965,6 +5016,10 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    #chat-title-origin {
+      margin-top: 1px;
+      font-size: clamp(0.62rem, 2vw, 0.7rem);
+    }
     #chat-header-actions {
       margin-left: auto;
     }
@@ -5448,7 +5503,7 @@
     <div id="chat-header">
       <button id="sidebar-toggle" class="header-icon-btn" type="button" title="Toggle conversations sidebar" aria-label="Toggle conversations sidebar">☰</button>
       <div id="chat-title-wrap">
-        <span id="chat-title-slot"><span id="chat-title-primary"><span id="chat-title-watch-indicator" hidden>👁️ </span><span id="chat-title">Select or start a conversation</span></span><span id="chat-title-cwd" hidden></span><span id="chat-title-session-usage" hidden></span></span>
+        <span id="chat-title-slot"><span id="chat-title-primary"><span id="chat-title-watch-indicator" hidden>👁️ </span><span id="chat-title">Select or start a conversation</span></span><span id="chat-title-origin" hidden></span><span id="chat-title-cwd" hidden></span><span id="chat-title-session-usage" hidden></span></span>
         <form id="chat-title-editor" hidden>
           <input id="chat-title-input" type="text" maxlength="120" autocomplete="off" spellcheck="false">
           <button id="chat-title-save-btn" class="chat-title-action-btn" type="submit">Save</button>
@@ -6376,6 +6431,42 @@
           >
         </div>
         <div class="settings-help" style="margin-top: 6px;">When off, agents on paired relays can still read sessions here, but cannot send prompts, start sessions, answer questions or stop turns. The relay token stays the real boundary: anyone holding it has full access.</div>
+        <!-- Agent sessions (agent-sessions-settings-ui.js). Hidden until the relay
+             answers with settings; a relay without the route never shows it. -->
+        <div id="agent-sessions-section" hidden>
+          <div class="settings-row settings-row-column" style="margin-top: 16px; margin-bottom: 0;">
+            <label>Agent sessions</label>
+          </div>
+          <div class="settings-row" style="margin-top: 6px; margin-bottom: 0;">
+            <label for="agent-sessions-enabled-toggle" style="font-weight: normal;">Agents may start and use sessions on this relay</label>
+            <input
+              id="agent-sessions-enabled-toggle"
+              type="checkbox"
+              onchange="toggleAgentSessions(this.checked)"
+              aria-label="Agents may start and use sessions on this relay"
+              disabled
+            >
+          </div>
+          <div class="settings-help" style="margin-top: 6px;">Sessions an agent starts use this relay's accounts. The first one in a conversation asks for your approval. <span id="agent-sessions-cap" hidden></span></div>
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="agent-sessions-max-wait-slider">Longest wait per tool call <span id="agent-sessions-max-wait-value">10 min</span></label>
+            <input
+              id="agent-sessions-max-wait-slider"
+              type="range"
+              min="120"
+              max="3600"
+              step="60"
+              value="600"
+              aria-label="Longest wait per tool call"
+              aria-valuetext="10 min"
+              oninput="previewAgentSessionsMaxWait(this.value)"
+              onchange="saveAgentSessionsMaxWait(this.value)"
+              disabled
+            >
+          </div>
+          <div class="settings-help" style="margin-top: 6px;">How long an agent may wait for a session in one call, on this relay or a paired one. It can call again to keep waiting.</div>
+          <div id="agent-sessions-status" class="settings-help settings-provider-status" style="margin-top: 6px;" role="status" aria-live="polite" hidden></div>
+        </div>
         <div id="remote-relays-list-section" class="settings-row settings-row-column" style="margin-top: 16px; margin-bottom: 0;">
           <label>Remote relays</label>
           <div id="remote-relays-list"></div>

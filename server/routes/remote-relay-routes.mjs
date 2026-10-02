@@ -42,12 +42,15 @@ export function registerRemoteRelayRoutes(app, deps) {
     });
   });
 
-  // Workers ask at start whether to register the remote_relay tool at all.
+  // Workers ask at start whether to register the remote_relay tool at all:
+  // when a relay is paired (`count`), or when this relay's own sessions are
+  // open to its agents (`localEnabled`, the local target).
   app.get('/api/remote-relays/summary', auth, (_req, res) => {
     const relays = registry.listPublic();
     res.json({
       count: relays.length,
       online: relays.filter((relay) => relay.lastStatus === 'online').length,
+      localEnabled: registry.getAgentSessionsSettings?.().enabled === true,
     });
   });
 
@@ -109,6 +112,17 @@ export function registerRemoteRelayRoutes(app, deps) {
 
   app.post('/api/settings/remote-relays', auth, (req, res) => {
     sendResult(res, registry.setSelfSettings(req.body || {}));
+  });
+
+  // Agent sessions: whether this relay's agents may start and use sessions on
+  // it, and the longest wait of one tool call. POST takes
+  // `{ enabled?, maxWaitSeconds? }` and answers the GET shape plus `ok`.
+  app.get('/api/settings/agent-sessions', auth, (_req, res) => {
+    res.json(registry.getAgentSessionsSettings());
+  });
+
+  app.post('/api/settings/agent-sessions', auth, (req, res) => {
+    sendResult(res, registry.setAgentSessionsSettings(req.body || {}));
   });
 
   // PATCH /api/remote-relays/:id — { permission, url, token, tokenMode }.

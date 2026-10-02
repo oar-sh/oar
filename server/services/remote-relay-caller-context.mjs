@@ -33,6 +33,8 @@ import { sanitizeRelayQuestionContext } from './relay-question-context.mjs';
 
 const LOG_PREFIX = '[remote-relays]';
 const APPROVAL_HEADER = 'Remote relay';
+// The once-per-conversation card for sessions an agent starts on this relay.
+const LOCAL_SESSIONS_HEADER = 'Agent sessions';
 const APPROVAL_ALLOW = 'Allow';
 const APPROVAL_DENY = 'Deny';
 const EXCERPT_MAX = 200;
@@ -116,20 +118,44 @@ function describeRemoteTurn(action, args, caller) {
 }
 
 /**
+ * What a session an agent starts on this relay works on, for the card: the
+ * repository (and branch) of a Claude Cloud session, else the folder, else
+ * the relay's default folder.
+ */
+function describeLocalSessionTarget(args) {
+  const repo = toText(args.repo).replace(/^https?:\/\/(?:www\.)?github\.com\//i, '');
+  if (repo) return toText(args.branch) ? `${excerpt(repo)}, branch ${excerpt(args.branch)}` : excerpt(repo);
+  return toText(args.cwd) ? excerpt(args.cwd) : 'the default folder';
+}
+
+/**
  * The card text: what the agent wants to do where, how the remote turn would
  * run, then the prompt (or the answer) it wants to send, so the user decides
  * on the actual words. `caller` is the calling session's context.
+ *
+ * `localSessions` is the once-per-conversation card of the local target: the
+ * agent wants to start sessions on this relay itself. Allowing it covers the
+ * later ones of that conversation, so the card says what they cost.
  */
-export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null, agentPrompts = 0 } = {}) {
+export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null, agentPrompts = 0, localSessions = false } = {}) {
+  const local = relay?.local === true;
   const name = toText(relay?.name) || 'a remote relay';
+  const where = local ? 'this relay' : `relay "${name}"`;
   const verb = APPROVAL_VERBS[action] || toText(action).replace(/_/g, ' ') || 'act';
   const target = args.session ? ` (session ${shortId(args.session)})` : '';
   const lines = [];
   // The loop guard's card: agents that prompt each other without the user.
   if (agentPrompts > 0) {
-    lines.push(`The agent has sent ${agentPrompts} prompts to agents on other relays since your last message. Let it go on?`);
+    lines.push(`The agent has sent ${agentPrompts} prompts to ${local ? 'other agents' : 'agents on other relays'} since your last message. Let it go on?`);
   }
-  lines.push(`Allow the agent to ${verb} on relay "${name}"${target}?`);
+  if (localSessions) {
+    const requested = toText(args.provider).toLowerCase();
+    const callerProvider = toText(caller?.provider).toLowerCase();
+    const provider = requested || (REMOTE_RELAY_PROVIDERS.includes(callerProvider) ? callerProvider : 'github');
+    lines.push(`This agent wants to start sessions on this relay (${provider}, ${describeLocalSessionTarget(args)}). Sessions it starts use this relay's accounts.`);
+  } else {
+    lines.push(`Allow the agent to ${verb} on ${where}${target}?`);
+  }
   if (action === 'send' || action === 'create_session') {
     const details = describeRemoteTurn(action, args, caller);
     if (details) lines.push(details);
@@ -288,31 +314,44 @@ export function createRemoteRelayCallerContext({
    * `agentPrompts` (the loop guard) is how many prompts the agent has sent to
    * other relays' agents since the user last wrote; the card then asks for
    * that, in any relay mode.
+   * `localSessions` makes it the card for starting sessions on this relay
+   * itself, asked once per conversation (the dispatcher remembers the Allow).
    */
-  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal, agentPrompts = 0 } = {}) {
+  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal, agentPrompts = 0, localSessions = false } = {}) {
     const rowId = toText(callerContext?.processingRowId);
     const row = rowId ? getQueueRow.get(rowId) : null;
     if (!row || row.status !== 'processing') {
       return {
         approved: false,
         code: REMOTE_RELAY_ERROR_CODES.noTurn,
-        error: 'This write action needs the user\'s approval, but the conversation has no running turn to ask on.',
+        error: localSessions
+          ? 'Starting sessions on this relay needs the user\'s approval once per conversation, but the conversation has no running turn to ask on.'
+          : 'This write action needs the user\'s approval, but the conversation has no running turn to ask on.',
       };
     }
 
     const createdAt = now().toISOString();
     const questionId = String(uuid());
     const relayMode = normalizeMode(row.relay_mode);
-    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts });
+    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts, localSessions });
+    const local = relay?.local === true;
+    let rationale = `Write actions on ${local ? 'other sessions of this relay' : 'other relays'} need approval in ${relayMode} mode.`;
+    if (agentPrompts > 0) {
+      rationale = local
+        ? 'Agents that keep prompting each other need your go from time to time.'
+        : 'Agents on different relays that keep prompting each other need your go from time to time.';
+    } else if (localSessions) {
+      rationale = 'Allow covers every session this conversation\'s agent starts on this relay; Deny refuses this one.';
+    }
+    // The same source for every card of this tool: it is what keeps agents
+    // (other relays' and this relay's own) from seeing or answering one.
     const context = sanitizeRelayQuestionContext({
       source: REMOTE_RELAY_APPROVAL_SOURCE,
-      rationale: agentPrompts > 0
-        ? 'Agents on different relays that keep prompting each other need your go from time to time.'
-        : `Write actions on other relays need approval in ${relayMode} mode.`,
+      rationale,
       queueMessageId: row.id,
       conversationId: toText(conversationId) || row.conversation_id,
       relayMode,
-      header: APPROVAL_HEADER,
+      header: localSessions ? LOCAL_SESSIONS_HEADER : APPROVAL_HEADER,
     }, { normalizeRelayMode: normalizeMode, defaultRelayMode });
     questionStatements.insertQuestion.run(
       questionId,

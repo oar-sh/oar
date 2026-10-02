@@ -78,3 +78,15 @@ test('preserves TeX escapes that Markdown would otherwise consume', () => {
   );
   assert.equal(normalizeMathDelimiters('`$\\eta_{\\%}$`'), '`$\\eta_{\\%}$`');
 });
+
+test('prices do not open dollar maths: the text between two prices is left as it is', () => {
+  // Backslashes between the two signs would be doubled if the pair counted as a formula.
+  const prices = 'This run: $5.95, see docs\\_old. The earlier one: $5.93.';
+  assert.equal(normalizeMathDelimiters(prices), prices);
+  // TeX-style parentheses after a price are still converted: the price opened nothing.
+  assert.equal(normalizeMathDelimiters('It costs $5 and \\(x^2\\) is the area, for $9.'), 'It costs $5 and $x^2$ is the area, for $9.');
+});
+
+test('real dollar maths keeps its escape protection next to a price', () => {
+  assert.equal(normalizeMathDelimiters('For $7 you get $a\\,b$ here.'), 'For $7 you get $a\\\\,b$ here.');
+});

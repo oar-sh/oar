@@ -243,7 +243,7 @@ test('error mapping: parsed detail objects, 404 and transport failures', () => {
   assert.deepEqual(transport, { ok: false, code: REMOTE_RELAY_CALL_FAILED, error: 'fetch failed' });
 });
 
-test('registration: only a positive remote count registers the tool', async () => {
+test('registration: a paired relay or the local target registers the tool, nothing else does', async () => {
   const seen = [];
   const decide = (reply) => shouldRegisterRemoteRelayTool({
     api: async (method, path) => {
@@ -257,6 +257,10 @@ test('registration: only a positive remote count registers the tool', async () =
   assert.equal(await decide({}), false);
   assert.equal(await decide(null), false);
   assert.equal(await decide({ count: 'many' }), false);
+  // No relay is paired, but this relay's own sessions are open to its agents.
+  assert.equal(await decide({ count: 0, online: 0, localEnabled: true }), true);
+  assert.equal(await decide({ count: 0, online: 0, localEnabled: false }), false);
+  assert.equal(await decide({ count: 0, localEnabled: 'true' }), false, 'only the boolean counts');
   assert.equal(await decide(new Error('HTTP 404')), false, 'an older relay without the route fails closed');
   assert.deepEqual([...new Set(seen)], [`GET ${REMOTE_RELAY_SUMMARY_PATH}`]);
   assert.equal(await shouldRegisterRemoteRelayTool({}), false, 'no api, no tool');

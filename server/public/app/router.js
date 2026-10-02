@@ -6,6 +6,7 @@ import {
   WORKSPACE_FILE_EXTENSIONS,
   serverPlatform,
 } from './store.js';
+import { scanInlineDollars, splitAtLiteralDollars } from './math-dollars.mjs';
 
 export function workspaceMentionRegex() {
   return /(?:[A-Za-z]:[\\/])?(?:\.{1,2}[\\/])?(?:[A-Za-z0-9._-]+[\\/])*[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,16}/g;
@@ -397,7 +398,8 @@ function normalizeInlineMathDelimiters(line) {
   let output = '';
   let index = 0;
   let inCode = false;
-  let inDollarMath = false;
+  // Only real dollar maths is skipped over; a price's `$` opens nothing.
+  const dollarMathEnds = new Map(scanInlineDollars(line).spans);
 
   while (index < line.length) {
     const char = line[index];
@@ -412,15 +414,10 @@ function normalizeInlineMathDelimiters(line) {
       index += 1;
       continue;
     }
-    if (char === '$' && line[index - 1] !== '\\') {
-      inDollarMath = !inDollarMath;
-      output += char;
-      index += 1;
-      continue;
-    }
-    if (inDollarMath) {
-      output += char;
-      index += 1;
+    if (char === '$' && dollarMathEnds.has(index)) {
+      const closeIndex = dollarMathEnds.get(index);
+      output += line.slice(index, closeIndex + 1);
+      index = closeIndex + 1;
       continue;
     }
     if (char === '\\' && line[index + 1] === '(') {
@@ -469,6 +466,7 @@ function protectMarkdownEscapesInMath(source) {
     let output = '';
     let index = 0;
     let inCode = false;
+    const dollarMathEnds = new Map(scanInlineDollars(line).spans);
     while (index < line.length) {
       if (line[index] === '`') {
         inCode = !inCode;
@@ -482,7 +480,10 @@ function protectMarkdownEscapesInMath(source) {
         continue;
       }
       const delimiter = line[index + 1] === '$' ? '$$' : '$';
-      const closeIndex = line.indexOf(delimiter, index + delimiter.length);
+      // A single `$` that is a plain dollar sign (a price) opens no formula.
+      const closeIndex = delimiter === '$'
+        ? (dollarMathEnds.has(index) ? dollarMathEnds.get(index) : -1)
+        : line.indexOf(delimiter, index + delimiter.length);
       if (closeIndex < 0) {
         output += line[index];
         index += 1;
@@ -550,6 +551,40 @@ export function normalizeMathDelimiters(source) {
   return protectMarkdownEscapesInMath(normalized.join('\n'));
 }
 
+const MATH_IGNORED_TAGS = ['pre', 'code', 'script', 'style', 'textarea', 'option', 'a'];
+const LITERAL_DOLLAR_CLASS = 'literal-dollar';
+
+/**
+ * KaTeX's auto-render pairs any two `$` in a block, so "$5 … $9" would become
+ * one formula. Each plain dollar sign (see math-dollars.mjs) is moved into a
+ * span of its own that auto-render skips; with no partner in its text node,
+ * it stays a dollar sign.
+ */
+function isolateLiteralDollars(container) {
+  const ignored = MATH_IGNORED_TAGS.join(',');
+  const walker = document.createTreeWalker(container, 4 /* NodeFilter.SHOW_TEXT */);
+  const textNodes = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeValue.includes('$') && !node.parentElement?.closest(ignored)) textNodes.push(node);
+  }
+  for (const node of textNodes) {
+    const parts = splitAtLiteralDollars(node.nodeValue);
+    if (!parts.some((part) => part.literal)) continue;
+    const fragment = document.createDocumentFragment();
+    for (const part of parts) {
+      if (!part.literal) {
+        fragment.appendChild(document.createTextNode(part.text));
+        continue;
+      }
+      const span = document.createElement('span');
+      span.className = LITERAL_DOLLAR_CLASS;
+      span.textContent = part.text;
+      fragment.appendChild(span);
+    }
+    node.parentNode.replaceChild(fragment, node);
+  }
+}
+
 function renderMathInHtml(html) {
   const renderMathInElement = globalThis.renderMathInElement;
   if (typeof renderMathInElement !== 'function' || !globalThis.document?.createElement) return html;
@@ -557,6 +592,7 @@ function renderMathInHtml(html) {
   const container = document.createElement('div');
   container.innerHTML = html;
   try {
+    isolateLiteralDollars(container);
     renderMathInElement(container, {
       delimiters: [
         { left: '$$', right: '$$', display: true },
@@ -564,7 +600,8 @@ function renderMathInHtml(html) {
         { left: '\\(', right: '\\)', display: false },
         { left: '$', right: '$', display: false },
       ],
-      ignoredTags: ['pre', 'code', 'script', 'style', 'textarea', 'option', 'a'],
+      ignoredTags: MATH_IGNORED_TAGS,
+      ignoredClasses: [LITERAL_DOLLAR_CLASS],
       throwOnError: false,
       strict: 'ignore',
       trust: false,

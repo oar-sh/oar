@@ -104,6 +104,41 @@ test('the zod mirror takes an effort as free text and the handler passes it on',
   assert.equal(stub.calls.length, 1, 'a malformed effort never reaches the relay');
 });
 
+test('the zod mirror takes repo and branch, and the handler sends a cloud create to this relay with them', async () => {
+  for (const field of ['repo', 'branch']) {
+    assert.ok(REMOTE_RELAY_TOOL_ZOD_SHAPE[field], `${field} is part of the shape`);
+    assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE[field].safeParse(undefined).success, true);
+  }
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.provider.safeParse('claude-cloud').success, true);
+
+  const stub = recordingApi({ ok: true, status: 'queued' });
+  const definition = createRemoteRelayToolDefinition({ api: stub.api, getConversationId: () => 'conv-1' });
+  await definition.handler({
+    action: 'create_session',
+    relay: 'this',
+    text: 'Fix the sample banner on feature/banner and push it.',
+    provider: 'claude-cloud',
+    repo: 'example-org/sample-repo',
+    branch: 'feature/banner',
+    wait_seconds: 3000,
+  }, {});
+  assert.deepEqual(stub.calls[0].body.args, {
+    relay: 'this',
+    text: 'Fix the sample banner on feature/banner and push it.',
+    wait_seconds: 3000,
+    provider: 'claude-cloud',
+    repo: 'https://github.com/example-org/sample-repo',
+    branch: 'feature/banner',
+  });
+
+  const refused = JSON.parse((await definition.handler(
+    { action: 'create_session', relay: 'this', text: 'x', provider: 'claude', repo: 'example-org/sample-repo' },
+    {},
+  )).content[0].text);
+  assert.equal(refused.code, 'REMOTE_RELAY_INVALID_INPUT');
+  assert.equal(stub.calls.length, 1, 'repo with another provider never reaches the relay');
+});
+
 test('the handler forwards the call with the live conversation id and returns pretty JSON text', async () => {
   const reply = { ok: true, relays: [{ name: 'linux-test', unlocked: false }], summary: 'list_relays' };
   const stub = recordingApi(reply);

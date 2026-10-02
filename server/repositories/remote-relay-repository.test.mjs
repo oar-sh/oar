@@ -81,3 +81,73 @@ test('a damaged origin column reads as no origin', () => {
   assert.equal(parseRemoteRelayOriginJson(null), null);
   assert.equal(parseRemoteRelayOriginJson('{"relayName":"win-test"}').relayName, 'win-test');
 });
+
+test('the Allow for starting sessions on this relay is remembered per conversation, like an unlock', () => {
+  const { repo } = setup();
+  assert.equal(repo.hasLocalSessionApproval('c-1'), false);
+  assert.equal(repo.recordLocalSessionApproval('c-1', 'm-1', '2026-09-20T10:00:01.000Z'), true);
+  assert.equal(repo.recordLocalSessionApproval('c-1', 'm-2', '2026-09-20T10:00:02.000Z'), false, 'given once');
+  assert.equal(repo.hasLocalSessionApproval('c-1'), true);
+  assert.equal(repo.hasLocalSessionApproval('c-2'), false, 'per conversation');
+  assert.equal(repo.recordLocalSessionApproval('', 'm-1'), false);
+  // Stored under the local target's id, next to the paired relays' unlocks.
+  assert.deepEqual(repo.listUnlocks('c-1'), [{ remoteRelayId: 'self', messageId: 'm-1', createdAt: '2026-09-20T10:00:01.000Z' }]);
+  assert.equal(repo.hasUnlock('c-1', 'r-1'), false, 'it unlocks no paired relay');
+  // Removing a paired relay leaves it; deleting the conversation forgets it.
+  repo.recordUnlock('c-1', 'r-1');
+  repo.forgetRelay('r-1');
+  assert.equal(repo.hasLocalSessionApproval('c-1'), true);
+  repo.forgetConversation('c-1');
+  assert.equal(repo.hasLocalSessionApproval('c-1'), false);
+});
+
+test('a local origin round-trips with its flag and the creating conversation', () => {
+  const { repo } = setup();
+  const origin = { relayId: 'r-self', relayName: 'win-test', conversationId: 'c-0', conversationTitle: 'report builder', hops: 0, local: true };
+  repo.setConversationOrigin('c-1', origin);
+  const stored = repo.getConversationOrigin('c-1');
+  assert.equal(stored.local, true);
+  assert.equal(stored.conversationId, 'c-0');
+  assert.equal(stored.conversationTitle, 'report builder');
+  assert.equal(parseRemoteRelayOriginJson(JSON.stringify(origin)).local, true);
+  repo.setConversationOrigin('c-1', { relayId: 'r-9', relayName: 'linux-test', conversationId: 'c-0', hops: 1 });
+  assert.equal('local' in repo.getConversationOrigin('c-1'), false, 'a paired relay\'s origin has none');
+});
+
+test('active local sessions: created by that conversation here, with a turn queued or running', () => {
+  const { db, repo } = setup();
+  const now = '2026-09-20T10:00:00.000Z';
+  const addConversation = (id, origin, status = 'active') => {
+    db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES (?, 'sidebar polish', ?, ?, ?)`).run(id, status, now, now);
+    if (origin) repo.setConversationOrigin(id, origin);
+  };
+  const addQueueRow = (id, conversationId, status) => {
+    db.prepare(`INSERT INTO queue (id, conversation_id, text, status, timestamp) VALUES (?, ?, 'work', ?, ?)`).run(id, conversationId, status, now);
+  };
+  const local = (conversationId) => ({ relayId: 'r-self', relayName: 'win-test', conversationId, hops: 0, local: true });
+
+  addConversation('s-pending', local('c-1'));
+  addQueueRow('q-1', 's-pending', 'pending');
+  addConversation('s-processing', local('c-1'));
+  addQueueRow('q-2', 's-processing', 'processing');
+  addQueueRow('q-2b', 's-processing', 'pending');
+  addConversation('s-parked', local('c-1'));
+  addQueueRow('q-3', 's-parked', 'parked');
+  addConversation('s-done', local('c-1'));
+  addQueueRow('q-4', 's-done', 'done');
+  addConversation('s-idle', local('c-1'));
+  addConversation('s-other-creator', local('c-2'));
+  addQueueRow('q-5', 's-other-creator', 'processing');
+  // Created from a paired relay by a conversation with the same id there.
+  addConversation('s-remote', { relayId: 'r-9', relayName: 'linux-test', conversationId: 'c-1', hops: 1 });
+  addQueueRow('q-6', 's-remote', 'processing');
+  addConversation('s-deleted', local('c-1'), 'deleted');
+  addQueueRow('q-7', 's-deleted', 'pending');
+  addConversation('s-human', null);
+  addQueueRow('q-8', 's-human', 'processing');
+
+  assert.deepEqual(repo.listActiveLocalSessions('c-1').sort(), ['s-parked', 's-pending', 's-processing']);
+  assert.deepEqual(repo.listActiveLocalSessions('c-2'), ['s-other-creator']);
+  assert.deepEqual(repo.listActiveLocalSessions('c-3'), []);
+  assert.deepEqual(repo.listActiveLocalSessions(''), []);
+});

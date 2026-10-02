@@ -7,6 +7,7 @@ import { RemoteRelayError } from './remote-relay-client.mjs';
 import { applySchema } from '../db-schema.mjs';
 import { createRemoteRelayRepository } from '../repositories/remote-relay-repository.mjs';
 import {
+  AGENT_SESSIONS_SOCKET_EVENT,
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_LIMITS,
   REMOTE_RELAY_SETTING_KEYS,
@@ -442,4 +443,64 @@ test('the health loop runs a first pass immediately by default', async () => {
   assert.equal(client.probes.length, 1, 'the in-flight first pass is shared, not repeated');
   assert.equal(registry.get('rr_1').lastStatus, 'online');
   registry.stopHealthLoop();
+});
+
+test('agent sessions are off by default, wait 600 s at most, and say so in one shape', () => {
+  const { registry, events } = setup();
+  assert.deepEqual(registry.getAgentSessionsSettings(), {
+    enabled: false,
+    maxWaitSeconds: 600,
+    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 },
+    maxActiveSessions: 4,
+  });
+  assert.deepEqual(events, [], 'reading emits nothing');
+});
+
+test('agent sessions settings are stored as JSON values and announced with the read shape', () => {
+  const { registry, store, events } = setup();
+  const saved = registry.setAgentSessionsSettings({ enabled: true, maxWaitSeconds: 1800 });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.enabled, true);
+  assert.equal(saved.maxWaitSeconds, 1800);
+  assert.equal(store.values.get(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled), 'true');
+  assert.equal(store.values.get(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds), '1800');
+  assert.deepEqual(events, [{ event: AGENT_SESSIONS_SOCKET_EVENT, payload: registry.getAgentSessionsSettings() }]);
+  assert.equal('ok' in events[0].payload, false, 'the event carries the GET shape');
+
+  // One field at a time; the other keeps its value.
+  assert.equal(registry.setAgentSessionsSettings({ enabled: false }).maxWaitSeconds, 1800);
+  assert.equal(registry.setAgentSessionsSettings({ maxWaitSeconds: 120 }).enabled, false);
+  assert.equal(events.length, 3);
+});
+
+test('agent sessions settings refuse values outside the range or off the step, and store nothing', () => {
+  const { registry, store, events } = setup();
+  for (const patch of [
+    { enabled: 'true' },
+    { maxWaitSeconds: 119 },
+    { maxWaitSeconds: 3601 },
+    { maxWaitSeconds: 150 },
+    { maxWaitSeconds: '600' },
+    { maxWaitSeconds: Number.NaN },
+    { enabled: true, maxWaitSeconds: 1 },
+  ]) {
+    const refused = registry.setAgentSessionsSettings(patch);
+    assert.equal(refused.ok, false, JSON.stringify(patch));
+    assert.equal(refused.status, 400);
+    assert.match(refused.error, /enabled must be|maxWaitSeconds must be/);
+  }
+  assert.equal(store.values.size, 0);
+  assert.deepEqual(events, []);
+});
+
+test('a stored wait outside the range reads as the nearest bound, a broken one as the default', () => {
+  const read = (value) => setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds]: value } }).registry.getAgentSessionsSettings().maxWaitSeconds;
+  assert.equal(read('9000'), 3600);
+  assert.equal(read('30'), 120);
+  assert.equal(read('"soon"'), 600);
+  assert.equal(read('900'), 900);
+  const on = (value) => setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled]: value } }).registry.getAgentSessionsSettings().enabled;
+  assert.equal(on('true'), true);
+  assert.equal(on('false'), false);
+  assert.equal(on('"maybe"'), false, 'anything but a clear yes is off');
 });

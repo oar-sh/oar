@@ -129,12 +129,14 @@ test('every route is behind auth and static paths come before /:id', () => {
     'GET /api/remote-relays',
     'GET /api/remote-relays/inflight',
     'GET /api/remote-relays/summary',
+    'GET /api/settings/agent-sessions',
     'GET /api/settings/remote-relays',
     'PATCH /api/remote-relays/:id',
     'POST /api/remote-relays',
     'POST /api/remote-relays/:id/check',
     'POST /api/remote-relays/pair',
     'POST /api/remote-relays/tool',
+    'POST /api/settings/agent-sessions',
     'POST /api/settings/remote-relays',
   ]);
   for (const [key, handlers] of app.routes) assert.equal(handlers[0], auth, `${key} starts with auth`);
@@ -179,10 +181,76 @@ test('GET /api/remote-relays lists public entries and the self block, never a to
 
 test('GET /api/remote-relays/summary counts remotes and online ones', async () => {
   const { route, registry } = setup();
-  assert.deepEqual((await callRoute(route('GET /api/remote-relays/summary'))).body, { count: 0, online: 0 });
+  assert.deepEqual((await callRoute(route('GET /api/remote-relays/summary'))).body, { count: 0, online: 0, localEnabled: false });
   registry.add({ name: 'linux-test', url: 'https://relay-b.example.test', lastStatus: 'online' });
   registry.add({ name: 'win-test-2', url: 'https://relay-a.example.test', lastStatus: 'offline' });
-  assert.deepEqual((await callRoute(route('GET /api/remote-relays/summary'))).body, { count: 2, online: 1 });
+  assert.deepEqual((await callRoute(route('GET /api/remote-relays/summary'))).body, { count: 2, online: 1, localEnabled: false });
+});
+
+test('the summary says when this relay itself is open to its agents, with no relay paired', async () => {
+  const { route } = setup();
+  await callRoute(route('POST /api/settings/agent-sessions'), { body: { enabled: true } });
+  assert.deepEqual((await callRoute(route('GET /api/remote-relays/summary'))).body, { count: 0, online: 0, localEnabled: true });
+});
+
+test('agent sessions settings: off and 600 s by default, with the slider\'s range', async () => {
+  const { route } = setup();
+  const read = await callRoute(route('GET /api/settings/agent-sessions'));
+  assert.equal(read.statusCode, 200);
+  assert.deepEqual(read.body, {
+    enabled: false,
+    maxWaitSeconds: 600,
+    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 },
+    maxActiveSessions: 4,
+  });
+});
+
+test('agent sessions settings are saved one field at a time and answer the whole state', async () => {
+  const { route, values } = setup();
+  const post = route('POST /api/settings/agent-sessions');
+  const shape = (enabled, maxWaitSeconds) => ({
+    ok: true,
+    enabled,
+    maxWaitSeconds,
+    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 },
+    maxActiveSessions: 4,
+  });
+
+  const enabled = await callRoute(post, { body: { enabled: true } });
+  assert.equal(enabled.statusCode, 200);
+  assert.deepEqual(enabled.body, shape(true, 600));
+  const longer = await callRoute(post, { body: { maxWaitSeconds: 3600 } });
+  assert.deepEqual(longer.body, shape(true, 3600));
+  assert.deepEqual((await callRoute(post, { body: { enabled: false, maxWaitSeconds: 120 } })).body, shape(false, 120));
+  assert.deepEqual((await callRoute(post, { body: {} })).body, shape(false, 120), 'an empty body changes nothing');
+  assert.equal(values.get(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled), 'false');
+  assert.equal(values.get(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds), '120');
+  const { ok: _ok, ...state } = shape(false, 120);
+  assert.deepEqual((await callRoute(route('GET /api/settings/agent-sessions'))).body, state);
+});
+
+test('agent sessions settings refuse what the slider and the toggle cannot produce', async () => {
+  const { route, values } = setup();
+  const post = route('POST /api/settings/agent-sessions');
+  for (const body of [
+    { enabled: 'yes' },
+    { enabled: 1 },
+    { maxWaitSeconds: 60 },
+    { maxWaitSeconds: 3660 },
+    { maxWaitSeconds: 610 },
+    { maxWaitSeconds: 600.5 },
+    { maxWaitSeconds: '600' },
+    { maxWaitSeconds: null },
+    // One bad field refuses the whole request: nothing is half-saved.
+    { enabled: true, maxWaitSeconds: 5 },
+  ]) {
+    const refused = await callRoute(post, { body });
+    assert.equal(refused.statusCode, 400, JSON.stringify(body));
+    assert.equal(typeof refused.body.error, 'string');
+    assert.ok(refused.body.error.length > 0);
+  }
+  assert.equal(values.has(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled), false);
+  assert.equal(values.has(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds), false);
 });
 
 test('POST /api/remote-relays maps the pairing outcomes to status codes', async () => {

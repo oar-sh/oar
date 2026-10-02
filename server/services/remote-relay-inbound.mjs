@@ -10,10 +10,19 @@
 //   { listRelays, selfNames, inboundEnabled, recordUnlock, describeRelay, repository }
 // Every helper treats a missing one as "feature absent": nothing is remote,
 // nothing unlocks, and the routes behave exactly as before.
+//
+// An agent of THIS relay reaches the same routes through the in-process
+// loopback (remote-relay-loopback.mjs), which marks its requests here. Such a
+// request is an agent's like any other relay's (provenance is stored, approval
+// cards stay hidden, nothing unlocks), with two differences: the inbound
+// switch does not apply to it (the local target has its own setting, which the
+// dispatcher checks), and only it may store an origin with `local: true`.
 
 import {
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_HEADERS,
+  REMOTE_RELAY_LOCAL_ALIAS,
+  REMOTE_RELAY_LOCAL_ID,
   REMOTE_RELAY_TOOL_NAME,
   normalizeRemoteRelayOrigin,
   stripRemotePromptHeader,
@@ -24,6 +33,19 @@ export const REMOTE_INBOUND_DISABLED_RESPONSE = Object.freeze({
   error: 'This relay does not accept prompts from other relays\' agents',
   code: REMOTE_RELAY_ERROR_CODES.inboundDisabled,
 });
+
+// Requests the loopback built. Membership cannot be claimed over HTTP.
+const loopbackRequests = new WeakSet();
+
+/** Marks a request object as built in-process for an agent of this relay. */
+export function markRemoteRelayLoopbackRequest(req) {
+  if (req && typeof req === 'object') loopbackRequests.add(req);
+  return req;
+}
+
+export function isRemoteRelayLoopbackRequest(req) {
+  return !!req && typeof req === 'object' && loopbackRequests.has(req);
+}
 
 function headerValue(req, name) {
   const value = req?.headers?.[name];
@@ -44,8 +66,21 @@ function headerHops(req) {
  * built from the header (its value is the sender's relay id), so a turn an
  * agent started is always recognisable as one. The hop count is the larger of
  * the body's and the X-OAR-Remote-Hops header's.
+ * `local` is true for a request of this relay's own agent (the loopback);
+ * an origin's `local` flag is kept for those alone.
  */
 export function readRemoteRelayRequest(req, inbound, { body = req?.body } = {}) {
+  const facts = readRemoteRelayRequestFacts(req, inbound, body);
+  if (!facts.remote) return facts;
+  const local = isRemoteRelayLoopbackRequest(req);
+  if (facts.origin?.local && !local) {
+    const { local: _claimed, ...origin } = facts.origin;
+    return { remote: true, origin };
+  }
+  return local ? { ...facts, local: true } : facts;
+}
+
+function readRemoteRelayRequestFacts(req, inbound, body) {
   if (!inbound) return { remote: false, origin: null };
   const rawOrigin = body && typeof body === 'object' ? body.origin : undefined;
   const senderRelayId = headerValue(req, REMOTE_RELAY_HEADERS.origin);
@@ -78,7 +113,9 @@ export function remoteRelayInboundEnabled(inbound) {
  */
 export function admitRemoteRelayRequest(req, res, inbound) {
   const request = readRemoteRelayRequest(req, inbound);
-  if (!request.remote || remoteRelayInboundEnabled(inbound)) return request;
+  // The switch is about OTHER relays' agents; this relay's own are let in by
+  // the agent-sessions setting, before the loopback is ever reached.
+  if (!request.remote || request.local || remoteRelayInboundEnabled(inbound)) return request;
   res.status(403).json({ ...REMOTE_INBOUND_DISABLED_RESPONSE });
   return null;
 }
@@ -164,9 +201,13 @@ export function formatRemoteRelayMentionHint(relays = []) {
 /**
  * The paired relay a remote prompt came from: `{ relayId, name }` (`relayId`
  * is the local registry id), or null when the sender is not paired here or
- * names no relay id.
+ * names no relay id. For a prompt from an agent of this relay itself:
+ * `{ relayId, name, local: true }` with the local target's id.
  */
 export function findOriginRemoteRelay(inbound, origin) {
+  if (inbound && origin?.local === true) {
+    return { relayId: REMOTE_RELAY_LOCAL_ID, name: String(origin.relayName || '').trim() || REMOTE_RELAY_LOCAL_ALIAS, local: true };
+  }
   const instance = String(origin?.relayId || '').trim();
   if (!inbound || typeof inbound.listRelays !== 'function' || !instance) return null;
   try {
@@ -188,6 +229,12 @@ export function findOriginRemoteRelay(inbound, origin) {
 export function formatRemoteRelayOriginHint(relay, origin) {
   const name = hintText(relay?.name);
   if (!name) return '';
+  if (relay?.local === true) {
+    const title = hintText(origin?.conversationTitle, 80);
+    return `<system_reminder>This prompt came from an agent in another session on this relay${title ? ` ("${title}")` : ''}, which started or prompted this session for a part of its own task. `
+      + 'Your reply to it is handed back to that agent by itself, so end with the result it needs. '
+      + 'You see nothing of its conversation: work from the prompt alone.</system_reminder>';
+  }
   const session = hintText(origin?.conversationId, 80);
   const where = session ? `relay "${name}", session "${session}"` : `relay "${name}"`;
   return `<system_reminder>This prompt came from an agent on the paired OAR relay "${name}". `

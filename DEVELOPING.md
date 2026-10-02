@@ -199,7 +199,7 @@ Common routes:
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
 - Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`, `/api/git/remote` (the New Chat modal of a Claude Cloud chat)
 - Previews: `/api/previews`, `/api/previews/:token` (publish a local dev server; see `docs/preview-servers.md`)
-- Remote relays: `/api/relay/identity`, `/api/remote-relays`, `/api/remote-relays/:id`, `/api/remote-relays/:id/check`, `/api/remote-relays/pair`, `/api/settings/remote-relays`; agent tool calls go through `/api/remote-relays/tool`, and workers read `/api/remote-relays/summary` and `/api/remote-relays/inflight`
+- Remote relays: `/api/relay/identity`, `/api/remote-relays`, `/api/remote-relays/:id`, `/api/remote-relays/:id/check`, `/api/remote-relays/pair`, `/api/settings/remote-relays`, `/api/settings/agent-sessions`; agent tool calls go through `/api/remote-relays/tool`, and workers read `/api/remote-relays/summary` and `/api/remote-relays/inflight`. With agent sessions on, the relay itself is a target of the tool (its name, or `this`): the dispatcher (`server/services/remote-relay-dispatcher.mjs`) hands such a call to the loopback client (`server/services/remote-relay-loopback.mjs`), which runs it through the relay's own Express handler in-process, with the relay's token and the `x-oar-remote-*` headers. A session an agent creates here therefore goes through the same routes as one a paired relay creates (bootstrap, message, conversation, questions, cancel-turn, archive); the inbound switch does not apply to a loopback request, and it alone may store an origin with `local: true`
 - Uploads: `/api/upload`, `/api/upload/:sha256/content`
 
 All authenticated routes accept either:
@@ -504,6 +504,17 @@ it to (`interrupt`).
 A question card, a `remote_relay` call and a compaction hold the watchdog whatever the phase. What
 bounds a turn that stays quiet and alive is the relay's turn ceiling.
 
+A `remote_relay` call can be quiet for long: `wait_seconds` goes up to the relay's **Longest wait
+per tool call** (`remote_relay_max_wait_seconds`, 600 s by default, 120 to 3600 s), and an
+approval card adds the time the user takes. Nothing on the way cuts that short. The worker's
+request to `/api/remote-relays/tool` is a long call without a client-side timeout
+(`executeRemoteRelayTool`), the MCP adapters allow a tool call 8 hours
+(`REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS`), and the relay does the waiting itself by reading the
+target's transcript every 2 s with short requests (`pollForReply`), so no single request to a
+paired relay or to the loopback stays open for the wait. The turn ceiling does not know about
+the call: with a wait near the maximum and the default ceiling of 60 minutes, the ceiling's
+recovery reaches the calling turn before the wait is over.
+
 ## Branches and landing
 
 `main` is the only permanent branch, and the only one the public repository receives. Everything
@@ -735,7 +746,11 @@ the Copilot SDK engine's accept path, which the shared server's routing pin make
 `GROK_CLI_COMMAND` into its process env and hoists its `PATH` — none of which the shared server's
 other specs should inherit. `tests/claude-cloud.spec.mjs` does it because it needs what the shared
 server forbids: worker launches and session-worker routing, for a real Claude Cloud worker (in a
-tmux server of its own, so the spec is skipped on Windows).
+tmux server of its own, so the spec is skipped on Windows). `tests/agent-sessions.spec.mjs` boots
+two: a plain one, because it switches the agent-sessions setting, and one set up like the cloud
+spec's for a `claude-cloud` session created through the tool (that half is skipped on Windows
+too). It runs no model: it posts to `/api/remote-relays/tool` as a worker's tool adapter would
+and answers the approval card itself.
 Keep that rare: it costs a server boot per relay.
 
 **A test relay must never reach the Anthropic API.** The Claude Cloud client sends the Claude

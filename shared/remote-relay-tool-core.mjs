@@ -41,7 +41,8 @@ export function cloneRemoteRelayToolInputSchema() {
   return JSON.parse(JSON.stringify(REMOTE_RELAY_TOOL_INPUT_SCHEMA));
 }
 
-// How many remotes this relay knows (`{ count }`): the registration decision.
+// How many remotes this relay knows and whether its own sessions are open to
+// agents (`{ count, localEnabled }`): the registration decision.
 export const REMOTE_RELAY_SUMMARY_PATH = '/api/remote-relays/summary';
 // Calls of one conversation the relay is still working on (`{ inflight }`):
 // the Grok inactivity hold, which cannot see the tool call itself.
@@ -62,9 +63,9 @@ export const REMOTE_RELAY_CANCELLED = 'REMOTE_RELAY_CANCELLED';
 export const REMOTE_RELAY_DECISION_TIMEOUT_MS = 5_000;
 
 // A hard ceiling for one tool call on the providers that impose their own
-// (MCP clients). The relay already bounds the wait (wait_seconds ≤ 600) but not
-// the time an approval card may sit unanswered, so this only has to outlast a
-// human, never a remote turn.
+// (MCP clients). The relay already bounds the wait (wait_seconds up to its
+// "longest wait" setting, at most an hour) but not the time an approval card
+// may sit unanswered, so this only has to outlast a human, never a turn.
 export const REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS = 8 * 60 * 60_000;
 
 function toText(value) {
@@ -146,8 +147,9 @@ export function remoteRelayCancelledResult() {
  * contract as executePreviewTool.
  *
  * The call goes out as a long call (`{ longCall: true }`): no client-side
- * timeout at all, because the relay bounds the wait itself (wait_seconds plus
- * approval time) and fetch's 300 s header limit would cut both short.
+ * timeout at all, because the relay bounds the wait itself (wait_seconds,
+ * cut to the relay's own maximum, plus approval time) and fetch's 300 s
+ * header limit would cut both short.
  * `signal` (the provider's cancellation) is the only way to end it early.
  */
 export async function executeRemoteRelayTool(input, { api, conversationId = '', signal = null } = {}) {
@@ -176,7 +178,8 @@ export async function executeRemoteRelayTool(input, { api, conversationId = '', 
 }
 
 /**
- * Whether a worker should register the tool: at least one remote is paired.
+ * Whether a worker should register the tool: at least one remote is paired,
+ * or this relay lets agents start and use sessions on it (the local target).
  * Fails closed — any error, a malformed answer or a slow relay leaves the tool
  * out, and the next worker start asks again.
  */
@@ -188,7 +191,7 @@ export async function shouldRegisterRemoteRelayTool({ api, timeoutMs = REMOTE_RE
       timeoutMs,
       'remote relay summary',
     );
-    return Number(response?.count) > 0;
+    return Number(response?.count) > 0 || response?.localEnabled === true;
   } catch {
     return false;
   }

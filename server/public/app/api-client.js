@@ -588,6 +588,23 @@ export async function updateRemoteRelaySettings(patch = {}) {
   return remoteRelayRequest('/api/settings/remote-relays', { method: 'POST', body });
 }
 
+// ─── Agent sessions (Settings → Relays) ──────────────────────────────────────
+// `{ enabled, maxWaitSeconds, limits, maxActiveSessions }`, with `ok` and
+// `status` as above. A relay without the feature answers 404, which the
+// section reads as "do not show me", so the status has to travel with the
+// answer instead of apiFetch's bare null.
+
+export async function loadAgentSessionsSettings() {
+  return remoteRelayRequest('/api/settings/agent-sessions');
+}
+
+export async function updateAgentSessionsSettings(patch = {}) {
+  const body = {};
+  if (typeof patch.enabled === 'boolean') body.enabled = patch.enabled;
+  if (Number.isFinite(patch.maxWaitSeconds)) body.maxWaitSeconds = patch.maxWaitSeconds;
+  return remoteRelayRequest('/api/settings/agent-sessions', { method: 'POST', body });
+}
+
 export async function loadUpdateState() {
   return apiFetch('/api/update/state');
 }

@@ -37,8 +37,8 @@ All notable changes to OAR are documented here. The format follows
   your message twice; deleting or archiving the chat archives the cloud
   session. Not there: relay modes, a reasoning effort, steering during a
   turn, files other than images and anything else from the relay host, the
-  relay's tools and previews inside the sandbox, OAR's commit attribution,
-  and starting a cloud chat from a paired relay. **Before you switch it on:**
+  relay's tools and previews inside the sandbox, and OAR's commit
+  attribution. **Before you switch it on:**
   the provider uses the Claude CLI's stored login to call the Anthropic API
   endpoints the CLI itself uses. These are not a documented public API and
   may change. OAR only reads the token: it never stores, logs or refreshes
@@ -62,8 +62,37 @@ All notable changes to OAR are documented here. The format follows
   claude.ai-only: no endpoint the CLI's login reaches carries them, so the
   card links to the usage page instead. With Claude Cloud off, the Claude
   card is what it was.
+- **Agent sessions: an agent can hand parts of its task to other sessions on
+  the same relay.** The `remote_relay` tool now also works on the relay the
+  agent runs on: it starts sessions there, waits for them and reads their
+  replies, and each one is an ordinary conversation in your list. Off by
+  default; switch it on in Settings → Relays → Agent sessions (**Agents may
+  start and use sessions on this relay**). No relay has to be paired. The
+  first time the agent of a conversation starts a session, a card asks you
+  once for that conversation. At most 4 sessions it started may be at work at
+  the same time, a session that an agent created cannot start sessions
+  itself, and an agent cannot prompt, stop or archive the conversation it
+  runs in. A session can use any provider that is enabled on the relay
+  (image chats excepted); a Claude Cloud chat is started with the new `repo`
+  and `branch` arguments, and an agent on a paired relay can now start a
+  cloud chat here the same way. Sessions an agent starts use this relay's
+  accounts, show **via agent** with the title of the conversation they came
+  from in the sidebar and the header (a click opens it), and are never
+  archived automatically. The new
+  **Longest wait per tool call** slider in the same place sets how long one
+  call may wait for a reply: 10 minutes as before, up to 60; it applies to
+  waits on paired relays too. See "Agent sessions" in the README.
 
 ### Fixed
+
+- **Two prices in one paragraph were shown as a formula.** In a reply such
+  as `this run cost $4.20, the earlier one $3.80`, everything between the
+  two dollar signs was rendered as maths. A dollar sign now starts a formula
+  only when it is written the way inline maths is: no space after the
+  opening sign, no space before the closing one, and no digit right after
+  it. Prices stay text; `$x^2$` is still maths. A wide inline formula also
+  no longer makes the whole message scroll sideways: it stays inside the
+  bubble and scrolls within itself.
 
 - **Windows: no worker could start once an agent had run a command with an
   arrow or a bullet in it.** Before every launch the relay reads the list of

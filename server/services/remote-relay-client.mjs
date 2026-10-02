@@ -121,6 +121,15 @@ function networkError(relay, error, timeoutMs) {
   );
 }
 
+/**
+ * The error for a relay that answered with a non-2xx status and (maybe) a JSON
+ * body. Shared with the in-process loopback, so a refusal of this relay's own
+ * routes reads exactly like a paired relay's.
+ */
+export function remoteRelayHttpError(relay, status, body) {
+  return httpError(relay, status, body);
+}
+
 function httpError(relay, status, body) {
   const remoteError = isPlainObject(body) && toText(body.error) ? toText(body.error).slice(0, REMOTE_ERROR_TEXT_MAX) : null;
   const remoteCode = isPlainObject(body) && toText(body.code) ? toText(body.code).slice(0, 100) : null;

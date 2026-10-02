@@ -433,3 +433,93 @@ test('the card says how the remote turn would run: mode, provider, model and fol
     'no turn details for actions that start no turn',
   );
 });
+
+// ─── Sessions on this relay itself ───────────────────────────────────────────
+
+const SELF = Object.freeze({ id: 'self', name: 'win-test', url: '', local: true });
+
+test('the once-per-conversation card says what the agent wants to start here and whose accounts pay', async () => {
+  let harness;
+  harness = setup({
+    onSleep: () => {
+      harness.db.prepare(`UPDATE relay_questions SET status = 'answered', answer = 'Allow' WHERE id = 'question-1'`).run();
+    },
+  });
+  const { db, context } = harness;
+  seedConversation(db, { preferredMode: 'agent' });
+  seedTurn(db, { id: 'q-1', mode: 'agent' });
+  const result = await context.requestApproval({
+    conversationId: 'c-1',
+    callerContext: context.getCallerContext('c-1'),
+    relay: SELF,
+    action: 'create_session',
+    args: { provider: 'claude-cloud', repo: 'https://github.com/example-org/sample-repo', branch: 'feature/banner', text: 'Fix the sample banner' },
+    localSessions: true,
+  });
+  assert.deepEqual(result, { approved: true });
+
+  const row = questionRow(db, 'question-1');
+  assert.equal(row.queue_id, 'q-1');
+  assert.deepEqual(JSON.parse(row.choices), ['Allow', 'Deny']);
+  assert.equal(
+    row.prompt,
+    'This agent wants to start sessions on this relay (claude-cloud, example-org/sample-repo, branch feature/banner). Sessions it starts use this relay\'s accounts.'
+      + '\n\nMode: agent · Provider: claude-cloud\n\n“Fix the sample banner”',
+  );
+  const envelope = JSON.parse(row.request);
+  assert.equal(envelope.context.header, 'Agent sessions');
+  assert.equal(envelope.context.source, 'remote_relay', 'agents can neither see nor answer it');
+  assert.match(envelope.context.rationale, /Allow covers every session/);
+  assert.equal(envelope.allowFreeform, false);
+});
+
+test('the card names the folder of a local session, or the default one', () => {
+  const caller = { mode: 'agent', provider: 'claude' };
+  const first = (args) => formatRemoteRelayApprovalPrompt({ relay: SELF, action: 'create_session', args, caller, localSessions: true }).split('\n\n')[0];
+  assert.equal(
+    first({ text: 'x', cwd: '/home/dev/work' }),
+    'This agent wants to start sessions on this relay (claude, /home/dev/work). Sessions it starts use this relay\'s accounts.',
+  );
+  assert.equal(
+    first({ text: 'x', provider: 'cursor' }),
+    'This agent wants to start sessions on this relay (cursor, the default folder). Sessions it starts use this relay\'s accounts.',
+  );
+  assert.equal(
+    first({ text: 'x', provider: 'claude-cloud', repo: 'https://github.com/example-org/sample-repo' }),
+    'This agent wants to start sessions on this relay (claude-cloud, example-org/sample-repo). Sessions it starts use this relay\'s accounts.',
+  );
+});
+
+test('the other cards of the local target say "this relay", not a relay name', () => {
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: SELF, action: 'send', args: { session: 'abcdef123456', text: 'Run it' }, caller: { mode: 'ask' } }),
+    'Allow the agent to send a prompt on this relay (session abcdef12)?\n\nMode: ask\n\n“Run it”',
+  );
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: SELF, action: 'stop', args: {}, agentPrompts: 30 }),
+    'The agent has sent 30 prompts to other agents since your last message. Let it go on?\n\n'
+      + 'Allow the agent to stop the running turn on this relay?',
+  );
+});
+
+test('Deny on the local-sessions card denies; without a running turn it fails closed and says why', async () => {
+  let harness;
+  harness = setup({
+    onSleep: () => {
+      harness.db.prepare(`UPDATE relay_questions SET status = 'answered', answer = 'Deny' WHERE id = 'question-1'`).run();
+    },
+  });
+  const { db, context } = harness;
+  seedConversation(db, { preferredMode: 'agent' });
+  seedTurn(db, { id: 'q-1', mode: 'agent' });
+  const request = { conversationId: 'c-1', relay: SELF, action: 'create_session', args: { text: 'x' }, localSessions: true };
+  assert.deepEqual(await context.requestApproval({ ...request, callerContext: context.getCallerContext('c-1') }), { approved: false });
+
+  const idle = setup();
+  seedConversation(idle.db);
+  const refused = await idle.context.requestApproval({ ...request, callerContext: idle.context.getCallerContext('c-1') });
+  assert.equal(refused.approved, false);
+  assert.equal(refused.code, CODES.noTurn);
+  assert.match(refused.error, /Starting sessions on this relay needs the user's approval once per conversation/);
+  assert.equal(idle.db.prepare(`SELECT COUNT(*) AS n FROM relay_questions`).get().n, 0);
+});

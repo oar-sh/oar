@@ -986,10 +986,12 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | DELETE | `/api/remote-relays/:id` | Remove a paired relay here (the other side keeps its entry) |
 | POST | `/api/remote-relays/:id/check` | Probe a paired relay now |
 | POST | `/api/remote-relays/pair` | (Relay to relay) Another relay introduces itself after the user paired it there |
-| GET | `/api/remote-relays/summary` | (Worker) Number of paired relays; workers register `remote_relay` only when it is above zero |
-| POST | `/api/remote-relays/tool` | (Worker) One `remote_relay` tool call: `{ conversationId, action, args }`. The relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote |
+| GET | `/api/remote-relays/summary` | (Worker) `{ count, online, localEnabled }`: the number of paired relays, how many of them are online, and whether agent sessions are switched on. Workers register `remote_relay` when `count` is above zero or `localEnabled` is `true` |
+| POST | `/api/remote-relays/tool` | (Worker) One `remote_relay` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
 | GET | `/api/remote-relays/inflight` | (Worker) Number of `remote_relay` calls running for `conversationId` |
 | GET/POST | `/api/settings/remote-relays` | This relay's `publicUrl` and `inboundEnabled` (accept prompts from other relays' agents) |
+| GET | `/api/settings/agent-sessions` | Agent sessions: `{ enabled, maxWaitSeconds, limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 }, maxActiveSessions: 4 }`. `enabled` (default `false`) lets this relay's agents start and use sessions on it through `remote_relay`; `maxWaitSeconds` (default `600`) is the longest wait of one `remote_relay` call, for this relay and paired ones |
+| POST | `/api/settings/agent-sessions` | `{ enabled?, maxWaitSeconds? }` → `{ ok: true, …the GET body }`, and the socket event `agent_sessions_settings_updated` with the GET body. `enabled` must be a boolean and `maxWaitSeconds` a whole number of seconds inside `limits` and on its step; anything else is `400` with `{ ok: false, error }` and nothing is stored |
 
 ### Manual relay shutdown / self-restart
 
@@ -1558,6 +1560,10 @@ and on `messages`:
 `0005-remote-relays.mjs` adds `origin_json` to `messages` and `conversations` (provenance of
 prompts and sessions another relay's agent created) and the table
 `conversation_remote_relay_unlocks` (the remote relays the user mentioned per conversation).
+Agent sessions reuse both without a migration of their own: a conversation an agent of this relay
+created stores an origin with `local: true` that names the conversation it was created from, and
+the user's **Allow** for a conversation's agent to start sessions here is a row of that table
+under the relay id `self` (`remote-relay-repository.mjs`).
 
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next
@@ -1609,6 +1615,7 @@ working with the corresponding feature inert rather than crashing at startup.
 | `services/claude-cloud-session-service.mjs` | What the relay keeps per cloud conversation: worker reports, the `cloud` payload field, archiving |
 | `services/claude-account-usage-service.mjs` | Live Claude account usage for Check Usage (only while Claude Cloud is on) |
 | `services/git-remote-service.mjs` | GitHub remote and branch of a folder, for the New Chat modal |
+| `services/remote-relay-loopback.mjs` | The `remote_relay` client for this relay itself (agent sessions): hands the dispatcher's requests to the relay's own HTTP handler in-process instead of opening a connection |
 | `services/claude-session-root-service.mjs` | Resolves the browsable session folder for Claude conversations |
 | `services/context-usage-view.mjs` | Normalizes Copilot and Claude context data into one payload |
 | `services/cloudflared-tunnel-service.mjs` | Supervises the `cloudflared` child process for the Cloudflare Tunnel mode |

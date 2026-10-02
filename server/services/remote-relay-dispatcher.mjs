@@ -5,9 +5,12 @@ import { randomUUID as nodeRandomUUID } from 'crypto';
 import { isFailureNoteText } from '../../shared/failure-note-text.mjs';
 import {
   REMOTE_RELAY_APPROVAL_MODES,
+  REMOTE_RELAY_CLOUD_PROVIDER,
   REMOTE_RELAY_EFFORT_PATTERN,
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_LIMITS,
+  REMOTE_RELAY_LOCAL_ALIAS,
+  REMOTE_RELAY_LOCAL_ID,
   REMOTE_RELAY_PROVIDERS,
   isRemoteRelayApprovalQuestion,
   isRemoteRelayPromptAction,
@@ -31,6 +34,19 @@ import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 //   validate → list_relays (local, no gate) → resolve the relay → mention gate
 //   → permission → hop limit → rate limit → approval (write actions in
 //   ask/plan) → execute against the remote relay's existing API
+//
+// The relay the agent runs on is a target too (the "local target", named by
+// this relay's name or `this`), when its owner switched that on. It needs no
+// pairing, mention, permission or hop; instead:
+//
+//   setting on → no acting on the caller's own conversation → rate limit →
+//   create_session only: one level (a created session creates none), at most
+//   localActiveSessions created sessions at work, the user's Allow once per
+//   conversation → approval (ask/plan) → execute
+//
+// Its actions run through the same code as a paired relay's: `call()` hands
+// them to the loopback client, which reaches this relay's own routes
+// in-process (remote-relay-loopback.mjs).
 //
 // The remote is reached only through the outbound client (auth, origin and
 // hop headers are its job). Reply detection reads the remote's own transcript:
@@ -74,11 +90,15 @@ const TITLE_MAX = 80;
 // The provider settings routes a relay serves; github (Copilot) has none with
 // models — its catalogue is /api/models plus /api/status defaultModel.
 const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai', 'claude-cloud']);
-// A Claude Cloud session clones a GitHub repository, and create_session has
-// no field for one yet: the provider is listed (send, read and stop work on
-// its sessions) but cannot be created from another relay.
-const CLOUD_PROVIDER = 'claude-cloud';
-const CLOUD_CREATE_NOTE = 'create_session cannot open a Claude Cloud session yet (it needs a GitHub repository); its existing sessions take send, wait, read_session and stop.';
+// A Claude Cloud session clones a GitHub repository instead of opening a
+// folder: create_session takes `repo` and `branch` for it.
+const CLOUD_PROVIDER = REMOTE_RELAY_CLOUD_PROVIDER;
+const CLOUD_CREATE_NOTE = 'create_session needs repo (https://github.com/owner/repo or owner/repo) and takes branch instead of cwd. The session works on a fresh clone in a sandbox at Anthropic: write a self-contained prompt and name the branch to work on and to push.';
+// POST /api/conversation/bootstrap refuses a cloud session with this code
+// while the provider is switched off.
+const CLOUD_DISABLED_CODE = 'claude_cloud_disabled';
+// The actions an agent must not aim at the conversation it runs in.
+const OWN_SESSION_ACTIONS = new Set(['send', 'stop', 'archive', 'wait']);
 // How /api/models `providersByModel` names each provider.
 const CATALOG_PROVIDER_LABELS = Object.freeze({
   github: 'github-copilot',
@@ -347,7 +367,7 @@ const PERMISSION_DESCRIPTIONS = Object.freeze({
 });
 
 function relayTarget(relay) {
-  return { id: relay.id, name: relay.name, url: relay.url };
+  return { id: relay.id, name: relay.name, url: relay.url, ...(relay.local ? { local: true } : {}) };
 }
 
 /**
@@ -524,6 +544,12 @@ export function settleRemoteReply(messages, messageId) {
 export function createRemoteRelayDispatcher({
   registry,
   client,
+  // The local target's client (remote-relay-loopback.mjs): same `request` as
+  // `client`, answered by this relay's own routes. Without it the local target
+  // does not exist, whatever the setting says.
+  localClient = null,
+  // `{ enabled, maxWaitSeconds }`: the agent-sessions settings of this relay.
+  getAgentSessionsSettings = () => null,
   repository,
   getCallerContext = async () => null,
   requestApproval = async () => false,
@@ -545,6 +571,13 @@ export function createRemoteRelayDispatcher({
   // counted from the user's latest own message. Kept in memory: a restart
   // ends a loop of agents by itself.
   const agentPromptsByConversation = new Map();
+  // create_session calls on the local target that passed the cap and have not
+  // queued their prompt yet: they count toward it, so parallel calls cannot
+  // slip past together.
+  const localCreatesByConversation = new Map();
+  // The once-per-conversation approval card while it is open: parallel first
+  // creates share the one card and its answer.
+  const localApprovalsByConversation = new Map();
 
   // ─── Bookkeeping ───────────────────────────────────────────────────────────
 
@@ -590,6 +623,41 @@ export function createRemoteRelayDispatcher({
     const fresh = { since, count: 0 };
     agentPromptsByConversation.set(conversationId, fresh);
     return fresh;
+  }
+
+  /** `{ enabled, maxWaitSeconds }`; off and the default wait when unreadable. */
+  function agentSessions() {
+    let settings = null;
+    try {
+      settings = getAgentSessionsSettings() || null;
+    } catch {}
+    const maxWaitSeconds = Number(settings?.maxWaitSeconds);
+    return {
+      enabled: settings?.enabled === true && typeof localClient?.request === 'function',
+      maxWaitSeconds: Number.isFinite(maxWaitSeconds) && maxWaitSeconds > 0
+        ? maxWaitSeconds
+        : REMOTE_RELAY_LIMITS.waitMaxSeconds,
+    };
+  }
+
+  /** This relay as a target: the shape of a registry entry, marked `local`. */
+  async function localTarget() {
+    const self = (await registry.selfIdentity?.()) || {};
+    return {
+      id: REMOTE_RELAY_LOCAL_ID,
+      relayId: toText(self.relayId) || null,
+      name: toText(self.name) || toText(await registry.selfName?.()) || REMOTE_RELAY_LOCAL_ALIAS,
+      url: toText(self.publicUrl),
+      version: toText(self.version) || null,
+      permission: 'full',
+      local: true,
+    };
+  }
+
+  function adjustLocalCreates(conversationId, delta) {
+    const next = (localCreatesByConversation.get(conversationId) || 0) + delta;
+    if (next > 0) localCreatesByConversation.set(conversationId, next);
+    else localCreatesByConversation.delete(conversationId);
   }
 
   function adjustInflight(conversationId, delta) {
@@ -644,7 +712,7 @@ export function createRemoteRelayDispatcher({
   // ─── Remote calls ──────────────────────────────────────────────────────────
 
   function call(ctx, method, path, { query, body, timeoutMs } = {}) {
-    return client.request(ctx.relay, method, path, {
+    return (ctx.relay.local ? localClient : client).request(ctx.relay, method, path, {
       ...(query ? { query: compactQuery(query) } : {}),
       ...(body !== undefined ? { body } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
@@ -702,6 +770,8 @@ export function createRemoteRelayDispatcher({
       provider: ctx.caller.provider,
       model: ctx.caller.model,
       hops: ctx.hops,
+      // The conversation named above lives on the relay that reads this.
+      ...(ctx.relay.local ? { local: true } : {}),
     });
   }
 
@@ -994,12 +1064,18 @@ export function createRemoteRelayDispatcher({
     return {
       summary: `relay_info → ${ctx.relay.name}: OAR ${version || '?'}, providers ${configured.join(', ') || 'none'}`,
       name: toText(identity?.name) || ctx.relay.name,
+      ...(ctx.relay.local ? { self: true } : {}),
       url: ctx.relay.url,
-      openUrl: remoteConversationUrl(ctx.relay.url, ''),
+      openUrl: remoteConversationUrl(ctx.relay.url, '') || null,
       version,
       platform: toText(status.platform) || toText(identity?.platform) || null,
       protocol: remoteRelays ? nonNegativeInt(remoteRelays.protocol) : 0,
-      acceptsAgentPrompts: remoteRelays ? remoteRelays.inbound !== false : null,
+      // The inbound switch is about other relays' agents; this relay's own are
+      // let in by the agent-sessions setting, which is on or this would not run.
+      acceptsAgentPrompts: ctx.relay.local ? true : (remoteRelays ? remoteRelays.inbound !== false : null),
+      ...(ctx.relay.local ? {
+        sessionRules: `create_session: at most ${REMOTE_RELAY_LIMITS.localActiveSessions} sessions you started may work at the same time; a session an agent created cannot create sessions; sessions run on this relay's accounts.`,
+      } : {}),
       providers,
       workspaces: {
         default: toText(status.defaultSessionWorkspaceRootPath) || toText(status.workspaceRootPath) || null,
@@ -1024,9 +1100,11 @@ export function createRemoteRelayDispatcher({
     }
   }
 
-  function mapSession(row, workerIds) {
+  function mapSession(row, workerIds, ctx = null) {
     const id = toText(row?.id);
     const via = toText(row?.origin?.relayName);
+    // A session an agent of that relay created there, and from which session.
+    const createdBy = row?.origin?.local === true ? toText(row.origin.conversationId) : '';
     return {
       id,
       title: toText(row?.title),
@@ -1037,6 +1115,8 @@ export function createRemoteRelayDispatcher({
       messageCount: nonNegativeInt(row?.messageCount),
       cwd: toText(row?.currentWorkspaceRootPath) || null,
       ...(via ? { via } : {}),
+      ...(createdBy ? { createdBy } : {}),
+      ...(createdBy && ctx?.relay?.local && createdBy === ctx.conversationId ? { startedByYou: true } : {}),
     };
   }
 
@@ -1070,7 +1150,7 @@ export function createRemoteRelayDispatcher({
       let consumed = 0;
       for (const row of rows) {
         consumed += 1;
-        if (keep(row)) sessions.push(mapSession(row, workerIds));
+        if (keep(row)) sessions.push(mapSession(row, workerIds, ctx));
         if (sessions.length >= limit) break;
       }
       scanned += consumed;
@@ -1187,7 +1267,7 @@ export function createRemoteRelayDispatcher({
         cwd: toText(conversation?.currentWorkspaceRootPath) || null,
         archived: conversation?.archived === true,
         ...(via ? { via } : {}),
-        openUrl: remoteConversationUrl(ctx.relay.url, conversationId),
+        openUrl: remoteConversationUrl(ctx.relay.url, conversationId) || null,
       },
       messages,
       ...(inFlight ? { inFlight } : {}),
@@ -1318,7 +1398,8 @@ export function createRemoteRelayDispatcher({
   }
 
   async function deliverAndWait(action, ctx, { session, sent, waitSeconds, extra: given = {} }) {
-    const openUrl = remoteConversationUrl(ctx.relay.url, session);
+    // Null for this relay itself while it has no public URL: no link to offer.
+    const openUrl = remoteConversationUrl(ctx.relay.url, session) || null;
     // `extra.note` (how the effort was settled) goes in front of the outcome's own.
     const { note: extraNote, ...extra } = given;
     const result = await deliverOutcome(action, ctx, { session, sent, waitSeconds, extra, openUrl });
@@ -1378,29 +1459,27 @@ export function createRemoteRelayDispatcher({
     const catalog = await loadCatalog(ctx);
     const providers = buildProviders(catalog);
     const configured = providers.filter((entry) => entry.configured).map((entry) => entry.provider);
-    const provider = args.provider || normalizeProvider(ctx.caller.provider) || 'github';
-    if (provider === CLOUD_PROVIDER) {
-      // Refused here rather than by the remote's bootstrap (which would answer
-      // "repository missing"): the agent learns what to do instead.
-      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
-        `A Claude Cloud session clones a GitHub repository, and create_session cannot name one yet. Ask the user to open the chat from New Chat on relay "${ctx.relay.name}" (then use send with its session id), or pass another provider. Providers there: ${configured.filter((name) => name !== CLOUD_PROVIDER).join(', ') || 'none'}.`,
-        { providers: configured.filter((name) => name !== CLOUD_PROVIDER) });
-    }
+    const provider = createProvider(ctx.caller, args);
+    const cloud = provider === CLOUD_PROVIDER;
     const entry = providers.find((candidate) => candidate.provider === provider);
     if (!entry?.configured) {
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.providerUnavailable,
         `Relay "${ctx.relay.name}" has no ${provider} provider set up. Providers there: ${configured.join(', ') || 'none'}. Pass provider to pick one.`,
-        { providers: configured });
+        { providers: configured, ...(cloud && catalog.settings[CLOUD_PROVIDER] ? { remoteCode: CLOUD_DISABLED_CODE } : {}) });
     }
 
     let model = args.model || '';
     let modelSource = model ? 'requested' : '';
     let note = null;
-    if (!model) {
+    // A cloud session without a requested model gets the Claude Cloud tab's
+    // default, as New Chat does: the bootstrap picks it, nothing is mirrored.
+    if (!model && cloud) {
+      modelSource = 'remote default';
+    } else if (!model) {
       model = matchOfferedModel(ctx.caller.model, entry.models);
       modelSource = model ? 'same as this session' : '';
     }
-    if (!model) {
+    if (!model && !cloud) {
       model = entry.defaultModel || entry.models[0] || '';
       modelSource = 'remote default';
       if (toText(ctx.caller.model)) {
@@ -1414,7 +1493,10 @@ export function createRemoteRelayDispatcher({
     // The effort mirrors the caller like the model does: this session's when
     // the remote lists it for the model (or lists nothing), else the remote's.
     let choice = { effort: normalizeEffort(args.effort), source: EFFORT_SOURCES.requested, note: null };
-    if (!choice.effort) {
+    if (!choice.effort && cloud) {
+      // A cloud session takes no effort: none is mirrored, none is reported.
+      choice = { effort: '', source: '', note: null };
+    } else if (!choice.effort) {
       const callerEffort = normalizeEffort(ctx.caller.effort);
       const offered = catalogEffortsFor(catalog.models, provider, model);
       if (callerEffort && (!offered || offered.includes(callerEffort))) {
@@ -1438,6 +1520,9 @@ export function createRemoteRelayDispatcher({
         ...(effort ? { reasoningEffort: effort } : {}),
         title,
         ...(args.cwd ? { cwd: args.cwd } : {}),
+        // What New Chat sends for a Claude Cloud conversation; the bootstrap
+        // validates it and refuses with its own codes.
+        ...(cloud ? { cloudSource: { repoUrl: args.repo, ...(args.branch ? { branch: args.branch } : {}) } } : {}),
         origin,
       },
     });
@@ -1455,7 +1540,8 @@ export function createRemoteRelayDispatcher({
       };
       bootstrap = await bootstrapWith('');
     }
-    choice = settleEffort(ctx, choice, bootstrap?.preferredReasoningEffort);
+    // Nothing to settle for a cloud session that was asked for no effort.
+    if (!cloud || choice.effort) choice = settleEffort(ctx, choice, bootstrap?.preferredReasoningEffort);
     const session = toText(bootstrap?.conversationId);
     if (!session) {
       throw new DispatchFailure(502, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}502`,
@@ -1464,7 +1550,11 @@ export function createRemoteRelayDispatcher({
     const boundModel = toText(bootstrap?.selectedModel) || model;
     let sent;
     try {
-      ({ sent, choice } = await postPromptWithEffort(ctx, { session, text: args.text, origin, model: boundModel, mode }, choice));
+      const posted = await postPromptWithEffort(ctx, { session, text: args.text, origin, model: boundModel, mode }, choice);
+      sent = posted.sent;
+      if (!cloud || choice.effort) choice = posted.choice;
+      // From here the new session's queued turn counts toward the cap itself.
+      ctx.onPromptQueued?.();
     } catch (error) {
       if (!choice.effort || !isEffortRejection(error)) throw error;
       // The session exists by now: say so, or the agent starts a second one.
@@ -1476,7 +1566,7 @@ export function createRemoteRelayDispatcher({
           session,
           ...(remoteCode ? { remoteCode } : {}),
           ...(supported.length ? { supportedEfforts: supported } : {}),
-          openUrl: remoteConversationUrl(ctx.relay.url, session),
+          openUrl: remoteConversationUrl(ctx.relay.url, session) || null,
           note: 'Use send with this session and an effort it takes (or none); do not create another session.',
         });
     }
@@ -1490,11 +1580,43 @@ export function createRemoteRelayDispatcher({
         modelSource,
         mode: toText(bootstrap?.preferredRelayMode) || mode || null,
         title,
+        ...(cloud ? { repo: toText(bootstrap?.cloud?.repoUrl) || args.repo, branch: toText(bootstrap?.cloud?.branch) || args.branch || null } : {}),
         ...(toText(bootstrap?.workspaceRootWarning) ? { cwdWarning: toText(bootstrap.workspaceRootWarning) } : {}),
         ...(note ? { modelNote: note } : {}),
         ...effortResult(choice),
       },
     });
+  }
+
+  /** The provider a new session gets: the one asked for, else the calling session's. */
+  function createProvider(caller, args) {
+    return args.provider || normalizeProvider(caller?.provider) || 'github';
+  }
+
+  /**
+   * What is wrong with a create_session call that only the calling session
+   * reveals, or null. Checked before anyone is asked for approval: a card for
+   * a call that cannot run would be a question about nothing.
+   */
+  function createSessionProblem(caller, args) {
+    if (createProvider(caller, args) === CLOUD_PROVIDER && !args.repo) {
+      // The provider came from the calling session (the validator requires
+      // repo when the call names claude-cloud itself).
+      return `This session's provider is ${CLOUD_PROVIDER}, which a new session gets by default, and a Claude Cloud session needs repo (https://github.com/owner/repo or owner/repo). Pass repo (and branch), or pass another provider (relay_info lists them).`;
+    }
+    return null;
+  }
+
+  /** Whether `session` (a conversation or session id on this relay) is the caller's own conversation. */
+  function isOwnConversation(ctx, session) {
+    const id = toText(session);
+    if (!id) return false;
+    if (id === ctx.conversationId) return true;
+    try {
+      return toText(resolveConversationId(id)) === ctx.conversationId;
+    } catch {
+      return false;
+    }
   }
 
   /** The answer body the remote's answer route expects for this question. */
@@ -1535,6 +1657,11 @@ export function createRemoteRelayDispatcher({
         `Question ${args.question_id} was not found on relay "${ctx.relay.name}".`);
     }
     const session = toText(question.conversationId) || null;
+    if (ctx.relay.local && session && isOwnConversation(ctx, session)) {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.ownSession,
+        `Question ${args.question_id} belongs to this conversation itself; an agent cannot answer its own question. It is the user's to answer.`,
+        { session });
+    }
     if (isRemoteRelayApprovalQuestion(question)) {
       throw new DispatchFailure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
         `Question ${args.question_id} is relay "${ctx.relay.name}"'s approval of its own agent's call to another relay; only its user can answer it.`,
@@ -1649,6 +1776,8 @@ export function createRemoteRelayDispatcher({
 
   async function listRelays(conversationId) {
     const relays = (await registry.list()) || [];
+    const settings = agentSessions();
+    const local = settings.enabled ? await localTarget() : null;
     const listed = relays.map((relay) => ({
       name: relay.name,
       url: relay.url,
@@ -1657,6 +1786,10 @@ export function createRemoteRelayDispatcher({
       permission: relay.permission,
       unlocked: relayAccess(conversationId, relay) !== null,
     }));
+    // This relay itself comes first: no address, always online, never locked.
+    if (local) {
+      listed.unshift({ name: local.name, self: true, online: true, version: local.version, permission: 'full', unlocked: true });
+    }
     const unlocked = listed.filter((relay) => relay.unlocked).length;
     return {
       status: 200,
@@ -1665,21 +1798,155 @@ export function createRemoteRelayDispatcher({
         summary: `list_relays: ${listed.length} relay${listed.length === 1 ? '' : 's'}, ${unlocked} unlocked`,
         self: { name: (await registry.selfName?.()) || null },
         relays: listed,
-        hint: 'The user unlocks a relay by mentioning @name in the chat; a relay whose agent wrote to this conversation is open as well.',
+        limits: {
+          maxWaitSeconds: settings.maxWaitSeconds,
+          ...(local ? { maxActiveSessions: REMOTE_RELAY_LIMITS.localActiveSessions } : {}),
+        },
+        hint: 'The user unlocks a relay by mentioning @name in the chat; a relay whose agent wrote to this conversation is open as well.'
+          + (local
+            ? ` The relay marked self is the one you run on: name it (or "${REMOTE_RELAY_LOCAL_ALIAS}") to start and use sessions here, no mention needed. At most ${REMOTE_RELAY_LIMITS.localActiveSessions} sessions you started may work at the same time, and they run on this relay's accounts.`
+            : ''),
       },
     };
   }
 
-  async function runRelayAction({ conversationId, action, args, req, signal }) {
-    const resolved = await registry.resolve(args.relay);
-    if (!resolved?.relay) {
-      const names = Array.isArray(resolved?.names) ? resolved.names : [];
-      const error = resolved?.error === 'ambiguous'
-        ? `"${args.relay}" matches several relays (${names.join(', ')}); use the full name.`
-        : `No paired relay is called "${args.relay}". Known relays: ${names.join(', ') || 'none'}.`;
-      return failure(404, REMOTE_RELAY_ERROR_CODES.unknown, error, { relays: names });
+  /**
+   * The relay a call names: `{ relay }` (a registry entry, or the local
+   * target), or `{ failure }`. "this" always means the relay the agent runs
+   * on; its name does too, unless a paired relay answers to that name.
+   */
+  async function resolveTarget(name) {
+    const query = toText(name).replace(/^@/, '').toLowerCase();
+    const settings = agentSessions();
+    const alias = query === REMOTE_RELAY_LOCAL_ALIAS;
+    const resolved = alias ? null : await registry.resolve(name);
+    if (resolved?.relay) return { relay: resolved.relay };
+    const selfName = toText(await registry.selfName?.());
+    if (alias || (resolved?.error !== 'ambiguous' && selfName && selfName.toLowerCase() === query)) {
+      if (!settings.enabled) {
+        return {
+          failure: failure(403, REMOTE_RELAY_ERROR_CODES.localDisabled,
+            'Agents may not start or use sessions on this relay: its setting "Agents may start and use sessions on this relay" (Settings → Relays → Agent sessions) is off. Ask the user to turn it on; do not retry until then.',
+            { relay: selfName || REMOTE_RELAY_LOCAL_ALIAS }),
+        };
+      }
+      if (!repository) {
+        return {
+          failure: failure(503, REMOTE_RELAY_ERROR_CODES.localDisabled,
+            'Sessions on this relay are not available to agents right now: its storage for them could not be opened (see the server log).',
+            { relay: selfName || REMOTE_RELAY_LOCAL_ALIAS }),
+        };
+      }
+      return { relay: await localTarget() };
     }
-    const relay = resolved.relay;
+    const names = Array.isArray(resolved?.names) ? resolved.names : [];
+    const error = resolved?.error === 'ambiguous'
+      ? `"${name}" matches several relays (${names.join(', ')}); use the full name.`
+      : `No paired relay is called "${name}". Known relays: ${names.join(', ') || 'none'}${settings.enabled ? `; this relay itself is "${selfName || REMOTE_RELAY_LOCAL_ALIAS}" (or "${REMOTE_RELAY_LOCAL_ALIAS}")` : ''}.`;
+    return { failure: failure(404, REMOTE_RELAY_ERROR_CODES.unknown, error, { relays: names }) };
+  }
+
+  /**
+   * The user's Allow for this conversation's agent to start sessions on this
+   * relay: remembered once given, asked with a card otherwise. Calls that
+   * arrive while the card is open share it and its answer. Resolves
+   * `{ approved:true, asked }` or `{ approved:false, code?, error? }`.
+   */
+  async function ensureLocalSessionApproval({ conversationId, caller, relay, action, args, signal }) {
+    const remembered = () => {
+      try {
+        return repository.hasLocalSessionApproval(conversationId) === true;
+      } catch {
+        return false;
+      }
+    };
+    if (remembered()) return { approved: true, asked: false };
+    const open = localApprovalsByConversation.get(conversationId);
+    if (open) {
+      const shared = await open;
+      return shared.approved ? { approved: true, asked: false } : shared;
+    }
+    const asking = (async () => {
+      const decision = await requestApproval({
+        conversationId,
+        callerContext: caller,
+        relay: relayTarget(relay),
+        action,
+        args,
+        summary: summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
+        signal,
+        localSessions: true,
+      });
+      if (decision !== true && decision?.approved !== true) {
+        return {
+          approved: false,
+          code: toText(decision?.code) || REMOTE_RELAY_ERROR_CODES.approvalDenied,
+          error: toText(decision?.error)
+            || 'The user did not allow this agent to start a session on this relay. Go on without it, or ask the user before trying again.',
+        };
+      }
+      try {
+        repository.recordLocalSessionApproval(conversationId, caller.processingRowId || null);
+      } catch (error) {
+        // Not remembered: the next create asks again.
+        try {
+          logger?.warn?.(`${LOG_PREFIX} local session approval not stored conv=${shortId(conversationId)}: ${toText(error?.message || error).slice(0, 200)}`);
+        } catch {}
+      }
+      return { approved: true, asked: true };
+    })();
+    localApprovalsByConversation.set(conversationId, asking);
+    try {
+      return await asking;
+    } finally {
+      localApprovalsByConversation.delete(conversationId);
+    }
+  }
+
+  /**
+   * The local target's own rules for create_session, before anyone is asked:
+   * one level, and the cap. Null when the call may go on (the caller then
+   * holds a place under the cap until its prompt is queued).
+   */
+  function refuseLocalCreate(conversationId, relay) {
+    let origin = null;
+    let active = [];
+    try {
+      origin = repository.getConversationOrigin(conversationId);
+      active = repository.listActiveLocalSessions(conversationId);
+    } catch (error) {
+      try {
+        logger?.warn?.(`${LOG_PREFIX} local session rules unreadable conv=${shortId(conversationId)}: ${toText(error?.message || error).slice(0, 200)}`);
+      } catch {}
+      return failure(503, REMOTE_RELAY_ERROR_CODES.localDisabled,
+        'Sessions on this relay are not available to agents right now: its storage for them could not be read (see the server log).',
+        { relay: relay.name });
+    }
+    if (origin) {
+      return failure(403, REMOTE_RELAY_ERROR_CODES.nestedSession,
+        'A session that an agent created cannot create sessions. Do the work in this session, or say in your reply what the agent that prompted you should start.',
+        { relay: relay.name });
+    }
+    const limit = REMOTE_RELAY_LIMITS.localActiveSessions;
+    const starting = localCreatesByConversation.get(conversationId) || 0;
+    if (active.length + starting >= limit) {
+      return failure(409, REMOTE_RELAY_ERROR_CODES.sessionLimit,
+        `${limit} sessions you started are still working; wait for one to finish.`,
+        {
+          relay: relay.name,
+          limit,
+          sessions: active.slice(0, limit),
+          note: 'Use wait (or read_session) on one of these sessions; create_session works again once one has no turn queued or running.',
+        });
+    }
+    return null;
+  }
+
+  async function runRelayAction({ conversationId, action, args, req, signal, waitNote }) {
+    const target = await resolveTarget(args.relay);
+    if (!target.relay) return target.failure;
+    const relay = target.relay;
+    const local = relay.local === true;
     const write = isRemoteRelayWriteAction(action);
     const finish = (result, session) => {
       if (write) {
@@ -1696,21 +1963,30 @@ export function createRemoteRelayDispatcher({
       return result;
     };
 
-    const access = relayAccess(conversationId, relay);
+    // A paired relay is gated by the user's mention and its permission. The
+    // local target has neither: the setting let the call in (resolveTarget).
+    const access = local ? 'user' : relayAccess(conversationId, relay);
     if (!access) {
       return finish(failure(403, REMOTE_RELAY_ERROR_CODES.locked,
         `Relay "${relay.name}" is locked in this conversation. Ask the user to mention @${relay.name} (or its name) in a message to allow work there.`,
         { relay: relay.name }));
     }
-    if (!remoteRelayPermissionAllows(relay.permission, action)) {
+    if (!local && !remoteRelayPermissionAllows(relay.permission, action)) {
       return finish(failure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
         `Relay "${relay.name}" lets agents ${PERMISSION_DESCRIPTIONS[relay.permission] || 'do less'} (permission "${relay.permission}"); ${action} needs "${REMOTE_RELAY_ACTION_PERMISSION[action]}". The user can change this in Settings → Relays.`,
         { relay: relay.name, permission: relay.permission }));
     }
+    if (local && OWN_SESSION_ACTIONS.has(action) && isOwnConversation({ conversationId }, args.session)) {
+      return finish(failure(400, REMOTE_RELAY_ERROR_CODES.ownSession,
+        `Session ${args.session} is the conversation you are running in: an agent cannot ${action} itself. Use the id of another session (list_sessions, or the one create_session returned).`,
+        { relay: relay.name, session: args.session }));
+    }
 
     const caller = { conversationId, ...((await getCallerContext(conversationId, req)) || {}) };
     caller.mode = toText(caller.mode).toLowerCase();
-    const hops = nonNegativeInt(caller.hops) + 1;
+    // A call on this relay itself crosses no relay: it carries the hops of the
+    // prompt it acts on unchanged.
+    const hops = nonNegativeInt(caller.hops) + (local ? 0 : 1);
     // The hop limit stops a prompt from travelling on to a third relay. A
     // relay the user unlocked here stays in reach whatever prompts arrive,
     // the relay the prompts came from may always be answered, and reading
@@ -1731,11 +2007,42 @@ export function createRemoteRelayDispatcher({
         { relay: relay.name, retryAfterSeconds }));
     }
 
+    if (action === 'create_session') {
+      const problem = createSessionProblem(caller, args);
+      if (problem) return finish(failure(400, REMOTE_RELAY_ERROR_CODES.invalidInput, problem, { relay: relay.name }));
+    }
+
+    const localCreate = local && action === 'create_session';
+    let holdsLocalCreate = false;
+    const releaseLocalCreate = () => {
+      if (!holdsLocalCreate) return;
+      holdsLocalCreate = false;
+      adjustLocalCreates(conversationId, -1);
+    };
+    if (localCreate) {
+      const refusal = refuseLocalCreate(conversationId, relay);
+      if (refusal) return finish(refusal);
+      adjustLocalCreates(conversationId, 1);
+      holdsLocalCreate = true;
+    }
+
     adjustInflight(conversationId, 1);
     try {
       const prompting = isRemoteRelayPromptAction(action);
       let asked = false;
-      if (prompting && agentPrompts(conversationId).count >= REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking) {
+      if (localCreate) {
+        const decision = await ensureLocalSessionApproval({ conversationId, caller, relay, action, args, signal });
+        if (!decision.approved) {
+          return finish(failure(403, decision.code || REMOTE_RELAY_ERROR_CODES.approvalDenied, decision.error, { relay: relay.name }));
+        }
+        // The card this call raised showed its prompt: it is this call's
+        // approval too, and the user has just looked at what the agent does.
+        if (decision.asked) {
+          asked = true;
+          agentPrompts(conversationId).count = 0;
+        }
+      }
+      if (!asked && prompting && agentPrompts(conversationId).count >= REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking) {
         // Agents that prompt each other can go on without the user for good:
         // from time to time the user is asked, in any relay mode.
         const decision = await requestApproval({
@@ -1752,7 +2059,7 @@ export function createRemoteRelayDispatcher({
         if (!approved) {
           const code = toText(decision?.code) || REMOTE_RELAY_ERROR_CODES.approvalDenied;
           const error = toText(decision?.error)
-            || `The agent has sent ${agentPrompts(conversationId).count} prompts to other relays' agents since the user last wrote, and the user did not allow more for now.`;
+            || `The agent has sent ${agentPrompts(conversationId).count} prompts to ${local ? 'other agents' : 'other relays\' agents'} since the user last wrote, and the user did not allow more for now.`;
           return finish(failure(403, code, error, { relay: relay.name }));
         }
         agentPrompts(conversationId).count = 0;
@@ -1772,15 +2079,16 @@ export function createRemoteRelayDispatcher({
         if (!approved) {
           const code = toText(decision?.code) || REMOTE_RELAY_ERROR_CODES.approvalDenied;
           const error = toText(decision?.error)
-            || `The user did not allow this ${action.replace(/_/g, ' ')} on relay "${relay.name}".`;
+            || `The user did not allow this ${action.replace(/_/g, ' ')} on ${local ? 'this relay' : `relay "${relay.name}"`}.`;
           return finish(failure(403, code, error, { relay: relay.name }));
         }
       }
 
-      const ctx = { relay, caller, hops, conversationId, signal };
+      const ctx = { relay, caller, hops, conversationId, signal, onPromptQueued: releaseLocalCreate };
       const body = await ACTIONS[action](ctx, args);
       if (prompting) agentPrompts(conversationId).count += 1;
       const { summary, ...rest } = body;
+      const note = [rest.note, waitNote].map(toText).filter(Boolean).join(' ');
       return finish({
         status: 200,
         body: {
@@ -1788,6 +2096,7 @@ export function createRemoteRelayDispatcher({
           relay: relay.name,
           summary: summary || summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
           ...rest,
+          ...(note ? { note } : {}),
         },
       });
     } catch (error) {
@@ -1797,6 +2106,7 @@ export function createRemoteRelayDispatcher({
       if (isRemoteRelayError(error)) return finish(mapRemoteError(error, relay, { action, args }));
       throw error;
     } finally {
+      releaseLocalCreate();
       adjustInflight(conversationId, -1);
     }
   }
@@ -1807,7 +2117,10 @@ export function createRemoteRelayDispatcher({
    * the caller hangs up.
    */
   async function dispatch({ conversationId, action, args, req, signal } = {}) {
-    const validation = validateRemoteRelayToolInput({ ...(isPlainObject(args) ? args : {}), action });
+    // wait_seconds is cut to this relay's "longest wait" setting, for every
+    // target: the waiting is done here, by polling the target.
+    const { maxWaitSeconds } = agentSessions();
+    const validation = validateRemoteRelayToolInput({ ...(isPlainObject(args) ? args : {}), action }, { maxWaitSeconds });
     if (!validation.ok) return failure(400, validation.code, validation.error);
     const requestedConversationId = toText(conversationId);
     let callerConversationId = requestedConversationId;
@@ -1817,6 +2130,9 @@ export function createRemoteRelayDispatcher({
     if (!callerConversationId) {
       return failure(400, REMOTE_RELAY_ERROR_CODES.invalidInput, 'conversationId is required');
     }
+    const waitNote = validation.waitLimitedFrom
+      ? `wait_seconds ${validation.waitLimitedFrom} is more than this relay allows per call (${validation.args.wait_seconds}, set by its owner); it waited at most ${validation.args.wait_seconds} s.`
+      : '';
     try {
       if (validation.action === 'list_relays') return await listRelays(callerConversationId);
       return await runRelayAction({
@@ -1825,6 +2141,7 @@ export function createRemoteRelayDispatcher({
         args: validation.args,
         req,
         signal,
+        waitNote,
       });
     } catch (error) {
       try {

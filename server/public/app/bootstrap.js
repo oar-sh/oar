@@ -84,6 +84,7 @@ import {
   confirmNewConversationModel,
   closeNewConversationModelModal,
   deleteConv,
+  openOriginConversation,
 } from './journal-view.js';
 import {
   loadRelayQuestions,
@@ -340,6 +341,12 @@ import {
   toggleClaudeCloudProvider,
 } from './claude-cloud-settings-ui.js';
 import { openCurrentCloudSession, syncClaudeCloudConversationUi } from './claude-cloud-conversation-ui.js';
+import { syncConversationOriginHeader } from './conversation-origin-ui.js';
+import {
+  previewAgentSessionsMaxWait,
+  saveAgentSessionsMaxWait,
+  toggleAgentSessions,
+} from './agent-sessions-settings-ui.js';
 import { CLAUDE_CLOUD_PROVIDER, claudeCloudComposerModelIds } from './claude-cloud-ui.mjs';
 import {
   confirmCliInstall,
@@ -3882,6 +3889,8 @@ function syncChatTitleControls() {
   // Cloud line, hidden controls and the image-only attach button all follow
   // the conversation on screen, like the header does.
   syncClaudeCloudConversationUi();
+  // "via agent": the conversation an agent on this relay started this one from.
+  syncConversationOriginHeader();
   syncChatTitleWatcherIndicator();
 }
 
@@ -4486,6 +4495,9 @@ window.addRemoteRelayFromForm = addRemoteRelayFromForm;
 window.showRemoteRelayTokenField = showRemoteRelayTokenField;
 window.saveRemoteRelayPublicUrl = saveRemoteRelayPublicUrl;
 window.toggleRemoteRelayInbound = toggleRemoteRelayInbound;
+window.toggleAgentSessions = toggleAgentSessions;
+window.previewAgentSessionsMaxWait = previewAgentSessionsMaxWait;
+window.saveAgentSessionsMaxWait = saveAgentSessionsMaxWait;
 window.doAuth = doAuth;
 window.initApp = initApp;
 window.connectSocket = connectSocket;
@@ -4523,6 +4535,7 @@ window.confirmNewConversationModel = confirmNewConversationModel;
 window.closeNewConversationModelModal = closeNewConversationModelModal;
 window.deleteConv = deleteConv;
 window.openConversation = openConversation;
+window.openOriginConversation = openOriginConversation;
 window.toggleStatusView = toggleStatusView;
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;

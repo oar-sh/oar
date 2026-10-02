@@ -1,6 +1,6 @@
 'use strict';
 
-import { normalizeRemoteRelayOrigin } from '../../shared/remote-relay-contract.mjs';
+import { REMOTE_RELAY_LOCAL_ID, normalizeRemoteRelayOrigin } from '../../shared/remote-relay-contract.mjs';
 
 // Storage for remote relays that is not app settings: which remote relays a
 // conversation has unlocked (the user mentioned them), and the provenance of
@@ -10,6 +10,11 @@ import { normalizeRemoteRelayOrigin } from '../../shared/remote-relay-contract.m
 // A relay whose agent wrote to a conversation is open to that conversation as
 // well. That is read from the provenance, not stored as an unlock, so what the
 // user allowed and what another agent started stay apart.
+//
+// Agent sessions on this relay itself reuse both: the user's "Allow" for a
+// conversation's agent to start sessions here is an unlock under the local
+// target's id, and a conversation such an agent created carries an origin
+// with `local: true` that names the conversation it was created from.
 
 function parseOrigin(json) {
   if (!json) return null;
@@ -33,6 +38,18 @@ export function createRemoteRelayRepository(db) {
   const listUserMessageOrigins = db.prepare(`
     SELECT DISTINCT origin_json FROM messages
     WHERE conversation_id = ? AND role = 'user' AND origin_json IS NOT NULL
+  `);
+  // Conversations an agent of this relay created that have a turn queued or
+  // running. The origin is filtered in SQL only roughly (it is JSON text); the
+  // caller matches the creating conversation on the parsed value.
+  const listActiveLocalOrigins = db.prepare(`
+    SELECT c.id, c.origin_json FROM conversations c
+    WHERE c.origin_json LIKE '%"local":true%'
+      AND COALESCE(c.status, '') <> 'deleted'
+      AND EXISTS (
+        SELECT 1 FROM queue q
+        WHERE q.conversation_id = c.id AND q.status IN ('pending', 'processing', 'parked')
+      )
   `);
   const getLatestHumanMessage = db.prepare(`
     SELECT id FROM messages
@@ -58,6 +75,30 @@ export function createRemoteRelayRepository(db) {
       const relay = String(remoteRelayId || '').trim();
       if (!conversation || !relay) return false;
       return insertUnlock.run(conversation, relay, messageId ? String(messageId) : null, nowIso).changes > 0;
+    },
+    /** Did the user allow this conversation's agent to start sessions on this relay? */
+    hasLocalSessionApproval(conversationId) {
+      return !!hasUnlock.get(String(conversationId || ''), REMOTE_RELAY_LOCAL_ID);
+    },
+    /** Remembers that "Allow"; `messageId` is the turn it was given on. */
+    recordLocalSessionApproval(conversationId, messageId = null, nowIso = new Date().toISOString()) {
+      const conversation = String(conversationId || '').trim();
+      if (!conversation) return false;
+      return insertUnlock.run(conversation, REMOTE_RELAY_LOCAL_ID, messageId ? String(messageId) : null, nowIso).changes > 0;
+    },
+    /**
+     * The ids of the conversations this conversation's agent created on this
+     * relay that have a turn queued or running (pending, processing, parked).
+     */
+    listActiveLocalSessions(conversationId) {
+      const creator = String(conversationId || '').trim();
+      if (!creator) return [];
+      return listActiveLocalOrigins.all()
+        .filter((row) => {
+          const origin = parseOrigin(row.origin_json);
+          return origin?.local === true && origin.conversationId === creator;
+        })
+        .map((row) => String(row.id));
     },
     forgetRelay(remoteRelayId) {
       return deleteUnlocksForRelay.run(String(remoteRelayId || '')).changes;
