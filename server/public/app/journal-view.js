@@ -1065,6 +1065,25 @@ function ensureNewConversationCloudRepoList() {
   return newConversationCloudRepoListPromise;
 }
 
+/** The ↻ next to Repository: read the list afresh from the relay (and Anthropic). */
+export async function refreshNewConversationCloudRepoList() {
+  const button = document.getElementById('new-conversation-cloud-repo-refresh');
+  if (button?.getAttribute('aria-busy') === 'true') return;
+  button?.setAttribute('aria-busy', 'true');
+  const seq = newConversationCloudLookupSeq;
+  try {
+    const payload = await loadClaudeCloudRepos({ refresh: true });
+    if (seq !== newConversationCloudLookupSeq) return;
+    newConversationCloudRepoList = payload && typeof payload === 'object' ? payload : { ok: false, repos: [] };
+    renderNewConversationCloudWarnings();
+    const { repo } = newConversationCloudInputs();
+    if (repo && document.activeElement !== repo) repo.focus?.();
+    renderNewConversationCloudSuggestions('repo');
+  } finally {
+    button?.removeAttribute('aria-busy');
+  }
+}
+
 function newConversationCloudSuggestList(field) {
   return document.getElementById(`new-conversation-cloud-${field}-list`);
 }

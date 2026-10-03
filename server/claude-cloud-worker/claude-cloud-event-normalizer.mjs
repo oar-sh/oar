@@ -9,6 +9,9 @@ import {
 
 const MAX_ACTIVITY_LENGTH = 140;
 const REDACTED_THINKING_PLACEHOLDER = '[Reasoning redacted by the model provider]';
+// The cloud sends most thinking blocks with the text left out (a signature
+// only): the bubble says that the model thought rather than showing nothing.
+const EMPTY_THINKING_PLACEHOLDER = '[Thinking — the cloud does not show the text]';
 // Sandbox log lines worth a row: a step that begins, is skipped or fails.
 // Each step also logs its completion, and lines without a step are the
 // runner talking to itself (the path it launches the CLI from).
@@ -167,7 +170,7 @@ export function createClaudeCloudEventNormalizer() {
       if (blockType === 'thinking' || blockType === 'redacted_thinking') {
         const text = blockType === 'redacted_thinking'
           ? (String(block?.data || '').trim() ? REDACTED_THINKING_PLACEHOLDER : '')
-          : capThought(block?.thinking || '');
+          : (capThought(block?.thinking || '').trim() || (String(block?.signature || '').trim() ? EMPTY_THINKING_PLACEHOLDER : ''));
         if (!text.trim()) continue;
         actions.push({
           channel: 'thought',

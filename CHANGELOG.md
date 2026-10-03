@@ -20,6 +20,12 @@ All notable changes to OAR are documented here. The format follows
 
 ### Changed
 
+- **Claude Cloud: small things.** A thinking block the cloud sends without
+  its text (most of them) shows as "[Thinking — the cloud does not show the
+  text]" instead of nothing; the New Chat repository list has a **↻** to
+  read it again; `scripts/claude-cloud-live-check.mjs` checks a running
+  relay's Claude Cloud end to end (one short cloud turn on a scratch
+  repository: create, commit trailer, repository list, delete).
 - **Claude Cloud: turns the session starts by itself show up in the chat.**
   A cloud chat's worker now keeps the session's event stream open between
   turns and follows a turn nobody here asked for — the agent's closing turn

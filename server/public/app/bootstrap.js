@@ -88,6 +88,7 @@ import {
   unarchiveConv,
   toggleArchivedConversations,
   isArchivedConversationsView,
+  refreshNewConversationCloudRepoList,
   openOriginConversation,
 } from './journal-view.js';
 import {
@@ -4677,6 +4678,7 @@ window.deleteConv = deleteConv;
 window.archiveConv = archiveConv;
 window.unarchiveConv = unarchiveConv;
 window.toggleArchivedConversations = toggleArchivedConversations;
+window.refreshNewConversationCloudRepoList = refreshNewConversationCloudRepoList;
 window.openConversation = openConversation;
 window.openOriginConversation = openOriginConversation;
 window.toggleStatusView = toggleStatusView;

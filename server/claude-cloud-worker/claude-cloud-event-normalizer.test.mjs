@@ -208,3 +208,25 @@ test('toCloudSequence reads the wire\'s string numbers', () => {
   assert.equal(toCloudSequence(''), null);
   assert.equal(toCloudSequence('next'), null);
 });
+
+test('a thinking block the cloud sends without its text becomes a placeholder thought; one with nothing at all is skipped', () => {
+  const normalizer = createClaudeCloudEventNormalizer();
+  const signedOnly = cloudEvent(31, {
+    type: 'assistant',
+    session_id: 'cse_01EXAMPLEnormalizer000001',
+    parent_tool_use_id: null,
+    message: { id: 'msg_example_31', role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 'EqYGCtABCBIYAipA' }] },
+  });
+  const [thought] = normalizer.normalize(signedOnly);
+  assert.equal(thought.channel, 'thought');
+  assert.equal(thought.payload.text, '[Thinking — the cloud does not show the text]');
+  assert.equal(thought.payload.done, true);
+
+  const bare = cloudEvent(32, {
+    type: 'assistant',
+    session_id: 'cse_01EXAMPLEnormalizer000001',
+    parent_tool_use_id: null,
+    message: { id: 'msg_example_32', role: 'assistant', content: [{ type: 'thinking', thinking: '' }] },
+  });
+  assert.deepEqual(normalizer.normalize(bare), []);
+});

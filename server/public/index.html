@@ -3548,6 +3548,20 @@
     color: var(--muted);
     white-space: nowrap;
   }
+  .new-conversation-cloud-refresh {
+    margin-left: 6px;
+    padding: 0 6px;
+    min-height: 22px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    cursor: pointer;
+    vertical-align: middle;
+  }
+  .new-conversation-cloud-refresh:hover { color: var(--text); border-color: var(--border); }
+  .new-conversation-cloud-refresh[aria-busy="true"] { opacity: 0.5; cursor: progress; }
   .new-conversation-cloud-suggest-note {
     padding: 8px 10px;
     font-size: 0.78rem;
@@ -6763,7 +6777,7 @@
       <!-- Claude Cloud only (journal-view.js): the GitHub repository and branch
            the cloud session clones, filled from the folder picked above. -->
       <div id="new-conversation-cloud-row" hidden>
-        <label for="new-conversation-cloud-repo" style="display:block;margin-top:12px;">Repository</label>
+        <label for="new-conversation-cloud-repo" style="display:block;margin-top:12px;">Repository <button id="new-conversation-cloud-repo-refresh" type="button" class="new-conversation-cloud-refresh" title="Read the repository list again" aria-label="Read the repository list again" onclick="refreshNewConversationCloudRepoList()">↻</button></label>
         <input id="new-conversation-cloud-repo" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="new-conversation-cloud-repo-list" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="owner/repo or GitHub URL" aria-describedby="new-conversation-cloud-warnings new-conversation-cloud-error">
         <div id="new-conversation-cloud-repo-list" class="new-conversation-cloud-suggest" role="listbox" aria-label="Repositories" hidden></div>
         <label for="new-conversation-cloud-branch" style="display:block;margin-top:12px;">Branch</label>
