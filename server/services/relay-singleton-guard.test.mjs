@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
@@ -7,8 +7,13 @@ import crypto from 'crypto';
 
 import { createRelaySingletonGuard } from './relay-singleton-guard.mjs';
 
+// Every folder made here is removed at the end: a run used to leave one per test in the temp dir.
+const tempDirs = [];
+after(() => { for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true }); });
+
 function tmpLock() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-lock-'));
+  tempDirs.push(dir);
   return path.join(dir, 'relay-server.lock');
 }
 

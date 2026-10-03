@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -22,8 +22,13 @@ function settingsStore(initial = {}) {
   };
 }
 
+// Every folder made here is removed at the end: a run used to leave one per test in the temp dir.
+const tempDirs = [];
+after(() => { for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true }); });
+
 function tempConfig(contents) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-features-'));
+  tempDirs.push(dir);
   const configPath = path.join(dir, 'config.json');
   if (contents !== undefined) fs.writeFileSync(configPath, contents);
   return configPath;

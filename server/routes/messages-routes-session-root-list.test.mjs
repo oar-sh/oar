@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 
 import { registerMessagesRoutes } from './messages-routes.mjs';
 import {
@@ -102,8 +102,13 @@ function listSessionRoot(rootPath, { includeHidden = false } = {}) {
   return captured;
 }
 
+// Every folder made here is removed at the end: a run used to leave one per test in the temp dir.
+const tempDirs = [];
+after(() => { for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true }); });
+
 function makeProjectDir() {
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-root-list-'));
+  tempDirs.push(projectDir);
   return { projectDir, sessionRootPath: path.join(projectDir, NATIVE_ID) };
 }
 

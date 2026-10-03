@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,8 +11,14 @@ import {
   resolveOarRoot,
 } from './oar-state-migration-service.mjs';
 
+// Every folder made here is removed at the end: a run used to leave several in the temp dir.
+const tempDirs = [];
+after(() => { for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true }); });
+
 function tempDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
 }
 
 /** A repo-shaped server dir with a real WAL-mode database. Returns the open
