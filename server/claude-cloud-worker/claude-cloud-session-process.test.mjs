@@ -893,10 +893,11 @@ test('a turn that finished while no worker ran is answered from the event log al
 // ---------------------------------------------------------------------------
 // Idle
 
-test('ten idle minutes close the stream; the next delivery reopens it after the last event', async () => {
+test('ten idle minutes close the stream when asked to; the next delivery reopens it after the last event', async () => {
   const api = makeApi();
   const cloud = makeCloud({ sendSequences: [11] });
-  const { runner, timers } = makeRunner({ api, cloud });
+  // By default the stream stays open (the session may take a turn of its own).
+  const { runner, timers } = makeRunner({ api, cloud, idleCloseMs: 10 * 60_000 });
 
   const done = runner.handlePendingPayload({ message: relayMessage() });
   await waitFor(() => cloud.streams.length === 1, 'stream opened');
@@ -1376,5 +1377,89 @@ test('a set_model the API refuses costs the switch, not the turn', async () => {
   }, [turnResult(13, { result: 'Hi.' })]);
   assert.equal(api.posts('/api/response')[0].terminalError ?? null, null);
   assert.ok(activityTexts(api).some((text) => /model could not be switched to claude-opus-5-5/.test(text)));
+  await runner.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// Turns the session starts by itself
+
+test('a turn started on claude.ai is followed as a continuation row of its own', async () => {
+  const api = makeApi({ '/api/continuation-turn': (body) => ({ ok: true, messageId: `cont-${body.trigger}`, attemptId: 'attempt-c1' }) });
+  const cloud = makeCloud();
+  const { runner } = makeRunner({ api, cloud });
+
+  // A delivered turn first: the session is bound and the stream open.
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(sessionInit(1), assistantText(2, 'Done.'), turnResult(3, { result: 'Done.' }));
+  assert.equal(await done, true);
+  assert.equal(runner.isTurnActive(), false);
+  assert.equal(stream.aborted, false, 'the stream stays open between turns');
+
+  // Then, with nothing delivered: a user message from another client, and the
+  // session's turn on it.
+  stream.emit(
+    userPrompt(4, 'Hello from the browser at claude.ai'),
+    sessionInit(5),
+    assistantText(6, 'Hello back, from the sandbox.'),
+  );
+  await waitFor(() => api.posts('/api/continuation-turn').length === 1, 'continuation registered');
+  await waitFor(() => api.posts('/api/stream').length >= 1, 'reply streamed');
+  assert.equal(runner.isTurnActive(), true);
+  assert.equal(runner.getActiveQueueMessageId(), 'cont-cloud_client_message');
+  const registration = api.posts('/api/continuation-turn')[0];
+  assert.equal(registration.conversationId, CONVERSATION_ID);
+  assert.equal(registration.relayMode, 'agent');
+  assert.match(registration.operationId, /^[0-9a-f-]{36}$/);
+  assert.ok(activityTexts(api).some((text) => text === 'Cloud: message sent on claude.ai: Hello from the browser at claude.ai'));
+
+  stream.emit(turnResult(7, { result: 'Hello back, from the sandbox.' }));
+  await waitFor(() => api.posts('/api/response').length === 2, 'continuation answered');
+  const [, response] = api.posts('/api/response');
+  assert.equal(response.messageId, 'cont-cloud_client_message');
+  assert.equal(response.attemptId, 'attempt-c1');
+  assert.equal(response.text, 'Hello back, from the sandbox.');
+  await waitFor(() => !runner.isTurnActive(), 'turn closed');
+  assert.equal(api.posts('/api/claude-cloud-session').at(-1).lastSequence, '7');
+
+  // A delivered message afterwards is an ordinary turn again.
+  const again = runner.handlePendingPayload({ message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Thanks', ...boundTo('7') }) });
+  await waitFor(() => cloud.callsOf('sendUserMessage').length === 1, 'sent');
+  stream.emit(turnResult(9, { result: 'Welcome.' }));
+  assert.equal(await again, true);
+  assert.equal(api.posts('/api/response').at(-1).messageId, 'queue-message-2');
+  await runner.dispose();
+});
+
+test('the agent continuing on its own is a continuation too; a turn the relay will not register is skipped whole', async () => {
+  let register = true;
+  const api = makeApi({ '/api/continuation-turn': () => (register ? { ok: true, messageId: 'cont-1', attemptId: 'attempt-c1' } : {}) });
+  const cloud = makeCloud();
+  const { runner, sleeps } = makeRunner({ api, cloud });
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(turnResult(3, { result: 'Done.' }));
+  assert.equal(await done, true);
+
+  // The agent speaks without a message: its closing turn after background work.
+  stream.emit(assistantText(4, 'The background task finished; here is the summary.'), turnResult(5, { result: 'Summary.' }));
+  await waitFor(() => api.posts('/api/response').length === 2, 'continuation answered');
+  assert.equal(api.posts('/api/continuation-turn')[0].trigger, 'cloud_turn');
+  assert.ok(activityTexts(api).includes('Cloud: the agent continued on its own.'));
+
+  // The relay gives no row (three tries): the turn is skipped until its
+  // result, and the next delivered message is paired with its own result.
+  register = false;
+  stream.emit(assistantText(6, 'Unregistered chatter.'), turnResult(7, { result: 'Unregistered.' }));
+  await waitFor(() => api.posts('/api/continuation-turn').length === 4, 'three more tries');
+  await waitFor(() => sleeps.length >= 3, 'retry pauses');
+  assert.equal(api.posts('/api/response').length, 2);
+
+  register = true;
+  const next = runner.handlePendingPayload({ message: relayMessage({ id: 'queue-message-2', attemptId: 'attempt-2', text: 'Now', ...boundTo('5') }) });
+  await waitFor(() => cloud.callsOf('sendUserMessage').length === 1, 'sent');
+  stream.emit(assistantText(13, 'Answer.'), turnResult(14, { result: 'Answer.' }));
+  assert.equal(await next, true);
+  assert.equal(api.posts('/api/response').at(-1).text, 'Answer.');
   await runner.dispose();
 });

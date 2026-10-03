@@ -20,6 +20,12 @@ All notable changes to OAR are documented here. The format follows
 
 ### Changed
 
+- **Claude Cloud: turns the session starts by itself show up in the chat.**
+  A cloud chat's worker now keeps the session's event stream open between
+  turns and follows a turn nobody here asked for — the agent's closing turn
+  when its background work outlived the hold, or a message you sent on
+  claude.ai — as a continuation reply of its own, with a line saying where
+  it came from. Before, such turns were only visible on claude.ai.
 - **Claude Cloud: the model can be changed between turns.** The composer's
   model picker is no longer locked once a cloud chat has started; a change
   reaches the sandbox before the next message (Claude Code there switches

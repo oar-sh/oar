@@ -736,6 +736,19 @@ export async function startFakeClaudeCloudApi({
           .filter((event) => event?.event_type === eventType)
           .map((event) => ({ sessionId: decodeURIComponent(request.path.split("/")[4]), payload: event.payload })));
     },
+    /**
+     * A message from another client of the session (claude.ai): the session
+     * takes a turn of its own, as the real one does, without any request
+     * from the relay. Returns the user event's sequence number.
+     */
+    sendFromOtherClient(sessionId, text) {
+      const session = sessions.get(String(sessionId || ""));
+      if (!session) throw new Error(`fake cloud: no session ${sessionId}`);
+      const { event } = acceptUserMessage(session, {
+        uuid: randomUUID(), session_id: session.id, type: "user", parent_tool_use_id: null, message: { role: "user", content: String(text || "") },
+      });
+      return event.sequence_num;
+    },
     /** The sessions created so far: `{ id, status, workerStatus, model, source, title, environmentId, costUsd }`. */
     sessions() {
       return [...sessions.values()].map((session) => ({

@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
 import { buildDequeuedRelayMessage } from './messages-routes.mjs';
 import { makeRouteDeps, invokePost } from './messages-routes-test-harness.mjs';
 import { applySchema } from '../db-schema.mjs';
+import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { buildCloudSourceRecord } from '../services/claude-cloud-session-service.mjs';
 
@@ -26,7 +28,7 @@ const CLOUD_SETTINGS = Object.freeze({
 function makeDb() {
   const db = new Database(':memory:');
   applySchema(db);
-  return { db, stmts: createSessionRepository(db) };
+  return { db, stmts: { ...createSessionRepository(db), ...createMessageRepository(db) } };
 }
 
 function seedConversation(stmts, {
@@ -259,13 +261,16 @@ test('claude-plan-usage keeps a cloud report under its own key, away from the Cl
   assert.equal(planUsageService.saved.length, 2);
 });
 
-test('the routes that are the Claude provider\'s own stay closed to a cloud conversation, except the usage limit', async () => {
+test('the routes that are the Claude provider\'s own stay closed to a cloud conversation, except the usage limit and continuations', async () => {
   const { stmts } = makeDb();
   seedConversation(stmts);
   const recorded = [];
   const deps = makeRouteDeps({
     stmts,
     usageLimitPauseService: { recordReport: (report) => { recorded.push(report); return {}; } },
+    uuidv4: () => crypto.randomUUID(),
+    ts: () => new Date().toISOString(),
+    io: { emit() {}, volatile: { emit() {} } },
   });
 
   const native = await invokePost('/api/claude-native-session', deps, { conversationId: 'conv-cloud', claudeNativeSessionId: 'native-1' });
@@ -278,7 +283,9 @@ test('the routes that are the Claude provider\'s own stay closed to a cloud conv
   assert.equal(limit.status, 200);
   assert.deepEqual(recorded, [{ report: { status: 'rejected' } }]);
 
+  // A cloud session takes turns of its own (background work, claude.ai):
+  // the worker registers them like a local Claude worker does.
   const continuation = await invokePost('/api/continuation-turn', deps, { conversationId: 'conv-cloud' });
-  assert.equal(continuation.status, 409);
-  assert.match(continuation.body.error, /not supported for claude-cloud conversations/);
+  assert.equal(continuation.status, 200);
+  assert.equal(typeof continuation.body.messageId, 'string');
 });

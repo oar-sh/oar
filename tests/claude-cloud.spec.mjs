@@ -456,6 +456,22 @@ for (const profile of PROFILES) {
       await expect(page.locator("#cloud-session-line .cloud-line-cost")).toHaveText("$0.84");
     });
 
+    test("a turn started on claude.ai shows up in the chat as a continuation", async ({ page }) => {
+      await openConversation(page, conversationId);
+      // Another client of the session sends a message: the session takes a
+      // turn nobody here asked for. The worker follows it on the stream it
+      // keeps open and registers it as a continuation row.
+      const text = `Sent from claude.ai on the ${profile.name} side`;
+      fake.sendFromOtherClient(cloudSessionId, text);
+      const reply = page.locator(".msg.assistant", { hasText: fakeCloudReplyFor(text) }).last();
+      await expect(reply).toBeVisible({ timeout: TURN_TIMEOUT });
+      await expect(reply.locator(".msg-continuation")).toHaveCount(1);
+      await expect(reply.locator(".msg-activity-item", { hasText: `message sent on claude.ai: ${text}` })).toHaveCount(1);
+      await expect(page.locator(".thinking-bubble")).toHaveCount(0, { timeout: TURN_TIMEOUT });
+      // No request of the relay's went to the cloud for it.
+      expect(fake.postedEvents("user").filter((event) => event.sessionId === cloudSessionId && userText(event.payload).includes(text))).toHaveLength(0);
+    });
+
     test("commits in the sandbox follow the relay's attribution setting, and a change reaches it with the next message", async ({ page }) => {
       const settingsRequests = () => fake.postedEvents("control_request")
         .filter((event) => event.sessionId === cloudSessionId && event.payload?.request?.subtype === "apply_flag_settings")

@@ -155,12 +155,19 @@ export function createClaudeCloudSessionRunner({
   reconnectMinMs = 1_000,
   reconnectMaxMs = 15_000,
   reconnectGiveUpMs = 5 * 60_000,
-  idleCloseMs = 10 * 60_000,
+  // The event stream is kept open while the process lives (0 = never
+  // closed for idleness): the session may take a turn of its own at any
+  // time, and the chat should show it. A value closes it after that long
+  // without a turn; the next delivery reopens it.
+  idleCloseMs = 0,
   interruptGraceMs = 30_000,
   sessionReadTimeoutMs = 10_000,
   // No byte for this long, keepalives included, and the stream is taken for
   // dead and reopened.
   streamIdleTimeoutMs = 120_000,
+  // How often a turn the session starts by itself (see followStrayTurn) is
+  // registered again when the relay does not answer.
+  continuationRetryDelayMs = 1_000,
   // How long a turn stays open for background work of the cloud agent (a
   // subagent, a long command) after the agent ended its own turn; the relay's
   // background-task timeout replaces it when a delivery carries one.
@@ -334,6 +341,9 @@ export function createClaudeCloudSessionRunner({
       // The sequence number the turn starts after (create: 0, send: the
       // number of the user event); null until the message is in the session.
       startSeq: null,
+      // A turn the session started by itself (openStrayTurn): nothing was
+      // delivered for it, and it is published under a continuation row.
+      stray: false,
       sent: false,
       settled: false,
       interrupted: false,
@@ -477,6 +487,90 @@ export function createClaudeCloudSessionRunner({
     return Boolean(t) && t.startSeq !== null && (sequence === null || sequence > t.startSeq);
   }
 
+  /**
+   * Whether an event opens a turn nobody here asked for: a user message from
+   * another client (claude.ai), or the agent speaking (a closing turn after
+   * background work). Tool results, keepalive-ish system events and the
+   * clients' own control traffic do not.
+   */
+  function startsStrayTurn(event, payload, type) {
+    if (type === 'user') {
+      const content = payload?.message?.content;
+      const blocks = Array.isArray(content) ? content : [];
+      return typeof content === 'string' || blocks.some((block) => block?.type === 'text');
+    }
+    if (type === 'assistant') return true;
+    if (type === 'system') return ['init', 'background_tasks_changed'].includes(String(payload?.subtype || ''));
+    return false;
+  }
+
+  /**
+   * Register a turn the session started by itself with the relay (a
+   * continuation row, like the local workers') and follow it from this
+   * event on. Null when the relay gives no row: the turn is then skipped
+   * until its `result`, which the next delivery's bookkeeping accounts for.
+   */
+  async function openStrayTurn(sequence, payload, type) {
+    const operationId = crypto.randomUUID();
+    let response = null;
+    for (let attempt = 0; attempt < 3 && !response?.messageId; attempt += 1) {
+      response = await api('POST', '/api/continuation-turn', {
+        conversationId: sdkSessionId,
+        sdkSessionId,
+        relayMode: 'agent',
+        trigger: type === 'user' ? 'cloud_client_message' : 'cloud_turn',
+        operationId,
+      }).catch((error) => {
+        dbg('stray turn registration failed', error?.message || String(error));
+        return null;
+      });
+      if (!response?.messageId) await sleep(continuationRetryDelayMs);
+    }
+    if (!response?.messageId) {
+      dbg('stray cloud turn not registered; skipping it until its result');
+      session.unfinishedTurns += 1;
+      return null;
+    }
+    const message = {
+      id: String(response.messageId),
+      attemptId: response.attemptId ? String(response.attemptId) : null,
+      conversationId: sdkSessionId,
+      relayMode: 'agent',
+      kind: 'continuation',
+      text: '',
+    };
+    const t = openTurn(message);
+    t.stray = true;
+    t.startSeq = sequence - 1;
+    t.sent = true;
+    turn = t;
+    clearIdleClose();
+    t.controlState = controlPoller?.start?.({ queueMessageId: message.id, onAbortTurn: () => abortTurn(t) });
+    if (type === 'user') {
+      const content = payload?.message?.content;
+      const text = typeof content === 'string'
+        ? content
+        : (Array.isArray(content) ? content : []).filter((block) => block?.type === 'text').map((block) => String(block.text || '')).join('');
+      await publisher.postActivity(message, `Cloud: message sent on claude.ai: ${truncate(text, 400)}`);
+    } else {
+      await publisher.postActivity(message, 'Cloud: the agent continued on its own.');
+    }
+    // Runs beside the event line: the turn ends on its `result` like any other.
+    (async () => {
+      try {
+        await finishTurn(t, await t.done);
+      } catch (error) {
+        settleTurn(t, { kind: 'error', error });
+        await failTurn(t, error).catch(() => {});
+      } finally {
+        endTurn(t);
+        if (turn === t) turn = null;
+        scheduleIdleClose();
+      }
+    })();
+    return t;
+  }
+
   async function handleEvent(event, sequence, { answered = null } = {}) {
     if (!session) return;
     if (sequence !== null) {
@@ -487,7 +581,17 @@ export function createClaudeCloudSessionRunner({
     }
     const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
     const type = String(payload.type || event?.event_type || '');
-    const t = turn && !turn.settled ? turn : null;
+    let t = turn && !turn.settled ? turn : null;
+
+    // No turn of ours, and the session is working: a turn the session
+    // started by itself (the agent's closing turn after its background work
+    // outlived the hold, or a message sent on claude.ai). It is followed as a
+    // continuation of its own, so the chat shows it.
+    if (!t && session.attached && sequence !== null && session.unfinishedTurns === 0
+      && sequence > session.cursorSeq && startsStrayTurn(event, payload, type)) {
+      t = await openStrayTurn(sequence, payload, type);
+      if (!t) return;
+    }
 
     if (type === 'control_response' && session.attributionRequestId
       && String(payload.response?.request_id || '') === session.attributionRequestId) {
@@ -744,11 +848,20 @@ export function createClaudeCloudSessionRunner({
         await chain;
         if (signal.aborted) return;
         const t = turn;
-        if (!t || t.settled) return;
         const code = String(failure?.code || '').trim();
         if (failure && FATAL_STREAM_CODES.has(code)) {
-          settleTurn(t, { kind: 'error', error: failure });
+          if (t && !t.settled) settleTurn(t, { kind: 'error', error: failure });
           return;
+        }
+        // Between turns the stream is kept too: the session may take a turn
+        // of its own (followStream is left alone by the idle close until the
+        // session has been quiet for idleCloseMs).
+        if (!t || t.settled) {
+          if (downSince === null) downSince = now();
+          else if (now() - downSince >= reconnectGiveUpMs) return;
+          await sleep(delay);
+          delay = Math.min(delay * 2, reconnectMaxMs);
+          continue;
         }
         if (downSince === null) {
           downSince = now();
@@ -797,7 +910,7 @@ export function createClaudeCloudSessionRunner({
 
   function scheduleIdleClose() {
     clearIdleClose();
-    if (!stream) return;
+    if (!stream || !(idleCloseMs > 0)) return;
     idleTimer = setTimeoutImpl(() => {
       idleTimer = null;
       if (turn) return;
@@ -1073,6 +1186,12 @@ export function createClaudeCloudSessionRunner({
       return;
     }
     if (outcome.kind === 'gave-up') {
+      if (t.stray) {
+        // Nothing to deliver again: the row ends on what was seen.
+        await publisher.publishFinalStream(message, streamed);
+        await publisher.publishResponse(message, { text: streamed || EMPTY_TURN_COMPLETION_NOTE, model: state.responseModel || t.model || null });
+        return;
+      }
       // The message stays in `session.sent`: delivered again, its turn is
       // followed from the start instead of being sent a second time.
       await publisher.postActivity(

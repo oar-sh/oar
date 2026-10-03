@@ -7197,7 +7197,10 @@ export function registerMessagesRoutes(app, deps) {
   // Providers whose workers turn runtime-initiated activity into continuation
   // rows: the Claude worker (background tasks/agents) and the Copilot SDK
   // worker (detached background shells) serving both Copilot-CLI providers.
-  const CONTINUATION_PROVIDER_TYPES = new Set(['claude', 'github', 'openai']);
+  // A Claude Cloud session can take a turn of its own too: one the agent
+  // starts when its background work reports back, or one started on
+  // claude.ai; the cloud worker follows it and registers it here.
+  const CONTINUATION_PROVIDER_TYPES = new Set(['claude', 'github', 'openai', 'claude-cloud']);
 
   // POST /api/continuation-turn — a session worker's CLI started a turn on its
   // own (a background task's notification). The synthetic queue row gives that
