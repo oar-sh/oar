@@ -703,9 +703,9 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **4035 pass / 0 fail / 0 skip on Linux (0.9.6, 2026-09-29)** — the count
+Expected: **0 fail** everywhere; **4658 pass / 0 fail / 0 skip on Linux (0.9.7, 2026-10-03)** — the count
 grows with every change, so treat it as a floor. Windows runs the same suite with **4 skips** that are host-gated
-(0600 file modes, symlinks) and run on Linux: **4031 pass / 0 fail / 4 skip** on the same commit.
+(0600 file modes, symlinks) and run on Linux (0.9.6: **4031 pass / 0 fail / 4 skip**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns

@@ -247,6 +247,8 @@ Differences from Copilot conversations:
 
 ### Claude Cloud
 
+**Experimental**, and off by default.
+
 A Claude Cloud chat runs Claude Code in a sandbox at Anthropic instead of on the relay host. The sandbox works on its own clone of a GitHub repository: it sees what is pushed to GitHub and nothing on the host, and its results come back as branches the agent pushes. The chat is billed to the Claude account the relay host's Claude CLI is logged in to. In OAR it is a conversation like the others: the reply streams in, questions arrive as cards, and it works from the phone.
 
 **What it needs.**
@@ -392,6 +394,15 @@ The composer's model picker is the union of every enabled provider's catalog, fi
 Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation. Claude Cloud has no tab there.
 
 ## Highlights
+
+### New in 0.9.7
+
+- **Claude Cloud (experimental, off by default)**: a chat that runs Claude Code in a sandbox at Anthropic, on its own clone of a GitHub repository. Pick the repository and branch from a list, follow the turn live, answer its questions, stop it, change the model between turns; the results come back as pushed branches. See [Claude Cloud](#claude-cloud) for what it needs and what it does with the Claude login.
+- **Archive, and a menu on every conversation**: archive a conversation instead of deleting it (🗄 shows the archived ones), and right-click a row, or long-press it on a phone, to open, rename, stop, kill, archive or delete it.
+- **Agent sessions**: an agent can start other sessions on the relay it runs on, wait for them and read their results, once you switch it on under Settings → Relays.
+- **Commits say Open Agent Relay**: commits and pull requests of Claude sessions carry `Co-authored-by: Open Agent Relay (<model>)`; choose OAR, Claude Code's own lines or none, per relay and per folder.
+- **Check Usage opens at once**: the last reading shows immediately and only the open tab is read live.
+- **Fixes**: two prices in one paragraph are no longer shown as a formula, a reply that names an error code is no longer stored as a failed turn, and on Windows the relay no longer stalls or fails to start workers while it reads the process list.
 
 ### New in 0.9.6
 

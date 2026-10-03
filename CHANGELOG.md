@@ -5,6 +5,14 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.7] — 2026-10-03
+
+Highlights: Claude Cloud chats (experimental, off by default) run Claude Code
+in a sandbox at Anthropic on a GitHub repository; conversations can be
+archived and have a context menu in the list; agents can start and use
+sessions on the relay they run on; commits of Claude sessions say "Open
+Agent Relay"; Check Usage opens at once.
+
 ### Added
 
 - **Archive conversations, and a context menu in the list.** Every
@@ -17,59 +25,6 @@ All notable changes to OAR are documented here. The format follows
   the composer of an archived chat says so instead of sending. A right-click
   on a row — a long press on a phone — opens a menu with Open, Edit title,
   Stop turn, Kill session, Archive/Unarchive and Delete.
-
-### Fixed
-
-- **A reply that names an error code is a reply.** A reply a session
-  worker published was read as a failed turn when its one paragraph led up
-  to "Error code: relay.…" — a short report on a test that had failed with
-  that code, for instance. Workers always send the failure as a record, so
-  their replies are no longer read for one; the page's fix buttons under a
-  failure follow the same rule and no longer appear under a reply that
-  mentions a code in a quotation, a code span, a table or a list.
-
-### Changed
-
-- **Claude Cloud: small things.** A thinking block the cloud sends without
-  its text (most of them) shows as "[Thinking — the cloud does not show the
-  text]" instead of nothing; the New Chat repository list has a **↻** to
-  read it again; `scripts/claude-cloud-live-check.mjs` checks a running
-  relay's Claude Cloud end to end (one short cloud turn on a scratch
-  repository: create, commit trailer, repository list, delete).
-- **Claude Cloud: turns the session starts by itself show up in the chat.**
-  A cloud chat's worker now keeps the session's event stream open between
-  turns and follows a turn nobody here asked for — the agent's closing turn
-  when its background work outlived the hold, or a message you sent on
-  claude.ai — as a continuation reply of its own, with a line saying where
-  it came from. Before, such turns were only visible on claude.ai.
-- **Claude Cloud: the model can be changed between turns.** The composer's
-  model picker is no longer locked once a cloud chat has started; a change
-  reaches the sandbox before the next message (Claude Code there switches
-  and re-initialises on the new model), as in a local Claude chat.
-- **Claude Cloud: an expired Claude login is refreshed before a chat gives
-  up.** The Claude CLI's login lasts eight hours and is refreshed only when
-  the CLI runs; a cloud chat used after a quiet night found an expired token
-  and asked you to log in again. The cloud worker now asks the relay to run
-  the CLI's own status probe first (which refreshes a login whose refresh
-  token is still good), reads the login again and retries; the "log in
-  again" note comes only when that did not help. OAR still never uses the
-  refresh token itself.
-- **Claude Cloud: a turn refused at the usage limit is paused, not failed.**
-  A cloud chat now pauses at the Claude usage limit the way a local Claude
-  chat does: the row ends with a note naming the reset time, the banner
-  shows the pause, and the work carries on by itself after the reset (or
-  waits for **Resume now**). Before, the limit was one line in the tool
-  activity and the turn failed.
-- **Check Usage opens at once.** The modal shows the reading it showed last
-  time immediately and reads only the open tab's provider live (the card says
-  "updating…" meanwhile), instead of fetching every provider and showing a
-  spinner until the slowest answered. A tab you switch to is read live when
-  its reading is older than a minute; **Refresh** reads the open tab only.
-  The relay keeps the last live answer of every provider, so the other cards
-  stay filled (`GET /api/usage?providers=…`).
-
-### Added
-
 - **Commits made from OAR say so.** Claude sessions now end their commit
   messages with `Co-authored-by: Open Agent Relay (<model>) <no-reply@oar.sh>`
   — the model's name in the parentheses, e.g. `Claude Fable 5.1` — and pull
@@ -82,40 +37,45 @@ All notable changes to OAR are documented here. The format follows
   it with the first message and again when it changes, and in OAR mode the
   `Claude-Session` link is left out of the commit as well. Other providers
   are not touched: their tools have no such setting.
-- **Claude Cloud: chats that run in a sandbox at Anthropic.** A new provider,
-  off by default. A Claude Cloud chat runs Claude Code in Anthropic's cloud,
-  on its own clone of a GitHub repository instead of on the relay host. It is
-  billed to the Claude account the host's Claude CLI is logged in to, and its
-  results come back as branches the agent pushes. Switch it on in Settings →
-  Providers → Claude Cloud and choose the cloud environment and a default
-  model there; it needs the Claude CLI logged in with a claude.ai account on
-  the relay host, GitHub connected to that account, and the Claude GitHub app
-  allowed on the repository. New Chat → Claude Cloud fills **Repository** and
-  **Branch** from the folder you pick, offers the repositories the Claude
-  GitHub app can reach (the ones used here before first) and the branches of
-  the picked repository as suggestions, lets you type both, and warns about
-  commits that are not pushed, changes that are not committed and a
-  repository the app cannot reach. In the chat
-  the reply streams in live, the agent's questions and permission prompts
-  arrive as cards, **Stop** interrupts the turn, and images can be attached.
-  A line above the composer links the session on claude.ai and every branch
-  the agent pushed to its comparison on GitHub, and shows the cost so far. A
-  follow-up goes into the same session, also after it has been idle; a
-  restart in the middle of a turn picks the turn up again instead of sending
-  your message twice; deleting or archiving the chat archives the cloud
-  session. Not there: relay modes, a reasoning effort, steering during a
-  turn, files other than images and anything else from the relay host, and
-  the relay's tools and previews inside the sandbox. **Before you switch it
-  on:**
-  the provider uses the Claude CLI's stored login to call the Anthropic API
-  endpoints the CLI itself uses. These are not a documented public API and
-  may change. OAR only reads the token: it never stores, logs or refreshes
-  it, and sends it nowhere but to Anthropic. While the provider is off the
-  relay fetches nothing with that login, except for cloud chats you created
-  before. See "Claude Cloud" in the README.
-  When the cloud agent hands work to a subagent in the background and
-  pauses, the turn stays open and the reply is what the agent says once that
-  work is done.
+- **Claude Cloud (experimental): chats that run in a sandbox at Anthropic.**
+  A new provider, off by default. A Claude Cloud chat runs Claude Code in
+  Anthropic's cloud, on its own clone of a GitHub repository instead of on
+  the relay host. It is billed to the Claude account the host's Claude CLI
+  is logged in to, and its results come back as branches the agent pushes.
+  Switch it on in Settings → Providers → Claude Cloud and choose the cloud
+  environment and a default model there; it needs the Claude CLI logged in
+  with a claude.ai account on the relay host, GitHub connected to that
+  account, and the Claude GitHub app allowed on the repository.
+  - **New Chat** fills **Repository** and **Branch** from the folder you
+    pick, offers the repositories the Claude GitHub app can reach (the ones
+    used here before first) and the branches of the picked repository, lets
+    you type both, and warns about commits that are not pushed, changes
+    that are not committed and a repository the app cannot reach.
+  - **In the chat** the reply streams in live, the agent's questions and
+    permission prompts arrive as cards, **Stop** interrupts the turn, images
+    can be attached, and the model can be changed between turns. A line
+    above the composer links the session on claude.ai and every branch the
+    agent pushed to its comparison on GitHub, and shows the cost so far.
+  - **Turns** survive a restart of the worker or the relay without sending
+    your message twice. A turn stays open while the agent's background work
+    runs, a turn the session starts by itself (after long background work,
+    or from a message sent on claude.ai) appears as a reply of its own, and
+    a turn refused at the usage limit is paused until the reset like a
+    local Claude turn.
+  - **Commits** follow the relay's attribution setting (see above), and
+    deleting or archiving the chat archives the cloud session.
+  - **Not there:** relay modes, a reasoning effort, steering during a turn,
+    files other than images and anything else from the relay host, and the
+    relay's tools and previews inside the sandbox.
+  - **Before you switch it on:** the provider uses the Claude CLI's stored
+    login to call the Anthropic API endpoints the CLI itself uses. These
+    are not a documented public API and may change. OAR only reads the
+    token: it never stores or logs it and sends it nowhere but to
+    Anthropic; when it has run out, OAR lets the CLI refresh it. While the
+    provider is off the relay fetches nothing with that login, except for
+    cloud chats you created before. See "Claude Cloud" in the README.
+    `scripts/claude-cloud-live-check.mjs` checks a running relay's Claude
+    Cloud end to end.
 - **Check Usage: live Claude limits and a Claude Cloud card.** With Claude
   Cloud switched on, the Claude card reads the 5-hour, weekly and per-model
   limits live from the account when you open the modal, instead of showing
@@ -151,8 +111,39 @@ All notable changes to OAR are documented here. The format follows
   call may wait for a reply: 10 minutes as before, up to 60; it applies to
   waits on paired relays too. See "Agent sessions" in the README.
 
+### Changed
+
+- **Check Usage opens at once.** The modal shows the reading it showed last
+  time immediately and reads only the open tab's provider live (the card says
+  "updating…" meanwhile), instead of fetching every provider and showing a
+  spinner until the slowest answered. A tab you switch to is read live when
+  its reading is older than a minute; **Refresh** reads the open tab only.
+  The relay keeps the last live answer of every provider, so the other cards
+  stay filled (`GET /api/usage?providers=…`).
+- **Windows: the relay no longer stops while it reads the process list.**
+  Before every launch, every kill and every check of a worker that went
+  quiet, the relay reads the list of all processes through PowerShell. It
+  did so synchronously: half a second to a second and a half on an idle
+  machine, several seconds under load, during which the relay answered
+  nothing — under CI load that was enough for the tunnel to report 502 for
+  the whole relay. The list is now read off the relay's thread; callers that
+  ask at the same time share one read, and a read is reused for 1.5 s. A
+  worker that went quiet is checked by its pid first and by the list last.
+  `GET /api/status` → `sessionWorker.processList` shows when the list was
+  last read, how long it took and whether it failed; a read slower than two
+  seconds is logged. A kill or a workspace relaunch that cannot read the
+  list answers 409 with the reason instead of failing with 500 or stopping
+  blind.
+
 ### Fixed
 
+- **A reply that names an error code is a reply.** A reply a session
+  worker published was read as a failed turn when its one paragraph led up
+  to "Error code: relay.…" — a short report on a test that had failed with
+  that code, for instance. Workers always send the failure as a record, so
+  their replies are no longer read for one; the page's fix buttons under a
+  failure follow the same rule and no longer appear under a reply that
+  mentions a code in a quotation, a code span, a table or a list.
 - **Two prices in one paragraph were shown as a formula.** In a reply such
   as `this run cost $4.20, the earlier one $3.80`, everything between the
   two dollar signs was rendered as maths. A dollar sign now starts a formula
@@ -185,23 +176,6 @@ All notable changes to OAR are documented here. The format follows
   Claude reports these amounts in the currency's minor units (cents), and
   the card showed them as dollars: 12.50 used of a 50.00 limit read as 1250
   of 5000. The percentage was right.
-
-### Changed
-
-- **Windows: the relay no longer stops while it reads the process list.**
-  Before every launch, every kill and every check of a worker that went
-  quiet, the relay reads the list of all processes through PowerShell. It
-  did so synchronously: half a second to a second and a half on an idle
-  machine, several seconds under load, during which the relay answered
-  nothing — under CI load that was enough for the tunnel to report 502 for
-  the whole relay. The list is now read off the relay's thread; callers that
-  ask at the same time share one read, and a read is reused for 1.5 s. A
-  worker that went quiet is checked by its pid first and by the list last.
-  `GET /api/status` → `sessionWorker.processList` shows when the list was
-  last read, how long it took and whether it failed; a read slower than two
-  seconds is logged. A kill or a workspace relaunch that cannot read the
-  list answers 409 with the reason instead of failing with 500 or stopping
-  blind.
 
 ## [0.9.6] — 2026-09-29
 
