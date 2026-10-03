@@ -72,6 +72,25 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-10-03: **Claude Cloud, finished for now** (rows in [claude-cloud.md](claude-cloud.md)).
+  Model switching between turns (`set_model`), turns the session starts by itself as
+  continuation replies (event stream kept open), the usage-limit pause, the login nudge through
+  the relay for workers, a placeholder for thinking blocks without text, a refresh for the
+  repository list, and `scripts/claude-cloud-live-check.mjs`. Both relays (Linux, Windows) pass
+  the live check on c478652.
+- 2026-10-03: **A worker's reply is never a failure note by its text.** `/api/response` reads a
+  failure from the text alone only when the sender names no attempt
+  (`resolveTerminalFailurePayload({ inferFromText })`); the page's fix buttons mirror the shape
+  rule of `shared/failure-note-text.mjs` (`relay-error-ctas.mjs`, kept in step by a test).
+- 2026-10-02: **Conversation archive and a context menu on conversation rows.** See the
+  "Conversation archive + row context menu" row under
+  [Relay core](#relay-core-provider-agnostic).
+- 2026-10-02: **Check Usage reads one provider live.** `GET /api/usage?providers=<ids>` reads the
+  named providers live and serves the rest from the last live answer the route keeps per fetcher
+  (Copilot quota and billing, Grok, Cursor; the Claude account service's `peekAccountUsage`), all
+  reads side by side; the answer carries `live` and `fetchedAt`. The page keeps the last report
+  (module state and sessionStorage), renders it at once, refreshes the open tab, and a tab older
+  than a minute when it is shown (`refreshUsageProvider`, `mergeUsageReports` in `bootstrap.js`).
 - 2026-10-02: **Repository picker for Claude Cloud.** New Chat's Repository field suggests the
   repositories the Claude GitHub app can reach (Anthropic's per-organisation list, `GET
   /api/oauth/organizations/{org}/code/repos`, read by the relay and cached a minute) with the

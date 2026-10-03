@@ -365,10 +365,39 @@ A turn is everything after its user event up to the first `result`. In the log, 
   stream ended or could not be opened, and is reopened after the last event handled, with a pause
   growing from 1 s to 15 s. No byte for 120 s, keepalives included, counts as a drop. After five
   minutes without a stream the row is requeued;
-- `closing the idle cloud event stream`: ten minutes without a turn; the next delivery reopens it;
+- `closing the idle cloud event stream`: only with `idleCloseMs` set. By default the stream stays
+  open between turns, because the session may take a turn of its own (see below); between turns a
+  dropped stream is reopened with the same pauses for five minutes, then left to the next delivery;
+- `login nudge ran|skipped …`: the login in the file had run out, and the worker asked the relay to
+  let the CLI refresh it (`POST /api/claude-cloud/login-nudge`, which runs `claude auth status`
+  and answers what the file holds now, never the token);
+- `cloud set_model refused …` / `cloud attribution request refused …`: a control request the API
+  answered with 400. The turn goes on without the switch or the setting, with one activity line;
+- `stray turn registration failed` / `stray cloud turn not registered; skipping it until its
+  result`: a turn the session started by itself could not get its continuation row;
 - `cloud turn failed <code> …`: the code is one of the client's (`login_expired`,
   `github_not_connected`, `repo_access_denied`, `environment_missing`, `rate_limited`, `not_found`,
   `transient`, …). `transient` requeues the row; the others answer it with what to do.
+
+**What the worker sends besides messages.** Three control requests go over the same event API
+(`POST …/events` with `event_type: "control_request"`), each answered by a `control_response` on
+the stream: `interrupt` (Stop), `apply_flag_settings` (the commit attribution; inside the create
+call in front of the first message, and before a later message when it changed; `null` takes a
+key out again) and `set_model` (before a message whose model is not the one the worker last gave
+the sandbox; the sandbox answers with a fresh `system/init`). After a worker restart the worker
+does not know what the sandbox holds and sends both once.
+
+**Turns the session starts by itself.** An event that opens a turn while no turn of ours runs (a
+text `user` message from another client such as claude.ai, an `assistant` message, `system/init`
+or `background_tasks_changed`) makes the worker register a continuation row
+(`POST /api/continuation-turn`, trigger `cloud_client_message` or `cloud_turn`) and publish the
+turn under it, like the local workers' background continuations. Turns that happened while no
+worker ran are not recovered: the catch-up reads only the delivered turn.
+
+**The usage limit.** The worker feeds the turn's events to the Claude worker's tracker
+(`shared/claude-usage-limit.mjs`): reports go to `POST /api/claude-usage-limit`, and a failed
+`result` with a rejected report is published as the usage-limit terminal error, which the relay
+turns into a pause (`usage-limit-pause-service.mjs`, for `claude` and `claude-cloud`).
 
 **Why a redelivery is safe.** Two things keep a queue row that is delivered a second time from
 becoming a second prompt in the cloud:
@@ -409,6 +438,18 @@ way.
 
 A live cloud turn costs real money on the relay host's Claude account. Run one only with the
 user's explicit go-ahead.
+
+**Checking a running relay.** `scripts/claude-cloud-live-check.mjs --relay <url> --repo
+<owner/repo>` (token in `OAR_RELAY_TOKEN`) runs one short cloud turn on a scratch repository and
+checks the provider switch, the login, the repository list, create, the commit trailer against the
+attribution mode, the session binding and the archive on delete. Exit code 0 means every check
+passed. Use it after a restart or a deploy, on each relay.
+
+**After the Claude account of the host changes.** The cloud environment id stored in the settings
+belongs to the account that was logged in when it was chosen, and so do the cloud sessions of the
+existing chats. Open Settings → Providers → Claude Cloud, switch the provider on again if it is
+off and pick an environment of the new account; chats bound to a session of the old account
+answer `not_found` and need a new chat.
 
 ### Copilot SDK workers
 
