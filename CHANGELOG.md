@@ -18,6 +18,16 @@ All notable changes to OAR are documented here. The format follows
   on a row — a long press on a phone — opens a menu with Open, Edit title,
   Stop turn, Kill session, Archive/Unarchive and Delete.
 
+### Fixed
+
+- **A reply that names an error code is a reply.** A reply a session
+  worker published was read as a failed turn when its one paragraph led up
+  to "Error code: relay.…" — a short report on a test that had failed with
+  that code, for instance. Workers always send the failure as a record, so
+  their replies are no longer read for one; the page's fix buttons under a
+  failure follow the same rule and no longer appear under a reply that
+  mentions a code in a quotation, a code span, a table or a list.
+
 ### Changed
 
 - **Claude Cloud: small things.** A thinking block the cloud sends without

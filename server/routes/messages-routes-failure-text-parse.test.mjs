@@ -61,3 +61,18 @@ test('a failure known from its text alone says so, a reported one does not', () 
     assert.equal(resolveTerminalFailurePayload(payload)?.fromText, undefined, JSON.stringify(Object.keys(payload)));
   }
 });
+
+test('a worker\'s publish (an attempt id) is never read as a failure by its text alone', () => {
+  const note = 'System note: the turn failed (the runtime exited). Error code: relay.copilot-turn-error. Send the message again to retry.';
+  // The route passes inferFromText: false when the body names an attempt.
+  assert.equal(resolveTerminalFailurePayload({ text: note, attemptId: 'attempt-1' }, { inferFromText: false }), null);
+  // The record still decides.
+  const recorded = resolveTerminalFailurePayload(
+    { text: 'The fix is in; the test that showed Error code: relay.turn-aborted passes now.', attemptId: 'attempt-1', terminalError: { code: 'turn-aborted', message: 'stopped' } },
+    { inferFromText: false },
+  );
+  assert.equal(recorded.terminal, true);
+  assert.equal(recorded.code, 'turn-aborted');
+  // Without an attempt the text is still read, as before.
+  assert.equal(resolveTerminalFailurePayload({ text: note }, { inferFromText: true })?.code, 'copilot-turn-error');
+});

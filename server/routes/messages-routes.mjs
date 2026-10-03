@@ -594,9 +594,17 @@ async function resolveRelayResponseText({
   }
 }
 
-export function resolveTerminalFailurePayload(payload = {}, { fallbackText = null } = {}) {
+/**
+ * `inferFromText`: whether a text shaped like a failure note counts as one
+ * when no record came with it. A session worker always sends the record
+ * (`terminalError`), so for its publishes (an `attemptId` names the attempt)
+ * the text is a reply whatever it says — a reply that names a code after
+ * fixing a failed test is a reply. Senders without an attempt (the Copilot
+ * extension, a note read from another relay) still report as text.
+ */
+export function resolveTerminalFailurePayload(payload = {}, { fallbackText = null, inferFromText = true } = {}) {
   const body = payload && typeof payload === 'object' ? payload : {};
-  const parsedTextFailure = parseTerminalFailureText(body.text);
+  const parsedTextFailure = inferFromText ? parseTerminalFailureText(body.text) : null;
   const direct = body.terminalError && typeof body.terminalError === 'object'
     ? body.terminalError
     : null;
@@ -6667,7 +6675,10 @@ export function registerMessagesRoutes(app, deps) {
       }
     };
     let trimmedText = String(text || '').trim();
-    let terminalFailure = resolveTerminalFailurePayload(req.body, { fallbackText: trimmedText });
+    let terminalFailure = resolveTerminalFailurePayload(req.body, {
+      fallbackText: trimmedText,
+      inferFromText: !String(req.body?.attemptId || '').trim(),
+    });
     // Final digests of background workflows that settled during this turn —
     // the transcript's "Finished background task" cards. Same structural
     // sanitizer as the live panel rows; junk entries drop silently (this

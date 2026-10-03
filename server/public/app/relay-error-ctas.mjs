@@ -39,10 +39,24 @@ const RELAY_ERROR_CTAS = Object.freeze({
 });
 
 const STABLE_CODE_PATTERN = /error code:\s*relay\.([a-z0-9-]+)/i;
+// The shape of a failure note, mirrored from shared/failure-note-text.mjs
+// (the browser cannot import it; failure-note-text.test.mjs keeps the two in
+// step): one paragraph of at most this length leading up to the code, not a
+// quotation, a code span, a table cell, a list item or a heading. A reply
+// that talks about a code gets no button.
+const FAILURE_NOTE_LEAD_MAX = 600;
+const QUOTED_LEAD = /["“”'`|>]\s*$/;
+const MARKUP_LEAD = /^\s*(?:#+|[>|*-]|\d+\.)\s/;
 
+/** The code of a text that is a failure note of the relay, else ''. */
 export function relayErrorCodeFromText(text) {
-  const match = String(text || '').match(STABLE_CODE_PATTERN);
-  return match ? match[1].toLowerCase() : '';
+  const raw = String(text || '').trim();
+  const match = raw.match(STABLE_CODE_PATTERN);
+  if (!match) return '';
+  const lead = raw.slice(0, match.index);
+  if (lead.length > FAILURE_NOTE_LEAD_MAX || /[\r\n]/.test(lead)) return '';
+  if (QUOTED_LEAD.test(lead) || MARKUP_LEAD.test(lead)) return '';
+  return match[1].toLowerCase();
 }
 
 /**
