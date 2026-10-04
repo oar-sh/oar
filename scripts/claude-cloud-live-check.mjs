@@ -15,6 +15,8 @@
 
 import process from 'node:process';
 
+import { buildClaudeAttributionSettings } from '../shared/claude-attribution.mjs';
+
 function arg(name, fallback = '') {
   const index = process.argv.indexOf(`--${name}`);
   return index >= 0 ? String(process.argv[index + 1] || '') : fallback;
@@ -60,8 +62,9 @@ try {
   const claude = await call('GET', '/api/settings/claude');
   const mode = String(claude.json?.attributionMode || 'oar');
   const chosenModel = model || String(settings.json?.defaultModel || '').trim();
+  // The whole trailer the relay hands to the sandbox for this model, not only its start.
   const expectedTrailer = mode === 'oar'
-    ? `Co-authored-by: Open Agent Relay (${chosenModel.replace(/\[[^\]]*\]$/, '').split('-').filter(Boolean).map((part, index) => (index === 0 ? 'Claude' : index === 1 ? part[0].toUpperCase() + part.slice(1) : null)).filter(Boolean).join(' ')}`
+    ? buildClaudeAttributionSettings({ mode: 'oar', modelId: chosenModel }).commit
     : null;
 
   const repoUrl = /^https?:\/\//.test(repo) ? repo : `https://github.com/${repo}`;

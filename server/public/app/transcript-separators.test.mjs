@@ -199,6 +199,12 @@ class FakeNode {
     this.classList = {
       add: (...names) => names.forEach((name) => this._classes.add(name)),
       contains: (name) => this._classes.has(name),
+      toggle: (name, force) => {
+        const on = force === undefined ? !this._classes.has(name) : !!force;
+        if (on) this._classes.add(name);
+        else this._classes.delete(name);
+        return on;
+      },
     };
   }
 
@@ -259,6 +265,11 @@ class FakeNode {
 
   querySelectorAll(selector) {
     const raw = String(selector);
+    if (raw.includes(',')) {
+      const parts = raw.split(',').map((part) => part.trim());
+      const matched = new Set(parts.flatMap((part) => this.querySelectorAll(part)));
+      return this.childNodes.filter((node) => matched.has(node));
+    }
     if (raw.startsWith('#')) {
       const id = raw.slice(1);
       return this.childNodes.filter((node) => node.id === id);
@@ -434,4 +445,77 @@ test('the rail is skipped when the container is not laid out or has no parent', 
   assert.doesNotThrow(() => syncTranscriptSeparators(orphan, NOW));
   assert.equal(syncSeparatorRail(orphan), 0);
   assert.deepEqual(rowSummary(orphan), ['sep:Today', 'msg:m1']);
+});
+
+// ---------------------------------------------------------------------------
+// A compaction that is still running: the live bubble stamps `pending`, and
+// the reply that replaces it carries the boundary. Both name the same turn.
+// ---------------------------------------------------------------------------
+
+test('a running compaction plans a pending line keyed by the turn', () => {
+  assert.deepEqual(parseCompactBoundaryValue('pending'), { pending: true, preTokens: null, postTokens: null });
+  assert.equal(formatCompactBoundaryLabel({ pending: true }), 'Compacting context…');
+  const live = buildSeparatorPlan([
+    { messageId: 'u1', timestamp: localIso(2026, 8, 20, 9) },
+    { messageId: 'u1', timestamp: '', compactBoundary: 'pending' },
+  ], NOW);
+  assert.deepEqual(live.map((entry) => [entry.kind, entry.key, entry.label, entry.pending ?? null]), [
+    ['day', 'day:2026-08-20', 'Today', null],
+    ['compact', 'compact:u1', 'Compacting context…', true],
+  ]);
+  // The reply names its turn through sourceMessageId: same key, final label.
+  const landed = buildSeparatorPlan([
+    { messageId: 'u1', timestamp: localIso(2026, 8, 20, 9) },
+    { messageId: 'a1', sourceMessageId: 'u1', timestamp: localIso(2026, 8, 20, 9, 5), compactBoundary: '120000|40000' },
+  ], NOW);
+  assert.deepEqual(landed[1].key, 'compact:u1');
+  assert.equal(landed[1].pending, false);
+  assert.equal(landed[1].label, 'Context compacted · 120k → 40k tokens');
+});
+
+test('the pending line is relabelled in place when the boundary lands', async () => {
+  const { syncTranscriptSeparators } = await import('./transcript-separators.mjs');
+  const container = makeContainer();
+  container.appendMessageRow({ messageId: 'u1', timestamp: localIso(2026, 8, 20, 9) });
+  const bubble = new FakeNode(container.childNodes[0].ownerDocument);
+  bubble.className = 'msg assistant';
+  bubble.dataset.messageId = 'u1';
+  bubble.dataset.compactBoundary = 'pending';
+  container.appendChild(bubble);
+
+  syncTranscriptSeparators(container, NOW);
+  assert.deepEqual(rowSummary(container), ['sep:Today', 'msg:u1', 'sep:Compacting context…', 'msg:u1']);
+  const line = container.childNodes[2];
+  assert.equal(line.dataset.separatorKey, 'compact:u1');
+  assert.equal(line._classes.has('is-pending'), true);
+  const label = line.childNodes[0];
+  assert.equal(label.childNodes.filter((node) => node._classes.has('dots')).length, 1, 'the animated dots');
+  assert.equal(syncTranscriptSeparators(container, NOW), 0, 'idempotent while it runs');
+
+  // The live bubble goes, the reply lands under the same line.
+  bubble.remove();
+  const reply = container.appendMessageRow({ messageId: 'a1', timestamp: localIso(2026, 8, 20, 9, 5), compactBoundary: '120000|40000' });
+  reply.dataset.sourceMessageId = 'u1';
+  syncTranscriptSeparators(container, NOW);
+  assert.equal(container.childNodes[2], line, 'the same node, not a second row');
+  assert.deepEqual(rowSummary(container), ['sep:Today', 'msg:u1', 'sep:Context compacted · 120k → 40k tokens', 'msg:a1']);
+  assert.equal(line._classes.has('is-pending'), false);
+  assert.equal(label.childNodes.length, 0, 'the dots went with the pending label');
+  assert.equal(line.attributes['aria-label'], 'Context compacted · 120k → 40k tokens');
+});
+
+test('a pending line without a reply is retired with its bubble', async () => {
+  const { syncTranscriptSeparators } = await import('./transcript-separators.mjs');
+  const container = makeContainer();
+  container.appendMessageRow({ messageId: 'u1', timestamp: localIso(2026, 8, 20, 9) });
+  const bubble = new FakeNode(container.childNodes[0].ownerDocument);
+  bubble.className = 'msg assistant';
+  bubble.dataset.messageId = 'u1';
+  bubble.dataset.compactBoundary = 'pending';
+  container.appendChild(bubble);
+  syncTranscriptSeparators(container, NOW);
+  assert.equal(rowSummary(container).length, 4);
+  bubble.remove();
+  syncTranscriptSeparators(container, NOW);
+  assert.deepEqual(rowSummary(container), ['sep:Today', 'msg:u1']);
 });

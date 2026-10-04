@@ -210,25 +210,39 @@ export function buildClaudeContextSnapshot({
 }
 
 /**
+ * The model's own context limit in tokens, from the turn result's
+ * `modelUsage[model].contextWindow`. Unlike the usage response's maxTokens
+ * (which follows the active auto-compact window), this is what the model can
+ * hold. Null when the snapshot does not carry it.
+ */
+export function resolveModelContextLimit({ contextUsage = null, modelUsage = null, model = '' } = {}) {
+  const usage = normalizeClaudeContextUsage(contextUsage);
+  const entry = resolveModelUsageEntry(modelUsage, model || usage?.model);
+  const limit = toNullableInt(entry?.contextWindow);
+  return limit !== null && limit > 0 ? limit : null;
+}
+
+/**
  * Parse the JSON blob persisted on `runtime_sessions` and rebuild both the
  * snapshot and the normalized usage the view layer renders.
  */
 export function readStoredClaudeContextUsage(row) {
   const rawJson = normalizeText(row?.context_usage_json);
-  if (!rawJson) return { snapshot: null, contextUsage: null };
+  if (!rawJson) return { snapshot: null, contextUsage: null, modelContextLimit: null };
 
   let parsed = null;
   try {
     parsed = JSON.parse(rawJson);
   } catch {
-    return { snapshot: null, contextUsage: null };
+    return { snapshot: null, contextUsage: null, modelContextLimit: null };
   }
 
   const capturedAt = normalizeText(row?.context_usage_captured_at) || null;
+  const model = parsed?.model || row?.provider_model || row?.model || '';
   const snapshot = buildClaudeContextSnapshot({
     contextUsage: parsed?.contextUsage,
     modelUsage: parsed?.modelUsage,
-    model: parsed?.model || row?.provider_model || row?.model || '',
+    model,
     runtimeSessionId: row?.id || null,
     sdkSessionId: row?.sdk_session_id || null,
     capturedAt,
@@ -236,5 +250,39 @@ export function readStoredClaudeContextUsage(row) {
   return {
     snapshot,
     contextUsage: normalizeClaudeContextUsage(parsed?.contextUsage),
+    modelContextLimit: resolveModelContextLimit({
+      contextUsage: parsed?.contextUsage,
+      modelUsage: parsed?.modelUsage,
+      model,
+    }),
   };
+}
+
+/**
+ * Where the conversation's stored compaction window stands against the
+ * running Claude CLI, for the context-usage modal. `steering` is the worker's
+ * heartbeat snapshot; its `autoCompactWindow` ({active, backgroundWork}) is
+ * present only while a CLI runs, so an older worker or a stopped one yields
+ * nulls.
+ *
+ * - `activeAutoCompactWindow`: the window the running CLI was spawned with.
+ * - `autoCompactWindowDeferred`: why a stored window that differs from it is
+ *   not applied yet — 'turn' (a turn is running), 'background' (idle, but
+ *   background agents/shells hold the process) or 'next-message' (the next
+ *   message respawns the CLI). Null when the two agree or no CLI runs.
+ */
+export function resolveAutoCompactWindowStatus({ storedWindow = null, steering = null } = {}) {
+  const running = steering?.autoCompactWindow;
+  if (!running || typeof running !== 'object') {
+    return { activeAutoCompactWindow: null, autoCompactWindowDeferred: null };
+  }
+  const active = toNullableInt(running.active);
+  const stored = toNullableInt(storedWindow);
+  let deferred = null;
+  if (stored !== active) {
+    if (steering.turnActive === true) deferred = 'turn';
+    else if (running.backgroundWork === true) deferred = 'background';
+    else deferred = 'next-message';
+  }
+  return { activeAutoCompactWindow: active, autoCompactWindowDeferred: deferred };
 }

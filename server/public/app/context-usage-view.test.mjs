@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  AUTO_COMPACT_NOTE_TEXT,
+  autoCompactWindowNotes,
+  formatCompactionWindowHeadline,
   renderAutoCompactControlHtml,
+  renderAutoCompactNotesHtml,
   renderThinkingControlHtml,
   thinkingEnabledFromKey,
   thinkingEnabledToKey,
@@ -236,6 +240,79 @@ test('an unknown source string is rendered escaped, not dropped', () => {
   assert.match(html, /&lt;img src=x&gt;/);
 });
 
+// ── Compaction window: headline, draft, notes ───────────────────────────────
+
+test('a Claude headline names the compaction window and the model limit when known', () => {
+  assert.equal(
+    formatCompactionWindowHeadline({ totalTokens: 60900, maxTokens: 100000, modelContextLimit: 1000000 }),
+    '60.9k used · compaction window 100.0k · model limit 1M',
+  );
+  assert.equal(
+    formatCompactionWindowHeadline({ totalTokens: 60900, maxTokens: 100000, modelContextLimit: null }),
+    '60.9k used · compaction window 100.0k',
+  );
+  assert.equal(formatCompactionWindowHeadline({ totalTokens: null, maxTokens: 100000 }), '');
+  const html = renderContextUsageHtml(
+    { ...usage, totalTokens: 60900, maxTokens: 100000 },
+    { compactionWindow: true, modelContextLimit: 1000000 },
+  );
+  assert.match(html, /60\.9k used · compaction window 100\.0k · model limit 1M/);
+  // The bar keeps measuring against the window.
+  assert.match(html, /width:22\.13%/);
+  // Other providers keep the plain headline.
+  assert.match(renderContextUsageHtml(usage), /247\.1k \/ 1\.0M tokens \(25%\)/);
+});
+
+test('the draft drives the slider position; the stored value stays the baseline', () => {
+  const html = renderAutoCompactControlHtml({ autoCompactWindow: null, draftWindow: 200000 });
+  assert.match(html, /value="3"/, '200k is stop index 3');
+  assert.match(html, /id="ctx-autocompact-value">200k</);
+  assert.match(html, /data-autocompact-note="pending">Applies on the next message \(the session restarts once\)\./);
+  assert.ok(!html.includes('Applied on the next message in this conversation'));
+  // Untouched and in effect: no note at all.
+  const settled = renderAutoCompactControlHtml({ autoCompactWindow: 100000, activeAutoCompactWindow: 100000 });
+  assert.match(settled, /<div id="ctx-autocompact-notes" class="ctx-autocompact-notes"><\/div>/);
+});
+
+test('a draft below the tokens in use warns that the next message compacts', () => {
+  const below = autoCompactWindowNotes({ draftWindow: 100000, storedWindow: null, usedTokens: 160000 });
+  assert.equal(below.warning, AUTO_COMPACT_NOTE_TEXT.compactNext);
+  assert.equal(below.warning, 'The conversation will be compacted on the next message.');
+  assert.equal(autoCompactWindowNotes({ draftWindow: 200000, usedTokens: 160000 }).warning, '');
+  assert.equal(autoCompactWindowNotes({ draftWindow: null, usedTokens: 160000 }).warning, '', 'Auto never warns');
+  assert.equal(autoCompactWindowNotes({ draftWindow: 100000, usedTokens: null }).warning, '', 'unknown usage never warns');
+  assert.match(
+    renderAutoCompactNotesHtml({ draftWindow: 100000, storedWindow: 100000, activeWindow: 100000, usedTokens: 160000 }),
+    /data-autocompact-note="compact-next">The conversation will be compacted on the next message\./,
+  );
+});
+
+test('the pending note says what the change waits for', () => {
+  const base = { draftWindow: 100000, storedWindow: 100000 };
+  // Stored but not in effect yet.
+  assert.equal(autoCompactWindowNotes({ ...base, activeWindow: 200000 }).pending, 'Applies on the next message (the session restarts once).');
+  assert.equal(autoCompactWindowNotes({ ...base, activeWindow: 200000, deferred: 'turn' }).pending, 'Applies after the current turn.');
+  assert.equal(autoCompactWindowNotes({ ...base, activeWindow: 200000, turnRunning: true }).pending, 'Applies after the current turn.');
+  assert.equal(autoCompactWindowNotes({ ...base, activeWindow: 200000, deferred: 'background' }).pending, 'Applies when background work has finished.');
+  // A deferral the relay reports counts even when the active value is unknown.
+  assert.equal(autoCompactWindowNotes({ ...base, deferred: 'background' }).pending, 'Applies when background work has finished.');
+  // In effect: nothing pending.
+  assert.equal(autoCompactWindowNotes({ ...base, activeWindow: 100000 }).pending, '');
+  // An unsaved draft is pending too.
+  assert.equal(autoCompactWindowNotes({ draftWindow: 150000, storedWindow: 100000, activeWindow: 100000 }).pending, 'Applies on the next message (the session restarts once).');
+  // Set back to the stored value: nothing.
+  assert.equal(autoCompactWindowNotes({ draftWindow: 100000, storedWindow: 100000, activeWindow: 100000 }).pending, '');
+  // Unknown deferral spellings are ignored.
+  assert.equal(autoCompactWindowNotes({ ...base, activeWindow: 100000, deferred: 'later' }).pending, '');
+});
+
+test('a payload without the session fields only compares draft and stored', () => {
+  assert.equal(autoCompactWindowNotes({ storedWindow: 100000 }).pending, '');
+  assert.equal(autoCompactWindowNotes({ draftWindow: null, storedWindow: 100000 }).pending, AUTO_COMPACT_NOTE_TEXT.nextMessage);
+  const html = renderAutoCompactControlHtml({ autoCompactWindow: 150000, autoCompactThreshold: 140000, maxTokens: 150000 });
+  assert.ok(!html.includes('data-autocompact-note'));
+});
+
 test('the thinking control renders both axes with the stored state active', () => {
   const html = renderThinkingControlHtml({ thinkingEnabled: false, thinkingDisplay: 'omitted' });
   assert.match(html, /data-thinking-axis="enabled"[^>]*data-thinking-value="off"[^>]*aria-pressed="true"/s);
@@ -269,4 +346,9 @@ test('thinking enabled key mapping round-trips, and anything but off is on', () 
   assert.equal(thinkingEnabledToKey(null), 'on');
   assert.equal(thinkingEnabledFromKey('on'), true);
   assert.equal(thinkingEnabledFromKey('off'), false);
+});
+
+test('a session started on Auto reports a stored window as waiting for the next message', () => {
+  const notes = autoCompactWindowNotes({ storedWindow: 100000, activeWindow: null, deferred: 'next-message' });
+  assert.equal(notes.pending, AUTO_COMPACT_NOTE_TEXT.nextMessage);
 });

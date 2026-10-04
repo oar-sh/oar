@@ -52,6 +52,11 @@ function shouldUseImmersiveTopLayout() {
 function syncThemeColor(immersive) {
   const meta = document.querySelector('meta[name="theme-color"]');
   if (!meta) return;
+  // Day mode keeps the white the head script (and a Theme change) set.
+  if (document.documentElement.getAttribute('data-theme') === 'light') {
+    meta.setAttribute('content', '#ffffff');
+    return;
+  }
   meta.setAttribute('content', immersive ? THEME_COLOR_IMMERSIVE : THEME_COLOR_BASE);
 }
 

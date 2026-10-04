@@ -7,11 +7,11 @@
   "scope": "./",
   "display_override": ["standalone"],
   "display": "standalone",
-  "background_color": "#161b22",
-  "theme_color": "#161b22",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
   "icons": [
     {
-      "src": "app-icon.svg?v=25",
+      "src": "app-icon.svg?v=26",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any"
@@ -27,6 +27,12 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
+    },
+    {
+      "src": "app-icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
     }
   ]
 }

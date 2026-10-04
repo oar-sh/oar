@@ -339,56 +339,7 @@ test('mid-session effort changes toggle the ultracode flags, idempotently', asyn
   await settled(runner);
 });
 
-test('the auto-compact window reaches the spawn and reconciles drift live', async () => {
-  const stub = makeApiStub();
-  const capturedSpawns = [];
-  const turn = scriptedTurn({ echoPushes: true });
-  const flagCalls = [];
-  turn.applyFlagSettings = async (settings) => { flagCalls.push(settings); };
-  // The window arrives piggybacked on each delivery, so the runner reads it
-  // through a getter rather than off the message.
-  let deliveredWindow = 150000;
-  const runner = makeRunner({
-    stub,
-    startImpl: (params) => {
-      capturedSpawns.push(params);
-      return turn;
-    },
-    getAutoCompactWindow: () => deliveredWindow,
-  });
-
-  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
-  turn.emit(initMessage('native-1'));
-  turn.emit(resultMessage('first', 'native-1'));
-  assert.equal(await first, true);
-  assert.equal(capturedSpawns[0].autoCompactWindow, 150000, 'spawn carries the window');
-  assert.deepEqual(flagCalls, [], 'a spawn-time window needs no flag-settings call');
-
-  // Unchanged window: no redundant control request.
-  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
-  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
-  turn.emit(resultMessage('second', 'native-1'));
-  assert.equal(await second, true);
-  assert.equal(flagCalls.length, 0);
-
-  deliveredWindow = 500000;
-  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3' } });
-  await waitFor(() => turn.pushed.length === 3, { label: 'third push' });
-  turn.emit(resultMessage('third', 'native-1'));
-  assert.equal(await third, true);
-  assert.deepEqual(flagCalls, [{ autoCompactWindow: 500000 }]);
-
-  // Back to Auto: the flag layer must be cleared, or the setting is one-way.
-  deliveredWindow = null;
-  const fourth = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-4' } });
-  await waitFor(() => turn.pushed.length === 4, { label: 'fourth push' });
-  turn.emit(resultMessage('fourth', 'native-1'));
-  assert.equal(await fourth, true);
-  assert.deepEqual(flagCalls[1], { autoCompactWindow: null });
-
-  turn.endInput();
-  await settled(runner);
-});
+// The auto-compact window's spawn and respawn: claude-compaction-window.test.mjs.
 
 test('sdk failure publishes a terminal response instead of hanging the queue', async () => {
   const stub = makeApiStub();
@@ -1936,20 +1887,28 @@ test('steeringState reports the composer-facing snapshot', async () => {
     pendingDeliveredTimeoutMs: 60_000,
   });
 
-  assert.deepEqual(runner.steeringState(), { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true });
+  assert.deepEqual(runner.steeringState(), {
+    turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, autoCompactWindow: null,
+  });
 
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
   turn.emit(initMessage('native-1'));
   turn.emit(userReplay('hello'));
   turn.emit(assistantText('working on it'));
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
-  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true });
+  // A running CLI reports the window it was spawned with (Auto here).
+  const runningWindow = { active: null, backgroundWork: false };
+  assert.deepEqual(runner.steeringState(), {
+    turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true, autoCompactWindow: runningWindow,
+  });
 
   // Steered entries in flight do not hold steering (unbounded), and the
   // snapshot keeps naming the turn they steer into.
   const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer two' } });
   await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pending' });
-  assert.deepEqual(runner.steeringState(), { turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true });
+  assert.deepEqual(runner.steeringState(), {
+    turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true, autoCompactWindow: runningWindow,
+  });
 
   turn.emit(resultMessage('done', 'native-1'));
   assert.equal(await first, true);
@@ -2391,7 +2350,10 @@ test('the watchdog fails over a delivered entry the CLI never opens a turn for',
 
 function compactionActivities(stub) {
   return stub.calls.filter(
-    (call) => call.routePath === '/api/activity' && call.body?.metadata?.kind === 'compact_boundary',
+    // The boundary entries only; the pending/cancelled ones a compaction
+    // status publishes have their own suite (claude-compaction-window.test.mjs).
+    (call) => call.routePath === '/api/activity' && call.body?.metadata?.kind === 'compact_boundary'
+      && !call.body.metadata.state,
   );
 }
 

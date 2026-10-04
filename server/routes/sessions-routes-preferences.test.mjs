@@ -4,6 +4,7 @@ import Database from 'better-sqlite3';
 
 import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
+import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 
 // Route-level coverage for PATCH /api/conversation/:id/preferences.
@@ -41,6 +42,7 @@ function setup() {
   const stmts = createSessionRepository(db);
   const emitted = [];
   const app = createMockApp();
+  const sessionWorkerRegistry = createSessionWorkerRegistry();
 
   registerSessionsRoutes(app, {
     auth: (_req, _res, next) => next(),
@@ -99,6 +101,7 @@ function setup() {
     relayBridgeOwnerService: null,
     featureFlags: {},
     resolveSessionStateRoot: () => null,
+    sessionWorkerRegistry,
   });
 
   const handler = app.routes.get(ROUTE);
@@ -124,7 +127,21 @@ function setup() {
       'plan', 'claude-opus-5', 'high')
   `).run(CONV);
 
-  return { db, patch, row, emitted };
+  const getContext = async () => {
+    const captured = { status: 200, body: null };
+    const res = {
+      setHeader() {},
+      status(code) { captured.status = code; return res; },
+      json(payload) { captured.body = payload; return res; },
+    };
+    await app.routes.get('GET /api/context/:conversationId')(
+      { body: {}, headers: {}, query: {}, params: { conversationId: CONV }, socket: {} },
+      res,
+    );
+    return captured;
+  };
+
+  return { db, stmts, patch, row, emitted, getContext, sessionWorkerRegistry };
 }
 
 test('a slider-only PATCH stores the window and leaves every other preference alone', async () => {
@@ -283,4 +300,59 @@ test('the broadcast carries the merged thinking state', async () => {
   assert.equal(update[1].thinkingEnabled, false);
   assert.equal(update[1].thinkingDisplay, 'summarized');
   assert.equal(update[1].preferredModel, 'claude-opus-5');
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/context: the window the running CLI has against the stored one
+
+test('the context payload reports the running CLI\'s window, why a change waits, and the model limit', async () => {
+  const { db, stmts, patch, getContext, sessionWorkerRegistry } = setup();
+  db.prepare(`
+    INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, runtime_key, provider_type, provider_model, created_at, last_used_at)
+    VALUES ('rs-1', ?, ?, 'rk-1', 'claude', 'claude-opus-5[1m]', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
+  `).run(CONV, CONV);
+
+  // Nothing captured, no worker: every new field is null.
+  const empty = await getContext();
+  assert.equal(empty.body.activeAutoCompactWindow, null);
+  assert.equal(empty.body.autoCompactWindowDeferred, null);
+  assert.equal(empty.body.modelContextLimit, null);
+
+  stmts.updateRuntimeSessionContextUsage.run(JSON.stringify({
+    model: 'claude-opus-5[1m]',
+    contextUsage: { totalTokens: 60900, maxTokens: 100000, rawMaxTokens: 100000, categories: [] },
+    modelUsage: { 'claude-opus-5[1m]': { inputTokens: 1, outputTokens: 1, contextWindow: 1000000 } },
+  }), '2026-01-01T00:00:00.000Z', CONV);
+  await patch({ clientId: 'client-a', autoCompactWindow: 200000 });
+  const steering = (overrides = {}) => ({
+    turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true,
+    autoCompactWindow: { active: 100000, backgroundWork: false },
+    ...overrides,
+  });
+  sessionWorkerRegistry.upsertWorker({ sdkSessionId: CONV, status: 'ready', steering: steering() });
+
+  const idle = await getContext();
+  assert.equal(idle.body.autoCompactWindow, 200000);
+  assert.equal(idle.body.activeAutoCompactWindow, 100000);
+  assert.equal(idle.body.autoCompactWindowDeferred, 'next-message');
+  assert.equal(idle.body.modelContextLimit, 1000000);
+  assert.equal(idle.body.snapshot.max_context_tokens, 100000);
+
+  sessionWorkerRegistry.upsertWorker({ ...sessionWorkerRegistry.getWorker(CONV), steering: steering({ turnActive: true }) });
+  assert.equal((await getContext()).body.autoCompactWindowDeferred, 'turn');
+
+  sessionWorkerRegistry.upsertWorker({
+    ...sessionWorkerRegistry.getWorker(CONV),
+    steering: steering({ autoCompactWindow: { active: 100000, backgroundWork: true } }),
+  });
+  assert.equal((await getContext()).body.autoCompactWindowDeferred, 'background');
+
+  // An older worker reports no window: nothing to compare against.
+  sessionWorkerRegistry.upsertWorker({
+    ...sessionWorkerRegistry.getWorker(CONV),
+    steering: steering({ autoCompactWindow: undefined }),
+  });
+  const legacy = await getContext();
+  assert.equal(legacy.body.activeAutoCompactWindow, null);
+  assert.equal(legacy.body.autoCompactWindowDeferred, null);
 });

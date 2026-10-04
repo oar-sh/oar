@@ -176,6 +176,7 @@ import {
   isSafeProviderModelId,
 } from '../shared/model-id.mjs';
 import { createModelVariantCatalogService } from './services/model-variant-catalog-service.mjs';
+import { applyPwaManifestTheme, normalizePwaTheme } from './services/pwa-manifest-theme.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -2992,6 +2993,7 @@ const updateCheckService = updateCheckKilled ? null : createUpdateCheckService({
 const updateInstallService = createUpdateInstallService({
   runningVersion: RUNNING_VERSION,
   installMethod: INSTALL_METHOD,
+  packageRoot: PACKAGE_ROOT,
   readSetting: readAppSettingValue,
   writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
   deleteSetting: (key) => stmts.deleteAppSetting.run(key),
@@ -5525,8 +5527,7 @@ function shouldIncludeInPwaVersion(relativePath) {
   const normalized = String(relativePath).replace(/\\/g, '/').replace(/^\/+/, '');
   if (!normalized || normalized.startsWith('.')) return false;
   if (normalized === 'index.html' || normalized === 'sw.js' || normalized === 'manifest.webmanifest') return true;
-  if (/^app-icon(?:-\d+)?\.png$/i.test(normalized)) return true;
-  if (/^app-icon\.svg$/i.test(normalized)) return true;
+  if (/^app-icon(?:-light)?(?:-maskable)?(?:-\d+)?\.(?:png|svg)$/i.test(normalized)) return true;
   if (/^favicon\.ico$/i.test(normalized)) return true;
   if (normalized.startsWith('app/')) {
     const ext = path.extname(normalized).toLowerCase();
@@ -5598,12 +5599,13 @@ function loadPwaManifestTemplate() {
     description: 'OAR — Open Agent Relay: drive your local coding agents from any browser.',
     display_override: ['standalone'],
     display: 'standalone',
-    background_color: '#161b22',
-    theme_color: '#161b22',
+    background_color: '#0d1117',
+    theme_color: '#0d1117',
     icons: [
-      { src: 'app-icon.svg?v=25', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+      { src: 'app-icon.svg?v=26', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
       { src: 'app-icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
       { src: 'app-icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: 'app-icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
     ],
   };
   try {
@@ -5614,8 +5616,8 @@ function loadPwaManifestTemplate() {
   return fallback;
 }
 
-function buildScopedPwaManifest({ shared = false } = {}) {
-  const manifest = loadPwaManifestTemplate();
+function buildScopedPwaManifest({ shared = false, theme = 'dark' } = {}) {
+  const manifest = applyPwaManifestTheme(loadPwaManifestTemplate(), theme);
   // The custom name must be baked into every served manifest: Android's WebAPK
   // update check re-fetches this route outside any page session, so a name the
   // route doesn't know reverts on the phone with an accept-or-uninstall prompt.
@@ -6358,7 +6360,7 @@ app.get('/socket.io/socket.io.js', (req, res, next) => {
 app.get('/manifest.webmanifest', (req, res, next) => {
   try {
     const shared = String(req.query?.shared || '').trim() === '1';
-    const manifest = buildScopedPwaManifest({ shared });
+    const manifest = buildScopedPwaManifest({ shared, theme: normalizePwaTheme(req.query?.theme) });
     res.setHeader('Cache-Control', 'no-store');
     res.type('application/manifest+json').send(JSON.stringify(manifest, null, 2));
   } catch (error) {

@@ -5,6 +5,8 @@ import { randomUUID } from 'crypto';
 import { buildClaudeUserContent } from './claude-attachments.mjs';
 import {
   compactBoundaryActivityAction,
+  compactCancelledActivityAction,
+  compactPendingActivityAction,
   createSdkMessageNormalizer,
   displayToolName,
   formatApiRetryNotice,
@@ -20,7 +22,6 @@ import {
   readPlanUsage,
   normalizeClaudeEffort,
   claudeUltracodeFlagSettings,
-  claudeAutoCompactFlagSettings,
   claudeAttributionFlagSettings,
   claudeThinkingFlagSettings,
   applyThinkingDisplay,
@@ -29,6 +30,7 @@ import {
 } from './claude-sdk-adapter.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
 import { sameClaudeAttribution } from '../../shared/claude-attribution.mjs';
+import { formatAutoCompactWindowLabel } from '../../shared/auto-compact-window.mjs';
 import { relocateClaudeTranscriptForCwd } from './claude-transcript-relocator.mjs';
 import {
   attemptFields,
@@ -447,8 +449,9 @@ export function createClaudeSessionRunner({
   idleShutdownMs = 10 * 60_000,
   getBackgroundTaskTimeoutMs = () => 0,
   // The per-conversation auto-compact window (token count, null = Auto). Read
-  // per turn rather than captured, so a slider change picked up on the next
-  // delivery reaches a process that is already running.
+  // per turn rather than captured: the CLI only takes it at spawn, so a
+  // slider change picked up on the next delivery respawns an idle process
+  // (adaptProcess).
   getAutoCompactWindow = () => null,
   // What this session's commits say (shared/claude-attribution.mjs); null
   // leaves the CLI's own attribution. Piggybacked on deliveries like the
@@ -583,6 +586,10 @@ export function createClaudeSessionRunner({
   // the same misattribution as a continuation whose init follows the push.
   let settingsReinitsOwed = 0;
   let settingsWindowOpen = false;
+  // Row publishes that the process-level bookkeeping of one SDK message
+  // decided on (the compaction entries); handleSdkMessage drains them right
+  // after it, before the message's own actions.
+  const queuedProcessActions = [];
   let lastReportedDeliveryReady = true;
   // Rows whose prompt the CLI consumed and whose settle marker is being saved
   // (id → relay message). Runner-level, not per process: a process dying
@@ -801,6 +808,15 @@ export function createClaudeSessionRunner({
     // Orphan/settled-task notification lines that arrived between turns belong
     // to the turn they triggered.
     const carried = proc.pendingActivities.splice(0);
+    // A compaction's buffered boundary lands on this turn. Shown as running
+    // on another row (a delivery still waiting), it is cancelled there.
+    if (proc.compactionNotice?.boundaryCarried) {
+      if (proc.compactionNotice.ctx === ctx) proc.compactionNotice = null;
+      else {
+        const cancel = takeCompactionCancel();
+        if (cancel) void publishProcessAction(cancel);
+      }
+    }
     if (carried.length) {
       const actions = carried.map((entry) => (typeof entry === 'string'
         ? { channel: 'activity', payload: { text: entry, subagentRunId: null } }
@@ -2094,6 +2110,54 @@ export function createClaudeSessionRunner({
   }
 
   /**
+   * The row a running compaction is shown on: the active turn's, else the
+   * delivered message waiting for the turn the CLI compacts before. A
+   * compaction between turns with nothing waiting has no row to show it on.
+   */
+  function compactionNoticeContext() {
+    if (activeContextPublishes()) return proc.activeCtx;
+    return proc.pendingDelivered.find((entry) => !entry.steered)?.ctx || null;
+  }
+
+  /**
+   * `status: 'compacting'` puts a `pending` compaction entry on that row, at
+   * most once per compaction. Queued, not published here: handleSdkMessage
+   * publishes it ahead of the frame's own actions, so it stays in stream
+   * order with the boundary that replaces it.
+   */
+  function noteCompactionStarted() {
+    if (proc.compactionNotice && !proc.compactionNotice.boundaryCarried) return;
+    // An earlier compaction whose boundary still waits for a turn: its line
+    // gives way to this one.
+    const superseded = takeCompactionCancel();
+    if (superseded) queuedProcessActions.push(superseded);
+    const ctx = compactionNoticeContext();
+    if (!ctx) return;
+    proc.compactionNotice = { ctx };
+    queuedProcessActions.push({ ctx, action: compactPendingActivityAction() });
+  }
+
+  /**
+   * A compaction that ended without a boundary (failed, compacted nothing,
+   * went stale, or its process died): the row that shows it as running gets a
+   * `cancelled` entry, which takes the line away again. Nothing when no
+   * pending entry was published, or when the boundary already followed it.
+   */
+  function takeCompactionCancel(processRef = proc) {
+    const notice = processRef?.compactionNotice;
+    if (!notice) return null;
+    processRef.compactionNotice = null;
+    if (notice.ctx.finalized || notice.ctx.discarded) return null;
+    return { ctx: notice.ctx, action: compactCancelledActivityAction() };
+  }
+
+  async function publishProcessAction({ ctx, action }) {
+    await dispatchToContext(ctx, action).catch((error) => {
+      dbg('compaction entry publish failed', error?.message || String(error));
+    });
+  }
+
+  /**
    * The CLI is compacting, or just did: a delivered turn is still coming.
    * Armed only while a delivered entry is actually waiting; which turn the
    * window may then be spent on is decided when that turn opens, by reading
@@ -2216,8 +2280,14 @@ export function createClaudeSessionRunner({
       if (String(sdkMessage.status || '') === 'compacting') {
         proc.compactingSince = Date.now();
         armCompactReplayAdoption();
+        noteCompactionStarted();
       } else if (sdkMessage.permissionMode === undefined) {
         proc.compactingSince = 0;
+        // The boundary (which clears the notice) comes BEFORE this terminator
+        // when the compaction produced one; a notice still open here means
+        // it did not (a boundary buffered for the next turn keeps its notice).
+        const cancel = proc.compactionNotice?.boundaryCarried ? null : takeCompactionCancel();
+        if (cancel) queuedProcessActions.push(cancel);
         // A compaction that failed produces no boundary and no replay: the
         // turn just carries on uncompacted and attaches the normal way, so
         // leaving the adoption window open would only widen the chance of a
@@ -2231,6 +2301,23 @@ export function createClaudeSessionRunner({
     }
     if (subtype === 'compact_boundary') {
       proc.compactingSince = 0;
+      // The boundary entry supersedes the pending one on the row it lands on.
+      // A pending entry on another row (a waiting delivery, while the
+      // boundary goes to the turn the CLI opened itself) would show that row
+      // as compacting for its whole turn, so it is cancelled there.
+      // A buffered boundary has no row yet: the notice waits for the turn
+      // that takes it (activateContext).
+      if (proc.compactionNotice) {
+        if (!activeContextPublishes()) {
+          proc.compactionNotice.boundaryCarried = true;
+        } else {
+          if (proc.compactionNotice.ctx !== proc.activeCtx) {
+            const cancel = takeCompactionCancel();
+            if (cancel) queuedProcessActions.push(cancel);
+          }
+          proc.compactionNotice = null;
+        }
+      }
       armCompactReplayAdoption();
       // The boundary is a per-turn normalizer action, but a compaction at
       // resume — exactly what lowering the window causes — lands with no
@@ -2599,6 +2686,7 @@ export function createClaudeSessionRunner({
     const suppressed = maybeSuppressStopFollowUp(sdkMessage);
     if (suppressed === 'swallow') return;
     observeProcessLevel(sdkMessage);
+    for (const queued of queuedProcessActions.splice(0)) await publishProcessAction(queued);
     if (suppressed === 'observe-only') return;
     // Its traffic opens a continuation of its own instead of attaching to the
     // stopped steer waiting in pendingDelivered (which still settles stopped).
@@ -3042,6 +3130,12 @@ export function createClaudeSessionRunner({
     // answered instead of failing over minutes later.
     reapOvertakenDeliveredEntries(now);
     reapStalePendingDelivered(now);
+    // A compaction past the staleness cap is no longer held for; neither is
+    // the line that shows it running.
+    if (proc.compactionNotice && !proc.compactionNotice.boundaryCarried && !isCompacting()) {
+      const cancel = takeCompactionCancel();
+      if (cancel) void publishProcessAction(cancel);
+    }
     if (hasLiveWork()) {
       // Track how long background tasks alone have held the process, for the
       // user-configurable timeout (0 = unlimited).
@@ -3113,6 +3207,10 @@ export function createClaudeSessionRunner({
       processRef.taskPublishTimer = null;
     }
     stopWorkflowPoller(processRef);
+    // A compaction the process died in never ends with a boundary. Published
+    // before the contexts below are settled, so the entry lands on a row that
+    // is still open.
+    const compactionCancel = takeCompactionCancel(processRef);
     // The process took its background tasks with it; clear the panel — but
     // only when this process still owns it. A superseded process clearing the
     // panel would blank the replacement's live task set.
@@ -3134,6 +3232,7 @@ export function createClaudeSessionRunner({
     for (const entry of stoppedSteers) claimSettling(entry.ctx.message, 'stopped');
     processRef.activeCtx = null;
     if (proc === processRef) proc = null;
+    if (compactionCancel) await publishProcessAction(compactionCancel);
     for (const ctx of openContexts) {
       if (ctx.finalized) continue;
       if (streamError && !processRef.aborted && !ctx.interrupted) {
@@ -3168,7 +3267,7 @@ export function createClaudeSessionRunner({
   // ---------------------------------------------------------------------------
   // Spawn / adapt
 
-  function spawnProcess(message) {
+  function spawnProcess(message, { resume: resumeOverride = '' } = {}) {
     const relayMode = message.relayMode || 'agent';
     const model = resolvePerTurnModel(message);
     const effort = normalizeClaudeEffort(message.reasoningEffort);
@@ -3227,6 +3326,9 @@ export function createClaudeSessionRunner({
       // delivered entry may still adopt the turn the CLI re-opens afterwards.
       compactingSince: 0,
       compactReplayUntil: 0,
+      // { ctx } of the row a `pending` compaction entry was published on,
+      // until the boundary or a `cancelled` entry closes it.
+      compactionNotice: null,
       // A non-spawn init that opened a turn while a delivered row waited: the
       // turn is the CLI's own, so no compaction inside it may adopt that row.
       continuationInitPending: false,
@@ -3326,7 +3428,7 @@ export function createClaudeSessionRunner({
       }
     };
 
-    const resume = String(message.claudeNativeSessionId || claudeNativeSessionId || '').trim();
+    const resume = String(resumeOverride || message.claudeNativeSessionId || claudeNativeSessionId || '').trim();
     processRef.nativeSessionId = resume;
     // The CLI resolves `resume` inside the project directory for *this* CWD, so
     // a session whose workspace root changed has to bring its transcript along
@@ -3387,7 +3489,40 @@ export function createClaudeSessionRunner({
     settingsWindowOpen = true;
   }
 
-  async function adaptProcess(message) {
+  /**
+   * Whether the process may be released for a fresh one right now: nothing
+   * would die with it or be cut off by it — no turn, no delivery in flight, no
+   * open question, no compaction, no adoption window, no background agents or
+   * shells (nor a continuation one of them just announced), no Stop guard.
+   */
+  function canReleaseForRespawn() {
+    if (!proc || proc.closing || proc.aborted) return false;
+    if (hasLiveWork() || proc.liveTasks.size) return false;
+    if (Date.now() < proc.compactReplayUntil) return false;
+    return !proc.suppressingTurn;
+  }
+
+  /**
+   * The running CLI's compaction window (the one it was spawned with) and
+   * whether background work would block the respawn that applies another
+   * one. Rides the steering snapshot; the relay compares it with the stored
+   * window to tell the modal when a change applies. Null with no process.
+   */
+  function autoCompactWindowState() {
+    if (!proc || proc.closing || proc.aborted) return null;
+    return {
+      active: proc.autoCompactWindow,
+      backgroundWork: proc.liveTasks.size > 0 || isContinuationImminent(),
+    };
+  }
+
+  /**
+   * Prepare a live process for a turn-opening delivery. Returns null when the
+   * process was released instead (the caller cold-starts a fresh one).
+   * `delivery` is the delivery's own record: a window respawn is noted on it,
+   * and at most one is taken per delivery.
+   */
+  async function adaptProcess(message, delivery = {}) {
     const relayMode = message.relayMode || 'agent';
     const model = resolvePerTurnModel(message);
     const effort = normalizeClaudeEffort(message.reasoningEffort);
@@ -3398,6 +3533,25 @@ export function createClaudeSessionRunner({
       gracefulShutdown('mode-change');
       // A drain that times out forces the old CLI down so it cannot keep
       // streaming next to the replacement the caller is about to spawn.
+      await drainClosingProcess(10_000);
+      return null;
+    }
+
+    // The window is spawn-only: a running CLI ignores a flag-layer
+    // autoCompactWindow in either direction (probe 2026-10-03). A changed
+    // window is applied by releasing the process the way an idle release does
+    // and letting this delivery cold-start a fresh one on the same session.
+    // Nothing else is set on the old process first — the new one is spawned
+    // with every current setting. Blocked (background work), the delivery
+    // runs on the old process and the next turn-opening one tries again.
+    const autoCompactWindow = normalizeAutoCompactWindow(getAutoCompactWindow());
+    if (autoCompactWindow !== proc.autoCompactWindow && !delivery.windowRespawn && canReleaseForRespawn()) {
+      delivery.windowRespawn = {
+        from: proc.autoCompactWindow,
+        to: autoCompactWindow,
+        resume: String(proc.nativeSessionId || '').trim(),
+      };
+      gracefulShutdown('compact-window');
       await drainClosingProcess(10_000);
       return null;
     }
@@ -3441,20 +3595,9 @@ export function createClaudeSessionRunner({
       });
       proc.effort = effort;
     }
-    // The window is a delivery-scoped setting, not a per-message one: it only
-    // reaches a live process through the flag layer, and `null` (Auto) has to
-    // be pushed too or clearing the slider would never take effect.
-    const autoCompactWindow = normalizeAutoCompactWindow(getAutoCompactWindow());
-    if (autoCompactWindow !== proc.autoCompactWindow) {
-      expectSettingsReinit();
-      await Promise.resolve(proc.turn.applyFlagSettings?.(claudeAutoCompactFlagSettings(autoCompactWindow))).catch((error) => {
-        dbg('applyFlagSettings autoCompactWindow failed', error?.message || String(error));
-      });
-      proc.autoCompactWindow = autoCompactWindow;
-    }
-    // Attribution follows the window's pattern: a changed value (a settings
-    // change, a model switch that renames the trailer) reaches the live CLI
-    // through the flag layer, before the turn that may commit.
+    // Attribution: a changed value (a settings change, a model switch that
+    // renames the trailer) reaches the live CLI through the flag layer, before
+    // the turn that may commit.
     const attribution = getAttribution() || null;
     if (!sameClaudeAttribution(attribution, proc.attribution)) {
       if (attribution === null) {
@@ -3476,7 +3619,7 @@ export function createClaudeSessionRunner({
         proc.attribution = attribution;
       }
     }
-    // Thinking is NOT a symmetric copy of the window block: the probe
+    // Thinking is not symmetric either: the probe
     // (2026-08-26, docs/plans/claude-thinking-control.md) showed the two
     // directions of the on/off axis are not equally reachable mid-session.
     const thinkingState = getThinking() || {};
@@ -3615,7 +3758,9 @@ export function createClaudeSessionRunner({
     // A closing/aborted process is about to die — nothing about its last turn
     // should hold the composer of the worker that replaces it.
     if (!proc || proc.closing || proc.aborted) {
-      return { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true };
+      return {
+        turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, autoCompactWindow: null,
+      };
     }
     const ctx = proc.activeCtx || null;
     const ctxLive = Boolean(ctx && !ctx.finalized && !ctx.discarded && !ctx.interrupted);
@@ -3625,6 +3770,7 @@ export function createClaudeSessionRunner({
     const openingDelivery = proc.pendingDelivered.find((entry) => !entry.steered) || null;
     const turnActive = ctxLive || Boolean(openingDelivery);
     const canSteer = canAcceptSteering();
+    const autoCompactWindow = autoCompactWindowState();
     let holdReason = null;
     if (turnActive && !canSteer) {
       if (proc.pendingControlRequests > 0) holdReason = 'question';
@@ -3641,7 +3787,7 @@ export function createClaudeSessionRunner({
     // `supported` is the worker-advertised opt-in the client's composer reads
     // (the same flag the Copilot SDK worker publishes) — its only steering
     // gate, so every snapshot carries it, idle ones included.
-    return { turnActive, canSteer, holdReason, messageId, supported: true };
+    return { turnActive, canSteer, holdReason, messageId, supported: true, autoCompactWindow };
   }
 
   /**
@@ -3682,6 +3828,22 @@ export function createClaudeSessionRunner({
       syncDeliveryReadiness();
     };
     syncDeliveryReadiness();
+    // This delivery's own record: a window respawn taken for it (one at most).
+    const delivery = { windowRespawn: null };
+    // Its note goes on this message's row, once, whichever delivery's spawn
+    // the message then runs on.
+    let respawnNoted = false;
+    const noteWindowRespawn = () => {
+      if (!delivery.windowRespawn || respawnNoted) return;
+      respawnNoted = true;
+      const { from, to } = delivery.windowRespawn;
+      publisher.postActivity(
+        message,
+        `Restarted the session to apply the compaction window (${formatAutoCompactWindowLabel(from)} → ${formatAutoCompactWindowLabel(to)})`,
+        null,
+        { kind: 'compact_window_respawn', from, to },
+      );
+    };
     try {
       // A steered delivery (a turn is live) must not run the settings diffs:
       // setModel/effort/mode against a mid-flight turn would disturb the very
@@ -3691,7 +3853,7 @@ export function createClaudeSessionRunner({
       // lost — the steered message's own model/mode intent applies from the
       // next turn on, same as Claude Code.
       if (proc && !proc.closing && !proc.aborted && !proc.activeCtx) {
-        await adaptProcess(message);
+        await adaptProcess(message, delivery);
       }
       if (!proc || proc.closing || proc.aborted) {
         // Awaited only when there is one: a cold spawn with the decision
@@ -3704,20 +3866,26 @@ export function createClaudeSessionRunner({
         if (!remoteRelayGate.isSettled?.()) await remoteRelayGate.ready();
         // Another delivery spawned while this one waited: join that process
         // like any delivery (between turns: adapt; mid-turn: steer below).
-        if (proc && !proc.closing && !proc.aborted && !proc.activeCtx) await adaptProcess(message);
+        if (proc && !proc.closing && !proc.aborted && !proc.activeCtx) await adaptProcess(message, delivery);
         // What it joined may be gone by now: that adapt can recycle the
         // process (a mode change), and a process can wind down under any of
         // these waits. Only a live one takes the push below.
         if (proc && (proc.closing || proc.aborted)) await drainClosingProcess();
-        if (!proc) spawnProcess(message);
+        // A window respawn resumes the session the released process ran.
+        const respawnResume = delivery.windowRespawn?.resume || '';
+        if (!proc) spawnProcess(message, { resume: respawnResume });
+        noteWindowRespawn();
         // A cold start is the one moment a turn can sit silent for many
         // seconds (transcript load + first request); say so instead of
         // showing bare dots. Posted once here — not in spawnProcess — so a
         // push-race respawn cannot duplicate the line.
-        publisher.postActivity(message, (message.claudeNativeSessionId || claudeNativeSessionId)
+        publisher.postActivity(message, (respawnResume || message.claudeNativeSessionId || claudeNativeSessionId)
           ? 'Starting the Claude CLI (cold start — resuming the session transcript)…'
           : 'Starting the Claude CLI (cold start)…');
       }
+      // Released for the window, then joined a process another delivery
+      // spawned in the meantime.
+      noteWindowRespawn();
       const content = buildClaudeUserContent(message);
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const procRef = proc;
@@ -3763,7 +3931,7 @@ export function createClaudeSessionRunner({
           // Belt and braces: the stream was already ending, but make sure the
           // superseded CLI cannot linger next to its replacement.
           try { procRef.turn.close?.(); } catch {}
-          spawnProcess(message);
+          spawnProcess(message, { resume: delivery.windowRespawn?.resume || '' });
           continue;
         }
         // Pushed: the pending entry now holds the gate on its own.

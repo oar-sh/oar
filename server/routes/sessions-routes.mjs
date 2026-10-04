@@ -21,7 +21,7 @@ import {
   withClaudeUltracodeTier,
 } from '../services/provider-reasoning-effort.mjs';
 import { mapUsageSnapshotRow, fetchUsageSummaryPromise } from '../services/usage-snapshot-helpers.mjs';
-import { readStoredClaudeContextUsage } from '../services/claude-context-usage.mjs';
+import { readStoredClaudeContextUsage, resolveAutoCompactWindowStatus } from '../services/claude-context-usage.mjs';
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
@@ -3212,6 +3212,7 @@ export function registerSessionsRoutes(app, deps) {
         return {
           snapshot: stored.snapshot,
           contextUsage: stored.contextUsage,
+          modelContextLimit: stored.modelContextLimit,
           eventsPath: null,
           error: stored.snapshot
             ? null
@@ -3231,6 +3232,15 @@ export function registerSessionsRoutes(app, deps) {
     const conversationRow = resolveConversationByIdOrSdkSessionId(
       String(runtimeSession?.conversation_id || '').trim() || lookupId,
     );
+    const autoCompactWindow = parseAutoCompactWindow(conversationRow?.auto_compact_window);
+    // Only the local Claude worker runs a CLI whose window the slider sets;
+    // it reports that CLI on its heartbeat's steering snapshot.
+    const windowStatus = resolveAutoCompactWindowStatus({
+      storedWindow: autoCompactWindow,
+      steering: providerType === 'claude' && copilotSessionId
+        ? sessionWorkerRegistry?.getWorker?.(copilotSessionId)?.steering || null
+        : null,
+    });
 
     return {
       conversationId: lookupId,
@@ -3238,7 +3248,10 @@ export function registerSessionsRoutes(app, deps) {
       // for the modal's refresh handle), so the id a preferences PATCH needs is
       // reported separately.
       resolvedConversationId: conversationRow?.id || null,
-      autoCompactWindow: parseAutoCompactWindow(conversationRow?.auto_compact_window),
+      autoCompactWindow,
+      activeAutoCompactWindow: windowStatus.activeAutoCompactWindow,
+      autoCompactWindowDeferred: windowStatus.autoCompactWindowDeferred,
+      modelContextLimit: parsed.modelContextLimit ?? null,
       thinkingEnabled: parseThinkingEnabled(conversationRow?.thinking_enabled),
       thinkingDisplay: parseThinkingDisplay(conversationRow?.thinking_display),
       // What this folder's Claude commits say (the 🧠 modal's override row).

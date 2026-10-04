@@ -1390,7 +1390,32 @@ export function setSummaryModalLoading(loading) {
   }
 }
 
+// A modal kind can hold an unsaved draft (the context modal's compaction
+// window slider) that is written when the user leaves it, whichever way: the
+// close button, the backdrop, Escape, or another modal replacing it. A
+// re-render of the same kind (Refresh, a socket-driven refresh) is not a leave.
+let summaryModalLeave = null;
+
+export function setSummaryModalLeaveHandler(kind, handler) {
+  summaryModalLeave = typeof handler === 'function'
+    ? { kind: String(kind || '').trim(), handler }
+    : null;
+}
+
+function runSummaryModalLeave(nextKind = null) {
+  const leave = summaryModalLeave;
+  if (!leave) return;
+  if (nextKind !== null && nextKind === leave.kind) return;
+  summaryModalLeave = null;
+  try {
+    leave.handler();
+  } catch (error) {
+    console.warn('Summary modal leave handler failed:', error);
+  }
+}
+
 export function renderSummaryModalContent({ title, subtitle = '', bodyHtml = '', refresh = null, kind = '' }) {
+  runSummaryModalLeave(String(kind || '').trim());
   summaryModalState.kind = String(kind || '').trim();
   summaryModalState.refresh = typeof refresh === 'function' ? refresh : null;
 
@@ -1413,6 +1438,7 @@ export function openSummaryModal({ title, subtitle = '', bodyHtml = '', refresh 
 }
 
 export function closeSummaryModal() {
+  runSummaryModalLeave();
   summaryModalState.kind = '';
   summaryModalState.refresh = null;
   summaryModalState.loading = false;

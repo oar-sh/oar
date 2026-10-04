@@ -32,6 +32,7 @@ import {
   openSummaryModal,
   closeSummaryModal,
   refreshSummaryModal,
+  setSummaryModalLeaveHandler,
   syncViewportMetrics,
   isMobileComposerViewport,
   releaseComposerFocusAfterSend,
@@ -120,6 +121,7 @@ import {
   clearImageEditTarget,
   jumpToImageParent,
   flushDeferredMessageRender,
+  conversationHasActiveTurn,
 } from './conversation-view.js';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
@@ -197,8 +199,11 @@ import {
   registerPwaShell,
   updatePwaAppName,
 } from './pwa-install.js';
+import { initScrollbarHover } from './scrollbar-hover.mjs';
 import {
+  autoCompactWindowNotes,
   renderAutoCompactControlHtml,
+  renderAutoCompactNotesHtml,
   renderContextUsageHtml,
   renderThinkingControlHtml,
   thinkingEnabledFromKey,
@@ -207,7 +212,6 @@ import {
 import { renderAttributionControlHtml } from './attribution-control.mjs';
 import {
   autoCompactWindowFromIndex,
-  autoCompactWindowToIndex,
   formatAutoCompactWindowLabel,
 } from './auto-compact-window-options.mjs';
 import { renderPlanUsageHtml, planUsageSubtitle, normalizeUsageProvider } from './plan-usage-view.mjs';
@@ -826,7 +830,11 @@ function initNetworkLifecycleHandling() {
   window.addEventListener('pageshow', () => {
     handleForegroundTransition('pageshow', { immediate: true });
   });
-  window.addEventListener('pagehide', () => {
+  window.addEventListener('pagehide', (event) => {
+    // A page unloaded with the context modal still open (tab closed, app
+    // swiped away, reload) saves the window slider's draft like a modal
+    // close. A page only put aside (`persisted`) keeps its draft.
+    if (!event.persisted) commitAutoCompactDraft({ pageClosing: true });
     // The page is going away; no grace period, suspend immediately.
     cancelBackgroundSuspend();
     setForegroundNetworkWorkEnabled(false);
@@ -3094,18 +3102,37 @@ async function loadUsageSummaryAndRender() {
 // The context modal is rendered from scratch on every refresh, so the slider's
 // conversation binding lives here rather than on the element.
 let autoCompactControlConversationId = '';
-let autoCompactWindowUpdateInFlight = false;
-// The server's last known window for the rendered control. Kept so a rejected
-// PATCH can put the slider back instead of leaving the rejected value on
-// screen until the next refresh.
+// The save in flight, if any: saves run one after another, never side by side.
+let autoCompactWindowUpdateInFlight = null;
+// The server's last known window for the rendered control: what a draft is
+// compared against.
 let autoCompactControlStoredWindow = null;
+// What the last payload said about the running session, for the notes.
+let autoCompactControlSession = { activeWindow: null, deferred: null, usedTokens: null };
+// The slider is a draft while the modal is open: moving it only updates the
+// label and the notes, and the value is saved when the modal is left
+// (setSummaryModalLeaveHandler). `window` undefined = untouched. Kept outside
+// the DOM so a refresh of the open modal keeps the position.
+let autoCompactDraft = { conversationId: '', window: undefined };
 
-// Snaps both the range input and its label back to `window`.
-function setAutoCompactControlValue(window) {
-  const slider = document.getElementById('ctx-autocompact-slider');
-  if (slider) slider.value = String(autoCompactWindowToIndex(window));
+function autoCompactNotesOptions(draftWindow, storedWindow = autoCompactControlStoredWindow) {
+  return {
+    draftWindow,
+    storedWindow,
+    activeWindow: autoCompactControlSession.activeWindow,
+    deferred: autoCompactControlSession.deferred,
+    turnRunning: !!autoCompactControlConversationId && conversationHasActiveTurn(autoCompactControlConversationId),
+    usedTokens: autoCompactControlSession.usedTokens,
+  };
+}
+
+function trackAutoCompactDraft(slider) {
+  const window = autoCompactWindowFromIndex(slider.value);
+  autoCompactDraft = { conversationId: autoCompactControlConversationId, window };
   const label = document.getElementById('ctx-autocompact-value');
   if (label) label.textContent = formatAutoCompactWindowLabel(window);
+  const notes = document.getElementById('ctx-autocompact-notes');
+  if (notes) notes.innerHTML = renderAutoCompactNotesHtml(autoCompactNotesOptions(window));
 }
 
 /**
@@ -3121,18 +3148,37 @@ function initAutoCompactWindowControl() {
     const target = event?.target;
     return target && target.id === 'ctx-autocompact-slider' ? target : null;
   };
-  // Dragging only previews the label; nothing is persisted until the value
-  // settles, matching the settings-modal sliders.
-  body.addEventListener('input', (event) => {
-    const slider = sliderFrom(event);
-    if (!slider) return;
-    const label = document.getElementById('ctx-autocompact-value');
-    if (label) label.textContent = formatAutoCompactWindowLabel(autoCompactWindowFromIndex(slider.value));
-  });
-  body.addEventListener('change', (event) => {
-    const slider = sliderFrom(event);
-    if (!slider) return;
-    void applyAutoCompactWindowSelection(autoCompactWindowFromIndex(slider.value));
+  // Nothing is written while the modal is open; see commitAutoCompactDraft.
+  for (const type of ['input', 'change']) {
+    body.addEventListener(type, (event) => {
+      const slider = sliderFrom(event);
+      if (slider) trackAutoCompactDraft(slider);
+    });
+  }
+}
+
+// Runs when the context modal is left (or re-bound to another conversation):
+// a draft that differs from the stored value is saved; one set back to the
+// stored value sends nothing.
+function commitAutoCompactDraft({ pageClosing = false } = {}) {
+  const { conversationId, window } = autoCompactDraft;
+  autoCompactDraft = { conversationId: '', window: undefined };
+  if (!conversationId || window === undefined) return;
+  if (conversationId === autoCompactControlConversationId && window === autoCompactControlStoredWindow) return;
+  if (pageClosing) {
+    // Sent at once, not queued behind an earlier save: the request has to
+    // leave before the page does.
+    void saveAutoCompactWindow(conversationId, window, '', { pageClosing: true });
+    return;
+  }
+  const notes = autoCompactWindowNotes(autoCompactNotesOptions(window, window));
+  const previous = autoCompactWindowUpdateInFlight || Promise.resolve();
+  const run = previous
+    .catch(() => {})
+    .then(() => saveAutoCompactWindow(conversationId, window, notes.pending));
+  autoCompactWindowUpdateInFlight = run;
+  void run.finally(() => {
+    if (autoCompactWindowUpdateInFlight === run) autoCompactWindowUpdateInFlight = null;
   });
 }
 
@@ -3239,41 +3285,32 @@ async function applyThinkingSelection(axis, key) {
   }
 }
 
-async function applyAutoCompactWindowSelection(autoCompactWindow) {
-  const convId = String(autoCompactControlConversationId || '').trim();
-  const slider = document.getElementById('ctx-autocompact-slider');
-  if (!convId || autoCompactWindowUpdateInFlight) {
-    // Nothing will be written, so leave the control showing what is stored
-    // rather than a position the server never heard about.
-    setAutoCompactControlValue(autoCompactControlStoredWindow);
-    return;
-  }
-  autoCompactWindowUpdateInFlight = true;
-  if (slider) slider.disabled = true;
+async function saveAutoCompactWindow(convId, autoCompactWindow, pendingNote = '', { pageClosing = false } = {}) {
   try {
     // Only the window is sent: the route keeps every unmentioned preference as
     // stored, so this cannot clobber the composer's model/effort choice.
     const response = await updateConversationPreferences(convId, {
       clientId: CLIENT_ID,
       autoCompactWindow,
-    });
+    }, { keepalive: pageClosing });
+    // Nobody is left to tell on a page that is going away.
+    if (pageClosing) return;
     if (!response) throw new Error('Failed to update the auto-compact window');
     // The server, not the slider, decides what got stored (values snap to a
-    // stop), so the control follows the response.
+    // stop).
     const stored = response.autoCompactWindow ?? null;
-    autoCompactControlStoredWindow = stored;
-    setAutoCompactControlValue(stored);
+    if (convId === autoCompactControlConversationId) autoCompactControlStoredWindow = stored;
+    // No note when the running session already uses this value.
+    const when = pendingNote ? ` ${pendingNote}` : '';
     showTransientRelayNotice(stored === null
-      ? 'Auto-compact window back to the model default; applies to the next message.'
-      : `Auto-compact window set to ${formatAutoCompactWindowLabel(stored)} tokens; applies to the next message.`);
+      ? `Auto-compact window back to the model default.${when}`
+      : `Auto-compact window set to ${formatAutoCompactWindowLabel(stored)} tokens.${when}`);
+    // A modal reopened on this conversation meanwhile shows the new value.
+    if (summaryModalState.kind === 'context' && convId === autoCompactControlConversationId) {
+      await refreshSummaryModal();
+    }
   } catch (error) {
-    // The write was refused, so the rejected position is a lie: put the
-    // control back on the last value the server confirmed.
-    setAutoCompactControlValue(autoCompactControlStoredWindow);
     alert(error?.message || 'Failed to update the auto-compact window.');
-  } finally {
-    autoCompactWindowUpdateInFlight = false;
-    if (slider) slider.disabled = false;
   }
 }
 
@@ -3294,7 +3331,33 @@ async function loadContextSummaryAndRender(convId) {
     ? `${providerLabel} session ${sessionId.slice(0, 8)}`
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
 
-  const usageHtml = renderContextUsageHtml(payload.contextUsage);
+  // The session fields come with the payload when the relay knows them
+  // (older relays send neither, and the notes fall back to draft vs stored).
+  const sessionField = (key) => payload[key] ?? payload.contextUsage?.[key] ?? null;
+  const modelContextLimit = sessionField('modelContextLimit');
+  const usageHtml = renderContextUsageHtml(payload.contextUsage, {
+    compactionWindow: payload.providerType === 'claude',
+    modelContextLimit,
+  });
+  // The slider's writes need the conversation id even when the modal was
+  // opened through an sdk_session_id.
+  const boundConversationId = String(
+    payload.resolvedConversationId || (payload.providerType === 'claude' ? trimmedConvId : '') || '',
+  ).trim();
+  // A draft for another conversation is saved before this one takes over.
+  if (autoCompactDraft.conversationId && autoCompactDraft.conversationId !== boundConversationId) {
+    commitAutoCompactDraft();
+  }
+  autoCompactControlConversationId = boundConversationId;
+  // What the server says is stored right now, refreshed every time the
+  // control is re-rendered: the draft is compared against it.
+  autoCompactControlStoredWindow = payload.autoCompactWindow ?? null;
+  autoCompactControlSession = {
+    activeWindow: sessionField('activeAutoCompactWindow'),
+    deferred: sessionField('autoCompactWindowDeferred'),
+    usedTokens: payload.contextUsage?.totalTokens ?? null,
+  };
+  const draftWindow = autoCompactDraft.conversationId === boundConversationId ? autoCompactDraft.window : undefined;
   // Claude-only: no other provider exposes a compaction window (or any
   // session-settings surface) to steer.
   const autoCompactHtml = payload.providerType === 'claude'
@@ -3310,6 +3373,11 @@ async function loadContextSummaryAndRender(convId) {
         ? (payload.contextUsage.isAutoCompactEnabled ?? null)
         : null,
       maxTokens: payload.contextUsage?.maxTokens ?? null,
+      draftWindow,
+      activeAutoCompactWindow: autoCompactControlSession.activeWindow,
+      autoCompactWindowDeferred: autoCompactControlSession.deferred,
+      turnRunning: autoCompactNotesOptions(draftWindow).turnRunning,
+      usedTokens: autoCompactControlSession.usedTokens,
     })
     : '';
   const thinkingHtml = payload.providerType === 'claude'
@@ -3323,14 +3391,6 @@ async function loadContextSummaryAndRender(convId) {
   const attributionHtml = payload.providerType === 'claude' || payload.providerType === 'claude-cloud'
     ? renderAttributionControlHtml(payload.attribution || null)
     : '';
-  // The slider's writes need the conversation id even when the modal was
-  // opened through an sdk_session_id.
-  autoCompactControlConversationId = String(
-    payload.resolvedConversationId || (payload.providerType === 'claude' ? trimmedConvId : '') || '',
-  ).trim();
-  // Baseline for the failure path below: what the server says is stored right
-  // now, refreshed every time the control is re-rendered.
-  autoCompactControlStoredWindow = payload.autoCompactWindow ?? null;
   thinkingControlStored = {
     enabled: payload.thinkingEnabled !== false,
     display: payload.thinkingDisplay || 'summarized',
@@ -3351,6 +3411,7 @@ async function loadContextSummaryAndRender(convId) {
     refresh: () => loadContextSummaryAndRender(refreshLookupId),
     kind: 'context',
   });
+  setSummaryModalLeaveHandler('context', () => commitAutoCompactDraft());
 }
 
 async function showUsage() {
@@ -4194,11 +4255,15 @@ function refreshClaudeCloudComposerModels() {
 }
 
 function showAuthGate(error = '') {
-  document.getElementById('startup-loading')?.remove();
   document.getElementById('auth-gate').style.display = 'flex';
   document.getElementById('app').classList.remove('visible');
   showAuthError(error);
-  document.getElementById('token-input')?.focus();
+  // The start screen hands its logo over to the box first (installed app);
+  // focusing earlier would open the keyboard and move the box under it.
+  const focusToken = () => document.getElementById('token-input')?.focus();
+  const handover = window.__startupSplash?.toAuth?.();
+  if (handover && window.__startupSplash.animated) void handover.then(focusToken);
+  else focusToken();
 }
 
 // Runs before anything reads MODEL_STORAGE_KEY so the first load after an
@@ -4224,6 +4289,7 @@ async function initApp() {
   setForegroundNetworkWorkEnabled(document.visibilityState === 'visible');
   const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
   initTheme();
+  initScrollbarHover();
   initThemeMenuToggle();
   if (sharedThemeBtn && sharedMode) sharedThemeBtn.hidden = false;
   initFontScaling();
@@ -4256,7 +4322,8 @@ async function initApp() {
     void flushConversationDraft(currentConvId);
     closeTmuxInspectorView();
   });
-  document.getElementById('startup-loading')?.remove();
+  // The start screen lies over the app and leaves once its animation is done.
+  void window.__startupSplash?.finish?.();
   document.getElementById('auth-gate').style.display = 'none';
   document.getElementById('app').classList.add('visible');
   initSidebarLayout();

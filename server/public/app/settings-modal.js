@@ -35,7 +35,7 @@ import {
 } from './api-client.js';
 import { DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES } from './background-task-timeout-options.mjs';
 import { syncFontScaleSelect } from './font-scaling.js';
-import { syncPwaAppNameInput } from './pwa-install.js';
+import { syncInstalledAppUiState, syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
 import { refreshPushSettingsSection } from './push-settings.js';
 import { selectSettingsTab } from './settings-tabs.js';
@@ -1589,6 +1589,9 @@ export function updateTheme(theme) {
     document.documentElement.removeAttribute('data-theme');
     writeLocalStorage(THEME_STORAGE_KEY, 'dark');
   }
+  // The installed app's manifest, the tab icons and the toolbar colour follow.
+  window.__applyThemeAssets?.(theme === 'light' ? 'light' : 'dark');
+  syncInstalledAppUiState();
 }
 
 export function updateShowSuspendHostSetting(next) {

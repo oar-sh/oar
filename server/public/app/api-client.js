@@ -46,7 +46,9 @@ export function areNetworkRequestsEnabled() {
 }
 
 export async function apiFetch(url, opts = {}) {
-  if (!networkRequestsEnabled) return null;
+  // A keepalive request is a page's last word; it goes out even when the
+  // page's regular network work is already suspended.
+  if (!networkRequestsEnabled && !opts.keepalive) return null;
   try {
     const response = await fetch(`${BASE}${url}`, {
       signal: requestTimeoutSignal(),
@@ -924,12 +926,14 @@ export async function updateWorkspaceRootAttribution(path, attributionMode) {
   });
 }
 
-export async function updateConversationPreferences(id, preferences = {}) {
+// `keepalive` lets the request outlive the page (a save made while it closes).
+export async function updateConversationPreferences(id, preferences = {}, { keepalive = false } = {}) {
   const convId = String(id || '').trim();
   if (!convId) return null;
   return apiFetch(`/api/conversation/${convId}/preferences`, {
     method: 'PATCH',
     body: JSON.stringify(preferences || {}),
+    ...(keepalive ? { keepalive: true } : {}),
   });
 }
 

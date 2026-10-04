@@ -20,7 +20,7 @@ test('index auth gate uses resilient connect handler', () => {
 
 test('index keeps the auth gate hidden until bootstrap needs it', () => {
   assert.match(source, /#auth-gate \{\s*display: none;/);
-  assert.match(source, /<div id="startup-loading" role="status" aria-live="polite">Connecting to OAR…<\/div>/);
-  assert.match(source, /document\.getElementById\('startup-loading'\)\?\.remove\(\);/);
+  assert.match(source, /<div id="startup-loading" role="status" aria-live="polite"><div class="brand-logo" aria-hidden="true"><\/div><div class="startup-label">Connecting to OAR…<\/div><\/div>/);
+  assert.match(source, /void window\.__startupSplash\.toAuth\(\);/);
   assert.match(source, /document\.getElementById\('auth-gate'\)\.style\.display = 'flex';/);
 });

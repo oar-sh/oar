@@ -5,6 +5,119 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.8] — 2026-10-04
+
+Highlights: OAR has a logo, an otter, with icons that follow Day and Night
+mode and a start screen that continues the phone's launch screen; a
+*Compacting context…* line shows while a Claude session compacts, and a
+changed auto-compact window now really applies; the one-line installer
+finishes the job and `oar start` brings the relay up without a session;
+scrollbars are easier to grab with a mouse.
+
+### Added
+
+- **The otter logo, matching Day and Night mode.** OAR has a new logo. The
+  start screen and the sign-in box show it on a white tile in Day mode and on
+  a dark tile in Night mode, and only the matching file is loaded. The tab
+  icon, the toolbar colour and the installed app's icon and launch background
+  follow the Theme setting too (Android launchers get a full-bleed icon that
+  fills their shape), and the theme is applied before the first
+  paint, so Day mode no longer starts with a dark screen. On Android the
+  installed app's own launch screen updates when the system refreshes the
+  app, which can take a day.
+- **The installed app starts in one motion.** The start screen continues the
+  phone's launch screen: the otter stands where and as large as the launch
+  screen showed it, then slides up and shrinks while *Connecting to OAR…*
+  fades in below. Without a stored token it travels on into the sign-in box,
+  which fades in around it. Launch screen, start screen and status bar share
+  one colour, so no plate shows around the logo. The app waits for the
+  animation (under a second); a browser tab starts at once as before, and so
+  does an installed app when motion is reduced in the system settings.
+- **A compaction shows while it runs.** When a Claude session starts
+  compacting its context, a *Compacting context…* line appears above the
+  running turn and its bubble says *Compacting the conversation…*. When the
+  compaction ends, the same line becomes *Context compacted · 120k → 40k
+  tokens*; one that ends without a result leaves no line.
+- **`oar start`, and `oar setup --start`.** `oar start` starts the relay of a
+  global install in the background, without a Copilot session tied to it
+  (through the systemd user service when one is installed), and prints the
+  relay URL. `oar setup --start` does the whole job without a question: where
+  a systemd user session exists it writes and enables the service and enables
+  lingering, elsewhere it starts the relay in the background. `oar setup
+  --port <port>` sets the port; a new config otherwise takes the first free
+  port from 3333 on.
+- **The macOS and Linux installer does everything after one confirmation.**
+  `curl -fsSL oar.sh/install | sh` prints what it will do, asks once (`--yes`
+  skips the question), then installs OAR and starts the relay. Without
+  Node.js, or with one older than 22.13, it downloads Node.js 24 from
+  nodejs.org into `~/.oar/runtime/node` for OAR alone. Nothing needs root.
+
+### Changed
+
+- **Scrollbars are easier to grab with a mouse.** A scrollbar doubles its
+  width while the pointer is on it and goes back to thin 2.5 seconds after
+  the pointer left. The space for the wide scrollbar is always kept, so
+  nothing on the page moves when it grows. Touch devices are unchanged.
+
+- **The auto-compact window slider saves when the 🧠 modal closes.** Moving
+  it only changes the label and the notes beneath it; the value is saved
+  when the modal is closed, and setting it back sends nothing. A notice
+  warns when the new window is below what the conversation already uses
+  (*The conversation will be compacted on the next message.*), and another
+  says when the change takes effect: after the current turn, when
+  background work has finished, or on the next message. The modal's
+  headline reads `60.9k used · compaction window 100.0k · model limit 1M`.
+
+### Fixed
+
+- **`oar start` no longer mistakes a leftover lock or another program for a
+  running relay.** It asks the relay itself: only an answer to OAR's own status
+  call with the configured token counts as running. A lock left behind by a
+  relay that did not stop cleanly is removed and the relay is started; if
+  another program holds the port, `oar start` says so and names
+  `oar setup --port`.
+- **A new config no longer picks a port that is in use on Windows.** The
+  free-port check binds the loopback addresses as well as all interfaces and
+  tries a connection, since Windows allows a wildcard bind beside a listener
+  on 127.0.0.1 alone.
+- **The compaction line survives a busy turn.** The live *Compacting context…*
+  / *Context compacted* line used to disappear after two dozen further
+  activity lines until the next reload.
+- **The auto-compact slider is saved when the page closes.** Closing the tab
+  or the app with the context window still open used to drop a moved slider.
+
+- **A "Compacting context…" line no longer stays on a waiting message.** When
+  the session compacted while a message waited behind a turn the agent had
+  opened itself, the line stayed on the waiting message for its whole turn.
+
+- **A new auto-compact window now reaches a running Claude session.** The
+  CLI reads the window only when it starts, so a changed window used to wait
+  until the session restarted for some other reason. The session now
+  restarts once, before the next message, when nothing is running in it
+  (no turn, question, compaction or background work); the reply notes it
+  (*Restarted the session to apply the compaction window (Auto → 100k)*).
+- **The installer no longer fails with `EACCES` on a Node.js from a
+  distribution or NodeSource package.** There npm's global folder needs root,
+  and the installer refuses to run as root, so the install could not succeed.
+  It now installs the package into `~/.oar/npm` and puts the `oar` command
+  into `~/.local/bin`.
+- **Updates land in the install that is running.** `oar update` and the
+  **Update** button ran whatever `npm` was first on `PATH` into npm's default
+  global folder. They now run the npm of the Node.js that runs the relay, into
+  the folder the package is installed in, so an install made with `--prefix`,
+  a relay service without `npm` on its `PATH`, and a version manager pointing
+  at another Node.js all update correctly.
+- **Installs and updates work on npm 12.** npm 12 runs no install script it
+  was not told to allow, so `better-sqlite3`, `koffi` and `cloudflared` were
+  installed without their binaries and the relay did not start. `oar update`,
+  the **Update** button and both installers now pass `--allow-scripts` for
+  these three; for a manual `npm install -g` the README gives the flag.
+- **The systemd user service finds your tools.** The unit `oar setup` writes
+  now carries the `PATH` of the shell that ran it, plus `~/.local/bin` and the
+  directory of its Node.js. A user service otherwise starts with systemd's
+  bare `PATH`, on which the relay's sessions found neither the provider CLIs
+  nor, with a version manager, `node` itself.
+
 ## [0.9.7] — 2026-10-03
 
 Highlights: Claude Cloud chats (experimental, off by default) run Claude Code

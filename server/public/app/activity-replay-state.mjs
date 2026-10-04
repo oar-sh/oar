@@ -18,8 +18,42 @@ export function normalizeRelayActivityEntry(item) {
 // A compaction boundary is published as an ordinary activity row carrying
 // structured metadata. The transcript promotes it to a full-width break row
 // (and drops it from the bubble's tool-activity list), so both sides ask here.
+// Every compaction entry answers here, whatever its state: the live bubble
+// never shows any of them as prose.
 export function isCompactBoundaryActivityEntry(item) {
   return normalizeRelayActivityEntry(item)?.metadata?.kind === 'compact_boundary';
+}
+
+// The live list of one turn keeps its newest ordinary lines only, but every
+// structured row a line of the transcript is built from: the turn's
+// compaction entries and the session-restart note would otherwise scroll out
+// of a busy turn and take their line with them until the next reload.
+export const LIVE_ACTIVITY_CAP = 24;
+function isKeptLiveActivityEntry(item) {
+  const kind = normalizeRelayActivityEntry(item)?.metadata?.kind;
+  return kind === 'compact_boundary' || kind === 'compact_window_respawn';
+}
+export function capLiveActivityEntries(items, cap = LIVE_ACTIVITY_CAP) {
+  const list = Array.isArray(items) ? items : [];
+  let ordinary = list.reduce((count, item) => count + (isKeptLiveActivityEntry(item) ? 0 : 1), 0);
+  if (ordinary <= cap) return list;
+  return list.filter((item) => {
+    if (isKeptLiveActivityEntry(item)) return true;
+    ordinary -= 1;
+    return ordinary < cap;
+  });
+}
+
+// A compaction is published in up to two steps on the same message: a
+// `pending` entry when it starts, then either the boundary (no `state`, token
+// counts) or a `cancelled` entry when it ended without a result.
+// → 'pending' | 'cancelled' | 'boundary' | null (not a compaction entry).
+export function compactionEntryState(item) {
+  const metadata = normalizeRelayActivityEntry(item)?.metadata;
+  if (metadata?.kind !== 'compact_boundary') return null;
+  const state = String(metadata.state || '').trim().toLowerCase();
+  if (state === 'pending' || state === 'cancelled') return state;
+  return 'boundary';
 }
 
 function toTokenCount(value) {
@@ -34,24 +68,53 @@ function toTokenCount(value) {
 // than once only the LAST boundary is promoted. This returns that entry by
 // identity, so the render path can keep the others visible as prose instead
 // of dropping them (they would otherwise vanish from the transcript).
-export function promotedCompactBoundaryEntry(items) {
+//
+// The last compaction entry decides: a `pending` one is promoted only while
+// the message is still `processing` (a finished or failed message never shows
+// a dangling start). A dangling start or a `cancelled` end draws no line of
+// its own, so the line falls back to an earlier boundary of the same message
+// when there is one.
+export function promotedCompactBoundaryEntry(items, { processing = false } = {}) {
   const list = Array.isArray(items) ? items : [];
+  let sawLast = false;
   for (let index = list.length - 1; index >= 0; index -= 1) {
-    if (isCompactBoundaryActivityEntry(list[index])) return list[index];
+    const state = compactionEntryState(list[index]);
+    if (!state) continue;
+    if (!sawLast) {
+      sawLast = true;
+      if (state === 'pending' && processing) return list[index];
+    }
+    if (state === 'boundary') return list[index];
   }
   return null;
 }
 
 // The last compaction recorded against one message's activities, as
-// { preTokens, postTokens } (either may be null when the SDK omitted it).
-export function compactBoundaryFromActivities(items) {
-  const promoted = promotedCompactBoundaryEntry(items);
+// { preTokens, postTokens } (either may be null when the SDK omitted it), or
+// { pending: true, preTokens: null, postTokens: null } while it runs.
+export function compactBoundaryFromActivities(items, options = {}) {
+  const promoted = promotedCompactBoundaryEntry(items, options);
   if (!promoted) return null;
+  if (compactionEntryState(promoted) === 'pending') {
+    return { pending: true, preTokens: null, postTokens: null };
+  }
   const metadata = normalizeRelayActivityEntry(promoted).metadata;
   return {
     preTokens: toTokenCount(metadata.preTokens),
     postTokens: toTokenCount(metadata.postTokens),
   };
+}
+
+// Activity rows the message bubble lists as prose: everything except the
+// promoted boundary (it is the break row) and every pending/cancelled step
+// (transient state, never prose).
+export function visibleActivityEntries(items, promoted) {
+  const list = Array.isArray(items) ? items : [];
+  return list.filter((item) => {
+    if (item === promoted) return false;
+    const state = compactionEntryState(item);
+    return state !== 'pending' && state !== 'cancelled';
+  });
 }
 
 // Head-cap that never drops structured rows. Activity lists are capped from

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="server/public/app-icon.svg">
+    <img src="server/public/app-icon-light.svg" alt="The OAR logo: an otter standing upright" width="120" height="120">
+  </picture>
+</p>
+
 # OAR — Open Agent Relay
 
 Drive the coding agents on your machine from any browser (phone, tablet, or a second computer) through a self-hosted web relay.
@@ -29,23 +36,23 @@ OAR is under active development, so expect occasional rough edges and some provi
 <table>
 <tr>
 <td width="42%" rowspan="3" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.3"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.3" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></a>
+<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.8"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.8" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></a>
 <br><sub>On a phone: the same conversations, installable as an app.</sub>
 </td>
 <td width="58%" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.3"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.3" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></a>
+<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.8"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.8" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></a>
 <br><sub>Agents working in parallel, each with live token counts and its own Stop.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.3"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.3" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></a>
+<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.8"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.8" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></a>
 <br><sub>When the agent needs a decision, it asks, and waits for your answer.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.3"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.3" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></a>
+<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.8"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.8" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></a>
 <br><sub>Read the reasoning, not just the answer.</sub>
 </td>
 </tr>
@@ -61,7 +68,7 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 
 | Requirement | Needed for | Notes |
 | ----------- | ---------- | ----- |
-| Node.js 22.13 or newer | always | Both installers check this. Running the development test suite needs Node 24 (see [DEVELOPING.md](DEVELOPING.md#node-version)) |
+| Node.js 22.13 or newer | always | The macOS and Linux installer fetches its own copy when yours is missing or too old; the Windows installer only checks. Running the development test suite needs Node 24 (see [DEVELOPING.md](DEVELOPING.md#node-version)) |
 | GitHub Copilot CLI (`copilot`), signed in | Copilot and OpenAI (BYOK) chats | Install it with `npm install -g @github/copilot`, then run `copilot` once on the relay host and sign in. The relay looks for the CLI's runtime when it starts, so restart the relay after installing or upgrading the CLI. Needs a GitHub Copilot plan that includes Copilot CLI |
 | GitHub CLI (`gh`), signed in | the `oar` launcher command; Extension-engine sessions on Windows; the Copilot card in **Check Usage** | `gh copilot` is built into current GitHub CLI releases, so there is no extension to install. The usage card also accepts a token in `GH_TOKEN` or `GITHUB_TOKEN` |
 | OpenAI API key | OpenAI and OpenAI Image chats | Entered in **⚙️ Settings**, stored in the relay database |
@@ -77,11 +84,26 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 curl -fsSL oar.sh/install | sh
 ```
 
-The script checks for Node.js 22.13 or newer, runs `npm install -g @oar-sh/oar`, and then hands off to `oar setup` (with `--defaults` when there is no terminal to ask questions in). It refuses to run as root, because OAR installs per user. `OAR_VERSION=x.y.z` pins a version, `OAR_CHANNEL=beta` follows the beta channel, and `OAR_DRY_RUN=1` only prints what it would do:
+The script looks at what the machine has, prints what it is about to do, and asks once. After a yes it installs OAR, writes the config with a fresh auth token, starts the relay, and prints the relay URL with a QR code. Nothing needs root (it refuses to run as root, because OAR installs per user), and everything lands in your home directory:
+
+| The machine has | What the installer does |
+| --------------- | ----------------------- |
+| Node.js 22.13 or newer whose global npm folder you can write (nvm, fnm, Homebrew, a user prefix) | `npm install -g @oar-sh/oar`, as you would by hand |
+| Node.js 22.13 or newer whose global npm folder needs root (a distribution or NodeSource package) | Installs the package into `~/.oar/npm` with your Node.js and puts an `oar` command into `~/.local/bin`. Your npm setup is not changed |
+| No Node.js, or an older one | Downloads the current Node.js 24 from nodejs.org into `~/.oar/runtime/node` (checksum verified, about 30 MB), installs the package into `~/.oar/npm` with it, and puts an `oar` command into `~/.local/bin`. Only OAR uses that Node.js; one of your own stays first on `PATH` |
+
+When it puts the command into `~/.local/bin` and that folder is not on your `PATH`, it adds one line to your shell's startup file (`~/.bashrc`, `~/.zshrc`, or `~/.profile`) and says so.
+
+The relay is started as a systemd user service where a systemd user session exists, with lingering enabled, so it is back after a reboot and keeps running while you are logged out. Elsewhere (macOS, containers, WSL without systemd) it is started in the background; after a reboot, `oar start` starts it again.
+
+`--yes` skips the question, for scripts and CI; without a terminal to ask on, the installer stops and says so. `OAR_VERSION=x.y.z` pins a version, `OAR_CHANNEL=beta` follows the beta channel, `OAR_PORT=n` sets the relay port, `OAR_NODE=private` uses OAR's own Node.js even when yours would do, and `OAR_DRY_RUN=1` only prints the plan:
 
 ```bash
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.6 sh
+curl -fsSL oar.sh/install | sh -s -- --yes
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.8 OAR_PORT=3400 sh
 ```
+
+The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
 
 Read it before you run it: [oar.sh/install](https://oar.sh/install).
 
@@ -91,14 +113,16 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) does the same: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.6'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.6'` before the command.
 
 ### npm
 
 ```bash
-npm install -g @oar-sh/oar
+npm install -g --allow-scripts=better-sqlite3,cloudflared,koffi @oar-sh/oar
 oar setup
 ```
+
+npm 12 runs no install script it was not told to allow, and three of OAR's dependencies fetch their native binary in one; without `--allow-scripts` the install succeeds there and the relay then fails to start. npm 10 and 11 accept the flag and need none. The installers and `oar update` pass it themselves.
 
 ### From a git checkout
 
@@ -126,13 +150,14 @@ Development workflows, tests, and relay internals are in [DEVELOPING.md](DEVELOP
 
 ### Start the relay
 
-`oar setup` creates the config and prints the relay URL with a QR code, but it does not start the relay. Pick one:
+The macOS and Linux installer starts the relay itself. After a manual install, `oar setup` creates the config and prints the relay URL with a QR code, but it does not start the relay unless you pass `--start`. Pick one:
 
-- **Linux (global install):** accept the systemd user service that `oar setup` offers, then run `systemctl --user enable --now oar`. The relay then starts when you log in; run `loginctl enable-linger "$USER"` once if it should keep running while you are logged out.
+- **Any global install on macOS or Linux:** `oar start` starts the relay in the background (through the systemd user service when one is installed) and prints the relay URL. `oar setup --defaults --start` is what the installer runs: it also installs and enables the systemd user service where a systemd user session exists, and enables lingering.
+- **Linux (global install), by hand:** accept the systemd user service that `oar setup` offers, then run `systemctl --user enable --now oar`. The relay then starts when you log in; run `loginctl enable-linger "$USER"` once if it should keep running while you are logged out. The unit carries the `PATH` of the shell that ran `oar setup`, plus `~/.local/bin`, so the relay's sessions find the tools you have; rerun `oar setup` after your `PATH` changed.
 - **Windows:** start the relay once with `oar`, then choose **⚙️ Settings → General → Autostart (Windows)**: *At sign-in* opens a visible terminal after you log on, and *At system startup* runs it headless before anyone signs in, after one admin confirmation on the PC itself.
 - **Any platform:** `oar` starts the relay in the background if it is not already running, then opens the Copilot CLI (`gh copilot`) in the same shell. A relay that `oar` started stops again when that Copilot session ends, and `oar` needs the GitHub CLI.
 
-To run only the relay from a global install, without a Copilot session, start the server the way the systemd unit does:
+To run the relay of a global install in the foreground, start the server the way the systemd unit does:
 
 ```bash
 COPILOT_WEB_RELAY_CONFIG="$HOME/.oar/config.json" \
@@ -154,14 +179,15 @@ Then open the URL that `oar setup` printed, or scan its QR code. With `localhost
 | `oar --port <port>` | Finds or starts the relay on `<port>` for this run, overriding the config's `port` without changing the file; a config this command creates saves it. Without it, `oar` uses the config's `port` (default `3333`) |
 | `oar --migrate-from <dir>` | Global installs: copies the relay state of a pre-rename git checkout at `<dir>` into the OAR state root, once. The source is never moved or changed, and a relay still running from it blocks the copy. `oar setup` accepts the same option |
 | `oar --install-extension` | Writes or refreshes the user-global Copilot CLI extension wrapper in `~/.copilot/extensions/web-relay/`, then exits. Plain `oar` does this on every run; `--no-install-extension` skips it |
-| `oar setup [--defaults]` | Creates or updates the config: generates an auth token (with a config already present it offers a new one, which signs every device out), asks whether a new config should allow LAN access and whether to enable the managed Cloudflare tunnel, offers the systemd user service on Linux global installs, then prints the relay URL and a QR code. An existing config keeps its `localhostOnly` value. `--defaults` accepts every default without asking |
+| `oar setup [--defaults] [--start] [--port <port>]` | Creates or updates the config: generates an auth token (with a config already present it offers a new one, which signs every device out), asks whether a new config should allow LAN access and whether to enable the managed Cloudflare tunnel, offers the systemd user service on Linux global installs, then prints the relay URL and a QR code. An existing config keeps its `localhostOnly` value. `--defaults` accepts every default without asking. `--port` sets the relay port; without it a new config takes the first free port from 3333 on, and an existing config keeps its port. `--start` (global installs) also gets the relay running without a question: with a systemd user session it writes and enables the service and enables lingering, elsewhere it starts the relay in the background; a relay that is already running is left alone |
+| `oar start` | Global installs: starts the relay in the background without a Copilot session, through the systemd user service when one is installed, and prints the relay URL. A relay that is already running is left alone |
 | `oar doctor` | Prints the version, Node.js, install mode, state root, config path, port, whether an auth token is set, the tunnel mode, the database path and size, and which provider CLIs (`gh`, `claude`, `grok`) answer. It changes nothing |
-| `oar update [--beta] [--to X.Y.Z]` | Global installs: looks up the newest release of your channel in `https://oar.sh/latest.json` (`--beta` for the beta channel), installs it with `npm install -g`, and asks a running relay to restart once no turn is running. `--to X.Y.Z` installs that version straight from npm, which works even when `OAR_NO_UPDATE_CHECK=1` blocks the lookup |
+| `oar update [--beta] [--to X.Y.Z]` | Global installs: looks up the newest release of your channel in `https://oar.sh/latest.json` (`--beta` for the beta channel), installs it with `npm install -g` (the npm of the Node.js that runs `oar`, into the folder the package is installed in), and asks a running relay to restart once no turn is running. `--to X.Y.Z` installs that version straight from npm, which works even when `OAR_NO_UPDATE_CHECK=1` blocks the lookup |
 | `oar --version`, `oar --help` | Prints the version, or the usage |
 
 ### Where OAR keeps its files
 
-A global install keeps its state in `~/.oar` (`%APPDATA%\oar` on Windows; `OAR_STATE_ROOT` moves it): `config.json`, `data/` (the database and uploads), and `logs/` (`server.log` when `oar` started the relay, and a `worker-<session>.log` per Node session worker). `npm install -g` updates never touch it. A git checkout uses `server/config.json`, `server/data/`, `server/uploads/`, and `server/logs/` instead.
+A global install keeps its state in `~/.oar` (`%APPDATA%\oar` on Windows; `OAR_STATE_ROOT` moves it): `config.json`, `data/` (the database and uploads), and `logs/` (`server.log` when `oar` started the relay, and a `worker-<session>.log` per Node session worker). `npm install -g` updates never touch it. The macOS and Linux installer may add two folders there that are not state: `npm/` (the package, when npm's own global folder was not writable) and `runtime/node/` (OAR's own Node.js, when the machine had none new enough). A git checkout uses `server/config.json`, `server/data/`, `server/uploads/`, and `server/logs/` instead.
 
 `COPILOT_WEB_RELAY_CONFIG`, `COPILOT_WEB_RELAY_DATA_DIR`, and `COPILOT_WEB_RELAY_LOG_DIR` override the config file, the data directory, and the log directory. `oar doctor` prints the paths in use.
 
@@ -440,7 +466,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 - Question cards for clarification: one-click choices, multi-select checkmarks, free text, and multi-field structured forms validated against their JSON schema
 - Mathematical and scientific notation rendering for TeX/LaTeX equations and chemical formulas, written as `$…$`, `\(…\)`, `$$…$$` or `\[…\]`. A single `$` opens a formula only when a non-space character follows it directly and the next `$` has a non-space character directly before it and no digit directly after it (a digit is allowed after something that looks like TeX, as in `$x^2$3`), so prices such as `$5 and $9` stay text
 - **Context usage** modal with a per-category token breakdown of the model's context window, plus a per-conversation **auto-compact window** slider for Claude sessions
-- **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context, and matching dots beside the scrollbar
+- **Transcript breaks**: day separators, a marker where a Claude session auto-compacted its context (shown while the compaction runs), and matching dots beside the scrollbar
 - **Plan usage** modal with subscription credits, rate-limit windows, and reset countdowns for Copilot, Claude, Claude Cloud, Cursor, and Grok
 - **Image conversations** (OpenAI Image): generate images in chat and iterate on a generated image with **Edit this image**
 - Agents can embed **images, video, and audio** in a reply by their absolute path, on every runtime; clicking an embedded image opens the file viewer with zoom, download, and copy
@@ -525,8 +551,8 @@ The composer draft, attachments included, is saved per conversation on the relay
   - **Grok** — the live weekly subscription quota, read with the host's Grok CLI login, plus per-turn tokens and estimated cost from the agent's prompt result. An optional monthly USD allowance in Settings adds an estimated remaining meter; the card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
 - Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Claude Cloud, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
 - Use the **🧠** context button for a per-category breakdown of the conversation's context window (Claude sessions also show the auto-compact window, the thinking controls and the folder's commit attribution there): a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets. A Claude Cloud session reports how much of its window is used after each turn, without categories.
-- Claude conversations additionally get an **auto-compact window** slider in that modal. Claude Code compacts a session once it approaches a model-tuned window (around 967k tokens on a 1M-context model), which is why long conversations rarely compact at all; setting a smaller window makes it happen sooner and keeps turns cheaper. *Auto* hands the choice back to the CLI. The smallest window is 100k, because the CLI silently ignores anything below that and falls back to its own default. The line beneath the slider reports the window actually in force and where it came from — your setting, the model default, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment override — and fills in once the conversation's first turn completes. The change reaches a running session on its next message.
-- The transcript marks day boundaries, and marks the point where a Claude session compacted its context with the tokens before and after. Both appear as dots beside the scrollbar for the messages currently loaded.
+- Claude conversations additionally get an **auto-compact window** slider in that modal. Claude Code compacts a session once it approaches a model-tuned window (around 967k tokens on a 1M-context model), which is why long conversations rarely compact at all; setting a smaller window makes it happen sooner and keeps turns cheaper. *Auto* hands the choice back to the CLI. The smallest window is 100k, because the CLI silently ignores anything below that and falls back to its own default. The line beneath the slider reports the window actually in force and where it came from — your setting, the model default, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment override — and fills in once the conversation's first turn completes. The slider is saved when the modal closes. Claude Code reads the window only when a session starts, so a running session restarts once, before the next message, to pick up a new one; while a turn or background work is running the change waits, and the note under the slider says for what. A window below what the conversation already uses compacts it on the next message, which the slider warns about. The modal's headline shows the tokens in use, the compaction window and, when known, the model's own limit.
+- The transcript marks day boundaries, and marks the point where a Claude session compacted its context with the tokens before and after. While a compaction runs, the line reads *Compacting context…* and the turn's bubble says so; it turns into the final line when the compaction ends. Both kinds appear as dots beside the scrollbar for the messages currently loaded.
 
 ### Sharing
 
@@ -898,6 +924,8 @@ under **General** (60 minutes by default), which does not know about the wait.
 | A conversation will not delete     | It is still working: a running turn, one waiting on a question card or approval, or live background tasks. Stop it, then delete |
 | A conversation seems wedged        | **☠️ Kill session** in the `⋯` menu stops its worker; retry the turn or send a new message |
 | **🌄 Restart web relay** fails with *localhost-only* | The restart endpoint accepts loopback connections only: use it on the relay host or through a tunnel, not over a direct LAN connection |
+| `npm install -g @oar-sh/oar` fails with `EACCES` | npm's global folder needs root (a distribution or NodeSource Node.js). Do not use `sudo`; run the installer (`curl -fsSL oar.sh/install \| sh`), which installs into `~/.oar/npm` instead |
+| The relay does not start after an install with npm 12 (a `better-sqlite3` error in `server-err.log`) | npm 12 skipped the install scripts of OAR's native dependencies. Reinstall with `npm install -g --allow-scripts=better-sqlite3,cloudflared,koffi @oar-sh/oar` |
 | `npm install -g @oar-sh/oar` fails with node-gyp or prebuild errors | `better-sqlite3` has no prebuilt binary for your platform; install a C/C++ build toolchain and Python, then retry |
 | No usage line under a reply        | Expected for OpenAI, Claude, Claude Cloud, Cursor, and Grok turns; only Copilot turns record plan usage |
 

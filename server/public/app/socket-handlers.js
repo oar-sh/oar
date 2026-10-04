@@ -34,6 +34,7 @@ import {
   summaryModalState,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
+import { capLiveActivityEntries } from './activity-replay-state.mjs';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
 import { renderConvList, refreshConversations, openConversation } from './journal-view.js';
 import {
@@ -574,7 +575,7 @@ export async function connectSocket(overrideDeps) {
     const lastText = typeof last === 'string' ? last : String(last?.text || '');
     const lastSubagentRunId = typeof last === 'object' && last ? (last.subagentRunId || null) : null;
     if (lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId) {
-      relayActivities.set(messageId, items.concat(entry).slice(-24));
+      relayActivities.set(messageId, capLiveActivityEntries(items.concat(entry)));
     }
     if (entry.subagentRunId) {
       upsertSubagentRun({ subagentRunId: entry.subagentRunId, messageId, conversationId });

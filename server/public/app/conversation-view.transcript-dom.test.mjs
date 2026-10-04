@@ -817,6 +817,92 @@ test('deleting the viewed conversation over the socket clears its live bubble', 
   assert.equal(liveBubble(), null);
 });
 
+const compactLines = () => [...messagesEl.querySelectorAll(':scope > .transcript-separator.is-compact')];
+const compactingNote = () => liveBubble()?.querySelector('.thinking-compacting-note');
+
+test('a running compaction draws its line above the live bubble; the reply relabels that same line', async () => {
+  resetView();
+  const conv = openConversation();
+  const messageId = uid('u');
+  liveTurn(conv, messageId);
+  assert.equal(compactLines().length, 0);
+  assert.equal(compactingNote().hidden, true);
+
+  fire('relay_activity', { conversationId: conv, messageId, text: 'Compacting context…', metadata: { kind: 'compact_boundary', state: 'pending' } });
+  const [line] = compactLines();
+  assert.ok(line, 'the pending line is up');
+  assert.equal(line.textContent, 'Compacting context…');
+  assert.ok(line.classList.contains('is-pending'));
+  assert.equal(line.querySelectorAll('.dots span').length, 3, 'with the animated dots');
+  assert.equal(line.dataset.separatorKey, `compact:${messageId}`);
+  assert.equal(line.nextElementSibling, liveBubble(), 'directly above the live bubble');
+  assert.equal(compactingNote().hidden, false);
+  assert.equal(compactingNote().textContent, 'Compacting the conversation…');
+  assert.equal(liveBubble().querySelector('.thinking-activity-item'), null, 'never live prose');
+
+  // The boundary lands while the turn still runs: the same line, final label.
+  fire('relay_activity', { conversationId: conv, messageId, text: 'Context compacted', metadata: { kind: 'compact_boundary', preTokens: 120000, postTokens: 40000 } });
+  assert.deepEqual(compactLines(), [line]);
+  assert.equal(line.textContent, 'Context compacted · 120k → 40k tokens');
+  assert.equal(compactingNote().hidden, true);
+  assert.equal(liveBubble().querySelector('.thinking-activity-item'), null, 'never live prose');
+
+  const replyId = uid('a');
+  fire('assistant_message', {
+    conversationId: conv,
+    messageId: replyId,
+    sourceMessageId: messageId,
+    message: {
+      role: 'assistant',
+      text: 'done',
+      timestamp: at(30),
+      sourceMessageId: messageId,
+      activities: [
+        { text: 'Compacting context…', metadata: { kind: 'compact_boundary', state: 'pending' } },
+        { text: 'Context compacted', metadata: { kind: 'compact_boundary', preTokens: 120000, postTokens: 40000 } },
+      ],
+    },
+  });
+  await flushMicrotasks();
+  assert.deepEqual(compactLines(), [line], 'the same node, not a second line');
+  assert.equal(line.textContent, 'Context compacted · 120k → 40k tokens');
+  assert.equal(line.classList.contains('is-pending'), false);
+  assert.equal(line.nextElementSibling, row(replyId));
+  assert.equal(row(replyId).querySelector('.msg-activity'), null, 'neither step shows as prose');
+});
+
+test('a compaction that ends without a result, or a turn that ends during one, leaves no line', async () => {
+  resetView();
+  const conv = openConversation();
+  const messageId = uid('u');
+  liveTurn(conv, messageId);
+  fire('relay_activity', { conversationId: conv, messageId, text: 'Compacting context…', metadata: { kind: 'compact_boundary', state: 'pending' } });
+  assert.equal(compactLines().length, 1);
+  fire('relay_activity', { conversationId: conv, messageId, text: 'Compaction ended without a result', metadata: { kind: 'compact_boundary', state: 'cancelled' } });
+  assert.equal(compactLines().length, 0, 'cancelled: the line goes');
+  assert.equal(compactingNote().hidden, true);
+  assert.equal(liveBubble().querySelector('.thinking-activity-item'), null, 'never live prose');
+
+  fire('relay_activity', { conversationId: conv, messageId, text: 'Compacting context…', metadata: { kind: 'compact_boundary', state: 'pending' } });
+  assert.equal(compactLines().length, 1);
+  const replyId = uid('a');
+  fire('assistant_message', {
+    conversationId: conv,
+    messageId: replyId,
+    sourceMessageId: messageId,
+    message: {
+      role: 'assistant',
+      text: 'failed',
+      timestamp: at(30),
+      sourceMessageId: messageId,
+      activities: [{ text: 'Compacting context…', metadata: { kind: 'compact_boundary', state: 'pending' } }],
+    },
+  });
+  await flushMicrotasks();
+  assert.equal(compactLines().length, 0, 'a finished message never shows a dangling start');
+  assert.equal(row(replyId).querySelector('.msg-activity'), null);
+});
+
 // ---------------------------------------------------------------------------
 // Worker-advertised steering (decision 9) and un-steer for the queued lane
 // (decision 8): the composer gate and the pushed rows' Cancel both derive
@@ -1067,4 +1153,28 @@ test('cancelling a pushed row: the 20 s fallback hands the control back when nei
   fire('message_status', { conversationId: conv, messageId: 'u2', status: 'cancelled' });
   assert.equal(cancelButtonOf('u2'), null);
   view.applyConversationTurnStatus({ conversationId: conv, messageId: 'u1', status: 'done' });
+});
+
+// ---------------------------------------------------------------------------
+// The summary modal's leave hook: a draft held by one modal kind is written
+// on every way out, never on a refresh of the same kind.
+// ---------------------------------------------------------------------------
+
+test('the summary modal runs its leave handler on close and on a different kind, not on a refresh', () => {
+  const calls = [];
+  store.openSummaryModal({ title: 'Context usage', bodyHtml: '<p>one</p>', kind: 'context' });
+  store.setSummaryModalLeaveHandler('context', () => calls.push('left'));
+  store.renderSummaryModalContent({ title: 'Context usage', bodyHtml: '<p>two</p>', kind: 'context' });
+  assert.deepEqual(calls, [], 'a refresh is not a leave');
+  store.closeSummaryModal();
+  assert.deepEqual(calls, ['left']);
+  store.closeSummaryModal();
+  assert.deepEqual(calls, ['left'], 'once per registration');
+
+  store.openSummaryModal({ title: 'Context usage', bodyHtml: '<p>three</p>', kind: 'context' });
+  store.setSummaryModalLeaveHandler('context', () => calls.push('replaced'));
+  store.openSummaryModal({ title: 'Stop this turn?', bodyHtml: '<p>confirm</p>', kind: 'stop-turn' });
+  assert.deepEqual(calls, ['left', 'replaced'], 'another modal taking over is a leave');
+  store.closeSummaryModal();
+  assert.deepEqual(calls, ['left', 'replaced']);
 });

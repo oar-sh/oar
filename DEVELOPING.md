@@ -327,6 +327,19 @@ Useful overrides: `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary),
 `COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH` (worker script location),
 `COPILOT_WEB_RELAY_CONFIG` (relay config used to resolve the server URL and auth token).
 
+The auto-compact window is spawn-only: the CLI reads `settings.autoCompactWindow` when it starts,
+and a live `applyFlagSettings({ autoCompactWindow })` has no effect. A changed window is applied by
+restarting the CLI process once (same session id) before the next turn-opening message, and only
+when it is idle — no turn, open question, compaction or background agents/shells. Until then the
+context payload reports why (`autoCompactWindowDeferred`: `'turn'`, `'background'` or `'next-message'`).
+
+A running compaction is shown by a `pending` compaction entry on the row of the running turn, or on
+the delivered message that waits for its turn. The boundary entry replaces it; a compaction that
+ends without one, or whose boundary goes to another row, gets a `cancelled` entry. Known and left
+as it is: a waiting message whose boundary is held for its turn reads "Compacting context…" from
+the end of the compaction until that turn opens — normally milliseconds, longer only when the turn
+start is delayed (API retries).
+
 ### Claude Cloud workers
 
 Claude Cloud conversations run `server/claude-cloud-worker/claude-cloud-session-worker.mjs`, a
@@ -703,7 +716,7 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **4658 pass / 0 fail / 0 skip on Linux (0.9.7, 2026-10-03)** — the count
+Expected: **0 fail** everywhere; **4715 pass / 0 fail / 0 skip on Linux (0.9.8, 2026-10-04)** — the count
 grows with every change, so treat it as a floor. Windows runs the same suite with **4 skips** that are host-gated
 (0600 file modes, symlinks) and run on Linux (0.9.6: **4031 pass / 0 fail / 4 skip**).
 

@@ -62,13 +62,18 @@ function formatCompactTokens(value) {
   return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}k`;
 }
 
+// Stamp of a compaction that is still running (the live bubble's
+// `data-compact-boundary`).
+export const COMPACT_PENDING_STAMP = 'pending';
+
 /**
  * Parses the `data-compact-boundary` stamp (`"<pre>|<post>"`, either side
- * possibly empty) into token counts.
+ * possibly empty, or `pending`) into token counts.
  */
 export function parseCompactBoundaryValue(value) {
   const text = String(value == null ? '' : value).trim();
   if (!text) return null;
+  if (text === COMPACT_PENDING_STAMP) return { pending: true, preTokens: null, postTokens: null };
   const [rawPre, rawPost] = text.split('|');
   const toCount = (raw) => {
     const digits = String(raw || '').trim();
@@ -80,6 +85,7 @@ export function parseCompactBoundaryValue(value) {
 }
 
 export function formatCompactBoundaryLabel(boundary) {
+  if (boundary?.pending) return 'Compacting context…';
   const preTokens = formatCompactTokens(boundary?.preTokens);
   const postTokens = formatCompactTokens(boundary?.postTokens);
   if (preTokens && postTokens) return `Context compacted · ${preTokens} → ${postTokens} tokens`;
@@ -97,6 +103,11 @@ export function formatCompactBoundaryLabel(boundary) {
  * every local-day rollover; a compaction separator sits immediately before
  * the message whose activities recorded the boundary (after that message's
  * day separator, when both land on the same row).
+ *
+ * The compaction key names the turn (`sourceMessageId`, else the row's own
+ * id), not the token counts: the live bubble and the reply that replaces it
+ * share it, so a running compaction's line is relabelled in place when the
+ * boundary lands instead of being swapped for a second row.
  */
 export function buildSeparatorPlan(rows, nowMs = Date.now()) {
   const list = Array.isArray(rows) ? rows : [];
@@ -123,11 +134,13 @@ export function buildSeparatorPlan(rows, nowMs = Date.now()) {
     const boundary = row?.compactBoundary && typeof row.compactBoundary === 'object'
       ? row.compactBoundary
       : parseCompactBoundaryValue(row?.compactBoundary);
-    if (boundary && (boundary.preTokens != null || boundary.postTokens != null || row?.compactBoundary)) {
+    if (boundary && (boundary.pending || boundary.preTokens != null || boundary.postTokens != null || row?.compactBoundary)) {
+      const turnId = String(row?.sourceMessageId || '').trim() || messageId || index;
       plan.push({
-        key: `compact:${messageId || index}:${boundary.preTokens ?? ''}-${boundary.postTokens ?? ''}`,
+        key: `compact:${turnId}`,
         kind: 'compact',
         label: formatCompactBoundaryLabel(boundary),
+        pending: boundary.pending === true,
         beforeIndex: index,
         messageId,
       });
@@ -140,9 +153,29 @@ function readRowFromNode(node) {
   const dataset = node?.dataset || {};
   return {
     messageId: String(dataset.messageId || '').trim(),
+    sourceMessageId: String(dataset.sourceMessageId || '').trim(),
     timestamp: String(dataset.messageTimestamp || '').trim(),
     compactBoundary: String(dataset.compactBoundary || '').trim(),
   };
+}
+
+// The animated dots of a running compaction sit after the label text.
+function setSeparatorLabel(doc, node, separator) {
+  const label = node.querySelector?.('.transcript-separator-label');
+  if (!label) return;
+  // textContent, never innerHTML: labels are generated here but the row sits
+  // in the same container as user content.
+  label.replaceChildren?.();
+  label.textContent = separator.label;
+  if (separator.pending) {
+    const dots = doc.createElement('span');
+    dots.className = 'dots';
+    for (let i = 0; i < 3; i += 1) dots.appendChild(doc.createElement('span'));
+    label.appendChild(dots);
+  }
+  node.classList.toggle('is-pending', !!separator.pending);
+  node.setAttribute('aria-label', separator.label);
+  node.dataset.separatorLabel = separator.label;
 }
 
 function createSeparatorNode(doc, separator) {
@@ -153,13 +186,10 @@ function createSeparatorNode(doc, separator) {
   node.dataset.separatorKey = separator.key;
   node.dataset.separatorKind = separator.kind;
   node.setAttribute('role', 'separator');
-  node.setAttribute('aria-label', separator.label);
   const label = doc.createElement('span');
   label.className = 'transcript-separator-label';
-  // textContent, never innerHTML: labels are generated here but the row sits
-  // in the same container as user content.
-  label.textContent = separator.label;
   node.appendChild(label);
+  setSeparatorLabel(doc, node, separator);
   return node;
 }
 
@@ -176,7 +206,9 @@ export function syncTranscriptSeparators(container, nowMs = Date.now()) {
   if (!container || typeof container.querySelectorAll !== 'function') return 0;
   const doc = container.ownerDocument || (typeof document !== 'undefined' ? document : null);
   if (!doc || typeof doc.createElement !== 'function') return 0;
-  const nodes = Array.from(container.querySelectorAll('.msg[data-message-timestamp]'))
+  // The live bubble carries no timestamp; it joins the plan only while it
+  // stamps its turn's compaction.
+  const nodes = Array.from(container.querySelectorAll('.msg[data-message-timestamp], .msg[data-compact-boundary]'))
     .filter((node) => node.parentNode === container);
   const plan = buildSeparatorPlan(nodes.map(readRowFromNode), nowMs);
   const planByIndex = new Map();
@@ -196,16 +228,21 @@ export function syncTranscriptSeparators(container, nowMs = Date.now()) {
       cursor = cursor.previousSibling;
     }
     const matches = existing.length === desired.length
-      && existing.every((el, i) => el.dataset.separatorKey === desired[i].key
-        && el.dataset.separatorLabel === desired[i].label);
+      && existing.every((el, i) => el.dataset.separatorKey === desired[i].key);
     if (matches) {
+      // Same rows, maybe a new label (a running compaction that finished):
+      // relabel in place.
+      existing.forEach((el, i) => {
+        if (el.dataset.separatorLabel === desired[i].label) return;
+        setSeparatorLabel(doc, el, desired[i]);
+        changed += 1;
+      });
       for (const el of existing) kept.add(el);
       return;
     }
     for (const el of existing) el.remove();
     for (const separator of desired) {
       const created = createSeparatorNode(doc, separator);
-      created.dataset.separatorLabel = separator.label;
       container.insertBefore(created, node);
       kept.add(created);
       changed += 1;

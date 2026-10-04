@@ -56,17 +56,6 @@ export function claudeUltracodeFlagSettings(effort) {
 }
 
 /**
- * The flag-settings payload that moves a live session onto another auto-compact
- * window. `null` clears the flag layer back to the CLI's model-tuned default,
- * which is exactly what "Auto" means — leaving the previous window pinned would
- * make the setting one-way.
- */
-export function claudeAutoCompactFlagSettings(autoCompactWindow) {
-  const window = normalizeAutoCompactWindow(autoCompactWindow);
-  return { autoCompactWindow: window };
-}
-
-/**
  * The flag-settings payload that pins (or clears) `alwaysThinkingEnabled` on a
  * live session.
  *

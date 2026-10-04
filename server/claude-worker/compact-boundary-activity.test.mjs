@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
-import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
+import {
+  compactCancelledActivityAction,
+  compactPendingActivityAction,
+  createSdkMessageNormalizer,
+} from './sdk-message-normalizer.mjs';
 import { createClaudeTurnPublisher } from './claude-turn-publisher.mjs';
 import {
   makeRouteDeps as baseRouteDeps,
@@ -160,6 +164,37 @@ test('an auto-compaction with no post_tokens keeps its metadata all the way thro
   });
   assert.equal(isCompactBoundaryActivityEntry(entry), true);
   assert.deepEqual(compactBoundaryFromActivities([entry]), { preTokens: 614117, postTokens: null });
+  db.close();
+});
+
+test('the pending and cancelled compaction entries and the respawn note persist their metadata', async () => {
+  const { db, stmts } = bootRelay();
+  const publisher = createClaudeTurnPublisher({ api: makeApi(captureRoutes(baseRouteDeps({
+    db,
+    stmts,
+    io: { emit: () => {}, volatile: { emit: () => {} } },
+    DEFAULT_RELAY_MODE: 'agent',
+    sanitizeActivityText: (value) => String(value || '').trim().slice(0, 4000),
+  }))) });
+  const message = { id: QUEUE_ID, conversationId: CONV, relayMode: 'agent' };
+  await publisher.dispatchAction(message, compactPendingActivityAction(), {});
+  await publisher.dispatchAction(message, compactCancelledActivityAction(), {});
+  await publisher.postActivity(
+    message,
+    'Restarted the session to apply the compaction window (150k → Auto)',
+    null,
+    { kind: 'compact_window_respawn', from: 150000, to: null },
+  );
+
+  const rows = stmts.listActivityByQueueMessage.all(QUEUE_ID);
+  assert.deepEqual(rows.map((row) => [row.text, JSON.parse(row.metadata_json)]), [
+    ['Compacting context…', { kind: 'compact_boundary', state: 'pending' }],
+    ['Compaction ended without a result', { kind: 'compact_boundary', state: 'cancelled' }],
+    [
+      'Restarted the session to apply the compaction window (150k → Auto)',
+      { kind: 'compact_window_respawn', from: 150000, to: null },
+    ],
+  ]);
   db.close();
 });
 

@@ -248,6 +248,30 @@ test('the heartbeat persists supported and cancellableIds flips, and quiet heart
   });
 });
 
+test('the Claude worker\'s running compaction window is persisted when it changes, and only then', async () => {
+  const fx = boot();
+  seedWorker(fx);
+  const beat = (steering) => fx.post('/api/heartbeat', { steering }, fx.asWorker());
+  const idle = { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true };
+
+  await beat({ ...idle, autoCompactWindow: { active: 150000, backgroundWork: false } });
+  assert.equal(fx.upserts.length, 1);
+  assert.deepEqual(fx.registry.getWorker(CONV).steering.autoCompactWindow, { active: 150000, backgroundWork: false });
+  await beat({ ...idle, autoCompactWindow: { active: 150000, backgroundWork: false } });
+  assert.equal(fx.upserts.length, 1, 'unchanged: no write');
+
+  await beat({ ...idle, autoCompactWindow: { active: 150000, backgroundWork: true } });
+  assert.equal(fx.upserts.length, 2, 'background work starting is a change');
+  await beat({ ...idle, autoCompactWindow: { active: null, backgroundWork: false } });
+  assert.equal(fx.upserts.length, 3, 'a respawn onto Auto is a change');
+  assert.deepEqual(fx.registry.getWorker(CONV).steering.autoCompactWindow, { active: null, backgroundWork: false });
+
+  // The CLI idled out: the key goes away.
+  await beat({ ...idle, autoCompactWindow: null });
+  assert.equal(fx.upserts.length, 4);
+  assert.equal('autoCompactWindow' in fx.registry.getWorker(CONV).steering, false);
+});
+
 test('a changed steering snapshot is broadcast at once; an unchanged one is not', async () => {
   // The client would otherwise only see it on its next status poll (4 s),
   // after a heartbeat that already lags the change by up to 10 s.

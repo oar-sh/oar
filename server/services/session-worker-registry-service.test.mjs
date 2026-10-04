@@ -157,6 +157,28 @@ test('the steering snapshot is normalized, stored, and survives spread-conventio
   assert.equal(registry.getWorker('sdk-1').steering, null);
 });
 
+test('the steering snapshot carries the running CLI\'s compaction window only when reported', () => {
+  const registry = createSessionWorkerRegistry();
+  const base = { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true };
+  registry.upsertWorker({ sdkSessionId: 'sdk-1', status: 'ready', steering: base });
+  assert.equal('autoCompactWindow' in registry.getWorker('sdk-1').steering, false, 'an older worker sends nothing');
+
+  registry.upsertWorker({
+    ...registry.getWorker('sdk-1'),
+    steering: { ...base, autoCompactWindow: { active: '150000', backgroundWork: 'yes' } },
+  });
+  assert.deepEqual(registry.getWorker('sdk-1').steering.autoCompactWindow, { active: 150000, backgroundWork: false });
+
+  // Auto (null) and junk windows both read as Auto; a junk shape as nothing.
+  registry.upsertWorker({
+    ...registry.getWorker('sdk-1'),
+    steering: { ...base, autoCompactWindow: { active: 'junk', backgroundWork: true } },
+  });
+  assert.deepEqual(registry.getWorker('sdk-1').steering.autoCompactWindow, { active: null, backgroundWork: true });
+  registry.upsertWorker({ ...registry.getWorker('sdk-1'), steering: { ...base, autoCompactWindow: 'junk' } });
+  assert.equal('autoCompactWindow' in registry.getWorker('sdk-1').steering, false);
+});
+
 test('the Copilot SDK worker snapshot: supported opt-in and the un-steerable id set', () => {
   const registry = createSessionWorkerRegistry();
   registry.upsertWorker({ sdkSessionId: 'sdk-1', status: 'processing', pid: 100 });

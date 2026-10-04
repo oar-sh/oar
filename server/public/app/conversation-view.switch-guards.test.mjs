@@ -960,6 +960,7 @@ function resetThinkingIndicatorStub() {
   stub.remove();
   delete stub.dataset.messageId;
   delete stub.dataset.conversationId;
+  delete stub.dataset.compactBoundary;
   return stub;
 }
 

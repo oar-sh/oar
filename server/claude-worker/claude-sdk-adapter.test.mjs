@@ -6,7 +6,6 @@ import {
   RELAY_MCP_SERVER_NAME,
   RELAY_MCP_TOOL_TIMEOUT_MS,
   applyThinkingDisplay,
-  claudeAutoCompactFlagSettings,
   claudeSpawnSettings,
   claudeThinkingFlagSettings,
   claudeUltracodeFlagSettings,
@@ -327,12 +326,6 @@ test('claudeSpawnSettings omits itself when nothing is set', () => {
   // Junk is Auto, never a pinned window.
   assert.equal(claudeSpawnSettings({ autoCompactWindow: 'nonsense' }), null);
   assert.equal(claudeSpawnSettings({ autoCompactWindow: 0 }), null);
-});
-
-test('claudeAutoCompactFlagSettings clears the layer for Auto', () => {
-  assert.deepEqual(claudeAutoCompactFlagSettings(150000), { autoCompactWindow: 150000 });
-  assert.deepEqual(claudeAutoCompactFlagSettings(null), { autoCompactWindow: null });
-  assert.deepEqual(claudeAutoCompactFlagSettings('junk'), { autoCompactWindow: null });
 });
 
 test('claudeUltracodeFlagSettings translates the sentinel both ways', () => {

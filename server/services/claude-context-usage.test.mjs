@@ -6,6 +6,8 @@ import {
   resolveModelUsageEntry,
   buildClaudeContextSnapshot,
   readStoredClaudeContextUsage,
+  resolveAutoCompactWindowStatus,
+  resolveModelContextLimit,
 } from './claude-context-usage.mjs';
 
 // Mirrors the reference breakdown: 4.8k + 19.2k + 1.8k + 221.3k = 247.1k of 1M.
@@ -169,9 +171,67 @@ test('readStoredClaudeContextUsage parses the persisted row', () => {
 });
 
 test('readStoredClaudeContextUsage tolerates missing and corrupt blobs', () => {
-  assert.deepEqual(readStoredClaudeContextUsage({}), { snapshot: null, contextUsage: null });
+  assert.deepEqual(readStoredClaudeContextUsage({}), { snapshot: null, contextUsage: null, modelContextLimit: null });
   assert.deepEqual(
     readStoredClaudeContextUsage({ context_usage_json: '{not json' }),
-    { snapshot: null, contextUsage: null },
+    { snapshot: null, contextUsage: null, modelContextLimit: null },
+  );
+});
+
+test('the model limit comes from modelUsage, never from the window-bound maxTokens', () => {
+  // Spawned with a 100k window: the usage response's max follows the window.
+  const contextUsage = sdkResponse({ totalTokens: 60900, maxTokens: 100000, rawMaxTokens: 100000 });
+  const modelUsage = { 'claude-opus-5[1m]': { inputTokens: 10, outputTokens: 20, contextWindow: 1000000 } };
+  assert.equal(resolveModelContextLimit({ contextUsage, modelUsage, model: 'claude-opus-5[1m]' }), 1000000);
+  assert.equal(resolveModelContextLimit({ contextUsage, modelUsage: null }), null, 'unknown without modelUsage');
+  assert.equal(resolveModelContextLimit({ modelUsage: { 'claude-opus-5': { contextWindow: 0 } } }), null);
+
+  const row = {
+    context_usage_json: JSON.stringify({ model: 'claude-opus-5[1m]', contextUsage, modelUsage }),
+  };
+  const stored = readStoredClaudeContextUsage(row);
+  assert.equal(stored.modelContextLimit, 1000000);
+  assert.equal(stored.snapshot.max_context_tokens, 100000, 'the snapshot keeps the window');
+});
+
+test('the window status compares the stored window with the running CLI', () => {
+  const steering = (overrides = {}, running = { active: 100000, backgroundWork: false }) => ({
+    turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true,
+    ...(running ? { autoCompactWindow: running } : {}),
+    ...overrides,
+  });
+  const none = { activeAutoCompactWindow: null, autoCompactWindowDeferred: null };
+
+  // No CLI running, an older worker, or no worker at all.
+  assert.deepEqual(resolveAutoCompactWindowStatus({ storedWindow: 200000, steering: steering({}, null) }), none);
+  assert.deepEqual(resolveAutoCompactWindowStatus({ storedWindow: 200000, steering: null }), none);
+  assert.deepEqual(resolveAutoCompactWindowStatus(), none);
+
+  // Applied.
+  assert.deepEqual(
+    resolveAutoCompactWindowStatus({ storedWindow: 100000, steering: steering() }),
+    { activeAutoCompactWindow: 100000, autoCompactWindowDeferred: null },
+  );
+  // Differs, idle: the next message respawns the CLI.
+  assert.deepEqual(
+    resolveAutoCompactWindowStatus({ storedWindow: 200000, steering: steering() }),
+    { activeAutoCompactWindow: 100000, autoCompactWindowDeferred: 'next-message' },
+  );
+  // Differs while a turn runs, or while background work holds the CLI.
+  assert.equal(
+    resolveAutoCompactWindowStatus({ storedWindow: 200000, steering: steering({ turnActive: true }) }).autoCompactWindowDeferred,
+    'turn',
+  );
+  assert.equal(
+    resolveAutoCompactWindowStatus({
+      storedWindow: null,
+      steering: steering({}, { active: 100000, backgroundWork: true }),
+    }).autoCompactWindowDeferred,
+    'background',
+  );
+  // Auto on both sides.
+  assert.deepEqual(
+    resolveAutoCompactWindowStatus({ storedWindow: null, steering: steering({}, { active: null, backgroundWork: true }) }),
+    { activeAutoCompactWindow: null, autoCompactWindowDeferred: null },
   );
 });

@@ -13,6 +13,11 @@ const STATIC_ASSETS = [
   'app-icon-512.png',
   'favicon.ico',
   'app-icon.svg',
+  'app-icon-light-192.png',
+  'app-icon-light-512.png',
+  'app-icon-light.svg',
+  'app-icon-maskable-512.png',
+  'app-icon-light-maskable-512.png',
 ];
 
 function sameOrigin(url) {
@@ -26,7 +31,7 @@ function isApiRequest(url) {
 function isPwaMetadataRequest(url) {
   if (!url.pathname.startsWith(REGISTRATION_SCOPE_PATH)) return false;
   const relativePath = url.pathname.slice(REGISTRATION_SCOPE_PATH.length);
-  return /^(?:manifest\.webmanifest|app-icon(?:-\d+)?\.png|app-icon\.svg|favicon\.ico)$/.test(relativePath);
+  return /^(?:manifest\.webmanifest|app-icon(?:-light)?(?:-maskable)?(?:-\d+)?\.(?:png|svg)|favicon\.ico)$/.test(relativePath);
 }
 
 function isApplicationModuleRequest(url) {

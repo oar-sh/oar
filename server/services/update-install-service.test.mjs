@@ -40,6 +40,9 @@ function createService(store, { exitCode = 0, output = ['added 1 package'], ...o
     installMethod: 'npm-global',
     env: {},
     platform: 'linux',
+    // No npm beside this Node, so the plain `npm` from PATH is spawned.
+    execPath: '/opt/absent/bin/node',
+    existsImpl: () => false,
     readSetting: store.readSetting,
     writeSetting: (key, value) => { events.push(`write:${key}`); store.writeSetting(key, value); },
     deleteSetting: store.deleteSetting,
@@ -69,7 +72,7 @@ test('a successful update persists the attempt before requesting the restart', a
   const { service, spawned, shutdowns, events } = createService(store);
   const result = await service.startUpdate({ version: '0.9.2' });
   assert.equal(result.ok, true);
-  assert.deepEqual(spawned, [['npm', 'install', '-g', '@oar-sh/oar@0.9.2']]);
+  assert.deepEqual(spawned, [['npm', 'install', '-g', '--allow-scripts=better-sqlite3,cloudflared,koffi', '@oar-sh/oar@0.9.2']]);
   assert.equal(shutdowns.length, 1);
   assert.equal(shutdowns[0].restart, true);
 
@@ -150,6 +153,29 @@ test('win32 spawns npm.cmd through a shell', async () => {
   });
   await service.startUpdate({ version: '0.9.2' });
   assert.deepEqual(commands, [{ command: 'npm.cmd', shell: true }]);
+});
+
+test('the update runs the npm beside this Node, into the prefix the package sits in', async () => {
+  const store = settingsStore();
+  const calls = [];
+  const { service } = createService(store, {
+    env: { PATH: '/usr/bin:/bin' },
+    execPath: '/home/dev/.oar/runtime/node/bin/node',
+    existsImpl: (candidate) => candidate === '/home/dev/.oar/runtime/node/bin/npm',
+    packageRoot: '/home/dev/.oar/npm/lib/node_modules/@oar-sh/oar',
+    spawnImpl: (command, args, options) => {
+      calls.push({ command, args, path: options.env.PATH });
+      const child = fakeChild();
+      queueMicrotask(() => { child.exitCode = 0; child.emit('close', 0); });
+      return child;
+    },
+  });
+  await service.startUpdate({ version: '0.9.2' });
+  assert.deepEqual(calls, [{
+    command: '/home/dev/.oar/runtime/node/bin/npm',
+    args: ['install', '-g', '--prefix', '/home/dev/.oar/npm', '--allow-scripts=better-sqlite3,cloudflared,koffi', '@oar-sh/oar@0.9.2'],
+    path: '/home/dev/.oar/runtime/node/bin:/usr/bin:/bin',
+  }]);
 });
 
 test('reconcile: matching version becomes a success outcome and clears the attempt', () => {

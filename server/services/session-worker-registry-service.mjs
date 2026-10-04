@@ -82,6 +82,19 @@ function normalizeSteeringCancellableIds(raw) {
   return ids;
 }
 
+// The Claude worker's running CLI: the compaction window it was spawned with
+// (a token count, null = Auto) and whether background work holds it, which
+// blocks the respawn that applies a changed window. Null when no CLI runs or
+// the worker does not report it.
+function normalizeSteeringAutoCompactWindow(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const active = Number(raw.active);
+  return {
+    active: Number.isFinite(active) && active > 0 ? Math.round(active) : null,
+    backgroundWork: raw.backgroundWork === true,
+  };
+}
+
 // The worker's composer-facing steering snapshot, published on its heartbeat.
 // Callers follow the registry convention of spreading the existing entry into
 // upserts, so an update without `steering` keeps the last known snapshot.
@@ -98,7 +111,7 @@ export function normalizeWorkerSteeringSnapshot(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const holdReason = String(raw.holdReason || '').trim().toLowerCase();
   const messageId = String(raw.messageId || '').trim().slice(0, STEERING_MESSAGE_ID_MAX_LENGTH);
-  return {
+  const snapshot = {
     turnActive: raw.turnActive === true,
     canSteer: raw.canSteer === true,
     holdReason: STEERING_HOLD_REASONS.has(holdReason) ? holdReason : null,
@@ -106,6 +119,10 @@ export function normalizeWorkerSteeringSnapshot(raw) {
     supported: raw.supported === true,
     cancellableIds: normalizeSteeringCancellableIds(raw.cancellableIds),
   };
+  // Only a snapshot that reports a running CLI carries the key.
+  const autoCompactWindow = normalizeSteeringAutoCompactWindow(raw.autoCompactWindow);
+  if (autoCompactWindow) snapshot.autoCompactWindow = autoCompactWindow;
+  return snapshot;
 }
 
 function sanitizeState(raw = null) {

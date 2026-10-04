@@ -6,7 +6,8 @@ import os from 'os';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
+import net from 'net';
 
 import {
   migrateStateToOarRoot,
@@ -275,6 +276,7 @@ export async function launchRelay({
       'Starts the web relay server if needed, then launches gh copilot in the current shell.',
       '--install-extension installs/updates a user-global web-relay wrapper extension and exits.',
       '--no-install-extension skips automatic wrapper setup for this run.',
+      'oar start starts only the relay, in the background; oar setup writes the config; oar doctor and oar update are described in the README.',
       'Install globally with: npm i -g @oar-sh/oar  (or from a checkout: npm link)',
     ].join('\n'));
     return { code: 0, reason: 'help' };
@@ -511,14 +513,274 @@ async function promptYesNo(question, { defaultYes = false, interactive = true } 
   }
 }
 
+function canBind(port, host) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', (error) => {
+      // A host this machine does not have (no IPv6) says nothing about the port.
+      resolve(error?.code === 'EADDRNOTAVAIL' || error?.code === 'EAFNOSUPPORT');
+    });
+    probe.once('listening', () => probe.close(() => resolve(true)));
+    if (host) probe.listen(port, host);
+    else probe.listen(port);
+  });
+}
+
+function acceptsConnection(port, host, timeoutMs = 400) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ port, host });
+    let settled = false;
+    const finish = (accepted) => {
+      if (settled) return;
+      settled = true;
+      // An accepted connection is closed politely: destroying it reaches the
+      // listener as a reset, which a program without an error handler on its
+      // sockets would take as a fault.
+      if (accepted) socket.end();
+      else socket.destroy();
+      resolve(accepted);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once('connect', () => finish(true));
+    socket.on('error', () => finish(false));
+  });
+}
+
+/**
+ * A port is free when nothing accepts a connection on it and it can be bound
+ * on the loopback addresses and on all interfaces. One wildcard bind is not
+ * enough: Windows allows it beside a listener on 127.0.0.1 alone.
+ */
+export async function isPortFree(port) {
+  for (const host of ['127.0.0.1', '::1']) {
+    if (await acceptsConnection(port, host)) return false;
+  }
+  for (const host of ['127.0.0.1', '::1', '']) {
+    if (!(await canBind(port, host))) return false;
+  }
+  return true;
+}
+
+/** The first free port from `start` on, so a fresh config does not name a port something else holds. */
+export async function findFreePort(start = 3333, { attempts = 20, isPortFreeImpl = isPortFree } = {}) {
+  for (let port = start; port < start + attempts && port <= 65535; port += 1) {
+    if (await isPortFreeImpl(port)) return port;
+  }
+  return start;
+}
+
+function runQuiet(command, args, { spawnSyncImpl = spawnSync } = {}) {
+  try {
+    const result = spawnSyncImpl(command, args, { stdio: 'ignore', timeout: 15_000 });
+    return result.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// A systemd *user* manager this process can talk to: absent in containers, on
+// macOS, and in a WSL distro without systemd.
+function systemdUserAvailable(options = {}) {
+  return process.platform === 'linux' && runQuiet('systemctl', ['--user', 'show-environment'], options);
+}
+
+function systemdUnitPath() {
+  return path.join(os.homedir(), '.config', 'systemd', 'user', 'oar.service');
+}
+
+async function waitForRelay({ statusUrl, token, fetchImpl = globalThis.fetch, deadlineMs = 20_000, stillStarting = () => true } = {}) {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    try {
+      const res = await fetchImpl(statusUrl, { headers: { Authorization: `Bearer ${token}` } });
+      if (res && res.ok) return true;
+    } catch {
+      // retry
+    }
+    if (Date.now() >= deadline || !stillStarting()) return false;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+}
+
+/**
+ * What answers on the relay's port: 'oar' (this relay: its status call accepts
+ * the configured token and has the relay's shape), 'taken' (something else
+ * answers, or holds the port without answering), or 'none'.
+ */
+export async function probeRelayPort({ statusUrl, token = '', fetchImpl = globalThis.fetch, timeoutMs = 2500 } = {}) {
+  if (typeof fetchImpl !== 'function' || !statusUrl) return 'none';
+  try {
+    const response = await fetchImpl(statusUrl, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response) return 'none';
+    if (!response.ok) return 'taken';
+    const body = await Promise.resolve(response.json?.()).catch(() => null);
+    return body && typeof body === 'object' && 'cliOnline' in body ? 'oar' : 'taken';
+  } catch (error) {
+    // A port that accepts the connection and then stays silent is held too.
+    return error?.name === 'TimeoutError' || error?.name === 'AbortError' ? 'taken' : 'none';
+  }
+}
+
+/**
+ * Makes sure the relay of a global install runs, without a Copilot session
+ * tied to it: an already running relay is left alone, an installed systemd
+ * user service is started, and anywhere else the server is started detached,
+ * so it outlives this command.
+ */
+export async function ensureRelayRunning({
+  packageRoot = resolvePackageRoot(),
+  layout,
+  configPath,
+  config,
+  cwd = os.homedir(),
+  env = process.env,
+  nodeBin = process.execPath,
+  spawnImpl = spawn,
+  spawnSyncImpl = spawnSync,
+  fetchImpl = globalThis.fetch,
+  isProcessAliveImpl = isProcessAlive,
+  lockGraceMs = 5000,
+  logger = console,
+} = {}) {
+  const port = normalizePort(config?.port) ?? 3333;
+  const token = String(config?.authToken || '').trim();
+  const statusUrl = `http://localhost:${port}/api/status`;
+  const logDir = getLauncherLogDir(env, layout);
+  // The relay itself says whether it runs: a lock file can outlive its relay
+  // (and its process id can pass to another program), and anything can answer
+  // on a port.
+  const lockPath = path.join(layout.dataDir, 'relay-server.lock');
+  let answer = await probeRelayPort({ statusUrl, token, fetchImpl });
+  const lockedByLiveProcess = () => {
+    const lock = readRelayLock(lockPath);
+    return Number.isInteger(lock?.pid) && isProcessAliveImpl(lock.pid);
+  };
+  if (answer === 'none' && lockedByLiveProcess()) {
+    // A relay that is still starting holds the lock before it listens.
+    const deadline = Date.now() + lockGraceMs;
+    while (answer === 'none' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      answer = await probeRelayPort({ statusUrl, token, fetchImpl });
+    }
+    if (answer === 'none' && lockedByLiveProcess()) {
+      // Nothing listens: the lock is left over from a relay that did not
+      // stop cleanly. The server refuses to start beside a lock whose process
+      // id is alive, so it goes first.
+      logger.log?.(`[oar] Removing a leftover relay lock (${lockPath}); no relay answers on port ${port}.`);
+      try { fs.unlinkSync(lockPath); } catch {}
+    }
+  }
+  if (answer === 'oar') return { ok: true, how: 'already', logDir };
+  if (answer === 'taken') {
+    logger.error?.(`[oar] Port ${port} is in use by another program (or by a relay with another token).`);
+    logger.error?.('[oar] Stop that program, or pick another port: oar setup --port <port>');
+    return { ok: false, how: 'port-taken', logDir };
+  }
+
+  if (fs.existsSync(systemdUnitPath()) && systemdUserAvailable({ spawnSyncImpl })) {
+    runQuiet('systemctl', ['--user', 'daemon-reload'], { spawnSyncImpl });
+    if (!runQuiet('systemctl', ['--user', 'enable', '--now', 'oar'], { spawnSyncImpl })) {
+      logger.error?.('[oar] systemctl --user enable --now oar failed — see: systemctl --user status oar');
+      return { ok: false, how: 'service', logDir };
+    }
+    return { ok: await waitForRelay({ statusUrl, token, fetchImpl }), how: 'service', logDir };
+  }
+
+  const serverDir = path.join(packageRoot, 'server');
+  const outFd = openAppendFileDescriptor(path.join(logDir, 'server.log'));
+  const errFd = openAppendFileDescriptor(path.join(logDir, 'server-err.log'));
+  let child = null;
+  try {
+    child = spawnImpl(nodeBin, [path.join(serverDir, 'server.js')], {
+      cwd: layout.root,
+      env: {
+        ...env,
+        COPILOT_WORKSPACE_ROOT: cwd,
+        COPILOT_WEB_RELAY_ROOT: packageRoot,
+        COPILOT_WEB_RELAY_SERVER_DIR: serverDir,
+        COPILOT_WEB_RELAY_CONFIG: configPath,
+        COPILOT_WEB_RELAY_LOG_DIR: logDir,
+        COPILOT_WEB_RELAY_DATA_DIR: String(env.COPILOT_WEB_RELAY_DATA_DIR || '').trim() || layout.dataDir,
+      },
+      detached: true,
+      stdio: ['ignore', outFd, errFd],
+      windowsHide: true,
+    });
+    child.unref?.();
+  } catch (error) {
+    logger.error?.(`[oar] Failed to launch relay: ${error?.message || error}`);
+    return { ok: false, how: 'detached', logDir };
+  } finally {
+    try { fs.closeSync(outFd); } catch {}
+    try { fs.closeSync(errFd); } catch {}
+  }
+  const ok = await waitForRelay({ statusUrl, token, fetchImpl, stillStarting: () => child.exitCode === null });
+  return { ok, how: 'detached', logDir };
+}
+
+function printRelayUrl({ config, logger, relayUrl, primaryLanAddress }) {
+  const url = relayUrl({ config, lanAddress: primaryLanAddress() });
+  logger.log('');
+  logger.log(`[oar] Relay URL: ${url}`);
+  if (config.localhostOnly) {
+    logger.log('[oar] localhostOnly is on — reach it from other devices via the tunnel, or rerun `oar setup` for LAN access.');
+  }
+  return url;
+}
+
+function reportRelayStart(result, logger) {
+  // A port held by something else was already explained.
+  if (result.how === 'port-taken') return;
+  if (!result.ok) {
+    logger.error?.(`[oar] The relay did not come up — see ${path.join(result.logDir, 'server-err.log')}`);
+    return;
+  }
+  if (result.how === 'already') {
+    logger.log('[oar] The relay is already running. To load a new version, restart it from the web UI (⋯ → Restart web relay).');
+  } else if (result.how === 'service') {
+    logger.log('[oar] The relay is running as a systemd user service (systemctl --user status oar).');
+  } else {
+    logger.log(`[oar] The relay is running in the background (log: ${path.join(result.logDir, 'server.log')}). After a reboot, start it again with: oar start`);
+  }
+}
+
+/** `oar start` — the relay alone, in the background, without a Copilot session. */
+async function runStart({ env = process.env, cwd = process.cwd(), logger = console } = {}) {
+  const { primaryLanAddress, relayUrl } = await import('../server/services/oar-cli-helpers.mjs');
+  const packageRoot = resolvePackageRoot();
+  const layout = resolveStateLayout({ packageRoot, env });
+  if (layout.checkout) {
+    logger.error('[oar] This is a git checkout — start the relay with: npm start');
+    return { code: 1, reason: 'git-checkout' };
+  }
+  const configPath = path.join(layout.configDir, 'config.json');
+  const config = readJsonFile(configPath);
+  if (!config) {
+    logger.error('[oar] No config yet — run: oar setup');
+    return { code: 1, reason: 'no-config' };
+  }
+  const result = await ensureRelayRunning({ packageRoot, layout, configPath, config, cwd, env, logger });
+  reportRelayStart(result, logger);
+  if (result.ok) printRelayUrl({ config, logger, relayUrl, primaryLanAddress });
+  return { code: result.ok ? 0 : 1, reason: result.ok ? 'started' : 'server-not-ready' };
+}
+
 async function runSetup({ argv = [], env = process.env, logger = console } = {}) {
   const {
-    buildDefaultConfig, buildSystemdUnit, generateAuthToken, primaryLanAddress, relayUrl,
+    buildDefaultConfig, buildServicePath, buildSystemdUnit, generateAuthToken, primaryLanAddress, relayUrl,
   } = await import('../server/services/oar-cli-helpers.mjs');
 
   const packageRoot = resolvePackageRoot();
   const layout = resolveStateLayout({ packageRoot, env });
   const useDefaults = argv.includes('--defaults') || !process.stdin.isTTY;
+  // `--start` is the installer's mode: beyond the config it sets up whatever
+  // keeps the relay running on this host and starts it, without a question.
+  const startRequested = argv.includes('--start') && !layout.checkout;
+  const portOverride = parsePort(argv, null);
   const migrateFromIdx = argv.indexOf('--migrate-from');
   const migrateFromRoot = migrateFromIdx !== -1 ? String(argv[migrateFromIdx + 1] || '').trim() : '';
 
@@ -564,6 +826,17 @@ async function runSetup({ argv = [], env = process.env, logger = console } = {})
   const config = { ...buildDefaultConfig({ token }), ...(existing || {}) };
   config.authToken = token;
   config.localhostOnly = !lanAccess;
+  if (portOverride) {
+    config.port = portOverride;
+  } else if (!existing) {
+    // A fresh config takes the first free port; an existing one keeps its own,
+    // which its running relay may be the one holding.
+    const freePort = await findFreePort(config.port);
+    if (freePort !== config.port) {
+      logger.log(`[oar] Port ${config.port} is in use — using ${freePort}.`);
+      config.port = freePort;
+    }
+  }
 
   if (await promptYesNo('Enable the managed cloudflared tunnel (public URL for remote access)?', {
     defaultYes: false,
@@ -579,40 +852,66 @@ async function runSetup({ argv = [], env = process.env, logger = console } = {})
   }
   logger.log(`[oar] Wrote ${configPath}`);
 
+  let serviceInstalled = false;
   if (process.platform === 'linux' && !layout.checkout) {
-    if (await promptYesNo('Install a systemd user service so the relay starts on login?', {
-      defaultYes: false,
-      interactive: !useDefaults,
-    })) {
-      const unitDir = path.join(os.homedir(), '.config', 'systemd', 'user');
-      const unitPath = path.join(unitDir, 'oar.service');
-      fs.mkdirSync(unitDir, { recursive: true });
+    const hasSystemd = systemdUserAvailable();
+    const wantService = startRequested
+      ? hasSystemd
+      : await promptYesNo('Install a systemd user service so the relay starts on login?', {
+        defaultYes: false,
+        interactive: !useDefaults,
+      });
+    if (wantService) {
+      const unitPath = systemdUnitPath();
+      fs.mkdirSync(path.dirname(unitPath), { recursive: true });
       fs.writeFileSync(unitPath, buildSystemdUnit({
         nodeBin: process.execPath,
         packageRoot,
         configPath,
         dataDir: layout.dataDir,
         logDir: getLauncherLogDir(env, layout),
+        pathEnv: buildServicePath({ nodeBin: process.execPath, envPath: env.PATH, homeDir: os.homedir() }),
       }));
-      logger.log(`[oar] Wrote ${unitPath} — enable it with: systemctl --user enable --now oar`);
+      serviceInstalled = true;
+      if (startRequested) {
+        logger.log(`[oar] Wrote ${unitPath}`);
+        // Lingering keeps the user's services up while nobody is logged in;
+        // without it the relay of a headless host stops at logout.
+        const lingering = runQuiet('loginctl', ['enable-linger', os.userInfo().username]);
+        if (!lingering) {
+          logger.log('[oar] Could not enable lingering — the relay stops when you log out. Enable it with: loginctl enable-linger "$USER"');
+        }
+      } else {
+        logger.log(`[oar] Wrote ${unitPath} — enable it with: systemctl --user enable --now oar`);
+      }
     }
   } else if (process.platform === 'win32') {
     logger.log('[oar] Autostart on Windows: enable it in the web UI under Settings → Autostart.');
   }
 
-  const url = relayUrl({ config, lanAddress: primaryLanAddress() });
-  logger.log('');
-  logger.log(`[oar] Relay URL: ${url}`);
-  if (config.localhostOnly) {
-    logger.log('[oar] localhostOnly is on — reach it from other devices via the tunnel, or rerun `oar setup` for LAN access.');
+  let started = null;
+  if (startRequested) {
+    started = await ensureRelayRunning({ packageRoot, layout, configPath, config, env, logger });
+    reportRelayStart(started, logger);
   }
+
+  const url = printRelayUrl({ config, logger, relayUrl, primaryLanAddress });
   try {
     const qrcode = (await import('qrcode-terminal')).default;
     qrcode.generate(url, { small: true }, (qr) => logger.log(qr));
   } catch {
     // QR is a convenience — the URL above is the contract.
   }
-  logger.log('[oar] Start the relay with: oar');
+  if (started) {
+    return { code: started.ok ? 0 : 1, reason: started.ok ? 'setup-complete' : 'server-not-ready' };
+  }
+  if (layout.checkout) {
+    logger.log('[oar] Start the relay with: npm start');
+  } else if (serviceInstalled) {
+    logger.log('[oar] Start the relay with: systemctl --user enable --now oar');
+  } else {
+    logger.log('[oar] Start the relay with: oar start  (or `oar` to open a Copilot session with it)');
+  }
   return { code: 0, reason: 'setup-complete' };
 }
 
@@ -714,10 +1013,12 @@ async function runUpdate({ argv = [], env = process.env, logger = console, fetch
   }
 
   logger.log(`[oar] Updating @oar-sh/oar ${runningVersion} -> ${target} ...`);
-  const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const { NPM_ALLOW_SCRIPTS_ARG, resolveNpmInvocation } = await import('../server/services/oar-cli-helpers.mjs');
+  const npm = resolveNpmInvocation({ packageRoot, env });
   const exitCode = await new Promise((resolve) => {
-    const child = spawnImpl(npmCommand, ['install', '-g', `@oar-sh/oar@${target}`], {
+    const child = spawnImpl(npm.command, ['install', '-g', ...npm.prefixArgs, NPM_ALLOW_SCRIPTS_ARG, `@oar-sh/oar@${target}`], {
       stdio: 'inherit',
+      env: npm.env,
       ...(process.platform === 'win32' ? { shell: true, windowsHide: true } : {}),
     });
     child.on('error', (error) => {
@@ -778,6 +1079,7 @@ function main() {
     return Promise.resolve({ code: 0, reason: 'version' });
   }
   if (command === 'setup') return runSetup({ argv: argv.slice(1) });
+  if (command === 'start') return runStart({});
   if (command === 'doctor') return runDoctor({});
   if (command === 'update') return runUpdate({ argv: argv.slice(1) });
   return launchRelay();

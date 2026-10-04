@@ -75,6 +75,34 @@ export function compactBoundaryActivityAction(sdkMessage) {
   };
 }
 
+/**
+ * The compaction's start and its end without a result, as entries of the same
+ * kind as the boundary: the transcript reads the LAST compaction entry of a
+ * message, so a `pending` one shows the running compaction, the boundary
+ * replaces it with the result, and `cancelled` takes the line away again.
+ */
+export function compactPendingActivityAction() {
+  return {
+    channel: 'activity',
+    payload: {
+      text: 'Compacting context…',
+      subagentRunId: null,
+      metadata: { kind: 'compact_boundary', state: 'pending' },
+    },
+  };
+}
+
+export function compactCancelledActivityAction() {
+  return {
+    channel: 'activity',
+    payload: {
+      text: 'Compaction ended without a result',
+      subagentRunId: null,
+      metadata: { kind: 'compact_boundary', state: 'cancelled' },
+    },
+  };
+}
+
 // MCP tools reach the transcript namespaced as `mcp__<server>__<tool>`; which
 // server carries a tool is relay plumbing, so the chip shows the bare name.
 const MCP_TOOL_NAME = /^mcp__(?:.+?)__(.+)$/;

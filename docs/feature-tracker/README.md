@@ -44,7 +44,7 @@ checklist for a new provider (details per column in the per-SDK files).
 | Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) | Partial (path notes only) | Partial (inline images only, jpeg/png/gif/webp ≤ 5 MB; any other attachment refuses the turn, there is no path fallback) |
 | Resume across worker restarts | Implemented | Implemented | Implemented (`cursor_agent_id` + `Agent.resume()` + per-conversation store) | Implemented (`session/load`, capability-checked; visible note on fallback) | Implemented (`claude_cloud_session_id` + `claude_cloud_last_sequence`; a message uuid derived from the queue row keeps a redelivery from sending twice) |
 | Context usage display | Implemented (server-derived from `events.jsonl`) | Implemented | Implemented (window from the model's `context` parameter; shared static fallback) | Implemented (`_meta` tokens; shared static fallback) | Implemented (the session's `context_usage`, read once after each turn; no categories) |
-| Auto-compact window control | Not applicable (no compaction primitive) | Implemented (2026-08-20) | Not applicable | Not applicable | Not applicable |
+| Auto-compact window control | Not applicable (no compaction primitive) | Implemented (2026-08-20; applied by a respawn when idle since 2026-10-03, see [claude-sdk.md](claude-sdk.md)) | Not applicable | Not applicable | Not applicable |
 | Commit attribution (OAR / vanilla / off, per-folder override) | Not applicable (no CLI setting) | Implemented (2026-10-01, `Settings.attribution`) | Not applicable | Not applicable | Implemented (2026-10-02; the same setting, handed to the sandbox as an `apply_flag_settings` control request) |
 | Auth model | Relay host's CLI login | Relay host's `claude` login, **switchable from the web UI** (`claude auth login/logout`, code pasted back; [claude-sdk.md](claude-sdk.md#account-authentication)) | API key via provider settings (secret-env-file delivery; key rotation respawns workers) | Relay host's `grok` login, **switchable from the web UI** (`grok login --device-auth`, no PTY and nothing pasted back; [grok-sdk.md](grok-sdk.md#account-authentication)) | Relay host's `claude` login (a claude.ai account), read from the CLI's credentials file, never refreshed or stored; the account is changed on the Claude tab ([claude-cloud.md](claude-cloud.md#account-and-authentication)) |
 | Provider CLI install / update | Detect-only (npm-global under a prefix the relay user cannot write) | Implemented — install / update / **switch to native installer** when the npm global folder is unwritable | n/a (pure npm SDK, no CLI is ever invoked) | Implemented — install / update ([grok-sdk.md](grok-sdk.md#cli-install)) | n/a (no CLI runs a turn; the Claude tab's CLI row covers the login) |
@@ -72,6 +72,20 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-10-03: **Compaction in progress, and a compaction window that takes effect.** The Claude
+  worker publishes a compaction's start (`metadata: {kind:'compact_boundary', state:'pending'}`)
+  and, when it ends without a boundary, `state:'cancelled'`; the page draws one break line per
+  message from the LAST compaction entry (`promotedCompactBoundaryEntry(items, {processing})`):
+  *Compacting context…* with animated dots while the message is processing, relabelled in place
+  to the final line (key `compact:<turn message id>`), nothing for a cancel or a dangling start.
+  The live bubble stamps `data-compact-boundary` (`pending` or `<pre>|<post>`) so the line sits
+  above it, and shows *Compacting the conversation…*. The window is spawn-only (a live
+  `applyFlagSettings({autoCompactWindow})` does nothing), so the worker respawns an idle process
+  before a turn-opening delivery instead and notes it on the reply
+  (`kind:'compact_window_respawn'`). The 🧠 modal's slider is a draft saved when the modal is
+  left (`setSummaryModalLeaveHandler` in `store.js`); the context payload's
+  `activeAutoCompactWindow`, `modelContextLimit` and `autoCompactWindowDeferred` drive its notes
+  and headline. e2e: `tests/compaction-indicator.spec.mjs`.
 - 2026-10-03: **Claude Cloud, finished for now** (rows in [claude-cloud.md](claude-cloud.md)).
   Model switching between turns (`set_model`), turns the session starts by itself as
   continuation replies (event stream kept open), the usage-limit pause, the login nudge through

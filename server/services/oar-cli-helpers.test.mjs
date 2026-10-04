@@ -4,7 +4,9 @@ import path from 'node:path';
 
 import {
   buildDefaultConfig,
+  buildServicePath,
   buildSystemdUnit,
+  resolveNpmInvocation,
   generateAuthToken,
   primaryLanAddress,
   relayUrl,
@@ -63,6 +65,72 @@ test('systemd unit points at server.js with the state env pinned', () => {
   assert.match(unit, /Environment=COPILOT_WEB_RELAY_CONFIG=\/home\/dev\/\.oar\/config\.json/);
   assert.match(unit, /Environment=COPILOT_WEB_RELAY_DATA_DIR=\/home\/dev\/\.oar\/data/);
   assert.match(unit, /WantedBy=default\.target/);
+  assert.doesNotMatch(unit, /PATH=/);
+});
+
+test('systemd unit carries the given PATH, quoted and escaped', () => {
+  const unit = buildSystemdUnit({
+    nodeBin: '/usr/bin/node',
+    packageRoot: '/home/dev/lib/node_modules/@oar-sh/oar',
+    configPath: '/home/dev/.oar/config.json',
+    dataDir: '/home/dev/.oar/data',
+    logDir: '/home/dev/.oar/logs',
+    pathEnv: '/home/dev/.local/bin:/mnt/c/Program Files/tool:/opt/100%/bin',
+  });
+  assert.ok(unit.includes('Environment="PATH=/home/dev/.local/bin:/mnt/c/Program Files/tool:/opt/100%%/bin"'));
+});
+
+test('the service PATH is the shell PATH plus the directory of the relay Node', () => {
+  assert.equal(
+    buildServicePath({ nodeBin: '/home/dev/.oar/runtime/node/bin/node', envPath: '/usr/local/bin:/usr/bin' }),
+    '/usr/local/bin:/usr/bin:/home/dev/.oar/runtime/node/bin',
+  );
+  assert.equal(buildServicePath({ nodeBin: '/usr/bin/node', envPath: '/usr/local/bin:/usr/bin' }), '/usr/local/bin:/usr/bin');
+  assert.equal(buildServicePath({ nodeBin: '/usr/bin/node', envPath: '' }), '/usr/bin');
+  // ~/.local/bin leads when the shell did not have it, and is not repeated when it did.
+  assert.equal(
+    buildServicePath({ nodeBin: '/usr/bin/node', envPath: '/usr/local/bin:/usr/bin', homeDir: '/home/dev' }),
+    '/home/dev/.local/bin:/usr/local/bin:/usr/bin',
+  );
+  assert.equal(
+    buildServicePath({ nodeBin: '/usr/bin/node', envPath: '/usr/bin:/home/dev/.local/bin', homeDir: '/home/dev' }),
+    '/usr/bin:/home/dev/.local/bin',
+  );
+});
+
+test('npm for an update: the one beside this Node, this Node first on PATH, the package prefix', () => {
+  const beside = resolveNpmInvocation({
+    execPath: '/home/dev/.oar/runtime/node/bin/node',
+    packageRoot: '/home/dev/.oar/npm/lib/node_modules/@oar-sh/oar',
+    platform: 'linux',
+    env: { PATH: '/usr/bin:/bin', HOME: '/home/dev' },
+    existsImpl: (candidate) => candidate === '/home/dev/.oar/runtime/node/bin/npm',
+  });
+  assert.equal(beside.command, '/home/dev/.oar/runtime/node/bin/npm');
+  assert.deepEqual(beside.prefixArgs, ['--prefix', '/home/dev/.oar/npm']);
+  assert.equal(beside.env.PATH, '/home/dev/.oar/runtime/node/bin:/usr/bin:/bin');
+  assert.equal(beside.env.HOME, '/home/dev');
+
+  // No npm beside this Node: the one on PATH. A package outside an npm
+  // prefix layout gets no prefix.
+  const fromPath = resolveNpmInvocation({
+    execPath: '/usr/bin/node',
+    packageRoot: '/srv/oar',
+    platform: 'linux',
+    env: { PATH: '/usr/bin:/bin' },
+    existsImpl: () => false,
+  });
+  assert.equal(fromPath.command, 'npm');
+  assert.deepEqual(fromPath.prefixArgs, []);
+  assert.equal(fromPath.env.PATH, '/usr/bin:/bin');
+
+  const windows = resolveNpmInvocation({
+    execPath: 'C:\\Program Files\\nodejs\\node.exe',
+    packageRoot: 'C:\\Users\\dev\\AppData\\Roaming\\npm\\node_modules\\@oar-sh\\oar',
+    platform: 'win32',
+    env: { PATH: 'C:\\Windows' },
+  });
+  assert.deepEqual({ command: windows.command, prefixArgs: windows.prefixArgs }, { command: 'npm.cmd', prefixArgs: [] });
 });
 
 test('doctor report renders both healthy and missing states without leaking the token', () => {

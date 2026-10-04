@@ -1,6 +1,7 @@
 'use strict';
 
 import { spawn as defaultSpawn } from 'child_process';
+import fs from 'fs';
 
 import {
   CLI_SPAWN_DISABLED_ERROR,
@@ -10,6 +11,7 @@ import {
   stripTerminalEscapes,
   tailOf,
 } from './cli-process-runner.mjs';
+import { NPM_ALLOW_SCRIPTS_ARG, resolveNpmInvocation } from './oar-cli-helpers.mjs';
 import { compareSemverIsh, parseSemverIsh } from '../../shared/update-semver.mjs';
 
 // Applies an OAR self-update: `npm i -g @oar-sh/oar@<version>` with the log
@@ -99,6 +101,9 @@ export function readUpdateOutcome(readSetting) {
 export function createUpdateInstallService({
   runningVersion,
   installMethod = 'npm-global',
+  packageRoot = '',
+  execPath = process.execPath,
+  existsImpl = fs.existsSync,
   spawnImpl = defaultSpawn,
   env = process.env,
   platform = process.platform,
@@ -204,12 +209,13 @@ export function createUpdateInstallService({
 
     // npm itself is a shim on Windows; spawn npm.cmd through a shell there
     // (args are fixed strings + a validated semver, so no injection surface).
-    const command = platform === 'win32' ? 'npm.cmd' : 'npm';
-    const args = ['install', '-g', `${UPDATE_PACKAGE_NAME}@${target}`];
+    const npm = resolveNpmInvocation({ execPath, packageRoot, platform, env, existsImpl });
+    const command = npm.command;
+    const args = ['install', '-g', ...npm.prefixArgs, NPM_ALLOW_SCRIPTS_ARG, `${UPDATE_PACKAGE_NAME}@${target}`];
     const result = await runToCompletion(
       () => spawnImpl(command, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...env },
+        env: npm.env,
         ...(platform === 'win32' ? { windowsHide: true, shell: true } : { detached: true }),
       }),
       {

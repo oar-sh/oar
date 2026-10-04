@@ -5147,7 +5147,9 @@ export function registerMessagesRoutes(app, deps) {
           // in either must reach the status payload (composer gate, bubble
           // Cancel), so it counts as a change like the hold fields do.
           || (stored.supported === true) !== (steering.supported === true)
-          || storedCancellableIds.join('\n') !== steering.cancellableIds.join('\n');
+          || storedCancellableIds.join('\n') !== steering.cancellableIds.join('\n')
+          // The running CLI's compaction window (context-usage modal).
+          || JSON.stringify(stored.autoCompactWindow ?? null) !== JSON.stringify(steering.autoCompactWindow ?? null);
         if (workerForSteering && changed) {
           sessionWorkerRegistry?.upsertWorker?.({ ...workerForSteering, steering });
           // Pushed rather than left for the clients' status poll: the

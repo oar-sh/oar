@@ -134,6 +134,73 @@ function autocompactSourceLabel(source) {
   return AUTOCOMPACT_SOURCE_LABELS[key.toLowerCase()] || key;
 }
 
+// The slider's notes. The window is read by the CLI only when it starts, so
+// a new value takes effect through one session restart before a message, as
+// soon as nothing is running.
+export const AUTO_COMPACT_NOTE_TEXT = Object.freeze({
+  compactNext: 'The conversation will be compacted on the next message.',
+  afterTurn: 'Applies after the current turn.',
+  afterBackground: 'Applies when background work has finished.',
+  nextMessage: 'Applies on the next message (the session restarts once).',
+});
+
+function normalizeDeferred(value) {
+  const key = String(value || '').trim().toLowerCase();
+  return key === 'turn' || key === 'background' || key === 'next-message' ? key : null;
+}
+
+/**
+ * Which notes sit under the slider.
+ *
+ * - `warning`: the draft is a fixed window below the tokens already in use, so
+ *   the next message starts with a compaction.
+ * - `pending`: what is on the slider is not what the running session uses
+ *   yet — an unsaved draft, a stored value the session was not started with
+ *   (`activeWindow`, known only as a number), or a change the relay reports
+ *   as held back (`deferred`). Worded by what it waits for. Payloads without
+ *   the session fields only ever compare draft and stored.
+ *
+ * @returns {{ warning: string, pending: string }}
+ */
+export function autoCompactWindowNotes({
+  draftWindow,
+  storedWindow = null,
+  activeWindow = null,
+  deferred = null,
+  turnRunning = false,
+  usedTokens = null,
+} = {}) {
+  const stored = parseAutoCompactWindow(storedWindow);
+  const draft = draftWindow === undefined ? stored : parseAutoCompactWindow(draftWindow);
+  const active = toNullableNumber(activeWindow);
+  const held = normalizeDeferred(deferred);
+  const used = toNullableNumber(usedTokens);
+  const warning = draft !== null && used !== null && draft < used ? AUTO_COMPACT_NOTE_TEXT.compactNext : '';
+  const differs = draft !== stored
+    || (active !== null && parseAutoCompactWindow(active) !== stored)
+    || held !== null;
+  let pending = '';
+  if (differs) {
+    if (held === 'turn' || turnRunning) pending = AUTO_COMPACT_NOTE_TEXT.afterTurn;
+    else if (held === 'background') pending = AUTO_COMPACT_NOTE_TEXT.afterBackground;
+    else pending = AUTO_COMPACT_NOTE_TEXT.nextMessage;
+  }
+  return { warning, pending };
+}
+
+/** The notes block's inner HTML (re-rendered live while the slider moves). */
+export function renderAutoCompactNotesHtml(options = {}) {
+  const { warning, pending } = autoCompactWindowNotes(options);
+  return [
+    warning
+      ? `<div class="ctx-autocompact-note ctx-autocompact-warning" data-autocompact-note="compact-next">${escapeHtml(warning)}</div>`
+      : '',
+    pending
+      ? `<div class="ctx-autocompact-note" data-autocompact-note="pending">${escapeHtml(pending)}</div>`
+      : '',
+  ].join('');
+}
+
 /**
  * The Claude-only auto-compact window control: a snap-stop slider over
  * AUTO_COMPACT_WINDOW_STOPS plus the measured effective threshold.
@@ -142,8 +209,10 @@ function autocompactSourceLabel(source) {
  * trustworthy model-limit field. `rawMaxTokens` tracks the ACTIVE setting, not
  * the model's own window (probed on claude-opus-5[1m]: no setting → 1000000,
  * setting 100000 → 100000), so annotating from it told a user who had just
- * pinned 100k that every larger stop was pointless. Applied on the next
- * message delivery, which is why there is no live preview of the effect.
+ * pinned 100k that every larger stop was pointless.
+ *
+ * The slider is a draft while the modal is open (`draftWindow`, defaulting to
+ * the stored window); the caller saves it when the modal closes.
  *
  * `isAutoCompactEnabled` is tri-state on purpose: `null`/`undefined` means the
  * runtime has not reported yet (no context-usage snapshot exists before the
@@ -158,9 +227,23 @@ export function renderAutoCompactControlHtml({
   autocompactSource = null,
   isAutoCompactEnabled = null,
   maxTokens = null,
+  draftWindow = undefined,
+  activeAutoCompactWindow = null,
+  autoCompactWindowDeferred = null,
+  turnRunning = false,
+  usedTokens = null,
 } = {}) {
-  const window = parseAutoCompactWindow(autoCompactWindow);
+  const stored = parseAutoCompactWindow(autoCompactWindow);
+  const window = draftWindow === undefined ? stored : parseAutoCompactWindow(draftWindow);
   const index = autoCompactWindowToIndex(window);
+  const notesHtml = renderAutoCompactNotesHtml({
+    draftWindow: window,
+    storedWindow: stored,
+    activeWindow: activeAutoCompactWindow,
+    deferred: autoCompactWindowDeferred,
+    turnRunning,
+    usedTokens,
+  });
 
   const threshold = toNullableNumber(autoCompactThreshold);
   const sourceLabel = autocompactSourceLabel(autocompactSource);
@@ -195,7 +278,7 @@ export function renderAutoCompactControlHtml({
       >
       <div class="ctx-autocompact-effective">Effective: ${effective}</div>
       ${disabledNote}
-      <div class="ctx-autocompact-note">Applied on the next message in this conversation.</div>
+      <div id="ctx-autocompact-notes" class="ctx-autocompact-notes">${notesHtml}</div>
     </div>
   `;
 }
@@ -267,20 +350,56 @@ ${renderThinkingButtons('display', THINKING_DISPLAY_CHOICES, displayKey)}
   `;
 }
 
+// A model limit is a round figure: 1M rather than 1.0M.
+function formatModelLimit(value) {
+  const n = toNullableNumber(value);
+  if (n === null) return '—';
+  if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  return formatCompactTokens(n);
+}
+
+/**
+ * The headline of a Claude session, whose snapshot max is the compaction
+ * window rather than the model's limit:
+ * `60.9k used · compaction window 100.0k · model limit 1M` (the limit only
+ * when known).
+ */
+export function formatCompactionWindowHeadline({ totalTokens, maxTokens, modelContextLimit = null } = {}) {
+  if (toNullableNumber(totalTokens) === null || toNullableNumber(maxTokens) === null) return '';
+  const parts = [
+    `${formatCompactTokens(totalTokens)} used`,
+    `compaction window ${formatCompactTokens(maxTokens)}`,
+  ];
+  if (toNullableNumber(modelContextLimit) !== null && Number(modelContextLimit) > 0) {
+    parts.push(`model limit ${formatModelLimit(modelContextLimit)}`);
+  }
+  return parts.join(' · ');
+}
+
 /**
  * @param {object|null} usage the `contextUsage` field of an /api/context response
+ * @param {object} [options]
+ * @param {boolean} [options.compactionWindow] the max is a compaction window
+ *   (Claude): the headline names it, plus `modelContextLimit` when known
  * @returns {string} modal body HTML, or '' when there is nothing to render
  */
-export function renderContextUsageHtml(usage) {
+export function renderContextUsageHtml(usage, { compactionWindow = false, modelContextLimit = null } = {}) {
   if (!usage || typeof usage !== 'object') return '';
   const categories = Array.isArray(usage.categories) ? usage.categories : [];
   const hasTotals = toNullableNumber(usage.totalTokens) !== null
     && toNullableNumber(usage.maxTokens) !== null;
   if (!categories.length && !hasTotals) return '';
 
-  const headline = hasTotals
-    ? `${formatCompactTokens(usage.totalTokens)} / ${formatCompactTokens(usage.maxTokens)} tokens (${formatUsagePercent(usage.percentage, { digits: 0 })})`
-    : '';
+  let headline = '';
+  if (hasTotals) {
+    headline = compactionWindow
+      ? formatCompactionWindowHeadline({
+        totalTokens: usage.totalTokens,
+        maxTokens: usage.maxTokens,
+        modelContextLimit,
+      })
+      : `${formatCompactTokens(usage.totalTokens)} / ${formatCompactTokens(usage.maxTokens)} tokens (${formatUsagePercent(usage.percentage, { digits: 0 })})`;
+  }
 
   const rows = categories.map((category) => renderRow(category)).join('');
   const freeRow = toNullableNumber(usage.freeTokens) !== null

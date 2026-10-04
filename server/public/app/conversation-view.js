@@ -88,8 +88,14 @@ import {
   normalizeRelayActivityEntry,
   promotedCompactBoundaryEntry,
   relayActivityEntryText,
+  visibleActivityEntries,
 } from './activity-replay-state.mjs';
-import { SEPARATOR_CLASS, syncSeparatorRail, syncTranscriptSeparators } from './transcript-separators.mjs';
+import {
+  COMPACT_PENDING_STAMP,
+  SEPARATOR_CLASS,
+  syncSeparatorRail,
+  syncTranscriptSeparators,
+} from './transcript-separators.mjs';
 import { ABSORBED_MSG_CLASS, STEER_MARKER_CLASS_BY_KIND, syncSteeredTurnMerge } from './steered-turn-merge.mjs';
 import { resolveSubagentFold, subagentFoldSummary, toggledSubagentFoldChoice } from './subagent-fold.mjs';
 import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
@@ -1338,12 +1344,14 @@ function createMessageNode(msg, msgId = null, force = false) {
   // break row immediately above this message (syncTranscriptSeparators reads
   // the stamp), so it must not also show up inside the bubble's activity list.
   // Only the promoted (last) boundary is hidden — see renderActivityMarkup.
+  // A rendered row is a finished message, so a compaction start without an
+  // end draws no line here (the live bubble owns the running one).
   const promotedBoundaryEntry = promotedCompactBoundaryEntry(activities);
   const compactBoundary = compactBoundaryFromActivities(activities);
   if (compactBoundary) {
     div.dataset.compactBoundary = `${compactBoundary.preTokens ?? ''}|${compactBoundary.postTokens ?? ''}`;
   }
-  if (activities.some((item) => item !== promotedBoundaryEntry)) div.classList.add('msg-with-activity');
+  if (visibleActivityEntries(activities, promotedBoundaryEntry).length) div.classList.add('msg-with-activity');
   const thoughts = Array.isArray(msg.thoughts) ? msg.thoughts.filter((t) => t && String(t.text || '').trim()) : [];
   const attachmentHtml = attachments.length ? renderAttachmentMarkup(attachments, { messageId: msgId }) : '';
   const subagentRuns = Array.isArray(msg.subagentRuns) ? msg.subagentRuns.filter(Boolean) : [];
@@ -1479,7 +1487,15 @@ function insertMessageNode(node, insertAfterId = null) {
   const anchorId = String(insertAfterId || '').trim();
   const anchor = anchorId ? el.querySelector(`[data-message-id="${anchorId}"]`) : null;
   if (anchor && anchor.parentNode === el) {
-    const next = anchor.nextSibling;
+    let next = anchor.nextSibling;
+    // The line of a compaction that ran in this turn sits between the user
+    // message and its live bubble; the reply lands under it, so the
+    // separator pass relabels that line instead of replacing it.
+    if (next?.nodeType === 1
+      && next.classList?.contains(SEPARATOR_CLASS)
+      && next.dataset?.separatorKey === `compact:${anchorId}`) {
+      next = next.nextSibling;
+    }
     if (next) el.insertBefore(node, next);
     else el.appendChild(node);
   } else {
@@ -1604,11 +1620,12 @@ export function renderActivityMarkup(activities, promotedBoundaryEntry = undefin
   // ones stay visible here as prose rather than disappearing from the
   // transcript altogether (one break row per message is all the separator
   // planner can place).
+  // A compaction's start and cancel steps are never prose either.
   const list = Array.isArray(activities) ? activities : [];
   const promoted = promotedBoundaryEntry === undefined
     ? promotedCompactBoundaryEntry(list)
     : promotedBoundaryEntry;
-  const visible = list.filter((item) => item !== promoted);
+  const visible = visibleActivityEntries(list, promoted);
   const progress = visible.filter((item) => relayActivityEntryText(item).startsWith('● '));
   const tools = visible.filter((item) => !relayActivityEntryText(item).startsWith('● '));
   const progressHtml = progress.length
@@ -1711,10 +1728,16 @@ function anchorThinkingBubble(div, messageId) {
   const id = String(messageId || '').trim();
   const target = id ? el.querySelector(`[data-message-id="${id}"]`) : null;
   if (target && target.parentNode === el) {
-    if (target.nextSibling === div) return;
+    // The bubble's own compaction line sits between the two.
+    let follower = target.nextSibling;
+    while (follower && follower !== div && follower.classList?.contains('transcript-separator')) {
+      follower = follower.nextSibling;
+    }
+    if (follower === div) return;
     const next = target.nextSibling;
     if (next) el.insertBefore(div, next);
     else el.appendChild(div);
+    if (div.dataset.compactBoundary) syncSeparatorsNow();
   } else if (div.parentNode !== el) {
     el.appendChild(div);
   }
@@ -1771,11 +1794,13 @@ export function showThinking(messageId = null, autoScroll = true) {
         <div class="thinking-thoughts-list"></div>
       </details>
       <div id="thinking-stream" class="thinking-stream" hidden></div>
+      <div class="thinking-compacting-note" hidden>Compacting the conversation…</div>
       <div class="dots"><span></span><span></span><span></span></div>
       <div id="thinking-activity" class="thinking-activity"></div>
       <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
     </div>`;
   anchorThinkingBubble(div, nextMessageId);
+  syncThinkingCompaction(div);
   renderThinkingThoughts();
   renderThinkingStream();
   // A board the turn has posted already lives in its live bubble.
@@ -1788,8 +1813,33 @@ export function showThinking(messageId = null, autoScroll = true) {
 export function removeThinking() {
   thinkingMessageId = null;
   lastInFlightSnapshotKey = '';
+  const wasCompacting = !!document.getElementById('thinking-indicator')?.dataset?.compactBoundary;
   unobserveThinkingBubble();
   document.getElementById('thinking-indicator')?.remove();
+  // The bubble's compaction line goes with it, but only after the
+  // caller's same-tick work: a reply appended right after this call takes
+  // the line over (relabelled in place) instead of it being dropped first.
+  if (wasCompacting) queueMicrotask(syncSeparatorsNow);
+}
+
+// The live turn's compaction line: the bubble stamps the turn's compaction
+// for the separator pass — "Compacting context…" while the last compaction
+// entry is a start without an end, the final label once the boundary is in —
+// so the line sits above the bubble and the reply takes it over unchanged.
+// The bubble's own note shows only while it runs.
+function syncThinkingCompaction(bubble = document.getElementById('thinking-indicator')) {
+  if (!bubble) return;
+  const items = thinkingMessageId ? (relayActivities.get(thinkingMessageId) || []) : [];
+  const boundary = compactBoundaryFromActivities(items, { processing: true });
+  const note = bubble.querySelector('.thinking-compacting-note');
+  if (note) note.hidden = !boundary?.pending;
+  const stamp = !boundary
+    ? ''
+    : (boundary.pending ? COMPACT_PENDING_STAMP : `${boundary.preTokens ?? ''}|${boundary.postTokens ?? ''}`);
+  if ((bubble.dataset.compactBoundary || '') === stamp) return;
+  if (stamp) bubble.dataset.compactBoundary = stamp;
+  else delete bubble.dataset.compactBoundary;
+  if (bubble.parentNode) syncSeparatorsNow();
 }
 
 // Stop is one tap away on a sticky header, so a stray touch must not kill a
@@ -1955,6 +2005,7 @@ export function renderThinkingActivities() {
   if (!selectionIntersectsNode(box)) {
     patchActivityList(box, mainExpected, 'thinking-activity-item');
   }
+  syncThinkingCompaction();
   for (const [subagentRunId, expected] of bySubagentRun) {
     const bubble = ensureSubagentBubble(subagentRunId);
     const runBox = bubble?.querySelector('.subagent-activity');
@@ -2060,8 +2111,12 @@ export function appendThinkingActivity(item, subagentRunId = null, autoScroll = 
   );
   if (!entry) return;
   // Same rule as renderThinkingActivities: a boundary becomes a break row on
-  // the persisted message, so it never shows as live prose.
-  if (isCompactBoundaryActivityEntry(entry)) return;
+  // the persisted message, so it never shows as live prose. Every
+  // compaction step does move the live turn's compaction line, though.
+  if (isCompactBoundaryActivityEntry(entry)) {
+    syncThinkingCompaction();
+    return;
+  }
   const decorated = decorateActivityText(entry.text);
 
   if (subagentRunId) {
