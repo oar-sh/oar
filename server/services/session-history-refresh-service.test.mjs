@@ -436,6 +436,50 @@ test('replaceRetrievableHistory maps two remapped hidden duplicates one-to-one b
   assert.equal(db.prepare(`SELECT hidden_from_shares FROM messages WHERE id = 'sdk-late'`).get().hidden_from_shares, 1);
 });
 
+test('replaceRetrievableHistory keeps a pin by message id and when SDK message ids change', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  insertConversation(db, 'conv-pins');
+  db.prepare(`
+    INSERT INTO messages (id, conversation_id, role, text, pinned_at, timestamp) VALUES
+      ('same-id', 'conv-pins', 'user', 'pinned question', '2026-01-01T01:00:00.000Z', '2026-01-01T00:00:00.000Z'),
+      ('relay-reply', 'conv-pins', 'assistant', 'pinned answer', '2026-01-01T01:05:00.000Z', '2026-01-01T00:00:05.000Z'),
+      ('relay-plain', 'conv-pins', 'user', 'not pinned', NULL, '2026-01-01T00:01:00.000Z')
+  `).run();
+
+  const service = createSessionHistoryRefreshService({ db, stmts });
+  service.replaceRetrievableHistory('conv-pins', [
+    { id: 'same-id', role: 'user', text: 'pinned question', timestamp: '2026-01-01T00:00:00.000Z' },
+    { id: 'sdk-reply', role: 'assistant', text: 'pinned answer', timestamp: '2026-01-01T00:00:06.000Z' },
+    { id: 'sdk-plain', role: 'user', text: 'not pinned', timestamp: '2026-01-01T00:01:01.000Z' },
+  ]);
+
+  const pinnedAt = (id) => db.prepare(`SELECT pinned_at FROM messages WHERE id = ?`).get(id)?.pinned_at ?? null;
+  assert.equal(pinnedAt('same-id'), '2026-01-01T01:00:00.000Z');
+  assert.equal(pinnedAt('sdk-reply'), '2026-01-01T01:05:00.000Z');
+  assert.equal(pinnedAt('sdk-plain'), null);
+});
+
+test('replaceRetrievableHistory keeps both marks of a hidden and pinned message', () => {
+  const db = makeDb();
+  const stmts = makeStmts(db);
+  insertConversation(db, 'conv-both');
+  db.prepare(`
+    INSERT INTO messages (id, conversation_id, role, text, hidden_from_shares, share_hidden_at, pinned_at, timestamp)
+    VALUES ('relay-both', 'conv-both', 'user', 'private and kept', 1, '2026-01-01T00:20:00.000Z', '2026-01-01T00:30:00.000Z', '2026-01-01T00:00:00.000Z')
+  `).run();
+
+  const service = createSessionHistoryRefreshService({ db, stmts });
+  service.replaceRetrievableHistory('conv-both', [
+    { id: 'sdk-both', role: 'user', text: 'private and kept', timestamp: '2026-01-01T00:00:01.000Z' },
+  ]);
+
+  const row = db.prepare(`SELECT hidden_from_shares, share_hidden_at, pinned_at FROM messages WHERE id = 'sdk-both'`).get();
+  assert.equal(row.hidden_from_shares, 1);
+  assert.equal(row.share_hidden_at, '2026-01-01T00:20:00.000Z');
+  assert.equal(row.pinned_at, '2026-01-01T00:30:00.000Z');
+});
+
 test('replaceRetrievableHistory keeps same-name candidates with distinct sha256 apart', () => {
   const db = makeDb();
   const stmts = makeStmts(db);

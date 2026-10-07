@@ -62,6 +62,33 @@ test('a disconnected tunnel surfaces its last error', () => {
   assert.equal(state.title, 'Web relay reachable; Cloudflare tunnel disconnected (auth-or-config)');
 });
 
+test('a tunnel without cloudflared reads off and says how to install it', () => {
+  const state = resolveRelayDotState({
+    relayOnline: true,
+    cliOnline: true,
+    cloudflaredTunnel: {
+      mode: 'managed',
+      connected: false,
+      binaryMissing: true,
+      lastError: 'cloudflared is not installed — install it with: brew install cloudflared',
+    },
+  });
+  assert.equal(state.className, 'online');
+  assert.equal(state.tone, 'online');
+  assert.equal(
+    state.title,
+    'Web relay reachable; Cloudflare tunnel off: cloudflared is not installed — install it with: brew install cloudflared',
+  );
+  assert.equal(
+    resolveRelayDotState({
+      relayOnline: true,
+      cliOnline: true,
+      cloudflaredTunnel: { mode: 'managed', connected: false, binaryMissing: true },
+    }).title,
+    'Web relay reachable; Cloudflare tunnel off: cloudflared is not installed',
+  );
+});
+
 test('an offline CLI is reported alongside the tunnel reach', () => {
   const state = resolveRelayDotState({ relayOnline: true, cliOnline: false, cloudflaredTunnel: MANAGED_CONNECTED });
   assert.equal(state.className, 'online tunnelled');

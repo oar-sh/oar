@@ -5,7 +5,7 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
-import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
+import { fileVersionToken, serveFileWithRangeSupport, withFileVersion } from '../services/file-serving.mjs';
 import {
   shouldParkForRestart,
   parkPendingQueueForRestart,
@@ -71,6 +71,11 @@ const STRANDED_SESSION_HEARTBEAT_FRESH_MS = 15_000;
 const RELAY_QUESTION_FINALIZATION_HOLD_MS = 5_000;
 const AUTO_MODEL_SENTINEL = 'auto';
 const USAGE_FETCH_RETRY_DELAY_MS = 250;
+// Preview kinds whose bytes travel in the preview JSON; media and PDF are
+// fetched by the browser from the raw URL instead.
+const TEXT_PREVIEW_KINDS = new Set(['markdown', 'code', 'text']);
+// An upload's URL names its bytes (the sha256), so a kept answer stays right.
+const UPLOAD_CONTENT_CACHE_CONTROL = 'private, max-age=31536000, immutable';
 
 export function resolveOpenAIReasoningEffort(explicitReasoningEffort = '', model = '') {
   const explicit = String(explicitReasoningEffort || '').trim().toLowerCase();
@@ -1610,57 +1615,6 @@ export function cleanupPersistedGeneratedImagesForAssistantResponse({
   }
 }
 
-function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDelete = null } = {}) {
-  const fileSize = meta.size;
-  const name = safeName || path.basename(filePath).replace(/"/g, '');
-  const rangeHeader = req.headers['range'];
-
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Cache-Control', 'no-store');
-  // Neutralize browser-executable types (HTML/SVG/XML), force nosniff, and
-  // sandbox the response so a worker-written workspace file can't run as script
-  // on this origin. Media stays inline for preview; everything else downloads.
-  applySafeServedContentHeaders(res, meta.contentType, { fileName: name });
-
-  const onStreamError = (error) => {
-    if (cacheDelete) cacheDelete(filePath);
-    if (res.headersSent) { res.destroy(error); return; }
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
-      res.status(404).json({ error: 'File not found' });
-      return;
-    }
-    res.status(500).json({ error: 'Failed to read file' });
-  };
-
-  if (rangeHeader) {
-    const match = /bytes=(\d+)-(\d*)/.exec(rangeHeader);
-    if (!match) {
-      res.setHeader('Content-Range', `bytes */${fileSize}`);
-      res.status(416).end();
-      return;
-    }
-    const start = parseInt(match[1], 10);
-    const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
-    if (start > end || start >= fileSize || end >= fileSize) {
-      res.setHeader('Content-Range', `bytes */${fileSize}`);
-      res.status(416).end();
-      return;
-    }
-    const chunkSize = end - start + 1;
-    res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
-    res.setHeader('Content-Length', String(chunkSize));
-    res.status(206);
-    const stream = fs.createReadStream(filePath, { start, end });
-    stream.on('error', onStreamError);
-    stream.pipe(res);
-  } else {
-    res.setHeader('Content-Length', String(fileSize));
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', onStreamError);
-    stream.pipe(res);
-  }
-}
-
 // Structural sanitizer for the workflow-progress digest a Claude session
 // worker attaches to its background-task rows (docs/plans/workflow-progress-tree.md,
 // Phase 2). The relay never trusts worker JSON: strings are trimmed and
@@ -1769,6 +1723,10 @@ export function registerMessagesRoutes(app, deps) {
     fetchLinuxDirectoryEntries,
     mapLinuxDirectoryEntry,
     readWorkspaceFileMeta,
+    // The cache readWorkspaceFileMeta fills. The routes drop an entry when a
+    // read shows it is out of date; the name was used here without ever
+    // being handed in, so each of those paths threw a ReferenceError.
+    workspaceFileMetaCache,
     resolveWorkspaceFilePath,
     normalizeWorkspaceRelativePath,
     previewLanguageForWorkspaceFile,
@@ -3408,9 +3366,10 @@ export function registerMessagesRoutes(app, deps) {
     if (!file) return res.status(404).json({ error: 'Not found' });
     const filePath = uploadPathForSha(sha256);
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
-    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
-    applySafeServedContentHeaders(res, file.mime_type, { fileName: file.name || file.file_name || '' });
-    fs.createReadStream(filePath).pipe(res);
+    serveFileWithRangeSupport(req, res, filePath, { contentType: file.mime_type }, {
+      safeName: String(file.name || file.file_name || '').replace(/"/g, ''),
+      cacheControl: UPLOAD_CONTENT_CACHE_CONTROL,
+    });
   });
 
   app.get('/api/generated-image/:conversationId/:messageId/:imageId/content', auth, (req, res) => {
@@ -3483,6 +3442,9 @@ export function registerMessagesRoutes(app, deps) {
     const filePath = resolveWorkspaceFilePath(requestedPath, rootOverride);
     if (!filePath || !normalizedPath) return res.status(400).json({ error: 'Invalid file path' });
 
+    // The preview carries the version the download link is built from, so
+    // it reads the file's metadata fresh, not from the short-lived cache.
+    workspaceFileMetaCache.delete(filePath);
     let meta = null;
     try {
       meta = readWorkspaceFileMeta(filePath);
@@ -3538,10 +3500,12 @@ export function registerMessagesRoutes(app, deps) {
       size,
       truncated,
       previewBytes: contentBuffer.length,
-      rawUrl: `${remotePath}/api/files/${normalizedWebPath.split('/').map((part) => encodeURIComponent(part)).join('/')}${scopeSuffix}`,
+      mtimeMs: meta.mtimeMs ?? null,
+      version: fileVersionToken(meta),
+      rawUrl: withFileVersion(`${remotePath}/api/files/${normalizedWebPath.split('/').map((part) => encodeURIComponent(part)).join('/')}${scopeSuffix}`, fileVersionToken(meta)),
     };
 
-    if (kind !== 'binary' && kind !== 'image' && kind !== 'video') {
+    if (TEXT_PREVIEW_KINDS.has(kind)) {
       payload.content = contentBuffer.toString('utf8');
     }
 
@@ -3917,6 +3881,8 @@ export function registerMessagesRoutes(app, deps) {
       const filePath = normalizeLinuxAbsolutePath(requestedPath);
       if (!filePath) return res.status(400).json({ error: 'Invalid Linux file path' });
 
+      // Fresh metadata: the download link's version comes from this answer.
+      workspaceFileMetaCache.delete(filePath);
       let meta = null;
       try {
         meta = readWorkspaceFileMeta(filePath);
@@ -3969,10 +3935,12 @@ export function registerMessagesRoutes(app, deps) {
         size,
         truncated,
         previewBytes: contentBuffer.length,
-        rawUrl: `${remotePath}/api/drives/file?path=${encodeURIComponent(filePath)}`,
+        mtimeMs: meta.mtimeMs ?? null,
+        version: fileVersionToken(meta),
+        rawUrl: withFileVersion(`${remotePath}/api/drives/file?path=${encodeURIComponent(filePath)}`, fileVersionToken(meta)),
       };
 
-      if (kind !== 'binary' && kind !== 'image' && kind !== 'video') {
+      if (TEXT_PREVIEW_KINDS.has(kind)) {
         payload.content = contentBuffer.toString('utf8');
       }
 
@@ -3989,6 +3957,8 @@ export function registerMessagesRoutes(app, deps) {
         return res.status(400).json({ error: 'Invalid drive file path' });
       }
 
+      // Fresh metadata: the download link's version comes from this answer.
+      workspaceFileMetaCache.delete(filePath);
       let meta = null;
       try {
         meta = readWorkspaceFileMeta(filePath);
@@ -4043,10 +4013,12 @@ export function registerMessagesRoutes(app, deps) {
         size,
         truncated,
         previewBytes: contentBuffer.length,
-        rawUrl: `${remotePath}/api/drives/file?path=${encodeURIComponent(normalizedWebPath)}`,
+        mtimeMs: meta.mtimeMs ?? null,
+        version: fileVersionToken(meta),
+        rawUrl: withFileVersion(`${remotePath}/api/drives/file?path=${encodeURIComponent(normalizedWebPath)}`, fileVersionToken(meta)),
       };
 
-      if (kind !== 'binary' && kind !== 'image' && kind !== 'video') {
+      if (TEXT_PREVIEW_KINDS.has(kind)) {
         payload.content = contentBuffer.toString('utf8');
       }
 

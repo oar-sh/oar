@@ -52,8 +52,10 @@ import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility, launchSessionWorker } from './api-client.js';
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
 import { linkifyWorkspaceMentionsInNode, parseAppFileHref, renderMarkdownPreview, rewriteLocalAssetUrlsInNode } from './router.js';
-import { renderAttachmentMarkup, removeComposerAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo, openDriveFilePreview, openWorkspaceFilePreview, openUploadedAttachmentViewer } from './attachments-view.js';
+import { renderAttachmentMarkup, removeComposerAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo, openGalleryItem } from './attachments-view.js';
+import { chatMediaGallery, chatMediaItemFromNode } from './viewer-chat-gallery.mjs';
 import { buildWorkflowRunCard } from './background-tasks-view.mjs';
+import { isMessagePinned, toggleMessagePin } from './pinned-messages-view.mjs';
 import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
 import { buildTranscriptPreviewCard } from './preview-cards.mjs';
 import { closeSlashAutocomplete, handleSlashAutocompleteKey, updateSlashAutocomplete } from './slash-autocomplete.mjs';
@@ -1393,8 +1395,13 @@ function createMessageNode(msg, msgId = null, force = false) {
   const belongsToActiveTurn = !!activeTurnMessageId
     && (activeTurnMessageId === msgId || activeTurnMessageId === sourceMessageId);
   const canToggleShareVisibility = !IS_SHARED_VIEW && !!msgId && !isQueuedUserMessage && !belongsToActiveTurn;
+  // From the conversation's pin list, not from the message: the list is
+  // ordered by revision, and a bubble built from a live event has no pin
+  // state of its own.
+  const pinned = isMessagePinned(currentConvId, msgId);
   const shareVisibilityActionHtml = canToggleShareVisibility
     ? `<div class="msg-share-visibility">
+        ${buildMessagePinControlsHtml(msgId, pinned)}
         ${hiddenFromShares ? '<span class="msg-hidden-label">Hidden from shared viewers</span>' : ''}
         <button type="button" class="msg-share-visibility-btn" data-action="toggle-share-visibility" data-message-id="${escHtml(msgId)}" data-hidden-from-shares="${hiddenFromShares ? 'true' : 'false'}" title="${hiddenFromShares ? 'Shows this message in shared conversations' : 'Hides this message from shared conversations'}">${hiddenFromShares ? 'Unhide' : 'Hide'}</button>
       </div>`
@@ -3134,6 +3141,38 @@ async function cancelSubagentByRunId(conversationId, subagentRunId) {
   updateSubagentStopButton(targetSubagentRunId, false);
 }
 
+const PINNED_LABEL_HTML = '<span class="msg-pinned-label">📍 Pinned</span>';
+
+function pinButtonTitle(pinned) {
+  return pinned ? 'Removes this message from the pinned list' : 'Adds this message to the pinned list';
+}
+
+// The pin half of a bubble's corner row. No whitespace between label and
+// button: syncRenderedPinState finds the label as the button's sibling.
+function buildMessagePinControlsHtml(msgId, pinned) {
+  return `${pinned ? PINNED_LABEL_HTML : ''}<button type="button" class="msg-pin-btn" data-action="toggle-pin" data-message-id="${escHtml(msgId)}" data-pinned="${pinned ? 'true' : 'false'}" title="${pinButtonTitle(pinned)}">${pinned ? 'Unpin' : 'Pin'}</button>`;
+}
+
+// The pin list changed (this page, another device): bring the bubbles on the
+// page in line without rebuilding them.
+export function syncRenderedPinState(pinnedIds) {
+  const el = getMessagesElement();
+  if (!el) return;
+  const ids = pinnedIds instanceof Set ? pinnedIds : new Set(pinnedIds || []);
+  for (const button of el.querySelectorAll('.msg-pin-btn')) {
+    const pinned = ids.has(String(button.dataset.messageId || '').trim());
+    if ((button.dataset.pinned === 'true') === pinned) continue;
+    button.dataset.pinned = pinned ? 'true' : 'false';
+    button.disabled = false;
+    button.textContent = pinned ? 'Unpin' : 'Pin';
+    button.title = pinButtonTitle(pinned);
+    const sibling = button.previousElementSibling;
+    const label = sibling?.classList?.contains('msg-pinned-label') ? sibling : null;
+    if (pinned && !label) button.insertAdjacentHTML('beforebegin', PINNED_LABEL_HTML);
+    if (!pinned && label) label.remove();
+  }
+}
+
 async function toggleMessageShareVisibility(conversationId, messageId, hiddenFromShares) {
   const conversationKey = String(conversationId || '').trim();
   const targetMessageId = String(messageId || '').trim();
@@ -3192,7 +3231,7 @@ function runRelayErrorCta(cta) {
 }
 
 function handleBubbleActionClick(event) {
-  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn, .thinking-follow-btn, .subagent-bubble-header');
+  const btn = event.target.closest('.bubble-action-btn, .msg-share-visibility-btn, .msg-pin-btn, .thinking-follow-btn, .subagent-bubble-header');
   if (!btn) return;
   const action = btn.dataset.action;
   const messageId = btn.dataset.messageId;
@@ -3212,6 +3251,12 @@ function handleBubbleActionClick(event) {
       messageId,
       btn.dataset.hiddenFromShares === 'true',
     );
+  }
+
+  if (action === 'toggle-pin' && messageId) {
+    event.preventDefault();
+    event.stopPropagation();
+    void toggleMessagePin(currentConvId, messageId, btn.dataset.pinned === 'true');
   }
 
   if (action === 'stop-turn' && messageId) {
@@ -3269,30 +3314,48 @@ function handleBubbleActionKeydown(event) {
   toggleSubagentFold(header.dataset.subagentRunId);
 }
 
-// Clicking an inline-embedded image in a message bubble opens it in the file
-// viewer modal (zoom + Download + Copy), the same viewer the repo browser
-// uses. Attachment thumbnails keep their own handler; video/audio keep their
-// native controls untouched.
-function handleEmbeddedImageClick(event) {
-  const img = event.target.closest?.('.msg-bubble img');
-  if (!img || img.closest('.msg-attachment')) return;
-  if (IS_SHARED_VIEW) return; // the file routes are cookie-authed; shared viewers would only see a failed load
-  const src = String(img.getAttribute('src') || '').trim();
-  if (!src) return;
+// A tap on a media attachment (its picture, chip or name) or on a picture
+// embedded in a bubble opens it in the file viewer, together with the other
+// media of the conversation to swipe through. Inline video/audio players in
+// bubbles keep their native controls untouched.
+function handleChatMediaClick(event) {
+  const attachment = event.target.closest?.('.msg-attachment[data-media-url]');
+  let node = null;
+  if (attachment) {
+    // The buttons under a generated image ("Edit this image") do their own work.
+    if (event.target.closest?.('button')) return;
+    if (!event.target.closest?.('img, .msg-attachment-video-chip, [data-media-open]')) return;
+    node = attachment;
+  } else {
+    const img = event.target.closest?.('.msg-bubble img');
+    if (!img || img.closest('.msg-attachment')) return;
+    if (IS_SHARED_VIEW) return; // the file routes are cookie-authed; shared viewers would only see a failed load
+    if (!String(img.getAttribute('src') || '').trim()) return;
+    node = img;
+  }
   event.preventDefault();
   event.stopPropagation();
-  const target = parseAppFileHref(src);
-  if (target?.kind === 'drive') {
-    void openDriveFilePreview(target.path);
-    return;
+  const options = { includeEmbedded: !IS_SHARED_VIEW, parseAppFileHref };
+  const gallery = chatMediaGallery(getMessagesElement(), node, options);
+  const item = gallery ? gallery.items[gallery.index] : chatMediaItemFromNode(node, options);
+  void openGalleryItem(item, gallery);
+}
+
+// On a touch screen the corner row (Pin, Hide) is revealed by a tap on the
+// bubble. The tap leaves an emulated :hover behind, which the CSS also honours,
+// but Chromium drops that hover at the next scroll or layout change on some
+// platforms (seen on Linux), and the row went back to `pointer-events: none`
+// before it could be tapped. The class keeps the reveal until a tap lands
+// outside the bubble. A pointer with hover keeps the hover reveal alone.
+const REVEALED_BUBBLE_CLASS = 'msg-actions-revealed';
+function handleBubbleTapReveal(event) {
+  const bubble = event.target?.closest?.('.msg-bubble') || null;
+  for (const revealed of document.querySelectorAll(`.msg-bubble.${REVEALED_BUBBLE_CLASS}`)) {
+    if (revealed !== bubble) revealed.classList.remove(REVEALED_BUBBLE_CLASS);
   }
-  if (target?.kind === 'workspace') {
-    void openWorkspaceFilePreview(target.path);
-    return;
-  }
-  // data: thumbnails and external http(s) images: show them directly.
-  const dataMime = /^data:(image\/[a-z0-9.+-]+)/i.exec(src)?.[1] || '';
-  openUploadedAttachmentViewer(img.getAttribute('alt') || 'image', src, dataMime || 'image/*');
+  if (!bubble || IS_SHARED_VIEW) return;
+  if (!window.matchMedia?.('(hover: none)')?.matches) return;
+  bubble.classList.add(REVEALED_BUBBLE_CLASS);
 }
 
 export function initBubbleActionHandlers() {
@@ -3300,7 +3363,9 @@ export function initBubbleActionHandlers() {
   if (!messagesEl) return;
   messagesEl.addEventListener('click', handleBubbleActionClick);
   messagesEl.addEventListener('keydown', handleBubbleActionKeydown);
-  messagesEl.addEventListener('click', handleEmbeddedImageClick);
+  messagesEl.addEventListener('click', handleChatMediaClick);
+  // On the document: a tap outside the transcript clears the reveal too.
+  document.addEventListener('click', handleBubbleTapReveal);
   initThinkingFollow({ getCurrentConversationId: () => currentConvId });
 }
 
@@ -3410,6 +3475,20 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
       })),
     })),
   });
+}
+
+// Counts jumps into the history (a search result, a pinned message). A reload
+// of the END of the conversation that was asked for before a jump and is
+// answered after it would put the end back over the window just jumped to.
+// Only jumps count: an ordinary reload must still be able to correct another.
+let transcriptJumpEpoch = 0;
+
+export function getTranscriptJumpEpoch() {
+  return transcriptJumpEpoch;
+}
+
+export function noteTranscriptJump() {
+  transcriptJumpEpoch += 1;
 }
 
 export function renderMessages(msgs, scroll = true, meta = {}) {
@@ -3590,12 +3669,18 @@ export async function loadNewerConversationMessages() {
   await conversationFutureLoader.loadMore();
 }
 
+// False while a window in the middle of the history is on the page (a search
+// result or a pinned message was jumped to) and newer messages are unloaded.
+export function isConversationWindowAtTail() {
+  return !conversationHistoryState.hasMoreNewer;
+}
+
 export function focusConversationMessageById(messageId, { behavior = 'smooth', block = 'center' } = {}) {
   const id = String(messageId || '').trim();
   if (!id) return false;
   const el = getMessagesElement();
   if (!el) return false;
-  const target = el.querySelector(`[data-message-id="${id}"]`);
+  const target = el.querySelector(`.msg[data-message-id="${CSS.escape(id)}"]`);
   if (!target) return false;
   target.scrollIntoView({ behavior, block, inline: 'nearest' });
   target.classList.add('msg-search-target');

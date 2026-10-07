@@ -2,16 +2,17 @@
 
 import path from 'path';
 import fs from 'fs';
-import { createRequire } from 'module';
 import { spawn } from 'child_process';
-
-const requireFromHere = createRequire(import.meta.url);
 
 const BACKOFF_STEPS = [5_000, 10_000, 20_000, 40_000, 60_000];
 const READINESS_WINDOW_MS = 5_000;
 const STABLE_CONNECTION_MS = 30_000;
 const FAST_EXIT_MS = 10_000;
 const MAX_CONSECUTIVE_FAST_EXITS = 3;
+const BINARY_RECHECK_MS = 60_000;
+// What Windows starts without a shell. A `.cmd`/`.bat` launcher would need
+// cmd.exe, and the tunnel token does not go through a shell command line.
+const WINDOWS_DIRECT_EXTENSIONS = ['.exe', '.com'];
 
 function toText(value) {
   return String(value || '').trim();
@@ -29,28 +30,91 @@ function normalizeExtraArgs(rawValue) {
   return rawValue.map((entry) => toText(entry)).filter(Boolean);
 }
 
-// The npm `cloudflared` package downloads the official binary on demand; it is an
-// optional dependency, so absence must degrade to a config error, never a crash.
-// `requireImpl` is a seam: the package is optional, so a suite running under
-// `npm ci --omit=optional` (or after a failed postinstall download) must still be
-// able to exercise this logic instead of silently testing the host's install state.
-export function resolveCloudflaredBinaryFromPackage({
-  existsSync = fs.existsSync,
-  requireImpl = requireFromHere,
+function hasDirectoryPart(value) {
+  return value.includes('/') || value.includes('\\');
+}
+
+/**
+ * Where the cloudflared the tunnel would run really is, or null. OAR ships no
+ * copy: a name is looked up on PATH (on Windows with the `.exe`/`.com`
+ * suffixes PATHEXT lists), a path must be an executable file.
+ */
+export function locateCloudflaredBinary(binary, {
+  platform = process.platform,
+  env = process.env,
+  fsImpl = fs,
+  pathImpl = platform === 'win32' ? path.win32 : path.posix,
 } = {}) {
-  try {
-    const mod = requireImpl('cloudflared');
-    const bin = toText(mod?.bin);
-    // `bin` is where the package *will* place the binary; it only exists after
-    // the on-demand download has run, so an un-downloaded path is not usable.
-    if (bin && existsSync(bin)) return bin;
-  } catch {}
+  const name = toText(binary);
+  if (!name) return null;
+
+  let names = [name];
+  if (platform === 'win32' && !WINDOWS_DIRECT_EXTENSIONS.includes(pathImpl.extname(name).toLowerCase())) {
+    const listed = String(env?.PATHEXT || '')
+      .split(';')
+      .map((ext) => toText(ext).toLowerCase())
+      .filter((ext) => WINDOWS_DIRECT_EXTENSIONS.includes(ext));
+    names = (listed.length ? listed : WINDOWS_DIRECT_EXTENSIONS).map((ext) => `${name}${ext}`);
+  }
+
+  const isExecutableFile = (candidate) => {
+    try {
+      if (!fsImpl.statSync(candidate).isFile()) return false;
+      // Windows has no execute bit; the suffix above decided.
+      if (platform !== 'win32') fsImpl.accessSync(candidate, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const dirs = hasDirectoryPart(name)
+    ? [null]
+    : String(env?.PATH ?? env?.Path ?? '').split(pathImpl.delimiter).map(toText).filter(Boolean);
+  for (const dir of dirs) {
+    for (const candidate of names) {
+      const full = dir === null ? candidate : pathImpl.join(dir, candidate);
+      if (isExecutableFile(full)) return full;
+    }
+  }
   return null;
+}
+
+export function cloudflaredInstallPointer(platform = process.platform) {
+  if (platform === 'win32') return 'install it with: winget install --id Cloudflare.cloudflared';
+  if (platform === 'darwin') return 'install it with: brew install cloudflared';
+  return "install it from Cloudflare's package repository: https://pkg.cloudflare.com/";
+}
+
+/** The one sentence the tunnel state, the status dot and the CLI show. */
+export function describeMissingCloudflaredBinary({ binary = '', binarySource = 'path', platform = process.platform } = {}) {
+  const pointer = cloudflaredInstallPointer(platform);
+  if (binarySource === 'config') {
+    return `cloudflared was not found as configured (${binary}) — correct cloudflaredTunnel.binary, or ${pointer}`;
+  }
+  return `cloudflared is not installed — ${pointer}`;
+}
+
+/**
+ * The tunnel in one line for a CLI status row. Takes the manager's state or
+ * the `cloudflaredTunnel` object of `/api/status`; the public address is the
+ * caller's to pass, the relay does not know it (the route lives in Cloudflare).
+ */
+export function describeTunnelState(state, { url = '' } = {}) {
+  const tunnel = state && typeof state === 'object' ? state : {};
+  const managed = toText(tunnel.mode).toLowerCase() === 'managed' || tunnel.enabled === true;
+  if (!managed) return 'off';
+  const reason = toText(tunnel.lastError);
+  if (tunnel.connected === true) {
+    const address = toText(url);
+    return address ? `running (${address})` : 'running';
+  }
+  if (tunnel.binaryMissing === true || tunnel.valid === false) return reason ? `off: ${reason}` : 'off';
+  return reason ? `not connected (${reason})` : 'not connected';
 }
 
 export function normalizeCloudflaredTunnelConfig(rawConfig = {}, {
   env = process.env,
-  resolveBinary = resolveCloudflaredBinaryFromPackage,
   configBaseDir = process.cwd(),
   pathImpl = path,
 } = {}) {
@@ -64,33 +128,20 @@ export function normalizeCloudflaredTunnelConfig(rawConfig = {}, {
   const binaryInput = toText(env?.COPILOT_CLOUDFLARED_BINARY) || toText(raw.binary);
   const extraArgs = normalizeExtraArgs(raw.extraArgs);
 
-  let binary = '';
-  let binarySource = null;
+  // The configured binary, else `cloudflared` from PATH. Whether it is really
+  // there is checked when the tunnel starts (locateCloudflaredBinary).
+  let binary = 'cloudflared';
+  let binarySource = 'path';
   if (binaryInput) {
-    binary = binaryInput.includes('/') || binaryInput.includes('\\')
+    binary = hasDirectoryPart(binaryInput)
       ? pathImpl.resolve(configBaseDir, binaryInput)
       : binaryInput;
     binarySource = 'config';
-  } else {
-    let packageBinary = null;
-    try {
-      packageBinary = toText(typeof resolveBinary === 'function' ? resolveBinary() : '');
-    } catch {
-      packageBinary = null;
-    }
-    if (packageBinary) {
-      binary = packageBinary;
-      binarySource = 'package';
-    } else {
-      binary = 'cloudflared';
-      binarySource = 'path';
-    }
   }
 
   const errors = [];
   if (mode === 'managed') {
     if (!token) errors.push('cloudflaredTunnel.token is required when cloudflaredTunnel.mode is "managed"');
-    if (!binary) errors.push('cloudflaredTunnel.binary could not be resolved (install the "cloudflared" package or set cloudflaredTunnel.binary)');
   }
 
   return {
@@ -104,6 +155,28 @@ export function normalizeCloudflaredTunnelConfig(rawConfig = {}, {
     binarySource,
     extraArgs,
   };
+}
+
+/**
+ * The tunnel as `oar doctor` reports it, from the config alone (no relay
+ * needed): whether the built-in tunnel is on and whether it could start.
+ */
+export function describeConfiguredTunnel(rawConfig = {}, {
+  env = process.env,
+  platform = process.platform,
+  configBaseDir = process.cwd(),
+  pathImpl = path,
+  locateBinary = locateCloudflaredBinary,
+} = {}) {
+  const tunnelConfig = normalizeCloudflaredTunnelConfig(rawConfig, { env, configBaseDir, pathImpl });
+  if (tunnelConfig.mode !== 'managed') return 'disabled';
+  if (!tunnelConfig.valid) return `managed, cannot start: ${tunnelConfig.errors[0]}`;
+  const located = locateBinary(tunnelConfig.binary, { platform, env });
+  if (!located) {
+    const { binary, binarySource } = tunnelConfig;
+    return `managed, cannot start: ${describeMissingCloudflaredBinary({ binary, binarySource, platform })}`;
+  }
+  return `managed (cloudflared: ${located})`;
 }
 
 export function buildCloudflaredArgs(tunnelConfig) {
@@ -145,12 +218,11 @@ export function createCloudflaredTunnelManager({
   clearTimeoutImpl = clearTimeout,
   configBaseDir = process.cwd(),
   env = process.env,
-  resolveBinary = resolveCloudflaredBinaryFromPackage,
+  locateBinary = locateCloudflaredBinary,
   pathImpl = path,
 } = {}) {
   const tunnelConfig = normalizeCloudflaredTunnelConfig(rawTunnelConfig, {
     env,
-    resolveBinary,
     configBaseDir,
     pathImpl,
   });
@@ -174,6 +246,7 @@ export function createCloudflaredTunnelManager({
     lastError: tunnelConfig.errors[0] || null,
     lastEventAt: nowIso(),
     binary: tunnelConfig.binary || null,
+    binaryMissing: false,
     proc: null,
     backoffTimer: null,
   };
@@ -189,6 +262,7 @@ export function createCloudflaredTunnelManager({
       reconnectAttempts: state.reconnectAttempts,
       connectedSince: state.connectedSince,
       lastError: state.lastError,
+      binaryMissing: state.binaryMissing,
     });
   };
 
@@ -220,9 +294,33 @@ export function createCloudflaredTunnelManager({
       return;
     }
 
+    // OAR ships no cloudflared. Without one the tunnel stays off, the state
+    // says how to install it, and a look every minute starts the tunnel once
+    // it is there (no relay restart, as long as it lands on the relay's PATH).
+    let located = null;
+    try { located = toText(locateBinary(tunnelConfig.binary, { platform, env })); } catch {}
+    if (!located) {
+      if (!state.binaryMissing) {
+        state.binaryMissing = true;
+        state.lastError = describeMissingCloudflaredBinary({
+          binary: tunnelConfig.binary,
+          binarySource: tunnelConfig.binarySource,
+          platform,
+        });
+        warn(`Tunnel not started: ${state.lastError}`);
+        updateBlockingState();
+        emitStatus();
+      }
+      if (state.backoffTimer) clearTimeoutImpl(state.backoffTimer);
+      state.backoffTimer = setTimeoutImpl(spawnTunnel, BINARY_RECHECK_MS);
+      if (typeof state.backoffTimer?.unref === 'function') state.backoffTimer.unref();
+      return;
+    }
+    state.binaryMissing = false;
+
     const args = buildCloudflaredArgs(tunnelConfig);
-    log(`Spawning: ${tunnelConfig.binary} ${redactCloudflaredArgs(args).join(' ')}`);
-    const proc = spawnImpl(tunnelConfig.binary, args, buildSpawnOptions(platform, ['ignore', 'pipe', 'pipe']));
+    log(`Spawning: ${located} ${redactCloudflaredArgs(args).join(' ')}`);
+    const proc = spawnImpl(located, args, buildSpawnOptions(platform, ['ignore', 'pipe', 'pipe']));
     state.proc = proc;
     state.lastError = null;
     updateBlockingState();

@@ -62,6 +62,53 @@ test('the live poll defers while the user selects or drags in the chat', () => {
   assert.match(bootstrap, /flushDeferredMessageRender\(\)/);
 });
 
+test('the live poll leaves a window in the middle of the history alone, also when the jump raced it', () => {
+  const poll = functionBody(readSource('./bootstrap.js'), 'pollAuthenticatedCurrentConversationLive');
+  const bootstrap = readSource('./bootstrap.js');
+  assert.match(
+    functionBody(bootstrap, 'transcriptIsInHistory'),
+    /return !isConversationWindowAtTail\(\) && !hasPendingUserMessageForConversation\(conversationId\);/,
+    'a message sent from the history window still gets its poll',
+  );
+  assert.ok(
+    poll.indexOf('if (transcriptIsInHistory(currentId)) return;') >= 0
+      && poll.indexOf('if (transcriptIsInHistory(currentId)) return;') < poll.indexOf('await loadConversation('),
+    'no request is made for a window that will not be replaced',
+  );
+  // An answer that was on its way during the jump is dropped.
+  assert.match(
+    poll,
+    /const jumpEpoch = getTranscriptJumpEpoch\(\);\s*\n\s*const response = await loadConversation\(currentId, \{ limit: requestLimit \}\);[\s\S]*?if \(getTranscriptJumpEpoch\(\) !== jumpEpoch\) return;[\s\S]*?applyLoadedConversationState\(/,
+  );
+  // Only a jump counts, and it counts when its window is put on the page: an
+  // ordinary reload must still be able to correct another one.
+  const open = functionBody(readSource('./journal-view.js'), 'openConversation');
+  assert.match(open, /if \(forceFreshWindow\) noteTranscriptJump\(\);\s*\n\s*applyLoadedConversationState\(id, r, \{ restoreScroll, savedScrollTop \}\);/);
+  assert.doesNotMatch(functionBody(readSource('./conversation-view.js'), 'renderMessages'), /transcriptJumpEpoch/);
+  assert.match(
+    readSource('./conversation-view.js'),
+    /export function isConversationWindowAtTail\(\) \{\s*\n\s*return !conversationHistoryState\.hasMoreNewer;/,
+  );
+});
+
+test('a view refresh after a jump into the history refreshes everything but the transcript', () => {
+  const refresh = functionBody(readSource('./bootstrap.js'), 'refreshCurrentView');
+  assert.ok(
+    refresh.indexOf('const jumpEpoch = getTranscriptJumpEpoch();') >= 0
+      && refresh.indexOf('const jumpEpoch = getTranscriptJumpEpoch();') < refresh.indexOf('await refreshConversations()'),
+    'the epoch is taken before the first await',
+  );
+  assert.match(
+    refresh,
+    /const keepTranscript = getTranscriptJumpEpoch\(\) !== jumpEpoch \|\| transcriptIsInHistory\(currentId\);/,
+  );
+  assert.match(refresh, /followLiveUpdates: preserveBottom && !keepTranscript,\s*\n\s*keepTranscript,/);
+  assert.match(refresh, /if \(messagesEl && !keepTranscript && /, 'the saved scroll position is not put back over the jump');
+  const apply = functionBody(readSource('./journal-view.js'), 'applyLoadedConversationState');
+  assert.match(apply, /const didRenderMessages = keepTranscript\s*\n\s*\? false\s*\n\s*: renderMessages\(response\.messages, !restoreScroll, response\);/);
+  assert.match(apply, /setConversationBackgroundTasks\(id, response\.backgroundTasks \|\| \[\]\);/, 'the rest still applies');
+});
+
 test('the sidebar spinner tick updates only the dot spans', () => {
   const body = functionBody(readSource('./journal-view.js'), 'ensureProcessingDotTimer');
   assert.doesNotMatch(body, /renderConvList\(\)/);

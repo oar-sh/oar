@@ -1,10 +1,12 @@
 'use strict';
 
 import { createShareVisibilityStatements } from './share-visibility-statements.mjs';
+import { createMessagePinStatements } from './message-pin-statements.mjs';
 import { sessionWorkerProviderSqlList } from '../../shared/provider-routing.mjs';
 
 export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
+    const messagePins = createMessagePinStatements(db);
     const queueHasImageOperationId = db.prepare(`PRAGMA table_info(queue)`).all()
         .some((column) => column.name === 'image_operation_id');
     // A turn paused at the Claude usage limit (usage-limit-pause-service): a
@@ -27,6 +29,9 @@ export function createMessageRepository(db) {
         getSharedMessages: shareVisibility.getSharedMessages,
         getMessageByConversation: db.prepare(`SELECT * FROM messages WHERE id = ? AND conversation_id = ? LIMIT 1`),
         setMessageShareVisibility: shareVisibility.setMessageShareVisibility,
+        setMessagePinnedAt: messagePins.setMessagePinnedAt,
+        listPinnedMessages: messagePins.listPinnedMessages,
+        countPinnedMessages: messagePins.countPinnedMessages,
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
         getRecentMessagesDesc: db.prepare(`SELECT id, role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
         insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),

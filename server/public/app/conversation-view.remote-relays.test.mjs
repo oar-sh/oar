@@ -274,7 +274,8 @@ test('the header line sits between the title and the folder, and the app keeps i
   // bootstrap.js cannot be loaded here as a whole: its header sync has to call
   // this one, and the marker's inline handler has to exist on window.
   const bootstrap = fs.readFileSync(new URL('./bootstrap.js', import.meta.url), 'utf8');
-  assert.match(bootstrap, /\n {2}syncConversationOriginHeader\(\);\n/);
+  // A Windows checkout with core.autocrlf reads the file with CRLF endings.
+  assert.match(bootstrap, /\r?\n {2}syncConversationOriginHeader\(\);\r?\n/);
   assert.ok(bootstrap.includes('window.openOriginConversation = openOriginConversation;'));
 });
 

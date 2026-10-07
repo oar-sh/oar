@@ -24,6 +24,7 @@ import {
   normalizeWorkspaceRootKey,
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
+import { applyCdnNoStoreHeaders } from './services/file-serving.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
 import { sanitizeRelayQuestionContext as sanitizeRelayQuestionContextWith } from './services/relay-question-context.mjs';
@@ -1510,6 +1511,17 @@ const WORKSPACE_CONTENT_TYPES = Object.freeze({
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.ico': 'image/x-icon',
+  '.bmp': 'image/bmp',
+  '.avif': 'image/avif',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac',
+  '.ogg': 'audio/ogg',
+  '.oga': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.weba': 'audio/webm',
   '.mp4': 'video/mp4',
   '.m4v': 'video/mp4',
   '.mov': 'video/quicktime',
@@ -1650,6 +1662,7 @@ const WORKSPACE_CODE_EXTENSIONS = new Set(Object.keys(WORKSPACE_PREVIEW_LANGUAGE
   .filter((ext) => !WORKSPACE_MARKDOWN_EXTENSIONS.has(ext)));
 const WORKSPACE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.bmp', '.avif']);
 const WORKSPACE_VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.ogv', '.wmv']);
+const WORKSPACE_AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.oga', '.opus', '.flac', '.weba']);
 const REPO_HEAVY_DIR_NAMES = new Set(['.git', 'node_modules']);
 const MAX_REPO_TREE_NODES = 20_000;
 const MAX_REPO_TREE_DEPTH = 64;
@@ -4148,6 +4161,7 @@ function readWorkspaceFileMeta(filePath) {
   return cacheWorkspaceFileMeta(filePath, {
     kind: 'file',
     size: Number(stat.size || 0),
+    mtimeMs: Number(stat.mtimeMs || 0),
     contentType: workspaceContentType(filePath),
   });
 }
@@ -4214,6 +4228,8 @@ function workspacePreviewKindForMeta(filePath, contentType) {
   if (WORKSPACE_MARKDOWN_EXTENSIONS.has(normalizedExt)) return 'markdown';
   if (WORKSPACE_IMAGE_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('image/')) return 'image';
   if (WORKSPACE_VIDEO_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('video/')) return 'video';
+  if (WORKSPACE_AUDIO_EXTENSIONS.has(normalizedExt) || normalizedType.startsWith('audio/')) return 'audio';
+  if (normalizedExt === '.pdf' || normalizedType === 'application/pdf') return 'pdf';
   if (WORKSPACE_CODE_EXTENSIONS.has(normalizedExt) || WORKSPACE_PREVIEW_LANGUAGE_BY_FILENAME[filename]) return 'code';
   if (isLikelyTextContentType(normalizedType)) return 'text';
   return 'binary';
@@ -6341,6 +6357,10 @@ app.use((req, _res, next) => {
   stripRequestPathPrefix(req, remotePath);
   next();
 });
+function isApiRequestPath(requestPath) {
+  return /^\/api(?:\/|$)/.test(String(requestPath || ''));
+}
+
 // Baseline security headers on every response. Served-file/attachment endpoints
 // layer a stricter sandbox CSP on top (see applySafeServedContentHeaders). A
 // global script-src CSP is intentionally omitted for now: the SPA relies on
@@ -6349,6 +6369,14 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('Referrer-Policy', 'no-referrer');
+  // Nothing this relay answers belongs in a CDN's cache: it is all behind a
+  // login. These two headers bind the edge itself, whatever cache rule the
+  // zone in front of a tunnel has.
+  applyCdnNoStoreHeaders(res);
+  // An API answer is never stored by default, errors included (a 404 or a
+  // 401 for a file must not outlive the file's absence). A route that
+  // serves content-addressed bytes sets its own, longer-lived value.
+  if (isApiRequestPath(req.path)) res.setHeader('Cache-Control', 'no-store');
   next();
 });
 app.get('/socket.io/socket.io.js', (req, res, next) => {
@@ -6552,6 +6580,7 @@ const sharedRouteDeps = {
   compareRepoDirEntries,
   shouldSkipRepoEntryName,
   readWorkspaceFileMeta,
+  workspaceFileMetaCache,
   resolveWorkspaceFilePath,
   normalizeWorkspaceRelativePath,
   previewLanguageForWorkspaceFile,

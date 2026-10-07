@@ -133,6 +133,8 @@ export let filePreviewState = {
     preload: 'metadata',
     autoplay: false,
   },
+  // The files the viewer can step through (see viewer-gallery.mjs), or null.
+  gallery: null,
 };
 // Toolbar filters are sticky per browser (all default off); the toggles in
 // attachments-view.js are the only writers.
@@ -1418,6 +1420,9 @@ export function renderSummaryModalContent({ title, subtitle = '', bodyHtml = '',
   runSummaryModalLeave(String(kind || '').trim());
   summaryModalState.kind = String(kind || '').trim();
   summaryModalState.refresh = typeof refresh === 'function' ? refresh : null;
+  // Lets the stylesheet tell one kind of this shared modal from another.
+  const modalEl = document.getElementById('summary-modal');
+  if (modalEl?.dataset) modalEl.dataset.kind = summaryModalState.kind;
 
   const titleEl = document.getElementById('summary-modal-title');
   const subtitleEl = document.getElementById('summary-modal-subtitle');
@@ -1445,6 +1450,7 @@ export function closeSummaryModal() {
   const modal = document.getElementById('summary-modal');
   modal?.classList.remove('visible');
   modal?.setAttribute('aria-hidden', 'true');
+  if (modal?.dataset) delete modal.dataset.kind;
   const titleEl = document.getElementById('summary-modal-title');
   const subtitleEl = document.getElementById('summary-modal-subtitle');
   const bodyEl = document.getElementById('summary-modal-body');

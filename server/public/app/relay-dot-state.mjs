@@ -9,7 +9,9 @@
  * A managed-but-disconnected tunnel stays green rather than going grey: the
  * relay itself is still reachable, and grey would claim otherwise. The tooltip
  * carries the bad news instead. Note this state is only ever visible locally —
- * a remote browser whose tunnel is down cannot load the page at all.
+ * a remote browser whose tunnel is down cannot load the page at all. A tunnel
+ * that never started because cloudflared is not installed reads "off" there,
+ * followed by the relay's sentence on how to install it.
  *
  * `tone` is the same state as `className`, minus the dot's CSS baggage. The
  * mobile burger toggle dyes its bars from it, because the dot itself sits in
@@ -24,6 +26,7 @@ function normalizeTunnel(tunnel) {
   if (!managed) return null;
   return {
     connected: tunnel.connected === true,
+    binaryMissing: tunnel.binaryMissing === true,
     lastError: String(tunnel.lastError || '').trim(),
   };
 }
@@ -56,6 +59,10 @@ export function resolveRelayDotState({
   let reach = 'Web relay reachable';
   if (tunnelled) {
     reach = 'Web relay reachable via Cloudflare Tunnel';
+  } else if (tunnel?.binaryMissing) {
+    reach = tunnel.lastError
+      ? `Web relay reachable; Cloudflare tunnel off: ${tunnel.lastError}`
+      : 'Web relay reachable; Cloudflare tunnel off: cloudflared is not installed';
   } else if (tunnel) {
     reach = tunnel.lastError
       ? `Web relay reachable; Cloudflare tunnel disconnected (${tunnel.lastError})`

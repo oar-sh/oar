@@ -53,6 +53,33 @@ test('workspace previews recognize extensionless build and config files', () => 
   });
 });
 
+test('audio files are served with a real audio type and previewed as audio', () => {
+  // Without these, audio went out as application/octet-stream, an attachment
+  // the viewer could only offer for download.
+  assertMappingEntries('WORKSPACE_CONTENT_TYPES', {
+    '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
+    '.m4a': 'audio/mp4',
+    '.ogg': 'audio/ogg',
+    '.opus': 'audio/ogg',
+    '.flac': 'audio/flac',
+    '.bmp': 'image/bmp',
+    '.avif': 'image/avif',
+  });
+  assert.match(source, /const WORKSPACE_AUDIO_EXTENSIONS = new Set\(\[[^\]]*'\.mp3'[^\]]*'\.flac'/);
+  assert.match(
+    source,
+    /if \(WORKSPACE_AUDIO_EXTENSIONS\.has\(normalizedExt\) \|\| normalizedType\.startsWith\('audio\/'\)\) return 'audio';/,
+  );
+});
+
+test('a PDF is its own preview kind, neither text nor opaque binary', () => {
+  assert.match(
+    source,
+    /if \(normalizedExt === '\.pdf' \|\| normalizedType === 'application\/pdf'\) return 'pdf';/,
+  );
+});
+
 test('preview classification consults both extension and filename mappings', () => {
   assert.match(
     source,

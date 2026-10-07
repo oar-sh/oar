@@ -13,6 +13,7 @@ import { migrateSteerSettleMarkers } from './migrations/0004-steer-settle-marker
 import { migrateRemoteRelays } from './migrations/0005-remote-relays.mjs';
 import { migrateWorkspaceRootSettings } from './migrations/0006-workspace-root-settings.mjs';
 import { migrateClaudeCloud } from './migrations/0007-claude-cloud.mjs';
+import { migrateMessagePins } from './migrations/0008-message-pins.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -733,6 +734,13 @@ try {
   migrateClaudeCloud(db);
 } catch (error) {
   console.warn(`[claude-cloud] migration 0007 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Pinned messages: one additive column and its partial index. Readers tolerate
+// their absence (no pins), so a failure is logged and retried next boot like 0007.
+try {
+  migrateMessagePins(db);
+} catch (error) {
+  console.warn(`[message-pins] migration 0008 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

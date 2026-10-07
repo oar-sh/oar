@@ -44,6 +44,7 @@ import {
 } from './ask-user-view.js';
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
 import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
+import { setConversationPins } from './pinned-messages-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
 import { setRemoteRelaysSnapshot } from './remote-relays-store.mjs';
 import { REMOTE_RELAY_SOCKET_EVENT } from './remote-relay-shared.mjs';
@@ -544,6 +545,11 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('background_tasks', ({ conversationId, tasks }) => {
     setConversationBackgroundTasks(conversationId, tasks);
+  });
+  // A message was pinned or unpinned (any client): the conversation's whole
+  // pin list, replacing what this page had.
+  socket.on('conversation_pins_updated', ({ conversationId, pins, revision }) => {
+    setConversationPins(conversationId, pins, revision);
   });
   // REPLACE semantics for the whole set: the preview registry is relay-owned
   // and global, so every change ships the full list.

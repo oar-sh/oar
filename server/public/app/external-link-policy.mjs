@@ -57,7 +57,10 @@ export function installExternalLinkPolicy({ documentRef = document, onFallback =
   documentRef.addEventListener('click', (event) => {
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;
     const anchor = target?.closest?.('a[href]');
-    if (!anchor || isInAppLink(anchor)) return;
+    // A download link is left to the browser: opened in a new tab instead, it
+    // lost its `download` name, and a phone showed or saved the file under
+    // the plain name, next to (or instead of) an older copy.
+    if (!anchor || anchor.hasAttribute('download') || isInAppLink(anchor)) return;
     secureExternalLink(anchor, documentRef.baseURI, onFallback);
     if (!isExternalNavigationHref(anchor.getAttribute('href'), documentRef.baseURI)) return;
     if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;

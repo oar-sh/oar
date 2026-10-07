@@ -144,6 +144,22 @@ export function createSessionHistoryRefreshService({
         WHERE conversation_id = ? AND hidden_from_shares = 1
       `)
     : null;
+  // Pins are carried across the replace the same way as hidden marks.
+  const messagesSupportPins = messageColumns.has('pinned_at');
+  const listPinnedMessageMarks = messagesSupportPins
+    ? db.prepare(`
+        SELECT id, role, text, timestamp, pinned_at
+        FROM messages
+        WHERE conversation_id = ? AND pinned_at IS NOT NULL
+      `)
+    : null;
+  const restoreMessagePin = messagesSupportPins
+    ? db.prepare(`
+        UPDATE messages
+        SET pinned_at = ?
+        WHERE conversation_id = ? AND id = ?
+      `)
+    : null;
   const restoreHiddenMessageVisibility = messagesSupportShareVisibility
     ? db.prepare(`
         UPDATE messages
@@ -418,6 +434,7 @@ export function createSessionHistoryRefreshService({
 
   const replaceRetrievableHistoryTx = db.transaction((conversationId, messages = []) => {
     const hiddenMessages = listHiddenMessageVisibility?.all(conversationId) || [];
+    const pinnedMessages = listPinnedMessageMarks?.all(conversationId) || [];
     const attachmentCandidates = collectAttachmentCandidates(conversationId);
     deleteConversationMessages.run(conversationId);
     deleteConversationActivity.run(conversationId);
@@ -436,6 +453,13 @@ export function createSessionHistoryRefreshService({
         conversationId,
         resolvedId,
       );
+    }
+    // Its own consumed set: a message can be both hidden and pinned.
+    const consumedPinnedIds = new Set();
+    for (const pinnedMessage of pinnedMessages) {
+      const resolvedId = resolveHiddenMessageId(pinnedMessage, rebuiltMessages, consumedPinnedIds);
+      if (!resolvedId) continue;
+      restoreMessagePin.run(pinnedMessage.pinned_at, conversationId, resolvedId);
     }
   });
 

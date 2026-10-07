@@ -65,6 +65,17 @@ test('owner message payload retains shared visibility metadata', () => {
   assert.equal(messages[0]?.hiddenFromShares, true);
 });
 
+test('owner message payload says which messages are pinned', () => {
+  const messages = buildConversationMessages({
+    dbMessages: [
+      { id: 'kept', role: 'user', text: 'keep', pinned_at: '2026-01-01T00:05:00.000Z', timestamp: '2026-01-01T00:00:00.000Z' },
+      { id: 'plain', role: 'assistant', text: 'plain', pinned_at: null, timestamp: '2026-01-01T00:00:01.000Z' },
+    ],
+  });
+  assert.equal(messages.find((message) => message.id === 'kept')?.pinned, true);
+  assert.equal(messages.find((message) => message.id === 'plain')?.pinned, false);
+});
+
 test('a user message carries the reasoning effort its own queue row recorded', () => {
   const messages = buildConversationMessages({
     dbMessages: [
@@ -162,12 +173,14 @@ test('shared access status event is created only after a successful shared paylo
   assert.match(sharedRoute, /io\.emit\('shared_access', sharedAccess\.event\)/);
 });
 
-test('shared upload route handles stream errors explicitly', () => {
+test('shared attachment routes stream through the range-aware file server', () => {
+  // The helper owns stream errors, ranges (a shared video can seek) and the
+  // safe content headers; a share route no longer pipes a bare read stream.
   const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
-  assert.match(source, /const stream = fs\.createReadStream\(filePath\);/);
-  assert.match(source, /stream\.on\('error', \(\) => \{/);
-  assert.match(source, /res\.status\(500\)\.json\(\{ error: 'Failed to stream shared attachment' \}\);/);
+  assert.doesNotMatch(source, /fs\.createReadStream\(filePath\)/);
+  assert.match(source, /serveFileWithRangeSupport\(req, res, filePath, \{ contentType: file\.mime_type \}, \{[\s\S]*?cacheControl: SHARED_CONTENT_CACHE_CONTROL/);
+  assert.match(source, /serveFileWithRangeSupport\(req, res, filePath, \{ contentType: attachment\.type \}, \{[\s\S]*?cacheControl: SHARED_CONTENT_CACHE_CONTROL/);
 });
 
 test('an authenticated share revoke route exists and invalidates active shares (M2)', () => {
@@ -181,9 +194,11 @@ test('an authenticated share revoke route exists and invalidates active shares (
 test('shared attachment content is served with neutralized type + nosniff + sandbox CSP (H3)', () => {
   const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
-  // The shared (unauthenticated) upload + generated-image routes route through
-  // the safe-served-content helper instead of echoing the stored MIME inline.
-  assert.match(source, /applySafeServedContentHeaders\(res, file\.mime_type/);
-  assert.match(source, /applySafeServedContentHeaders\(res, attachment\.type\)/);
+  // The shared (unauthenticated) upload + generated-image routes hand the
+  // stored MIME to the file server, which applies the safe-served-content
+  // headers instead of echoing the type inline.
+  assert.match(source, /serveFileWithRangeSupport\(req, res, filePath, \{ contentType: file\.mime_type \}/);
+  assert.match(source, /serveFileWithRangeSupport\(req, res, filePath, \{ contentType: attachment\.type \}/);
+  assert.doesNotMatch(source, /applySafeServedContentHeaders/);
   assert.doesNotMatch(source, /res\.setHeader\('Content-Type', file\.mime_type \|\| 'application\/octet-stream'\)/);
 });

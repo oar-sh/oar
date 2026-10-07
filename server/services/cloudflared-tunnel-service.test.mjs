@@ -5,9 +5,12 @@ import path from 'node:path';
 
 import {
   createCloudflaredTunnelManager,
+  describeConfiguredTunnel,
+  describeMissingCloudflaredBinary,
+  describeTunnelState,
+  locateCloudflaredBinary,
   normalizeCloudflaredTunnelConfig,
   redactCloudflaredArgs,
-  resolveCloudflaredBinaryFromPackage,
 } from './cloudflared-tunnel-service.mjs';
 
 function createFakeChild() {
@@ -47,9 +50,11 @@ function createManager(overrides = {}) {
   const timers = overrides.timers || createFakeTimers();
   let now = overrides.startTime ?? 0;
   const manager = createCloudflaredTunnelManager({
-    tunnelConfig: { mode: 'managed', token: 'tok-abc', ...overrides.tunnelConfig },
+    tunnelConfig: { mode: 'managed', token: 'tok-abc', binary: '/opt/cloudflared', ...overrides.tunnelConfig },
     env: overrides.env || {},
-    resolveBinary: overrides.resolveBinary || (() => '/opt/cloudflared'),
+    // The binary is "installed" unless a test says otherwise; the host's PATH is never read.
+    locateBinary: overrides.locateBinary || ((binary) => binary),
+    pathImpl: path.posix,
     platform: overrides.platform || 'linux',
     runtimeShutdownRef: overrides.runtimeShutdownRef || (() => false),
     spawnImpl(command, args, options) {
@@ -67,7 +72,7 @@ function createManager(overrides = {}) {
 }
 
 test('normalizeCloudflaredTunnelConfig defaults to disabled', () => {
-  const normalized = normalizeCloudflaredTunnelConfig({}, { env: {}, resolveBinary: () => null });
+  const normalized = normalizeCloudflaredTunnelConfig({}, { env: {} });
   assert.equal(normalized.mode, 'disabled');
   assert.equal(normalized.enabled, false);
   assert.equal(normalized.valid, true);
@@ -80,30 +85,24 @@ test('normalizeCloudflaredTunnelConfig accepts a valid managed config', () => {
     required: true,
     token: 'tok-abc',
     extraArgs: ['--loglevel', 'debug', ''],
-  }, { env: {}, resolveBinary: () => '/opt/cloudflared' });
+  }, { env: {} });
   assert.equal(normalized.valid, true);
   assert.equal(normalized.enabled, true);
   assert.equal(normalized.required, true);
-  assert.equal(normalized.binary, '/opt/cloudflared');
-  assert.equal(normalized.binarySource, 'package');
+  assert.equal(normalized.binary, 'cloudflared');
+  assert.equal(normalized.binarySource, 'path');
   assert.deepEqual(normalized.extraArgs, ['--loglevel', 'debug']);
 });
 
 test('normalizeCloudflaredTunnelConfig reports a missing token in managed mode', () => {
-  const normalized = normalizeCloudflaredTunnelConfig({ mode: 'managed' }, {
-    env: {},
-    resolveBinary: () => '/opt/cloudflared',
-  });
+  const normalized = normalizeCloudflaredTunnelConfig({ mode: 'managed' }, { env: {} });
   assert.equal(normalized.valid, false);
   assert.equal(normalized.errors.length, 1);
   assert.match(normalized.errors[0], /token is required/);
 });
 
 test('normalizeCloudflaredTunnelConfig ignores a missing token when disabled', () => {
-  const normalized = normalizeCloudflaredTunnelConfig({ mode: 'disabled' }, {
-    env: {},
-    resolveBinary: () => null,
-  });
+  const normalized = normalizeCloudflaredTunnelConfig({ mode: 'disabled' }, { env: {} });
   assert.equal(normalized.valid, true);
   assert.deepEqual(normalized.errors, []);
 });
@@ -119,7 +118,6 @@ test('normalizeCloudflaredTunnelConfig lets env overrides beat file values', () 
       COPILOT_CLOUDFLARED_TOKEN: 'env-token',
       COPILOT_CLOUDFLARED_BINARY: 'env-binary',
     },
-    resolveBinary: () => '/opt/cloudflared',
   });
   assert.equal(normalized.mode, 'managed');
   assert.equal(normalized.token, 'env-token');
@@ -134,7 +132,6 @@ test('normalizeCloudflaredTunnelConfig resolves the binary config path first', (
     binary: './bin/cloudflared',
   }, {
     env: {},
-    resolveBinary: () => '/opt/cloudflared',
     configBaseDir: '/srv/relay',
     pathImpl: path.posix,
   });
@@ -149,7 +146,6 @@ test('normalizeCloudflaredTunnelConfig resolves a relative binary against the wi
     binary: '.\\bin\\cloudflared.exe',
   }, {
     env: {},
-    resolveBinary: () => null,
     configBaseDir: 'C:\\srv\\relay',
     pathImpl: path.win32,
   });
@@ -157,23 +153,170 @@ test('normalizeCloudflaredTunnelConfig resolves a relative binary against the wi
   assert.equal(normalized.binarySource, 'config');
 });
 
-test('normalizeCloudflaredTunnelConfig falls back to PATH when the package is absent', () => {
-  const normalized = normalizeCloudflaredTunnelConfig({ mode: 'managed', token: 'tok' }, {
-    env: {},
-    resolveBinary: () => null,
-  });
+test('normalizeCloudflaredTunnelConfig takes cloudflared from PATH when no binary is configured', () => {
+  const normalized = normalizeCloudflaredTunnelConfig({ mode: 'managed', token: 'tok' }, { env: {} });
   assert.equal(normalized.binary, 'cloudflared');
   assert.equal(normalized.binarySource, 'path');
   assert.equal(normalized.valid, true);
 });
 
-test('normalizeCloudflaredTunnelConfig survives a throwing binary resolver', () => {
-  const normalized = normalizeCloudflaredTunnelConfig({ mode: 'managed', token: 'tok' }, {
-    env: {},
-    resolveBinary: () => { throw new Error('module not found'); },
+// A fake disk: `files` are executable files, `plain` exist without the execute bit.
+function fakeFs({ files = [], plain = [] } = {}) {
+  return {
+    statSync(candidate) {
+      if (files.includes(candidate) || plain.includes(candidate)) return { isFile: () => true };
+      throw new Error('ENOENT');
+    },
+    accessSync(candidate) {
+      if (!files.includes(candidate)) throw new Error('EACCES');
+    },
+  };
+}
+
+test('locateCloudflaredBinary finds the name on PATH, first directory first', () => {
+  const located = locateCloudflaredBinary('cloudflared', {
+    platform: 'linux',
+    env: { PATH: '/home/dev/bin:/usr/local/bin:/usr/bin' },
+    fsImpl: fakeFs({ files: ['/usr/local/bin/cloudflared', '/usr/bin/cloudflared'] }),
   });
-  assert.equal(normalized.binary, 'cloudflared');
-  assert.equal(normalized.valid, true);
+  assert.equal(located, '/usr/local/bin/cloudflared');
+});
+
+test('locateCloudflaredBinary returns null when PATH has no cloudflared', () => {
+  const options = { platform: 'linux', fsImpl: fakeFs() };
+  assert.equal(locateCloudflaredBinary('cloudflared', { ...options, env: { PATH: '/usr/bin' } }), null);
+  assert.equal(locateCloudflaredBinary('cloudflared', { ...options, env: {} }), null);
+  assert.equal(locateCloudflaredBinary('', { ...options, env: { PATH: '/usr/bin' } }), null);
+});
+
+test('locateCloudflaredBinary skips a file that is not executable', () => {
+  const located = locateCloudflaredBinary('cloudflared', {
+    platform: 'linux',
+    env: { PATH: '/home/dev/bin:/usr/bin' },
+    fsImpl: fakeFs({ plain: ['/home/dev/bin/cloudflared'], files: ['/usr/bin/cloudflared'] }),
+  });
+  assert.equal(located, '/usr/bin/cloudflared');
+});
+
+test('locateCloudflaredBinary checks a configured path as it is, without PATH', () => {
+  const options = { platform: 'linux', env: { PATH: '/usr/bin' } };
+  assert.equal(
+    locateCloudflaredBinary('/opt/cloudflared', { ...options, fsImpl: fakeFs({ files: ['/opt/cloudflared'] }) }),
+    '/opt/cloudflared',
+  );
+  assert.equal(
+    locateCloudflaredBinary('/opt/cloudflared', { ...options, fsImpl: fakeFs({ plain: ['/opt/cloudflared'] }) }),
+    null,
+  );
+  assert.equal(
+    locateCloudflaredBinary('/opt/cloudflared', { ...options, fsImpl: fakeFs({ files: ['/usr/bin/cloudflared'] }) }),
+    null,
+  );
+});
+
+test('locateCloudflaredBinary adds the PATHEXT suffix on win32', () => {
+  const located = locateCloudflaredBinary('cloudflared', {
+    platform: 'win32',
+    env: { Path: 'C:\\Windows\\System32;C:\\Users\\dev\\bin', PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+    fsImpl: fakeFs({ plain: ['C:\\Users\\dev\\bin\\cloudflared.exe'] }), // win32: no execute bit to check
+  });
+  assert.equal(located, 'C:\\Users\\dev\\bin\\cloudflared.exe');
+});
+
+test('locateCloudflaredBinary ignores a batch launcher on win32', () => {
+  // A .cmd needs a shell to start; the tunnel is started without one.
+  const located = locateCloudflaredBinary('cloudflared', {
+    platform: 'win32',
+    env: { PATH: 'C:\\Users\\dev\\bin', PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+    fsImpl: fakeFs({ plain: ['C:\\Users\\dev\\bin\\cloudflared.cmd', 'C:\\Users\\dev\\bin\\cloudflared'] }), // win32
+  });
+  assert.equal(located, null);
+});
+
+test('locateCloudflaredBinary takes a configured win32 path with or without the suffix', () => {
+  const fsImpl = fakeFs({ plain: ['C:\\tools\\cloudflared.exe'] }); // win32
+  assert.equal(
+    locateCloudflaredBinary('C:\\tools\\cloudflared.exe', { platform: 'win32', env: {}, fsImpl }),
+    'C:\\tools\\cloudflared.exe', // win32
+  );
+  assert.equal(
+    locateCloudflaredBinary('C:\\tools\\cloudflared', { platform: 'win32', env: {}, fsImpl }),
+    'C:\\tools\\cloudflared.exe', // win32
+  );
+});
+
+test('describeMissingCloudflaredBinary names the install command of the platform', () => {
+  assert.equal(
+    describeMissingCloudflaredBinary({ binary: 'cloudflared', binarySource: 'path', platform: 'win32' }),
+    'cloudflared is not installed — install it with: winget install --id Cloudflare.cloudflared',
+  );
+  assert.equal(
+    describeMissingCloudflaredBinary({ binary: 'cloudflared', binarySource: 'path', platform: 'darwin' }),
+    'cloudflared is not installed — install it with: brew install cloudflared',
+  );
+  assert.equal(
+    describeMissingCloudflaredBinary({ binary: 'cloudflared', binarySource: 'path', platform: 'linux' }),
+    "cloudflared is not installed — install it from Cloudflare's package repository: https://pkg.cloudflare.com/",
+  );
+});
+
+test('describeMissingCloudflaredBinary names a configured binary that is not there', () => {
+  assert.equal(
+    describeMissingCloudflaredBinary({ binary: '/opt/cloudflared', binarySource: 'config', platform: 'darwin' }),
+    'cloudflared was not found as configured (/opt/cloudflared) — correct cloudflaredTunnel.binary, or install it with: brew install cloudflared',
+  );
+});
+
+test('describeTunnelState says off for no tunnel, a disabled one and a malformed state', () => {
+  for (const state of [null, undefined, 'managed', {}, { mode: 'disabled', connected: true }]) {
+    assert.equal(describeTunnelState(state), 'off');
+  }
+});
+
+test('describeTunnelState says running, with the address when the caller knows it', () => {
+  assert.equal(describeTunnelState({ mode: 'managed', connected: true }), 'running');
+  assert.equal(
+    describeTunnelState({ mode: 'managed', connected: true }, { url: 'https://relay.example.com/' }),
+    'running (https://relay.example.com/)',
+  );
+  assert.equal(describeTunnelState({ enabled: true, connected: true }), 'running');
+});
+
+test('describeTunnelState says why a tunnel that cannot start is off', () => {
+  const missing = describeMissingCloudflaredBinary({ binarySource: 'path', platform: 'darwin' });
+  assert.equal(
+    describeTunnelState({ mode: 'managed', connected: false, binaryMissing: true, lastError: missing }),
+    'off: cloudflared is not installed — install it with: brew install cloudflared',
+  );
+  assert.equal(
+    describeTunnelState({ mode: 'managed', enabled: false, valid: false, lastError: 'cloudflaredTunnel.token is required' }),
+    'off: cloudflaredTunnel.token is required',
+  );
+});
+
+test('describeTunnelState says not connected for a tunnel that is down or still starting', () => {
+  assert.equal(describeTunnelState({ mode: 'managed', connected: false }), 'not connected');
+  assert.equal(
+    describeTunnelState({ mode: 'managed', connected: false, lastError: 'auth-or-config' }),
+    'not connected (auth-or-config)',
+  );
+});
+
+test('describeConfiguredTunnel reports the tunnel from the config alone', () => {
+  const options = { env: {}, platform: 'linux', configBaseDir: '/srv/relay', pathImpl: path.posix };
+  const found = { ...options, locateBinary: () => '/usr/bin/cloudflared' };
+  const absent = { ...options, locateBinary: () => null };
+  assert.equal(describeConfiguredTunnel({}, absent), 'disabled');
+  assert.equal(describeConfiguredTunnel(undefined, absent), 'disabled');
+  assert.equal(
+    describeConfiguredTunnel({ mode: 'managed', token: 'tok' }, found),
+    'managed (cloudflared: /usr/bin/cloudflared)',
+  );
+  assert.equal(
+    describeConfiguredTunnel({ enabled: true, token: 'tok' }, absent),
+    "managed, cannot start: cloudflared is not installed — install it from Cloudflare's package repository: https://pkg.cloudflare.com/",
+  );
+  assert.match(describeConfiguredTunnel({ enabled: true }, found), /^managed, cannot start: cloudflaredTunnel\.token is required/);
 });
 
 test('redactCloudflaredArgs hides the tunnel token', () => {
@@ -197,7 +340,7 @@ test('manager never logs the raw tunnel token', () => {
   const manager = createCloudflaredTunnelManager({
     tunnelConfig: { mode: 'managed', token: 'super-secret-token' },
     env: {},
-    resolveBinary: () => '/opt/cloudflared',
+    locateBinary: () => '/opt/cloudflared',
     spawnImpl: () => createFakeChild(),
     setTimeoutImpl: (fn, ms) => ({ fn, ms, unref() {} }),
     clearTimeoutImpl: () => {},
@@ -359,28 +502,71 @@ test('manager emits status on process error', () => {
   assert.equal(ctx.emitted.at(-1).payload.lastError, 'ENOENT');
 });
 
-// `cloudflared` is an optionalDependency whose postinstall downloads a binary over
-// the network, so these must not depend on it actually being installed on the host.
-const fakeCloudflaredModule = { bin: '/opt/cloudflared/cloudflared' };
-
-test('resolveCloudflaredBinaryFromPackage ignores a not-yet-downloaded binary path', () => {
-  assert.equal(resolveCloudflaredBinaryFromPackage({
-    existsSync: () => false,
-    requireImpl: () => fakeCloudflaredModule,
-  }), null);
+test('manager does not start the tunnel when cloudflared is missing, and says how to install it', () => {
+  const ctx = createManager({ platform: 'darwin', tunnelConfig: { binary: '' }, locateBinary: () => null });
+  ctx.manager.start();
+  assert.equal(ctx.spawns.length, 0);
+  assert.equal(ctx.manager.state.binaryMissing, true);
+  assert.equal(ctx.manager.state.connected, false);
+  assert.equal(ctx.manager.state.blocking, false);
+  assert.equal(
+    ctx.manager.state.lastError,
+    'cloudflared is not installed — install it with: brew install cloudflared',
+  );
+  const status = ctx.emitted.at(-1);
+  assert.equal(status.event, 'cloudflared_tunnel_status');
+  assert.equal(status.payload.binaryMissing, true);
+  assert.equal(status.payload.lastError, ctx.manager.state.lastError);
 });
 
-test('resolveCloudflaredBinaryFromPackage returns the downloaded binary path', () => {
-  const resolved = resolveCloudflaredBinaryFromPackage({
-    existsSync: () => true,
-    requireImpl: () => fakeCloudflaredModule,
-  });
-  assert.equal(resolved, '/opt/cloudflared/cloudflared');
+test('manager names a configured binary that is not there', () => {
+  const ctx = createManager({ locateBinary: () => null });
+  ctx.manager.start();
+  assert.equal(ctx.spawns.length, 0);
+  assert.match(ctx.manager.state.lastError, /^cloudflared was not found as configured \(\/opt\/cloudflared\)/);
 });
 
-test('resolveCloudflaredBinaryFromPackage returns null when the package is not installed', () => {
-  assert.equal(resolveCloudflaredBinaryFromPackage({
-    existsSync: () => true,
-    requireImpl: () => { throw new Error("Cannot find module 'cloudflared'"); },
-  }), null);
+test('manager starts the tunnel once cloudflared is installed, without a restart', () => {
+  let installed = null;
+  const ctx = createManager({ tunnelConfig: { binary: '' }, locateBinary: () => installed });
+  ctx.manager.start();
+  const recheck = ctx.timers.timers.at(-1);
+  assert.equal(recheck.ms, 60000);
+
+  // Still missing: one more look later, no second status event, no spawn.
+  const eventsBefore = ctx.emitted.length;
+  recheck.fn();
+  assert.equal(ctx.spawns.length, 0);
+  assert.equal(ctx.emitted.length, eventsBefore);
+  assert.equal(recheck.cleared, true);
+
+  installed = '/usr/local/bin/cloudflared';
+  ctx.timers.timers.at(-1).fn();
+  assert.equal(ctx.spawns.length, 1);
+  assert.equal(ctx.spawns[0].command, '/usr/local/bin/cloudflared');
+  assert.equal(ctx.manager.state.binaryMissing, false);
+  assert.equal(ctx.manager.state.lastError, null);
+  assert.equal(ctx.emitted.at(-1).payload.binaryMissing, false);
+});
+
+test('manager keeps a required tunnel blocking while cloudflared is missing', () => {
+  const ctx = createManager({ tunnelConfig: { required: true }, locateBinary: () => null });
+  ctx.manager.start();
+  assert.equal(ctx.manager.state.blocking, true);
+  assert.equal(ctx.emitted.at(-1).payload.blocking, true);
+});
+
+test('manager stop ends the wait for a missing cloudflared', () => {
+  const ctx = createManager({ locateBinary: () => null });
+  ctx.manager.start();
+  const recheck = ctx.timers.timers.at(-1);
+  ctx.manager.stop();
+  assert.equal(recheck.cleared, true);
+});
+
+test('manager survives a locator that throws', () => {
+  const ctx = createManager({ locateBinary: () => { throw new Error('EPERM'); } });
+  ctx.manager.start();
+  assert.equal(ctx.spawns.length, 0);
+  assert.equal(ctx.manager.state.binaryMissing, true);
 });

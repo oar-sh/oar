@@ -83,7 +83,7 @@ serves every runtime without a Copilot CLI session attached.
 
 Run only one relay owner at a time:
 
-1. **Extension-managed mode**: the Copilot CLI extension (loaded into `gh copilot` by `oar`,
+1. **Extension-managed mode**: the Copilot CLI extension (loaded into `gh copilot` by `oar copilot`,
    `npm run copilot:relay`, or the global wrapper) starts and supervises `server.js --supervised`,
    and owns the relay worker WebSocket and fallback dequeue loop. `github`/`openai` turns run in
    Copilot sessions the server launches per conversation.
@@ -116,7 +116,7 @@ Do not restart the relay by killing processes; use `POST /api/relay/shutdown` in
   - `node server/server.js` — the attached supervisor respawns its worker child in the same terminal session
   - `node server/server.js --supervised` — the server exits 75 and the CLI extension relaunches it (bounded backoff, and it stops trying once the CLI session shuts down)
 
-The web UI's **🌄 Restart web relay** and `oar update` use the same endpoint.
+The web UI's **🌄 Restart web relay**, `oar stop`, `oar restart`, `oar update` and `oar setup` (after a changed token, port or access) use the same endpoint. The runtime a supervisor starts after a restart reads the config file again, so a new port or token applies; `oar` asks on the port and with the token the relay runs with, then waits for an answer on the new ones. A relay that `oar copilot` started carries its port and token on its command line and keeps them.
 
 ### Session mismatch recovery
 
@@ -132,7 +132,7 @@ npm link
 npm install -g .
 ```
 
-Run it from any folder to start the web relay server for that folder's workspace root, then immediately hand the shell to `gh copilot` without a bootstrap prompt. If a relay is already active, the command reuses it and still opens Copilot in the same shell.
+`oar copilot`, run from any folder, starts the web relay server for that folder's workspace root, then immediately hands the shell to `gh copilot` without a bootstrap prompt. If a relay already answers on the port, the command reuses it and still opens Copilot in the same shell. The other commands (`oar help`) are described in the README; in a checkout `oar start` and `oar service` refuse, and `oar setup`, `oar stop`, `oar restart`, `oar status` and `oar url` work on `server/config.json`.
 
 Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` (`~/.config/copilot-remote/logs` elsewhere) for git checkouts, or `~/.oar/logs` (`%APPDATA%\oar\logs`) for global installs, unless `COPILOT_WEB_RELAY_LOG_DIR` is set, so it stays out of the CLI terminal.
 
@@ -155,7 +155,7 @@ Recommended command:
 oar --install-extension
 ```
 
-This writes/updates `extension.mjs` in the user-global extension directory as a wrapper that imports the repository extension entrypoint directly. Plain `oar` does the same on every run unless you pass `--no-install-extension`.
+This writes/updates `extension.mjs` in the user-global extension directory as a wrapper that imports the repository extension entrypoint directly. `oar copilot` does the same on every run unless you pass `--no-install-extension`.
 The wrapper also avoids double-loading when you start Copilot from this repository itself, so the
 project-local extension remains the single runtime owner in repo-root sessions.
 
@@ -175,8 +175,8 @@ If the same extension is available both project-local (`.github/extensions/web-r
 ### Roadmap for later launcher modes
 
 1. **Option 2**: launch/attach a Copilot CLI session directly.
-2. **Option 3**: support `oar -- [gh copilot args]` pass-through. *Shipped:* `oar -- <args>` runs
-   `gh copilot -- <args>`.
+2. **Option 3**: support `oar -- [gh copilot args]` pass-through. *Shipped:* `oar copilot -- <args>`
+   (or `oar -- <args>`) runs `gh copilot -- <args>`.
 3. **Session resume**: add `--session-id=<...>` handoff once the session orchestration contract is defined.
 
 ### API overview
@@ -195,6 +195,7 @@ Common routes:
 - Cursor worker: `/api/cursor-agent-id`, `/api/cursor-context-usage`, `/api/cursor-plan-usage`
 - Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
+- Pinned messages: `/api/conversation/:id/message/:messageId/pin`
 - Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
 - Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`, `/api/git/remote` (the New Chat modal of a Claude Cloud chat)
@@ -273,7 +274,7 @@ gh copilot
 or:
 
 ```bash
-oar
+oar copilot
 ```
 
 ## Worker debugging
@@ -716,9 +717,9 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **4715 pass / 0 fail / 0 skip on Linux (0.9.8, 2026-10-04)** — the count
+Expected: **0 fail** everywhere; **4931 pass / 0 fail / 0 skip on Linux (0.9.9, 2026-10-07)** — the count
 grows with every change, so treat it as a floor. Windows runs the same suite with **4 skips** that are host-gated
-(0600 file modes, symlinks) and run on Linux (0.9.6: **4031 pass / 0 fail / 4 skip**).
+(0600 file modes, symlinks) and run on Linux (0.9.9: **4927 pass / 0 fail / 4 skip**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns
@@ -746,8 +747,8 @@ node --test server/services/context-usage-view.test.mjs
 npm run test:e2e
 ```
 
-Expected: **168 passed / 0 failed / 6 skipped on Linux (0.9.6, 2026-09-29)**, and 170 passed / 4 skipped on
-Windows (the skipped ones are host-gated). Two question-card
+Expected: **224 passed / 0 failed / 6 skipped on Linux (0.9.9, 2026-10-07)**, and 201 passed / 29 skipped on
+Windows (the skipped ones are host-gated; 24 of them are the Claude Cloud specs, which run only on Linux). Two question-card
 tests in `relay-question-ui.spec.mjs` (`:82` and `:386`) are **known flaky** and usually pass on
 Playwright's single retry; across five full runs they failed 0–2 times each with no relation to what
 else was in the suite. Treat a failure there as flake only after re-running — anything else failing

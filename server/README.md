@@ -658,6 +658,24 @@ images, calling the OpenAI Images API directly rather than going through a CLI w
   is never silently lost.
 - `POST /api/shared/:token/presence` tracks shared-viewer presence, surfaced as a watcher count.
 
+## Pinned messages
+
+- `PATCH /api/conversation/:id/message/:messageId/pin` with `{ pinned: boolean }` sets or clears
+  `messages.pinned_at`. A conversation holds at most 100 pins; the next one is refused with `409`
+  and `code: "pin-limit"`. The answer is
+  `{ ok, conversationId, messageId, pinned, pins, pinsRevision }`.
+- `GET /api/conversation/:id` carries `pins`: every pinned message of the conversation in
+  conversation order, also those outside the requested history page, each as
+  `{ messageId, role, preview, timestamp, pinnedAt, attachmentCount, hiddenFromShares }`.
+  `preview` is plain text of at most 160 characters. Each message also carries `pinned`.
+- Every change is broadcast as the socket event `conversation_pins_updated` with
+  `{ conversationId, pins, revision }`. `revision` (`pinsRevision` in the HTTP answers) grows with
+  every change. A conversation load that left the relay before a change can reach the browser
+  after the change's own event; the browser keeps the list with the higher revision.
+- Shared views carry neither `pins` nor `pinned`: pins are the owner's bookmarks.
+- Pins belong to message rows. `/compact` starts a new conversation without them (they stay with
+  the archived one); re-importing an imported session keeps them, matched like hidden marks.
+
 ## Relay Mode Selection
 
 The composer also includes a per-message mode picker:
@@ -973,6 +991,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run for the active turn |
 | POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Request cancellation of one subagent run (unsupported by the Claude runtime) |
 | PATCH | `/api/conversation/:id/message/:messageId/share-visibility` | Hide or unhide a single message from shared views |
+| PATCH | `/api/conversation/:id/message/:messageId/pin` | `{ pinned }` → pin or unpin a single message; answers with the conversation's pin list and broadcasts `conversation_pins_updated` |
 | POST | `/api/conversation/:id/share` | Create or update the conversation's read-only share token |
 | GET | `/api/shared/:token` | Read-only shared conversation view (hidden messages filtered out) |
 | POST | `/api/shared/:token/presence` | Report shared-viewer presence for the watcher count |
@@ -1381,7 +1400,7 @@ service).
 | `cloudflaredTunnel.enabled` | `false` | Legacy alias for mode (`true` => `managed`) |
 | `cloudflaredTunnel.required` | `false` | Pause dequeue when the Cloudflare tunnel is disconnected in managed mode |
 | `cloudflaredTunnel.token` | — | Tunnel token from the router panel (never logged) |
-| `cloudflaredTunnel.binary` | *(auto)* | `cloudflared` path; falls back to the optional npm package, then `PATH` |
+| `cloudflaredTunnel.binary` | `cloudflared` | Path or command name of the `cloudflared` you installed (OAR ships none); defaults to `cloudflared` on `PATH`. Without one the tunnel stays off and the status says how to install it |
 | `cloudflaredTunnel.extraArgs` | `[]` | Extra arguments appended to `cloudflared tunnel run` |
 | `tunnelMarkerHeaders` | `[]` | Extra edge-injected header names that mark tunnel traffic for the session-worker path guard |
 

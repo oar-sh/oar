@@ -49,9 +49,21 @@ import {
   copyReferenceTokenToClipboard,
   eventClosest,
 } from './router.js';
+import { buildDownloadLink } from './file-version.mjs';
 import { markdownHeadingId, resolveFilePreviewLink } from './file-preview-navigation.mjs';
 import { openExternalNavigation } from './external-link-policy.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
+import { createControlsState } from './viewer-controls-state.mjs';
+import { createTapRecognizer } from './viewer-tap.mjs';
+import { createSwipeRecognizer } from './viewer-gestures.mjs';
+import { createViewerHistory } from './viewer-history.mjs';
+import {
+  galleryAt,
+  galleryFromFolder,
+  galleryNeighborIndex,
+  galleryNeighbors,
+  galleryPositionLabel,
+} from './viewer-gallery.mjs';
 import {
   deepestExistingAncestor,
   planRepoRehydration,
@@ -75,6 +87,15 @@ function currentConversationId() {
 function isVideoMimeType(mimeType) {
   return String(mimeType || '').toLowerCase().startsWith('video/');
 }
+
+function isAudioMimeType(mimeType) {
+  return String(mimeType || '').toLowerCase().startsWith('audio/');
+}
+
+// Kinds whose bytes arrive as text in the preview payload and read in a
+// column; the others are shown edge to edge on black, or as a card.
+const TEXT_PREVIEW_KINDS = new Set(['markdown', 'code', 'text']);
+const DARK_PREVIEW_KINDS = new Set(['image', 'video', 'audio']);
 
 function normalizeVideoPreviewOptions(options = {}) {
   const startSeconds = Math.max(0, Number(options?.startSeconds ?? options?.startAtSeconds ?? 0) || 0);
@@ -195,17 +216,18 @@ export function renderAttachmentMarkup(attachments, { messageId = '' } = {}) {
               : ''}
           </div>`
         : '';
-      if ((isImage || isVideo) && rawUrl) {
-        const jsName = escHtml(JSON.stringify(att?.name || 'attachment'));
-        const jsUrl = escHtml(JSON.stringify(rawUrl));
-        const jsType = escHtml(JSON.stringify(att?.type || 'image/jpeg'));
-        const openHandler = `openUploadedAttachmentViewer(${jsName},${jsUrl},${jsType})`;
+      const isAudio = isAudioMimeType(att?.type);
+      if ((isImage || isVideo || isAudio) && rawUrl) {
+        // Opened by the conversation's click handler (see
+        // viewer-chat-gallery.mjs), which also finds the other media around it.
+        const mediaKind = isVideo ? 'video' : (isAudio ? 'audio' : 'image');
+        const chip = isVideo ? '🎞️' : '🎵';
         return `
-          <div class="msg-attachment msg-attachment-${isVideo ? 'video' : 'image'}">
-            ${isVideo
-              ? `<div class="msg-attachment-video-chip">🎞️</div>`
-              : `<img src="${escHtml(rawUrl)}" alt="${name}" loading="eager" decoding="async" onclick="${openHandler}">`}
-            <div class="msg-attachment-meta"><a href="#" onclick="${openHandler};return false;">${name}</a> · ${type}${sizeText} · <a href="#" onclick="${openHandler};return false;">open</a>${continuityActions}</div>
+          <div class="msg-attachment msg-attachment-${mediaKind}" data-media-name="${name}" data-media-url="${escHtml(rawUrl)}" data-media-type="${escHtml(att?.type || 'image/jpeg')}">
+            ${isImage
+              ? `<img src="${escHtml(rawUrl)}" alt="${name}" loading="eager" decoding="async">`
+              : `<div class="msg-attachment-video-chip">${chip}</div>`}
+            <div class="msg-attachment-meta"><a href="#" data-media-open>${name}</a> · ${type}${sizeText} · <a href="#" data-media-open>open</a>${continuityActions}</div>
           </div>`;
       }
       if (rawUrl) {
@@ -610,8 +632,10 @@ function updateFilePreviewUiState() {
   const payload = filePreviewState.payload;
   const isMarkdown = payload?.kind === 'markdown';
   const isUpload = filePreviewState.source === 'upload';
-  previewBtn.style.display = isUpload ? 'none' : '';
-  rawBtn.style.display = isUpload ? 'none' : '';
+  // Preview/Raw only mean something for text; media has no raw form to show.
+  const hasTextModes = !isUpload && TEXT_PREVIEW_KINDS.has(payload?.kind);
+  previewBtn.style.display = hasTextModes ? '' : 'none';
+  rawBtn.style.display = hasTextModes ? '' : 'none';
   previewBtn.classList.toggle('active', filePreviewState.mode === 'preview');
   rawBtn.classList.toggle('active', filePreviewState.mode === 'raw');
   htmlBtn.style.display = (!isUpload && isMarkdown && filePreviewState.mode === 'preview') ? 'inline-block' : 'none';
@@ -625,6 +649,14 @@ function updateFilePreviewUiState() {
   if (annotateBtn) annotateBtn.hidden = !filePreviewSupportsAnnotation();
   const copyBtn = document.getElementById('file-preview-copy-btn');
   if (copyBtn) copyBtn.hidden = payload?.kind !== 'image';
+  const gallery = filePreviewState.gallery;
+  const bottomChrome = document.getElementById('file-preview-chrome-bottom');
+  if (bottomChrome) {
+    bottomChrome.hidden = !gallery;
+    document.getElementById('file-preview-position').textContent = galleryPositionLabel(gallery);
+    document.getElementById('file-preview-prev').disabled = galleryNeighborIndex(gallery, -1) === -1;
+    document.getElementById('file-preview-next').disabled = galleryNeighborIndex(gallery, 1) === -1;
+  }
 }
 
 /**
@@ -681,6 +713,7 @@ function snapshotFilePreviewState() {
     error: filePreviewState.error,
     payload: filePreviewState.payload,
     viewerOptions: filePreviewState.viewerOptions,
+    gallery: filePreviewState.gallery,
     scrollTop: Number(bodyEl?.scrollTop || 0),
   };
 }
@@ -728,25 +761,92 @@ function teardownImageZoom() {
   if (bodyEl) bodyEl.classList.remove('image-zoom-mode');
 }
 
-function teardownVideoPreview() {
-  const video = videoPreview.videoEl;
-  const onLoadedMetadata = videoPreview.onLoadedMetadata;
-  const onError = videoPreview.onError;
-  const onCanPlay = videoPreview.onCanPlay;
-  if (video) {
-    if (onLoadedMetadata) video.removeEventListener('loadedmetadata', onLoadedMetadata);
-    if (onError) video.removeEventListener('error', onError);
-    if (onCanPlay) video.removeEventListener('canplay', onCanPlay);
+function teardownMediaPreview() {
+  const media = mediaPreview.el;
+  if (media) {
+    for (const [eventName, handler] of mediaPreview.listeners) media.removeEventListener(eventName, handler);
     try {
-      video.pause();
+      media.pause();
     } catch {}
   }
-  videoPreview.videoEl = null;
-  videoPreview.onLoadedMetadata = null;
-  videoPreview.onError = null;
-  videoPreview.onCanPlay = null;
+  mediaPreview.el = null;
+  mediaPreview.listeners = [];
+  viewerControls.setPlaying(false);
   const bodyEl = document.getElementById('file-preview-body');
-  if (bodyEl) bodyEl.classList.remove('video-preview-mode');
+  if (bodyEl) bodyEl.classList.remove('video-preview-mode', 'audio-preview-mode', 'card-preview-mode');
+}
+
+function listenMediaPreview(media, eventName, handler, options) {
+  media.addEventListener(eventName, handler, options);
+  mediaPreview.listeners.push([eventName, handler]);
+}
+
+// The hovering controls fade while a file plays; the player's own events
+// drive that, so a pause from the native controls brings them back.
+function followMediaPlayback(media) {
+  listenMediaPreview(media, 'play', () => viewerControls.setPlaying(true));
+  listenMediaPreview(media, 'pause', () => viewerControls.setPlaying(false));
+  listenMediaPreview(media, 'ended', () => viewerControls.setPlaying(false));
+}
+
+const viewerControls = createControlsState({
+  onChange: (visible) => {
+    document.getElementById('file-preview-modal')?.classList.toggle('controls-hidden', !visible);
+  },
+});
+const viewerTap = createTapRecognizer({
+  onTap: () => viewerControls.toggle(),
+  hasSelection: () => String(window.getSelection?.()?.toString() || '').length > 0,
+});
+
+/** The chrome's height goes into a CSS variable so text starts below it. */
+function syncViewerChromeHeight() {
+  const modal = document.getElementById('file-preview-modal');
+  const chromeTop = document.getElementById('file-preview-chrome-top');
+  if (!modal || !chromeTop || !modal.classList.contains('visible')) return;
+  modal.style.setProperty('--file-viewer-chrome-top', `${Math.ceil(chromeTop.getBoundingClientRect().height)}px`);
+}
+
+function showFilePreviewModal() {
+  const modal = document.getElementById('file-preview-modal');
+  const wasVisible = modal.classList.contains('visible');
+  modal.classList.add('visible');
+  modal.setAttribute('aria-hidden', 'false');
+  if (!wasVisible) {
+    viewerControls.reset();
+    viewerTap.cancel();
+    viewerHistory.opened();
+    // The composer keeps the keyboard otherwise: keys would type into it
+    // under the viewer instead of moving through the gallery.
+    const active = document.activeElement;
+    if (active && active !== document.body && !modal.contains(active)) active.blur?.();
+  }
+}
+
+const viewerHistory = createViewerHistory({
+  history: window.history,
+  onBack: () => closeFilePreview(),
+});
+window.addEventListener('popstate', () => viewerHistory.onPopState());
+
+function setViewerMediaMode(kind) {
+  document.getElementById('file-preview-modal')?.classList.toggle('media-mode', DARK_PREVIEW_KINDS.has(kind));
+}
+
+function fileCardMarkup({ icon, name, meta, actions }) {
+  return `
+    <div class="file-preview-card">
+      <div class="file-preview-card-icon">${icon}</div>
+      <div class="file-preview-card-name">${escHtml(name)}</div>
+      ${meta ? `<div class="file-preview-card-meta">${escHtml(meta)}</div>` : ''}
+      <div class="file-preview-card-actions">${actions}</div>
+    </div>`;
+}
+
+function downloadAnchorMarkup(download, plainName) {
+  const href = String(download?.href || '');
+  if (!href) return '';
+  return `<a class="file-preview-btn" href="${escHtml(href)}" download="${escHtml(download.downloadName || plainName)}">Download</a>`;
 }
 
 function setupImageZoom(container) {
@@ -798,11 +898,9 @@ let imgZoom = {
   baseW: 0,
   baseH: 0,
 };
-let videoPreview = {
-  videoEl: null,
-  onLoadedMetadata: null,
-  onError: null,
-  onCanPlay: null,
+let mediaPreview = {
+  el: null,
+  listeners: [],
 };
 const IMG_ZOOM_MIN_FLOOR = 0.05;
 const IMG_ZOOM_MAX = 8;
@@ -810,6 +908,11 @@ const IMG_ZOOM_EPS = 0.001;
 
 function _isAtImgZoomMin() {
   return Math.abs(imgZoom.scale - imgZoom.minScale) <= IMG_ZOOM_EPS;
+}
+
+/** True unless an image is zoomed in, when a sideways drag pans it instead. */
+function imageZoomAtRest() {
+  return !imgZoom.container || _isAtImgZoomMin();
 }
 
 /**
@@ -1084,10 +1187,19 @@ function _imgZoomOnResize() {
   _recomputeImgZoomMinScale({ resetToMin: _isAtImgZoomMin() });
 }
 
+function uploadPreviewKind(mimeType) {
+  const type = String(mimeType || '').toLowerCase();
+  if (type.startsWith('image/')) return 'image';
+  if (isVideoMimeType(type)) return 'video';
+  if (isAudioMimeType(type)) return 'audio';
+  if (type === 'application/pdf') return 'pdf';
+  return 'binary';
+}
+
 export function openUploadedAttachmentViewer(name, contentUrl, mimeType, options = {}) {
-  const isImage = String(mimeType || '').startsWith('image/');
-  const isVideo = isVideoMimeType(mimeType);
   const viewerOptions = normalizeVideoPreviewOptions(options);
+  filePreviewLoadSeq += 1;
+  filePreviewHistory.length = 0;
   setFilePreviewState({
     path: String(name || 'attachment'),
     source: 'upload',
@@ -1096,18 +1208,34 @@ export function openUploadedAttachmentViewer(name, contentUrl, mimeType, options
     loading: false,
     error: '',
     viewerOptions,
+    gallery: options?.gallery || null,
     payload: {
-      kind: isImage ? 'image' : (isVideo ? 'video' : 'binary'),
+      kind: uploadPreviewKind(mimeType),
       name: String(name || 'attachment'),
       rawUrl: String(contentUrl || ''),
       size: 0,
       contentType: String(mimeType || '').toLowerCase(),
     },
   });
-  const modal = document.getElementById('file-preview-modal');
-  modal.classList.add('visible');
-  modal.setAttribute('aria-hidden', 'false');
+  showFilePreviewModal();
   renderFilePreview();
+  prefetchGalleryNeighbors();
+}
+
+/**
+ * Open one item of a gallery: an uploaded attachment by its address, a
+ * drive or workspace file by its path. The gallery rides along so the
+ * viewer can move on from there.
+ */
+export function openGalleryItem(item, gallery) {
+  if (!item) return Promise.resolve(false);
+  const source = item.source || gallery?.source || 'workspace';
+  if (source === 'upload') {
+    openUploadedAttachmentViewer(item.name, item.href, item.mime, { gallery });
+    return Promise.resolve(true);
+  }
+  const open = source === 'workspace' ? openWorkspaceFilePreview : openDriveFilePreview;
+  return open(item.path, { gallery, viaGallery: true }).then((opened) => Boolean(opened));
 }
 
 export function setFilePreviewMode(mode) {
@@ -1123,25 +1251,38 @@ export function toggleFilePreviewHtml() {
   renderFilePreview();
 }
 
+/** The address the browser fetches a previewed file's bytes from. */
+function previewRawHref(source, path, payload) {
+  if (source === 'drives' || source === 'session') return driveFileHrefFromPath(path, payload?.version);
+  if (source === 'upload') return String(payload?.rawUrl || '');
+  return `${BASE}/api/files/${String(path || '').split('/').map((s) => encodeURIComponent(s)).join('/')}${currentWorkspaceScopeSuffix()}`;
+}
+
 export function renderFilePreview() {
   teardownImageZoom();
-  teardownVideoPreview();
+  teardownMediaPreview();
+  viewerTap.cancel();
+  setViewerMediaMode(filePreviewState.payload?.kind);
+  requestAnimationFrame(syncViewerChromeHeight);
   const titleEl = document.getElementById('file-preview-title');
   const metaEl = document.getElementById('file-preview-meta');
   const bodyEl = document.getElementById('file-preview-body');
   const rawLink = document.getElementById('file-preview-open-raw');
   const payload = filePreviewState.payload;
-  const rawHref = filePreviewState.source === 'drives'
-    || filePreviewState.source === 'session'
-    ? driveFileHrefFromPath(filePreviewState.path)
-    : filePreviewState.source === 'upload'
-      ? String(payload?.rawUrl || '')
-      : `${BASE}/api/files/${filePreviewState.path.split('/').map((s) => encodeURIComponent(s)).join('/')}${currentWorkspaceScopeSuffix()}`;
-  rawLink.href = rawHref || '#';
+  const rawHref = previewRawHref(filePreviewState.source, filePreviewState.path, payload);
   const fallbackName = String(filePreviewState.path || '').split('/').filter(Boolean).pop() || 'download';
-  rawLink.setAttribute('download', String(payload?.name || fallbackName));
+  const plainName = String(payload?.name || fallbackName);
+  // An upload is addressed by its content and never changes; a file on disk
+  // does, so its link and the name it is saved under carry its version.
+  const download = filePreviewState.source === 'upload'
+    ? { href: rawHref, downloadName: plainName }
+    : buildDownloadLink({ href: rawHref, name: plainName, version: payload?.version, mtimeMs: payload?.mtimeMs });
+  rawLink.href = download.href || '#';
+  rawLink.setAttribute('download', download.downloadName || plainName);
   rawLink.textContent = 'Download';
-  rawLink.setAttribute('title', 'Download file');
+  rawLink.setAttribute('title', download.downloadName && download.downloadName !== plainName
+    ? `Download as ${download.downloadName}`
+    : 'Download file');
 
   const titlePath = filePreviewState.path || '';
   titleEl.textContent = titlePath || 'File preview';
@@ -1178,8 +1319,56 @@ export function renderFilePreview() {
   const truncatedLabel = payload.truncated ? ` · truncated to ${formatBytes(FILE_PREVIEW_MAX_BYTES)}` : '';
   metaEl.textContent = `${kindLabel}${langLabel} · ${formatBytes(payload.size || 0)}${truncatedLabel}`;
 
+  const cardMeta = payload.size > 0 ? formatBytes(payload.size) : '';
+
   if (payload.kind === 'binary') {
-    bodyEl.innerHTML = '<div class="file-preview-note">Binary file preview is not shown. Use <b>Download</b> to save the file.</div>';
+    bodyEl.innerHTML = fileCardMarkup({
+      icon: '📦',
+      name: plainName,
+      meta: cardMeta ? `${cardMeta} · no inline preview` : 'no inline preview',
+      actions: downloadAnchorMarkup(download, plainName),
+    });
+    bodyEl.classList.add('card-preview-mode');
+    return;
+  }
+
+  if (payload.kind === 'pdf') {
+    // The browser's own PDF viewer takes it in a new tab; the plain address
+    // (no `as=` name) keeps the answer inline there.
+    const inlineHref = String(rawHref || payload.rawUrl || '');
+    bodyEl.innerHTML = fileCardMarkup({
+      icon: '📄',
+      name: plainName,
+      meta: cardMeta ? `PDF · ${cardMeta}` : 'PDF',
+      actions: `${inlineHref ? `<button type="button" class="file-preview-btn" data-viewer-open-tab="${escHtml(inlineHref)}">Open in new tab</button>` : ''}${downloadAnchorMarkup(download, plainName)}`,
+    });
+    bodyEl.classList.add('card-preview-mode');
+    return;
+  }
+
+  if (payload.kind === 'audio') {
+    const audioHref = String(rawHref || payload.rawUrl || '');
+    bodyEl.innerHTML = `
+      <div class="file-preview-audio-shell">
+        ${fileCardMarkup({
+          icon: '🎵',
+          name: plainName,
+          meta: cardMeta,
+          actions: audioHref ? `<audio class="file-preview-audio" controls preload="metadata" src="${escHtml(audioHref)}"></audio>` : '<span class="file-preview-note">Audio preview unavailable.</span>',
+        })}
+      </div>`;
+    bodyEl.classList.add('audio-preview-mode');
+    const audio = bodyEl.querySelector('audio');
+    if (audio) {
+      mediaPreview.el = audio;
+      listenMediaPreview(audio, 'error', () => {
+        const note = document.createElement('div');
+        note.className = 'file-preview-note';
+        note.innerHTML = 'Audio preview unavailable. Use <b>Download</b> to save the file.';
+        audio.replaceWith(note);
+      }, { once: true });
+      followMediaPlayback(audio);
+    }
     return;
   }
 
@@ -1197,13 +1386,6 @@ export function renderFilePreview() {
     return;
   }
 
-  if (filePreviewState.mode === 'raw') {
-    bodyEl.innerHTML = payload.kind === 'video'
-      ? '<div class="file-preview-note">Video files are binary. Use <b>Download</b> to save the file.</div>'
-      : `<div class="file-preview-code"><pre><code>${escHtml(String(payload.content || ''))}</code></pre></div>`;
-    return;
-  }
-
   if (payload.kind === 'video') {
     const videoHref = String(rawHref || payload.rawUrl || '');
     const viewerOptions = filePreviewState.viewerOptions || {};
@@ -1214,35 +1396,30 @@ export function renderFilePreview() {
       bodyEl.innerHTML = `
         <div class="file-preview-video-shell" data-start-seconds="${escHtml(String(startSeconds))}" data-preload="${escHtml(preload)}">
           <video class="file-preview-video" controls playsinline preload="${escHtml(preload)}" src="${escHtml(videoHref)}"></video>
-          <div class="file-preview-note">${startSeconds > 0 ? `Will start at ${startSeconds.toFixed(2)}s.` : 'Video preview ready.'} ${preload === 'auto' ? 'Preloading enabled.' : 'Metadata preload enabled.'}</div>
         </div>`;
       bodyEl.classList.add('video-preview-mode');
       const shell = bodyEl.querySelector('.file-preview-video-shell');
       const video = shell?.querySelector('video');
       if (video) {
-        videoPreview.videoEl = video;
-        videoPreview.onLoadedMetadata = () => {
+        mediaPreview.el = video;
+        const tryPlay = () => {
+          const playPromise = video.play?.();
+          if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(() => {});
+          }
+        };
+        listenMediaPreview(video, 'loadedmetadata', () => {
           if (startSeconds > 0 && Number.isFinite(video.duration) && video.duration > startSeconds) {
             try {
               video.currentTime = startSeconds;
             } catch {}
           }
-          if (autoplay) {
-            const playPromise = video.play?.();
-            if (playPromise && typeof playPromise.catch === 'function') {
-              playPromise.catch(() => {});
-            }
-          }
-        };
-        videoPreview.onCanPlay = () => {
-          if (autoplay && video.paused) {
-            const playPromise = video.play?.();
-            if (playPromise && typeof playPromise.catch === 'function') {
-              playPromise.catch(() => {});
-            }
-          }
-        };
-        videoPreview.onError = () => {
+          if (autoplay) tryPlay();
+        }, { once: true });
+        listenMediaPreview(video, 'canplay', () => {
+          if (autoplay && video.paused) tryPlay();
+        });
+        listenMediaPreview(video, 'error', () => {
           let errorNote = bodyEl.querySelector('.file-preview-video-error');
           if (!errorNote) {
             errorNote = document.createElement('div');
@@ -1250,18 +1427,21 @@ export function renderFilePreview() {
             bodyEl.appendChild(errorNote);
           }
           errorNote.innerHTML = 'Video preview unavailable. Use <b>Download</b> to save the file.';
-        };
-        video.addEventListener('loadedmetadata', videoPreview.onLoadedMetadata, { once: true });
-        video.addEventListener('canplay', videoPreview.onCanPlay);
-        video.addEventListener('error', videoPreview.onError, { once: true });
+        }, { once: true });
+        followMediaPlayback(video);
       }
     } else {
       bodyEl.innerHTML = '<div class="file-preview-note">Video preview unavailable.</div>';
     }
     return;
   }
- 
+
   const rawText = String(payload.content || '');
+
+  if (filePreviewState.mode === 'raw') {
+    bodyEl.innerHTML = `<div class="file-preview-code"><pre><code>${escHtml(rawText)}</code></pre></div>`;
+    return;
+  }
 
   if (payload.kind === 'markdown') {
     const html = renderMarkdownPreview(rawText, filePreviewState.allowHtml);
@@ -1285,92 +1465,173 @@ export function renderFilePreview() {
   attachCodeCopyButtons(bodyEl);
 }
 
-export async function openWorkspaceFilePreview(rawPath, options = {}) {
-  const normalized = normalizeWorkspaceMentionPath(rawPath);
-  if (!normalized) return;
+// Two files asked for in a row (a quick swipe, say) must not race: only the
+// answer to the latest request is shown.
+let filePreviewLoadSeq = 0;
+
+async function openFilePreviewFromSource(source, normalized, options, fetchPayload) {
   const viewerOptions = { ...normalizeVideoPreviewOptions(options), fragment: String(options?.fragment || '') };
   if (!options?.fromViewerLink) filePreviewHistory.length = 0;
+  const seq = ++filePreviewLoadSeq;
   setFilePreviewState({
     path: normalized,
-    source: 'workspace',
+    source,
     mode: 'preview',
     allowHtml: true,
     loading: true,
     error: '',
     payload: null,
     viewerOptions,
+    gallery: options?.gallery || null,
   });
-  const modal = document.getElementById('file-preview-modal');
-  modal.classList.add('visible');
-  modal.setAttribute('aria-hidden', 'false');
+  showFilePreviewModal();
   renderFilePreview();
 
-  const payload = await loadWorkspaceFilePreview(normalized, currentConversationId());
+  // A step through the gallery takes the neighbour fetched ahead of time.
+  const cached = options?.viaGallery ? galleryPayloadCache.get(galleryCacheKey(source, normalized)) : null;
+  const payload = await (cached || fetchPayload());
+  if (seq !== filePreviewLoadSeq) return false;
   if (!payload || payload.error) {
     filePreviewState.loading = false;
-    filePreviewState.error = payload?.error || 'Failed to load file preview';
+    filePreviewState.error = payload?.error || `Failed to load ${source === 'workspace' ? '' : 'drive '}file preview`;
     renderFilePreview();
     return false;
   }
+  rememberGalleryPayload(source, normalized, payload);
   filePreviewState.loading = false;
   filePreviewState.payload = payload;
   filePreviewState.path = String(payload.path || normalized);
+  filePreviewState.source = source;
   filePreviewState.viewerOptions = viewerOptions;
   renderFilePreview();
+  prefetchGalleryNeighbors();
   return true;
+}
+
+export async function openWorkspaceFilePreview(rawPath, options = {}) {
+  const normalized = normalizeWorkspaceMentionPath(rawPath);
+  if (!normalized) return;
+  return openFilePreviewFromSource('workspace', normalized, options,
+    () => loadWorkspaceFilePreview(normalized, currentConversationId()));
 }
 
 export async function openDriveFilePreview(rawPath, options = {}) {
   const normalized = normalizeDriveBrowserPath(rawPath);
   if (!normalized) return;
-  const viewerOptions = { ...normalizeVideoPreviewOptions(options), fragment: String(options?.fragment || '') };
-  if (!options?.fromViewerLink) filePreviewHistory.length = 0;
-  setFilePreviewState({
-    path: normalized,
-    source: 'drives',
-    mode: 'preview',
-    allowHtml: true,
-    loading: true,
-    error: '',
-    payload: null,
-    viewerOptions,
-  });
-  const modal = document.getElementById('file-preview-modal');
-  modal.classList.add('visible');
-  modal.setAttribute('aria-hidden', 'false');
-  renderFilePreview();
+  return openFilePreviewFromSource('drives', normalized, options, () => loadDriveFilePreview(normalized));
+}
 
-  const payload = await loadDriveFilePreview(normalized);
-  if (!payload || payload.error) {
-    filePreviewState.loading = false;
-    filePreviewState.error = payload?.error || 'Failed to load drive file preview';
-    renderFilePreview();
-    return false;
-  }
-  filePreviewState.loading = false;
-  filePreviewState.payload = payload;
-  filePreviewState.path = String(payload.path || normalized);
-  filePreviewState.source = 'drives';
-  filePreviewState.viewerOptions = viewerOptions;
-  renderFilePreview();
-  return true;
+/** The files of the browser's current folder, as a gallery open at `openedPath`. */
+function repoFolderGallery(openedPath) {
+  const node = repoBrowserState.nodeMap.get(String(repoBrowserState.currentPath || '')) || null;
+  if (!node || node.type !== 'dir' || !Array.isArray(node.children)) return null;
+  return galleryFromFolder(node.children, openedPath, {
+    source: repoBrowserState.activeRoot === 'workspace' ? 'workspace' : 'drives',
+  });
 }
 
 export async function openWorkspaceFilePreviewFromRepo(rawPath, options = {}) {
+  const gallery = repoFolderGallery(rawPath);
+  const openOptions = gallery ? { ...options, gallery } : options;
   if (repoBrowserState.activeRoot !== 'workspace') {
-    await openDriveFilePreview(rawPath, options);
+    await openDriveFilePreview(rawPath, openOptions);
     return;
   }
-  await openWorkspaceFilePreview(rawPath, options);
+  await openWorkspaceFilePreview(rawPath, openOptions);
+}
+
+/** Show the file `delta` steps along the gallery; false at either end. */
+export async function stepFilePreviewGallery(delta) {
+  const gallery = filePreviewState.gallery;
+  const index = galleryNeighborIndex(gallery, delta);
+  if (index === -1) return false;
+  const next = galleryAt(gallery, index);
+  return openGalleryItem(next.items[index], next);
+}
+
+// Preview payloads of the open file's neighbours, fetched ahead so a swipe
+// lands on the file and not on "Fetching…"; an image's bytes are asked for
+// too, under the very address the viewer will use. Entries are promises.
+const galleryPayloadCache = new Map();
+const GALLERY_PAYLOAD_CACHE_MAX = 12;
+
+function galleryCacheKey(source, path) {
+  return `${source}:${path}`;
+}
+
+function rememberGalleryPayload(source, path, payload) {
+  const key = galleryCacheKey(source, path);
+  galleryPayloadCache.delete(key);
+  galleryPayloadCache.set(key, Promise.resolve(payload));
+  while (galleryPayloadCache.size > GALLERY_PAYLOAD_CACHE_MAX) {
+    galleryPayloadCache.delete(galleryPayloadCache.keys().next().value);
+  }
+}
+
+function prefetchGalleryNeighbors() {
+  const gallery = filePreviewState.gallery;
+  if (!gallery) return;
+  for (const item of galleryNeighbors(gallery)) {
+    const source = item.source || gallery.source;
+    if (source === 'upload') {
+      // An attachment has no preview to fetch; its picture can be primed.
+      if (String(item.mime || '').startsWith('image/') && item.href) {
+        const image = new Image();
+        image.src = item.href;
+      }
+      continue;
+    }
+    const normalized = source === 'workspace'
+      ? normalizeWorkspaceMentionPath(item.path)
+      : normalizeDriveBrowserPath(item.path);
+    if (!normalized) continue;
+    const key = galleryCacheKey(source, normalized);
+    if (galleryPayloadCache.has(key)) continue;
+    const request = (source === 'workspace'
+      ? loadWorkspaceFilePreview(normalized, currentConversationId())
+      : loadDriveFilePreview(normalized)
+    ).then((payload) => {
+      if (!payload || payload.error) {
+        galleryPayloadCache.delete(key);
+        return null;
+      }
+      if (payload.kind === 'image') {
+        const image = new Image();
+        image.src = previewRawHref(source, String(payload.path || normalized), payload);
+      }
+      return payload;
+    }).catch(() => {
+      galleryPayloadCache.delete(key);
+      return null;
+    });
+    rememberGalleryPayload(source, normalized, request);
+  }
 }
 
 export function closeFilePreview() {
   teardownImageZoom();
-  teardownVideoPreview();
+  teardownMediaPreview();
+  viewerTap.cancel();
+  viewerControls.reset();
   const modal = document.getElementById('file-preview-modal');
-  modal.classList.remove('visible');
+  const wasVisible = modal.classList.contains('visible');
+  modal.classList.remove('visible', 'controls-hidden', 'media-mode');
   modal.setAttribute('aria-hidden', 'true');
   filePreviewHistory.length = 0;
+  filePreviewState.gallery = null;
+  galleryPayloadCache.clear();
+  viewerSwipe.cancel();
+  clearViewerDragStyles();
+  if (wasVisible) viewerHistory.closed();
+}
+
+function clearViewerDragStyles() {
+  const bodyEl = document.getElementById('file-preview-body');
+  const modal = document.getElementById('file-preview-modal');
+  bodyEl.style.transform = '';
+  bodyEl.style.transition = '';
+  modal.style.opacity = '';
+  modal.style.transition = '';
 }
 
 export function goBackFilePreview() {
@@ -2175,11 +2436,133 @@ document.addEventListener('click', (event) => {
   void openWorkspaceFilePreview(anchor.dataset.workspacePath || '');
 });
 
-document.getElementById('file-preview-modal').addEventListener('click', (event) => {
-  if (event.target.id === 'file-preview-modal') closeFilePreview();
+// A tap on the content shows or hides the floating controls; the recognizer
+// leaves drags, pinches, double taps and the content's own buttons alone.
+// While something plays, a mouse moving over the viewer brings the controls
+// back as players do; over a still image a click is the only switch, or a
+// nudge of the mouse would undo every click that hid them.
+for (const eventName of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel']) {
+  document.getElementById('file-preview-body').addEventListener(eventName, (event) => {
+    viewerTap.handle(event);
+    viewerSwipe.handle(event);
+    if (eventName === 'pointermove' && event.pointerType === 'mouse' && viewerControls.playing) {
+      viewerControls.interaction();
+    }
+  });
+}
+for (const id of ['file-preview-chrome-top', 'file-preview-chrome-bottom']) {
+  document.getElementById(id).addEventListener('pointerdown', () => viewerControls.interaction());
+}
+window.addEventListener('resize', syncViewerChromeHeight);
+
+// Moving through the gallery: the buttons below, the arrow keys, and a
+// sideways swipe of a finger (a mouse drag selects text and stays a drag).
+document.getElementById('file-preview-prev').addEventListener('click', () => { void stepFilePreviewGallery(-1); });
+document.getElementById('file-preview-next').addEventListener('click', () => { void stepFilePreviewGallery(1); });
+
+function isEditableTarget(target) {
+  return Boolean(target?.closest?.('input, textarea, select, [contenteditable]'));
+}
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  const modal = document.getElementById('file-preview-modal');
+  if (!modal.classList.contains('visible')) return;
+  if (document.getElementById('image-annotate-modal')?.classList.contains('visible')) return;
+  if ((isEditableTarget(event.target) && modal.contains(event.target)) || !filePreviewState.gallery) return;
+  event.preventDefault();
+  void stepFilePreviewGallery(event.key === 'ArrowRight' ? 1 : -1);
+});
+
+/** Something between `target` and the viewer body scrolls sideways itself. */
+function insideHorizontalScroller(target) {
+  const bodyEl = document.getElementById('file-preview-body');
+  for (let el = target instanceof Element ? target : null; el && el !== bodyEl; el = el.parentElement) {
+    if (el.scrollWidth > el.clientWidth + 1) {
+      const overflowX = getComputedStyle(el).overflowX;
+      if (overflowX === 'auto' || overflowX === 'scroll') return true;
+    }
+  }
+  return false;
+}
+
+// A swipe down dismisses what does not scroll (a picture, a player, a card):
+// the content follows the finger and the viewer fades, then goes if the
+// finger went far or fast enough. Text scrolls under the finger instead and
+// is closed with ×, Escape or the back gesture.
+const DISMISS_FADE_PX = 480;
+const DISMISS_ANIMATION_MS = 200;
+let viewerDismissing = false;
+
+function viewerDismissableBySwipe() {
+  return !viewerDismissing && !TEXT_PREVIEW_KINDS.has(filePreviewState.payload?.kind) && imageZoomAtRest();
+}
+
+function dismissFilePreviewWithSlide() {
+  const bodyEl = document.getElementById('file-preview-body');
+  const modal = document.getElementById('file-preview-modal');
+  viewerDismissing = true;
+  bodyEl.style.transition = `transform ${DISMISS_ANIMATION_MS}ms ease-in`;
+  modal.style.transition = `opacity ${DISMISS_ANIMATION_MS}ms ease-in`;
+  bodyEl.style.transform = 'translateY(100vh)';
+  modal.style.opacity = '0';
+  setTimeout(() => {
+    viewerDismissing = false;
+    closeFilePreview();
+  }, DISMISS_ANIMATION_MS);
+}
+
+const viewerSwipe = createSwipeRecognizer({
+  canStart: (event) => event.pointerType !== 'mouse'
+    && !viewerDismissing
+    && !event.target?.closest?.('video, audio, input, textarea, select, [contenteditable]')
+    && !insideHorizontalScroller(event.target),
+  horizontalEnabled: () => Boolean(filePreviewState.gallery) && imageZoomAtRest(),
+  verticalEnabled: viewerDismissableBySwipe,
+  onStart: () => {
+    const bodyEl = document.getElementById('file-preview-body');
+    bodyEl.style.transition = 'none';
+    document.getElementById('file-preview-modal').style.transition = 'none';
+  },
+  onMove: ({ axis, dx, dy }) => {
+    const bodyEl = document.getElementById('file-preview-body');
+    if (axis === 'y') {
+      // Upwards there is nothing: the content barely gives.
+      const shift = dy < 0 ? dy * 0.2 : dy;
+      bodyEl.style.transform = `translateY(${shift}px)`;
+      document.getElementById('file-preview-modal').style.opacity = String(Math.max(0.3, 1 - Math.max(0, dy) / DISMISS_FADE_PX));
+      return;
+    }
+    // Past either end the content gives a little, then holds.
+    const toward = galleryNeighborIndex(filePreviewState.gallery, dx < 0 ? 1 : -1);
+    const shift = toward === -1 ? dx * 0.25 : dx;
+    bodyEl.style.transform = `translateX(${shift}px)`;
+  },
+  onEnd: ({ axis, swipe }) => {
+    if (axis === 'y' && swipe === 'down') {
+      dismissFilePreviewWithSlide();
+      return;
+    }
+    const bodyEl = document.getElementById('file-preview-body');
+    const modal = document.getElementById('file-preview-modal');
+    bodyEl.style.transition = 'transform 180ms ease';
+    modal.style.transition = 'opacity 180ms ease';
+    bodyEl.style.transform = '';
+    modal.style.opacity = '';
+    if (swipe === 'left') void stepFilePreviewGallery(1);
+    else if (swipe === 'right') void stepFilePreviewGallery(-1);
+  },
 });
 
 document.getElementById('file-preview-body').addEventListener('click', (event) => {
+  const openTab = eventClosest(event, '[data-viewer-open-tab]');
+  if (openTab) {
+    event.preventDefault();
+    openExternalNavigation(openTab.getAttribute('data-viewer-open-tab') || '', (url) => {
+      window.dispatchEvent(new CustomEvent('copilot:external-link-fallback', { detail: { url } }));
+    });
+    return;
+  }
   const anchor = eventClosest(event, '.file-preview-markdown a[href]');
   if (!anchor) return;
   const target = resolveFilePreviewLink(anchor.getAttribute('href'), filePreviewState.path);

@@ -6,11 +6,14 @@ import {
   buildDefaultConfig,
   buildServicePath,
   buildSystemdUnit,
+  describeRelayAddress,
   resolveNpmInvocation,
   generateAuthToken,
+  parseCliArgs,
   primaryLanAddress,
   relayUrl,
   renderDoctorReport,
+  usageText,
 } from './oar-cli-helpers.mjs';
 
 test('generated tokens are long, urlsafe, and unique', () => {
@@ -168,4 +171,136 @@ test('doctor report renders both healthy and missing states without leaking the 
   });
   assert.match(missing, /missing — run: oar setup/);
   assert.match(missing, /not created yet/);
+});
+
+test('doctor report ends with the warnings it is given', () => {
+  const report = renderDoctorReport({
+    version: '0.9.0',
+    nodeVersion: 'v24.0.0',
+    platform: 'linux',
+    layout: { checkout: false, root: '/home/dev/.oar' },
+    configPath: '/home/dev/.oar/config.json',
+    config: { authToken: 'tok', port: 3333 },
+    dbPath: '/home/dev/.oar/data/copilot.db',
+    dbSizeBytes: null,
+    warnings: ['Windows holds port 3333 (node.exe)'],
+  });
+  assert.match(report.split('\n').at(-1), /warning {7}: Windows holds port 3333 \(node\.exe\)/);
+});
+
+test('the command may follow options, and --setup style options name it', () => {
+  assert.deepEqual(parseCliArgs(['setup', '--port', '3339']), { command: 'setup', args: ['--port', '3339'] });
+  assert.deepEqual(parseCliArgs(['--port', '3339', 'setup']), { command: 'setup', args: ['--port', '3339'] });
+  assert.deepEqual(parseCliArgs(['--port=3339', 'setup', '--lan']), { command: 'setup', args: ['--port=3339', '--lan'] });
+  assert.deepEqual(parseCliArgs(['--setup']), { command: 'setup', args: [] });
+  assert.deepEqual(parseCliArgs(['--setup', '--port', '3339', '--start']), { command: 'setup', args: ['--port', '3339', '--start'] });
+  assert.deepEqual(parseCliArgs(['setup', '--defaults', '--start']), { command: 'setup', args: ['--defaults', '--start'] });
+  assert.deepEqual(parseCliArgs(['--start']), { command: 'start', args: [] });
+  assert.deepEqual(parseCliArgs(['--stop']), { command: 'stop', args: [] });
+  assert.deepEqual(parseCliArgs(['--status']), { command: 'status', args: [] });
+  assert.deepEqual(parseCliArgs(['service', 'install']), { command: 'service', args: ['install'] });
+  assert.deepEqual(parseCliArgs(['update', '--to', '0.9.9', '--beta']), { command: 'update', args: ['--to', '0.9.9', '--beta'] });
+});
+
+test('no command means the menu, help and version are found anywhere before "--"', () => {
+  assert.deepEqual(parseCliArgs([]), { command: 'menu', args: [] });
+  assert.deepEqual(parseCliArgs(['--help']), { command: 'help', args: [] });
+  assert.deepEqual(parseCliArgs(['setup', '-h']), { command: 'help', args: [] });
+  assert.deepEqual(parseCliArgs(['help']), { command: 'help', args: [] });
+  assert.deepEqual(parseCliArgs(['--version']), { command: 'version', args: [] });
+  assert.deepEqual(parseCliArgs(['-v']), { command: 'version', args: [] });
+  // Behind "--" everything belongs to gh copilot.
+  assert.deepEqual(parseCliArgs(['copilot', '--', '--help']), { command: 'copilot', args: ['--', '--help'] });
+});
+
+test('the launcher flags without a command still mean the Copilot session', () => {
+  assert.deepEqual(parseCliArgs(['--no-install-extension']), { command: 'copilot', args: ['--no-install-extension'] });
+  assert.deepEqual(parseCliArgs(['--install-extension']), { command: 'copilot', args: ['--install-extension'] });
+  assert.deepEqual(
+    parseCliArgs(['--port', '3339', '--', '--allow-all']),
+    { command: 'copilot', args: ['--port', '3339', '--', '--allow-all'] },
+  );
+  assert.deepEqual(
+    parseCliArgs(['--migrate-from', '/home/dev/old-checkout']),
+    { command: 'copilot', args: ['--migrate-from', '/home/dev/old-checkout'] },
+  );
+  assert.deepEqual(
+    parseCliArgs(['copilot', '--port', '3339', '--', '--model', 'x']),
+    { command: 'copilot', args: ['--port', '3339', '--', '--model', 'x'] },
+  );
+});
+
+test('an unknown command or option is an error, never a launch', () => {
+  assert.match(parseCliArgs(['strat']).error, /Unknown command: strat/);
+  assert.match(parseCliArgs(['--frobnicate']).error, /Unknown option: --frobnicate/);
+  assert.match(parseCliArgs(['--port', '3339']).error, /--port needs a command/);
+  assert.match(parseCliArgs(['setup', '--port']).error, /--port needs a value/);
+  assert.match(parseCliArgs(['setup', '--tunnel']).error, /Unknown option for oar setup: --tunnel/);
+  assert.match(parseCliArgs(['start', '--port', '3339']).error, /Unknown option for oar start: --port/);
+  assert.match(parseCliArgs(['setup', 'now']).error, /Unexpected argument: now/);
+  assert.match(parseCliArgs(['service', 'install', 'remove']).error, /Unexpected argument: remove/);
+  assert.match(parseCliArgs(['service', 'enable']).error, /Unexpected argument: enable/);
+  assert.match(parseCliArgs(['start', '--', 'x']).error, /takes no "--" part/);
+  assert.match(parseCliArgs(['constructor']).error, /Unknown command/);
+});
+
+test('the usage names every command', () => {
+  const usage = usageText();
+  for (const command of ['start', 'stop', 'restart', 'status', 'url', 'setup', 'service install | remove | status', 'copilot', 'doctor', 'update', 'help', '--version']) {
+    assert.ok(usage.includes(`oar ${command}`), `usage lacks oar ${command}`);
+  }
+  for (const flag of ['--port', '--lan', '--local', '--new-token', '--defaults', '--start']) assert.ok(usage.includes(flag), flag);
+});
+
+test('a QR code is offered only for an address a phone can reach', () => {
+  const lan = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: false }, lanAddress: '192.168.7.20' });
+  assert.equal(lan.url, 'http://192.168.7.20:3340/?token=tok');
+  assert.equal(lan.qrUrl, lan.url);
+  assert.deepEqual(lan.lines, ['[oar] Relay URL: http://192.168.7.20:3340/?token=tok']);
+
+  const local = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: true }, lanAddress: '192.168.7.20' });
+  assert.equal(local.url, 'http://localhost:3340/?token=tok');
+  assert.equal(local.qrUrl, null);
+  assert.match(local.lines[1], /This machine only\. For a phone.*oar setup --lan.*tunnel/);
+
+  // A config without the key listens on this machine only, as the server reads it.
+  assert.equal(describeRelayAddress({ config: { authToken: 'tok' }, lanAddress: '192.168.7.20' }).url, 'http://localhost:3333/?token=tok');
+
+  const offline = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: false }, lanAddress: null });
+  assert.equal(offline.qrUrl, null);
+  assert.match(offline.lines[1], /no network address/);
+});
+
+test('a LAN address inside WSL gets a note instead of a QR code', () => {
+  const wsl = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: false }, lanAddress: '172.20.5.9', wslNat: true });
+  assert.equal(wsl.url, 'http://172.20.5.9:3340/?token=tok');
+  assert.equal(wsl.qrUrl, null);
+  assert.match(wsl.lines[1], /internal to WSL/);
+  assert.match(wsl.lines[1], /tunnel/);
+  assert.match(wsl.lines[1], /mirrored networking/);
+});
+
+test('a tunnel address a relay reports gets the token and its own QR code', () => {
+  const address = describeRelayAddress({
+    config: { authToken: 'tok en', port: 3340, localhostOnly: true },
+    tunnelBase: 'https://relay.example.com/oar/',
+  });
+  assert.equal(address.tunnelUrl, 'https://relay.example.com/oar/?token=tok%20en');
+  assert.equal(describeRelayAddress({ config: { authToken: 'tok' } }).tunnelUrl, null);
+});
+
+test('doctor report shows the tunnel finding it is given instead of the bare config value', () => {
+  const report = renderDoctorReport({
+    version: '0.9.0',
+    nodeVersion: 'v24.0.0',
+    platform: 'darwin',
+    layout: { checkout: false, root: '/home/dev/.oar' },
+    configPath: '/home/dev/.oar/config.json',
+    config: { authToken: 'tok', cloudflaredTunnel: { mode: 'managed' } },
+    dbPath: '/home/dev/.oar/data/copilot.db',
+    dbSizeBytes: null,
+    probes: [],
+    tunnel: 'managed, cannot start: cloudflared is not installed — install it with: brew install cloudflared',
+  });
+  assert.match(report, /tunnel {8}: managed, cannot start: cloudflared is not installed — install it with: brew install cloudflared/);
 });

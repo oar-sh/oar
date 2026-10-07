@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createMessageRepository } from './message-repository.mjs';
+import { createMessagePinStatements } from './message-pin-statements.mjs';
 import { dequeuePendingMessage, resolveExecutedProviderForResponse } from '../routes/messages-routes.mjs';
 import { mapUsageSnapshotRow } from '../routes/sessions-routes.mjs';
 import { applySchema } from '../db-schema.mjs';
@@ -29,6 +30,45 @@ test('message share visibility preserves owner history and filters shared histor
 
   repository.setMessageShareVisibility.run(0, null, 'msg-1', 'conv-1');
   assert.equal(repository.getSharedMessages.all('conv-1').length, 1);
+});
+
+test('pins are set and cleared per message and listed in conversation order', () => {
+  const db = createTestDb();
+  const repository = createMessageRepository(db);
+  const insertConv = db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES (?, ?, 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`);
+  insertConv.run('conv-1', 'Demo');
+  insertConv.run('conv-2', 'Other');
+  const insertMessage = db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES (?, ?, ?, ?, ?)`);
+  insertMessage.run('msg-early', 'conv-1', 'user', 'early', '2026-01-01T00:00:00.000Z');
+  insertMessage.run('msg-late', 'conv-1', 'assistant', 'late', '2026-01-01T00:05:00.000Z');
+  insertMessage.run('msg-other', 'conv-2', 'user', 'other', '2026-01-01T00:02:00.000Z');
+
+  // Pinned in reverse: the list still follows the messages' own order.
+  repository.setMessagePinnedAt.run('2026-01-02T00:00:00.000Z', 'msg-late', 'conv-1');
+  repository.setMessagePinnedAt.run('2026-01-02T00:01:00.000Z', 'msg-early', 'conv-1');
+  assert.deepEqual(repository.listPinnedMessages.all('conv-1').map((row) => row.id), ['msg-early', 'msg-late']);
+  assert.equal(repository.countPinnedMessages.get('conv-1').cnt, 2);
+  assert.equal(repository.getMessageByConversation.get('msg-late', 'conv-1').pinned_at, '2026-01-02T00:00:00.000Z');
+
+  // A message id is only pinned inside its own conversation.
+  assert.equal(repository.setMessagePinnedAt.run('2026-01-02T00:02:00.000Z', 'msg-other', 'conv-1').changes, 0);
+  assert.equal(repository.countPinnedMessages.get('conv-2').cnt, 0);
+
+  repository.setMessagePinnedAt.run(null, 'msg-early', 'conv-1');
+  assert.deepEqual(repository.listPinnedMessages.all('conv-1').map((row) => row.id), ['msg-late']);
+  assert.equal(repository.countPinnedMessages.get('conv-1').cnt, 1);
+});
+
+test('a database without the pin column gets no pin statements', () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, timestamp TEXT NOT NULL);
+  `);
+  const statements = createMessagePinStatements(db);
+  assert.equal(statements.messagesSupportPins, false);
+  assert.equal(statements.setMessagePinnedAt, null);
+  assert.equal(statements.listPinnedMessages, null);
+  assert.equal(statements.countPinnedMessages, null);
 });
 
 test('routed worker dequeue uses runtime session binding when queue owner is empty', () => {

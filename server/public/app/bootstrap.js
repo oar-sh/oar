@@ -122,7 +122,12 @@ import {
   jumpToImageParent,
   flushDeferredMessageRender,
   conversationHasActiveTurn,
+  focusConversationMessageById,
+  syncRenderedPinState,
+  isConversationWindowAtTail,
+  getTranscriptJumpEpoch,
 } from './conversation-view.js';
+import { initPinnedMessagesView, setPinsConversation } from './pinned-messages-view.mjs';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
 import { handleAttachmentInput, retryAttachmentUpload, openAnnotateEditorForPending, openAnnotateEditorForPreview, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, copyFilePreviewImage, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick } from './attachments-view.js';
@@ -198,7 +203,9 @@ import {
   adoptLegacyPwaAppName,
   registerPwaShell,
   updatePwaAppName,
+  isInstalledAppMode,
 } from './pwa-install.js';
+import { armBackGuardOnFirstInteraction } from './back-guard.mjs';
 import { initScrollbarHover } from './scrollbar-hover.mjs';
 import {
   autoCompactWindowNotes,
@@ -3592,6 +3599,15 @@ function startSessionWorkerStatusPolling() {
   }, 4000);
 }
 
+// The live poll and refreshCurrentView both reload the END of the
+// conversation. After a jump into the history (a search result, a pinned
+// message) that would put the end back over the window the user asked for,
+// until they have scrolled down to the newest message again. A message sent
+// from that window brings the present back at once: its bubble needs the poll.
+function transcriptIsInHistory(conversationId) {
+  return !isConversationWindowAtTail() && !hasPendingUserMessageForConversation(conversationId);
+}
+
 async function pollAuthenticatedCurrentConversationLive() {
   if (liveConversationPollInFlight) return;
   if (isSharedReaderMode()) return;
@@ -3609,6 +3625,7 @@ async function pollAuthenticatedCurrentConversationLive() {
   // Refreshing while the user selects or drags in the chat would rebuild the
   // DOM under the selection; the guard's release callback re-polls right away.
   if (isChatInteractionHeld()) return;
+  if (transcriptIsInHistory(currentId)) return;
 
   liveConversationPollInFlight = true;
   try {
@@ -3617,9 +3634,14 @@ async function pollAuthenticatedCurrentConversationLive() {
     const savedScrollTop = messagesEl?.scrollTop || 0;
     const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
     const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
+    const jumpEpoch = getTranscriptJumpEpoch();
     const response = await loadConversation(currentId, { limit: requestLimit });
     if (!response) return;
     if (String(currentConvId || '').trim() !== currentId) return;
+    // The user jumped into the history while this request was on its way: the
+    // answer is the end of the conversation as it was asked for before that,
+    // and would overwrite the window they jumped to. The next round asks again.
+    if (getTranscriptJumpEpoch() !== jumpEpoch) return;
     const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
     applyLoadedConversationState(currentId, response, {
       restoreScroll: !preserveBottom,
@@ -3827,6 +3849,7 @@ let refreshViewVersion = 0;
 
 async function refreshCurrentView() {
   const capturedVersion = ++refreshViewVersion;
+  const jumpEpoch = getTranscriptJumpEpoch();
   const messagesEl = document.getElementById('messages');
   const preserveBottom = isMessagesAtBottom();
   const scrollTop = messagesEl?.scrollTop || 0;
@@ -3849,11 +3872,16 @@ async function refreshCurrentView() {
   const r = await loadConversation(currentId, { limit: requestLimit });
   if (capturedVersion < refreshViewVersion) return;
   if (String(currentConvId || '').trim() !== currentId) return;
+  // The user jumped into the history, before this refresh or while it was on
+  // its way: title, tasks, pins and the rest are refreshed, the transcript
+  // and its scroll position are left as they are.
+  const keepTranscript = getTranscriptJumpEpoch() !== jumpEpoch || transcriptIsInHistory(currentId);
   if (r) {
     applyLoadedConversationState(currentId, r, {
       restoreScroll: !preserveBottom,
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
-      followLiveUpdates: preserveBottom,
+      followLiveUpdates: preserveBottom && !keepTranscript,
+      keepTranscript,
     });
   } else {
     setRepoBrowserSessionInfo('', '');
@@ -3862,7 +3890,7 @@ async function refreshCurrentView() {
   await loadRelayQuestions(currentId);
   await loadRelayBoards();
   scheduleContextUsageRefresh(currentId, 0);
-  if (messagesEl && String(currentConvId || '').trim() === currentId) {
+  if (messagesEl && !keepTranscript && String(currentConvId || '').trim() === currentId) {
     if (!preserveBottom && Number.isFinite(stableSavedScrollTop) && stableSavedScrollTop >= 0) {
       messagesEl.scrollTop = stableSavedScrollTop;
     }
@@ -4024,6 +4052,8 @@ function lockChatActionsMenuShield(ms = 300) {
 function syncChatTitleControls() {
   const { title, editBtn, editor, input } = getChatTitleElements();
   const convId = String(currentConvId || '').trim();
+  // No conversation open (deleted, new chat): its 📍 button goes with it.
+  if (!convId) setPinsConversation(null);
   const killBtn = document.getElementById('chat-menu-kill-session');
   const sharedMode = isSharedReaderMode();
   const conversation = convId ? (conversations[convId] || null) : null;
@@ -4571,6 +4601,11 @@ async function initApp() {
   initMessageScrollPersistence();
   initComposerAttachmentInput();
   initMessageSearchView({ openConversation });
+  initPinnedMessagesView({
+    openConversation,
+    focusMessage: focusConversationMessageById,
+    syncRenderedPinState,
+  });
   initGitChangesView();
   syncChatTitleControls();
   connectSocket();
@@ -4627,6 +4662,15 @@ async function bootstrap() {
   }
   const urlToken = getTokenFromUrl();
   if (urlToken) stripTokenFromUrl();
+  // In the installed app the system back button must never close the app;
+  // a tab keeps its own back button. After the token is gone from the
+  // address, so the entries the guard lays down carry the clean one.
+  armBackGuardOnFirstInteraction({
+    history: window.history,
+    enabled: isInstalledAppMode(),
+    target: window,
+    onFloor: () => showTransientRelayNotice('Press back again to close the app', 2500),
+  });
   const persistedToken = consumeLegacyPersistedAuthToken();
   const bootstrapToken = String(urlToken || persistedToken || '').trim();
   const existingSession = await verifyExistingSession(bootstrapToken);

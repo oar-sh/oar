@@ -1,3 +1,4 @@
+import { versionedFileHref } from './file-version.mjs';
 import {
   BASE,
   escHtml,
@@ -116,10 +117,15 @@ export function normalizeDriveBrowserPath(rawPath) {
   return rest ? `${drive}/${rest}` : drive;
 }
 
-export function driveFileHrefFromPath(rawPath) {
+/**
+ * `version` is the file's version token when the caller knows it (a preview
+ * carries one): the address then changes with the file, so an older copy
+ * cannot be served for it. The server ignores the parameter.
+ */
+export function driveFileHrefFromPath(rawPath, version = '') {
   const normalized = normalizeDriveBrowserPath(rawPath);
   if (!normalized) return '';
-  return `${BASE}/api/drives/file?path=${encodeURIComponent(normalized)}`;
+  return versionedFileHref(`${BASE}/api/drives/file?path=${encodeURIComponent(normalized)}`, version);
 }
 
 /**

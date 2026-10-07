@@ -72,7 +72,7 @@ test('a successful update persists the attempt before requesting the restart', a
   const { service, spawned, shutdowns, events } = createService(store);
   const result = await service.startUpdate({ version: '0.9.2' });
   assert.equal(result.ok, true);
-  assert.deepEqual(spawned, [['npm', 'install', '-g', '--allow-scripts=better-sqlite3,cloudflared,koffi', '@oar-sh/oar@0.9.2']]);
+  assert.deepEqual(spawned, [['npm', 'install', '-g', '--allow-scripts=better-sqlite3,koffi', '@oar-sh/oar@0.9.2']]);
   assert.equal(shutdowns.length, 1);
   assert.equal(shutdowns[0].restart, true);
 
@@ -173,7 +173,7 @@ test('the update runs the npm beside this Node, into the prefix the package sits
   await service.startUpdate({ version: '0.9.2' });
   assert.deepEqual(calls, [{
     command: '/home/dev/.oar/runtime/node/bin/npm',
-    args: ['install', '-g', '--prefix', '/home/dev/.oar/npm', '--allow-scripts=better-sqlite3,cloudflared,koffi', '@oar-sh/oar@0.9.2'],
+    args: ['install', '-g', '--prefix', '/home/dev/.oar/npm', '--allow-scripts=better-sqlite3,koffi', '@oar-sh/oar@0.9.2'],
     path: '/home/dev/.oar/runtime/node/bin:/usr/bin:/bin',
   }]);
 });

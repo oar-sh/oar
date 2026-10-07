@@ -5,6 +5,237 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.9] — 2026-10-07
+
+Highlights: `oar` opens a menu and gains stop, restart, status, url and
+service commands, and setup asks for access and port; files open in a
+fullscreen viewer with galleries to swipe through, and a PDF opens in the
+browser; messages can be pinned; a downloaded file is the file as it is now,
+and no cache may keep an API answer; the built-in Cloudflare tunnel uses the
+`cloudflared` you installed instead of a bundled copy; the three provider
+SDKs are current.
+
+### Upgrade notes
+
+- **The built-in Cloudflare tunnel needs `cloudflared` installed on the relay
+  host.** An install that ran the tunnel (`cloudflaredTunnel` in the config)
+  on the copy that came with OAR loses the tunnel after this update until
+  `cloudflared` is installed: `winget install --id Cloudflare.cloudflared`
+  on Windows, `brew install cloudflared` on macOS, Cloudflare's package
+  repository on Linux (<https://pkg.cloudflare.com/>). The relay itself
+  starts and works locally in the meantime. Installs with
+  `cloudflaredTunnel.binary` set, with `cloudflared` on the `PATH`, or
+  with a tunnel that runs outside OAR are not affected.
+
+### Added
+
+- **The file viewer fills the screen.** A file opened from the file browser
+  or from a chat takes the whole screen: pictures, video and audio on black,
+  text in a column that reads well on a wide screen. The title, the toolbar
+  and the meta line float over the content; a tap on the content hides them
+  and brings them back, and while a video or an audio file plays they fade
+  by themselves after three seconds, as players do. Audio files play in the
+  viewer. A PDF, which the viewer cannot show, is a card with **Open in new
+  tab** (the browser's own viewer) next to **Download**.
+- **Swipe through a folder, or through a chat's media.** A file opened from
+  the browser's folder pane carries its neighbours along: a sideways swipe
+  shows the next or the previous file, as do the arrow keys and the two
+  buttons below with the position between them. A picture or an attachment
+  tapped in a chat opens with every image, video and audio file of the
+  conversation to swipe through, oldest to newest. Neighbours are fetched
+  ahead, so a swipe lands on the file and not on "Fetching…".
+- **The back gesture closes the viewer, and a swipe down dismisses it.** On
+  a phone the system back gesture closed the app; it now closes the viewer
+  and nothing else, and the address never changes. A swipe down on a picture,
+  a player or a card lets the content follow the finger and then go.
+- **The back button never closes the installed app.** In the app installed
+  from the browser (Android, iOS, desktop), pressing back with nothing left
+  to go back to used to close it. From the first touch on, the app keeps
+  one entry beneath its own and steps back onto it: back closes the file
+  viewer and nothing more, and a back with nothing left to close shows
+  *Press back again to close the app* — a second press without a touch in
+  between closes it, as phone apps do. (Before any touch the browser lets
+  back leave on purpose; a page cannot change that.) In a browser tab the
+  back button is the browser's as before.
+- **`oar` opens a menu.** In a terminal, `oar` shows whether the relay runs,
+  its version, URL, port, access and service, and offers Start, Stop, Restart,
+  Show URL and QR code, Settings, Install or remove the service, Update,
+  Doctor and Copilot session (arrow keys or digits, Enter, `q`). Without a
+  terminal it prints the status and the usage.
+- **`oar stop`, `oar restart`, `oar status`, `oar url`, `oar service`.** Stop
+  and restart wait for running turns (the systemd service is stopped and
+  restarted by systemd). `oar status` exits 0 when the relay runs and 3 when
+  it does not. `oar url` prints the relay URL again. `oar service install`,
+  `remove` and `status` manage the start at login: the systemd user service
+  on Linux, the sign-in autostart on Windows; on macOS, and on a Linux
+  without a systemd user session, the command says so and names `oar start`.
+- **`oar setup` asks for access and port, with options for each.** In a
+  terminal, setup asks for a new token, the access (this machine only, or
+  LAN) and the port, each with its current value; Enter keeps it. `--port`,
+  `--lan`, `--local` and `--new-token` answer without a question, and
+  `--defaults` keeps everything of an existing config.
+- **WSL: a port has to be free on Windows too.** In WSL's default networking
+  a port can be free in the distro while a Windows program listens on it, and
+  a Windows browser's `localhost` then reaches that program. A new config now
+  takes the first port that is free on both sides, setup refuses a port
+  Windows holds, and `oar start`, `oar status`, `oar doctor` and `oar setup`
+  warn when Windows holds the relay's port. Where Windows cannot be asked,
+  nothing changes.
+- **Pin messages in a conversation.** Every message has a **Pin** button
+  beside **Hide**. A conversation with pins shows a **📍** button with their
+  count in its header; it opens the list of pinned messages, each with a short
+  preview. A row scrolls to its message, also one far up in the history, and
+  **🗑** unpins it. Pins are stored on the relay, appear on every open device
+  at once, and are not part of the shared view. At most 100 per conversation.
+
+### Changed
+
+- **The Copilot terminal session is `oar copilot`.** `oar` alone no longer
+  starts the relay and `gh copilot`. `oar copilot [-- <args>]` does; the old
+  forms with an option and no command (`oar -- <args>`,
+  `oar --install-extension`, `oar --no-install-extension`,
+  `oar --migrate-from <dir>`) still run it.
+- **Setup no longer asks about the tunnel or the service.** The service is
+  `oar service install`; the tunnel is set in the config
+  ([Remote access](README.md#remote-access)). `oar setup --start` still
+  installs the service where a systemd user session exists.
+- **A QR code only for an address a phone can reach.** With LAN access the
+  URL and the QR code carry the LAN address. With access for this machine
+  only, setup prints the localhost URL and one line on how to get phone
+  access, and no QR code. In WSL a LAN address is internal to WSL: setup says
+  so and names the two ways out, a tunnel or WSL's mirrored networking.
+- The npm package guard allows 6.5 MiB unpacked (was 6 MiB); the command line
+  grew by the menu and the new commands, and the app by the pinned messages
+  and the file viewer.
+- **A tunnel without `cloudflared` says so.** When the built-in Cloudflare
+  tunnel is switched on and no `cloudflared` is found, the relay starts as
+  usual, the tunnel stays off, and the status dot's tooltip, `oar doctor` and
+  the server log name the install command for the system. The relay looks
+  again every minute and starts the tunnel once `cloudflared` is there. With
+  `cloudflaredTunnel.required` the queue stays paused until the tunnel is
+  connected, as before.
+- **`--allow-scripts` lists two packages.** A manual install on npm 12 is now
+  `npm install -g --allow-scripts=better-sqlite3,koffi @oar-sh/oar`;
+  `oar update` and the **Update** button pass the same list.
+- `@github/copilot-sdk` 1.0.17 (bundled Copilot CLI 1.0.93): typed structured
+  outputs for `sendAndWait`, structured JSON-RPC error data, an experimental
+  `setTools()` to replace a session's client tools mid-session, sub-agent
+  start/stop hooks, and the new session events `tool.shell_output` and
+  `human_response.recorded`. The extension entry renames `factories` to
+  `workflows`; OAR passes neither. The package now pins its own dependencies
+  exactly, so it carries its own `zod` 4.3.6.
+- `@anthropic-ai/claude-agent-sdk` 0.3.292 (bundled Claude Code 2.1.292).
+  Of the nine releases since 0.3.283 these touch the relay's worker: a
+  cut-short or interrupted streaming reply now always ends with its
+  `message_stop` (0.3.287, 0.3.290), so the turn-liveness watchdog sees the
+  end of the model's output; a follow-up turn woken by a finished background
+  agent no longer fails its hooks, `canUseTool` and SDK MCP calls with
+  "Stream closed" (0.3.284); `commands_changed` no longer arrives before
+  `init` (0.3.287); a user message replayed under the same `uuid` while the
+  first copy still waits is no longer replayed twice (0.3.290); subagent
+  `assistant`/`user` messages carry `agent_id`, task events carry
+  `parent_task_id` and `run_id`, and `background_tasks_changed` for a
+  finishing task now arrives after its `task_updated` and `task_notification`
+  (0.3.292). An omitted `permissionMode` is now left to Claude Code (0.3.286);
+  the worker always passes one.
+- `@cursor/sdk` 1.0.36 (additive API changes only): an opt-in
+  `subagentInherit` for `Task` child sessions, `sessionId` in the custom-tool
+  context, and the SDK's *default* agent-store path now derives from SHA-256
+  with a one-time rename of the old MD5-named store. OAR passes its own
+  `stateRoot`, so its stores under `data/cursor-agents` keep their layout.
+  The package dropped its `@connectrpc/connect-node` dependency.
+
+### Removed
+
+- **The bundled `cloudflared`.** OAR no longer installs the `cloudflared`
+  npm package, which downloaded the binary during the install. The tunnel
+  runs the `cloudflared` named in `cloudflaredTunnel.binary` (or
+  `COPILOT_CLOUDFLARED_BINARY`), or else the one on the `PATH`.
+
+### Fixed
+
+- **A jump into the history stays where it landed.** After opening a search
+  result in an older part of a conversation, the page put the end of the
+  conversation back as soon as it refreshed itself: within a second while a
+  turn was running, and whenever a turn ended or the connection came back.
+  The window you jumped to now stays until you scroll down to the newest
+  message. The same holds for a jump to a pinned message.
+- **On a phone, the Pin button of a message can be tapped.** A tap on a bubble
+  reveals its Pin and Hide buttons, but the reveal hung on the hover state the
+  tap leaves behind, which the browser drops at the next scroll or layout
+  change (seen on Linux), and the share-visibility line then took the tap
+  instead of the button. The tap now holds the reveal until a tap lands
+  outside the bubble.
+- **A PDF opens in the browser's viewer again.** Served files carry a
+  `Content-Security-Policy` with `sandbox` so a worker-written file can never
+  run as script on the relay's origin; browsers refuse to show a sandboxed
+  PDF in their built-in viewer, so "open in a new tab" turned into a
+  download. A PDF alone is now served without the `sandbox` directive (PDF
+  viewers run no document script) and may be framed by the relay's own
+  origin; HTML, SVG and every other type keep the full lock-down.
+- **Audio files were an opaque download.** No audio type was known, so an
+  `.mp3` or `.wav` went out as `application/octet-stream` with a download
+  disposition. Audio types are served as such, previewed as audio, and
+  `.bmp` and `.avif` are served as images.
+- **An SVG can be previewed.** It was served as plain text so that a
+  worker-written SVG could never run as a page on the relay's origin, and
+  an `<img>` refuses plain text: the viewer and the file browser's
+  thumbnails showed a broken picture. An SVG now keeps its type; the
+  `sandbox` in every served file's `Content-Security-Policy` still denies
+  it script and an origin if it is opened as a page.
+- **Uploaded video can seek.** A video attachment in a chat was streamed
+  without range support, so the player could not jump; it now goes through
+  the same range-aware file serving as a workspace file, and so does a
+  shared conversation's attachment. Their long-lived caching stays.
+- **A file with a Japanese, Chinese or emoji name can be served again.** Its
+  name went into `Content-Disposition` as is, which the HTTP layer refuses
+  for characters outside Latin-1, so such a workspace file, upload or shared
+  attachment failed with a server error and left a file handle open each
+  time. The header now carries an ASCII fallback and the full name in the
+  `filename*` form, so the file opens and is saved under its own name.
+- **A changed file is downloaded as it is now.** The **Download** button of
+  the file viewer handed back an older copy of a file that had been written
+  again under the same name. Three things were wrong:
+  - A click on Download did not download: since 0.9.0 every link click was
+    turned into "open in a new tab", so the link's own file name was dropped
+    and a phone showed or saved the file under its plain name, next to (or
+    instead of) the copy it already had. Download links are left to the
+    browser again.
+  - A file fetched within two seconds of a change arrived cut to its
+    previous length, because the announced length came from an older read
+    than the bytes. Length, validators and bytes now come from one open file.
+  - The address and the saved name never changed. The link now carries the
+    file's version (`v=…`), and the file is saved with the time it was last
+    changed, `report.pdf` as `report (1005-0719).pdf`.
+- **No cache between the relay and you may keep an answer.** Every API
+  answer, errors included, now says `Cache-Control: no-store` unless the route
+  sets its own value, and every answer carries `CDN-Cache-Control: no-store`
+  and `Cloudflare-CDN-Cache-Control: no-store`, which bind a CDN in front of
+  a tunnel whatever cache rule its zone has. Served files also carry an
+  `ETag` and `Last-Modified`.
+- **A file preview could stop the relay.** The preview and file routes used a
+  cache they were never given, so dropping a stale entry threw; in the
+  preview route that happened outside any handler and ended the process.
+- **A changed token, port or access reaches the running relay.** `oar setup`
+  wrote the new value while the relay kept the old one, so the relay refused
+  the token in its own config. Setup now restarts a running relay after such
+  a change (in a terminal it asks first), with the old token on the old port,
+  and waits until the relay answers with the new settings. If you decline, or
+  the relay is still busy with a turn, `oar status`, `oar stop` and
+  `oar restart` still find it.
+- **The command may follow its options, and an unknown one starts nothing.**
+  `oar --port 3339 setup` and `oar --setup` used to start the relay and
+  `gh copilot` instead of running setup. The command is now found wherever it
+  stands, `--setup`, `--start`, `--stop` and `--status` name it too, and an
+  unknown command or option prints the usage and exits with code 2.
+- **`oar copilot` checks the relay on its port, and says when `gh` is
+  missing.** A lock file alone no longer counts as a running relay: the relay
+  has to answer on the port. Without the GitHub CLI the command says so and
+  starts nothing, instead of *spawn gh ENOENT*.
+- **Ctrl+C in a prompt** ends the command quietly with exit code 130 instead
+  of *Unhandled error*.
+
+
 ## [0.9.8] — 2026-10-04
 
 Highlights: OAR has a logo, an otter, with icons that follow Day and Night

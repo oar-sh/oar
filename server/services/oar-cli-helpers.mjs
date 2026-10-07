@@ -1,5 +1,5 @@
 /**
- * Pure helpers behind `oar setup` and `oar doctor` — everything here is
+ * Pure helpers behind the `oar` command line — everything here is
  * deterministic and unit-testable; the interactive glue stays in bin/oar.js.
  */
 
@@ -39,6 +39,135 @@ export function relayUrl({ config, lanAddress = null } = {}) {
   const host = !config?.localhostOnly && lanAddress ? lanAddress : 'localhost';
   const token = String(config?.authToken || '').trim();
   return `http://${host}:${config?.port || 3333}/?token=${encodeURIComponent(token)}`;
+}
+
+/**
+ * What `oar setup` and `oar url` print about the relay's address. `qrUrl` is
+ * set only for an address a phone can reach: the LAN address when LAN access
+ * is on, and never one that is internal to WSL. `tunnelUrl` is the address a
+ * running relay reports for its tunnel, with the token added.
+ */
+export function describeRelayAddress({ config, lanAddress = null, wslNat = false, tunnelBase = '' } = {}) {
+  const lan = config?.localhostOnly === false;
+  const url = relayUrl({ config: { ...config, localhostOnly: !lan }, lanAddress });
+  const lines = [`[oar] Relay URL: ${url}`];
+  let qrUrl = null;
+  if (!lan) {
+    lines.push('[oar] This machine only. For a phone, switch on LAN access (oar setup --lan) or use a tunnel (README: Remote access).');
+  } else if (!lanAddress) {
+    lines.push('[oar] LAN access is on, but this machine has no network address.');
+  } else if (wslNat) {
+    lines.push('[oar] That address is internal to WSL; other devices cannot reach it. Ways out: a tunnel (README: Remote access), or WSL\'s mirrored networking (networkingMode=mirrored in .wslconfig).');
+  } else {
+    qrUrl = url;
+  }
+  const base = String(tunnelBase || '').trim().replace(/\/+$/, '');
+  const tunnelUrl = base ? `${base}/?token=${encodeURIComponent(String(config?.authToken || '').trim())}` : null;
+  return { url, lines, qrUrl, tunnelUrl };
+}
+
+const VALUE_OPTIONS = ['--port', '--migrate-from', '--to'];
+const LAUNCHER_FLAGS = ['--install-extension', '--no-install-extension', '--migrate-from'];
+const COMMAND_OPTIONS = { '--setup': 'setup', '--start': 'start', '--stop': 'stop', '--status': 'status' };
+const CLI_COMMANDS = {
+  menu: {},
+  start: {},
+  stop: {},
+  restart: {},
+  status: {},
+  url: {},
+  doctor: {},
+  help: {},
+  version: {},
+  setup: { flags: ['--lan', '--local', '--new-token', '--defaults', '--start'], values: ['--port', '--migrate-from'] },
+  service: { words: ['install', 'remove', 'status'] },
+  update: { flags: ['--beta'], values: ['--to'] },
+  copilot: { flags: ['--install-extension', '--no-install-extension'], values: ['--port', '--migrate-from'], forwards: true },
+};
+
+export function usageText() {
+  return [
+    'Usage: oar [command] [options]',
+    '',
+    '  oar                    Menu in a terminal; status and this text elsewhere',
+    '  oar start              Start the relay in the background',
+    '  oar stop               Stop the relay (waits for running turns)',
+    '  oar restart            Restart the relay (waits for running turns)',
+    '  oar status             Is the relay running, on which port, as a service',
+    '  oar url                Relay URL, with a QR code when a phone can reach it',
+    '  oar setup              Auth token, access and port; asks, or takes',
+    '                         [--port <port>] [--lan | --local] [--new-token] [--defaults] [--start]',
+    '  oar service install | remove | status',
+    '                         Start the relay at login',
+    '  oar copilot [--port <port>] [--install-extension] [--no-install-extension] [-- gh copilot args...]',
+    '                         Relay plus a Copilot terminal session',
+    '  oar doctor             Check the install and the provider CLIs',
+    '  oar update [--beta] [--to <version>]',
+    '  oar help               This text',
+    '  oar --version',
+  ].join('\n');
+}
+
+/**
+ * Reads the command line into `{ command, args }`, or `{ error }` for anything
+ * `oar` does not know, so nothing starts by accident. The command may follow
+ * options (`oar --port 3339 setup`), and `--setup`, `--start`, `--stop` and
+ * `--status` name it too. Without a command the launcher's own flags (or a
+ * `--` part) mean the Copilot session, and nothing at all means the menu.
+ */
+export function parseCliArgs(argv = []) {
+  const all = (Array.isArray(argv) ? argv : []).map((arg) => String(arg));
+  const separator = all.indexOf('--');
+  const head = separator === -1 ? all : all.slice(0, separator);
+  const forwarded = separator === -1 ? [] : all.slice(separator);
+  if (head.includes('--help') || head.includes('-h')) return { command: 'help', args: [] };
+
+  let command = null;
+  let args = [];
+  for (let index = 0; index < head.length; index += 1) {
+    const arg = head[index];
+    if (VALUE_OPTIONS.includes(arg)) {
+      if (index + 1 >= head.length) return { error: `${arg} needs a value.` };
+      args.push(arg, head[index += 1]);
+    } else if (arg.startsWith('-') || command) {
+      args.push(arg);
+    } else {
+      command = arg;
+    }
+  }
+  if (!command) {
+    const named = args.includes('--setup') ? '--setup' : args.find((arg) => COMMAND_OPTIONS[arg]);
+    if (args.includes('--version') || args.includes('-v')) return { command: 'version', args: [] };
+    if (named) {
+      command = COMMAND_OPTIONS[named];
+      args.splice(args.indexOf(named), 1);
+    } else if (forwarded.length || args.some((arg) => LAUNCHER_FLAGS.includes(arg))) {
+      command = 'copilot';
+    } else if (!args.length) {
+      command = 'menu';
+    } else {
+      // An option this command line knows needs its command; any other is unknown.
+      const known = [...VALUE_OPTIONS, '--lan', '--local', '--new-token', '--defaults', '--beta'];
+      return { error: known.includes(args[0]) ? `${args[0]} needs a command.` : `Unknown option: ${args[0]}` };
+    }
+  }
+
+  const spec = Object.hasOwn(CLI_COMMANDS, command) ? CLI_COMMANDS[command] : null;
+  if (!spec) return { error: `Unknown command: ${command}` };
+  if (forwarded.length && !spec.forwards) return { error: `oar ${command} takes no "--" part.` };
+  let words = 0;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const name = arg.startsWith('--') ? arg.split('=')[0] : arg;
+    if (spec.values?.includes(name)) {
+      if (arg === name) index += 1;
+    } else if (spec.words?.includes(arg) && words === 0) {
+      words += 1;
+    } else if (!spec.flags?.includes(arg)) {
+      return { error: arg.startsWith('-') ? `Unknown option for oar ${command}: ${arg}` : `Unexpected argument: ${arg}` };
+    }
+  }
+  return { command, args: [...args, ...forwarded] };
 }
 
 /**
@@ -102,7 +231,7 @@ export function buildServicePath({ nodeBin, envPath = '', homeDir = '' } = {}) {
  * accept the flag and run the scripts as before. `npm-install-scripts.test.mjs`
  * holds this list to the lockfile.
  */
-export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze(['better-sqlite3', 'cloudflared', 'koffi']);
+export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze(['better-sqlite3', 'koffi']);
 export const NPM_ALLOW_SCRIPTS_ARG = `--allow-scripts=${NPM_INSTALL_SCRIPT_PACKAGES.join(',')}`;
 
 /**
@@ -155,6 +284,8 @@ export function renderDoctorReport({
   dbPath,
   dbSizeBytes,
   probes = [],
+  warnings = [],
+  tunnel = '',
 }) {
   const yesNo = (v) => (v ? 'yes' : 'no');
   const lines = [
@@ -167,13 +298,17 @@ export function renderDoctorReport({
   if (config) {
     lines.push(`  port          : ${config.port ?? 3333} (localhostOnly: ${yesNo(config.localhostOnly !== false)})`);
     lines.push(`  auth token    : ${String(config.authToken || '').trim() ? 'set' : 'MISSING'}`);
-    const tunnel = config.cloudflaredTunnel || {};
-    lines.push(`  tunnel        : ${tunnel.enabled === true || tunnel.mode === 'managed' ? 'managed' : 'disabled'}`);
+    // `tunnel` is the caller's finding (describeConfiguredTunnel: is the tunnel
+    // on, and is there a cloudflared to run it); without one, the config's word.
+    const tunnelConfig = config.cloudflaredTunnel || {};
+    const configured = tunnelConfig.enabled === true || tunnelConfig.mode === 'managed' ? 'managed' : 'disabled';
+    lines.push(`  tunnel        : ${tunnel || configured}`);
   }
   lines.push(`  database      : ${dbSizeBytes !== null ? `${dbPath} (${(dbSizeBytes / 1048576).toFixed(1)} MB)` : `${dbPath} (not created yet)`}`);
   lines.push('  provider CLIs :');
   for (const probe of probes) {
     lines.push(`    ${probe.id.padEnd(14)}: ${probe.ok ? probe.version || 'installed' : 'not found'}`);
   }
+  for (const warning of warnings) lines.push(`  warning       : ${warning}`);
   return lines.join('\n');
 }

@@ -70,12 +70,13 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 | ----------- | ---------- | ----- |
 | Node.js 22.13 or newer | always | The macOS and Linux installer fetches its own copy when yours is missing or too old; the Windows installer only checks. Running the development test suite needs Node 24 (see [DEVELOPING.md](DEVELOPING.md#node-version)) |
 | GitHub Copilot CLI (`copilot`), signed in | Copilot and OpenAI (BYOK) chats | Install it with `npm install -g @github/copilot`, then run `copilot` once on the relay host and sign in. The relay looks for the CLI's runtime when it starts, so restart the relay after installing or upgrading the CLI. Needs a GitHub Copilot plan that includes Copilot CLI |
-| GitHub CLI (`gh`), signed in | the `oar` launcher command; Extension-engine sessions on Windows; the Copilot card in **Check Usage** | `gh copilot` is built into current GitHub CLI releases, so there is no extension to install. The usage card also accepts a token in `GH_TOKEN` or `GITHUB_TOKEN` |
+| GitHub CLI (`gh`), signed in | `oar copilot`; Extension-engine sessions on Windows; the Copilot card in **Check Usage** | `gh copilot` is built into current GitHub CLI releases, so there is no extension to install. The usage card also accepts a token in `GH_TOKEN` or `GITHUB_TOKEN` |
 | OpenAI API key | OpenAI and OpenAI Image chats | Entered in **⚙️ Settings**, stored in the relay database |
 | A Claude login on the relay host | Claude chats | Log in from **⚙️ Settings → Providers → Claude → Relogin** (the panel can install the Claude Code CLI first), or run `claude` once on the host. The relay stores no Claude key |
 | The same Claude login, from a claude.ai account with GitHub connected | Claude Cloud chats | The Claude GitHub app must be allowed on each repository a cloud chat works on (see [Claude Cloud](#claude-cloud)) |
 | Cursor API key | Cursor chats | Entered in **⚙️ Settings**, stored in the relay database |
 | Grok CLI, signed in | Grok chats | Install it and sign in from **⚙️ Settings → Providers → Grok**, or set `XAI_API_KEY` in the relay's environment |
+| `cloudflared` (optional) | the built-in Cloudflare tunnel | Not included; install it yourself (see [Cloudflare Tunnel](#optional-remote-internet-access-cloudflare-tunnel)) |
 | tmux (optional) | Linux and macOS | Session workers run in detached tmux sessions you can watch from the browser (**🖥️ Inspect tmux console**). Without tmux they run as plain background processes |
 
 ### macOS and Linux
@@ -100,7 +101,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.8 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.9 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -113,16 +114,16 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.6'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.9'` before the command.
 
 ### npm
 
 ```bash
-npm install -g --allow-scripts=better-sqlite3,cloudflared,koffi @oar-sh/oar
+npm install -g --allow-scripts=better-sqlite3,koffi @oar-sh/oar
 oar setup
 ```
 
-npm 12 runs no install script it was not told to allow, and three of OAR's dependencies fetch their native binary in one; without `--allow-scripts` the install succeeds there and the relay then fails to start. npm 10 and 11 accept the flag and need none. The installers and `oar update` pass it themselves.
+npm 12 runs no install script it was not told to allow, and two of OAR's dependencies fetch their native binary in one; without `--allow-scripts` the install succeeds there and the relay then fails to start. npm 10 and 11 accept the flag and need none. The installers and `oar update` pass it themselves.
 
 ### From a git checkout
 
@@ -150,12 +151,11 @@ Development workflows, tests, and relay internals are in [DEVELOPING.md](DEVELOP
 
 ### Start the relay
 
-The macOS and Linux installer starts the relay itself. After a manual install, `oar setup` creates the config and prints the relay URL with a QR code, but it does not start the relay unless you pass `--start`. Pick one:
+The macOS and Linux installer starts the relay itself. After a manual install, `oar setup` creates the config and prints the relay URL, but it does not start the relay unless you pass `--start`. `oar` alone, in a terminal, opens a menu with everything below.
 
-- **Any global install on macOS or Linux:** `oar start` starts the relay in the background (through the systemd user service when one is installed) and prints the relay URL. `oar setup --defaults --start` is what the installer runs: it also installs and enables the systemd user service where a systemd user session exists, and enables lingering.
-- **Linux (global install), by hand:** accept the systemd user service that `oar setup` offers, then run `systemctl --user enable --now oar`. The relay then starts when you log in; run `loginctl enable-linger "$USER"` once if it should keep running while you are logged out. The unit carries the `PATH` of the shell that ran `oar setup`, plus `~/.local/bin`, so the relay's sessions find the tools you have; rerun `oar setup` after your `PATH` changed.
-- **Windows:** start the relay once with `oar`, then choose **⚙️ Settings → General → Autostart (Windows)**: *At sign-in* opens a visible terminal after you log on, and *At system startup* runs it headless before anyone signs in, after one admin confirmation on the PC itself.
-- **Any platform:** `oar` starts the relay in the background if it is not already running, then opens the Copilot CLI (`gh copilot`) in the same shell. A relay that `oar` started stops again when that Copilot session ends, and `oar` needs the GitHub CLI.
+- **Any global install:** `oar start` starts the relay in the background (through the systemd user service when one is installed) and prints the relay URL. `oar stop` stops it, `oar restart` restarts it, `oar status` says whether it runs; stop and restart wait for running turns.
+- **At every login:** `oar service install`. On Linux that writes and enables a systemd user service and enables lingering, so the relay is back after a reboot and keeps running while you are logged out; the unit carries the `PATH` of the shell that ran the command, plus `~/.local/bin`, so the relay's sessions find the tools you have (run it again after your `PATH` changed). On Windows it switches on the same autostart as **⚙️ Settings → General → Autostart (Windows)** → *At sign-in*; *At system startup*, which runs the relay headless before anyone signs in, is set in the web UI because it needs one admin confirmation. `oar service remove` takes it out again. Not available on macOS yet, nor on a Linux without a systemd user session (containers, WSL without systemd): use `oar start` there.
+- **With a Copilot terminal session:** `oar copilot` starts the relay in the background if it is not already running, then opens the Copilot CLI (`gh copilot`) in the same shell. A relay that `oar copilot` started stops again when that session ends. It needs the GitHub CLI.
 
 To run the relay of a global install in the foreground, start the server the way the systemd unit does:
 
@@ -168,22 +168,24 @@ node "$(npm root -g)/@oar-sh/oar/server/server.js"
 
 On Windows, point the same three variables at `%APPDATA%\oar\config.json`, `%APPDATA%\oar\data`, and `%APPDATA%\oar\logs`. The directory you start it from becomes the default working directory for new sessions.
 
-Then open the URL that `oar setup` printed, or scan its QR code. With `localhostOnly` on (the default) that is `http://localhost:3333/` on the relay host; reach it from other devices through a [tunnel](#remote-access), or set `localhostOnly` to `false` in the config file and restart the relay for LAN access. The URL carries your token once (`?token=…`); after that, the relay keeps the browser signed in with an HttpOnly cookie.
+Then open the URL that `oar setup` printed (`oar url` prints it again). With access set to this machine only (the default, `localhostOnly` in the config) that is `http://localhost:3333/` on the relay host; reach it from other devices through a [tunnel](#remote-access), or switch on LAN access with `oar setup --lan`, which also prints a QR code for your phone. The URL carries your token once (`?token=…`); after that, the relay keeps the browser signed in with an HttpOnly cookie.
 
 ### The `oar` command
 
 | Command | What it does |
 | ------- | ------------ |
-| `oar` | Starts the relay in the background unless one is already running, then runs `gh copilot` in the same shell. The relay's output goes to its log directory, not your terminal |
-| `oar -- <args>` | The same, passing `<args>` through to the Copilot CLI (`gh copilot -- <args>`) |
-| `oar --port <port>` | Finds or starts the relay on `<port>` for this run, overriding the config's `port` without changing the file; a config this command creates saves it. Without it, `oar` uses the config's `port` (default `3333`) |
-| `oar --migrate-from <dir>` | Global installs: copies the relay state of a pre-rename git checkout at `<dir>` into the OAR state root, once. The source is never moved or changed, and a relay still running from it blocks the copy. `oar setup` accepts the same option |
-| `oar --install-extension` | Writes or refreshes the user-global Copilot CLI extension wrapper in `~/.copilot/extensions/web-relay/`, then exits. Plain `oar` does this on every run; `--no-install-extension` skips it |
-| `oar setup [--defaults] [--start] [--port <port>]` | Creates or updates the config: generates an auth token (with a config already present it offers a new one, which signs every device out), asks whether a new config should allow LAN access and whether to enable the managed Cloudflare tunnel, offers the systemd user service on Linux global installs, then prints the relay URL and a QR code. An existing config keeps its `localhostOnly` value. `--defaults` accepts every default without asking. `--port` sets the relay port; without it a new config takes the first free port from 3333 on, and an existing config keeps its port. `--start` (global installs) also gets the relay running without a question: with a systemd user session it writes and enables the service and enables lingering, elsewhere it starts the relay in the background; a relay that is already running is left alone |
-| `oar start` | Global installs: starts the relay in the background without a Copilot session, through the systemd user service when one is installed, and prints the relay URL. A relay that is already running is left alone |
-| `oar doctor` | Prints the version, Node.js, install mode, state root, config path, port, whether an auth token is set, the tunnel mode, the database path and size, and which provider CLIs (`gh`, `claude`, `grok`) answer. It changes nothing |
+| `oar` | In a terminal: a menu with the relay's status (running or stopped, version, URL, port, access, service) and an entry for each command below; arrow keys or digits, Enter, `q`. Without a terminal: the status and the usage |
+| `oar start` | Starts the relay in the background, through the systemd user service when one is installed, and prints the relay URL. A relay that is already running is left alone. Global installs only; a git checkout uses `npm start` |
+| `oar stop` | Stops the relay: the systemd service through `systemctl --user stop oar`, any other relay through its own API, once no turn is running |
+| `oar restart` | Restarts a running relay once no turn is running (the service through systemd, at once), or starts a stopped one |
+| `oar status` | Says whether the relay runs, on which port and with which access, and whether the service is installed. Exit code 0 when it runs, 3 when it does not |
+| `oar url` | Prints the relay URL. With LAN access it also prints a QR code; with access for this machine only it says how to get phone access instead. When the running relay reports a tunnel address, that address and its QR code follow |
+| `oar setup` | Creates or updates the config. In a terminal it asks, showing the current value (Enter keeps it): a new auth token (which signs every device out), access (this machine only, or LAN), and the port. Options answer without a question: `--port <port>`, `--lan` or `--local`, `--new-token`; `--defaults` keeps everything of an existing config and gives a new one access for this machine only and the first free port from 3333 on. A port must be free, unless the install's own running relay holds it. When the token, the port or the access changed while the relay runs, setup restarts it (in a terminal it asks first) and waits until it answers with the new settings. `--start` (global installs, used by the installer) also installs the service where a systemd user session exists and starts the relay. `--migrate-from <dir>` copies the relay state of a pre-rename git checkout at `<dir>` into the OAR state root, once; the source is never changed, and a relay still running from it blocks the copy |
+| `oar service install` \| `remove` \| `status` | Starts the relay at every login: a systemd user service on Linux, the sign-in autostart on Windows. See [Start the relay](#start-the-relay) |
+| `oar copilot [-- <args>]` | Starts the relay in the background unless one already answers on its port, then runs `gh copilot` in the same shell, passing `<args>` through (`gh copilot -- <args>`). `--port <port>` finds or starts the relay on that port for this run without changing the config; a config this command creates saves it. `--install-extension` writes or refreshes the user-global Copilot CLI extension wrapper in `~/.copilot/extensions/web-relay/`, then exits; every run does that unless `--no-install-extension` is given. The same options without the word `copilot` (`oar -- <args>`, `oar --install-extension`) still run this command |
+| `oar doctor` | Prints the version, Node.js, install mode, state root, config path, port, whether an auth token is set, the tunnel mode and whether the `cloudflared` it needs is installed, the database path and size, and which provider CLIs (`gh`, `claude`, `grok`) answer. It changes nothing |
 | `oar update [--beta] [--to X.Y.Z]` | Global installs: looks up the newest release of your channel in `https://oar.sh/latest.json` (`--beta` for the beta channel), installs it with `npm install -g` (the npm of the Node.js that runs `oar`, into the folder the package is installed in), and asks a running relay to restart once no turn is running. `--to X.Y.Z` installs that version straight from npm, which works even when `OAR_NO_UPDATE_CHECK=1` blocks the lookup |
-| `oar --version`, `oar --help` | Prints the version, or the usage |
+| `oar --version`, `oar help` | Prints the version, or the usage. An unknown command or option prints the usage and exits with code 2 |
 
 ### Where OAR keeps its files
 
@@ -472,6 +474,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 - Agents can embed **images, video, and audio** in a reply by their absolute path, on every runtime; clicking an embedded image opens the file viewer with zoom, download, and copy
 - **Screenshot annotations**: mark up an uploaded screenshot with highlighter strokes before or after sending; the original upload is never modified
 - **Share** a conversation by read-only link, and hide individual messages from the shared view
+- **Pin** messages in a conversation and get back to them from a list that scrolls to each one
 - Conversation history in local SQLite, including the Copilot sessions already stored on the host
 - `/compact` continues in a fresh conversation seeded with a summary; `/preview` publishes a local dev server or folder on a public preview host
 - Workspace and drive browser with file previews, **Git changes** with a diff viewer, and `@file:` / `@folder:` reference tokens
@@ -558,6 +561,10 @@ The composer draft, attachments included, is saved per conversation on the relay
 
 Use **➡️ Share conversation** in the `⋯` menu to publish a read-only link. Each message has a **Hide** button that keeps it out of the shared view without deleting it; hidden messages stay fully visible to you, marked *Hidden from shared viewers*, with an **Unhide** button. Anyone with the link can read the shared view, without signing in.
 
+### Pinned messages
+
+Each message has a **Pin** button next to **Hide**; a pinned message is marked *📍 Pinned* and offers **Unpin**. Once a conversation has pins, a **📍** button with their count appears in its header. It opens the list of pinned messages in conversation order, each with a short preview. A row closes the list and scrolls to its message, also when that message is far up in the history; **🗑** in a row unpins it. Pins are kept on the relay and show on every device at once, up to 100 per conversation. They are your own bookmarks: the shared view does not show them, and a conversation continued with `/compact` starts without them.
+
 ### Notifications and the app
 
 - **⚙️ Settings → Notifications** turns on push notifications per device: for questions from the agent, completed or failed turns, plan boards, and the CLI going offline. They need a secure context (HTTPS, or `localhost`), are sent only while no device has the app in the foreground, and show generic text unless you opt in to message previews on that device.
@@ -640,7 +647,7 @@ The config file is `server/config.json` in a git checkout and `~/.oar/config.jso
 | `cloudflaredTunnel.mode`   | `disabled`           | Cloudflare tunnel mode (`disabled` or `managed`; `enabled: true` is a legacy alias for `managed`) |
 | `cloudflaredTunnel.required` | `false`            | Pause dequeue while the managed Cloudflare tunnel is disconnected         |
 | `cloudflaredTunnel.token`  | —                    | The tunnel token from your own Cloudflare Zero Trust tunnel               |
-| `cloudflaredTunnel.binary` | *(auto)*             | `cloudflared` path; defaults to the npm package, then `PATH`              |
+| `cloudflaredTunnel.binary` | `cloudflared`      | Path or command name of the `cloudflared` you installed; defaults to `cloudflared` on `PATH` |
 | `cloudflaredTunnel.extraArgs` | `[]`              | Extra arguments appended to `cloudflared tunnel run`                      |
 | `previews.enabled`         | `false`              | Publish local dev servers on a separate listener (see [docs/preview-servers.md](docs/preview-servers.md)) |
 | `previews.port`            | `port + 1`           | Loopback port for the preview listener; `0` picks an ephemeral port        |
@@ -726,11 +733,18 @@ An alternative to the SSH tunnel that needs no VPS and no inbound port: the rela
 supervises Cloudflare's `cloudflared` binary, and Cloudflare carries your hostname down
 to `127.0.0.1:3333`.
 
+OAR does not include `cloudflared`; install it on the relay host first:
+
+| System | Install |
+| ------ | ------- |
+| Windows | `winget install --id Cloudflare.cloudflared` |
+| macOS | `brew install cloudflared` |
+| Linux | Cloudflare's package repository (Debian, Ubuntu, RHEL): [pkg.cloudflare.com](https://pkg.cloudflare.com/) |
+
 1. In your own Cloudflare Zero Trust account, create a tunnel and route a public hostname on
    your zone to `http://localhost:3333` (or your `port`). That routing lives in Cloudflare, not
    on this machine.
-2. Put the tunnel's token into the config and restart the relay. (`oar setup` can switch the
-   tunnel on for you; it still needs the token.)
+2. Put the tunnel's token into the config and restart the relay (`oar restart`).
 
 ```json
 "cloudflaredTunnel": {
@@ -746,17 +760,21 @@ Environment overrides: `COPILOT_CLOUDFLARED_MODE`, `COPILOT_CLOUDFLARED_TOKEN`,
 `COPILOT_CLOUDFLARED_BINARY`.
 
 `localhostOnly` stays `true`: `cloudflared` connects outbound and nothing binds publicly.
-The binary resolves from `cloudflaredTunnel.binary`, then the optional `cloudflared` npm
-package, then `PATH`; a managed config with no resolvable binary is reported as a config
-error instead of crashing. Connection drops reconnect with jittered exponential backoff,
+The relay runs the `cloudflared` named in `cloudflaredTunnel.binary`, or else the one on
+its `PATH`. When there is none, the relay starts as usual and the tunnel stays off: the
+status dot's tooltip, `oar doctor` and the server log say that `cloudflared` is not
+installed and how to install it. The relay looks again every minute and starts the tunnel
+once `cloudflared` is there; restart the relay if it was installed into a folder that is
+not on the relay's `PATH`. With `required: true` the queue stays paused for as long as
+the tunnel is not connected, a missing `cloudflared` included. Connection drops reconnect with jittered exponential backoff,
 and repeated fast exits (deleted tunnel or bad token) are reported as `auth-or-config`
 instead of hammering Cloudflare.
 
 The relay status dot turns **amber** while the Cloudflare tunnel is connected, so it is
 obvious at a glance that the relay is reachable from the internet rather than only from
 this machine. It stays green when no tunnel is configured and grey when the relay itself
-is unreachable; a managed tunnel that has dropped keeps the dot green — the relay still
-answers locally — and reports the drop in the tooltip.
+is unreachable; a managed tunnel that has dropped, or could not start, keeps the dot green — the relay
+still answers locally — and gives the reason in the tooltip.
 
 ### Session-worker path guard
 
@@ -891,11 +909,12 @@ under **General** (60 minutes by default), which does not know about the wait.
 
 ## Security notes
 
-- The auth token guards the API and the Socket.IO channel. A browser signs in once, with the token or with a URL carrying `?token=` (such as the one `oar setup` prints and puts in its QR code), and then holds an HttpOnly cookie for 30 days, marked `Secure` when the relay is reached over HTTPS. Treat the token, and that URL, like a password.
-- Keep the config file private (the relay keeps it owner-only) and rotate `authToken` if it is exposed: `oar setup` offers a new token, which signs every device out.
+- The auth token guards the API and the Socket.IO channel. A browser signs in once, with the token or with a URL carrying `?token=` (such as the one `oar setup` and `oar url` print), and then holds an HttpOnly cookie for 30 days, marked `Secure` when the relay is reached over HTTPS. Treat the token, and that URL, like a password.
+- Keep the config file private (the relay keeps it owner-only) and rotate `authToken` if it is exposed: `oar setup --new-token` writes a new one and restarts the relay, which signs every device out.
 - `localhostOnly` (default `true`) keeps the relay on loopback. Beyond your LAN, use HTTPS through one of the [tunnels](#remote-access) rather than an open port.
 - Agents act with the permissions of the user the relay runs as. OAR adds reach, not a sandbox: whoever holds the token can have them run commands on the host. `workspaceRootAllowList` limits the directories conversations may start in.
 - Shared conversation links and preview links are public by design: anyone with the URL can read the shared transcript or reach the previewed app, without signing in.
+- Files the relay serves (workspace and drive files, attachments) are never run as pages on its origin: HTML and XML go out as plain text, every file carries `nosniff` and a `Content-Security-Policy` with `sandbox`. An SVG keeps its type so it can be previewed, and the sandbox denies it script and an origin should it be opened as a page. A PDF is the one exception, served without `sandbox` (browsers refuse to show a sandboxed PDF in their built-in viewer, and PDF viewers run no document script) and framable only by the relay's own origin.
 - A [paired relay](#remote-relays) holds a token that opens the other relay completely. The per-relay "Agents may" limit and the "Accept prompts from other relays' agents" switch are honoured by OAR's own traffic, but anyone holding the token can still use the full API: the token is the real boundary. A token entered for a paired relay is stored like the API keys below and never sent to browsers or agents.
 - API keys you enter (OpenAI, Cursor) are stored in the relay database on the host and never sent to browsers. Claude and Grok credentials stay with their CLIs on the host.
 - Claude Cloud, when you switch it on, reads the Claude CLI's login and uses it against Anthropic API endpoints that are not a documented public API. The token is only read and held in memory, and goes to `api.anthropic.com` only (see [Claude Cloud](#claude-cloud)). A cloud agent works in Anthropic's sandbox, not on your host.
@@ -906,7 +925,8 @@ under **General** (60 minutes by default), which does not know about the wait.
 | Symptom                            | What to check                                                                    |
 | ---------------------------------- | -------------------------------------------------------------------------------- |
 | Banner says *CLI is offline*       | No session worker has reported in during the last 10 seconds, which can be normal on an idle relay. Send a message: the relay starts that conversation's worker, and the banner clears once it connects. If it stays, check `/api/status` and the worker's `worker-<session>.log` in the log directory |
-| `oar` exits with *Copilot CLI process error: spawn gh ENOENT* | `oar` runs `gh copilot` after starting the relay, and stops the relay again when that fails. Install the GitHub CLI, or [run only the relay](#start-the-relay) |
+| `oar copilot` says the GitHub CLI is missing | It runs `gh copilot` beside the relay. Install the GitHub CLI, or [run only the relay](#start-the-relay) |
+| WSL: the browser on Windows shows another relay, or refuses the token | In WSL's default networking a port can be free in the distro while a Windows program listens on it; `localhost:<port>` in a Windows browser then reaches that program. `oar setup` picks a port that is free on both sides, and `oar status`, `oar start` and `oar doctor` warn when Windows holds the relay's port: choose another with `oar setup --port <port>` |
 | Settings refuses the **SDK** engine | Install or upgrade the Copilot CLI, run `copilot` once, and restart the relay (see [engine choice](#github-copilot--engine-choice)) |
 | Messages stuck pending             | Only one relay may run per data directory (a second one exits on the singleton lock), and only one process may own port `3333`. `oar doctor` shows the config and database in use |
 | Wrong or old model list            | **🤗 Select Models → Refresh** reruns discovery; `/api/model-variants` shows the Copilot catalog's `source` and `refreshedAt` |
@@ -925,7 +945,8 @@ under **General** (60 minutes by default), which does not know about the wait.
 | A conversation seems wedged        | **☠️ Kill session** in the `⋯` menu stops its worker; retry the turn or send a new message |
 | **🌄 Restart web relay** fails with *localhost-only* | The restart endpoint accepts loopback connections only: use it on the relay host or through a tunnel, not over a direct LAN connection |
 | `npm install -g @oar-sh/oar` fails with `EACCES` | npm's global folder needs root (a distribution or NodeSource Node.js). Do not use `sudo`; run the installer (`curl -fsSL oar.sh/install \| sh`), which installs into `~/.oar/npm` instead |
-| The relay does not start after an install with npm 12 (a `better-sqlite3` error in `server-err.log`) | npm 12 skipped the install scripts of OAR's native dependencies. Reinstall with `npm install -g --allow-scripts=better-sqlite3,cloudflared,koffi @oar-sh/oar` |
+| The relay does not start after an install with npm 12 (a `better-sqlite3` error in `server-err.log`) | npm 12 skipped the install scripts of OAR's native dependencies. Reinstall with `npm install -g --allow-scripts=better-sqlite3,koffi @oar-sh/oar` |
+| The Cloudflare tunnel stays off and the status dot's tooltip says `cloudflared is not installed` | OAR runs the `cloudflared` on the relay host and ships none. Install it (see [Cloudflare Tunnel](#optional-remote-internet-access-cloudflare-tunnel)); the tunnel starts within a minute |
 | `npm install -g @oar-sh/oar` fails with node-gyp or prebuild errors | `better-sqlite3` has no prebuilt binary for your platform; install a C/C++ build toolchain and Python, then retry |
 | No usage line under a reply        | Expected for OpenAI, Claude, Claude Cloud, Cursor, and Grok turns; only Copilot turns record plan usage |
 

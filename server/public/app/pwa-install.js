@@ -25,7 +25,7 @@ function matchesDisplayMode(query) {
   }
 }
 
-function isInstalledAppMode() {
+export function isInstalledAppMode() {
   const standalone = matchesDisplayMode('(display-mode: standalone)');
   const minimalUi = matchesDisplayMode('(display-mode: minimal-ui)');
   const launchedFromAndroidApp = String(document.referrer || '').startsWith('android-app://');

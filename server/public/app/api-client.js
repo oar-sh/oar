@@ -900,6 +900,36 @@ export async function updateMessageShareVisibility(conversationId, messageId, hi
   });
 }
 
+// Pin or unpin one message. Unlike apiFetch this keeps the relay's `error`
+// text on a refusal (the pin limit), so the notice can say why.
+export async function updateMessagePin(conversationId, messageId, pinned) {
+  const convId = String(conversationId || '').trim();
+  const msgId = String(messageId || '').trim();
+  if (!convId || !msgId || !networkRequestsEnabled) return null;
+  const url = `/api/conversation/${encodeURIComponent(convId)}/message/${encodeURIComponent(msgId)}/pin`;
+  try {
+    const response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(),
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify({ pinned: pinned === true }),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      console.error('API error', response.status, url);
+      return { ok: false, status: response.status, error: String(result?.error || '').trim() };
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure(url, error);
+    return null;
+  }
+}
+
 export async function updateConversationTitle(id, title) {
   const convId = String(id || '').trim();
   if (!convId) return null;

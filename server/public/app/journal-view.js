@@ -42,9 +42,10 @@ import {
   loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
-import { renderMessages, restoreInFlightThinking, focusConversationMessageById, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn } from './conversation-view.js';
+import { renderMessages, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn } from './conversation-view.js';
 import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
 import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
+import { setConversationPins, setPinsConversation } from './pinned-messages-view.mjs';
 import { setUsageLimitConversation } from './usage-limit-ui.js';
 import { mergeConversationPreviews } from './preview-cards.mjs';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
@@ -428,10 +429,14 @@ export function renderConvList() {
   scheduleConversationListBoundaryCheck();
 }
 
+// keepTranscript: the page shows a window this payload must not replace (the
+// user jumped into the history; the payload is the end of the conversation).
+// Everything but the messages still applies.
 export function applyLoadedConversationState(id, response, {
   restoreScroll = false,
   savedScrollTop = null,
   followLiveUpdates = !restoreScroll,
+  keepTranscript = false,
 } = {}) {
   if (!response) {
     setRepoBrowserSessionInfo('', '');
@@ -490,7 +495,13 @@ export function applyLoadedConversationState(id, response, {
   // live poll, and the bare loadRepoBrowserTree path resets loaded folders and
   // deep selections. The end-of-turn message_status handler refreshes the tree
   // through the restoring path instead.
-  const didRenderMessages = renderMessages(response.messages, !restoreScroll, response);
+  // Before the messages: their bubbles take Pin / Unpin from this list.
+  // Absent from an older relay's payload: keep what the socket said.
+  if ('pins' in response) setConversationPins(id, response.pins, response.pinsRevision);
+  setPinsConversation(id);
+  const didRenderMessages = keepTranscript
+    ? false
+    : renderMessages(response.messages, !restoreScroll, response);
   hydrateConversationDraft(id, {
     draftText: response.draftText,
     draftAttachments: response.draftAttachments,
@@ -605,6 +616,9 @@ export async function openConversation(id, options = {}) {
     return;
   }
   if (r) {
+    // Counted when the window is put on the page, not when it is asked for:
+    // a reload of the end that is still on its way must see the change.
+    if (forceFreshWindow) noteTranscriptJump();
     applyLoadedConversationState(id, r, { restoreScroll, savedScrollTop });
     if (focusMessageId) {
       requestAnimationFrame(() => {

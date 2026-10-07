@@ -7,8 +7,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
-import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
+import { serveFileWithRangeSupport } from '../services/file-serving.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
+import { MESSAGE_PIN_LIMIT, buildPinList } from '../services/message-pin-list.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import { CLAUDE_ATTRIBUTION_MODES, DEFAULT_CLAUDE_ATTRIBUTION_MODE, claudeAttributionModelLabel, claudeAttributionTrailer, normalizeClaudeAttributionMode, resolveClaudeAttributionMode } from '../../shared/claude-attribution.mjs';
@@ -88,6 +89,9 @@ const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing
 // Registry statuses that mean "this worker is currently running" (same triple
 // as countActiveCliWorkers in server-runtime.mjs).
 const SESSION_WORKER_ACTIVE_STATUSES = Object.freeze(['starting', 'ready', 'processing']);
+// A shared attachment's URL names its bytes (sha256 or a fixed generated-image
+// path), so a kept answer stays right.
+const SHARED_CONTENT_CACHE_CONTROL = 'private, max-age=31536000, immutable';
 
 function normalizeWorkerStatusText(value, fallback = null) {
   const text = String(value || '').trim();
@@ -1834,6 +1838,7 @@ export function buildConversationMessages({
           attachments: message?.attachments || [],
           mode: message?.mode || undefined,
           hiddenFromShares: Number(message?.hidden_from_shares || 0) === 1,
+          pinned: !!message?.pinned_at,
           timestamp: message?.timestamp,
           sourceMessageId,
           executedProvider: message?.executed_provider || message?.executedProvider || undefined,
@@ -2218,6 +2223,23 @@ export function registerSessionsRoutes(app, deps) {
       AND (id = ? OR response_message_id = ?)
     LIMIT 1
   `);
+  function listConversationPins(conversationId) {
+    return buildPinList(stmts.listPinnedMessages?.all?.(conversationId) || []);
+  }
+  // Orders the pin lists a browser receives. A conversation load that left
+  // before a pin change can arrive after the change's own socket event; with
+  // the revision the browser can tell the older list from the newer one. In
+  // memory only: a restart starts above every revision handed out before.
+  const pinRevisionFloor = Date.now();
+  const pinRevisionByConversation = new Map();
+  function conversationPinRevision(conversationId) {
+    return pinRevisionByConversation.get(conversationId) || pinRevisionFloor;
+  }
+  function bumpConversationPinRevision(conversationId) {
+    const next = Math.max(Date.now(), conversationPinRevision(conversationId) + 1);
+    pinRevisionByConversation.set(conversationId, next);
+    return next;
+  }
   const listSessionWorkerQueueRows = db.prepare(`
     SELECT id, conversation_id, runtime_session_id, owner_sdk_session_id, status
     FROM queue
@@ -2712,7 +2734,9 @@ export function registerSessionsRoutes(app, deps) {
     });
     messages = messages.map((message) => {
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
-      const withSource = sourceMessageId ? { ...message, sourceMessageId } : message;
+      // Pins are the owner's bookmarks: a public share never learns of them.
+      const { pinned: _pinned, ...unpinnedMessage } = message;
+      const withSource = sourceMessageId ? { ...unpinnedMessage, sourceMessageId } : unpinnedMessage;
       // A public share never shows another relay's address or ids.
       const nextMessage = withSource.origin
         ? { ...withSource, origin: publicRemoteRelayOrigin(withSource.origin) }
@@ -3600,6 +3624,9 @@ export function registerSessionsRoutes(app, deps) {
       cloud: conversationCloudPayload(conv, runtimeSession),
       messages: history.messages,
       pageInfo: history.pageInfo,
+      // A re-import can move a pin onto a new message id.
+      pins: listConversationPins(conversationId),
+      pinsRevision: conversationPinRevision(conversationId),
       refreshed: true,
     });
   });
@@ -3777,20 +3804,14 @@ export function registerSessionsRoutes(app, deps) {
     if (!file) return res.status(404).json({ error: 'Shared attachment not found' });
     const filePath = uploadPathForSha(sha256);
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Missing file on disk' });
-    // Unauthenticated share viewers: neutralize executable types (HTML/SVG),
-    // force nosniff + sandbox so an attachment can't run as script on this origin.
-    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    // Unauthenticated share viewers: the serving helper neutralizes executable
+    // types (HTML/SVG) and forces nosniff + sandbox so an attachment can't run
+    // as script on this origin; ranges let a shared video seek.
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
-    applySafeServedContentHeaders(res, file.mime_type, { fileName: file.name || file.file_name || '' });
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', () => {
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Failed to stream shared attachment' });
-        return;
-      }
-      res.destroy();
+    serveFileWithRangeSupport(req, res, filePath, { contentType: file.mime_type }, {
+      safeName: String(file.name || file.file_name || '').replace(/"/g, ''),
+      cacheControl: SHARED_CONTENT_CACHE_CONTROL,
     });
-    stream.pipe(res);
   });
 
   app.get('/api/shared/:token/generated-image/:messageId/:imageId/content', (req, res) => {
@@ -3832,18 +3853,10 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(404).json({ error: 'Shared attachment not found' });
     }
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Shared attachment not found' });
-    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
-    applySafeServedContentHeaders(res, attachment.type);
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', () => {
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Failed to stream shared attachment' });
-        return;
-      }
-      res.destroy();
+    serveFileWithRangeSupport(req, res, filePath, { contentType: attachment.type }, {
+      cacheControl: SHARED_CONTENT_CACHE_CONTROL,
     });
-    stream.pipe(res);
   });
 
   // GET /api/conversation/:id — get paginated conversation history
@@ -4000,6 +4013,9 @@ export function registerSessionsRoutes(app, deps) {
       backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
       usageLimitPause: usageLimitPauseService?.getPause?.(resolvedConversationId) || null,
       previews: listConversationPreviews?.(resolvedConversationId) || [],
+      // Every pin of the conversation, also those outside this history page.
+      pins: listConversationPins(resolvedConversationId),
+      pinsRevision: conversationPinRevision(resolvedConversationId),
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,
@@ -4056,6 +4072,57 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       messageId,
       hiddenFromShares,
+    });
+  });
+
+  // Pin or unpin one message. Unlike share visibility this may change while
+  // the message's turn runs (nothing public depends on it), and every open
+  // client learns of it through the socket instead of reloading.
+  app.patch('/api/conversation/:id/message/:messageId/pin', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const messageId = String(req.params.messageId || '').trim();
+    if (!conversationId || !messageId) {
+      return res.status(400).json({ error: 'Missing conversation or message id' });
+    }
+    if (typeof req.body?.pinned !== 'boolean') {
+      return res.status(400).json({ error: 'pinned must be a boolean' });
+    }
+
+    const conv = stmts.getConvAnyStatus.get(conversationId);
+    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    const message = stmts.getMessageByConversation?.get(messageId, conversationId) || null;
+    if (!message) return res.status(404).json({ error: 'Message not found' });
+    if (!stmts.setMessagePinnedAt || !stmts.countPinnedMessages) {
+      return res.status(503).json({ error: 'Pinning messages is unavailable until the relay restarts' });
+    }
+
+    const pinned = req.body.pinned === true;
+    const currentlyPinned = !!message.pinned_at;
+    if (currentlyPinned !== pinned) {
+      if (pinned && Number(stmts.countPinnedMessages.get(conversationId)?.cnt || 0) >= MESSAGE_PIN_LIMIT) {
+        return res.status(409).json({
+          error: `This conversation already has ${MESSAGE_PIN_LIMIT} pinned messages. Unpin one first.`,
+          code: 'pin-limit',
+          limit: MESSAGE_PIN_LIMIT,
+        });
+      }
+      stmts.setMessagePinnedAt.run(pinned ? new Date().toISOString() : null, messageId, conversationId);
+    }
+
+    const pins = listConversationPins(conversationId);
+    if (currentlyPinned !== pinned) {
+      const revision = bumpConversationPinRevision(conversationId);
+      io?.emit?.('conversation_pins_updated', { conversationId, pins, revision });
+    }
+    return res.json({
+      ok: true,
+      conversationId,
+      messageId,
+      pinned,
+      pins,
+      pinsRevision: conversationPinRevision(conversationId),
     });
   });
 
@@ -5461,6 +5528,7 @@ export function registerSessionsRoutes(app, deps) {
         reconnectAttempts: runtimeState.cloudflaredTunnelState?.reconnectAttempts ?? 0,
         connectedSince: runtimeState.cloudflaredTunnelState?.connectedSince ?? null,
         lastError: runtimeState.cloudflaredTunnelState?.lastError ?? null,
+        binaryMissing: runtimeState.cloudflaredTunnelState?.binaryMissing ?? false,
         valid: runtimeState.cloudflaredTunnelState?.valid ?? true,
       },
       workerWebSocket: runtimeState.workerWebSocketStatus || null,
