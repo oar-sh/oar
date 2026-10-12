@@ -32,7 +32,7 @@ test('findMessageLeaks names each pattern once', () => {
 });
 
 function topicBranch(box, name = 'dev/topic') {
-  box.git('switch', '-q', '-c', name);
+  box.git('checkout', '-q', '-b', name);
   box.commit('feature.md', 'first draft\n', 'wip');
   box.commit('feature.md', 'second draft\n', 'fixup');
   box.commit('extra.md', 'extra\n', 'more');
@@ -140,7 +140,7 @@ test('refuses: on main, dirty tree, stale base, empty branch, leaking message', 
     const run = (extra = {}) => land({ cwd: box.repo, message: 'Add the feature', gates: [], patterns: NO_PATTERNS, log: quiet, ...extra });
     assert.throws(() => run(), /you are on main/);
 
-    box.git('switch', '-q', '-c', 'dev/empty');
+    box.git('checkout', '-q', '-b', 'dev/empty');
     assert.throws(() => run(), /no commits on top of main/);
 
     topicBranch(box, 'dev/topic');

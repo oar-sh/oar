@@ -47,6 +47,10 @@ import {
   getSessionWorkerState,
   openSummaryModal,
   closeSummaryModal,
+  parseTimestampMs,
+  relayQuestions,
+  relayBoards,
+  toggleSidebar,
 } from './store.js';
 import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility, launchSessionWorker } from './api-client.js';
@@ -55,12 +59,25 @@ import { linkifyWorkspaceMentionsInNode, parseAppFileHref, renderMarkdownPreview
 import { renderAttachmentMarkup, removeComposerAttachments, uploadAttachments, setComposerAttachments, setRepoBrowserSessionInfo, openGalleryItem } from './attachments-view.js';
 import { chatMediaGallery, chatMediaItemFromNode } from './viewer-chat-gallery.mjs';
 import { buildWorkflowRunCard } from './background-tasks-view.mjs';
+import { mergeLiveSubagentRun, subagentRowsMarkup } from './subagent-row.mjs';
+import { rememberSubagentRuns, syncSubagentRowClock } from './subagent-viewer.mjs';
 import { isMessagePinned, toggleMessagePin } from './pinned-messages-view.mjs';
 import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
 import { buildTranscriptPreviewCard } from './preview-cards.mjs';
 import { closeSlashAutocomplete, handleSlashAutocompleteKey, updateSlashAutocomplete } from './slash-autocomplete.mjs';
 import { closeMentionAutocomplete, handleMentionAutocompleteKey, updateMentionAutocomplete } from './mention-autocomplete.mjs';
 import { renderRemoteOriginBadgeHtml } from './remote-relay-origin-view.mjs';
+import { isRelayEventMessage, renderRelayEventRowHtml } from './relay-event-view.mjs';
+import {
+  AGENT_EXCHANGE_CLOSED_CLASS,
+  AGENT_EXCHANGE_HEAD_CLASS,
+  AGENT_EXCHANGE_MEMBER_CLASS,
+  agentExchangeFoldOpen,
+  agentExchangeRowOf,
+  agentExchangeSummary,
+  planAgentExchangeFolds,
+  renderAgentExchangeRowHtml,
+} from './agent-exchange-fold-view.mjs';
 import { stripRemoteRelayDisplayArtifacts } from './relay-prompt-sanitizer.mjs';
 import { evaluateUnknownCommandGuard } from './slash-commands.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
@@ -98,9 +115,11 @@ import {
   syncSeparatorRail,
   syncTranscriptSeparators,
 } from './transcript-separators.mjs';
-import { ABSORBED_MSG_CLASS, STEER_MARKER_CLASS_BY_KIND, syncSteeredTurnMerge } from './steered-turn-merge.mjs';
+import { ABSORBED_MSG_CLASS, STEERED_MSG_CLASS, STEER_MARKER_CLASS_BY_KIND, syncSteeredTurnMerge } from './steered-turn-merge.mjs';
 import { resolveSubagentFold, subagentFoldSummary, toggledSubagentFoldChoice } from './subagent-fold.mjs';
 import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
+import { resolveNoConversationState } from './no-conversation-state.mjs';
+import { getProviderReadiness, isProviderSetupRequired } from './provider-readiness.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
@@ -150,6 +169,8 @@ function syncSeparatorsNow() {
   if (!el) return;
   syncTranscriptSeparators(el);
   syncSteeredTurnMerge(el);
+  // After the merge pass: a steered row's class is one of its inputs.
+  syncAgentExchangeFolds(el);
   observeTranscriptResize(el);
 }
 
@@ -265,6 +286,7 @@ export function jumpToImageParent(messageId) {
     showTransientRelayNotice('Load earlier messages to view the source image.');
     return;
   }
+  revealAgentExchangeMessage(id);
   node.scrollIntoView({ behavior: 'smooth', block: 'center' });
   node.classList.add('message-highlight');
   window.setTimeout(() => node.classList.remove('message-highlight'), 1400);
@@ -355,6 +377,8 @@ const conversationHistoryLoader = createInfiniteLoader({
     // A steering pair split across the page boundary heals here (the absorbed
     // reply just arrived above its already-rendered steered user row).
     syncSteeredTurnMerge(el);
+    // The page's agent exchanges fold before the height delta is measured.
+    syncAgentExchangeFolds(el);
     requestAnimationFrame(() => {
       if (!el || String(currentConvId || '').trim() !== currentId) return;
       const nextScrollHeight = el.scrollHeight;
@@ -555,11 +579,28 @@ function syncSendButtonState() {
     steeringHeld: steeringHold.held,
     steeringHoldReason: steeringHold.reason,
     archived: conversations[String(currentConvId || '').trim()]?.archived === true,
+    setupRequired: !String(currentConvId || '').trim() && isProviderSetupRequired(),
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
   btn.textContent = state.label;
   btn.title = state.title;
+  // The textarea follows: locked with the setup placeholder while no provider
+  // is ready, given back the moment readiness flips or a chat opens. The
+  // shared view owns its own read-only field and is left alone.
+  const input = document.getElementById('msg-input');
+  if (input && !IS_SHARED_VIEW) {
+    const lock = state.composerDisabled === true;
+    if (lock) {
+      input.disabled = true;
+      input.placeholder = state.placeholder;
+      input.dataset.setupLocked = '1';
+    } else if (input.dataset.setupLocked === '1') {
+      delete input.dataset.setupLocked;
+      input.disabled = false;
+      window.syncComposerPlaceholder?.();
+    }
+  }
 }
 
 // Button-only refresh for status, poll and question paths. It must never save
@@ -1226,6 +1267,178 @@ function splitVariantId(modelVariantId = '') {
   };
 }
 
+// The user's fold of an event row, by message id: a re-render of the
+// transcript must not open a row the user folded (or fold one they opened).
+const relayEventFoldChoices = new Map();
+
+function createRelayEventNode(msg, msgId) {
+  const div = document.createElement('div');
+  div.className = 'msg relay-event';
+  if (msgId) div.dataset.messageId = msgId;
+  const fingerprint = buildLiveMessageFingerprint({ ...msg, id: msgId || msg?.id || '' });
+  div.dataset.messageRole = fingerprint.role || '';
+  div.dataset.messageTextFingerprint = fingerprint.text || '';
+  div.dataset.messageTimestamp = String(msg?.timestamp || '').trim();
+  div.innerHTML = renderRelayEventRowHtml(msg, { escHtml, timeText: msg?.timestamp ? fmtDate(msg.timestamp) : '' });
+  const row = div.querySelector('details');
+  if (row && msgId) {
+    if (relayEventFoldChoices.has(msgId)) row.open = relayEventFoldChoices.get(msgId);
+    row.addEventListener('toggle', () => relayEventFoldChoices.set(msgId, row.open));
+  }
+  setAgentExchangeRow(div, msg, msgId);
+  return div;
+}
+
+// Agent exchanges (agent-exchange-fold-view.mjs): an agent's prompt and this
+// session's reply fold into one row. What the fold pass needs of a message is
+// kept on its node when the row is built, so the pass reads the transcript
+// itself and not the payload it came from.
+const AGENT_EXCHANGE_ROW_KEY = '__agentExchangeRow';
+// The user's toggle of an exchange, by its prompt's id: true opened, false
+// closed, unset none (agentExchangeFoldOpen: open while it works, else
+// folded). Kept through any re-render.
+const agentExchangeFoldChoices = new Map();
+// Exchanges shown for the user while this page lives: a turn that had an open
+// card, or ran while a message of the user's waited, stays shown once that
+// has passed instead of folding away under them. A reload folds it again.
+const agentExchangesShownForUser = new Set();
+// Each folded row's prompt id, by message id, and each folded exchange's
+// status, by prompt id, as of the last pass.
+let agentExchangePromptIdByMessageId = new Map();
+let agentExchangeStatusByPromptId = new Map();
+
+function setAgentExchangeRow(div, msg, msgId) {
+  div[AGENT_EXCHANGE_ROW_KEY] = agentExchangeRowOf(msg, { id: msgId || msg?.id || '', parseTimestamp: parseTimestampMs });
+}
+
+// The turns an open question or approval card (a plan board) belongs to.
+function openCardMessageIds() {
+  const ids = new Set();
+  for (const card of [...relayQuestions.values(), ...relayBoards.values()]) {
+    if (card?.status !== 'pending') continue;
+    for (const id of [card.messageId, card.queueId]) {
+      if (id) ids.add(String(id).trim());
+    }
+  }
+  return ids;
+}
+
+// The rows the plan reads, in order, and the node of each. The live bubble
+// is the running turn's row; cards and boards without a reply are not rows.
+function agentExchangeTranscriptRows(el) {
+  const rows = [];
+  const nodes = new Map();
+  for (const node of el.children) {
+    if (!node.classList?.contains('msg')) continue;
+    let row = null;
+    if (node.id === 'thinking-indicator') {
+      const id = String(node.dataset.messageId || '').trim();
+      if (id) row = { id, role: 'assistant', live: true };
+    } else if (node[AGENT_EXCHANGE_ROW_KEY]) {
+      row = { ...node[AGENT_EXCHANGE_ROW_KEY], steered: node.classList.contains(STEERED_MSG_CLASS) };
+    }
+    if (!row) continue;
+    rows.push(row);
+    nodes.set(row, node);
+  }
+  return { rows, nodes };
+}
+
+/**
+ * Fold the transcript's agent exchanges. One idempotent pass, run after every
+ * render and update of the list like the separator and merge passes. The
+ * folded row lives in the prompt's own node, as its first child, so no
+ * insertion path has to place it; closed, classes hide the prompt's bubble and
+ * the exchange's other rows, which stay in the list and go on updating.
+ */
+function syncAgentExchangeFolds(el = getMessagesElement()) {
+  if (!el) return;
+  const { rows, nodes } = agentExchangeTranscriptRows(el);
+  const plan = planAgentExchangeFolds(rows, {
+    runningIds: [getActiveTurnForConversation(currentConvId)?.messageId],
+    openCardIds: openCardMessageIds(),
+    keptShownIds: agentExchangesShownForUser,
+  });
+  const states = new Map();
+  const promptIdByMessageId = new Map();
+  const statusByPromptId = new Map();
+  for (const group of plan) {
+    if (group.transient) agentExchangesShownForUser.add(group.promptId);
+    if (!group.fold) continue;
+    const open = agentExchangeFoldOpen(group.status, agentExchangeFoldChoices.get(group.promptId));
+    states.set(nodes.get(group.prompt), { group, head: true, open });
+    promptIdByMessageId.set(group.promptId, group.promptId);
+    statusByPromptId.set(group.promptId, group.status);
+    for (const member of group.members) {
+      states.set(nodes.get(member), { group, head: false, open });
+      promptIdByMessageId.set(member.id, group.promptId);
+    }
+  }
+  agentExchangePromptIdByMessageId = promptIdByMessageId;
+  agentExchangeStatusByPromptId = statusByPromptId;
+  for (const node of el.children) {
+    if (node.classList?.contains('msg')) applyAgentExchangeState(node, states.get(node) || null);
+  }
+}
+
+// For the paths that change the list outside a render: the live bubble, a
+// card opening. A bulk render runs the pass once at its end.
+export function syncAgentExchangeFoldsNow() {
+  if (separatorSyncSuspended > 0) return;
+  syncAgentExchangeFolds();
+}
+
+function applyAgentExchangeState(node, state) {
+  node.classList.toggle(AGENT_EXCHANGE_HEAD_CLASS, !!state?.head);
+  node.classList.toggle(AGENT_EXCHANGE_MEMBER_CLASS, !!state && !state.head);
+  node.classList.toggle(AGENT_EXCHANGE_CLOSED_CLASS, !!state && !state.open);
+  // The jump-to-bottom badge counts a fold's rows as one by this id.
+  if (state) node.dataset.agentExchangePromptId = state.group.promptId;
+  else delete node.dataset.agentExchangePromptId;
+  const existing = node.querySelector(':scope > .agent-exchange-row');
+  if (!state?.head) {
+    existing?.remove();
+    return;
+  }
+  const { group, open } = state;
+  const summary = agentExchangeSummary(group.prompt.origin, group.status, { conversations });
+  const timeText = fmtDate(node.dataset.messageTimestamp);
+  const key = JSON.stringify([summary.text, timeText]);
+  let row = existing;
+  if (!row || row.dataset.summaryKey !== key) {
+    const holder = document.createElement('div');
+    holder.innerHTML = renderAgentExchangeRowHtml(summary, { escHtml, timeText, open });
+    const fresh = holder.firstElementChild;
+    fresh.dataset.summaryKey = key;
+    fresh.dataset.promptId = group.promptId;
+    fresh.addEventListener('toggle', () => onAgentExchangeToggle(fresh));
+    if (row) row.replaceWith(fresh);
+    else node.insertBefore(fresh, node.firstChild);
+    row = fresh;
+  }
+  if (row.open !== open) row.open = open;
+}
+
+function onAgentExchangeToggle(row) {
+  const promptId = String(row.dataset.promptId || '').trim();
+  // The pass setting `open` fires this too, and a row it has since replaced
+  // (its status changed) fires it late; only the user's toggle is news.
+  if (!promptId || !row.isConnected) return;
+  const shown = agentExchangeFoldOpen(agentExchangeStatusByPromptId.get(promptId), agentExchangeFoldChoices.get(promptId));
+  if (shown === row.open) return;
+  agentExchangeFoldChoices.set(promptId, row.open);
+  syncAgentExchangeFolds();
+}
+
+// A search result, a pin or a jump inside a folded exchange opens it first:
+// a hidden row has nowhere to scroll to.
+function revealAgentExchangeMessage(messageId) {
+  const promptId = agentExchangePromptIdByMessageId.get(String(messageId || '').trim());
+  if (!promptId || agentExchangeFoldChoices.get(promptId) === true) return;
+  agentExchangeFoldChoices.set(promptId, true);
+  syncAgentExchangeFolds();
+}
+
 function createMessageNode(msg, msgId = null, force = false) {
   const el = getMessagesElement();
   if (!el) return null;
@@ -1236,6 +1449,10 @@ function createMessageNode(msg, msgId = null, force = false) {
     if (!force && seenMessageIds.has(msgId)) return null;
     seenMessageIds.add(msgId);
   }
+
+  // An event message the relay wrote into a watcher's conversation: a
+  // compact, foldable row, never a bubble of the user's.
+  if (isRelayEventMessage(msg)) return createRelayEventNode(msg, msgId);
 
   // A prompt another relay's agent sent carries `origin`: its header line is
   // hidden (the badge below says the same), and a stray remote-relay mention
@@ -1258,6 +1475,7 @@ function createMessageNode(msg, msgId = null, force = false) {
   div.dataset.messageTextFingerprint = fingerprint.text || '';
   div.dataset.messageTimestamp = String(msg?.timestamp || '').trim();
   if (fingerprint.sourceMessageId) div.dataset.sourceMessageId = fingerprint.sourceMessageId;
+  setAgentExchangeRow(div, msg, msgId);
 
   const label = msg.role === 'user' ? 'You' : '';
   const { baseModelId, reasoningEffort } = splitVariantId(msg.model);
@@ -1361,7 +1579,14 @@ function createMessageNode(msg, msgId = null, force = false) {
   const mainThoughts = thoughts.filter((t) => !t?.subagentRunId);
   const activityHtml = mainActivities.length ? renderActivityMarkup(mainActivities, promotedBoundaryEntry) : '';
   const thoughtsHtml = mainThoughts.length ? renderThoughtsMarkup(mainThoughts) : '';
-  const subagentHtml = renderSubagentRunsMarkup(subagentRuns, activities, thoughts);
+  // One row per sub-agent the turn spawned, as in the composer's task panel;
+  // its title opens the agent's whole record. The store's copy wins: status
+  // events keep it current after the bubble was built.
+  rememberSubagentRuns(subagentRuns);
+  const subagentHtml = subagentRowsMarkup(
+    subagentRuns.map((run) => mergeLiveSubagentRun(run, getSubagentRun(run.subagentRunId))),
+    { clickable: !IS_SHARED_VIEW },
+  );
   // Finished background workflows persisted with this assistant message
   // (docs/plans/workflow-progress-tree.md, Phase 4). The template only
   // reserves a placeholder; the cards are DOM-built below so digest text
@@ -1440,6 +1665,8 @@ function createMessageNode(msg, msgId = null, force = false) {
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
+  // A running sub-agent's row keeps its clock going once the bubble is placed.
+  if (subagentHtml.includes('data-started-at')) setTimeout(syncSubagentRowClock, 0);
   rewriteLocalAssetUrlsInNode(bubble, { preferDrive: msg.role === 'assistant' });
   linkifyWorkspaceMentionsInNode(bubble);
   // One collapsed "Finished background task" card per persisted run, sharing
@@ -1648,83 +1875,6 @@ export function renderActivityMarkup(activities, promotedBoundaryEntry = undefin
   return `${progressHtml}${toolsHtml}`;
 }
 
-// Persisted nested subagent sections: groups a finished message's activities
-// and thoughts by subagentRunId and renders one collapsible block per run,
-// nested by parentSubagentId — mirroring the live sub-bubbles.
-export function renderSubagentRunsMarkup(subagentRuns, activities, thoughts) {
-  const activityByRun = new Map();
-  for (const item of (Array.isArray(activities) ? activities : [])) {
-    const entry = normalizeRelayActivityEntry(item);
-    if (!entry?.subagentRunId) continue;
-    const list = activityByRun.get(entry.subagentRunId) || [];
-    list.push(entry.text);
-    activityByRun.set(entry.subagentRunId, list);
-  }
-  const thoughtsByRun = new Map();
-  for (const thought of (Array.isArray(thoughts) ? thoughts : [])) {
-    const runId = thought?.subagentRunId ? String(thought.subagentRunId).trim() : '';
-    const text = String(thought?.text || '').trim();
-    if (!runId || !text) continue;
-    const list = thoughtsByRun.get(runId) || [];
-    list.push({ reasoningId: String(thought?.reasoningId || '').trim(), text });
-    thoughtsByRun.set(runId, list);
-  }
-  const runsById = new Map();
-  for (const run of (Array.isArray(subagentRuns) ? subagentRuns : [])) {
-    const runId = String(run?.subagentRunId || '').trim();
-    if (!runId) continue;
-    runsById.set(runId, {
-      subagentRunId: runId,
-      parentSubagentId: run?.parentSubagentId ? String(run.parentSubagentId).trim() : null,
-      displayName: String(run?.displayName || '').trim() || `Subagent ${runId.slice(0, 8)}`,
-      status: String(run?.status || 'completed').trim().toLowerCase(),
-    });
-  }
-  // Items may reference runs whose metadata rows are unavailable; synthesize.
-  for (const runId of new Set([...activityByRun.keys(), ...thoughtsByRun.keys()])) {
-    if (!runsById.has(runId)) {
-      runsById.set(runId, {
-        subagentRunId: runId,
-        parentSubagentId: null,
-        displayName: `Subagent ${runId.slice(0, 8)}`,
-        status: 'completed',
-      });
-    }
-  }
-  if (!runsById.size) return '';
-  const childrenByParent = new Map();
-  const roots = [];
-  for (const run of runsById.values()) {
-    const parentId = run.parentSubagentId && runsById.has(run.parentSubagentId) ? run.parentSubagentId : null;
-    if (parentId) {
-      const children = childrenByParent.get(parentId) || [];
-      children.push(run);
-      childrenByParent.set(parentId, children);
-    } else {
-      roots.push(run);
-    }
-  }
-  const renderRun = (run) => {
-    const runActivities = activityByRun.get(run.subagentRunId) || [];
-    const runThoughts = thoughtsByRun.get(run.subagentRunId) || [];
-    const children = childrenByParent.get(run.subagentRunId) || [];
-    const thoughtsBlock = runThoughts.length
-      ? `<details class="msg-thoughts msg-subagent-thoughts"><summary>💭 Thoughts (${runThoughts.length})</summary><div class="msg-thoughts-list">${runThoughts.map((thought) => `<div class="msg-thought-item"${thought.reasoningId ? ` data-reasoning-id="${escHtml(thought.reasoningId)}"` : ''}>${renderMarkdownPreview(thought.text, false)}</div>`).join('')}</div></details>`
-      : '';
-    const activitiesBlock = runActivities.length
-      ? `<div class="msg-activity-list">${runActivities.map((text) => `<div class="msg-activity-item">${escHtml(decorateActivityText(text))}</div>`).join('')}</div>`
-      : '';
-    const childrenBlock = children.map(renderRun).join('');
-    const statusLabel = run.status && run.status !== 'completed' ? ` · ${escHtml(run.status)}` : '';
-    return `
-      <details class="msg-activity msg-subagent-run" data-subagent-run-id="${escHtml(run.subagentRunId)}">
-        <summary>🤖 ${escHtml(run.displayName)}${statusLabel}${runActivities.length ? ` (${runActivities.length})` : ''}</summary>
-        ${thoughtsBlock}${activitiesBlock}${childrenBlock}
-      </details>`;
-  };
-  return roots.map(renderRun).join('');
-}
-
 // Places the live bubble directly under its owning user message, or leaves a
 // bubble already in the transcript where it is when that row is not rendered.
 // Idempotent so the reuse path can call it every tick: a bubble built before
@@ -1745,6 +1895,9 @@ function anchorThinkingBubble(div, messageId) {
     if (next) el.insertBefore(div, next);
     else el.appendChild(div);
     if (div.dataset.compactBoundary) syncSeparatorsNow();
+    // Under a folded agent prompt the bubble folds with it, and the row says
+    // the turn is working.
+    else syncAgentExchangeFoldsNow();
   } else if (div.parentNode !== el) {
     el.appendChild(div);
   }
@@ -1820,6 +1973,7 @@ export function showThinking(messageId = null, autoScroll = true) {
 export function removeThinking() {
   thinkingMessageId = null;
   lastInFlightSnapshotKey = '';
+  const hadBubble = !!document.getElementById('thinking-indicator');
   const wasCompacting = !!document.getElementById('thinking-indicator')?.dataset?.compactBoundary;
   unobserveThinkingBubble();
   document.getElementById('thinking-indicator')?.remove();
@@ -1827,6 +1981,8 @@ export function removeThinking() {
   // caller's same-tick work: a reply appended right after this call takes
   // the line over (relabelled in place) instead of it being dropped first.
   if (wasCompacting) queueMicrotask(syncSeparatorsNow);
+  // A turn that ended without a reply (cancelled) stops saying "working".
+  if (hadBubble) syncAgentExchangeFoldsNow();
 }
 
 // The live turn's compaction line: the bubble stamps the turn's compaction
@@ -2045,6 +2201,9 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
     return;
   }
   lastInFlightSnapshotKey = snapshotKey;
+  // The snapshot may have been read before the newest live frame was stored.
+  const liveStreamSeq = relayStreamStateByMessageId.get(messageId)?.seq || 0;
+  const liveStreamText = relayStreamTextByMessageId.get(messageId);
   clearRelayStreamState();
   setConversationTurnState(currentConvId, { messageId, status: 'processing' });
   const activities = mergeRelayActivityTexts(
@@ -2086,14 +2245,19 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
   // Seed the per-thread stream text before the bubbles are built so both the
   // reply preview and each subagent bubble repaint on reload.
   const streamTextByThread = deriveInFlightStreamTextByThread(inFlight);
-  if (streamTextByThread.main) {
+  if (streamTextByThread.main && streamTextByThread.main.seq >= liveStreamSeq) {
     relayStreamTextByMessageId.set(messageId, streamTextByThread.main.text);
+  } else if (liveStreamText !== undefined) {
+    relayStreamTextByMessageId.set(messageId, liveStreamText);
   }
   for (const [runId, entry] of streamTextByThread.bySubagentRunId) {
     upsertSubagentRun({ subagentRunId: runId, messageId, conversationId: currentConvId });
     setSubagentStreamText(runId, entry.text);
   }
   showThinking(messageId, autoScroll);
+  // relay_stream frames are volatile, so a dropped one reaches the bubble only
+  // from here; showThinking does not repaint a bubble it reuses.
+  renderThinkingStream();
   renderThinkingActivities();
   renderThinkingThoughts();
   renderRestoredSubagentBubbles(messageId);
@@ -2578,6 +2742,8 @@ export function applyRelayStreamEvent({
   if (id !== thinkingMessageId) return true;
   if (runId) renderSubagentStream(runId, text);
   else renderThinkingStream();
+  // Again once the text is in: it grew below the end the status scrolled to.
+  if (autoScroll && !getThinkingFollowMode()) scrollBottom();
   return true;
 }
 
@@ -2905,6 +3071,8 @@ export function replaceRenderedMessage(msg, msgId) {
   seenMessageIds.delete(id);
   const fresh = createMessageNode(msg, id, true);
   placeholder.replaceWith(fresh || existing);
+  // The rebuilt row takes its merge and fold classes back.
+  if (fresh) syncSeparatorsNow();
   return Boolean(fresh);
 }
 
@@ -3376,6 +3544,14 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
   if (empty) empty.remove();
   const node = createMessageNode(msg, msgId, force);
   const isNewNode = !!node && !node.parentNode;
+  // A reply the socket delivers without its prompt's id in the message (a
+  // failed turn's note) is placed under that prompt, and belongs to its
+  // agent exchange too.
+  const exchangeRow = isNewNode ? node[AGENT_EXCHANGE_ROW_KEY] : null;
+  const anchorId = String(insertAfterId || '').trim();
+  if (exchangeRow?.role === 'assistant' && !exchangeRow.sourceMessageId && anchorId && anchorId !== String(msgId || '').trim()) {
+    exchangeRow.sourceMessageId = anchorId;
+  }
   // Insert without scrolling: the separator pass below can add a row above
   // this message, and scrolling before it runs leaves the viewport a
   // separator-height short of the bottom (which then reads as "not at
@@ -3491,6 +3667,91 @@ export function noteTranscriptJump() {
   transcriptJumpEpoch += 1;
 }
 
+// Counts rows the socket put on the page: another client's message, a reply,
+// a row rewritten in place. A reload whose request was on its way when one
+// landed may not have it, and its rebuild would take it off the page again
+// (transcript-reload-freshness.mjs).
+let transcriptLiveRowEpoch = 0;
+
+export function getTranscriptLiveRowEpoch() {
+  return transcriptLiveRowEpoch;
+}
+
+export function noteTranscriptLiveRow() {
+  transcriptLiveRowEpoch += 1;
+}
+
+function liveConversationCount() {
+  return Object.values(conversations || {}).filter((conversation) => conversation && conversation.archived !== true).length;
+}
+
+function runEmptyStateAction(action) {
+  switch (String(action || '').trim()) {
+    case 'open-settings':
+      openSettingsModal('providers');
+      return;
+    case 'new-chat':
+      void window.newConversation?.();
+      return;
+    case 'show-conversations':
+      toggleSidebar(true);
+      return;
+    default:
+  }
+}
+
+function buildEmptyStateNode(model) {
+  const node = document.createElement('div');
+  node.className = 'empty-state';
+  node.dataset.variant = model.variant;
+  const actions = model.actions.map((action) => {
+    const classes = ['empty-state-btn'];
+    if (action.primary) classes.push('empty-state-btn-accent');
+    if (action.link) classes.push('empty-state-link');
+    return `<button type="button" id="${escHtml(action.id)}" class="${classes.join(' ')}" data-empty-action="${escHtml(action.action)}">${escHtml(action.label)}</button>`;
+  }).join('');
+  node.innerHTML = `
+    <div class="icon">${escHtml(model.icon)}</div>
+    <h3>${escHtml(model.heading)}</h3>
+    <p>${escHtml(model.text)}</p>
+    <div class="empty-state-actions">${actions}</div>`;
+  for (const button of node.querySelectorAll('[data-empty-action]')) {
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      runEmptyStateAction(button.dataset.emptyAction);
+    });
+  }
+  return node;
+}
+
+/**
+ * Draws the "no conversation open" screen into the transcript, or redraws it
+ * when readiness or the conversation list changed. A no-op with a
+ * conversation open, in the shared view, or while the status view owns the
+ * transcript. Idempotent: the same model leaves the node alone.
+ */
+export function renderNoConversationState() {
+  if (IS_SHARED_VIEW) return false;
+  if (String(currentConvId || '').trim()) return false;
+  const el = getMessagesElement();
+  if (!el || el.querySelector('.status-view')) return false;
+  const existing = el.querySelector('.empty-state');
+  // A transcript with rows in it belongs to something else (a render in flight).
+  if (!existing && el.children.length) return false;
+  const model = resolveNoConversationState({
+    readiness: getProviderReadiness(),
+    conversationCount: liveConversationCount(),
+    mobile: isMobileComposerViewport(),
+  });
+  const key = JSON.stringify(model);
+  if (existing && existing.dataset.emptyStateKey === key) return true;
+  const node = buildEmptyStateNode(model);
+  node.dataset.emptyStateKey = key;
+  if (existing) existing.replaceWith(node);
+  else el.appendChild(node);
+  return true;
+}
+
 export function renderMessages(msgs, scroll = true, meta = {}) {
   const el = getMessagesElement();
   if (!el) return false;
@@ -3571,11 +3832,17 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     && thinkingNode.dataset.conversationId === renderConversationKey) ? thinkingNode : null;
   if (thinkingNodeInTranscript && !preservedThinkingNode) removeThinking();
   if (!ordered.length && !preservedPendingNodes.length && !preservedThinkingNode) {
-    el.innerHTML = `<div class="empty-state">
-      <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
-      <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
-      <p>${currentConvId ? 'Start the conversation below' : 'Type your first message below'}</p>
-    </div>`;
+    if (!currentConvId && !IS_SHARED_VIEW) {
+      // Nothing open: the screen says what can be done here (no-conversation-state.mjs).
+      el.innerHTML = '';
+      renderNoConversationState();
+    } else {
+      el.innerHTML = `<div class="empty-state">
+        <div class="icon">${currentConvId ? '💬' : '🚀'}</div>
+        <h3>${currentConvId ? 'No messages yet' : 'New Conversation'}</h3>
+        <p>${currentConvId ? 'Start the conversation below' : 'Type your first message below'}</p>
+      </div>`;
+    }
     resetConversationHistoryState();
     renderRelayQuestions();
     renderRelayBoards();
@@ -3680,6 +3947,8 @@ export function focusConversationMessageById(messageId, { behavior = 'smooth', b
   if (!id) return false;
   const el = getMessagesElement();
   if (!el) return false;
+  // A message in a folded agent exchange is shown before it is scrolled to.
+  revealAgentExchangeMessage(id);
   const target = el.querySelector(`.msg[data-message-id="${CSS.escape(id)}"]`);
   if (!target) return false;
   target.scrollIntoView({ behavior, block, inline: 'nearest' });
@@ -3733,6 +4002,13 @@ export async function sendMessage() {
     return;
   }
   if (!hasDraft) return;
+  // No conversation open and no provider ready: a send would create a
+  // Copilot chat that cannot run. The composer is locked in this state; this
+  // guard covers a programmatic send, before any upload starts.
+  if (!String(currentConvId || '').trim() && isProviderSetupRequired()) {
+    showTransientRelayNotice('Set up a provider in Settings → Providers before starting a chat.', 6000);
+    return;
+  }
   closeSlashAutocomplete();
   closeMentionAutocomplete();
 

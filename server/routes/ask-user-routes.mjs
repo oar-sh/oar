@@ -116,6 +116,8 @@ export function registerAskUserRoutes(app, deps) {
     DEFAULT_RELAY_MODE,
     sessionWorkerRegistry,
     pushDispatchService,
+    // Relay event subscriptions: a question is an event for its watchers.
+    relayEventService = null,
     // Remote relays: another relay's agent answering a question is refused
     // while the inbound switch is off. Absent in older wiring (no-op).
     remoteRelayInbound = null,
@@ -246,6 +248,7 @@ export function registerAskUserRoutes(app, deps) {
     console.log(`[${ts()}] QUESTION  ${questionId.slice(0,8)} conv=${question.conversationId.slice(0,8)} mode=${relayMode} fields=${fieldCount} prompt="${promptText.slice(0,60)}"`);
     io.emit('relay_question', { question });
     void pushDispatchService?.notifyQuestion?.(question);
+    try { relayEventService?.noteQuestion?.(question); } catch {}
     res.json({ question });
   });
 

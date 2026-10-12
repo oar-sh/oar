@@ -498,6 +498,17 @@ export async function updateTurnCeilingSetting(ceilingMinutes) {
   });
 }
 
+export async function loadSubagentRecordRetentionSetting() {
+  return apiFetch('/api/settings/subagent-record-retention');
+}
+
+export async function updateSubagentRecordRetentionSetting(retentionDays) {
+  return apiFetch('/api/settings/subagent-record-retention', {
+    method: 'POST',
+    body: JSON.stringify({ retentionDays: Number(retentionDays) }),
+  });
+}
+
 export async function loadBackgroundTaskTimeoutSetting() {
   return apiFetch('/api/settings/background-task-timeout');
 }
@@ -1316,6 +1327,56 @@ export async function uploadAttachment(item) {
     throw new Error(text || `Upload failed (${response.status})`);
   }
   return response.json();
+}
+
+// A POST whose failure message matters: unlike apiFetch it throws with the
+// relay's `error` text, so the explorer can show "That name is already taken"
+// instead of a bare failure.
+export async function apiMutate(url, body = {}) {
+  if (!networkRequestsEnabled) throw new Error('Network requests are paused');
+  let response;
+  try {
+    response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    noteFetchFailure(url, error);
+    throw new Error('The relay could not be reached');
+  }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(String(payload?.error || '').trim() || `Request failed (${response.status})`);
+  noteFetchSuccess();
+  return payload;
+}
+
+// The explorer's edits. `root` is the explorer root the path belongs to:
+// 'workspace' paths are relative to the conversation's root, everything else
+// ('drives', 'session') is an absolute path checked like a drives listing.
+function explorerMutationRoute(root, operation) {
+  return root === 'workspace' ? `/api/repo/${operation}` : `/api/drives/${operation}`;
+}
+
+function explorerScope(root, conversationId) {
+  const convId = String(conversationId || '').trim();
+  return root === 'workspace' && convId ? { conversationId: convId } : {};
+}
+
+export function createExplorerFolder({ root, path: parentPath, name, conversationId = null }) {
+  return apiMutate(explorerMutationRoute(root, 'mkdir'), { path: String(parentPath || ''), name, ...explorerScope(root, conversationId) });
+}
+
+export function renameExplorerEntry({ root, path: entryPath, newName, conversationId = null }) {
+  return apiMutate(explorerMutationRoute(root, 'rename'), { path: String(entryPath || ''), newName, ...explorerScope(root, conversationId) });
+}
+
+export function deleteExplorerEntry({ root, path: entryPath, conversationId = null, dryRun = false }) {
+  return apiMutate(explorerMutationRoute(root, 'delete'), { path: String(entryPath || ''), dryRun: dryRun === true, ...explorerScope(root, conversationId) });
 }
 
 export async function loadRepoTree(includeHidden = false, includeHeavy = false, conversationId = null) {

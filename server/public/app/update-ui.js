@@ -100,7 +100,7 @@ export function renderUpdateSection() {
       status.textContent = install.state === 'running'
         ? `Updating to ${install.targetVersion}…`
         : install.state === 'success'
-          ? 'npm finished — the relay restarts when the queue is idle.'
+          ? 'npm finished — the relay restarts once the running turns finish.'
           : `Update failed: ${install.error || 'unknown error'}`;
     }
     const logPre = byId('update-install-log-pre');

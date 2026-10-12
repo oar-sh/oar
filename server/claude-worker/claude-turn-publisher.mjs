@@ -127,6 +127,9 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
         parentSubagentId: payload.parentSubagentId || undefined,
         displayName: payload.displayName || undefined,
         status: payload.status,
+        ...(payload.subagentType ? { subagentType: payload.subagentType } : {}),
+        ...(payload.background ? { background: true } : {}),
+        ...(payload.timelineOwner ? { timelineOwner: payload.timelineOwner } : {}),
         ...attemptFields(message),
       }).catch(() => {});
       return;

@@ -399,13 +399,33 @@ export function createPreviewProxyServer({
 
   // WebSocket upgrades (Vite HMR, an app's own socket) ride the same prefix.
   function handleUpgrade(req, socket, head) {
+    // Node removes its own error listener from a socket the moment it emits
+    // 'upgrade', and the upstream socket handed to 'upgrade' comes bare too. A
+    // browser that drops the connection while the dev server is still
+    // answering would otherwise raise an uncaught ECONNRESET and end the
+    // whole relay. Whatever fails on either side takes both down.
+    let upstreamReq = null;
+    let upstreamSocket = null;
+    const teardown = () => {
+      try { socket.destroy(); } catch {}
+      try { upstreamSocket?.destroy(); } catch {}
+      try { upstreamReq?.destroy(); } catch {}
+    };
+    socket.on('error', teardown);
+    // A client that leaves before the dev server answers abandons the
+    // handshake. Once both sides are piped, an orderly close travels through
+    // the pipes, so the pending writes still reach the other side.
+    socket.once('close', teardown);
+    const reply = (text) => {
+      if (socket.destroyed) return;
+      try { socket.write(text); } catch {}
+    };
+
     const resolved = resolveRequest(req);
     // Static previews have nothing to upgrade to; refuse like an unknown token.
     if (resolved.kind !== 'proxy' || resolved.entry?.mode === 'static') {
-      try {
-        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-      } catch {}
-      try { socket.destroy(); } catch {}
+      reply('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      teardown();
       return;
     }
 
@@ -426,7 +446,7 @@ export function createPreviewProxyServer({
     headers.connection = 'Upgrade';
     headers.upgrade = String(req.headers.upgrade || 'websocket');
 
-    const upstreamReq = httpImpl.request({
+    upstreamReq = httpImpl.request({
       host: entry.targetHost,
       port: entry.targetPort,
       method: req.method,
@@ -436,25 +456,26 @@ export function createPreviewProxyServer({
     });
     guardConnectTimeout(upstreamReq, connectTimeoutMs, () => {});
 
-    upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    upstreamReq.on('upgrade', (upstreamRes, answeredSocket, upstreamHead) => {
+      upstreamSocket = answeredSocket;
+      upstreamSocket.on('error', teardown);
+      // The client left while the dev server was answering.
+      if (socket.destroyed) {
+        teardown();
+        return;
+      }
       const lines = [`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`];
       for (const [name, value] of Object.entries(upstreamRes.headers)) {
         for (const entryValue of Array.isArray(value) ? value : [value]) {
           lines.push(`${name}: ${entryValue}`);
         }
       }
-      try {
-        socket.write(`${lines.join('\r\n')}\r\n\r\n`);
-      } catch {
-        try { upstreamSocket.destroy(); } catch {}
-        return;
-      }
-      if (upstreamHead?.length) socket.write(upstreamHead);
+      reply(`${lines.join('\r\n')}\r\n\r\n`);
+      if (upstreamHead?.length) reply(upstreamHead);
       if (head?.length) upstreamSocket.write(head);
+      socket.removeListener('close', teardown);
       trackUpgradedSocket(socket);
       trackUpgradedSocket(upstreamSocket);
-      upstreamSocket.on('error', () => { try { socket.destroy(); } catch {} });
-      socket.on('error', () => { try { upstreamSocket.destroy(); } catch {} });
       upstreamSocket.pipe(socket);
       socket.pipe(upstreamSocket);
     });
@@ -462,18 +483,15 @@ export function createPreviewProxyServer({
     // A dev server that answers an upgrade with a plain response (404 on an
     // unknown HMR path) must not leave the client hanging.
     upstreamReq.on('response', (upstreamRes) => {
-      try {
-        socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\nConnection: close\r\n\r\n`);
-      } catch {}
+      reply(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\nConnection: close\r\n\r\n`);
+      upstreamRes.on('error', () => {});
       upstreamRes.resume();
-      try { socket.destroy(); } catch {}
+      teardown();
     });
 
     upstreamReq.on('error', () => {
-      try {
-        socket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
-      } catch {}
-      try { socket.destroy(); } catch {}
+      reply('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+      teardown();
     });
 
     upstreamReq.end();

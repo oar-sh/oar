@@ -14,6 +14,10 @@ import { migrateRemoteRelays } from './migrations/0005-remote-relays.mjs';
 import { migrateWorkspaceRootSettings } from './migrations/0006-workspace-root-settings.mjs';
 import { migrateClaudeCloud } from './migrations/0007-claude-cloud.mjs';
 import { migrateMessagePins } from './migrations/0008-message-pins.mjs';
+import { migrateSubagentTimeline } from './migrations/0009-subagent-timeline.mjs';
+import { migrateSubagentTimelinePruning } from './migrations/0010-subagent-timeline-pruning.mjs';
+import { migrateRelayEventSubscriptions } from './migrations/0011-relay-event-subscriptions.mjs';
+import { migrateCrossRelayEventSubscriptions } from './migrations/0012-cross-relay-event-subscriptions.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -741,6 +745,38 @@ try {
   migrateMessagePins(db);
 } catch (error) {
   console.warn(`[message-pins] migration 0008 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Sub-agent viewer: the timeline table and the run header columns. Readers
+// tolerate their absence (runs fall back to the activity, thought and stream
+// rows), so a failure is logged and retried next boot like 0008.
+try {
+  migrateSubagentTimeline(db);
+} catch (error) {
+  console.warn(`[subagent-timeline] migration 0009 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Sub-agent record retention: the pruned marker and the sweep's index. The
+// sweep checks for the column and does nothing without it, so a failure is
+// logged and retried next boot like 0009.
+try {
+  migrateSubagentTimelinePruning(db);
+} catch (error) {
+  console.warn(`[subagent-timeline] migration 0010 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Relay event subscriptions: two new tables. The event service checks for
+// them and stays off without them, so a failure is logged and retried next
+// boot like 0010.
+try {
+  migrateRelayEventSubscriptions(db);
+} catch (error) {
+  console.warn(`[relay-events] migration 0011 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Relay event subscriptions across paired relays: columns on 0011's table and
+// the link table. Without them the event service keeps to this relay's own
+// sessions, so a failure is logged and retried next boot like 0011.
+try {
+  migrateCrossRelayEventSubscriptions(db);
+} catch (error) {
+  console.warn(`[relay-events] migration 0012 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

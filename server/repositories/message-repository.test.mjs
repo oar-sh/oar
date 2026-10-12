@@ -617,6 +617,20 @@ test('once the question is answered the turn is eligible again', () => {
   assert.deepEqual(fixture.recoverable(), ['q-answered']);
 });
 
+test('answering a question restarts the ceiling clock', () => {
+  const fixture = createRecoveryFixture();
+  // Started long before the ceiling, but the human answered a question five
+  // minutes ago: the turn is being watched, so the ceiling counts from there.
+  fixture.addTurn({ id: 'q-watched', startedMsAgo: 3 * RECOVERY_HOUR_MS, lastHeartbeatMsAgo: 5_000 });
+  fixture.askQuestion('q-watched', 'answered');
+  fixture.db.prepare(`UPDATE relay_questions SET answered_at = ? WHERE queue_id = 'q-watched'`).run(recoveryIsoAgo(5 * 60_000));
+  assert.deepEqual(fixture.recoverable({ ceilingMinutes: 60 }), []);
+
+  // An answer older than the ceiling no longer protects it.
+  fixture.db.prepare(`UPDATE relay_questions SET answered_at = ? WHERE queue_id = 'q-watched'`).run(recoveryIsoAgo(2 * RECOVERY_HOUR_MS));
+  assert.deepEqual(fixture.recoverable({ ceilingMinutes: 60 }), ['q-watched']);
+});
+
 test('the ceiling catches a turn that is hung but still heartbeating', () => {
   const fixture = createRecoveryFixture();
   fixture.addTurn({ id: 'q-hung', startedMsAgo: 3 * RECOVERY_HOUR_MS, lastHeartbeatMsAgo: 5_000 });
@@ -760,6 +774,52 @@ test('the stale sweep tears down continuations instead of requeueing them', () =
   assert.deepEqual(stale, ['q-cont-stale']);
   stmts.dropStaleContinuation.run('q-cont-stale');
   assert.equal(db.prepare(`SELECT status FROM queue WHERE id = 'q-cont-stale'`).get().status, 'failed');
+});
+
+// The live failure of 2026-10-10: a background-agent interview hung five
+// question cards on its continuation row; the fifth sat unanswered for hours,
+// the ceiling tore the row down meanwhile, and the agent's reply was dropped.
+function askContinuationQuestion(db, queueId, { status = 'pending', answeredMsAgo = null, suffix = '' } = {}) {
+  db.prepare(`INSERT INTO relay_questions (id, queue_id, status, conversation_id, message_id, prompt, created_at, expires_at, answered_at) VALUES (?, ?, ?, 'conv-1', ?, 'Question?', '2026-01-01T00:00:00.000Z', '2026-01-01T08:00:00.000Z', ?)`)
+    .run(`question-${queueId}${suffix}`, queueId, status, queueId, answeredMsAgo === null ? null : recoveryIsoAgo(answeredMsAgo));
+}
+
+function staleContinuations(stmts, { inactiveMinutes = 10, ceilingMinutes = null } = {}) {
+  return stmts.listStaleProcessingContinuations.all({
+    inactiveBefore: recoveryIsoAgo(inactiveMinutes * 60_000),
+    ceilingBefore: ceilingMinutes === null ? null : recoveryIsoAgo(ceilingMinutes * 60_000),
+  }).map((row) => row.id);
+}
+
+test('a continuation waiting on an unanswered question is never torn down', () => {
+  const db = createTestDb();
+  const stmts = createMessageRepository(db);
+  // Silent for hours and far past the ceiling — but a card is pending.
+  insertContinuationRow(stmts, { id: 'q-cont-interview', lastClaimedAgoMs: 5 * RECOVERY_HOUR_MS });
+  askContinuationQuestion(db, 'q-cont-interview');
+  assert.deepEqual(staleContinuations(stmts, { inactiveMinutes: 10, ceilingMinutes: 60 }), []);
+
+  // Pending protection is per card: once it is answered the row is judged
+  // on its own clocks again.
+  db.prepare(`UPDATE relay_questions SET status = 'answered' WHERE queue_id = 'q-cont-interview'`).run();
+  assert.deepEqual(staleContinuations(stmts, { inactiveMinutes: 10 }), ['q-cont-interview']);
+});
+
+test('an answered question restarts the ceiling clock of a continuation', () => {
+  const db = createTestDb();
+  const stmts = createMessageRepository(db);
+  // Born ten hours ago, heartbeating, four cards answered along the way, the
+  // last one five minutes ago: the ceiling counts from that answer.
+  insertContinuationRow(stmts, { id: 'q-cont-watched', lastClaimedAgoMs: 5_000 });
+  db.prepare(`UPDATE queue SET timestamp = ?, processing_at = NULL WHERE id = 'q-cont-watched'`).run(recoveryIsoAgo(10 * RECOVERY_HOUR_MS));
+  askContinuationQuestion(db, 'q-cont-watched', { status: 'answered', answeredMsAgo: 9 * RECOVERY_HOUR_MS, suffix: '-1' });
+  askContinuationQuestion(db, 'q-cont-watched', { status: 'answered', answeredMsAgo: 5 * 60_000, suffix: '-2' });
+  assert.deepEqual(staleContinuations(stmts, { ceilingMinutes: 60 }), []);
+
+  // Only the most recent answer counts; one that is itself past the ceiling
+  // leaves the row to the cap.
+  db.prepare(`DELETE FROM relay_questions WHERE id = 'question-q-cont-watched-2'`).run();
+  assert.deepEqual(staleContinuations(stmts, { ceilingMinutes: 60 }), ['q-cont-watched']);
 });
 
 test('recoverStale never revives a continuation row', () => {

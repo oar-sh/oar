@@ -116,6 +116,23 @@ export function isSubagentToolName(name) {
   return SUBAGENT_TOOL_NAMES.has(String(name || '').trim().toLowerCase());
 }
 
+const BACKGROUND_LAUNCH_STATUSES = new Set(['async_launched', 'remote_launched']);
+
+/**
+ * The tool result of an Agent/Task spawn that went to the background: the
+ * structured result says so (`tool_use_result.status`), and the receipt text
+ * the model reads is the fallback for producers without it.
+ */
+export function isBackgroundLaunch(block, toolUseResult = null) {
+  const status = String(toolUseResult?.status || '').trim();
+  if (BACKGROUND_LAUNCH_STATUSES.has(status)) return true;
+  const content = block?.content;
+  const text = typeof content === 'string'
+    ? content
+    : (Array.isArray(content) ? content.map((part) => String(part?.text || '')).join(' ') : '');
+  return /^\s*Async agent launched/i.test(text);
+}
+
 export function summarizeToolInput(toolName, input) {
   if (!input || typeof input !== 'object') return '';
   // `mcp__relay__remote_relay` reads as what it does on which relay
@@ -287,7 +304,8 @@ export function createSdkMessageNormalizer() {
         || 'Subagent',
       ).trim() || 'Subagent';
       const parentSubagentId = subagentRunIdFor(parentToolUseId);
-      knownSubagentRuns.set(toolUseId, { displayName, parentSubagentId });
+      const subagentType = String(input.subagent_type || '').trim();
+      knownSubagentRuns.set(toolUseId, { displayName, parentSubagentId, subagentType });
       actions.push({
         channel: 'subagent',
         payload: {
@@ -295,6 +313,10 @@ export function createSdkMessageNormalizer() {
           parentSubagentId,
           displayName,
           status: 'running',
+          ...(subagentType ? { subagentType } : {}),
+          // The worker's timeline recorder writes this run's record itself;
+          // the relay must not copy the lane frames into it as well.
+          timelineOwner: 'worker',
         },
       });
     }
@@ -308,19 +330,24 @@ export function createSdkMessageNormalizer() {
     return actions;
   }
 
-  function actionsForToolResultBlock(block, parentToolUseId) {
+  function actionsForToolResultBlock(block, parentToolUseId, toolUseResult = null) {
     const actions = [];
     const toolUseId = String(block?.tool_use_id || '').trim();
     const isError = block?.is_error === true;
     if (toolUseId && knownSubagentRuns.has(toolUseId)) {
       const run = knownSubagentRuns.get(toolUseId);
+      // A background launch answers its spawn at once with a receipt; the
+      // agent is only starting. Its end arrives later as a task
+      // notification, which the worker's timeline recorder reports.
+      const launchedInBackground = !isError && isBackgroundLaunch(block, toolUseResult);
       actions.push({
         channel: 'subagent',
         payload: {
           subagentRunId: toolUseId,
           parentSubagentId: run.parentSubagentId,
           displayName: run.displayName,
-          status: isError ? 'failed' : 'completed',
+          status: launchedInBackground ? 'running' : (isError ? 'failed' : 'completed'),
+          ...(launchedInBackground ? { background: true } : {}),
         },
       });
     }
@@ -574,7 +601,7 @@ export function createSdkMessageNormalizer() {
       const content = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
       for (const block of content) {
         if (block?.type === 'tool_result') {
-          actions.push(...actionsForToolResultBlock(block, parentToolUseId));
+          actions.push(...actionsForToolResultBlock(block, parentToolUseId, sdkMessage?.tool_use_result || null));
         }
       }
       return actions;

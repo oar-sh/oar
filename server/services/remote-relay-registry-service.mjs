@@ -146,6 +146,10 @@ export function createRemoteRelayRegistry({
   setIntervalImpl = setInterval,
   clearIntervalImpl = clearInterval,
   randomUUID = nodeRandomUUID,
+  // Called with the removed entry (address and token still in it), after it
+  // is gone from the list: the event link tells that relay its
+  // subscriptions ended.
+  onRemove = () => {},
 } = {}) {
   let cachedInstanceId = '';
   let healthTimer = null;
@@ -446,13 +450,19 @@ export function createRemoteRelayRegistry({
   function remove(id) {
     const key = toText(id);
     const entries = readList();
+    const removed = entries.find((entry) => entry.id === key) || null;
     const remaining = entries.filter((entry) => entry.id !== key);
-    if (!key || remaining.length === entries.length) return invalid('Unknown remote relay', 404);
+    if (!key || !removed) return invalid('Unknown remote relay', 404);
     writeList(remaining);
     try {
       repository?.forgetRelay?.(key);
     } catch (error) {
       logger?.warn?.(`[remote-relays] forgetting unlocks failed: ${error?.message || error}`);
+    }
+    try {
+      onRemove(removed);
+    } catch (error) {
+      logger?.warn?.(`[remote-relays] removal hook failed: ${error?.message || error}`);
     }
     emitChange();
     return { ok: true };

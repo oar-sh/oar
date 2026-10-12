@@ -1,2 +1,10 @@
+# Normalise line endings to LF on every platform, whatever core.autocrlf says:
+# tests and scripts read source files and expect "\n".
+* text=auto eol=lf
+
 # Hooks are run by sh on every platform; a CRLF shebang breaks them.
 scripts/git-hooks/* text eol=lf
+
+# cmd.exe mis-reads labels in LF-only batch files.
+*.bat text eol=crlf
+*.cmd text eol=crlf

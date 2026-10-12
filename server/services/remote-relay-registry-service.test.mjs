@@ -60,7 +60,7 @@ function identity(overrides = {}) {
   };
 }
 
-function setup({ settings = {}, answers = {}, repository = null, selfName = 'win-test', clock } = {}) {
+function setup({ settings = {}, answers = {}, repository = null, selfName = 'win-test', clock, onRemove } = {}) {
   const store = createSettingsStore(settings);
   const client = createFakeClient(answers);
   const events = [];
@@ -81,6 +81,7 @@ function setup({ settings = {}, answers = {}, repository = null, selfName = 'win
     emit: (event, payload) => events.push({ event, payload }),
     logger: { warn: (line) => logs.push(String(line)) },
     randomUUID: () => `uuid-${++ids}`,
+    ...(onRemove ? { onRemove } : {}),
   });
   return { registry, store, client, events, logs };
 }
@@ -224,19 +225,24 @@ test('update validates permission, URL and token changes', () => {
   assert.equal(events.length, quiet, 'a no-op update emits nothing');
 });
 
-test('remove deletes the entry and forgets its unlocks', () => {
+test('remove deletes the entry, forgets its unlocks and watch approvals, and hands the entry on', () => {
   const db = new Database(':memory:');
   applySchema(db);
   const repository = createRemoteRelayRepository(db);
-  const { registry, events } = setup({ repository });
-  const linux = registry.add({ name: 'linux-test', url: 'https://relay-b.example.test' });
+  const removed = [];
+  const { registry, events } = setup({ repository, onRemove: (entry) => removed.push(entry) });
+  const linux = registry.add({ name: 'linux-test', url: 'https://relay-b.example.test', token: 'fixture-token-b' });
   const win = registry.add({ name: 'win-test', url: 'https://relay-a.example.test' });
   repository.recordUnlock('c-1', linux.id, 'm-1');
+  repository.recordUnlock('c-1', `${linux.id}:watch`, 'm-1');
   repository.recordUnlock('c-1', win.id, 'm-1');
 
   assert.deepEqual(registry.remove(linux.id), { ok: true });
   assert.deepEqual(registry.list().map((entry) => entry.id), [win.id]);
   assert.equal(repository.hasUnlock('c-1', linux.id), false);
+  assert.equal(repository.hasUnlock('c-1', `${linux.id}:watch`), false);
+  // The event link still needs the address and token to say goodbye.
+  assert.deepEqual([removed.length, removed[0].id, removed[0].url, removed[0].token], [1, linux.id, 'https://relay-b.example.test', 'fixture-token-b']);
   assert.equal(repository.hasUnlock('c-1', win.id), true);
   assert.equal(events.at(-1).payload.relays.length, 1);
   assert.equal(registry.remove(linux.id).status, 404);

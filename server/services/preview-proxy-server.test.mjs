@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { once } from 'node:events';
+import { Duplex } from 'node:stream';
 
 import {
   createPreviewRegistry,
@@ -464,6 +466,160 @@ test('websocket upgrades are proxied through the prefix', async (t) => {
   const [echoed] = await once(socket, 'data');
   assert.equal(echoed.toString('utf8'), 'ping');
   socket.destroy();
+});
+
+// An upstream that takes an upgrade and answers only when the test says so,
+// so a client can drop its connection on either side of the answer.
+async function startHeldUpgradeUpstream() {
+  const sockets = new Set();
+  const pending = [];
+  let notify = null;
+  const server = http.createServer((_req, res) => res.end('http'));
+  server.on('upgrade', (_req, socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    // Reading is what lets the socket see the proxy hang up; the server keeps
+    // its half of the connection open, so the hang-up shows as 'end'.
+    socket.resume();
+    const closed = new Promise((resolve) => {
+      socket.once('end', resolve);
+      socket.once('close', resolve);
+    });
+    const entry = {
+      socket,
+      closed,
+      answer() {
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+      },
+    };
+    pending.push(entry);
+    notify?.();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return {
+    port: server.address().port,
+    async next() {
+      while (!pending.length) await new Promise((resolve) => { notify = resolve; });
+      return pending.shift();
+    },
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      server.closeAllConnections?.();
+      server.close();
+      await once(server, 'close');
+    },
+  };
+}
+
+// Node drops its own error listener from a socket when it emits 'upgrade';
+// an error nobody listens for is an uncaught exception that ends the relay.
+function captureUncaught(t) {
+  const caught = [];
+  const onUncaught = (error) => caught.push(error);
+  process.on('uncaughtException', onUncaught);
+  t.after(() => process.off('uncaughtException', onUncaught));
+  return caught;
+}
+
+function openRawUpgrade(port, path) {
+  const client = net.connect(port, '127.0.0.1');
+  client.on('error', () => {});
+  client.write([
+    `GET ${path} HTTP/1.1`,
+    'Host: preview.example.com',
+    'Connection: Upgrade',
+    'Upgrade: websocket',
+    '\r\n',
+  ].join('\r\n'));
+  return client;
+}
+
+function settle(ms = 100) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+test('a client reset before the upstream answers an upgrade tears down both sides', async (t) => {
+  const caught = captureUncaught(t);
+  const upstream = await startHeldUpgradeUpstream();
+  const lane = await startLane();
+  t.after(async () => {
+    await lane.close();
+    await upstream.close();
+  });
+  const { preview } = lane.registry.create({ port: upstream.port });
+
+  const client = openRawUpgrade(lane.proxy.address.port, `${preview.basePath}hmr`);
+  const held = await upstream.next();
+  client.resetAndDestroy();
+
+  // The upstream leg is dropped instead of being upgraded into a dead client.
+  await held.closed;
+  await settle();
+  assert.deepEqual(caught, []);
+});
+
+test('a client reset after the upstream answered an upgrade tears down both sides', async (t) => {
+  const caught = captureUncaught(t);
+  const upstream = await startHeldUpgradeUpstream();
+  const lane = await startLane();
+  t.after(async () => {
+    await lane.close();
+    await upstream.close();
+  });
+  const { preview } = lane.registry.create({ port: upstream.port });
+
+  const client = openRawUpgrade(lane.proxy.address.port, `${preview.basePath}hmr`);
+  const held = await upstream.next();
+  held.answer();
+  const [handshake] = await once(client, 'data');
+  assert.match(handshake.toString('utf8'), /^HTTP\/1\.1 101/);
+  client.resetAndDestroy();
+
+  await held.closed;
+  await settle();
+  assert.deepEqual(caught, []);
+});
+
+test('a client socket that errors inside the upgrade handler is torn down with the upstream', async (t) => {
+  // The window the wire tests cannot time: the error lands while the handler
+  // is still waiting for the upstream, on a socket Node no longer guards.
+  const caught = captureUncaught(t);
+  const upstream = await startHeldUpgradeUpstream();
+  const lane = await startLane();
+  t.after(async () => {
+    await lane.close();
+    await upstream.close();
+  });
+  const { preview } = lane.registry.create({ port: upstream.port });
+
+  for (const answered of [false, true]) {
+    const written = [];
+    const clientSocket = new Duplex({
+      read() {},
+      write(chunk, _encoding, callback) {
+        written.push(chunk.toString('utf8'));
+        callback();
+      },
+    });
+    lane.proxy.handleUpgrade({
+      method: 'GET',
+      url: `${preview.basePath}hmr`,
+      headers: { host: 'preview.example.com', connection: 'Upgrade', upgrade: 'websocket' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, clientSocket, Buffer.alloc(0));
+    const held = await upstream.next();
+    if (answered) {
+      held.answer();
+      while (!written.length) await settle(10);
+      assert.match(written[0], /^HTTP\/1\.1 101/);
+    }
+    clientSocket.destroy(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+    await held.closed;
+    await settle();
+    assert.equal(clientSocket.destroyed, true);
+  }
+  assert.deepEqual(caught, []);
 });
 
 test('an upgrade on an unknown token is refused without reaching any upstream', async (t) => {

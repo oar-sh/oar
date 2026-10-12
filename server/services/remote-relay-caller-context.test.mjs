@@ -523,3 +523,14 @@ test('Deny on the local-sessions card denies; without a running turn it fails cl
   assert.match(refused.error, /Starting sessions on this relay needs the user's approval once per conversation/);
   assert.equal(idle.db.prepare(`SELECT COUNT(*) AS n FROM relay_questions`).get().n, 0);
 });
+
+test('the watch card names every session or all, and a transfer says from where', () => {
+  const some = formatRemoteRelayApprovalPrompt({ watch: { kind: 'subscribe', all: false, sessions: [{ id: 'conv-fixture-orbit', title: 'Orbit camera' }], events: ['turn_end', 'error'], heartbeatMinutes: 60 } });
+  assert.match(some, /watch “Orbit camera” \(conv-fix\) and be woken by their events/);
+  assert.match(some, /Events: turn_end, error · heartbeat every 60 min/);
+  const all = formatRemoteRelayApprovalPrompt({ watch: { kind: 'subscribe', all: true, events: ['all_idle'] } });
+  assert.match(all, /ALL sessions of this relay, including ones created later/);
+  const transfer = formatRemoteRelayApprovalPrompt({ watch: { kind: 'transfer', from: { id: 'conv-fixture-old', title: 'Old watcher' }, count: 3, all: true } });
+  assert.match(transfer, /take over 3 event subscriptions from session “Old watcher” \(conv-fix\) → this session/);
+  assert.match(transfer, /Among them: ALL sessions/);
+});

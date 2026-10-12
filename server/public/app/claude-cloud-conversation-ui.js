@@ -7,6 +7,9 @@
 // and the server's `cloud` payload field), so the one sync function below is
 // idempotent and is simply called whenever the header is synced. A
 // conversation of any other provider gets every element back exactly as it was.
+// The ⋯ menu is not touched here: its entries are decided in one place
+// (chat-actions-menu-state.mjs), which reads the cloud state through
+// isCurrentConversationClaudeCloud() and currentCloudSessionUrl().
 
 import { conversations, currentConvId, IS_SHARED_VIEW } from './store.js';
 import { openExternalNavigation } from './external-link-policy.mjs';
@@ -32,21 +35,10 @@ export function isCurrentConversationClaudeCloud() {
   return !IS_SHARED_VIEW && isClaudeCloudConversation(currentConversation());
 }
 
-// Hides an element for cloud chats and gives it back afterwards, without ever
-// un-hiding something another owner (shared view, feature gates) had hidden.
-function setHiddenForCloud(element, hide) {
-  if (!element) return;
-  if (hide) {
-    if (!element.hidden) {
-      element.hidden = true;
-      element.dataset.cloudHidden = '1';
-    }
-    return;
-  }
-  if (element.dataset.cloudHidden === '1') {
-    element.hidden = false;
-    delete element.dataset.cloudHidden;
-  }
+/** The claude.ai link of the open cloud conversation, once the worker reported one. */
+export function currentCloudSessionUrl() {
+  if (!isCurrentConversationClaudeCloud()) return null;
+  return buildCloudLineModel(currentConversation()?.cloud)?.sessionUrl || null;
 }
 
 export function syncClaudeCloudConversationUi() {
@@ -65,13 +57,9 @@ export function syncClaudeCloudConversationUi() {
     line.hidden = !lineHtml;
   }
 
-  // The session has no working directory on the relay host to change.
-  setHiddenForCloud(document.getElementById('chat-menu-change-cwd'), isCloud);
-
-  const openSessionButton = document.getElementById('chat-menu-open-cloud-session');
-  if (openSessionButton) {
-    openSessionButton.hidden = !(isCloud && buildCloudLineModel(conversation?.cloud)?.sessionUrl);
-  }
+  // The ⋯ menu entries (no Change CWD for a cloud chat, Open on claude.ai once
+  // there is a link) are decided with the rest of the menu in
+  // chat-actions-menu-state.mjs, from `isCloud` and currentCloudSessionUrl().
 
   const fileInput = document.getElementById('image-input');
   if (fileInput) {

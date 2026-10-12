@@ -70,6 +70,11 @@ import {
   parseTurnCeilingUpdate,
 } from '../../shared/turn-ceiling.mjs';
 import {
+  DEFAULT_SUBAGENT_RECORD_RETENTION_DAYS,
+  SUBAGENT_RECORD_RETENTION_CHOICES,
+  parseSubagentRecordRetentionUpdate,
+} from '../../shared/subagent-record-retention.mjs';
+import {
   DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
   BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
   BACKGROUND_TASK_TIMEOUT_MIN_MINUTES,
@@ -2160,6 +2165,8 @@ export function registerSessionsRoutes(app, deps) {
     resolveCursorSessionRoot = null,
     getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
+    getSubagentRecordRetentionDays = () => DEFAULT_SUBAGENT_RECORD_RETENTION_DAYS,
+    setSubagentRecordRetentionDays = () => ({ ok: false, error: 'Sub-agent record settings are unavailable' }),
     getFeatureFlagsSettingsState = () => [],
     setFeatureFlagSetting = () => ({ ok: false, error: 'Feature settings are unavailable' }),
     getPwaAppName = () => '',
@@ -2181,8 +2188,47 @@ export function registerSessionsRoutes(app, deps) {
     // conversations another relay's agent created, and the inbound switch.
     // Absent in older wiring and most tests, where both are no-ops.
     remoteRelayInbound = null,
+    // Relay events: what each session is doing (state, tasks) and the
+    // subscriptions that end with an archived or deleted conversation.
+    relayEventService = null,
+    sessionActivityTracker = null,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
+  let listRunningRunConversations = null;
+  try {
+    listRunningRunConversations = db.prepare(`SELECT DISTINCT conversation_id FROM subagent_runs WHERE status = 'running'`);
+  } catch {}
+
+  /**
+   * `{ sessionState, sessionTasks, lastActivityAt }` of one conversation:
+   * running_turn, background_only or idle, with its tasks. Only conversations
+   * that may be doing something are asked (`candidates`); the rest are idle.
+   */
+  function describeSessionActivity(conversationId, candidates = null) {
+    const id = String(conversationId || '').trim();
+    if (!sessionActivityTracker || !id) return null;
+    if (candidates && !candidates.has(id)) return { sessionState: 'idle' };
+    try {
+      const view = sessionActivityTracker.describe(id);
+      return {
+        sessionState: view.state,
+        ...(view.tasks.length ? { sessionTasks: view.tasks } : {}),
+        ...(view.state !== 'idle' && view.lastActivityAt ? { lastActivityAt: view.lastActivityAt } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** The conversations that may be busy: a turn queued, a run or task known. */
+  function activityCandidates(activeTurnConversationIds) {
+    const ids = new Set(activeTurnConversationIds);
+    for (const id of sessionActivityTracker?.knownConversationIds?.() || []) ids.add(String(id));
+    try {
+      for (const row of listRunningRunConversations?.all?.() || []) ids.add(String(row.conversation_id || ''));
+    } catch {}
+    return ids;
+  }
   // Generic synchronous transaction runner for the session-sync route: binding
   // validation, workspace learning and the binding writes must commit or roll
   // back as one unit (audit #21).
@@ -2555,6 +2601,7 @@ export function registerSessionsRoutes(app, deps) {
       hardDeleteConversationRows(conversationId);
       deleteOrphanedUploads(orphanedUploads);
       io.emit('conversation_deleted', { conversationId });
+      try { relayEventService?.noteConversationGone?.(conversationId, { deleted: true }); } catch {}
       finalized.push(conversationId);
     }
     return finalized;
@@ -2847,6 +2894,7 @@ export function registerSessionsRoutes(app, deps) {
         .map((row) => String(row?.conversation_id || '').trim())
         .filter(Boolean),
     );
+    const busyCandidates = sessionActivityTracker ? activityCandidates(activeTurnConversationIds) : null;
     const conversations = page.rows.map((r) => {
       const sid = String(r.sdk_session_id || '').trim();
       const workspaceState = typeof resolveConversationWorkspaceState === 'function'
@@ -2865,6 +2913,7 @@ export function registerSessionsRoutes(app, deps) {
         sdkSessionId: sid || null,
         title:        resolveConversationTitle({ title: r.title, titleSource: r.title_source }),
         activeTurn:   activeTurnConversationIds.has(String(r.id || '').trim()),
+        ...(describeSessionActivity(r.id, busyCandidates) || {}),
         archived:     Number(r.archived || 0) === 1,
         compactedInto: r.compacted_into || null,
         compactedFrom: r.compacted_from || null,
@@ -4010,6 +4059,7 @@ export function registerSessionsRoutes(app, deps) {
       // processing one. Another relay's agent tells "still queued" from
       // "cancelled" with it.
       activeTurn: Number(stmts.getConversationActiveQueueCount?.get?.(resolvedConversationId)?.count || 0) > 0,
+      ...(describeSessionActivity(resolvedConversationId) || {}),
       backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
       usageLimitPause: usageLimitPauseService?.getPause?.(resolvedConversationId) || null,
       previews: listConversationPreviews?.(resolvedConversationId) || [],
@@ -4820,6 +4870,7 @@ export function registerSessionsRoutes(app, deps) {
     deleteOrphanedUploads(orphanedUploads);
     if (sdkSessionId && !cliSession.queued) stmts.deleteSdkDeleteRequest?.run?.(sdkSessionId);
     io.emit('conversation_deleted', { conversationId: id });
+    try { relayEventService?.noteConversationGone?.(id, { deleted: true }); } catch {}
     return { statusCode: 200, body: { ok: true, workerStopped, cliSessionDeleted: cliSession.deleted } };
   }
 
@@ -4898,6 +4949,8 @@ export function registerSessionsRoutes(app, deps) {
         }
         db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
         io.emit('conversation_archived', { conversationId: id, archived: true });
+        // Its subscriptions end, and so does its place in others'.
+        try { relayEventService?.noteConversationGone?.(id); } catch {}
         // The cloud session of a Claude Cloud conversation is archived with it;
         // best effort and not waited for.
         if (!sharedWithConversationId) {
@@ -6415,6 +6468,25 @@ export function registerSessionsRoutes(app, deps) {
       stepMinutes: TURN_CEILING_STEP_MINUTES,
       defaultMinutes: DEFAULT_TURN_CEILING_MINUTES,
     });
+  });
+
+  // How long sub-agent records keep their tool inputs and output (0 = always).
+  const subagentRecordRetentionPayload = (retentionDays) => ({
+    retentionDays,
+    choices: [...SUBAGENT_RECORD_RETENTION_CHOICES],
+    defaultDays: DEFAULT_SUBAGENT_RECORD_RETENTION_DAYS,
+  });
+
+  app.get('/api/settings/subagent-record-retention', auth, (_req, res) => {
+    res.json(subagentRecordRetentionPayload(getSubagentRecordRetentionDays()));
+  });
+
+  app.post('/api/settings/subagent-record-retention', auth, (req, res) => {
+    const parsed = parseSubagentRecordRetentionUpdate(req.body?.retentionDays);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setSubagentRecordRetentionDays(parsed.days);
+    if (!result.ok) return res.status(500).json({ error: result.error });
+    return res.json(subagentRecordRetentionPayload(result.retentionDays));
   });
 
   app.get('/api/settings/background-task-timeout', auth, (_req, res) => {

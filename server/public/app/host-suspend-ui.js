@@ -103,10 +103,13 @@ export function relayShutdownBannerText(state) {
   if (String(state.status || '') === 'shutting_down') {
     return `${icon} Relay ${action === 'restart' ? 'restarting' : 'shutting down'} now…`;
   }
+  // Only the processing turns hold it; queued messages wait for the restart.
   const queue = state.queue || {};
-  const turns = Number(queue.pendingCount || 0) + Number(queue.processingCount || 0) + Number(queue.parkedCount || 0);
-  const waiting = turns > 0 ? `waiting for ${turns} turn${turns === 1 ? '' : 's'} to finish` : 'queue is idle, going down now';
-  return `${icon} Relay ${action} queued — ${waiting}`;
+  const turns = Number(queue.processingCount || 0);
+  const held = Number(queue.pendingCount || 0) + Number(queue.parkedCount || 0);
+  const waiting = turns > 0 ? `waiting for ${turns} running turn${turns === 1 ? '' : 's'} to finish` : 'nothing is running, going down now';
+  const queued = held > 0 ? `; ${held} queued message${held === 1 ? '' : 's'} wait${held === 1 ? 's' : ''} for it` : '';
+  return `${icon} Relay ${action} queued — ${waiting}${queued}`;
 }
 
 function ensureBanner() {

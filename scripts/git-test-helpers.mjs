@@ -16,17 +16,24 @@ export function hasGit() {
   try { execFileSync('git', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
 }
 
+// `git init -b` needs git 2.28; pointing HEAD at main by hand works on older
+// git too, where the default branch would be master.
+function initOnMain(dir, { bare = false } = {}) {
+  execFileSync('git', ['init', '-q', ...(bare ? ['--bare'] : []), dir]);
+  execFileSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: dir });
+}
+
 export function createSandbox({ withWorkRemote = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-git-sandbox-'));
   const publicDir = path.join(root, 'public.git');
   const workDir = path.join(root, 'work.git');
   const repo = path.join(root, 'checkout');
   fs.mkdirSync(repo);
-  execFileSync('git', ['init', '--bare', '-q', '-b', 'main', publicDir]);
-  if (withWorkRemote) execFileSync('git', ['init', '--bare', '-q', '-b', 'main', workDir]);
+  initOnMain(publicDir, { bare: true });
+  if (withWorkRemote) initOnMain(workDir, { bare: true });
+  initOnMain(repo);
 
   const git = gitIn(repo);
-  git('init', '-q', '-b', 'main');
   git('config', 'user.name', 'Dev');
   git('config', 'user.email', 'dev@example.com');
   git('config', 'commit.gpgsign', 'false');

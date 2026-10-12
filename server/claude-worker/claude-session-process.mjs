@@ -38,6 +38,7 @@ import {
   createClaudeTurnPublisher,
   isStaleAttemptError,
 } from './claude-turn-publisher.mjs';
+import { createSubagentTimelineRecorder } from './subagent-timeline-recorder.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
@@ -49,6 +50,7 @@ import {
   STEER_STOPPED_TEXT,
 } from '../../shared/steer-settle-markers.mjs';
 import { stripSteerNote, withSteerNoteContent } from '../../shared/steer-note.mjs';
+import { isRelayEventDelivery } from '../../shared/relay-events.mjs';
 import {
   stripSlashCommandGuard,
   stripSlashCommandGuardContent,
@@ -547,8 +549,12 @@ export function createClaudeSessionRunner({
   // Whether CLI processes carry the relay's `remote_relay` tool
   // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
   remoteRelayToolGate = null,
+  // Records every sub-agent's frames as its timeline, run-scoped (see
+  // subagent-timeline-recorder.mjs). Injectable for tests.
+  subagentTimelineRecorder = null,
   dbg = () => {},
 } = {}) {
+  const timelineRecorder = subagentTimelineRecorder || createSubagentTimelineRecorder({ api, conversationId: sdkSessionId, dbg });
   const publisher = createClaudeTurnPublisher({
     api,
     dbg,
@@ -2481,6 +2487,19 @@ export function createClaudeSessionRunner({
       // tree publishes before the row clears (best-effort: the CLI may have
       // already removed the task via background_tasks_changed).
       if (taskId) publishFinalWorkflowDigest(taskId, String(sdkMessage.status || '').trim());
+      // How the task ended, for the relay's task status and the watchers of
+      // this session (the live set only says it is gone). Ambient tasks are
+      // not activity. Advisory: a failed post never disturbs the stream.
+      if (taskId && sdkMessage.ambient !== true) {
+        api('POST', '/api/background-task-settled', {
+          conversationId: sdkSessionId,
+          taskId,
+          toolUseId: String(sdkMessage.tool_use_id || '').trim() || null,
+          status: String(sdkMessage.status || '').trim() || 'completed',
+          summary: String(sdkMessage.summary || '').trim().slice(0, 500) || null,
+          ...(sdkMessage.reason ? { reason: String(sdkMessage.reason).slice(0, 40) } : {}),
+        }).catch((error) => dbg('background task settle publish failed', error?.message || String(error)));
+      }
       // A settled session-level task means the CLI is about to dequeue a
       // continuation turn — the process must not idle out under it. The SDK
       // flags silent notifications explicitly: skip_transcript means no
@@ -2681,6 +2700,9 @@ export function createClaudeSessionRunner({
   }
 
   async function handleSdkMessage(sdkMessage) {
+    // Before any turn takes the frame: a background agent's frames arrive
+    // between turns too, and belong to the run, not to whichever turn is open.
+    timelineRecorder.observe(sdkMessage);
     const usageLimitReport = usageLimit.observe(sdkMessage);
     if (usageLimitReport) publisher.publishUsageLimitReport({ conversationId: sdkSessionId, sdkSessionId, report: usageLimitReport });
     const suppressed = maybeSuppressStopFollowUp(sdkMessage);
@@ -2702,6 +2724,12 @@ export function createClaudeSessionRunner({
       await settling;
     }
     if (!ctx) return;
+    timelineRecorder.claimSpawns(sdkMessage, ctx);
+    // A background agent spawned by an earlier turn: its frames are not this
+    // turn's, and published here they would be filed under it. Its record
+    // goes to its own run through the recorder above.
+    const subagentParent = String(sdkMessage?.parent_tool_use_id || '').trim();
+    if (subagentParent && timelineRecorder.isForeignRun(subagentParent, ctx)) return;
     const actions = ctx.normalizer.normalize(sdkMessage);
     for (const action of actions) {
       // Decided here, while the reports the turn ran under are the latest.
@@ -3201,6 +3229,10 @@ export function createClaudeSessionRunner({
     const wasCurrent = proc === processRef;
     // The next spawn reads the registration decision; refresh it now.
     if (wasCurrent) void remoteRelayGate.refresh();
+    // Agents die with their process: their runs end, what streamed closes.
+    if (wasCurrent) {
+      void timelineRecorder.processEnded().catch((error) => dbg('subagent timeline flush failed', error?.message || String(error)));
+    }
     stopLifecycleTimer(processRef);
     if (processRef.taskPublishTimer) {
       clearTimeout(processRef.taskPublishTimer);
@@ -3913,7 +3945,9 @@ export function createClaudeSessionRunner({
         // noted steer no longer starts with "/" and is pushed as noted. The
         // replay signatures strip the guard too, so expectedText stays the
         // user's own text here as well.
-        const pushedContent = withSlashCommandGuardContent(steered && procRef.activeCtx?.kind !== 'continuation'
+        // Nor into an event message the relay wrote: the note speaks as the
+        // user, the event must not (shared/relay-events.mjs).
+        const pushedContent = withSlashCommandGuardContent(steered && procRef.activeCtx?.kind !== 'continuation' && !isRelayEventDelivery(message)
           ? withSteerNoteContent(content)
           : content);
         procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now(), steered });

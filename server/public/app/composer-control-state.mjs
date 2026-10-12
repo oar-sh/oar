@@ -22,6 +22,8 @@ export function hasUploadingAttachments(attachments = []) {
 // Why a message sent right now queues instead of steering — worker-reported
 // hold reasons mapped to a human title. Stopping a turn lives on the message
 // bubbles, never here, so every state below is a Send/Steer/Queue shape.
+export const SETUP_REQUIRED_TEXT = 'Set up a provider to start chatting';
+
 const STEERING_HOLD_TITLES = Object.freeze({
   question: 'Will steer in after you answer the question',
   compaction: 'Will steer in once the conversation finishes compacting',
@@ -50,7 +52,21 @@ export function deriveComposerControlState({
   // An archived conversation: its worker is stopped and it is out of the
   // live list; sending would start it again behind the user's back.
   archived = false,
+  // No conversation open and no provider known to be ready (a fresh install):
+  // a send here would create a Copilot chat that cannot run. The composer is
+  // locked, with a placeholder that says what to do, until readiness flips.
+  setupRequired = false,
 } = {}) {
+  if (setupRequired) {
+    return {
+      action: 'send',
+      label: 'Send',
+      title: SETUP_REQUIRED_TEXT,
+      disabled: true,
+      composerDisabled: true,
+      placeholder: SETUP_REQUIRED_TEXT,
+    };
+  }
   if (archived) {
     return {
       action: 'send',

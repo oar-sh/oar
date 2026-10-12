@@ -29,7 +29,10 @@ export function createRemoteRelayRepository(db) {
   const hasUnlock = db.prepare(`SELECT 1 FROM conversation_remote_relay_unlocks WHERE conversation_id = ? AND remote_relay_id = ?`);
   const listUnlocks = db.prepare(`SELECT remote_relay_id, message_id, created_at FROM conversation_remote_relay_unlocks WHERE conversation_id = ? ORDER BY created_at ASC`);
   const insertUnlock = db.prepare(`INSERT OR IGNORE INTO conversation_remote_relay_unlocks (conversation_id, remote_relay_id, message_id, created_at) VALUES (?, ?, ?, ?)`);
-  const deleteUnlocksForRelay = db.prepare(`DELETE FROM conversation_remote_relay_unlocks WHERE remote_relay_id = ?`);
+  // The relay's unlocks and the approvals stored under its id (`<id>:watch`).
+  const deleteUnlocksForRelay = db.prepare(`
+    DELETE FROM conversation_remote_relay_unlocks WHERE remote_relay_id = ? OR substr(remote_relay_id, 1, length(?) + 1) = ? || ':'
+  `);
   const deleteUnlocksForConversation = db.prepare(`DELETE FROM conversation_remote_relay_unlocks WHERE conversation_id = ?`);
   const setMessageOrigin = db.prepare(`UPDATE messages SET origin_json = ? WHERE id = ?`);
   const getMessageOrigin = db.prepare(`SELECT origin_json FROM messages WHERE id = ?`);
@@ -101,7 +104,8 @@ export function createRemoteRelayRepository(db) {
         .map((row) => String(row.id));
     },
     forgetRelay(remoteRelayId) {
-      return deleteUnlocksForRelay.run(String(remoteRelayId || '')).changes;
+      const id = String(remoteRelayId || '');
+      return deleteUnlocksForRelay.run(id, id, id).changes;
     },
     forgetConversation(conversationId) {
       return deleteUnlocksForConversation.run(String(conversationId || '')).changes;

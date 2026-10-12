@@ -1498,6 +1498,17 @@ export function isSubagentCancelInFlight(subagentRunId) {
   return id ? subagentCancelInFlight.has(id) : false;
 }
 
+const SUBAGENT_HEADER_FIELDS = ['completedAt', 'model', 'modelInherited', 'subagentType', 'taskId', 'totalTokens', 'background', 'truncated', 'stoppable'];
+
+function subagentHeaderFields(payload, existing) {
+  const fields = {};
+  for (const name of SUBAGENT_HEADER_FIELDS) {
+    const value = payload?.[name];
+    fields[name] = value === undefined ? (existing?.[name] ?? null) : value;
+  }
+  return fields;
+}
+
 export function upsertSubagentRun(payload) {
   const subagentRunId = normalizeSubagentRunId(payload?.subagentRunId);
   if (!subagentRunId) return null;
@@ -1511,8 +1522,14 @@ export function upsertSubagentRun(payload) {
     parentSubagentId: normalizeSubagentRunId(payload?.parentSubagentId) || existing?.parentSubagentId || null,
     displayName: String(payload?.displayName || existing?.displayName || '').trim() || null,
     status: nextSubagentStatus({ reported: payload?.status, known: existing?.status, normalize: normalizeSubagentStatus }),
-    startedAt: existing?.startedAt || payload?.timestamp || now,
-    updatedAt: payload?.timestamp || now,
+    startedAt: payload?.startedAt || existing?.startedAt || payload?.timestamp || now,
+    updatedAt: payload?.updatedAt || payload?.timestamp || now,
+    // The run header (relay 0009): what the sub-agent rows and the viewer
+    // show. An event that does not name a field keeps the known value.
+    ...subagentHeaderFields(payload, existing),
+    // Whether `status` came from the relay rather than the default a live
+    // lane's first frame starts with.
+    statusReported: Boolean(String(payload?.status || '').trim()) || existing?.statusReported === true,
     activities: existing?.activities || [],
     thoughts: existing?.thoughts || [],
     // Cumulative streamed text for this run, replayed when its bubble is

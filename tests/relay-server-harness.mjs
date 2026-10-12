@@ -322,10 +322,13 @@ export async function startRelayServer({
   // Receives the state root paths (and the port) and returns the overrides;
   // for a pin that has to name a path inside the state root.
   overrides = {},
+  // The state root of an earlier handle (after its `kill()`): the relay
+  // restarts on the same database and settings. Pass its port too.
+  state = null,
 } = {}) {
   const resolvedPort = port || await reserveFreePort();
   const baseUrl = `http://127.0.0.1:${resolvedPort}`;
-  const paths = createStateRoot();
+  const paths = state || createStateRoot();
   if (persistWorkerConfig) {
     fs.writeFileSync(
       path.join(paths.stateRoot, "config.json"),
@@ -369,6 +372,9 @@ export async function startRelayServer({
     get stdout() { return stdout; },
     get stderr() { return stderr; },
     cleanupStateRoot: () => removeStateRoot(paths.stateRoot),
+    // The process only: the state root stays for a restart (`state`).
+    kill: () => stopProcess(proc),
+    state: paths,
     stop: async () => {
       await stopProcess(proc);
       removeStateRoot(paths.stateRoot);

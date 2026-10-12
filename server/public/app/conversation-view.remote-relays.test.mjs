@@ -294,6 +294,213 @@ test('a prompt from an agent on this relay carries a "via agent" badge that open
   assert.match(bubble.textContent, /check the docs build/);
 });
 
+// ─── Agent exchanges fold into one row ───────────────────────────────────────
+
+const fxAt = (minute, second = 0) => `2026-10-01T10:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}.000Z`;
+const EXCHANGE = [
+  { id: 'fx-u1', role: 'user', text: 'collect the numbers', timestamp: fxAt(0) },
+  { id: 'fx-a1', role: 'assistant', text: 'collected', sourceMessageId: 'fx-u1', timestamp: fxAt(0, 20) },
+  { id: 'fx-p1', role: 'user', text: HEADER_TEXT, origin: ORIGIN, timestamp: fxAt(1) },
+  { id: 'fx-a2', role: 'assistant', text: 'the suite is green', sourceMessageId: 'fx-p1', timestamp: fxAt(1, 30) },
+];
+const foldRow = (id) => row(id)?.querySelector(':scope > details.agent-exchange-row') || null;
+const classesOf = (id) => ['agent-exchange-head', 'agent-exchange-member', 'agent-exchange-closed']
+  .filter((name) => row(id).classList.contains(name));
+
+test('an agent\'s prompt and its reply fold into one row; the user\'s own exchange stays as it is', () => {
+  messagesEl.innerHTML = '';
+  const conv = openConversation();
+  view.renderMessages(EXCHANGE, false, { conversationId: conv });
+
+  const fold = foldRow('fx-p1');
+  assert.ok(fold, 'the row is the prompt node\'s own');
+  assert.equal(row('fx-p1').firstElementChild, fold);
+  assert.equal(fold.open, false);
+  assert.equal(fold.querySelector('.agent-exchange-text').textContent, 'note from win-test · report builder');
+  assert.equal(fold.querySelector('.agent-exchange-status').textContent, 'replied');
+  assert.equal(fold.querySelector('summary').getAttribute('title'), 'note from win-test · report builder · replied');
+  assert.deepEqual(classesOf('fx-p1'), ['agent-exchange-head', 'agent-exchange-closed']);
+  assert.deepEqual(classesOf('fx-a2'), ['agent-exchange-member', 'agent-exchange-closed']);
+  // Folded, not gone: the badge and the reply are rendered as before.
+  assert.equal(row('fx-p1').querySelector('.msg-bubble .msg-origin-badge').textContent, '↗ from win-test · “report builder” · claude-sonnet-5');
+  assert.match(row('fx-a2').textContent, /the suite is green/);
+  for (const id of ['fx-u1', 'fx-a1']) {
+    assert.deepEqual(classesOf(id), [], id);
+    assert.equal(foldRow(id), null, id);
+  }
+
+  // Opened, the classes go; a re-render rebuilds the nodes and keeps it open.
+  fold.open = true;
+  fold.dispatchEvent(new window.Event('toggle'));
+  assert.deepEqual(classesOf('fx-p1'), ['agent-exchange-head']);
+  assert.deepEqual(classesOf('fx-a2'), ['agent-exchange-member']);
+  const before = row('fx-p1');
+  view.renderMessages([...EXCHANGE, { id: 'fx-u3', role: 'user', text: 'thanks', timestamp: fxAt(2) }], false, { conversationId: conv });
+  assert.notEqual(row('fx-p1'), before);
+  assert.equal(foldRow('fx-p1').open, true);
+  assert.deepEqual(classesOf('fx-a2'), ['agent-exchange-member']);
+  // Folded again by the user: the same through a render.
+  foldRow('fx-p1').open = false;
+  foldRow('fx-p1').dispatchEvent(new window.Event('toggle'));
+  view.renderMessages(EXCHANGE, false, { conversationId: conv });
+  assert.deepEqual(classesOf('fx-a2'), ['agent-exchange-member', 'agent-exchange-closed']);
+});
+
+test('a running agent turn folds with its live bubble, and a jump into it opens it', () => {
+  messagesEl.innerHTML = '';
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'fx-p4', role: 'user', text: 'rerun the suite', origin: ORIGIN, timestamp: fxAt(4) },
+  ], false, { conversationId: conv });
+  assert.equal(foldRow('fx-p4').querySelector('.agent-exchange-status').textContent, 'no reply yet');
+
+  view.showThinking('fx-p4', false);
+  const bubble = document.getElementById('thinking-indicator');
+  assert.equal(bubble.previousElementSibling, row('fx-p4'));
+  assert.ok(bubble.classList.contains('agent-exchange-member'));
+  assert.equal(bubble.classList.contains('agent-exchange-closed'), false);
+  assert.equal(foldRow('fx-p4').querySelector('.agent-exchange-status').textContent, 'working…');
+
+  // The reply arrives the way the socket appends it: a failed turn's note
+  // names its prompt only through the anchor.
+  view.removeThinking();
+  view.appendMessage({
+    role: 'assistant',
+    text: 'The relay runtime hit a terminal error and could not complete this turn. Error code: relay.copilot-session-lost. Send the message again to retry.',
+    timestamp: fxAt(5),
+  }, false, 'fx-a4', false, 'fx-p4');
+  assert.equal(foldRow('fx-p4').querySelector('.agent-exchange-status').textContent, 'failed');
+  assert.deepEqual(classesOf('fx-a4'), ['agent-exchange-member', 'agent-exchange-closed']);
+
+  assert.equal(view.focusConversationMessageById('fx-a4'), true);
+  assert.equal(foldRow('fx-p4').open, true);
+  assert.deepEqual(classesOf('fx-a4'), ['agent-exchange-member']);
+});
+
+// JSDOM fires a details' toggle on a timer, as a browser does on a task.
+const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+test('an agent\'s exchange stays open while it works', async () => {
+  messagesEl.innerHTML = '';
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'fx-p8', role: 'user', text: 'tidy the legend', origin: ORIGIN, timestamp: fxAt(8) },
+  ], false, { conversationId: conv });
+  view.showThinking('fx-p8', false);
+  try {
+    assert.equal(foldRow('fx-p8').open, true);
+    assert.equal(foldRow('fx-p8').querySelector('.agent-exchange-status').textContent, 'working…');
+    assert.deepEqual(classesOf('fx-p8'), ['agent-exchange-head']);
+    assert.equal(document.getElementById('thinking-indicator').classList.contains('agent-exchange-closed'), false);
+    // The pass opening it is not a choice of the user's: still open, and
+    // still the pass's to close.
+    await settle();
+    view.syncAgentExchangeFoldsNow();
+    assert.equal(foldRow('fx-p8').open, true);
+  } finally {
+    view.removeThinking();
+  }
+});
+
+test('an agent\'s exchange folds by itself once it is replied to', async () => {
+  messagesEl.innerHTML = '';
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'fx-p9', role: 'user', text: 'check the totals', origin: ORIGIN, timestamp: fxAt(9) },
+  ], false, { conversationId: conv });
+  view.showThinking('fx-p9', false);
+  assert.equal(foldRow('fx-p9').open, true);
+
+  // The reply lands before the opened row's toggle has fired.
+  view.removeThinking();
+  view.appendMessage({ role: 'assistant', text: 'the totals add up', timestamp: fxAt(9, 40) }, false, 'fx-a9', false, 'fx-p9');
+  assert.equal(foldRow('fx-p9').querySelector('.agent-exchange-status').textContent, 'replied');
+  assert.equal(foldRow('fx-p9').open, false);
+  assert.deepEqual(classesOf('fx-a9'), ['agent-exchange-member', 'agent-exchange-closed']);
+  await settle();
+  view.renderMessages([
+    { id: 'fx-p9', role: 'user', text: 'check the totals', origin: ORIGIN, timestamp: fxAt(9) },
+    { id: 'fx-a9', role: 'assistant', text: 'the totals add up', sourceMessageId: 'fx-p9', timestamp: fxAt(9, 40) },
+  ], false, { conversationId: conv });
+  assert.equal(foldRow('fx-p9').open, false);
+  assert.deepEqual(classesOf('fx-a9'), ['agent-exchange-member', 'agent-exchange-closed']);
+});
+
+test('a working exchange the user closed stays closed, and opened again once replied it stays open', async () => {
+  messagesEl.innerHTML = '';
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'fx-p10', role: 'user', text: 'rename the sheet', origin: ORIGIN, timestamp: fxAt(10) },
+  ], false, { conversationId: conv });
+  view.showThinking('fx-p10', false);
+  await settle();
+  foldRow('fx-p10').open = false;
+  await settle();
+  assert.deepEqual(classesOf('fx-p10'), ['agent-exchange-head', 'agent-exchange-closed']);
+  assert.ok(document.getElementById('thinking-indicator').classList.contains('agent-exchange-closed'));
+  view.syncAgentExchangeFoldsNow();
+  assert.equal(foldRow('fx-p10').open, false);
+
+  view.removeThinking();
+  view.appendMessage({ role: 'assistant', text: 'renamed', timestamp: fxAt(10, 30) }, false, 'fx-a10', false, 'fx-p10');
+  assert.equal(foldRow('fx-p10').open, false);
+  assert.deepEqual(classesOf('fx-a10'), ['agent-exchange-member', 'agent-exchange-closed']);
+
+  foldRow('fx-p10').open = true;
+  await settle();
+  assert.deepEqual(classesOf('fx-a10'), ['agent-exchange-member']);
+  view.renderMessages([
+    { id: 'fx-p10', role: 'user', text: 'rename the sheet', origin: ORIGIN, timestamp: fxAt(10) },
+    { id: 'fx-a10', role: 'assistant', text: 'renamed', sourceMessageId: 'fx-p10', timestamp: fxAt(10, 30) },
+  ], false, { conversationId: conv });
+  assert.equal(foldRow('fx-p10').open, true);
+});
+
+test('a user message steered into an agent\'s turn keeps that turn as it is', () => {
+  messagesEl.innerHTML = '';
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'fx-p5', role: 'user', text: 'collect the totals', origin: ORIGIN, timestamp: fxAt(5) },
+    { id: 'fx-a5', role: 'assistant', text: 'totals and the extra column', sourceMessageId: 'fx-p5', timestamp: fxAt(7) },
+    { id: 'fx-u6', role: 'user', text: 'add a column for May', timestamp: fxAt(6) },
+    { id: 'fx-m6', role: 'assistant', kind: 'folded', text: '_(Handled together with the previous reply — this message was steered into that turn.)_', sourceMessageId: 'fx-u6', timestamp: fxAt(7) },
+  ], false, { conversationId: conv });
+  for (const id of ['fx-p5', 'fx-a5', 'fx-u6', 'fx-m6']) assert.deepEqual(classesOf(id), [], id);
+  assert.equal(foldRow('fx-p5'), null);
+  assert.ok(row('fx-u6').classList.contains('msg-steered'));
+});
+
+test('an open approval card shows its turn whole, and it stays shown once answered', () => {
+  messagesEl.innerHTML = '';
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'fx-p7', role: 'user', text: 'plan the release', origin: ORIGIN, timestamp: fxAt(7) },
+  ], false, { conversationId: conv });
+  view.showThinking('fx-p7', false);
+  assert.ok(foldRow('fx-p7'));
+
+  const board = { id: 'board-fixture-1', conversationId: conv, messageId: 'fx-p7', status: 'pending', title: 'Plan', body: 'ship it', actions: [] };
+  store.relayBoards.set(board.id, board);
+  try {
+    view.syncAgentExchangeFoldsNow();
+    assert.equal(foldRow('fx-p7'), null);
+    assert.deepEqual(classesOf('fx-p7'), []);
+    assert.equal(document.getElementById('thinking-indicator').classList.contains('agent-exchange-closed'), false);
+    store.relayBoards.set(board.id, { ...board, status: 'acted', selectedAction: 'approve' });
+    view.syncAgentExchangeFoldsNow();
+    assert.equal(foldRow('fx-p7'), null);
+  } finally {
+    store.relayBoards.delete(board.id);
+    view.removeThinking();
+  }
+
+  // The renderers of cards and boards call the pass through window.
+  for (const file of ['./ask-user-view.js', './relay-board-view.js']) {
+    assert.ok(fs.readFileSync(new URL(file, import.meta.url), 'utf8').includes('window.syncAgentExchangeFolds?.();'), file);
+  }
+  assert.ok(fs.readFileSync(new URL('./bootstrap.js', import.meta.url), 'utf8').includes('window.syncAgentExchangeFolds = syncAgentExchangeFoldsNow;'));
+});
+
 // ─── Composer: slash menu and @relay popup share the keyboard ────────────────
 
 const input = document.getElementById('msg-input');

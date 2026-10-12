@@ -7,6 +7,7 @@
 // per conversation for the life of the page.
 
 import { isChatInteractionHeld } from './selection-guard.mjs';
+import { AGENT_EXCHANGE_CLOSED_CLASS } from './agent-exchange-fold-view.mjs';
 
 export const THINKING_FOLLOW_MODES = Object.freeze(['thoughts', 'stream', 'tools']);
 export const THINKING_FOLLOW_BOTTOM_GAP_PX = 16;
@@ -108,6 +109,9 @@ function resolveTarget(mode) {
   const el = document.querySelector(selector);
   if (!el) return null;
   if (el.hidden || el.closest?.('[hidden]')) return null;
+  // Nor does a live bubble folded into an agent exchange: it has no box, and
+  // following it would scroll the pane to the top.
+  if (el.closest?.(`.${AGENT_EXCHANGE_CLOSED_CLASS}`)) return null;
   // A collapsed <details> or an empty list has nothing to follow yet.
   const details = el.closest?.('details');
   if (details && !details.open) return null;

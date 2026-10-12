@@ -16,14 +16,13 @@ import {
   setRelayOnline,
   setCliOnline,
   setCloudflaredTunnelState,
-  setCurrentConv,
   updateWorkspaceRootHints,
   updateCompactButton,
-  updateSessionPill,
   clearPendingUserMessage,
   hasPendingUserMessageDuplicate,
   isMessagesAtBottom,
   upsertSubagentRun,
+  getSubagentRun,
   addSubagentActivity,
   addSubagentThought,
   clearSubagentCancelInFlight,
@@ -36,7 +35,8 @@ import {
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { capLiveActivityEntries } from './activity-replay-state.mjs';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
-import { renderConvList, refreshConversations, openConversation } from './journal-view.js';
+import { clearOpenConversation, renderConvList, refreshConversations, openConversation } from './journal-view.js';
+import { applyRelayEventSubscriptions, loadRelayEventSubscriptions } from './relay-event-subscriptions-ui.js';
 import {
   upsertRelayQuestion,
   loadRelayQuestions,
@@ -54,6 +54,7 @@ import { applyClaudeAuthState } from './claude-auth-ui.js';
 import { applyGrokAuthState } from './grok-auth-ui.js';
 import { applyClaudeCloudSettingsState, refreshClaudeCloudSettingsState } from './claude-cloud-settings-ui.js';
 import { applyClaudeCloudSessionEvent } from './claude-cloud-conversation-ui.js';
+import { updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { applyCliInstallState } from './cli-install-ui.js';
 import { renderUpdateSection } from './update-ui.js';
 import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
@@ -74,6 +75,7 @@ import {
   renderMessages,
   appendMessage,
   replaceRenderedMessage,
+  noteTranscriptLiveRow,
   applyIncomingConversationDraftUpdate,
   getRenderedConversationMessageFingerprints,
   clearBubbleCancelState,
@@ -88,6 +90,12 @@ import { clearMessageSearchRuntimeState } from './message-search-view.js';
 import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
 import { mergeRelayThoughts } from './relay-thoughts.mjs';
+import {
+  handleSubagentStatusEventForViewer,
+  handleSubagentTimelineEvent,
+  handleSubagentViewerReconnect,
+  refreshSubagentRows,
+} from './subagent-viewer.mjs';
 
 const FALLBACK_MODE = 'agent';
 
@@ -327,6 +335,10 @@ export async function connectSocket(overrideDeps) {
     resyncAfterConnect();
     refreshSessionWorkerStatus().catch(() => {});
     refreshModelCatalog().catch(() => {});
+    // An open sub-agent viewer fetches whatever it missed while away.
+    handleSubagentViewerReconnect();
+    // Subscriptions that changed while away.
+    void loadRelayEventSubscriptions();
   });
   socket.on('connect_error', (e) => {
     setRelayOnline(false);
@@ -357,8 +369,11 @@ export async function connectSocket(overrideDeps) {
     updateModelCatalogState(payload || {});
     void reconcileOpenModelVariantModal();
   });
+  // Each settings event also feeds provider readiness (provider-readiness.mjs),
+  // so a Settings save changes the empty screen without a reload.
   socket.on('openai_settings_updated', (payload) => {
-    deps?.applyOpenAISettingsState?.(payload || {});
+    const state = deps?.applyOpenAISettingsState?.(payload || {});
+    updateProviderReadinessInputs({ openai: state || payload || null });
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())
@@ -371,7 +386,8 @@ export async function connectSocket(overrideDeps) {
     deps?.applyCopilotSettingsState?.(payload || {});
   });
   socket.on('claude_settings_updated', (payload) => {
-    deps?.applyClaudeSettingsState?.(payload || {});
+    const state = deps?.applyClaudeSettingsState?.(payload || {});
+    updateProviderReadinessInputs({ claude: state || payload || null });
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())
@@ -421,8 +437,13 @@ export async function connectSocket(overrideDeps) {
   // carries the same shape as GET /api/settings/claude-cloud; one without a
   // body is read as "something changed" and answered with a fresh read.
   socket.on('claude_cloud_settings_updated', (payload) => {
-    if (payload && typeof payload === 'object') applyClaudeCloudSettingsState(payload);
-    else void refreshClaudeCloudSettingsState();
+    if (payload && typeof payload === 'object') {
+      updateProviderReadinessInputs({ claudeCloud: applyClaudeCloudSettingsState(payload) || null });
+    } else {
+      void refreshClaudeCloudSettingsState().then((state) => {
+        updateProviderReadinessInputs({ claudeCloud: state || null });
+      });
+    }
   });
   // A cloud session got its id, pushed a branch or reported a new cost: the
   // conversation's `cloud` field changed, and with it the cloud line.
@@ -430,7 +451,8 @@ export async function connectSocket(overrideDeps) {
     if (applyClaudeCloudSessionEvent(payload || null)) deps?.syncChatTitleControls?.();
   });
   socket.on('grok_settings_updated', (payload) => {
-    deps?.applyGrokSettingsState?.(payload || {});
+    const state = deps?.applyGrokSettingsState?.(payload || {});
+    updateProviderReadinessInputs({ grok: state || payload || null });
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())
@@ -438,7 +460,8 @@ export async function connectSocket(overrideDeps) {
     }
   });
   socket.on('cursor_settings_updated', (payload) => {
-    deps?.applyCursorSettingsState?.(payload || {});
+    const state = deps?.applyCursorSettingsState?.(payload || {});
+    updateProviderReadinessInputs({ cursor: state || payload || null });
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())
@@ -485,7 +508,11 @@ export async function connectSocket(overrideDeps) {
       })) {
         return;
       }
-      appendMessage(normalizedMessage, true, messageId);
+      // Another client's message (an agent's prompt included) follows the
+      // end like any live row: a reader scrolled up stays where they are,
+      // and the jump-to-bottom badge counts it.
+      appendMessage(normalizedMessage, isMessagesAtBottom(), messageId);
+      noteTranscriptLiveRow();
     }
   });
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
@@ -512,6 +539,7 @@ export async function connectSocket(overrideDeps) {
     if (messageId && seenMessageIds?.has(messageId)) return;
     if (isCurrentConversation) {
       appendMessage(message, autoScroll, messageId || null, false, sourceMessageId || null);
+      noteTranscriptLiveRow();
       scheduleContextUsageRefresh(conversationId, 120);
     }
     if (sourceMessageId) relayActivities.delete(sourceMessageId);
@@ -532,6 +560,7 @@ export async function connectSocket(overrideDeps) {
     if (!replaceRenderedMessage(message, messageId)) {
       appendMessage(message, isMessagesAtBottom(), messageId, false);
     }
+    noteTranscriptLiveRow();
   });
   socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
   socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
@@ -542,6 +571,10 @@ export async function connectSocket(overrideDeps) {
   socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_changed', () => {
     loadRelayBoards();
+  });
+  // Relay event subscriptions: the whole active list, after every change.
+  socket.on('relay_event_subscriptions', ({ subscriptions }) => {
+    applyRelayEventSubscriptions(subscriptions);
   });
   socket.on('background_tasks', ({ conversationId, tasks }) => {
     setConversationBackgroundTasks(conversationId, tasks);
@@ -623,24 +656,28 @@ export async function connectSocket(overrideDeps) {
       appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
     }
   });
-  socket.on('subagent_status', ({ conversationId, messageId, subagentRunId, parentSubagentId, displayName, status, timestamp, stopUnsupported }) => {
-    if (!messageId || !subagentRunId) return;
-    upsertSubagentRun({
-      subagentRunId,
-      messageId,
-      conversationId,
-      parentSubagentId,
-      displayName,
-      status,
-      timestamp,
-    });
+  socket.on('subagent_status', (payload = {}) => {
+    const { conversationId, subagentRunId, status, stopUnsupported } = payload;
+    if (!subagentRunId) return;
+    // An event without its turn is placed on the run the store already
+    // knows; one for an unknown run without a turn cannot be placed.
+    const messageId = payload.messageId || getSubagentRun(subagentRunId)?.messageId || null;
+    if (!messageId) return;
+    upsertSubagentRun({ ...payload, messageId });
     clearSubagentCancelInFlight(subagentRunId);
     // The provider answered "not supported": pin the state so the button does
     // not re-arm into an endless click-and-fail loop.
     if (stopUnsupported) markSubagentStopUnsupported(subagentRunId);
     if (conversationId === currentConvId) {
       updateSubagentBubbleFromStatus(subagentRunId, status);
+      refreshSubagentRows(subagentRunId);
     }
+    handleSubagentStatusEventForViewer({ ...payload, messageId });
+  });
+  // Entries of a sub-agent's record; the relay sends them only while this
+  // page's viewer watches that run.
+  socket.on('subagent_timeline', (payload) => {
+    handleSubagentTimelineEvent(payload);
   });
   socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
     if (!sourceConversationId || !targetConversationId) return;
@@ -811,13 +848,7 @@ export async function connectSocket(overrideDeps) {
     renderRelayBoards();
     renderConvList();
     if (currentConvId === conversationId) {
-      setCurrentConv(null);
-      renderMessages([]);
-      document.getElementById('chat-title').textContent = 'Select or start a conversation';
-      syncChatTitleControls();
-      updateSessionPill(null, null);
-      updateCompactButton();
-      scheduleContextUsageRefresh(null);
+      clearOpenConversation();
     } else {
       updateCompactButton();
     }

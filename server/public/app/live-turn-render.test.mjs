@@ -78,7 +78,7 @@ test('the live poll leaves a window in the middle of the history alone, also whe
   // An answer that was on its way during the jump is dropped.
   assert.match(
     poll,
-    /const jumpEpoch = getTranscriptJumpEpoch\(\);\s*\n\s*const response = await loadConversation\(currentId, \{ limit: requestLimit \}\);[\s\S]*?if \(getTranscriptJumpEpoch\(\) !== jumpEpoch\) return;[\s\S]*?applyLoadedConversationState\(/,
+    /const jumpEpoch = getTranscriptJumpEpoch\(\);\s*\n\s*const \{ response, stale \} = await loadKeepingLiveRows\(\s*\n\s*\(\) => loadConversation\(currentId, \{ limit: requestLimit \}\),\s*\n\s*getTranscriptLiveRowEpoch,\s*\n\s*\);[\s\S]*?if \(getTranscriptJumpEpoch\(\) !== jumpEpoch\) return;[\s\S]*?if \(stale\) return;[\s\S]*?applyLoadedConversationState\(/,
   );
   // Only a jump counts, and it counts when its window is put on the page: an
   // ordinary reload must still be able to correct another one.
@@ -100,7 +100,7 @@ test('a view refresh after a jump into the history refreshes everything but the 
   );
   assert.match(
     refresh,
-    /const keepTranscript = getTranscriptJumpEpoch\(\) !== jumpEpoch \|\| transcriptIsInHistory\(currentId\);/,
+    /const keepTranscript = getTranscriptJumpEpoch\(\) !== jumpEpoch \|\| transcriptIsInHistory\(currentId\) \|\| stale;/,
   );
   assert.match(refresh, /followLiveUpdates: preserveBottom && !keepTranscript,\s*\n\s*keepTranscript,/);
   assert.match(refresh, /if \(messagesEl && !keepTranscript && /, 'the saved scroll position is not put back over the jump');
@@ -113,4 +113,18 @@ test('the sidebar spinner tick updates only the dot spans', () => {
   const body = functionBody(readSource('./journal-view.js'), 'ensureProcessingDotTimer');
   assert.doesNotMatch(body, /renderConvList\(\)/);
   assert.match(body, /conv-processing-dots/);
+});
+
+test('every row the socket puts on the page moves the live-row count the reloads check', () => {
+  const handlers = readSource('./socket-handlers.js');
+  for (const event of ['user_message', 'assistant_message', 'message_updated']) {
+    const start = handlers.indexOf(`socket.on('${event}'`);
+    assert.ok(start >= 0, event);
+    const body = handlers.slice(start, handlers.indexOf('\n  });', start));
+    assert.match(body, /appendMessage\([^;]*\);[\s\S]*?noteTranscriptLiveRow\(\);/, `${event} counts its row`);
+  }
+  const bootstrap = readSource('./bootstrap.js');
+  for (const name of ['pollAuthenticatedCurrentConversationLive', 'refreshCurrentView', 'refreshSharedConversation']) {
+    assert.match(functionBody(bootstrap, name), /await loadKeepingLiveRows\(/, `${name} reloads through the guard`);
+  }
 });

@@ -186,6 +186,9 @@ export function renderRelayBoards() {
   // the live bubble into the reply, or one of another conversation.
   el.querySelectorAll('.relay-board-inline').forEach((node) => { if (!placed.has(node)) node.remove(); });
   el.querySelectorAll('.relay-board-container').forEach((node) => { if (!node.querySelector('.relay-board-inline')) node.remove(); });
+  // A folded agent exchange whose turn waits on a board opens to show it
+  // (agent-exchange-fold-view.mjs).
+  window.syncAgentExchangeFolds?.();
   if (added) window.scrollBottom?.();
 }
 

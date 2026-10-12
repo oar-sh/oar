@@ -9,21 +9,23 @@
 export const VIEWER_HISTORY_MARK = 'oarFileViewer';
 const OWN_POP_WINDOW_MS = 1500;
 
-export function createViewerHistory({ history, onBack, now = () => Date.now() } = {}) {
+// `mark` names the viewer's entry: two viewers (the file viewer and the
+// sub-agent viewer) must never take each other's entry for their own.
+export function createViewerHistory({ history, onBack, now = () => Date.now(), mark = VIEWER_HISTORY_MARK } = {}) {
   const state = { pushed: false, ownPopAt: 0 };
   return {
     get pushed() { return state.pushed; },
     /** The viewer came up: one entry, however many files it then shows. */
     opened() {
       if (state.pushed) return;
-      history.pushState({ [VIEWER_HISTORY_MARK]: true }, '');
+      history.pushState({ [mark]: true }, '');
       state.pushed = true;
     },
     /** The viewer went away by itself: take its entry back out of history. */
     closed() {
       if (!state.pushed) return;
       state.pushed = false;
-      if (history.state?.[VIEWER_HISTORY_MARK]) {
+      if (history.state?.[mark]) {
         state.ownPopAt = now();
         history.back();
       }

@@ -6,6 +6,7 @@ import {
   REMOTE_RELAY_ERROR_CODES as CODES,
   REMOTE_RELAY_LIMITS,
 } from '../../shared/remote-relay-contract.mjs';
+import { executeRemoteRelayTool } from '../../shared/remote-relay-tool-core.mjs';
 import { RemoteRelayError, createRemoteRelayClient } from './remote-relay-client.mjs';
 import {
   REMOTE_RELAY_INTERNAL_ERROR_CODE,
@@ -240,6 +241,8 @@ function createFakeRemote() {
             messageCount: conv.messages.length,
             currentWorkspaceRootPath: conv.cwd,
             ...(conv.origin ? { origin: conv.origin } : {}),
+            ...(conv.sessionState ? { sessionState: conv.sessionState } : {}),
+            ...(conv.sessionTasks ? { sessionTasks: conv.sessionTasks } : {}),
           })),
           pageInfo: {
             hasMore: start + limit < ordered.length,
@@ -286,6 +289,8 @@ function createFakeRemote() {
             ...(conv.reportActiveTurn ? { activeTurn: conv.activeTurn } : {}),
             ...(conv.origin ? { origin: conv.origin } : {}),
             backgroundTasks: conv.backgroundTasks || [],
+            ...(conv.sessionState ? { sessionState: conv.sessionState } : {}),
+            ...(conv.sessionTasks ? { sessionTasks: conv.sessionTasks } : {}),
             messages: page,
             pageInfo: {
               hasMoreOlder: firstIndex > 0,
@@ -402,6 +407,8 @@ function setup({
   // Conversations (by id) whose agent the user already allowed to start sessions here.
   localApproved = [],
   withLocalClient = true,
+  // The relay event service (subscribe and its siblings), or null.
+  relayEvents = null,
 } = {}) {
   const unlocks = new Set(unlocked.map((relayId) => `c-1:${relayId}`));
   const approvedLocal = new Set(localApproved);
@@ -415,6 +422,10 @@ function setup({
       .filter((conv) => conv.origin?.local === true && conv.origin.conversationId === conversationId && conv.activeTurn === true)
       .map((conv) => conv.id),
     hasLocalSessionApproval: (conversationId) => approvedLocal.has(conversationId),
+    recordUnlock: (conversationId, relayId) => {
+      unlocks.add(`${conversationId}:${relayId}`);
+      return true;
+    },
     recordLocalSessionApproval: (conversationId) => {
       approvedLocal.add(conversationId);
       return true;
@@ -457,6 +468,7 @@ function setup({
     pollIntervalMs: 2000,
     randomUUID: () => `m-sent-${++uuidCounter}`,
     ...(resolveConversationId ? { resolveConversationId } : {}),
+    relayEvents,
   });
   const run = (action, args = {}, conversationId = 'c-1') => dispatcher.dispatch({ conversationId, action, args });
   return { remote, local, dispatcher, run, logs, events, approvals, sleeps, clock, unlocks, approvedLocal };
@@ -2760,4 +2772,304 @@ test('the wait action and the local target follow the same limit', async () => {
   assert.equal(clock.now - before, 900 * 1000, 'inside the limit: as asked');
   assert.doesNotMatch(waited.body.note, /more than this relay allows/);
   assert.deepEqual((await run('list_relays')).body.limits, { maxWaitSeconds: 1200, maxActiveSessions: 4 });
+});
+
+// ─── Event subscriptions ─────────────────────────────────────────────────────
+
+/** A stand-in for the relay event service: records calls, keeps subscriptions. */
+function createFakeRelayEvents() {
+  const subscriptions = [];
+  let counter = 0;
+  return {
+    subscriptions,
+    isAvailable: () => true,
+    subscribe(options) {
+      const subscription = {
+        id: `sub_fixture${++counter}`,
+        watcher: options.watcherConversationId,
+        scope: options.scope,
+        sessions: options.scope === 'all' ? 'all' : options.sessionIds.map((id) => ({ id, title: null })),
+        events: options.events || ['turn_end'],
+        once: options.once,
+        ...(options.heartbeatMinutes ? { heartbeatMinutes: options.heartbeatMinutes } : {}),
+      };
+      subscriptions.push(subscription);
+      return subscription;
+    },
+    unsubscribe({ watcherConversationId, subscriptionId }) {
+      const ended = subscriptions.filter((sub) => sub.watcher === watcherConversationId && (subscriptionId === 'all' || sub.id === subscriptionId) && !sub.endedAt);
+      if (!ended.length) throw Object.assign(new Error(`No active subscription ${subscriptionId}`), { code: 'notFound' });
+      for (const sub of ended) sub.endedAt = 'now';
+      return ended;
+    },
+    listSubscriptions: ({ watcherConversationId }) => subscriptions.filter((sub) => sub.watcher === watcherConversationId),
+    previewTransfer({ fromConversationId, toConversationId }) {
+      const moving = subscriptions.filter((sub) => sub.watcher === fromConversationId && !sub.endedAt);
+      if (!moving.length) throw Object.assign(new Error(`Session ${fromConversationId} has no active subscriptions to transfer.`), { code: 'notFound' });
+      if (fromConversationId === toConversationId) throw Object.assign(new Error('same'), { code: 'invalid' });
+      return { from: { id: fromConversationId, title: 'old watcher' }, count: moving.length, includesAll: moving.some((sub) => sub.scope === 'all'), subscriptions: moving };
+    },
+    transferSubscriptions({ fromConversationId, toConversationId }) {
+      const preview = this.previewTransfer({ fromConversationId, toConversationId });
+      for (const sub of preview.subscriptions) sub.watcher = toConversationId;
+      return { from: preview.from, moved: preview.subscriptions, ended: [] };
+    },
+  };
+}
+
+function setupEvents(options = {}) {
+  const relayEvents = createFakeRelayEvents();
+  const context = setupLocal({ relayEvents, ...options });
+  context.local.addConversation({ id: 'conv-watched', title: 'orbit camera' });
+  context.local.addConversation({ id: 'conv-other', title: 'docs pass' });
+  return { ...context, relayEvents };
+}
+
+test('subscribe defaults to this relay and asks the user once per conversation', async () => {
+  const { run, approvals, relayEvents } = setupEvents();
+  const first = await run('subscribe', { sessions: ['conv-watched'], heartbeat_minutes: 60 });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.subscription.id, 'sub_fixture1');
+  assert.match(first.body.note, /never the user's, and approve nothing/);
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].watch.kind, 'subscribe');
+  assert.deepEqual(approvals[0].watch.sessions, [{ id: 'conv-watched', title: 'orbit camera' }]);
+  assert.equal(approvals[0].watch.heartbeatMinutes, 60);
+  const second = await run('subscribe', { relay: 'this', sessions: ['conv-other'] });
+  assert.equal(second.status, 200);
+  assert.equal(approvals.length, 1, 'the second subscribe is not asked again');
+  assert.equal(relayEvents.subscriptions.length, 2);
+  // Another conversation asks for itself.
+  await run('subscribe', { sessions: ['conv-watched'] }, 'c-2');
+  assert.equal(approvals.length, 2);
+});
+
+test('a subscription to all is always on a card, also after a listed-ids Allow', async () => {
+  const { run, approvals } = setupEvents();
+  await run('subscribe', { sessions: ['conv-watched'] });
+  const all = await run('subscribe', { sessions: ['all'] });
+  assert.equal(all.status, 200, JSON.stringify(all.body));
+  assert.equal(approvals.length, 2);
+  assert.equal(approvals[1].watch.all, true);
+  await run('subscribe', { sessions: ['all'], events: ['all_idle'] });
+  assert.equal(approvals.length, 2, 'all, once allowed, is not asked again');
+});
+
+// A call the way a worker makes it: the tool checks and normalizes the input,
+// and the relay's route hands what the tool sent to the dispatcher, which
+// checks it again.
+function runAsWorker(dispatcher, action, input = {}, conversationId = 'c-1') {
+  return executeRemoteRelayTool({ ...input, action }, {
+    conversationId,
+    api: async (_method, _path, body) => (await dispatcher.dispatch(body)).body,
+  });
+}
+
+test('"all" survives the worker\'s own check: subscribe, unsubscribe and list_subscriptions', async () => {
+  const { dispatcher, approvals, relayEvents } = setupEvents();
+  for (const input of [{ sessions: ['all'] }, { relay: 'this', session: 'all' }, { sessions: 'all' }]) {
+    const subscribed = await runAsWorker(dispatcher, 'subscribe', input);
+    assert.equal(subscribed.ok, true, JSON.stringify(subscribed));
+    assert.equal(subscribed.subscription.scope, 'all');
+  }
+  assert.equal(relayEvents.subscriptions.length, 3);
+  assert.equal(relayEvents.subscriptions.every((sub) => sub.scope === 'all'), true);
+  // The one-time card for "all" is still shown, once.
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].watch.all, true);
+
+  const listed = await runAsWorker(dispatcher, 'list_subscriptions', { relay: 'this' });
+  assert.equal(listed.ok, true, JSON.stringify(listed));
+  const removed = await runAsWorker(dispatcher, 'unsubscribe', { subscription_id: 'all' });
+  assert.equal(removed.ok, true, JSON.stringify(removed));
+  assert.equal(relayEvents.subscriptions.every((sub) => sub.endedAt), true);
+});
+
+test('a denied subscribe subscribes nothing; own and unknown sessions are refused before the card', async () => {
+  const { run, approvals, relayEvents } = setupEvents({ requestApproval: async (request) => { approvals.push(request); return { approved: false }; } });
+  const denied = await run('subscribe', { sessions: ['conv-watched'] });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.code, CODES.approvalDenied);
+  assert.equal(relayEvents.subscriptions.length, 0);
+  const own = await run('subscribe', { sessions: ['c-1'] });
+  assert.equal(own.body.code, CODES.ownSession);
+  const unknown = await run('subscribe', { sessions: ['conv-missing'] });
+  assert.equal(unknown.status, 404);
+  assert.equal(approvals.length, 1);
+});
+
+test('a relay that cannot store subscriptions on paired relays refuses them', async () => {
+  // The fake event service has no cross-relay storage, and there is no link.
+  const { run, remote } = setup({ relayEvents: createFakeRelayEvents() });
+  const result = await run('subscribe', { relay: 'linux-test', sessions: ['conv-1'] });
+  assert.equal(result.status, 503);
+  assert.equal(result.body.code, CODES.unsupported);
+  assert.match(result.body.error, /relay "linux-test" cannot be watched from here/);
+  assert.equal(remote.calls.length, 0);
+});
+
+test('unsubscribe and list_subscriptions, also of another watcher', async () => {
+  const { run, relayEvents } = setupEvents();
+  await run('subscribe', { sessions: ['conv-watched'] }, 'c-old');
+  const listed = await run('list_subscriptions', { watcher: 'c-old' });
+  assert.equal(listed.status, 200);
+  assert.equal(listed.body.watcher, 'c-old');
+  assert.equal(listed.body.subscriptions.length, 1);
+  const missing = await run('unsubscribe', { subscription_id: 'sub_fixture1' });
+  assert.equal(missing.status, 404, 'a conversation ends only its own subscriptions');
+  const ended = await run('unsubscribe', { subscription_id: 'all' }, 'c-old');
+  assert.equal(ended.body.ended.length, 1);
+  assert.equal(relayEvents.subscriptions[0].endedAt, 'now');
+});
+
+test('transfer always shows its card, moves everything on Allow and nothing on Deny', async () => {
+  let answer = true;
+  const approvals = [];
+  const { run, relayEvents } = setupEvents({ requestApproval: async (request) => { approvals.push(request); return answer; } });
+  await run('subscribe', { sessions: ['conv-watched'] }, 'c-old');
+  await run('subscribe', { sessions: ['all'] }, 'c-old');
+  await run('subscribe', { sessions: ['conv-other'] });
+  const before = approvals.length;
+  answer = { approved: false };
+  const denied = await run('transfer_subscriptions', { from: 'c-old' });
+  assert.equal(denied.status, 403);
+  assert.equal(relayEvents.subscriptions.filter((sub) => sub.watcher === 'c-old').length, 2);
+  answer = true;
+  const moved = await run('transfer_subscriptions', { from: 'c-old' });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.moved.length, 2);
+  const cards = approvals.slice(before);
+  assert.equal(cards.length, 2, 'asked although c-1 already passed its first-subscribe card');
+  assert.deepEqual([cards[1].watch.kind, cards[1].watch.count, cards[1].watch.all], ['transfer', 2, true]);
+  assert.equal(relayEvents.subscriptions.filter((sub) => sub.watcher === 'c-old').length, 0);
+  const nothing = await run('transfer_subscriptions', { from: 'c-old' });
+  assert.equal(nothing.status, 404);
+});
+
+test('list_sessions and read_session say what a session does: state and tasks', async () => {
+  const { run, local } = setupLocal();
+  const tasks = [
+    { kind: 'subagent', description: 'M1 orbit camera', startedAt: '2026-09-20T09:00:00.000Z', lastActivityAt: '2026-09-20T09:58:00.000Z', status: 'running', runId: 'toolu_fixture_m1' },
+    { kind: 'shell', description: 'npm test', startedAt: '2026-09-20T09:10:00.000Z', status: 'failed', exitCode: 1, summary: 'Exit code 1', endedAt: '2026-09-20T09:20:00.000Z' },
+  ];
+  withLocalSession(local, { sessionState: 'background_only', sessionTasks: tasks });
+  const listed = await run('list_sessions', { relay: 'this' });
+  const [session] = listed.body.sessions;
+  assert.equal(session.active, true, 'background work counts as active');
+  assert.equal(session.state, 'background_only');
+  assert.deepEqual(session.tasks.map((task) => [task.kind, task.status, task.exitCode]), [['subagent', 'running', undefined], ['shell', 'failed', 1]]);
+  const active = await run('list_sessions', { relay: 'this', scope: 'active' });
+  assert.equal(active.body.sessions.length, 1);
+  const read = await run('read_session', { relay: 'this', session: 'conv-1' });
+  assert.equal(read.body.session.state, 'background_only');
+  assert.equal(read.body.session.active, true);
+  assert.equal(read.body.session.tasks[1].summary, 'Exit code 1');
+});
+
+test('a relay without sessionState reads as before', async () => {
+  const { run, local } = setupLocal();
+  withLocalSession(local);
+  const listed = await run('list_sessions', { relay: 'this' });
+  assert.equal(listed.body.sessions[0].active, false);
+  assert.equal(listed.body.sessions[0].state, undefined);
+});
+
+// ─── usage ───────────────────────────────────────────────────────────────────
+
+function withUsageRoutes(remote, { usage, limit = null }) {
+  const original = remote.request.bind(remote);
+  remote.request = async (relay, method, path, options = {}) => {
+    if (method === 'GET' && path === '/api/usage') {
+      remote.calls.push({ relay: relay.name, method, path });
+      if (usage instanceof Error) throw usage;
+      return usage;
+    }
+    if (method === 'GET' && path === '/api/usage-limit') {
+      remote.calls.push({ relay: relay.name, method, path });
+      if (!limit) throw remoteError(`${CODES.httpPrefix}501`, 'Relay answered HTTP 501', 501, { ok: false, error: 'Usage limit handling is unavailable' });
+      return limit;
+    }
+    return original(relay, method, path, options);
+  };
+}
+
+const USAGE_REPORT = Object.freeze({
+  // A legacy Copilot field at the top: never passed on.
+  quota_snapshots: { premium_interactions: { remaining: 12 } },
+  providers: [
+    {
+      provider: 'cursor',
+      label: 'Cursor',
+      status: 'ok',
+      planName: 'Pro',
+      accountLabel: 'dev@example.com',
+      source: 'live',
+      capturedAt: '2026-09-20T09:00:00.000Z',
+      meters: [{ id: 'cursor-total', label: 'Plan usage (total)', unit: 'usd', used: 14.5, allowance: 20, remaining: 5.5, utilization: 72.5, resetAt: '2026-10-01T00:00:00.000Z', secretish: 'x' }],
+      details: [{ id: 'cycle', label: 'Billing cycle', rows: [{ label: 'Resets', value: '2026-10-01' }, { label: 'Signed in as', value: 'dev@example.com' }] }],
+      notes: [{ id: 'n1', text: `Token ${'a'.repeat(40)} expires soon` }],
+      links: [{ label: 'Cursor Spending dashboard', url: 'https://cursor.example.test/spending' }],
+    },
+    { provider: 'grok', label: 'Grok', status: 'not-configured', message: 'Grok is not set up on this relay.', meters: [] },
+    { provider: 'claude', label: 'Claude', status: 'ok', planName: 'Max', meters: [{ label: '5-hour window', unit: 'percent', utilization: 41, resetAt: '2026-09-20T12:00:00.000Z' }] },
+  ],
+});
+
+test('usage reports each provider plan and the usage-limit state, with nothing private', async () => {
+  const { run, remote } = setup();
+  withUsageRoutes(remote, {
+    usage: USAGE_REPORT,
+    limit: {
+      ok: true,
+      account: { status: 'allowed_warning', rateLimitType: 'five_hour', label: '5-hour', utilization: 0.91, resetsAt: '2026-09-20T12:00:00.000Z', observedAt: '2026-09-20T09:59:00.000Z' },
+      pauses: [{ conversationId: 'conv-paused', messageId: 'm-held', label: '5-hour', rateLimitType: 'five_hour', resetsAt: '2026-09-20T12:00:00.000Z', resumeAt: '2026-09-20T12:00:05.000Z', auto: true }],
+    },
+  });
+  const result = await run('usage', { relay: 'spare-test' });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.match(result.body.summary, /^usage → spare-test: cursor, claude reported, 1 paused at a usage limit$/);
+  const [cursor, grok, claude] = result.body.providers;
+  assert.deepEqual(cursor.meters, [{ label: 'Plan usage (total)', unit: 'usd', used: 14.5, allowance: 20, remaining: 5.5, utilization: 72.5, resetAt: '2026-10-01T00:00:00.000Z' }]);
+  assert.equal(cursor.plan, 'Pro');
+  assert.deepEqual(cursor.details[0].rows, [{ label: 'Resets', value: '2026-10-01' }, { label: 'Signed in as', value: '[address]' }]);
+  assert.deepEqual(cursor.notes, ['Token [hidden] expires soon']);
+  assert.deepEqual([grok.status, grok.message, grok.meters], ['not-configured', 'Grok is not set up on this relay.', []]);
+  assert.equal(claude.meters[0].utilization, 41);
+  assert.deepEqual(result.body.usageLimit, {
+    account: { status: 'allowed_warning', window: '5-hour', utilization: 0.91, resetsAt: '2026-09-20T12:00:00.000Z', observedAt: '2026-09-20T09:59:00.000Z' },
+    pauses: [{ session: 'conv-paused', window: '5-hour', resetsAt: '2026-09-20T12:00:00.000Z', resumeAt: '2026-09-20T12:00:05.000Z', auto: true }],
+  });
+  const text = JSON.stringify(result.body);
+  for (const leak of ['dev@example.com', 'quota_snapshots', 'cursor.example.test', 'secretish', 'a'.repeat(40)]) {
+    assert.equal(text.includes(leak), false, `no ${leak}`);
+  }
+});
+
+test('usage needs read permission only, and works on this relay too', async () => {
+  // spare-test is a "read" relay: enough.
+  const { run, remote, local } = setupLocal({ unlocked: ['rr_spare'] });
+  withUsageRoutes(remote, { usage: USAGE_REPORT });
+  const paired = await run('usage', { relay: 'spare-test' });
+  assert.equal(paired.status, 200, JSON.stringify(paired.body));
+  assert.equal(paired.body.usageLimit, null);
+  assert.match(paired.body.note, /usage-limit state was not available/);
+  withUsageRoutes(local, { usage: USAGE_REPORT });
+  const own = await run('usage', { relay: 'this' });
+  assert.equal(own.status, 200, JSON.stringify(own.body));
+  assert.equal(own.body.providers.length, 3);
+  const locked = await run('usage', { relay: 'linux-test' });
+  assert.equal(locked.body.code, CODES.locked);
+});
+
+test('a relay without plan usage answers a clear error', async () => {
+  const { run, remote } = setup();
+  withUsageRoutes(remote, { usage: remoteError(CODES.notFound, 'Relay "linux-test": not found', 404) });
+  const missing = await run('usage', { relay: 'linux-test' });
+  assert.equal(missing.status, 400);
+  assert.equal(missing.body.code, CODES.unsupported);
+  assert.match(missing.body.error, /Relay "linux-test" does not report plan usage/);
+  withUsageRoutes(remote, { usage: { quota_snapshots: {} } });
+  const legacy = await run('usage', { relay: 'linux-test' });
+  assert.equal(legacy.body.code, CODES.unsupported);
+  assert.match(legacy.body.error, /older shape/);
 });

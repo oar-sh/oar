@@ -105,7 +105,8 @@ function setup({ dispatcher = null, probeAnswers = {} } = {}) {
   const pairing = createRemoteRelayPairing({ registry, client, getOwnToken: () => OWN_TOKEN });
   const app = createMockApp();
   const auth = (_req, _res, next) => next();
-  registerRemoteRelayRoutes(app, { auth, registry, pairing, dispatcher });
+  const remoteRelayInbound = { listRelays: () => [], inboundEnabled: () => true };
+  registerRemoteRelayRoutes(app, { auth, registry, pairing, dispatcher, remoteRelayInbound });
   const route = (key) => {
     const handlers = app.routes.get(key);
     assert.ok(handlers, `${key} is registered`);
@@ -377,6 +378,19 @@ test('the tool endpoint forwards to the dispatcher and relays its answer', async
 
   assert.deepEqual((await callRoute(route('GET /api/remote-relays/inflight'), { query: { conversationId: 'c-1' } })).body, { inflight: 2 });
   assert.deepEqual((await callRoute(route('GET /api/remote-relays/inflight'), { query: {} })).body, { inflight: 0 });
+});
+
+test('another relay cannot call the tool: it would act for a conversation it does not host', async () => {
+  const calls = [];
+  const dispatcher = { async dispatch(input) { calls.push(input); return { status: 200, body: { ok: true } }; }, inflight: () => 0 };
+  const { route } = setup({ dispatcher });
+  const body = { conversationId: 'c-1', action: 'subscribe', args: { relay: 'this', sessions: ['all'] } };
+  const byHeader = await callRoute(route('POST /api/remote-relays/tool'), { body, headers: { 'x-oar-remote-origin': 'relay-b-0002' } });
+  assert.equal(byHeader.statusCode, 403);
+  assert.equal(byHeader.body.code, REMOTE_RELAY_ERROR_CODES.forbidden);
+  const byOrigin = await callRoute(route('POST /api/remote-relays/tool'), { body: { ...body, origin: { relayId: 'relay-b-0002', relayName: 'linux-test' } } });
+  assert.equal(byOrigin.statusCode, 403);
+  assert.equal(calls.length, 0);
 });
 
 test('a worker that hangs up aborts the dispatch, and nothing is written to the closed response', async () => {

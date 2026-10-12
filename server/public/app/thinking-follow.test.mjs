@@ -81,3 +81,17 @@ test('conversation-view wires the group next to Stop and routes Stop through a c
   assert.match(source, /kind: 'stop-turn'/);
   assert.match(source, /unobserveThinkingBubble\(\);\s*document\.getElementById\('thinking-indicator'\)\?\.remove\(\);/);
 });
+
+test('a live bubble folded into an agent exchange is not followed', () => {
+  const pane = document.getElementById('messages');
+  pane.innerHTML = '<div class="msg assistant" id="thinking-indicator"><div id="thinking-activity"><div>Read file</div></div></div>';
+  follow.setThinkingFollowMode('conv-a', 'tools');
+  try {
+    assert.equal(follow.applyThinkingFollow({ force: true }), true);
+    // Folded it has no box: following it would scroll the pane to the top.
+    document.getElementById('thinking-indicator').classList.add('agent-exchange-closed');
+    assert.equal(follow.applyThinkingFollow({ force: true }), false);
+  } finally {
+    pane.innerHTML = '';
+  }
+});

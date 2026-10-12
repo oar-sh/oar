@@ -163,7 +163,10 @@ but are not Copilot SDK surface.
   (`clamp(64px, 100dvh - 296px, min(45vh, 420px))`). Phone landscape keeps the portrait text size
   (`text-size-adjust: 100%`, height-based root clamp). The transcript keeps its reading position through
   rotations / resizes / the keyboard (`server/public/app/transcript-viewport-anchor.mjs`: at-bottom or
-  top-row + hidden share, re-applied on every resize step; the font-scale change reuses it). Claude worker:
+  top-row + hidden share, re-applied on every resize step; the font-scale change reuses it). A reader
+  following the end stays there when the composer or the background-task panel grows under the transcript
+  (`server/public/app/transcript-jump-bottom-view.mjs`, ResizeObserver re-pin), and a ⌄ button with a
+  new-row badge jumps back to the end (`server/public/app/transcript-jump-bottom.mjs`). Claude worker:
   a settings change between turns (`setModel` / `setPermissionMode` / `applyFlagSettings`) makes the CLI
   re-init before the push, which used to route the answer to a continuation row and strand the delivered
   message — now expected (`settingsReinitExpected`, see [claude-sdk.md](claude-sdk.md)). A test fixture

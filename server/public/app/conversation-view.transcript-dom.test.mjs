@@ -533,6 +533,25 @@ test('restoreInFlightThinking skips an identical payload and repaints a changed 
   assert.equal(liveBubble(), null, 'a finished turn drops the bubble');
 });
 
+test('the reply a dropped stream frame carried shows from the next snapshot, in the same bubble', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([{ id: 'u1', role: 'user', text: 'task', timestamp: at(0) }], false, { conversationId: conv });
+  view.restoreInFlightThinking({ messageId: 'u1', status: 'processing' }, false);
+  const bubble = liveBubble();
+  const stream = () => bubble.querySelector('#thinking-stream');
+  assert.equal(stream().hidden, true);
+  // The frame never reached the page; the live poll's snapshot has its text.
+  view.restoreInFlightThinking({ messageId: 'u1', status: 'processing', streamEvents: [{ seq: 1, text: 'Checking the shelf' }] }, false);
+  assert.equal(liveBubble(), bubble);
+  assert.equal(stream().hidden, false);
+  assert.match(stream().textContent, /Checking the shelf/);
+  // A snapshot read before the newest live frame does not take its text back.
+  view.applyRelayStreamEvent({ messageId: 'u1', text: 'Checking the shelf and the drawer', seq: 3, autoScroll: false });
+  view.restoreInFlightThinking({ messageId: 'u1', status: 'processing', streamEvents: [{ seq: 2, text: 'Checking the shelf and' }] }, false);
+  assert.match(stream().textContent, /and the drawer/);
+});
+
 // ---------------------------------------------------------------------------
 // 3d — optimistic pending bubbles across rebuilds.
 // ---------------------------------------------------------------------------

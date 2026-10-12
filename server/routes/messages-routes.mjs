@@ -6,6 +6,8 @@ import { randomUUID } from 'crypto';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
 import { fileVersionToken, serveFileWithRangeSupport, withFileVersion } from '../services/file-serving.mjs';
+import { validateEntryName } from '../services/explorer-entry-name.mjs';
+import { countEntries, createDirectory, removeEntry, renameEntry } from '../services/explorer-mutations.mjs';
 import {
   shouldParkForRestart,
   parkPendingQueueForRestart,
@@ -44,6 +46,17 @@ import { isLiveResend } from '../services/steer-resend.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
 import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
+import {
+  createSubagentTimelineService,
+  mapSubagentRunHeader,
+  sanitizeRunHeaderPatch,
+  TIMELINE_READ_DEFAULT_LIMIT,
+} from '../services/subagent-timeline-service.mjs';
+import { normalizeSubagentRunStatus } from '../../shared/subagent-timeline.mjs';
+import { RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
+import { isRelayShutdownQueued, relayShutdownGateReply } from '../services/relay-shutdown-gate.mjs';
+import { createStaleAttemptLogLimiter } from '../services/stale-attempt-log-limiter.mjs';
+import { createSubagentTimelinePublisher } from '../services/subagent-viewer-rooms.mjs';
 import { buildClaudeCloudDelivery, isClaudeCloudProviderType } from '../services/claude-cloud-session-service.mjs';
 import {
   admitRemoteRelayRequest,
@@ -1180,6 +1193,12 @@ export function buildDequeuedRelayMessage({
         fallbackEnvironmentId: getClaudeCloudProviderSettings()?.environmentId || '',
       })
     : null;
+  // An event message the relay wrote (relay event subscriptions): the
+  // workers deliver it without the steer note, which speaks as the user.
+  let messageKind = '';
+  try {
+    messageKind = String(stmts.getMessageByConversation?.get?.(msg.id, msg.conversation_id)?.kind || '').trim();
+  } catch {}
   return {
     id: msg.id,
     conversationId: msg.conversation_id,
@@ -1211,6 +1230,7 @@ export function buildDequeuedRelayMessage({
     ownerAssignedAt: msg.owner_assigned_at || null,
     ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
     imageOperationId: String(msg.image_operation_id || '').trim() || null,
+    ...(messageKind === RELAY_EVENT_MESSAGE_KIND ? { messageKind } : {}),
   };
 }
 
@@ -1813,9 +1833,90 @@ export function registerMessagesRoutes(app, deps) {
     // agent-sent messages, the inbound switch, and mention unlocks. Absent in
     // older wiring and most tests, where every remote-relay step is a no-op.
     remoteRelayInbound = null,
+    // Relay event subscriptions (services/relay-event-service.mjs) and the
+    // per-session activity they read (services/session-activity-tracker.mjs).
+    // Absent in older wiring and most tests: every hook is then a no-op.
+    relayEventService = null,
+    sessionActivityTracker = null,
+    // A worker's SDK session id or a conversation id → the conversation row.
+    resolveConversationRecord = null,
   } = deps;
 
   const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
+
+  // ─── Sub-agent runs: header, timeline, live events ─────────────────────────
+  const subagentTimeline = createSubagentTimelineService({ db, stmts });
+
+  // The live background task a run belongs to (the panel's row), if any: the
+  // task's spawning tool_use id is the run id.
+  function liveTaskForSubagentRun(run) {
+    const tasks = backgroundTaskStore?.get?.(run?.conversation_id) || [];
+    const runId = String(run?.id || '');
+    const taskId = String(run?.task_id || '');
+    return tasks.find((task) => (task?.toolUseId && task.toolUseId === runId) || (taskId && task?.taskId === taskId)) || null;
+  }
+
+  // Stop is offered while a run is running: a background run through its
+  // task, a foreground run through the sub-agent cancel route.
+  function isSubagentRunStoppable(run) {
+    if (String(run?.status || '') !== 'running') return false;
+    const task = liveTaskForSubagentRun(run);
+    if (task) return task.stoppable !== false;
+    return Number(run?.background || 0) !== 1;
+  }
+
+  // Every subagent_status event carries the whole header and the run's own
+  // turn, so a client can place it without having seen the run before.
+  function subagentStatusEvent(run, extra = {}) {
+    const header = mapSubagentRunHeader(run, { stoppable: isSubagentRunStoppable(run) });
+    if (!header) return null;
+    return { ...header, timestamp: new Date().toISOString(), ...extra };
+  }
+
+  function emitSubagentStatus(run, extra = {}) {
+    const event = subagentStatusEvent(run, extra);
+    if (event) io.emit('subagent_status', event);
+    try { sessionActivityTracker?.noteSubagentRun?.(run); } catch {}
+  }
+
+  // Only to the pages whose viewer shows this run, and volatile: a batch a
+  // connection cannot take is dropped (never kept for a reconnect replay);
+  // the viewer sees the hole in `seq` and fetches it.
+  const publishSubagentTimeline = createSubagentTimelinePublisher(io, deps.subagentTimelineDefer ? { defer: deps.subagentTimelineDefer } : {});
+  function emitSubagentTimeline(run, entries) {
+    if (!run || !entries?.length) return;
+    publishSubagentTimeline({
+      conversationId: String(run.conversation_id || ''),
+      messageId: run.queue_message_id ? String(run.queue_message_id) : null,
+      subagentRunId: String(run.id),
+      entries,
+      truncated: Number(run.truncated || 0) === 1,
+    });
+  }
+
+  // Copilot and Cursor publish their sub-agents on the live lanes only; the
+  // relay copies each frame into the run's timeline (the Claude worker writes
+  // its own and owns its runs' timelines).
+  function mirrorSubagentFrame(frame) {
+    if (!frame?.runId) return;
+    try {
+      const mirrored = subagentTimeline.mirrorFrame(frame);
+      if (!mirrored) return;
+      const run = mirrored.truncated ? (stmts.getSubagentRun?.get?.(frame.runId) || mirrored.run) : mirrored.run;
+      if (mirrored.truncated) emitSubagentStatus(run);
+      emitSubagentTimeline(run, mirrored.entries);
+    } catch (error) {
+      console.warn(`[${ts()}] SUBAGENT MIRROR failed run=${String(frame.runId).slice(0, 12)}: ${error?.message || error}`);
+    }
+  }
+
+  function activityTimelineFrame(text) {
+    const value = String(text || '');
+    const toolMatch = /^Tool \(([^)]+)\)/.exec(value);
+    if (toolMatch) return { kind: 'tool_call', toolName: toolMatch[1], text: value };
+    if (/^Tool failed:/i.test(value)) return { kind: 'tool_result', text: value, metadata: { isError: true } };
+    return { kind: 'note', text: value };
+  }
   const getMessageAttachmentsByConversation = db.prepare(`
     SELECT attachments
     FROM messages
@@ -1999,25 +2100,28 @@ export function registerMessagesRoutes(app, deps) {
     };
   }
 
+  // One warning per superseded attempt: a worker streaming for a requeued
+  // row writes several times a second until it learns of the refusal.
+  const staleAttemptLog = createStaleAttemptLogLimiter({ warn: (line) => console.warn(`[${ts()}] ${line}`) });
+
   function rejectSessionBinding(res, status, error, extra = {}) {
     return res.status(status).json({ error, ...extra });
   }
 
   function reconcileSubagentRunsForTerminalTurn(messageId, { status = 'failed' } = {}) {
-    const running = stmts.listRunningSubagentRunsByQueueMessage?.all?.(messageId) || [];
+    // A background run outlives the turn that spawned it: its worker reports
+    // its end (task_notification), and a dead worker's runs are closed by the
+    // worker-death sweep. Closing it here marked live agents failed.
+    const running = (stmts.listRunningSubagentRunsByQueueMessage?.all?.(messageId) || [])
+      .filter((run) => Number(run.background || 0) !== 1 && !liveTaskForSubagentRun(run));
     if (!running.length) return 0;
     const now = new Date().toISOString();
-    stmts.closeRunningSubagentRunsByQueueMessage?.run?.(status, now, now, messageId);
     for (const run of running) {
-      io.emit('subagent_status', {
-        conversationId: run.conversation_id,
-        subagentRunId: run.id,
-        parentSubagentId: run.parent_subagent_id || null,
-        displayName: run.display_name || null,
-        status,
-        queueMessageId: messageId,
-        reconciled: true,
-      });
+      stmts.updateSubagentRunStatus?.run?.(status, now, now, run.id);
+      const closed = stmts.getSubagentRun?.get?.(run.id) || { ...run, status, completed_at: now };
+      // messageId is the run's own turn: the browser drops a status event it
+      // cannot place, which left these runs showing "running" until a reload.
+      emitSubagentStatus(closed, { queueMessageId: messageId, reconciled: true });
     }
     return running.length;
   }
@@ -2104,6 +2208,19 @@ export function registerMessagesRoutes(app, deps) {
     });
     io.emit('message_status', { messageId, conversationId, status: 'failed' });
     void pushDispatchService?.notifyTurnFailed?.({ conversationId, messageId: responseId, sourceMessageId: messageId, text: responseText });
+    // A Stop from the relay ends the turn; anything else failed it.
+    try {
+      if (String(failureRecord?.code || '') === 'turn-aborted') {
+        relayEventService?.noteTurnEnd?.({ conversationId, queueMessageId: messageId, status: 'stopped' });
+      } else {
+        relayEventService?.noteError?.({
+          conversationId,
+          kind: 'turn_failed',
+          message: failureRecord?.message || failureRecord?.error || responseText,
+          queueMessageId: messageId,
+        });
+      }
+    } catch {}
     cancelPendingRelayQuestionsForMessage(messageId);
     const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
       ? normalizeSessionWorkerId(queueRow?.owner_sdk_session_id)
@@ -3825,6 +3942,137 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // Explorer changes: new folder, rename, delete. Two routes per operation,
+  // one for the conversation's workspace (relative paths, resolved exactly like
+  // `/api/files/*`) and one for the drives and session roots (absolute paths,
+  // checked exactly like `/api/drives/list`). Each write route therefore
+  // reaches nothing its listing route would not show.
+  // ---------------------------------------------------------------------------
+
+  function workspaceWebPath(relativePath) {
+    return String(relativePath || '').split(path.sep).join('/');
+  }
+
+  // Resolve a workspace entry from a request body: `{ absolutePath, relative }`
+  // or `null` after answering the request with the error.
+  function resolveWorkspaceMutationTarget(req, res, rawRelativePath) {
+    const relative = normalizeWorkspaceRelativePath(rawRelativePath);
+    if (!relative) {
+      res.status(400).json({ error: 'Invalid path' });
+      return null;
+    }
+    const absolutePath = resolveWorkspaceFilePath(relative, resolveScopedWorkspaceRootPath(req));
+    if (!absolutePath) {
+      res.status(400).json({ error: 'Invalid path' });
+      return null;
+    }
+    return { absolutePath, relative };
+  }
+
+  // Resolve an absolute drives/session path from a request body and hand it
+  // on, with the function that turns an absolute path into the explorer's
+  // path form for the answer. Answers the request itself on a bad path.
+  function withDriveMutationTarget(req, res, rawPath, { allowRoot = false } = {}, next) {
+    const requestedPath = String(rawPath || '').trim();
+    if (process.platform !== 'win32') {
+      const absolutePath = normalizeLinuxAbsolutePath(requestedPath);
+      if (!absolutePath) return res.status(400).json({ error: 'Invalid Linux path' });
+      if (absolutePath === '/' && !allowRoot) return res.status(400).json({ error: 'The root folder cannot be changed' });
+      return next(absolutePath, (value) => value);
+    }
+    return fetchBrowsableDrives((drivesErr, drives) => {
+      if (drivesErr) return res.status(500).json({ error: drivesErr.message || 'Failed to enumerate drives' });
+      const allowedRoots = new Set(drives.map((drive) => drive.rootAbsolute.toUpperCase()));
+      const absolutePath = normalizeDriveAbsolutePath(requestedPath);
+      const rootAbsolute = driveRootFromAbsolutePath(absolutePath).toUpperCase();
+      if (!absolutePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
+        return res.status(400).json({ error: 'Invalid drive path' });
+      }
+      if (absolutePath.toUpperCase() === rootAbsolute && !allowRoot) {
+        return res.status(400).json({ error: 'A drive root cannot be changed' });
+      }
+      return next(absolutePath, toDriveWebPath);
+    });
+  }
+
+  function validatedName(res, rawName) {
+    const check = validateEntryName(rawName);
+    if (!check.ok) {
+      res.status(400).json({ error: check.error });
+      return null;
+    }
+    return check.name;
+  }
+
+  function sendMutationResult(res, result, extra = {}) {
+    if (!result?.ok) return res.status(Number(result?.statusCode) || 500).json({ error: result?.error || 'Request failed' });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ ok: true, ...extra });
+  }
+
+  app.post('/api/repo/mkdir', auth, (req, res) => {
+    const name = validatedName(res, req.body?.name);
+    if (!name) return;
+    const parentRelative = normalizeWorkspaceRelativePath(req.body?.path);
+    if (String(req.body?.path || '').trim() && !parentRelative) return res.status(400).json({ error: 'Invalid path' });
+    const target = resolveWorkspaceMutationTarget(req, res, parentRelative ? `${workspaceWebPath(parentRelative)}/${name}` : name);
+    if (!target) return;
+    return sendMutationResult(res, createDirectory(target.absolutePath), { path: workspaceWebPath(target.relative) });
+  });
+
+  app.post('/api/repo/rename', auth, (req, res) => {
+    const newName = validatedName(res, req.body?.newName);
+    if (!newName) return;
+    const source = resolveWorkspaceMutationTarget(req, res, req.body?.path);
+    if (!source) return;
+    const parentWeb = workspaceWebPath(path.dirname(source.relative));
+    const destinationWeb = parentWeb && parentWeb !== '.' ? `${parentWeb}/${newName}` : newName;
+    // The destination goes through the same resolver: a new name can never
+    // leave the workspace or land on the root.
+    const destination = resolveWorkspaceMutationTarget(req, res, destinationWeb);
+    if (!destination) return;
+    return sendMutationResult(res, renameEntry(source.absolutePath, newName), { path: workspaceWebPath(destination.relative) });
+  });
+
+  app.post('/api/repo/delete', auth, (req, res) => {
+    const target = resolveWorkspaceMutationTarget(req, res, req.body?.path);
+    if (!target) return;
+    if (req.body?.dryRun === true) {
+      const counted = countEntries(target.absolutePath);
+      return sendMutationResult(res, counted, counted.ok ? { kind: counted.kind, files: counted.files, dirs: counted.dirs, capped: counted.capped } : {});
+    }
+    return sendMutationResult(res, removeEntry(target.absolutePath));
+  });
+
+  app.post('/api/drives/mkdir', auth, (req, res) => {
+    const name = validatedName(res, req.body?.name);
+    if (!name) return;
+    withDriveMutationTarget(req, res, req.body?.path, { allowRoot: true }, (parentAbsolute, webPathOf) => {
+      const targetAbsolute = path.join(parentAbsolute, name);
+      return sendMutationResult(res, createDirectory(targetAbsolute), { path: webPathOf(targetAbsolute) });
+    });
+  });
+
+  app.post('/api/drives/rename', auth, (req, res) => {
+    const newName = validatedName(res, req.body?.newName);
+    if (!newName) return;
+    withDriveMutationTarget(req, res, req.body?.path, {}, (sourceAbsolute, webPathOf) => {
+      const result = renameEntry(sourceAbsolute, newName);
+      return sendMutationResult(res, result, result.ok ? { path: webPathOf(result.path) } : {});
+    });
+  });
+
+  app.post('/api/drives/delete', auth, (req, res) => {
+    withDriveMutationTarget(req, res, req.body?.path, {}, (targetAbsolute) => {
+      if (req.body?.dryRun === true) {
+        const counted = countEntries(targetAbsolute);
+        return sendMutationResult(res, counted, counted.ok ? { kind: counted.kind, files: counted.files, dirs: counted.dirs, capped: counted.capped } : {});
+      }
+      return sendMutationResult(res, removeEntry(targetAbsolute));
+    });
+  });
+
   app.get('/api/drives/file', auth, (req, res) => {
     const requestedPath = String(req.query.path || '').trim();
 
@@ -5249,7 +5497,7 @@ export function registerMessagesRoutes(app, deps) {
     }
     const rowAttemptId = String(row.attempt_id || '').trim() || null;
     if (attemptId && rowAttemptId && attemptId !== rowAttemptId) {
-      console.warn(`[${ts()}] STALE ATTEMPT queue-cancelled ${messageId.slice(0, 8)} attempt=${attemptId.slice(0, 8)} current=${rowAttemptId.slice(0, 8)}`);
+      staleAttemptLog.note({ messageId, attemptId, currentAttemptId: rowAttemptId, route: 'queue-cancelled', status: row.status });
       return res.status(409).json({ error: 'stale_attempt' });
     }
 
@@ -5704,6 +5952,9 @@ export function registerMessagesRoutes(app, deps) {
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
     }
     if (runtimeState.relayPaused) return res.json({ message: null, paused: true });
+    // A queued shutdown or restart waits for the processing turns only: a
+    // pending row handed out now would start a turn that postpones it again.
+    if (isRelayShutdownQueued(runtimeState)) return res.json(relayShutdownGateReply(runtimeState));
     if (runtimeState.tunnelState?.blocking) {
       return res.json({
         message: null,
@@ -6689,7 +6940,7 @@ export function registerMessagesRoutes(app, deps) {
     // the legacy conditional semantics.
     const claimedAttemptId = String(req.body.attemptId || '').trim() || null;
     if (claimedAttemptId && q && String(q.attempt_id || '') !== claimedAttemptId) {
-      console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=response claimed=${claimedAttemptId.slice(0,8)} current=${String(q.attempt_id || '').slice(0,8) || 'none'} status=${q.status}`);
+      staleAttemptLog.note({ messageId, attemptId: claimedAttemptId, currentAttemptId: q.attempt_id, route: 'response', status: q.status });
       return res.status(409).json({ error: 'stale_attempt', currentStatus: q.status });
     }
     if (!claimedAttemptId && q && q.status === 'processing') {
@@ -6782,7 +7033,7 @@ export function registerMessagesRoutes(app, deps) {
       if (!failed) {
         const currentRow = stmts.findQById?.get(messageId) || null;
         if (claimedAttemptId && currentRow && String(currentRow.attempt_id || '') !== claimedAttemptId) {
-          console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=response-terminal claimed=${claimedAttemptId.slice(0,8)} current=${String(currentRow.attempt_id || '').slice(0,8) || 'none'} status=${currentRow.status}`);
+          staleAttemptLog.note({ messageId, attemptId: claimedAttemptId, currentAttemptId: currentRow.attempt_id, route: 'response-terminal', status: currentRow.status });
           return res.status(409).json({ error: 'stale_attempt', currentStatus: String(currentRow.status || 'unknown') });
         }
         console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing`);
@@ -6998,7 +7249,7 @@ export function registerMessagesRoutes(app, deps) {
       const currentRow = stmts.findQById?.get(messageId) || null;
       const currentStatus = String(currentRow?.status || 'unknown');
       if (claimedAttemptId && currentRow && String(currentRow.attempt_id || '') !== claimedAttemptId) {
-        console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=response-finalize claimed=${claimedAttemptId.slice(0,8)} current=${String(currentRow.attempt_id || '').slice(0,8) || 'none'} status=${currentStatus}`);
+        staleAttemptLog.note({ messageId, attemptId: claimedAttemptId, currentAttemptId: currentRow.attempt_id, route: 'response-finalize', status: currentStatus });
         return res.status(409).json({ error: 'stale_attempt', currentStatus });
       }
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=not_pending_or_processing actual_status=${currentStatus}`);
@@ -7174,6 +7425,25 @@ export function registerMessagesRoutes(app, deps) {
         sourceMessageId: messageId,
         text: resolvedText,
       });
+      // A turn paused at the usage limit did not end: it is an error event
+      // for whoever watches the session.
+      try {
+        if (usageLimitPause) {
+          relayEventService?.noteError?.({
+            conversationId: targetConversationId,
+            kind: 'usage_limit',
+            message: usageLimitPause.noteText,
+            queueMessageId: messageId,
+          });
+        } else {
+          relayEventService?.noteTurnEnd?.({
+            conversationId: targetConversationId,
+            queueMessageId: messageId,
+            replyText: resolvedText,
+            status: 'done',
+          });
+        }
+      } catch {}
     }
     cancelPendingRelayQuestionsForMessage(messageId);
     res.json({ ok: true });
@@ -7270,6 +7540,37 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true, messageId, conversationId, attemptId });
   });
 
+  function resolveTaskConversationId(id) {
+    const key = String(id || '').trim();
+    if (!key) return '';
+    try {
+      return String(resolveConversationRecord?.({ conversationId: key, sdkSessionId: key })?.id || key);
+    } catch {
+      return key;
+    }
+  }
+
+  // POST /api/background-task-settled — how a background task ended, where
+  // the worker learns it (the Claude worker's task_notification): status,
+  // summary, and the reason for an unusual end. The task leaves the live set
+  // on its own; this only says how it ended.
+  app.post('/api/background-task-settled', auth, (req, res) => {
+    touchCli();
+    const conversationId = resolveTaskConversationId(req.body?.conversationId);
+    const taskId = String(req.body?.taskId || '').trim();
+    if (!conversationId || !taskId) return res.status(400).json({ error: 'Missing conversationId or taskId' });
+    const exitCode = Number(req.body?.exitCode);
+    sessionActivityTracker?.noteTaskSettled?.(conversationId, {
+      taskId,
+      toolUseId: sanitizeSubagentRunId(req.body?.toolUseId) || null,
+      status: String(req.body?.status || '').trim().slice(0, 40) || 'completed',
+      summary: String(req.body?.summary || '').trim().slice(0, 500) || null,
+      exitCode: Number.isInteger(exitCode) ? exitCode : null,
+    });
+    relayEventService?.afterStateChange?.(conversationId);
+    res.json({ ok: true });
+  });
+
   // POST /api/background-tasks — a session worker publishes its live
   // background-task set (REPLACE semantics, mirroring the SDK's
   // background_tasks_changed signal) so the composer panel tracks it live.
@@ -7296,10 +7597,40 @@ export function registerMessagesRoutes(app, deps) {
         // Sanitized digest or undefined: JSON serialization (store broadcast,
         // conversation payload) drops the key entirely for flat rows.
         workflowProgress: sanitizeWorkflowProgress(task?.workflowProgress) || undefined,
+        // The spawning tool_use id: the sub-agent run this task is. The panel
+        // opens the run's viewer from it.
+        toolUseId: sanitizeSubagentRunId(task?.toolUseId) || undefined,
       }))
       .filter((task) => task.taskId);
     backgroundTaskStore?.replace?.(conversationId, tasks);
     io.emit('background_tasks', { conversationId, tasks });
+    // The store is keyed as the worker posts (its SDK session id); the
+    // tracker by the conversation.
+    try {
+      const trackedConversationId = resolveTaskConversationId(conversationId);
+      sessionActivityTracker?.noteTaskSet?.(trackedConversationId, tasks);
+      relayEventService?.afterStateChange?.(trackedConversationId);
+    } catch {}
+    // The panel's copy of a task lives in memory and goes when the task
+    // settles; what the run's row needs of it is kept on the run.
+    for (const task of tasks) {
+      if (!task.toolUseId) continue;
+      const before = stmts.getSubagentRun?.get?.(task.toolUseId) || null;
+      if (!before || String(before.conversation_id || '') !== conversationId) continue;
+      const patch = sanitizeRunHeaderPatch({
+        model: task.model,
+        modelInherited: task.model ? task.modelInherited : undefined,
+        subagentType: task.subagentType,
+        taskId: task.taskId,
+        totalTokens: task.totalTokens,
+        background: true,
+      });
+      if (!patch) continue;
+      const after = subagentTimeline.applyHeader(before.id, patch);
+      const changed = after && ['model', 'model_inherited', 'subagent_type', 'task_id', 'total_tokens', 'background']
+        .some((column) => before[column] !== after[column]);
+      if (changed) emitSubagentStatus(after);
+    }
     res.json({ ok: true, count: tasks.length });
   });
 
@@ -7332,7 +7663,7 @@ export function registerMessagesRoutes(app, deps) {
     if (!claimed || !queueRow) return false;
     const current = String(queueRow.attempt_id || '');
     if (current === claimed) return false;
-    console.warn(`[${ts()}] STALE ATTEMPT ${String(queueRow.id || '').slice(0,8)} route=${route} claimed=${claimed.slice(0,8)} current=${current.slice(0,8) || 'none'} status=${queueRow.status}`);
+    staleAttemptLog.note({ messageId: queueRow.id, attemptId: claimed, currentAttemptId: current, route, status: queueRow.status });
     res.status(409).json({ error: 'stale_attempt', currentStatus: String(queueRow.status || 'unknown') });
     return true;
   }
@@ -7347,10 +7678,11 @@ export function registerMessagesRoutes(app, deps) {
 
     const q = stmts.findQById.get(messageId);
     if (rejectStaleAttemptWrite({ req, res, queueRow: q, route: 'activity' })) return;
+    try { sessionActivityTracker?.touch?.(q?.conversation_id || conversationId); } catch {}
     const responseMessageId = q?.response_message_id || null;
     const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
     const normalizedMetadata = sanitizeActivityMetadata(metadata);
-    stmts.insertActivity.run(
+    const activityRow = stmts.insertActivity.run(
       messageId,
       responseMessageId,
       conversationId,
@@ -7360,6 +7692,14 @@ export function registerMessagesRoutes(app, deps) {
       normalizedSubagentRunId,
       normalizedMetadata ? JSON.stringify(normalizedMetadata) : null,
     );
+    if (normalizedSubagentRunId) {
+      // The lane keeps the capped line; the timeline copy keeps what came in.
+      mirrorSubagentFrame({
+        runId: normalizedSubagentRunId,
+        key: `activity:${activityRow?.lastInsertRowid ?? Date.now()}`,
+        ...activityTimelineFrame(String(text || '').trim() || activityText),
+      });
+    }
 
     io.emit('relay_activity', {
       messageId,
@@ -7394,6 +7734,7 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(409).json({ error: 'Stream conversationId does not match queue conversation' });
     }
     if (rejectStaleAttemptWrite({ req, res, queueRow, route: 'stream' })) return;
+    try { sessionActivityTracker?.touch?.(queueConversationId); } catch {}
 
     const isStreamSeqConstraintError = (error) => {
       const message = String(error?.message || '').toLowerCase();
@@ -7474,6 +7815,11 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(500).json({ error: error?.message || 'Failed to persist stream event' });
     }
 
+    if (normalizedSubagentRunId) {
+      // One reply text per run and turn, updated in place as it grows.
+      mirrorSubagentFrame({ runId: normalizedSubagentRunId, key: `stream:${messageId}`, kind: 'text', text: streamText, done: !!done });
+    }
+
     // Volatile keeps these out of the connection-state-recovery buffer. Each chunk
     // carries the full text so far, so replaying a turn's worth of them costs
     // megabytes to deliver what one reconnect resync already fetches from
@@ -7515,6 +7861,7 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(409).json({ error: 'Thought conversationId does not match queue conversation' });
     }
     if (rejectStaleAttemptWrite({ req, res, queueRow, route: 'thought' })) return;
+    try { sessionActivityTracker?.touch?.(queueConversationId); } catch {}
 
     const relayMode = normalizeRelayMode(mode) || DEFAULT_RELAY_MODE;
     const normalizedReasoningId = String(reasoningId || '').trim() || null;
@@ -7594,6 +7941,16 @@ export function registerMessagesRoutes(app, deps) {
       }
     }
 
+    if (normalizedSubagentRunId && (normalizedReasoningId || done) && String(thoughtText).trim()) {
+      mirrorSubagentFrame({
+        runId: normalizedSubagentRunId,
+        key: normalizedReasoningId ? `thought:${normalizedReasoningId}` : `thought:${messageId}:${seq}`,
+        kind: 'thought',
+        text: thoughtText,
+        done: !!done,
+      });
+    }
+
     io.emit('relay_thought', {
       messageId,
       conversationId,
@@ -7608,7 +7965,12 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true, seq });
   });
 
-  // POST /api/subagent-run — relay notifies about subagent lifecycle events
+  // POST /api/subagent-run — relay notifies about subagent lifecycle events.
+  // A new run needs the turn that spawned it (messageId). An update to a known
+  // run may come without one: a background agent outlives its turn, and its
+  // end (or its header) arrives between turns or during a later turn; the run
+  // row names its own turn. Header fields (model, type, task id, background,
+  // who writes the timeline) are patched onto the run.
   app.post('/api/subagent-run', auth, (req, res) => {
     touchCli();
     const { messageId, conversationId, subagentRunId, parentSubagentId, displayName, status } = req.body || {};
@@ -7617,40 +7979,56 @@ export function registerMessagesRoutes(app, deps) {
     const normalizedSubagentRunId = sanitizeSubagentRunId(subagentRunId);
     const normalizedParentSubagentId = sanitizeSubagentRunId(parentSubagentId);
     const normalizedDisplayName = displayName ? String(displayName).trim() : null;
-    const normalizedStatus = status ? String(status).trim() : 'running';
+    const normalizedStatus = status ? normalizeSubagentRunStatus(status) : 'running';
+    const normalizedMessageId = String(messageId || '').trim();
 
-    if (!messageId || !conversationId || !normalizedSubagentRunId) {
+    if (!conversationId || !normalizedSubagentRunId) {
+      return res.status(400).json({ error: 'Missing required subagent-run fields: messageId, conversationId, subagentRunId' });
+    }
+    const existingRun = stmts.getSubagentRun?.get(normalizedSubagentRunId);
+    if (!normalizedMessageId && !existingRun) {
       return res.status(400).json({ error: 'Missing required subagent-run fields: messageId, conversationId, subagentRunId' });
     }
 
-    const q = stmts.findQById.get(messageId);
-    if (rejectStaleAttemptWrite({ req, res, queueRow: q, route: 'subagent-run' })) return;
-    const existingRun = stmts.getSubagentRun?.get(normalizedSubagentRunId);
-    const binding = validateSubagentRunBinding({
-      queueRow: q,
-      messageId,
-      conversationId,
-      existingRun,
-    });
-    if (!binding.ok) {
-      return res.status(binding.statusCode || 409).json({ error: binding.error || 'Subagent run binding mismatch' });
+    let authoritativeConversationId;
+    if (normalizedMessageId) {
+      const q = stmts.findQById.get(normalizedMessageId);
+      if (rejectStaleAttemptWrite({ req, res, queueRow: q, route: 'subagent-run' })) return;
+      const binding = validateSubagentRunBinding({
+        queueRow: q,
+        messageId: normalizedMessageId,
+        conversationId,
+        existingRun,
+      });
+      if (!binding.ok) {
+        return res.status(binding.statusCode || 409).json({ error: binding.error || 'Subagent run binding mismatch' });
+      }
+      authoritativeConversationId = String(binding.conversationId || conversationId || '').trim();
+    } else {
+      authoritativeConversationId = String(existingRun.conversation_id || '').trim();
+      if (authoritativeConversationId !== String(conversationId).trim()) {
+        return res.status(409).json({ error: 'Subagent run conversation mismatch' });
+      }
     }
-    const authoritativeConversationId = String(binding.conversationId || conversationId || '').trim();
 
     const now = new Date().toISOString();
 
     if (existingRun) {
-      const isTerminal = normalizedStatus === 'completed' || normalizedStatus === 'failed' || normalizedStatus === 'cancelled';
-      stmts.updateSubagentRunStatus?.run(
-        normalizedStatus,
-        now,
-        isTerminal ? now : null,
-        normalizedSubagentRunId,
-      );
+      // Without a status the post is a header update and leaves the run's
+      // state alone.
+      if (status) {
+        const isTerminal = normalizedStatus === 'completed' || normalizedStatus === 'failed' || normalizedStatus === 'cancelled';
+        stmts.updateSubagentRunStatus?.run(
+          normalizedStatus,
+          now,
+          isTerminal ? now : null,
+          normalizedSubagentRunId,
+        );
+      }
     } else {
       stmts.insertSubagentRun?.run(
         normalizedSubagentRunId,
-        messageId,
+        normalizedMessageId,
         authoritativeConversationId,
         normalizedParentSubagentId,
         normalizedDisplayName,
@@ -7659,18 +8037,105 @@ export function registerMessagesRoutes(app, deps) {
         now,
       );
     }
-
-    io.emit('subagent_status', {
-      messageId,
-      conversationId: authoritativeConversationId,
-      subagentRunId: normalizedSubagentRunId,
-      parentSubagentId: normalizedParentSubagentId || undefined,
-      displayName: normalizedDisplayName || undefined,
-      status: normalizedStatus,
-      timestamp: now,
+    const headerPatch = sanitizeRunHeaderPatch({
+      model: req.body?.model,
+      modelInherited: req.body?.modelInherited,
+      subagentType: req.body?.subagentType,
+      taskId: req.body?.taskId,
+      background: req.body?.background === true,
+      timelineOwner: req.body?.timelineOwner,
     });
+    if (headerPatch) subagentTimeline.applyHeader(normalizedSubagentRunId, headerPatch);
+
+    const run = stmts.getSubagentRun?.get?.(normalizedSubagentRunId);
+    if (run) {
+      emitSubagentStatus(run);
+    } else {
+      io.emit('subagent_status', {
+        messageId: normalizedMessageId || null,
+        conversationId: authoritativeConversationId,
+        subagentRunId: normalizedSubagentRunId,
+        parentSubagentId: normalizedParentSubagentId || undefined,
+        displayName: normalizedDisplayName || undefined,
+        status: normalizedStatus,
+        timestamp: now,
+      });
+    }
 
     res.json({ ok: true });
+  });
+
+  // POST /api/subagent-timeline — a worker publishes entries of a sub-agent's
+  // record (and, optionally, a header patch) for a run it already announced.
+  // Fenced by the run row, not by an open turn: a background agent keeps
+  // writing after its turn ended, and its entries belong to that turn. A run
+  // the relay does not know yet but whose parent it does (an agent spawned
+  // inside another) is created under the parent's turn; anything else is a
+  // 404 the worker retries once the spawn has landed.
+  app.post('/api/subagent-timeline', auth, (req, res) => {
+    touchCli();
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const runId = sanitizeSubagentRunId(req.body?.subagentRunId);
+    if (!conversationId || !runId) {
+      return res.status(400).json({ error: 'Missing conversationId or subagentRunId' });
+    }
+    if (!subagentTimeline.supported()) {
+      return res.status(503).json({ error: 'timeline_unavailable' });
+    }
+    const rawHeader = req.body?.header && typeof req.body.header === 'object' ? req.body.header : {};
+    let run = stmts.getSubagentRun?.get?.(runId) || null;
+    let created = false;
+    if (!run) {
+      const parentId = sanitizeSubagentRunId(rawHeader.parentSubagentId);
+      const parent = parentId ? (stmts.getSubagentRun?.get?.(parentId) || null) : null;
+      if (!parent) return res.status(404).json({ error: 'unknown_run' });
+      if (String(parent.conversation_id || '') !== conversationId) {
+        return res.status(409).json({ error: 'Subagent run conversation mismatch' });
+      }
+      const now = new Date().toISOString();
+      const displayName = String(rawHeader.displayName || '').trim().slice(0, 500) || 'Subagent';
+      stmts.insertSubagentRun?.run(runId, parent.queue_message_id, parent.conversation_id, parentId, displayName, 'running', now, now);
+      run = stmts.getSubagentRun?.get?.(runId) || null;
+      if (!run) return res.status(500).json({ error: 'Failed to create the run' });
+      created = true;
+    }
+    if (String(run.conversation_id || '') !== conversationId) {
+      return res.status(409).json({ error: 'Subagent run conversation mismatch' });
+    }
+    const patch = sanitizeRunHeaderPatch(rawHeader);
+    if (patch) run = subagentTimeline.applyHeader(runId, patch) || run;
+    let stored;
+    try {
+      stored = subagentTimeline.applyEntries(run, req.body?.entries);
+    } catch (error) {
+      return res.status(500).json({ error: error?.message || 'Failed to store the timeline' });
+    }
+    if (stored.truncated) run = stmts.getSubagentRun?.get?.(runId) || run;
+    if (created || patch || stored.truncated) emitSubagentStatus(run);
+    emitSubagentTimeline(run, stored.entries);
+    try { sessionActivityTracker?.touch?.(conversationId); } catch {}
+    res.json({ ok: true, stored: stored.entries.length, truncated: stored.truncated });
+  });
+
+  // GET /api/conversation/:conversationId/subagent/:subagentRunId — one run's
+  // record for the viewer: header, entries after `after` (plus open ones),
+  // child runs. `complete` is false when more entries follow this page.
+  app.get('/api/conversation/:conversationId/subagent/:subagentRunId', auth, (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const runId = sanitizeSubagentRunId(req.params.subagentRunId);
+    if (!conversationId || !runId) return res.status(400).json({ error: 'Missing conversationId or subagentRunId' });
+    const run = stmts.getSubagentRun?.get?.(runId) || null;
+    if (!run || String(run.conversation_id || '') !== conversationId) {
+      return res.status(404).json({ error: 'Sub-agent run not found' });
+    }
+    const page = subagentTimeline.readTimeline(run, {
+      afterSeq: Number(req.query?.after) || 0,
+      limit: Number(req.query?.limit) || TIMELINE_READ_DEFAULT_LIMIT,
+      isStoppable: isSubagentRunStoppable,
+    });
+    const task = liveTaskForSubagentRun(run);
+    if (page.run && task?.taskId) page.run.taskId = page.run.taskId || task.taskId;
+    res.json(page);
   });
 
   // POST /api/requeue — relay re-queues a message it failed to process
@@ -7683,7 +8148,7 @@ export function registerMessagesRoutes(app, deps) {
     // terminal-fail a row that has already been requeued to someone else).
     const claimedAttemptId = String(req.body?.attemptId || '').trim() || null;
     if (claimedAttemptId && q && String(q.attempt_id || '') !== claimedAttemptId) {
-      console.warn(`[${ts()}] STALE ATTEMPT ${messageId?.slice(0,8)} route=requeue claimed=${claimedAttemptId.slice(0,8)} current=${String(q.attempt_id || '').slice(0,8) || 'none'} status=${q.status}`);
+      staleAttemptLog.note({ messageId, attemptId: claimedAttemptId, currentAttemptId: q.attempt_id, route: 'requeue', status: q.status });
       return res.status(409).json({ error: 'stale_attempt', currentStatus: String(q.status || 'unknown') });
     }
     const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)

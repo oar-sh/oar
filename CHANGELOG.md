@@ -5,6 +5,253 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.10] — 2026-10-12
+
+Highlights: sessions watch other sessions. An agent subscribes to sessions on
+its own relay or on a paired one and is woken by what happens there:
+questions waiting for an answer, errors, replies, finished background work,
+sessions gone quiet. A subscription only notifies; it approves nothing, and
+the first one in a conversation asks you on a card. Also new: a sub-agent's
+whole record opens in a viewer, a note between agents and its reply fold into
+one row, `remote_relay` reports what the provider plans have left, the file
+browser creates, renames and deletes folders and files, a ⌄ button jumps back
+to the latest message, archiving an active session asks first, and Settings
+opens with no conversation open.
+
+### Upgrade notes
+
+- **Running sessions pick up the new tools when their worker restarts.** A
+  session worker builds its `remote_relay` tool when it starts, so a worker
+  that was already running before the update offers neither `subscribe` nor
+  `usage`, and records no sub-agent timeline, until it is restarted: **☠️
+  Kill session** on an idle session is enough, the next message starts a new
+  worker. The database migrations run by themselves on the first start.
+
+### Added
+
+- **A session can watch other sessions and be woken by what happens there.**
+  With `remote_relay`'s new `subscribe` an agent asks to be told about
+  questions waiting for an answer, errors (a failed turn, the usage limit, a
+  worker that died), replies, background agents and shell tasks that finish
+  or fail, sessions that went quiet while working, and the moment nothing
+  runs any more, for listed sessions or all of them. OAR writes a short event
+  message into the watcher's conversation: a new turn when it is idle, a
+  steer into the running turn where the provider steers, the next turn
+  otherwise. The message says it is automated and approves nothing, and shows
+  as a compact row, never as one of your messages. Events within 30 s come
+  together; past 20 wake-ups an hour the rest comes as a digest every ten
+  minutes, while questions and errors still come at once. An optional
+  heartbeat says the watching works while anything runs. Subscriptions
+  survive a restart and end on unsubscribe, when the watcher or the watched
+  session is archived, or after firing once. The first subscribe of a
+  conversation, and any to all sessions, asks you on an approval card;
+  `transfer_subscriptions` hands every subscription of an old watcher to a
+  new one after your approval. The watcher's header shows **watching N
+  sessions** with an Unsubscribe button per subscription, and a watched
+  session shows a **watched** badge.
+
+- **Watch sessions on a paired relay.** `subscribe`, `unsubscribe`,
+  `list_subscriptions` and `transfer_subscriptions` also take a paired
+  relay, with the same events and options. The relay must be unlocked in
+  the conversation and allow at least reading, and the other relay must
+  accept other relays' agents; the approval card names that relay, and
+  nothing is asked there. This relay fetches the events every few seconds
+  over the pairing (a pairing in one direction is enough), and they arrive
+  like those of its own sessions, their lines starting with the relay's
+  name. If the link drops, the other relay keeps what happens (up to 500
+  events per subscription, for 7 days) and delivers it as one row tagged
+  **replayed** once it answers again, questions and errors first, between
+  "link lost" and "link restored". Subscriptions survive restarts of either
+  relay and end on unsubscribe (reaching the other relay later if it was
+  offline), when the watcher or the watched session is archived, or when
+  the pairing is removed. An older relay answers that it needs an update.
+
+- **list_sessions and read_session say what a session is doing.** `state`
+  is `running_turn`, `background_only` or `idle`, and `tasks` lists its
+  background agents and shell tasks with when they started, when they last
+  did something, how they ended and the exit code where it is known. A
+  session with background agents running no longer reads as inactive.
+
+- **Agents can check what the provider plans have left.** `remote_relay`'s
+  new `usage` action answers, for the relay an agent runs on or a paired
+  one, what each provider's plan has left: Cursor's spend against its
+  limit and when it resets, Claude's windows and whether a usage limit has
+  paused turns, Copilot and Grok where they are tracked; a provider that is
+  not set up says so. It needs only read permission and returns no account
+  names, addresses or tokens.
+
+- **Notes between agents fold away.** A prompt another agent sent a
+  session, from a paired relay or from this one, and the session's reply to
+  it show as one row, "note from linux-test · report builder · replied",
+  which opens to both, on a desktop and on a phone. Your own messages and
+  the replies to them stay as they are, and a turn you steered a message
+  into, or one with a question or card open for you, is never folded. A
+  note still being worked on stays open and folds by itself once it is
+  answered; one you fold or open yourself stays as you left it.
+
+- **Open a sub-agent's whole record.** A sub-agent's title in the composer's
+  background-task panel opens a viewer with everything the agent did, in
+  order: its thoughts, every tool call with its full input and its result,
+  its reply text and the agents it started itself, live while it runs. The
+  finished reply lists the turn's sub-agents as the same rows, with model,
+  type, tokens, time and how they ended, so the record stays one click away.
+  A child agent opens in place, and back returns to its parent. Stop is in
+  the viewer too. Claude records everything; Copilot and Cursor show what
+  they report. A tool result is kept to its first 4 KB, and a record to 2000
+  entries. Only a page with the viewer open receives the record as it grows.
+
+- **Choose how long sub-agent tool output is kept.** Settings → General →
+  **Keep sub-agent tool output** offers 7, 14, 30 or 90 days (the default)
+  or always. Once a finished agent's record is older than that, its tool
+  inputs and results are removed, once a day; its thoughts, its reply, its
+  notes and the one-line summary of each tool call stay, and the viewer says
+  what was removed.
+
+- **Folders can be created in the file browser.** A **📁+ New folder**
+  button in the toolbar opens a row at the top of the folder pane; the name
+  is typed there and Enter creates the folder inside the open one and opens
+  it. It works in the repository, on the drives and in the session folder,
+  and in the folder picker of **New chat** and **Change CWD**, so a new
+  project folder can be made and picked in one go. A taken name or a name
+  the system refuses is reported under the input.
+
+- **Files and folders can be renamed and deleted in the file browser.** A
+  right-click, or a long press on a phone, on a folder in the tree or a file
+  in the folder pane opens a menu with **Rename** and **Delete**; a folder's
+  menu also offers **New folder here**. Rename edits the name in place: Enter
+  saves, Escape cancels, and an unchanged name is a cancel. Delete asks in a
+  dialog that says what goes: a file, an empty folder, or a folder with so
+  many files and folders in it; for a folder with content the folder's name
+  must be typed before the red button enables. Links are never followed or
+  changed; roots (the repository root, `/`, a drive, the session folder)
+  cannot be renamed or deleted, and the session folder is read-only apart
+  from new folders.
+
+- **Jump back to the latest message.** A round ⌄ button above the composer
+  fades in once the transcript is about a screen above its end, and its
+  badge counts the rows that arrived since (an agent's folded exchange
+  counts once). A click goes back to the end, smoothly up to three screens
+  away and at once beyond, and the transcript follows new rows again; from
+  a search result or a pin deep in the history it loads the end.
+
+### Changed
+
+- **Archiving a session whose process is still active asks first.** A green
+  session, idle or working, now opens "Archive this session? Its process is
+  still active." from the row's 🗄, its menu and the chat menu alike; Cancel
+  or Escape keeps it. An inactive session archives at once, as before.
+
+- **A message from another device no longer pulls a reader who scrolled up
+  down to the end.** Another client's message, an agent's prompt included,
+  is followed like any live row: only while the transcript is at its end.
+
+- The npm package guard allows 6.75 MiB unpacked (was 6.5 MiB); the
+  sub-agent records and the event subscriptions, now across paired relays,
+  grew the server.
+
+### Fixed
+
+- **A dropped websocket can no longer take the relay down.** A browser that
+  reset its connection while a preview's websocket, or any websocket to the
+  relay, was still being set up ended the whole relay with `read ECONNRESET`.
+
+- **A queued relay restart no longer waits forever on a busy relay.** The
+  restart used to wait for the whole queue to empty while new messages kept
+  being handed to workers, so each new turn postponed it again. It now waits
+  for the running turns only; queued messages are held until the relay is
+  back and run then. The banner says which.
+
+- **Waking from sleep no longer restarts the running turns.** After the host
+  slept for hours, every worker heartbeat looked hours old the moment the
+  relay's timer fired again, so live turns were recovered as stale and their
+  messages delivered a second time while the workers' own replies were
+  refused, hundreds of warnings in minutes. The relay now notices the clock
+  jump and gives live workers a full inactivity window to report before
+  anything is recovered; a superseded attempt's refusals are logged once and
+  summarized, not line by line.
+
+- **A Cursor turn waiting on a long command is no longer ended as stalled.**
+  When the agent started a command in the background and then waited for
+  it, the wait counted as a model request, and the turn was ended after five
+  minutes of quiet. The wait now gets the 30 minutes a running tool gets.
+
+- **An event's fields cannot add lines to a watcher's event message.** A
+  line break in a session title, a task description or a field of a paired
+  relay's event could start a line without the `[relay event]` prefix. Every
+  field is now written as one line, and what a paired relay sends is stored
+  field by field from a fixed list, never as the payload it sent.
+
+- **The relay event tables no longer grow without bound.** Delivered events
+  and ended subscriptions were never deleted, and the retention check for
+  paired relays scanned the whole event table every 30 seconds. Delivered
+  events now go after two hours (the wake-up count reads the last hour),
+  ended subscriptions after a week, and the check uses its index.
+
+- **The "watching N sessions" list opens in full.** The header cut it off,
+  so on a phone it did not show at all. It now opens under the chip on top
+  of the page, and Escape or a tap elsewhere closes it.
+
+- **Sub-agent runs a worker never closed no longer count as running work.**
+  A run whose worker went away without reporting its end stayed `running`
+  for good, so a subscription to all sessions never saw `all_idle` and
+  reported the session stalled over and over, and the suspend watchdog saw
+  work. Such runs are now closed shortly after the relay starts and every
+  ten minutes (never while their worker is alive), and a run row not touched
+  for a day is not counted meanwhile.
+
+- **A background agent's output stays with the turn that started it.** Its
+  thoughts and tool calls no longer land in a later turn's reply, and between
+  turns they are no longer lost.
+
+- **A background agent no longer shows as finished the moment it starts.**
+  Its row now ends when the agent does.
+
+- **A sub-agent stopped by a failed turn or a worker crash settles on screen
+  without a reload.** The update used to arrive without its turn, and the
+  page ignored it.
+
+- **The transcript keeps following the live reply when a background task
+  starts.** The task panel appearing, opening or growing shrank the
+  transcript from below and left it that much short of the end, so the next
+  live row stopped following. It now stays at the end.
+
+- **The transcript follows the agent's reply as it streams in.** Each piece
+  of streamed text was scrolled to before it was shown, so the first new
+  line left the reader short of the end and the rest was not followed.
+
+- **Going back to the end while a turn finishes sticks.** The reload at the
+  end of a turn put a reader back where they were when it was asked for, so
+  scrolling to the end, or pressing ⌄, during it was undone and the next
+  rows were not followed. It now keeps where the reader is when it lands.
+
+- **⌄ no longer opens the keyboard on a phone.** The composer is no longer
+  focused when the page loads on a phone, and ⌄ keeps it focused only while
+  the keyboard is already open, so a tap on it just scrolls.
+
+- **A message that arrives while the conversation reloads stays on screen.**
+  A reload asked for just before another client's message or a reply landed
+  rebuilt the transcript without it, until the next reload. The reload now
+  asks again when rows arrived on the way.
+
+- **A message sent right after switching conversations shows up where it was
+  sent.** A quick run through the list, or a click back on the conversation
+  still open, could hand the view to an earlier click once the draft of the
+  conversation left behind had saved. The message then went to that
+  conversation, or its bubble and the live reply stayed hidden until the
+  conversation was opened again. A click now opens its conversation at once.
+
+- **The live reply stays on screen right after a send.** A poll answer read
+  just before the agent took the message could end the turn on the page, and
+  a reply update lost on a busy connection left the bubble empty; both waited
+  for the conversation to be opened again.
+
+- **Settings opens with no conversation open.** On a fresh install the ⋯
+  menu did nothing until a chat existed, so no provider could be turned on.
+  The menu now works on an empty screen, with the entries that need a
+  conversation left out, and the empty screen and New Chat point to
+  Settings → Providers until a provider is ready instead of starting a
+  Copilot chat that cannot run.
+
 ## [0.9.9] — 2026-10-07
 
 Highlights: `oar` opens a menu and gains stop, restart, status, url and

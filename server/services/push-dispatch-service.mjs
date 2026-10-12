@@ -324,6 +324,22 @@ export function createPushDispatchService({
     }
   }
 
+  // A turn that answers relay events (its message is the relay's event row,
+  // kind 'relay-event') pushes no "reply ready" or "failed" either: the
+  // watcher answers events many times an hour and pushes by itself when one
+  // matters. Question pushes are unchanged.
+  let messageKindStatement = null;
+  function turnAnswersRelayEvents(sourceMessageId) {
+    const id = String(sourceMessageId || '').trim();
+    if (!id) return false;
+    try {
+      messageKindStatement ??= db.prepare(`SELECT kind FROM messages WHERE id = ?`);
+      return String(messageKindStatement.get(id)?.kind || '').trim() === 'relay-event';
+    } catch {
+      return false;
+    }
+  }
+
   async function sendToSubscription(row, event) {
     const preferences = normalizePushPreferences(parseJsonObject(row.preferences_json));
     const payload = renderPushNotification(event, preferences);
@@ -440,6 +456,7 @@ export function createPushDispatchService({
   // the turn.
   function notifyTurnComplete({ conversationId, messageId, sourceMessageId, text } = {}) {
     if (turnStartedByRemoteAgent(sourceMessageId)) return Promise.resolve({ outcome: 'remote-agent' });
+    if (turnAnswersRelayEvents(sourceMessageId)) return Promise.resolve({ outcome: 'relay-event' });
     return dispatch({
       type: 'turnComplete',
       conversationId: conversationId || null,
@@ -450,6 +467,7 @@ export function createPushDispatchService({
 
   function notifyTurnFailed({ conversationId, messageId, sourceMessageId, text } = {}) {
     if (turnStartedByRemoteAgent(sourceMessageId)) return Promise.resolve({ outcome: 'remote-agent' });
+    if (turnAnswersRelayEvents(sourceMessageId)) return Promise.resolve({ outcome: 'relay-event' });
     return dispatch({
       type: 'turnFailed',
       conversationId: conversationId || null,

@@ -400,6 +400,69 @@ tree renderer as the live panel, `buildWorkflowRunCard` in `public/app/backgroun
 survives a reload. A history rebuild deletes a conversation's `workflow_runs` alongside its
 `subagent_runs`, because both key on message ids the rebuild replaces.
 
+### Sub-agent records (the sub-agent viewer)
+
+Every sub-agent run keeps its whole record in `subagent_timeline` (migration 0009): one row per
+thought, reply text, tool call (full input), tool result (cut at 4 KB, the original length kept in
+the entry's metadata), child agent or note, numbered per run by `seq` in the order the relay first
+saw it. A writer names each entry with its own `entry_key`; a second write under the same key
+updates the entry in place and keeps its `seq`, which is how a thought or a reply streams. A run
+keeps at most 2000 entries plus one note saying where it was cut (`subagent_runs.truncated`).
+`subagent_runs` also carries the run header the rows show: model, type, task id, tokens, whether it
+runs in the background, and who writes its timeline.
+
+- **Claude**: `claude-worker/subagent-timeline-recorder.mjs` reads every SDK message at process
+  level, before any turn takes it, and posts entries to `POST /api/subagent-timeline` keyed by the
+  run (coalesced every 500 ms; a run the relay does not know yet is retried). A background agent
+  outlives the turn that spawned it, so its frames arrive between turns and during later turns;
+  they go to its own record, never to a later turn's live lanes. A background launch's receipt
+  (`tool_use_result.status: 'async_launched'`) leaves the run running; its `task_notification`
+  ends it. Spawns carry `timelineOwner: 'worker'`.
+- **Copilot and Cursor** publish their sub-agents on the live lanes only (`/api/activity`,
+  `/api/thought`, `/api/stream` with a `subagentRunId`); the relay copies each frame into the run's
+  timeline, uncut. Fields they do not report (model, tokens) stay blank.
+- `POST /api/background-tasks` copies model, type, task id and tokens onto the run whose id is the
+  task's `toolUseId`, so the row keeps them after the in-memory task set is cleared.
+- Every `subagent_status` event carries the whole header and the run's own turn (`messageId`). A
+  turn that fails closes its foreground runs; background runs are closed by their worker, or by the
+  relay when the worker dies.
+
+The browser draws one row per top-level run in the reply bubble (`public/app/subagent-row.mjs`, the
+panel's row grammar); a row's title, like a sub-agent task's title in the composer panel, opens
+`public/app/subagent-viewer.mjs`. The viewer reads `GET /api/conversation/:id/subagent/:runId`, grows
+with the `subagent_timeline` event, and fetches again from the last contiguous `seq` after a missed
+event or a reconnect. A run recorded before the timeline existed is served from its tagged
+activity, thought and stream rows (`legacy: true`).
+
+**Live delivery.** `subagent_timeline` goes only to the pages whose viewer shows that run. The viewer
+names its run with the socket message `subagent_viewer_watch { conversationId, subagentRunId }`
+(acknowledged with `{ ok: true }` or `{ ok: false, code }`: `missing-id`, `not-found`,
+`conversation-mismatch`) when it opens, moves to a child or its parent, and after every reconnect,
+and sends `subagent_viewer_unwatch` when it closes. The relay checks the run exists and belongs to
+the conversation and keeps each socket in at most one room, `subagent-viewer:<runId>`
+(`services/subagent-viewer-rooms.mjs`). Batches go to that room as volatile packets, so they are
+never kept for a reconnect replay and a backed-up connection drops them. socket.io also drops a
+volatile packet while the connection is still writing an earlier one, even from the same tick
+(a worker post that changes the header emits `subagent_status` first), so the relay holds batches
+one tick, merged per run, before sending. The viewer covers what is dropped: it waits for the
+watch's answer before its first read, fetches on a `seq` hole, after a reconnect, and once more when
+the run ends. A refused `not-found` watch is sent again on the run's next `subagent_status`. The lane
+events (`relay_activity`, `relay_thought`, `relay_stream`, `subagent_status`) go to every page as
+before.
+
+**Retention.** After `subagent_record_retention_days` (app setting, `0` = keep for good, otherwise 7,
+14, 30 or 90; default 90; Settings → General → *Keep sub-agent tool output*) the relay strips a
+finished run's tool entries: a `tool_result` keeps its row with empty text, a `tool_call` keeps its
+one-line summary (`subagentToolCallSummary` in `shared/subagent-timeline.mjs`, the viewer's rule) in
+place of the input. Both get `pruned_at` (migration 0010) and metadata
+`{ pruned: true, prunedAt, originalChars, retentionDays }`; the viewer shows them as "Input removed
+after N days" / "output removed after N days". Thoughts, reply text, notes, child rows and the runs
+stay, and the age is the entry's `updated_at`; runs still `running` (or `pending`, `processing`) are
+never touched, nor are the lane rows. `services/subagent-record-retention.mjs` sweeps 30 s after
+start, once a day and 5 s after the setting changes, 2000 rows per transaction with the event loop
+free in between, through a partial index over the unstripped tool entries, and logs one
+`SUBAGENT RETENTION …` line. No VACUUM: SQLite reuses the freed pages.
+
 ### Context usage
 
 Claude sessions have no Copilot `events.jsonl` to tail. Instead the worker reads the live
@@ -430,6 +493,20 @@ On Windows it opens a `Claude Worker <id>` terminal window.
 `fetchUsageSummary` reads GitHub Copilot plan quota, so it is skipped entirely for OpenAI and Claude
 turns. Those replies carry no usage line rather than displaying Copilot premium-request numbers under
 a reply that never touched Copilot.
+
+### Plan usage for agents
+
+`remote_relay`'s `usage {relay}` (permission `read`, like `relay_info`; this relay too, as `this`)
+reads `GET /api/usage` and `GET /api/usage-limit` on the target and answers per provider card
+(Copilot, Claude, Claude Cloud, Cursor, Grok): `status` (`not-configured` and `unavailable` say why
+in `message`), `plan`, `source`, `capturedAt`, the meters (`used`, `allowance`, `remaining`,
+`utilization`, `unit`, `resetAt`, `severity`) and the card's detail rows and notes; plus
+`usageLimit` (`account`: the Claude window, its utilization, reset and overage; `pauses`: the turns
+held at a usage limit, by session). The dispatcher copies an allow-list of fields
+(`usageCard` in `services/remote-relay-dispatcher.mjs`), so a field the usage report gains later is
+not passed on; account labels and links are left out, and an e-mail address or a token-shaped
+string in a text is masked. A relay without `/api/usage` per provider answers
+`REMOTE_RELAY_UNSUPPORTED`; one without `/api/usage-limit` answers `usageLimit: null` with a note.
 
 ## Claude Cloud provider
 
@@ -630,6 +707,183 @@ turn finishing and delivery — leaving a permanent spinner. `activeTurn: false`
 client's optimistic state. Relay shutdown also waits 300 ms before disconnecting sockets so a terminal
 `message_status` emitted just before an idle-deferred restart still reaches the browser.
 
+## Relay event subscriptions
+
+A session (the **watcher**) can ask to be told what happens in other sessions of this relay or of a
+paired relay, through `remote_relay`. The relay tells it by writing a short event message into the
+watcher's conversation; nothing reads transcripts on disk, and it works for every provider.
+
+**Actions** (`relay` may be left out and means `this`; on this relay the agent-sessions setting must
+be on, as for every local action; a paired relay: see [Across paired relays](#across-paired-relays)):
+
+- `subscribe {sessions: [ids] | ["all"], events?, once?, match?, stalled_minutes?, heartbeat_minutes?}`
+  — `all` watches every session, ones created later too. The watcher's own conversation is never
+  watched. The first subscribe of a conversation shows the user an approval card naming the
+  sessions; a subscription to `all` is always named on a card (asked again after an Allow that did
+  not cover it). The Allow is remembered as unlock rows `self:watch` / `self:watch-all`.
+- `unsubscribe {subscription_id | "all"}`, `list_subscriptions {watcher?}` (another conversation's
+  subscriptions, to inspect before a transfer).
+- `transfer_subscriptions {from}` — moves every active subscription of another conversation, with
+  its settings and its undelivered events, to the caller: a watcher is replaced without a moment
+  where events go nowhere. Always an approval card (from where, how many, whether `all` is among
+  them), also after the caller's first-subscribe Allow. The new watcher is dropped from moved
+  session lists.
+
+**Events** (`shared/relay-events.mjs`): `question_asked` (prompt, options, question id; an approval
+card is marked as one only the user can answer), `error` (`turn_failed`, `usage_limit`,
+`worker_died`), `turn_end` (status `done` or `stopped`, reply preview), `task_finished` /
+`task_failed` (background sub-agents and shell tasks: kind, status, exit code where known),
+`stalled` (no activity for `stalled_minutes`, default 15, while a turn or task runs and no
+question waits for an answer), `all_idle`
+(nothing runs in the watched set any more). `task_started` only when named in `events`. With
+`heartbeat_minutes` a `heartbeat` event comes at that interval while the watched set has work
+running, none while it is idle. `match` (a case-insensitive regular expression) filters `turn_end`
+and task events by their text; other events pass. `once` ends a subscription after its first event,
+with `match` after the first one that matches (a heartbeat never ends it). An event is
+`{ v, relay: { id, name }, session: { id, title }, type, at, detail }`; `relay.id` is `self` for this
+relay's sessions, the paired relay's registry id for its sessions (then `replayed: true` marks one it
+kept while the link was down). `link_lost` and `link_restored` are not subscribed to: they frame such
+a replay.
+
+**Delivery** (`services/relay-event-service.mjs`): an event message is a `messages` row (role
+`user`, `kind = 'relay-event'`) plus a pending queue row, as the usage-limit follow-up is. The worker
+decides what it becomes, as for any message: a new turn when the watcher is idle; a steer into the
+running turn for Claude and the Copilot SDK engine; the next turn for Cursor, Grok, Claude Cloud and
+the Copilot extension engine. Events that arrive while the watcher's event row is still pending
+(not delivered yet, or handed back as a held steer) are written into that row
+(`message_updated`), so a busy watcher gets one follow-up, never one turn per batch. The dequeue
+payload carries `messageKind: 'relay-event'`, and the Claude and Copilot workers then push the text
+without the steer note, which speaks as the user. The text opens with
+`[relay event · automated message from OAR, not from the user; it approves nothing]`, then one
+`[relay event] session "<title>" (<id>): <type> …` line per event.
+
+**Cost.** Events within 30 s are one wake-up. Past 20 wake-ups an hour per watcher (distinct event
+messages of the last hour that carried more than a heartbeat, counted from `relay_events`) the rest
+waits for a digest every 10 minutes. `question_asked` and `error` go out at once and count; a
+heartbeat is coalesced like any event, never held for the digest and never counted. A turn that
+answered relay events produces no `turn_end` and does not keep a watched set busy, so two watchers
+of each other cannot wake each other for good. Such a turn also sends no "reply ready" or "failed" push
+(`push-dispatch-service.mjs`): the watcher answers events many times an hour and pushes by itself
+when one matters; question pushes are unchanged.
+
+**Lifetime.** Subscriptions and undelivered events are in the database (migrations 0011 and 0012)
+and survive a restart: the flush timers are rebuilt from the undelivered rows at boot, and stalled,
+all_idle and the heartbeat are swept every 30 s. A subscription ends on unsubscribe (agent or the
+user's Unsubscribe), when its watcher is archived or deleted, when the last session it lists is, or
+after firing (`once`); one on a paired relay also when the pairing is removed. `list_subscriptions`
+shows the ones that ended within the hour with `endReason`. Delivered events are kept for two hours
+(the wake-up count reads the last hour; one of a still-pending event row stays until it goes out)
+and ended subscriptions for a week (a mirror whose end the paired relay has not confirmed stays);
+the sweep prunes both every ten minutes. A `running` sub-agent run whose worker is gone is closed by
+`services/stale-subagent-run-sweep.mjs` (a minute after boot, then every ten minutes), and one not
+touched for a day is not counted as running meanwhile.
+
+**Hook points**: `/api/response` finalize (turn_end, or error at the usage limit), `failQueueMessage`
+(error; a Stop is turn_end `stopped`), `failRecoveredRowTerminally`, `recoverDeadWorkerProcessingRows`
+and the background-only worker death (worker_died), `/api/relay-question` and the approval card's
+notify (question_asked), the activity tracker's task edges, and the archive and delete routes.
+
+### Across paired relays
+
+The watching relay (**A**, it holds the watcher) and the watched one (**B**) each keep a row of the
+subscription. Only A calls, over its pairing: a pairing in one direction is enough.
+
+- **Gate.** The four actions with `relay: <paired relay>` pass the same checks as any `remote_relay`
+  call there: the relay unlocked in the watcher's conversation (the user named it, or its agent wrote
+  there), A's permission for it at least `read`, and B's inbound switch on (B refuses with
+  `REMOTE_INBOUND_DISABLED`). `subscribe` first asks B with a dry run (sessions, limits, switch,
+  version), then shows the watch card on A naming the relay (and `all`), remembered as
+  `<registry id>:watch` / `:watch-all` and forgotten with the pairing, then subscribes on B and stores
+  the mirror on A. No card on B. A relay that predates these routes answers Express's plain 404,
+  which A reports as `REMOTE_RELAY_UNSUPPORTED` ("runs an OAR version without event subscriptions
+  across relays").
+- **B's side** (`relay-event-routes.mjs`): `POST /api/relay-events/remote/subscribe` and
+  `POST /api/relay-events/remote/pull` take only another relay's request (the `X-OAR-Remote-Origin`
+  header names it; this relay's own agents and the browser get `403`) and only while the inbound
+  switch is on. The subscription is an ordinary row whose watcher is the key
+  `remote:<that relay's id>`, which names no conversation, so nothing a paired relay asks for is ever
+  written into a conversation of B's; its events are recorded, swept (stalled, all_idle, heartbeat)
+  and filtered like any, and wait for the fetch. Retention: per subscription the newest 500 undelivered
+  events (questions and errors kept longest), none older than 7 days; a subscription not fetched for
+  7 days ends (`subscriber-gone`). What was dropped is counted and reported once.
+- **The fetch** (`services/relay-event-link-service.mjs` on A): every 5 s while A holds active
+  subscriptions on B or an end B has not confirmed, every 30 s after a minute without an answer,
+  nothing once none are left. The body is `{ after, subscriptions: [{ id, watcher }], ended: [ids] }`:
+  B deletes what A stored up to `after`, applies the ends, updates the watcher names, and answers
+  `{ events, cursor, more, subscriptions: [state], ended, dropped }` (at most 200 events a page).
+  A writes the events into its watchers' undelivered events (only for subscriptions it holds, into the
+  watcher it stored), ends or updates its mirrors from the states, clears confirmed ends and moves its
+  cursor in one transaction, so a restart of either relay loses or repeats nothing. From there
+  delivery is the same as for A's own sessions: coalescing, the cap and digest, the steer, the loop
+  guard (an event turn on either relay is no `turn_end` for the other).
+- **Gaps.** A link without an answer for 60 s (failing fetches, or A down) is lost from its last
+  answer on. The first fetch after that, every page of it, is held and written as one urgent row per
+  watcher with subscriptions there: `link_lost` (no answer since …), `Replayed: N events …` with
+  questions and errors first, `link_restored` (after how long, how many kept, how many dropped, which
+  subscriptions ended there meanwhile). A shorter outage only delays. Nothing wakes the watcher when
+  the link drops; `list_subscriptions` shows each paired subscription's `link` (`ok`, `failing`,
+  `lost`), and a `heartbeat_minutes` subscription notices the silence.
+- **Ends.** Unsubscribe and an archived watcher end the mirror at once and mark it until B confirms
+  (`list_subscriptions` shows `endPending`); `unsubscribe` waits up to 10 s for that and says so when B
+  did not answer. An archived session on B, or B's user ending the subscription there, ends the mirror
+  with the next fetch (`archived`, `ended-on-relay`). Removing the pairing sends one last fetch with
+  every subscription as ended, then ends the mirrors (`pairing-removed`).
+- `unsubscribe "all"` and `transfer_subscriptions` act on the named relay's subscriptions; with `this`,
+  `list_subscriptions` lists all of the watcher's (each with `relay`) and `transfer_subscriptions`
+  moves all, its card naming the paired relays among them. A transfer reaches B as the new watcher's
+  name with the next fetch.
+
+`/api/remote-relays/tool` refuses a call that carries another relay's origin: a paired relay never
+acts, or subscribes, for one of this relay's conversations.
+
+### Session state and tasks
+
+`services/session-activity-tracker.mjs` knows what each session is doing, from the
+`/api/background-tasks` sets (a new task id is a start, a task gone from the set has ended, a
+changed one is activity), `POST /api/background-task-settled` (how a task ended; the Claude worker
+posts it from `task_notification`), the sub-agent run statuses and the activity, thought, stream and
+timeline posts (the activity clock). A task that leaves the set without word ends after 5 s with
+its run's status, else `completed` with `statusReported: false`; an exit code is read from the task
+summary when it names one (the SDK has no field for it). Memory only: a restart forgets the recently
+finished tasks and starts the clock at boot.
+
+`GET /api/conversations` and `GET /api/conversation/:id` carry `sessionState` (`running_turn`: a
+turn processing, or queued and not held by a usage-limit pause; `background_only`: tasks running;
+`idle`), `sessionTasks` (running tasks, then up to five that ended within the hour: `kind`
+`subagent` | `shell`, `description`, `startedAt`, `lastActivityAt`, `status` `running` |
+`completed` | `failed` | `stopped`, `exitCode`, `summary`, `endedAt`) and `lastActivityAt`.
+`remote_relay`'s `list_sessions` and `read_session` pass them on as `state`, `tasks` and
+`lastActivityAt`; `active` stays and is true for background work too.
+
+### Browser
+
+An event message renders as a compact row (`relay-event-view.mjs`) folded to its summary
+(`2 events · question, reply`); a row with a question or an error starts open, a replay carries a
+**replayed** tag, and the user's fold is kept across re-renders. A watcher's header shows **👁 watching
+N sessions** (or all; sessions on paired relays count, the chip's title names those relays), which
+opens its subscriptions with an **Unsubscribe** button each (`lab-relay · Report builder`); a watched
+session shows a **watched** badge in its header and, when watched by id, in the sidebar (a
+subscription to all would badge every row; one on a paired relay badges none of this relay's
+sessions). On the watched relay the badge names a paired relay's watcher with its relay.
+The list comes from `GET /api/relay-events/subscriptions` and the `relay_event_subscriptions`
+socket event (the whole active list after every change).
+
+### Folded agent exchanges
+
+A prompt another agent sent the session (a paired relay's, or one of this relay's own: a user row
+with `origin`) and the session's reply to it fold into one row, `note from <relay> · <session> ·
+replied` (`working…`, `failed`, `stopped`, `no reply yet`), which opens to both as they render
+otherwise. Presentation only (`agent-exchange-fold-view.mjs` decides, `syncAgentExchangeFolds` in
+`conversation-view.js` applies it as one more idempotent pass after every render and update, beside
+the separator and steering passes); the transcript data is unchanged. Nothing addressed to the user
+folds away: not a turn a message was steered into (the reply `absorbed`, or another message folded
+into or stopped with it), not an agent prompt that was itself steered into a turn, not an answer on
+a continuation row, and, while the page lives, not a turn that had an open question, approval card
+or plan board, or ran while a message of the user's waited. A folded exchange shows open while its
+turn is `working…` and closes by itself once it is replied, failed or stopped
+(`agentExchangeFoldOpen`); the user's own toggle, kept by prompt id, always wins over that, and a
+jump to a message inside (search, pins, image parent) opens it.
+
 ## Image conversations (OpenAI BYOK)
 
 Choosing **OpenAI Image (BYOK)** in New Chat creates a conversation whose replies are generated
@@ -715,7 +969,7 @@ When a newer version is available, Settings shows a dismissible-per-version
 card (not dismissible if the release is marked critical — it still never
 auto-applies). On npm-global installs, **Update** runs
 `npm i -g @oar-sh/oar@<version>` with the log streamed into the card, then the
-relay restarts once the message queue is idle. After the restart the relay
+relay restarts once the running turns finish (queued messages wait for it). After the restart the relay
 verifies the running version actually changed; if not, the npm log is surfaced
 as a failure. Git checkouts are detect-only — the card shows a "pull to
 update" hint instead of the button. `oar update [--beta] [--to X.Y.Z]` does
@@ -934,6 +1188,12 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/drives/roots` | Return browsable root(s) for explorer drive mode — on Windows returns fixed/removable drive letters; on Linux returns a single `/` root node |
 | GET | `/api/drives/list` | Lazy-load directory entries (`path`, optional `includeHidden`) — on Windows `path` is a drive-letter path (e.g. `C:/foo`); on Linux `path` is an absolute POSIX path (e.g. `/home/user`) |
 | GET | `/api/session-root/list` | List the explorer's Session root (`path`, optional `includeHidden`) — like `/api/drives/list`, but a not-yet-created root returns an empty folder (`exists: false`) instead of 404, and the sibling `<path>.jsonl` transcript is appended as a child |
+| POST | `/api/repo/mkdir` | Create a folder in the workspace: `{ path, name, conversationId? }` where `path` is the repo-relative parent (`''` for the root); the target is resolved like `/api/files/*` (no `..`, no symlink escape). Answers `{ ok, path }`; 409 when the name is taken |
+| POST | `/api/repo/rename` | Rename a workspace entry in place: `{ path, newName, conversationId? }`. The root cannot be renamed; symlinks are refused. Answers `{ ok, path }` |
+| POST | `/api/repo/delete` | Delete a workspace entry, folders recursively: `{ path, conversationId?, dryRun? }`. `dryRun: true` answers `{ ok, kind, files, dirs, capped }` (counted below the folder, capped at 10 000) and removes nothing |
+| POST | `/api/drives/mkdir` | As `/api/repo/mkdir` for an absolute path (also the explorer's Session root), checked like `/api/drives/list`: `{ path, name }`. Missing parents are created with the folder |
+| POST | `/api/drives/rename` | As `/api/repo/rename` for an absolute path: `{ path, newName }`. `/` and drive roots are refused |
+| POST | `/api/drives/delete` | As `/api/repo/delete` for an absolute path: `{ path, dryRun? }`. `/` and drive roots are refused |
 | GET | `/api/drives/file` | Stream a file by path — Windows drive path or Linux absolute path depending on server platform |
 | GET | `/api/drives/files-preview` | Return structured preview JSON for a file — Windows drive path or Linux absolute path depending on server platform |
 | GET | `/api/git/status` | Git status for the conversation's workspace root (`branch`, `upstream`, `ahead`, `behind`, `files[]` incl. untracked); a non-repo root returns `isRepo: false` rather than an error |
@@ -983,12 +1243,16 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
+| GET | `/api/settings/subagent-record-retention` | How long sub-agent records keep tool inputs and output: `{ retentionDays, choices: [0, 7, 14, 30, 90], defaultDays: 90 }`; `0` = keep for good |
+| POST | `/api/settings/subagent-record-retention` | `{ retentionDays }` → the GET body; anything but one of `choices` is `400`. Runs a retention sweep 5 s later |
 | POST | `/api/claude-native-session` | (Claude worker) Persist the native Agent SDK session id for resume |
 | POST | `/api/claude-context-usage` | (Claude and Claude Cloud workers) Report the session's context-window breakdown after a turn; `409` for a conversation of any other provider |
 | POST | `/api/claude-plan-usage` | (Claude and Claude Cloud workers) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot; a Claude Cloud conversation's report is stored under its own snapshot key, `claude-cloud` |
 | POST | `/api/claude-cloud-session` | (Claude Cloud worker) Report the cloud session a conversation is bound to: `{ conversationId, cloudSessionId, sessionUrl?, lastSequence, pushedBranch?, costUsd?, model? }` → `{ ok, cloud }`. Sent after the session was created, after every `result` and on a push; emits `claude_cloud_session`. `404` without a runtime session, `409` for a conversation that is not a cloud one |
 | POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
-| POST | `/api/subagent-run` | (Worker) Register/update a subagent run for the active turn |
+| POST | `/api/subagent-run` | (Worker) Register/update a subagent run. A new run needs the spawning turn's `messageId`; an update to a known run may omit it (a background agent's end arrives between turns). Optional header fields: `subagentType`, `model`, `modelInherited`, `taskId`, `background`, `timelineOwner`; a post without `status` leaves the run's state alone. Emits `subagent_status` with the whole header |
+| POST | `/api/subagent-timeline` | (Worker) `{ conversationId, subagentRunId, entries: [{ key, kind, text, done?, toolName?, toolUseId?, metadata? }], header? }` → `{ ok, stored, truncated }`. Kinds: `thought`, `tool_call`, `tool_result`, `text`, `child`, `note`. Fenced by the run row, not by an open turn; an unknown run whose `header.parentSubagentId` is known is created under the parent's turn, anything else is `404 unknown_run`. Sends `subagent_timeline` `{ conversationId, messageId, subagentRunId, entries, truncated }`, volatile, only to the pages watching the run (`subagent_viewer_watch`) |
+| GET | `/api/conversation/:conversationId/subagent/:subagentRunId` | One run's record for the viewer: `?after=<seq>&limit=<n>` (default 500, max 2000) → `{ run, entries, children, nextAfter, complete }`. `entries` are those after `after` plus any still open; `run.legacy` marks a record rebuilt from the lane rows |
 | POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Request cancellation of one subagent run (unsupported by the Claude runtime) |
 | PATCH | `/api/conversation/:id/message/:messageId/share-visibility` | Hide or unhide a single message from shared views |
 | PATCH | `/api/conversation/:id/message/:messageId/pin` | `{ pinned }` → pin or unpin a single message; answers with the conversation's pin list and broadcasts `conversation_pins_updated` |
@@ -1007,6 +1271,11 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/remote-relays/pair` | (Relay to relay) Another relay introduces itself after the user paired it there |
 | GET | `/api/remote-relays/summary` | (Worker) `{ count, online, localEnabled }`: the number of paired relays, how many of them are online, and whether agent sessions are switched on. Workers register `remote_relay` when `count` is above zero or `localEnabled` is `true` |
 | POST | `/api/remote-relays/tool` | (Worker) One `remote_relay` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
+| GET | `/api/relay-events/subscriptions` | Every active [relay event subscription](#relay-event-subscriptions) (`{ available, subscriptions }`); refused to other relays' agents |
+| DELETE | `/api/relay-events/subscriptions/:id` | The user's Unsubscribe (a paired relay's subscription too: it learns with its next fetch); refused to other relays' agents |
+| POST | `/api/relay-events/remote/subscribe` | (Relay to relay) A paired relay's agent subscribes to sessions here: `{ watcher: { conversationId, title }, subscriber: { name }, scope, sessions, events?, once?, match?, stalled_minutes?, heartbeat_minutes?, dry_run? }` → `{ ok, subscription }`. Another relay's request only, inbound switch on; see [Across paired relays](#across-paired-relays) |
+| POST | `/api/relay-events/remote/pull` | (Relay to relay) That relay fetches its events: `{ after, subscriptions: [{ id, watcher }], ended: [ids] }` → `{ ok, events, cursor, more, subscriptions, ended, dropped }` |
+| POST | `/api/background-task-settled` | (Worker) How a background task ended: `{ conversationId, taskId, toolUseId?, status, summary?, reason? }` (Claude worker, from `task_notification`) |
 | GET | `/api/remote-relays/inflight` | (Worker) Number of `remote_relay` calls running for `conversationId` |
 | GET/POST | `/api/settings/remote-relays` | This relay's `publicUrl` and `inboundEnabled` (accept prompts from other relays' agents) |
 | GET | `/api/settings/agent-sessions` | Agent sessions: `{ enabled, maxWaitSeconds, limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 }, maxActiveSessions: 4 }`. `enabled` (default `false`) lets this relay's agents start and use sessions on it through `remote_relay`; `maxWaitSeconds` (default `600`) is the longest wait of one `remote_relay` call, for this relay and paired ones |
@@ -1035,7 +1304,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   - `restart`: boolean mirror of the action
   - `requestedAt`, `reason`, `requestedBy`
   - `queue`: current `pendingCount` / `processingCount` / `parkedCount`
-- The relay waits until the queue is idle before acting; this API is not an interrupt or cancel mechanism.
+- The relay waits until no turn is processing before acting; this API is not an interrupt or cancel mechanism. While the request is queued no pending message is handed to a worker (a turn started meanwhile would postpone the restart again); pending and parked rows stay in the database and run after the restart.
 - Ownership after an intentional restart follows the argv role, so exactly one supervisor acts on exit 75:
   - `server.js --supervised` exits 75 and relaunches under `.github/extensions/web-relay/server-lifecycle/managed-server.mjs`
   - bare `node server/server.js` keeps its supervisor attached, respawns the `--relay-runtime` child, and keeps the same terminal session alive
@@ -1584,6 +1853,17 @@ created stores an origin with `local: true` that names the conversation it was c
 the user's **Allow** for a conversation's agent to start sessions here is a row of that table
 under the relay id `self` (`remote-relay-repository.mjs`).
 
+`0011-relay-event-subscriptions.mjs` adds `relay_event_subscriptions` (what each watcher asked for,
+kept after it ended with `ended_at` / `end_reason`, for a week) and `relay_events` (events per watcher, with
+`delivered_at` and the message they went into, kept for two hours once delivered). See
+[Relay event subscriptions](#relay-event-subscriptions).
+
+`0012-cross-relay-event-subscriptions.mjs` adds the columns both sides of a subscription across
+relays need (on the watching relay `remote_subscription_id`, `remote_meta_json`, `remote_sync`; on
+the watched one `subscriber_relay_id`, `subscriber_relay_name`, `subscriber_watcher_id`,
+`subscriber_watcher_title`, `last_pull_at`, `dropped_count`) and `relay_event_links` (per paired
+relay the fetch cursor and the link's health). See [Across paired relays](#across-paired-relays).
+
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next
 one:
@@ -1634,6 +1914,9 @@ working with the corresponding feature inert rather than crashing at startup.
 | `services/claude-cloud-session-service.mjs` | What the relay keeps per cloud conversation: worker reports, the `cloud` payload field, archiving |
 | `services/claude-account-usage-service.mjs` | Live Claude account usage for Check Usage (only while Claude Cloud is on) |
 | `services/git-remote-service.mjs` | GitHub remote and branch of a folder, for the New Chat modal |
+| `services/relay-event-service.mjs` | Relay event subscriptions: subscribe / transfer, recording, coalescing, the hourly cap and digest, delivery into the watcher's conversation, stalled / all_idle / heartbeat sweeps |
+| `services/session-activity-tracker.mjs` | What each session is doing: `state`, tasks, task edges and the activity clock |
+| `../shared/relay-events.mjs` | Relay event types, limits and the text of an event message |
 | `services/remote-relay-loopback.mjs` | The `remote_relay` client for this relay itself (agent sessions): hands the dispatcher's requests to the relay's own HTTP handler in-process instead of opening a connection |
 | `services/claude-session-root-service.mjs` | Resolves the browsable session folder for Claude conversations |
 | `services/context-usage-view.mjs` | Normalizes Copilot and Claude context data into one payload |

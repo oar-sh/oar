@@ -883,3 +883,101 @@ test('a run that starts after the stall is cancelled when it arrives', async () 
   await pause(20);
   assert.equal(run.cancelled, 1);
 });
+
+// A run whose delta hook the test drives, the way the SDK reports one step:
+// the model writes, its tool calls are reported (or not), then the step's
+// count of requested calls.
+function startDrivenRun() {
+  const run = createScriptedRun();
+  let onDelta = null;
+  const turn = startCursorRun({
+    agent: { send: async (_message, options) => { onDelta = options.onDelta; return run; } },
+    message: { text: 'hi' },
+    model: 'composer-1',
+    stallTimeoutMs: 100,
+    env: {},
+  });
+  const delta = (update) => onDelta({ update });
+  const shell = (command) => ({ type: 'shell', args: { command, workingDirectory: '/home/dev/project' } });
+  return { run, turn, delta, shell };
+}
+
+test('a background shell waited on by a tool the SDK does not report holds the run', async () => {
+  // Recorded with SDK 1.0.36: a backgrounded command's shell call ends at
+  // once; the wait on it (`awaitToolCall`) is dropped by the SDK, and all
+  // that is left of it is the step's count. The wait sent nothing for the
+  // length of the command, and the turn was failed in the model window.
+  const { run, turn, delta, shell } = startDrivenRun();
+  const draining = drain(turn);
+  await pause(20);
+  delta({ type: 'text-delta', text: 'Starting the suite in the background.' });
+  delta({ type: 'partial-tool-call', callId: 'call_fixture_bg', toolCall: shell('npm test') });
+  delta({ type: 'tool-call-started', callId: 'call_fixture_bg', toolCall: shell('npm test') });
+  run.push({ type: 'tool_call', call_id: 'call_fixture_bg', name: 'shell', status: 'running', args: { command: 'npm test' } });
+  delta({ type: 'tool-requests-listed', callCount: 1 });
+  delta({ type: 'tool-call-completed', callId: 'call_fixture_bg', toolCall: shell('npm test') });
+  run.push({ type: 'tool_call', call_id: 'call_fixture_bg', name: 'shell', status: 'completed', args: { command: 'npm test' } });
+  delta({ type: 'thinking-delta', text: 'Waiting for the suite.' });
+  delta({ type: 'thinking-completed', thinkingDurationMs: 600 });
+  delta({ type: 'tool-requests-listed', callCount: 1 });
+  // Twice the model window of silence: only the tool window may end this.
+  await pause(600);
+  assert.equal(run.cancelled, 0);
+  delta({ type: 'text-delta', text: 'The suite passed.' });
+  run.finish();
+
+  const { error } = await draining;
+  assert.equal(error, null);
+});
+
+test('once the model writes again, a silent model request after an unreported tool still stalls', async () => {
+  const { run, turn, delta } = startDrivenRun();
+  const draining = drain(turn);
+  await pause(20);
+  delta({ type: 'tool-requests-listed', callCount: 1 });
+  await pause(400);
+  assert.equal(run.cancelled, 0);
+  delta({ type: 'thinking-delta', text: 'The wait is over.' });
+
+  const { error } = await draining;
+  const classified = classifyCursorError(error);
+  assert.equal(classified.stableCode, 'cursor.turn-stalled');
+  assert.match(classified.text, /while a model request was running/);
+  assert.equal(run.cancelled, 1);
+});
+
+test('a step whose tools were all reported keeps the model window once they end', async () => {
+  // Both surfaces report the call, the stream once before the delta.
+  const { run, turn, delta, shell } = startDrivenRun();
+  const draining = drain(turn);
+  await pause(20);
+  run.push({ type: 'tool_call', call_id: 'call_fixture_ls', name: 'shell', status: 'running', args: { command: 'ls' } });
+  delta({ type: 'tool-call-started', callId: 'call_fixture_ls', toolCall: shell('ls') });
+  run.push({ type: 'tool_call', call_id: 'call_fixture_ls', name: 'shell', status: 'running', args: { command: 'ls' } });
+  delta({ type: 'tool-requests-listed', callCount: 1 });
+  delta({ type: 'tool-call-completed', callId: 'call_fixture_ls', toolCall: shell('ls') });
+  run.push({ type: 'tool_call', call_id: 'call_fixture_ls', name: 'shell', status: 'completed', args: { command: 'ls' } });
+
+  const { error } = await draining;
+  const classified = classifyCursorError(error);
+  assert.equal(classified.stableCode, 'cursor.turn-stalled');
+  assert.match(classified.text, /while a model request was running/);
+});
+
+test('a call reported after the count is no longer counted as unreported', async () => {
+  const { run, turn, delta, shell } = startDrivenRun();
+  const draining = drain(turn);
+  await pause(20);
+  delta({ type: 'tool-call-started', callId: 'call_fixture_one', toolCall: shell('make') });
+  delta({ type: 'tool-requests-listed', callCount: 2 });
+  delta({ type: 'tool-call-started', callId: 'call_fixture_two', toolCall: shell('make check') });
+  delta({ type: 'tool-call-completed', callId: 'call_fixture_one', toolCall: shell('make') });
+  // The second call holds the run while it runs …
+  await pause(400);
+  assert.equal(run.cancelled, 0);
+  delta({ type: 'tool-call-completed', callId: 'call_fixture_two', toolCall: shell('make check') });
+
+  // … and once it ends nothing is left open.
+  const { error } = await draining;
+  assert.match(classifyCursorError(error).text, /while a model request was running/);
+});

@@ -209,12 +209,66 @@ export function startCursorRun({
   };
   // A tool call is reported on both surfaces (the delta hook and the message
   // stream) under the same id; either one opens and closes it.
+  //
+  // Not every tool call is reported. The SDK translates only the tools it has
+  // a type for and drops the rest on both surfaces: among them the wait on a
+  // background shell (`awaitToolCall`), web fetches and input to a running
+  // shell. All a dropped call leaves is the step's `tool-requests-listed`
+  // count, sent once the model has finished requesting tools; from there the
+  // run waits for them without a single event, for as long as the command it
+  // waits on takes. So the calls listed beyond those reported count as one
+  // open tool, which closes when the model writes again: the SDK tells
+  // nothing about such a call ending, and the next step is the first sign.
+  // A step without such calls keeps the model window once its reported
+  // tools have ended. Steps are told from the delta hook alone: it carries
+  // the count, the reported calls and the model's output in step order.
+  const stepCalls = new Set();
+  let stepListed = false;
+  let unreportedCalls = 0;
+  const UNREPORTED_TOOLS = 'unreported-tools';
+  const noteCallStarted = (callId) => {
+    const key = String(callId || '').trim();
+    if (!key || stepCalls.has(key)) return;
+    stepCalls.add(key);
+    // Reported after the count: it was one of the calls counted as unreported.
+    if (stepListed && unreportedCalls > 0 && --unreportedCalls === 0) liveness.end('tool', UNREPORTED_TOOLS);
+  };
+  const noteToolsListed = (callCount) => {
+    stepListed = true;
+    unreportedCalls = Math.max(0, (Number(callCount) || 0) - stepCalls.size);
+    if (unreportedCalls > 0) liveness.begin('tool', UNREPORTED_TOOLS, 'unreported tool');
+  };
+  const noteModelWriting = () => {
+    if (!stepListed) return;
+    stepListed = false;
+    unreportedCalls = 0;
+    stepCalls.clear();
+    liveness.end('tool', UNREPORTED_TOOLS);
+  };
   const observe = (event) => {
     if (event.source === 'delta') {
       const update = event.update || {};
       liveness.traffic(update.type);
-      if (update.type === 'tool-call-started') liveness.begin('tool', update.callId, update.toolCall?.type);
-      else if (update.type === 'tool-call-completed') liveness.end('tool', update.callId);
+      switch (update.type) {
+        case 'tool-call-started':
+          noteCallStarted(update.callId);
+          liveness.begin('tool', update.callId, update.toolCall?.type);
+          break;
+        case 'tool-call-completed':
+          liveness.end('tool', update.callId);
+          break;
+        case 'tool-requests-listed':
+          noteToolsListed(update.callCount);
+          break;
+        case 'text-delta':
+        case 'thinking-delta':
+        case 'thinking-completed':
+        case 'partial-tool-call':
+          noteModelWriting();
+          break;
+        default:
+          break;
+      }
       return;
     }
     const message = event.message || {};

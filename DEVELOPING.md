@@ -531,6 +531,13 @@ none while it does not. The numbers behind this are in the module's header. Curs
 no idle phase inside a run: once the run has started it is a model request unless a tool call is
 open.
 
+The Cursor SDK reports only the tool calls it has a type for. Others, among them the wait on a
+background shell (`awaitToolCall`, SDK 1.0.36), web fetches and input to a running shell, send no
+event at all, on either surface; the only trace is the step's `tool-requests-listed` count. The
+worker counts the calls listed beyond those reported as one open tool until the model writes
+again. The cost: the model request that follows such a call has the tool window until its first
+output, because nothing tells the worker when the call ended.
+
 Overrides, for every worker: `OAR_TURN_STALL_IDLE_MS`, `OAR_TURN_STALL_MODEL_MS`,
 `OAR_TURN_STALL_TOOL_MS` (`0` = no limit for that phase). When only the idle window is set, by
 this variable or by `COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS`, the other two keep their proportion
@@ -717,9 +724,10 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **4931 pass / 0 fail / 0 skip on Linux (0.9.9, 2026-10-07)** — the count
-grows with every change, so treat it as a floor. Windows runs the same suite with **4 skips** that are host-gated
-(0600 file modes, symlinks) and run on Linux (0.9.9: **4927 pass / 0 fail / 4 skip**).
+Expected: **0 fail** everywhere; **5284 pass / 0 fail / 1 skip on Linux (0.9.10, 2026-10-12)** — the count
+grows with every change, so treat it as a floor. The Linux skip is a Windows-only drive check. Windows runs the
+same suite with **4 skips** that are host-gated (0600 file modes, symlinks) and run on Linux (0.9.9: **4927 pass /
+0 fail / 4 skip**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns
@@ -747,8 +755,8 @@ node --test server/services/context-usage-view.test.mjs
 npm run test:e2e
 ```
 
-Expected: **224 passed / 0 failed / 6 skipped on Linux (0.9.9, 2026-10-07)**, and 201 passed / 29 skipped on
-Windows (the skipped ones are host-gated; 24 of them are the Claude Cloud specs, which run only on Linux). Two question-card
+Expected: **295 passed / 0 failed / 6 skipped on Linux (0.9.10, 2026-10-12)**, and on Windows (0.9.9) 201
+passed / 29 skipped (the skipped ones are host-gated; 24 of them are the Claude Cloud specs, which run only on Linux). Two question-card
 tests in `relay-question-ui.spec.mjs` (`:82` and `:386`) are **known flaky** and usually pass on
 Playwright's single retry; across five full runs they failed 0–2 times each with no relation to what
 else was in the suite. Treat a failure there as flake only after re-running — anything else failing

@@ -8,6 +8,9 @@
 // No response carries a stored token: the registry's public views drop it, and
 // the pairing service's answers never contain one.
 
+import { REMOTE_RELAY_ERROR_CODES } from '../../shared/remote-relay-contract.mjs';
+import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
+
 function sendResult(res, result, fallbackStatus = 400) {
   const { status, ...payload } = result || {};
   const code = Number.isInteger(status) ? status : (payload.ok === false ? fallbackStatus : 200);
@@ -26,6 +29,9 @@ export function registerRemoteRelayRoutes(app, deps) {
     // WP2's dispatcher: `{ dispatch({ conversationId, action, args, req }) →
     // Promise<{ status, body }>, inflight(conversationId) → number }`.
     dispatcher = null,
+    // The inbound facts (remote-relay-inbound.mjs): which requests come from
+    // another relay.
+    remoteRelayInbound = null,
   } = deps;
 
   // Static paths first: Express would otherwise hand them to /:id.
@@ -85,6 +91,15 @@ export function registerRemoteRelayRoutes(app, deps) {
   // POST /api/remote-relays/tool — every provider adapter's remote_relay call.
   app.post('/api/remote-relays/tool', auth, async (req, res) => {
     if (!dispatcher) return res.status(503).json({ error: 'Remote relay dispatcher unavailable' });
+    // The tool acts for one of this relay's conversations: another relay
+    // never calls it (it would act, or subscribe, for a conversation it does
+    // not host). Its agents reach this relay through the routes it calls.
+    if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+      return res.status(403).json({
+        error: 'The remote_relay tool of this relay is for its own sessions; another relay cannot call it.',
+        code: REMOTE_RELAY_ERROR_CODES.forbidden,
+      });
+    }
     // A worker that gives up on the call (turn stopped, worker gone) closes
     // the request: withdraw its approval card and stop waiting for the reply.
     const controller = new AbortController();

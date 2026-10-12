@@ -11,6 +11,24 @@ import {
 const playwrightCli = path.join(repoRoot, "node_modules", "@playwright", "test", "cli.js");
 const token = randomUUID();
 
+// A relay booted on an empty database has no provider known to be ready, so
+// the app points to Settings instead of offering a Copilot chat: the empty
+// screen, New Chat and the composer all change. The specs here assume today's
+// ready relay, so the shared one is marked "Copilot ready" once after boot: a
+// snapshot post from a non-authoritative source naming a curated model changes
+// the catalog's `source` (the readiness signal) and nothing else. The
+// fresh-install specs boot their own relay and never see this.
+async function markRelayCopilotReady(relay) {
+  const response = await fetch(`${relay.baseUrl}/api/models/snapshot`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ source: "e2e-harness:copilot-ready", models: ["gpt-5.4-mini"] }),
+  });
+  if (!response.ok) {
+    throw new Error(`could not mark the test relay Copilot-ready: HTTP ${response.status}`);
+  }
+}
+
 async function main() {
   let shutdownRequested = false;
 
@@ -22,6 +40,7 @@ async function main() {
     token,
     allowCli: Boolean(String(process.env.RELAY_E2E_ALLOW_CLI || "").trim()),
   });
+  await markRelayCopilotReady(relay);
 
   const shutdown = async (exitCode) => {
     if (shutdownRequested) return;

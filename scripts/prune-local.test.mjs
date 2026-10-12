@@ -23,9 +23,9 @@ function messyRepository() {
   box.write('a.md', 'second wording\n');
   box.git('commit', '-q', '-a', '--amend', '-m', 'Add a');
 
-  box.git('switch', '-q', '-c', 'dev/abandoned');
+  box.git('checkout', '-q', '-b', 'dev/abandoned');
   const abandoned = box.commit('b.md', 'never landed\n', 'Try b');
-  box.git('switch', '-q', 'main');
+  box.git('checkout', '-q', 'main');
   box.git('branch', '-q', '-D', 'dev/abandoned');
 
   for (const text of ['older stash\n', 'dropped stash\n', 'newest stash\n']) {

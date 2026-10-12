@@ -43,6 +43,7 @@ import { registerGitRoutes } from './routes/git-routes.mjs';
 import { registerClaudeCloudRoutes } from './routes/claude-cloud-routes.mjs';
 import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
+import { registerRelayEventRoutes } from './routes/relay-event-routes.mjs';
 import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
 import { createRemoteRelayClient } from './services/remote-relay-client.mjs';
 import { createRemoteRelayLoopbackClient } from './services/remote-relay-loopback.mjs';
@@ -68,6 +69,9 @@ import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
 import { createHostSuspendService } from './services/host-suspend-service.mjs';
 import { USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, createUsageLimitPauseService } from './services/usage-limit-pause-service.mjs';
+import { createSessionActivityTracker } from './services/session-activity-tracker.mjs';
+import { createRelayEventService } from './services/relay-event-service.mjs';
+import { createRelayEventLinkService } from './services/relay-event-link-service.mjs';
 import { buildClaudeAttributionSettings, normalizeClaudeAttributionMode, resolveClaudeAttributionMode, DEFAULT_CLAUDE_ATTRIBUTION_MODE } from '../shared/claude-attribution.mjs';
 import { createWorkerLaunchNoteService } from './services/worker-launch-note-service.mjs';
 import { createGitHubCiActivityService } from './services/github-ci-activity-service.mjs';
@@ -116,12 +120,14 @@ import {
 import { createPreviewProxyServer } from './services/preview-proxy-server.mjs';
 import { createPreviewHealthProbe } from './services/preview-health-probe.mjs';
 import { createTunnelWorkerPathGuard } from './services/tunnel-worker-path-guard.mjs';
+import { guardUpgradeSocket } from './services/upgrade-socket-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createWindowsBootAutostartService } from './services/windows-boot-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
 import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
 import { createTmuxInspectorSocketService } from './services/tmux-inspector-socket-service.mjs';
+import { createSubagentViewerRooms } from './services/subagent-viewer-rooms.mjs';
 import {
   resolveDefaultSessionWorkspaceRootState as resolveDefaultSessionWorkspaceRootStateFromService,
   resolveLaunchWorkspaceRootPath,
@@ -142,6 +148,19 @@ import {
   readTurnCeilingSetting,
   turnCeilingMinutesToMs,
 } from '../shared/turn-ceiling.mjs';
+import {
+  SUBAGENT_RECORD_RETENTION_SETTING_KEY,
+  parseSubagentRecordRetentionUpdate,
+  readSubagentRecordRetentionSetting,
+} from '../shared/subagent-record-retention.mjs';
+import { createSubagentRecordRetention } from './services/subagent-record-retention.mjs';
+import { isRelayShutdownQueued, queuedShutdownCanProceed, relayShutdownGateReply } from './services/relay-shutdown-gate.mjs';
+import { createStaleRecoveryClockGuard } from './services/stale-recovery-clock-guard.mjs';
+import {
+  STALE_SUBAGENT_RUN_BOOT_DELAY_MS,
+  STALE_SUBAGENT_RUN_SWEEP_INTERVAL_MS,
+  createStaleSubagentRunSweep,
+} from './services/stale-subagent-run-sweep.mjs';
 import {
   normalizePwaAppName,
   readPwaAppNameSetting,
@@ -178,6 +197,7 @@ import {
 } from '../shared/model-id.mjs';
 import { createModelVariantCatalogService } from './services/model-variant-catalog-service.mjs';
 import { applyPwaManifestTheme, normalizePwaTheme } from './services/pwa-manifest-theme.mjs';
+import { mapSubagentRunHeader } from './services/subagent-timeline-service.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -1792,6 +1812,8 @@ const OFFLINE_STALE_RECOVER_MS = 45_000;
 // reaches the browser.
 const SHUTDOWN_SOCKET_FLUSH_MS = 300;
 let runtimeShutdownStarted = false;
+// Set once the database is open (see the retention sweep near the other sweeps).
+let subagentRecordRetention = null;
 const runtimeTimers = {
   cliStatus: null,
   ownerWatchdog: null,
@@ -1998,6 +2020,22 @@ function setTurnCeilingMinutes(value) {
   if (!parsed.ok) return parsed;
   stmts.upsertAppSetting.run(TURN_CEILING_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
   return { ok: true, ceilingMinutes: parsed.minutes };
+}
+
+function getSubagentRecordRetentionDays() {
+  return readSubagentRecordRetentionSetting(readAppSettingValue(SUBAGENT_RECORD_RETENTION_SETTING_KEY));
+}
+
+function setSubagentRecordRetentionDays(value) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Sub-agent record settings are unavailable' };
+  }
+  const parsed = parseSubagentRecordRetentionUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(SUBAGENT_RECORD_RETENTION_SETTING_KEY, String(parsed.days), new Date().toISOString());
+  // A shorter period takes effect now, not at the next daily sweep.
+  subagentRecordRetention?.scheduleSweep(5_000);
+  return { ok: true, retentionDays: parsed.days };
 }
 
 const PWA_APP_NAME_SETTING_KEY = 'pwa_app_name';
@@ -2541,6 +2579,14 @@ const stmts = {
   ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+// Relay events (built further down, next to the usage-limit pause): declared
+// here so recovery code that runs before then finds null, not a TDZ error.
+let sessionActivityTracker = null;
+let relayEventService = null;
+// Fetches the events of subscriptions on paired relays (built with the
+// remote relays below; the event service asks it to fetch at once when an
+// end or a new watcher must reach one).
+let relayEventLinkService = null;
 // Owns the `claude auth …` child processes, so the runtime (not the route
 // module) constructs it: shutdownRuntime() has to be able to dispose a login
 // PTY that is still holding a process group.
@@ -3344,26 +3390,6 @@ function cancelRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
   return { cancelled: true, dropped, ...relayShutdownStatePayload() };
 }
 
-const countPendingRowsByOwnerSession = db.prepare(`
-  SELECT owner_sdk_session_id AS sdk_session_id, COUNT(*) AS n
-  FROM queue
-  WHERE status = 'pending' AND owner_sdk_session_id IS NOT NULL AND owner_sdk_session_id != ''
-  GROUP BY owner_sdk_session_id
-`);
-
-function countPendingRowsOfStoppedSessions() {
-  try {
-    let stalled = 0;
-    for (const row of countPendingRowsByOwnerSession.all()) {
-      const lifecycle = sessionWorkerSupervisor?.getLifecycleState?.(String(row.sdk_session_id || '').trim());
-      if (lifecycle?.retriesStopped === true) stalled += Number(row.n || 0);
-    }
-    return stalled;
-  } catch {
-    return 0;
-  }
-}
-
 function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localhost-api', restart = false } = {}) {
   const safeReason = String(reason || 'manual-request').trim().slice(0, 140) || 'manual-request';
   const safeRequestedBy = String(requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
@@ -3379,7 +3405,11 @@ function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localh
     };
   }
 
-  // Shutdown is intentionally deferred until the queue is idle; it will not interrupt an active turn.
+  // Shutdown is deferred until no turn is processing; it never interrupts an
+  // active turn. From here on no pending row is handed out (the dequeue paths
+  // read relayShutdownQueued): a turn started meanwhile would postpone the
+  // restart again. Pending and parked rows wait in the database and run
+  // after the restart.
   if (!pendingRelayShutdownRequest) {
     pendingRelayShutdownRequest = {
       action: requestedAction,
@@ -3400,12 +3430,7 @@ function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localh
   const tryShutdownWhenIdle = () => {
     if (runtimeShutdownStarted) return;
     const counts = queueCounts();
-    // A row queued for a session whose launches the relay has stopped
-    // retrying makes no progress until somebody presses Retry; it must not
-    // hold the restart (which, fresh, is itself the next launch attempt).
-    const stalledPending = countPendingRowsOfStoppedSessions();
-    const queueFree = (counts.pendingCount - stalledPending + counts.processingCount + counts.parkedCount) <= 0;
-    if (!queueFree) return;
+    if (!queuedShutdownCanProceed(counts)) return;
     const requestInfo = pendingRelayShutdownRequest;
     pendingRelayShutdownRequest = null;
     if (runtimeTimers.shutdownDrain) {
@@ -3416,7 +3441,7 @@ function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localh
     const exitCode = action === 'restart' ? RELAY_RESTART_EXIT_CODE : 0;
     console.log(
       `${runtimeLogPrefix()}Relay ${action} request accepted by ${requestInfo?.requestedBy || 'unknown'}`
-      + `; queue is idle, exiting now (reason=${requestInfo?.reason || 'manual-request'})`,
+      + `; no turn is processing (${counts.pendingCount} pending, ${counts.parkedCount} parked wait), exiting now (reason=${requestInfo?.reason || 'manual-request'})`,
     );
     sessionWorkerWebSocketService.emitDraining(`api-${action}:${requestInfo?.reason || 'manual-request'}`);
     void shutdownRuntime(`api-${action}:${requestInfo?.reason || 'manual-request'}`, { exitCode });
@@ -5049,19 +5074,18 @@ function subagentRunsForResponse(responseMessageId) {
   return rows.map(mapSubagentRunRow).filter(Boolean).slice(0, 96);
 }
 
+// The run as a row of the panel, the reply bubble and the viewer header. Stop
+// is offered while it runs: a background run through its live task, a
+// foreground run through the sub-agent cancel route.
 function mapSubagentRunRow(row) {
-  const subagentRunId = String(row?.id || '').trim();
-  if (!subagentRunId) return null;
-  return {
-    subagentRunId,
-    messageId: String(row?.queue_message_id || '').trim() || null,
-    conversationId: String(row?.conversation_id || '').trim() || null,
-    parentSubagentId: row?.parent_subagent_id ? String(row.parent_subagent_id).trim() : null,
-    displayName: row?.display_name ? String(row.display_name).trim() : null,
-    status: String(row?.status || 'running').trim().toLowerCase() || 'running',
-    startedAt: row?.started_at || null,
-    updatedAt: row?.updated_at || null,
-  };
+  const status = String(row?.status || 'running').trim().toLowerCase();
+  let stoppable = false;
+  if (status === 'running') {
+    const tasks = backgroundTaskStore.get(row?.conversation_id);
+    const task = tasks.find((entry) => entry?.toolUseId && entry.toolUseId === String(row?.id || ''));
+    stoppable = task ? task.stoppable !== false : Number(row?.background || 0) !== 1;
+  }
+  return mapSubagentRunHeader(row, { stoppable });
 }
 
 // Final workflow digests persisted with an assistant message (the "Finished
@@ -5228,6 +5252,46 @@ const usageLimitPauseService = createUsageLimitPauseService({
   logger: console,
 });
 
+// ─── Relay events ─────────────────────────────────────────────────────────────
+// What each session is doing (state, tasks, quiet time) and the subscriptions
+// through which a watching session is woken with the events of the sessions
+// it watches (docs: server/README.md "Relay event subscriptions").
+sessionActivityTracker = createSessionActivityTracker({
+  db,
+  onEdge: (edge) => relayEventService?.noteTaskEdge(edge),
+  logger: console,
+});
+relayEventService = createRelayEventService({
+  db,
+  stmts,
+  tracker: sessionActivityTracker,
+  emit: (event, payload) => io.emit(event, payload),
+  // The event row is an ordinary pending message: the primer starts a
+  // stopped worker, the socket service hands it to a running one.
+  wakeWatcher: () => {
+    void primePendingSessionWorkers('relay-event');
+    sessionWorkerWebSocketService?.emitQueueChanged?.('relay-event');
+  },
+  relayName: () => remoteRelayRegistry?.selfName?.() || getPwaAppName?.() || '',
+  onRemoteChange: (relayId) => { void relayEventLinkService?.fetchNow(relayId); },
+  logger: console,
+});
+
+/** A worker died: its tasks are gone, and whoever watches its sessions hears of it. */
+function noteWorkerDeathForEvents(sessionId, conversationIds, reason) {
+  const ids = new Set((conversationIds || []).map((id) => String(id || '').trim()).filter(Boolean));
+  if (!ids.size) {
+    const conversation = resolveConversationRecord({ conversationId: sessionId, sdkSessionId: sessionId });
+    if (conversation?.id) ids.add(String(conversation.id));
+  }
+  for (const conversationId of ids) {
+    try {
+      sessionActivityTracker?.noteWorkerDied(conversationId);
+      relayEventService?.noteError({ conversationId, kind: 'worker_died', message: `the session's worker process ended (${reason})` });
+    } catch {}
+  }
+}
+
 // The live turn among a conversation's processing rows. Mid-turn steering can
 // leave several processing at once — the running turn, steered messages the
 // CLI folded into it (no output of their own), a handed-off row still settling
@@ -5330,6 +5394,9 @@ function failRecoveredRowTerminally(row, reason, { failureRecord = null, failure
     message: { role: 'assistant', text: failureText, model: requestedModel || 'unknown', mode: String(row?.relay_mode || '').trim() || null, timestamp: now },
   });
   io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+  try {
+    relayEventService?.noteError({ conversationId: row.conversation_id, kind: 'turn_failed', message: failureText, queueMessageId: row.id });
+  } catch {}
   console.warn(`${runtimeLogPrefix()}${failureRecord ? 'CONSUMED FAILED' : 'RECOVERY LIMIT'} ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
 }
 
@@ -5354,6 +5421,12 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
   for (const row of staleContinuations) {
     stmts.dropStaleContinuation?.run?.(row.id);
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+    // A teardown is a turn ending with no reply; it must be visible in the
+    // console log (the only trace of a silent one was `ignored=already_failed`
+    // hours later, when the worker's reply arrived for the dead row).
+    const lastSeen = row.owner_last_claimed_at || row.processing_at || row.timestamp || null;
+    const reason = lastSeen && lastSeen < cutoffIso ? `inactive since ${lastSeen}` : `ceiling (started ${row.processing_at || row.timestamp})`;
+    console.warn(`${runtimeLogPrefix()}STALE CONTINUATION ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} dropped: ${reason}`);
   }
   const listedRows = stmts.listRecoverableProcessing.all(params);
   for (const row of listedRows.filter((entry) => entry?.consumed_at)) failConsumedRowTerminally(row, 'stale-recovery');
@@ -5749,6 +5822,10 @@ httpServer.prependListener('request', (req, _res) => {
 httpServer.prependListener('upgrade', (req, _socket, _head) => {
   rewriteSocketIoRequestPath(req, remotePath);
 });
+// A client reset during an upgrade must not end the relay; see the guard.
+httpServer.prependListener('upgrade', (_req, socket, _head) => {
+  guardUpgradeSocket(socket);
+});
 // Public tunnels (Cloudflare, or a VPS/Caddy front) forward every path on the
 // bound hostname to this port, including the session-worker WebSocket plumbing.
 // Reject those before auth; local workers connect over 127.0.0.1 with no edge
@@ -5957,6 +6034,9 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
   sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
   if (runtimeState.relayPaused) {
     return { message: null, paused: true, reason: 'relay_paused' };
+  }
+  if (isRelayShutdownQueued(runtimeState)) {
+    return relayShutdownGateReply(runtimeState);
   }
   if (runtimeState.tunnelState?.blocking) {
     return {
@@ -6172,11 +6252,36 @@ async function isWorkerSessionProcessAlive(sessionId, hintPid = null) {
   return false;
 }
 
+// Runs a dead worker can no longer end: marked failed, each with the full
+// header and its own turn's messageId, so an open page settles the row
+// without a reload (the browser drops a status event it cannot place).
+function closeStrandedSubagentRuns(runs, queueMessageId = null) {
+  if (!runs.length) return;
+  const nowIso = new Date().toISOString();
+  for (const run of runs) {
+    stmts.updateSubagentRunStatus?.run?.('failed', nowIso, nowIso, run.id);
+    const closed = stmts.getSubagentRun?.get?.(run.id) || { ...run, status: 'failed', completed_at: nowIso };
+    const header = mapSubagentRunHeader(closed, { stoppable: false });
+    if (header) {
+      io.emit('subagent_status', {
+        ...header,
+        timestamp: nowIso,
+        queueMessageId: queueMessageId || header.messageId,
+        reconciled: true,
+      });
+    }
+  }
+}
+
 function recoverDeadWorkerProcessingRows(sessionId, reason) {
   const sid = String(sessionId || '').trim();
   if (!sid) return 0;
+  // A background agent outlives its turn, so its run is closed with the
+  // worker rather than with a processing row (its turn is usually done).
+  closeStrandedSubagentRuns(stmts.listRunningBackgroundSubagentRunsForSession?.all?.(sid, sid) || []);
   const rows = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
   if (!rows.length) return 0;
+  noteWorkerDeathForEvents(sid, rows.map((row) => row.conversation_id), reason);
   let recovered = 0;
   const requeueAt = addMsIso(2_000);
   for (const row of rows) {
@@ -6196,22 +6301,7 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
     }
     // The dead worker's subagent runs can never be terminated by the replay
     // (fresh worker, fresh call ids) — close them out now.
-    const strandedRuns = stmts.listRunningSubagentRunsByQueueMessage?.all?.(row.id) || [];
-    if (strandedRuns.length) {
-      const nowIso = new Date().toISOString();
-      stmts.closeRunningSubagentRunsByQueueMessage?.run?.('failed', nowIso, nowIso, row.id);
-      for (const run of strandedRuns) {
-        io.emit('subagent_status', {
-          conversationId: run.conversation_id,
-          subagentRunId: run.id,
-          parentSubagentId: run.parent_subagent_id || null,
-          displayName: run.display_name || null,
-          status: 'failed',
-          queueMessageId: row.id,
-          reconciled: true,
-        });
-      }
-    }
+    closeStrandedSubagentRuns(stmts.listRunningSubagentRunsByQueueMessage?.all?.(row.id) || [], row.id);
     stmts.recoverProcessingRowKeepOwner?.run?.(requeueAt, row.id);
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
     recovered += 1;
@@ -6235,14 +6325,22 @@ function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
   // A dead worker's steering snapshot must not keep holding the composer even
   // when it owned no rows (the hold can outlive them, e.g. a continuation's).
   const heldSteering = Boolean(sessionWorkerRegistry?.getWorker?.(sid)?.steering);
-  if (!owned.length && !heldSteering) return;
+  // Background agents run between turns too: a worker that dies then owns no
+  // row, but its agents' runs still read "running".
+  const backgroundRuns = () => stmts.listRunningBackgroundSubagentRunsForSession?.all?.(sid, sid) || [];
+  if (!owned.length && !heldSteering && !backgroundRuns().length) return;
   const timer = setTimeout(async () => {
     try {
       if (runtimeShutdownStarted) return;
       if (await isWorkerSessionProcessAlive(sid, pid)) return; // reconnect or socket flap
       sessionWorkerRegistry?.clearSteering?.(sid);
       const stillOwned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
-      if (!stillOwned.length) return;
+      if (!stillOwned.length) {
+        const stranded = backgroundRuns();
+        closeStrandedSubagentRuns(stranded);
+        if (stranded.length) noteWorkerDeathForEvents(sid, stranded.map((run) => run.conversation_id), 'socket-close');
+        return;
+      }
       console.warn(`${runtimeLogPrefix()}WORKER DIED session=${sid.slice(0, 8)} rows=${stillOwned.length} trigger=socket-close — recovering owned turns`);
       recoverDeadWorkerProcessingRows(sid, 'socket-close');
     } catch (error) {
@@ -6437,6 +6535,9 @@ const runtimeState = {
   set relayPaused(value) { relayPaused = value; },
   get ttyConsoleActive() { return Boolean(ttyConsoleRuntime?.tty); },
   get relayShutdown() { return getRelayShutdownState(); },
+  // A shutdown or restart waits for the processing turns: no pending row
+  // goes out meanwhile (see requestRelayShutdown).
+  get relayShutdownQueued() { return !!pendingRelayShutdownRequest && !runtimeShutdownStarted; },
   get hostSuspend() { return hostSuspendService.getState(); },
   get usageLimit() {
     return { account: usageLimitPauseService.getAccountState(), pauses: usageLimitPauseService.listPauses() };
@@ -6490,6 +6591,13 @@ const remoteRelayRegistry = createRemoteRelayRegistry({
   platform: process.platform,
   version: RUNNING_VERSION,
   emit: (event, payload) => io.emit(event, payload),
+  onRemove: (entry) => { void relayEventLinkService?.noteRelayRemoved(entry); },
+  logger: console,
+});
+relayEventLinkService = createRelayEventLinkService({
+  relayEvents: relayEventService,
+  registry: remoteRelayRegistry,
+  client: remoteRelayClient,
   logger: console,
 });
 const remoteRelayPairing = createRemoteRelayPairing({
@@ -6520,7 +6628,10 @@ const remoteRelayCallerContext = createRemoteRelayCallerContext({
   normalizeRelayMode,
   defaultRelayMode: DEFAULT_RELAY_MODE,
   emit: (event, payload) => io.emit(event, payload),
-  notifyQuestion: (question) => pushDispatchService.notifyQuestion?.(question),
+  notifyQuestion: (question) => {
+    try { relayEventService?.noteQuestion(question); } catch {}
+    return pushDispatchService.notifyQuestion?.(question);
+  },
   uuid: uuidv4,
   logger: console,
 });
@@ -6541,6 +6652,8 @@ const remoteRelayDispatcher = createRemoteRelayDispatcher({
   requestApproval: (request) => remoteRelayCallerContext.requestApproval(request),
   emitStatusEvent: ({ type, ...details }) => statusEventService.recordEvent(type, details),
   resolveConversationId: (id) => resolveConversationRecord({ conversationId: id, sdkSessionId: id })?.id || id,
+  relayEvents: relayEventService,
+  relayEventLink: relayEventLinkService,
   logger: console,
 });
 
@@ -6729,6 +6842,8 @@ const sharedRouteDeps = {
   resolveCursorSessionRoot: cursorSessionRootResolver.resolveCursorSessionRoot,
   getTurnCeilingMinutes,
   setTurnCeilingMinutes,
+  getSubagentRecordRetentionDays,
+  setSubagentRecordRetentionDays,
   getBackgroundTaskTimeoutMinutes,
   setBackgroundTaskTimeoutMinutes,
   getFeatureFlagsSettingsState,
@@ -6741,6 +6856,9 @@ const sharedRouteDeps = {
   hostSuspendService,
   collectHostActivity,
   usageLimitPauseService,
+  relayEventService,
+  sessionActivityTracker,
+  resolveConversationRecord,
   markSharedViewerPresence,
   getSharedWatcherCount,
   statusEventService,
@@ -6774,6 +6892,12 @@ registerRemoteRelayRoutes(app, {
   registry: remoteRelayRegistry,
   pairing: remoteRelayPairing,
   dispatcher: remoteRelayDispatcher,
+  remoteRelayInbound,
+});
+registerRelayEventRoutes(app, {
+  auth,
+  relayEventService,
+  remoteRelayInbound,
 });
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   cliLastSeen = null;
@@ -6817,9 +6941,22 @@ if (managedOwnerPid) {
 // The window is measured from the last heartbeat that named the message, not
 // from when the turn began, so a turn stays alive for as long as its worker
 // keeps reporting it — however many minutes of tool calls and subagents that
-// takes. The separate, user-configurable ceiling is the only elapsed-time cap,
-// and both exempt a turn that is waiting on an unanswered question.
+// takes. The separate, user-configurable ceiling is the only elapsed-time cap;
+// it counts from the last answered question rather than from the start, and
+// both exempt a turn that is waiting on an unanswered question (continuation
+// rows included — an interview hangs its cards on one).
+//
+// After a wall-clock jump (the host slept, the event loop was blocked) every
+// heartbeat looks old at once although the workers may be alive: the guard
+// skips recovery for a full inactivity window, so a live worker can report.
+const STALE_RECOVERY_INTERVAL_MS = 15_000;
+const staleRecoveryClockGuard = createStaleRecoveryClockGuard({
+  intervalMs: STALE_RECOVERY_INTERVAL_MS,
+  graceMs: Math.max(processingTimeoutMs, 60_000),
+  log: (line) => console.log(`${runtimeLogPrefix()}${line}`),
+});
 function recoverStaleMessages() {
+  if (staleRecoveryClockGuard.tick().skip) return;
   const staleWindowMs = cliOnline
     ? processingTimeoutMs
     : Math.min(processingTimeoutMs, OFFLINE_STALE_RECOVER_MS);
@@ -6835,7 +6972,7 @@ function recoverStaleMessages() {
     );
   }
 }
-runtimeTimers.staleRecovery = setInterval(recoverStaleMessages, 15_000);
+runtimeTimers.staleRecovery = setInterval(recoverStaleMessages, STALE_RECOVERY_INTERVAL_MS);
 recoverStaleMessages(); // run immediately on startup
 
 function expirePendingQuestions() {
@@ -6865,6 +7002,40 @@ if (sweptUploads > 0) {
 }
 runtimeTimers.uploadSweep = setInterval(sweepUnreferencedUploadBlobs, 6 * 60 * 60 * 1000);
 if (typeof runtimeTimers.uploadSweep.unref === 'function') runtimeTimers.uploadSweep.unref();
+// Old sub-agent records lose their tool inputs and output: shortly after
+// start (not in the boot path), then once a day.
+subagentRecordRetention = createSubagentRecordRetention({
+  db,
+  getRetentionDays: getSubagentRecordRetentionDays,
+  isStopped: () => runtimeShutdownStarted,
+  log: (line) => console.log(`${runtimeLogPrefix()}${line}`),
+  warn: (line) => console.warn(`${runtimeLogPrefix()}${line}`),
+});
+subagentRecordRetention.scheduleSweep(30_000);
+runtimeTimers.subagentRecordRetention = setInterval(() => { void subagentRecordRetention.sweep(); }, 24 * 60 * 60 * 1000);
+if (typeof runtimeTimers.subagentRecordRetention.unref === 'function') runtimeTimers.subagentRecordRetention.unref();
+// Sub-agent runs left `running` by a worker that is gone are closed: once
+// the previous runtime's workers have had time to reconnect after boot, then
+// periodically. A live worker's runs are never touched.
+const staleSubagentRunSweep = createStaleSubagentRunSweep({
+  db,
+  isConversationWorkerAlive: (conversationId) => {
+    if (hostActivityWorkerAlive(conversationId)) return true;
+    const sdkSessionId = String(stmts.getRuntimeSessionByConversation?.get?.(conversationId)?.sdk_session_id || '').trim();
+    return !!sdkSessionId && hostActivityWorkerAlive(sdkSessionId);
+  },
+  log: (line) => console.log(`${runtimeLogPrefix()}${line}`),
+  warn: (line) => console.warn(`${runtimeLogPrefix()}${line}`),
+});
+runtimeTimers.staleSubagentRunsBoot = setTimeout(() => {
+  runtimeTimers.staleSubagentRunsBoot = null;
+  if (!runtimeShutdownStarted) staleSubagentRunSweep.sweep();
+}, STALE_SUBAGENT_RUN_BOOT_DELAY_MS);
+if (typeof runtimeTimers.staleSubagentRunsBoot.unref === 'function') runtimeTimers.staleSubagentRunsBoot.unref();
+runtimeTimers.staleSubagentRuns = setInterval(() => {
+  if (!runtimeShutdownStarted) staleSubagentRunSweep.sweep();
+}, STALE_SUBAGENT_RUN_SWEEP_INTERVAL_MS);
+if (typeof runtimeTimers.staleSubagentRuns.unref === 'function') runtimeTimers.staleSubagentRuns.unref();
 // Arms the 12h update poller only when the user opted in; otherwise silent.
 updateCheckService?.startIfEnabled();
 const runtimeBindingsBootstrapped = bootstrapRuntimeSessionBindings();
@@ -7067,6 +7238,10 @@ function touchCli() {
 }
 sessionWorkerWebSocketService.start();
 void primePendingSessionWorkers('startup');
+// Undelivered events get their timers back; stalled, all_idle and the
+// heartbeat are swept from here on.
+relayEventService.start();
+relayEventLinkService.start();
 runtimeTimers.pendingWorkerPrime = setInterval(() => {
   void primePendingSessionWorkers('maintenance');
 }, 5_000);
@@ -7113,6 +7288,10 @@ function socketAuthToken(socket) {
   const cookies = parseCookies(socket.request.headers.cookie);
   return socket.handshake.auth?.token || socket.handshake.query?.token || cookies[AUTH_COOKIE];
 }
+// A sub-agent's record goes live only to the pages whose viewer shows it.
+const subagentViewerRooms = createSubagentViewerRooms({
+  getRun: (runId) => stmts.getSubagentRun?.get?.(runId) || null,
+});
 io.use((socket, next) => {
   if (tokensMatch(socketAuthToken(socket), config.authToken)) return next();
   next(new Error('Unauthorized'));
@@ -7150,6 +7329,7 @@ io.on('connection', (socket) => {
   // deviceVisible flag restored by connectionStateRecovery.
   activeDeviceTracker.registerSocket(socket);
   tmuxInspectorSocketService.registerSocket(socket);
+  subagentViewerRooms.registerSocket(socket);
 });
 
 // ─── SSH Reverse Tunnel ────────────────────────────────────────────────────────
@@ -7259,6 +7439,7 @@ function clearRuntimeTimers() {
     if (!timer) continue;
     try { clearInterval(timer); } catch {}
   }
+  subagentRecordRetention?.stop();
   runtimeTimers.cliStatus = null;
   runtimeTimers.ownerWatchdog = null;
   runtimeTimers.staleRecovery = null;
@@ -7306,6 +7487,8 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
     console.warn(`${runtimeLogPrefix()}Grok auth service shutdown failed: ${error?.message || error}`);
   }
   sessionWorkerWebSocketService.stop();
+  try { relayEventService.stop(); } catch {}
+  try { relayEventLinkService.stop(); } catch {}
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();

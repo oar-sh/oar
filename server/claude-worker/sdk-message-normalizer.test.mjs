@@ -728,3 +728,40 @@ test('a model refusal fallback updates the turn model and surfaces the notice', 
   });
   assert.equal(result.payload.model, 'claude-opus-4-8');
 });
+
+test('a background launch receipt keeps the subagent run running and marks it background', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const start = normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_use', id: 'toolu_bg_1', name: 'Agent', input: { description: 'Survey the widget parser', subagent_type: 'Explore' } }] },
+  });
+  const spawned = start.find((action) => action.channel === 'subagent');
+  assert.equal(spawned.payload.subagentType, 'Explore');
+  assert.equal(spawned.payload.timelineOwner, 'worker');
+
+  const receipt = normalizer.normalize({
+    type: 'user',
+    parent_tool_use_id: null,
+    tool_use_result: { status: 'async_launched', agentId: 'agent-1' },
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bg_1', content: 'Async agent launched successfully.' }] },
+  });
+  const status = receipt.find((action) => action.channel === 'subagent');
+  assert.equal(status.payload.status, 'running');
+  assert.equal(status.payload.background, true);
+});
+
+test('the receipt text alone marks a background launch for producers without the structured result', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_use', id: 'toolu_bg_2', name: 'Task', input: { description: 'Check fixtures' } }] },
+  });
+  const receipt = normalizer.normalize({
+    type: 'user',
+    parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bg_2', content: [{ type: 'text', text: 'Async agent launched successfully. agentId: x' }] }] },
+  });
+  assert.equal(receipt.find((action) => action.channel === 'subagent').payload.status, 'running');
+});

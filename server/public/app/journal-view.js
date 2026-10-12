@@ -23,7 +23,11 @@ import {
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
   IS_SHARED_VIEW,
+  openSummaryModal,
+  closeSummaryModal,
+  setSummaryModalLeaveHandler,
 } from './store.js';
+import { archiveConfirmationFor } from './archive-confirm.mjs';
 import {
   loadConversations as loadConversationsApi,
   loadConversation,
@@ -42,7 +46,10 @@ import {
   loadGrokSettings,
   loadOpenAISettings,
 } from './api-client.js';
-import { renderMessages, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn } from './conversation-view.js';
+import { isSetupRequired, updateProviderReadinessInputs } from './provider-readiness.mjs';
+import { SETUP_TEXT } from './no-conversation-state.mjs';
+import { openSettingsModal } from './settings-modal.js';
+import { renderMessages, renderNoConversationState, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn } from './conversation-view.js';
 import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
 import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setConversationPins, setPinsConversation } from './pinned-messages-view.mjs';
@@ -85,6 +92,7 @@ import {
   validateCloudSourceInputs,
 } from './claude-cloud-ui.mjs';
 import { renderConversationOriginMarkerHtml } from './remote-relay-origin-view.mjs';
+import { relayEventWatchedMarkerHtml } from './relay-event-subscriptions-ui.js';
 import {
   normalizeConversationFilter,
   filterConversations,
@@ -337,12 +345,27 @@ export async function refreshConversations(options = {}) {
     preserveProgress: preservePagination,
   });
   renderConvList();
+  // With nothing open the transcript's screen depends on whether chats exist.
+  if (!currentConvId) renderNoConversationState();
   updateCompactButton();
   // A reset bumps the loader version, which aborts any in-flight filter drain;
   // restart it so an active filter keeps covering the unloaded pages.
   if (normalizeConversationFilter(conversationListFilterText)) {
     void drainConversationListForFilter();
   }
+}
+
+/** A sidebar row's state: its colour (green is 'ready') and whether its dots run. */
+function conversationRowState(conversation, pendingByConversation = getPendingQuestionCountsByConversation()) {
+  const pendingCount = Number(pendingByConversation[conversation?.id] || 0);
+  const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
+  const workerState = sdkSessionId ? getSessionWorkerState(sdkSessionId) : null;
+  const visualState = resolveConversationUiState({
+    conversation,
+    workerState,
+    hasPendingQuestion: pendingCount > 0,
+  });
+  return { visualState, processing: isConversationProcessing(conversation, workerState) };
 }
 
 export function renderConvList() {
@@ -386,17 +409,9 @@ export function renderConvList() {
     return;
   }
   const conversationView = (conversation) => {
-    const pendingCount = Number(pendingByConversation[conversation?.id] || 0);
-    const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
-    const workerState = sdkSessionId ? getSessionWorkerState(sdkSessionId) : null;
-    const visualState = resolveConversationUiState({
-      conversation,
-      workerState,
-      hasPendingQuestion: pendingCount > 0,
-    });
-    const processing = isConversationProcessing(conversation, workerState);
-    if (processing) hasProcessingConversation = true;
-    return { visualState, processing };
+    const view = conversationRowState(conversation, pendingByConversation);
+    if (view.processing) hasProcessingConversation = true;
+    return view;
   };
   const listHtml = `${visible.map((c) => {
     const view = conversationView(c);
@@ -409,10 +424,12 @@ export function renderConvList() {
     // "↗ win-test": another relay's agent created this conversation.
     // "via agent · “title”": an agent in that conversation on this relay did.
     const originMarkerHtml = renderConversationOriginMarkerHtml(c, { conversations });
+    // "watched": a session another conversation watches by id (relay events).
+    const watchedMarkerHtml = relayEventWatchedMarkerHtml(c.id);
     return `
     <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}" data-conversation-id="${c.id}" onclick="openConversation('${c.id}')">
       <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${originMarkerHtml}${providerIndicatorHtml}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${originMarkerHtml}${watchedMarkerHtml}${providerIndicatorHtml}</div>
       ${c.archived
         ? `<button class="conv-archive" onclick="unarchiveConv(event,'${c.id}')" title="Unarchive" aria-label="Unarchive">📂</button>`
         : `<button class="conv-archive" onclick="archiveConv(event,'${c.id}')" title="Archive" aria-label="Archive">🗄</button>`}
@@ -483,6 +500,9 @@ export function applyLoadedConversationState(id, response, {
     messageCount: Array.isArray(response.messages)
       ? Math.max(existingConversation.messageCount || 0, response.messages.length)
       : (existingConversation.messageCount || 0),
+    // This payload's verdict only: the record's copy can predate the turn the
+    // socket has since reported running, and would end it on the page.
+    activeTurn: response.activeTurn,
   });
   renderConvList();
   window.applyConversationPreferences?.(id, {
@@ -555,7 +575,10 @@ export async function openConversation(id, options = {}) {
   const previousConversationId = String(currentConvId || '').trim();
   const nextConversationId = String(id || '').trim();
   if (previousConversationId && nextConversationId && previousConversationId !== nextConversationId) {
-    await flushConversationDraft(previousConversationId);
+    // Reads the composer now, before it changes hands below, and saves in the
+    // background: a switch that waited for the save would take over the view
+    // when the save returns, after any click the user made meanwhile.
+    void flushConversationDraft(previousConversationId);
     window.clearImageEditTarget?.();
   }
   const switchingConversation = !!nextConversationId && previousConversationId !== nextConversationId;
@@ -1489,6 +1512,31 @@ function populateNewConversationCwdSelect() {
   syncNewConversationCwdControls();
 }
 
+// The New Chat modal with no provider known to be ready: a note above the
+// buttons, Open Settings → Providers as the main button, and the usual Start
+// (same id, same handler) as a secondary "Start a Copilot chat anyway".
+function applyNewConversationSetupState(setupRequired) {
+  const note = document.getElementById('new-conversation-setup-note');
+  const openSettings = document.getElementById('new-conversation-open-settings');
+  const confirm = document.getElementById('new-conversation-model-confirm');
+  if (note) {
+    note.hidden = !setupRequired;
+    note.textContent = setupRequired ? SETUP_TEXT : '';
+  }
+  if (openSettings) {
+    openSettings.hidden = !setupRequired;
+    if (openSettings.dataset.bound !== '1') {
+      openSettings.dataset.bound = '1';
+      openSettings.addEventListener('click', (event) => {
+        event.preventDefault();
+        closeNewConversationModelModal();
+        openSettingsModal('providers');
+      });
+    }
+  }
+  if (confirm) confirm.textContent = setupRequired ? 'Start a Copilot chat anyway' : 'Start chat';
+}
+
 async function openNewConversationModelModal() {
   const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings] = await Promise.all([
     loadModelCatalog(),
@@ -1505,6 +1553,18 @@ async function openNewConversationModelModal() {
   newConversationCursorSettingsCache = cursorSettings || null;
   newConversationGrokSettingsCache = grokSettings || null;
   newConversationClaudeCloudSettingsCache = claudeCloudSettings || null;
+  // Fresh answers for the readiness question, shared with the empty screen
+  // and the composer. With no provider known to be ready the modal opens in
+  // its setup state: Settings is the main button, Start stays as "anyway".
+  const readiness = updateProviderReadinessInputs({
+    openai: settings || null,
+    claude: claudeSettings || null,
+    claudeCloud: claudeCloudSettings || null,
+    cursor: cursorSettings || null,
+    grok: grokSettings || null,
+    catalog: catalog || null,
+  });
+  applyNewConversationSetupState(isSetupRequired(readiness));
   // Every open starts from empty cloud fields; the folder lookup refills them.
   resetNewConversationCloudState();
   bindNewConversationCloudInputs();
@@ -1917,9 +1977,61 @@ async function setConversationArchived(id, archived) {
   return true;
 }
 
+const ARCHIVE_CONFIRM_KIND = 'archive-confirm';
+
+/** Resolves true when the user confirms; Cancel, Escape, the backdrop or × keep the chat. */
+function askBeforeArchive(id, confirmation) {
+  const title = String(conversations[id]?.title || '').trim();
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    openSummaryModal({
+      title: 'Archive session',
+      subtitle: title,
+      kind: ARCHIVE_CONFIRM_KIND,
+      bodyHtml: `
+        <p>${escHtml(confirmation.message)}</p>
+        <p>${escHtml(confirmation.detail)}</p>
+        <div class="summary-modal-actions">
+          <button class="chat-title-action-btn" type="button" data-archive-confirm="1">🗄 Archive</button>
+          <button class="chat-title-action-btn" type="button" data-archive-cancel="1">Cancel</button>
+        </div>
+      `,
+    });
+    // Runs on every way out of the modal, another modal replacing it included.
+    setSummaryModalLeaveHandler(ARCHIVE_CONFIRM_KIND, () => settle(false));
+    const body = document.getElementById('summary-modal-body');
+    body?.querySelector('[data-archive-confirm]')?.addEventListener('click', (event) => {
+      event.preventDefault();
+      settle(true);
+      closeSummaryModal();
+    }, { once: true });
+    const cancel = body?.querySelector('[data-archive-cancel]');
+    cancel?.addEventListener('click', (event) => {
+      event.preventDefault();
+      closeSummaryModal();
+    }, { once: true });
+    cancel?.focus?.();
+  });
+}
+
 export async function archiveConv(e, id) {
   e?.stopPropagation?.();
   closeContextMenu();
+  // A chat whose process is live (green, idle or not) asks first: archiving
+  // stops that process. The relay still refuses a chat with a running turn.
+  const conversation = conversations[id];
+  const view = conversation ? conversationRowState(conversation) : null;
+  const confirmation = archiveConfirmationFor({
+    archived: conversation?.archived === true,
+    visualState: view?.visualState,
+    running: conversationHasActiveTurn(id) || conversation?.activeTurn === true || view?.processing === true,
+  });
+  if (confirmation && !(await askBeforeArchive(id, confirmation))) return;
   await setConversationArchived(id, true);
 }
 
@@ -1985,16 +2097,24 @@ export async function deleteConv(e, id) {
   }
   delete conversations[id];
   renderConvList();
-  if (currentConvId === id) {
-    setCurrentConv(null);
-    clearAttachments();
-    setRepoBrowserSessionInfo('', '');
-    restoreInFlightThinking(null);
-    renderMessages([]);
-    document.getElementById('chat-title').textContent = 'Select or start a conversation';
-    window.syncChatTitleControls?.();
-    updateSessionPill(null, null);
-    updateCompactButton();
-    scheduleContextUsageRefresh(null);
-  }
+  if (currentConvId === id) clearOpenConversation();
+}
+
+/**
+ * The conversation on screen is gone (deleted here or from another device):
+ * nothing is open, the header says so, the transcript shows the empty state
+ * and the ⋯ menu keeps its relay-wide entries. One place for both callers.
+ */
+export function clearOpenConversation() {
+  setCurrentConv(null);
+  clearAttachments();
+  setRepoBrowserSessionInfo('', '');
+  restoreInFlightThinking(null);
+  renderMessages([]);
+  const title = document.getElementById('chat-title');
+  if (title) title.textContent = 'Select or start a conversation';
+  window.syncChatTitleControls?.();
+  updateSessionPill(null, null);
+  updateCompactButton();
+  scheduleContextUsageRefresh(null);
 }

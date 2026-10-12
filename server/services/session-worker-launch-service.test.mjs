@@ -105,57 +105,6 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
     IGNORED_VAR: 'nope',
   });
 
-  test('tmux worker command never embeds the provider API key', () => {
-    const env = {
-      COPILOT_PROVIDER_TYPE: 'openai',
-      COPILOT_PROVIDER_API_KEY: "sk-secret-'value",
-    };
-    assert.throws(
-      () => buildTmuxWorkerShellCommand('abc-123', env),
-      /worker-secret-env-file-required/,
-    );
-    const command = buildTmuxWorkerShellCommand('abc-123', env, {
-      secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env',
-    });
-    assert.doesNotMatch(command, /sk-secret|COPILOT_PROVIDER_API_KEY/);
-    assert.match(command, /\. '\/tmp\/copilot-relay-worker-test\/provider\.env'/);
-  });
-
-  test('createWorkerSecretEnvFile uses owner-only permissions and cleans up', () => {
-    const calls = [];
-    const fsImpl = {
-      mkdtempSync(prefix) {
-        calls.push(['mkdtemp', prefix]);
-        return '/tmp/copilot-relay-worker-test';
-      },
-      chmodSync(target, mode) {
-        calls.push(['chmod', target, mode]);
-      },
-      writeFileSync(target, contents, options) {
-        calls.push(['write', target, contents, options]);
-      },
-      rmSync(target, options) {
-        calls.push(['rm', target, options]);
-      },
-      rmdirSync(target) {
-        calls.push(['rmdir', target]);
-      },
-    };
-    const secret = createWorkerSecretEnvFile({
-      COPILOT_PROVIDER_API_KEY: "sk-secret-'value",
-    }, {
-      fsImpl,
-      tempRoot: '/tmp',
-    });
-    assert.equal(secret.filePath, path.join('/tmp/copilot-relay-worker-test', 'provider.env'));
-    assert.deepEqual(calls[1], ['chmod', '/tmp/copilot-relay-worker-test', 0o700]);
-    assert.deepEqual(calls[2][3], { encoding: 'utf8', mode: 0o600 });
-    assert.match(calls[2][2], /^export COPILOT_PROVIDER_API_KEY='sk-secret-'/);
-    secret.cleanup();
-    assert.deepEqual(calls.at(-2), ['rm', secret.filePath, { force: true }]);
-    assert.deepEqual(calls.at(-1), ['rmdir', '/tmp/copilot-relay-worker-test']);
-  });
-
   assert.match(command, /COPILOT_ALLOW_ALL='true'/);
   assert.match(command, /GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS='false'/);
   assert.doesNotMatch(command, /COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION/);
@@ -170,6 +119,57 @@ test('buildTmuxWorkerShellCommand injects only relay env needed for workers', ()
   assert.match(command, /abc-123/);
   assert.match(command, /\/dev\/null/);
   assert.doesNotMatch(command, /GH_FORCE_TTY/);
+});
+
+test('tmux worker command never embeds the provider API key', () => {
+  const env = {
+    COPILOT_PROVIDER_TYPE: 'openai',
+    COPILOT_PROVIDER_API_KEY: "sk-secret-'value",
+  };
+  assert.throws(
+    () => buildTmuxWorkerShellCommand('abc-123', env),
+    /worker-secret-env-file-required/,
+  );
+  const command = buildTmuxWorkerShellCommand('abc-123', env, {
+    secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env',
+  });
+  assert.doesNotMatch(command, /sk-secret|COPILOT_PROVIDER_API_KEY/);
+  assert.match(command, /\. '\/tmp\/copilot-relay-worker-test\/provider\.env'/);
+});
+
+test('createWorkerSecretEnvFile uses owner-only permissions and cleans up', () => {
+  const calls = [];
+  const fsImpl = {
+    mkdtempSync(prefix) {
+      calls.push(['mkdtemp', prefix]);
+      return '/tmp/copilot-relay-worker-test';
+    },
+    chmodSync(target, mode) {
+      calls.push(['chmod', target, mode]);
+    },
+    writeFileSync(target, contents, options) {
+      calls.push(['write', target, contents, options]);
+    },
+    rmSync(target, options) {
+      calls.push(['rm', target, options]);
+    },
+    rmdirSync(target) {
+      calls.push(['rmdir', target]);
+    },
+  };
+  const secret = createWorkerSecretEnvFile({
+    COPILOT_PROVIDER_API_KEY: "sk-secret-'value",
+  }, {
+    fsImpl,
+    tempRoot: '/tmp',
+  });
+  assert.equal(secret.filePath, path.join('/tmp/copilot-relay-worker-test', 'provider.env'));
+  assert.deepEqual(calls[1], ['chmod', '/tmp/copilot-relay-worker-test', 0o700]);
+  assert.deepEqual(calls[2][3], { encoding: 'utf8', mode: 0o600 });
+  assert.match(calls[2][2], /^export COPILOT_PROVIDER_API_KEY='sk-secret-'/);
+  secret.cleanup();
+  assert.deepEqual(calls.at(-2), ['rm', secret.filePath, { force: true }]);
+  assert.deepEqual(calls.at(-1), ['rmdir', '/tmp/copilot-relay-worker-test']);
 });
 
 test('buildTmuxWorkerShellCommand forwards extension bootstrap env vars', () => {

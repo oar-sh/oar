@@ -35,6 +35,7 @@ const LOG_PREFIX = '[remote-relays]';
 const APPROVAL_HEADER = 'Remote relay';
 // The once-per-conversation card for sessions an agent starts on this relay.
 const LOCAL_SESSIONS_HEADER = 'Agent sessions';
+const WATCH_HEADER = 'Relay events';
 const APPROVAL_ALLOW = 'Allow';
 const APPROVAL_DENY = 'Deny';
 const EXCERPT_MAX = 200;
@@ -137,7 +138,42 @@ function describeLocalSessionTarget(args) {
  * agent wants to start sessions on this relay itself. Allowing it covers the
  * later ones of that conversation, so the card says what they cost.
  */
-export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null, agentPrompts = 0, localSessions = false } = {}) {
+/**
+ * The card for relay event subscriptions (`watch`): the first subscribe of a
+ * conversation (`kind: 'subscribe'`, with the sessions or "all"), or a
+ * transfer of another conversation's subscriptions (`kind: 'transfer'`).
+ * "All sessions" is always spelled out.
+ */
+function formatWatchApprovalPrompt(watch) {
+  // A paired relay's sessions: named with it, so the user knows where.
+  const relayName = toText(watch.relayName);
+  const where = relayName ? `relay "${excerpt(relayName)}"` : 'this relay';
+  if (watch.kind === 'transfer') {
+    const from = watch.from || {};
+    const title = toText(from.title) ? `“${excerpt(from.title)}” ` : '';
+    const lines = [`This agent wants to take over ${watch.count} event subscription${watch.count === 1 ? '' : 's'} from session ${title}(${shortId(from.id)}) → this session. The old session stops getting their events.`];
+    const relays = (Array.isArray(watch.relays) ? watch.relays : []).map((name) => `"${excerpt(name)}"`);
+    if (relays.length) lines.push(`Among them: subscriptions on relay${relays.length === 1 ? '' : 's'} ${relays.join(', ')}.`);
+    if (watch.all) lines.push(`Among them: ALL sessions of ${relayName ? where : 'a relay'}, including ones created later.`);
+    return lines.join('\n\n');
+  }
+  const lines = [];
+  if (watch.all) {
+    lines.push(`This agent wants to watch ALL sessions of ${where}, including ones created later, and be woken by their events.`);
+  } else {
+    const sessions = (Array.isArray(watch.sessions) ? watch.sessions : []).slice(0, 10)
+      .map((session) => (toText(session?.title) ? `“${excerpt(session.title)}” (${shortId(session.id)})` : shortId(session?.id)));
+    const more = (watch.sessions?.length || 0) - sessions.length;
+    lines.push(`This agent wants to watch ${sessions.join(', ')}${more > 0 ? ` and ${more} more` : ''}${relayName ? ` on ${where}` : ''} and be woken by their events.`);
+  }
+  const events = (Array.isArray(watch.events) ? watch.events : []).join(', ');
+  const extras = [watch.once ? 'once' : '', Number(watch.heartbeatMinutes) > 0 ? `heartbeat every ${watch.heartbeatMinutes} min` : ''].filter(Boolean);
+  if (events) lines.push(`Events: ${events}${extras.length ? ` · ${extras.join(' · ')}` : ''}`);
+  return lines.join('\n\n');
+}
+
+export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null, agentPrompts = 0, localSessions = false, watch = null } = {}) {
+  if (watch && typeof watch === 'object') return formatWatchApprovalPrompt(watch);
   const local = relay?.local === true;
   const name = toText(relay?.name) || 'a remote relay';
   const where = local ? 'this relay' : `relay "${name}"`;
@@ -317,23 +353,25 @@ export function createRemoteRelayCallerContext({
    * `localSessions` makes it the card for starting sessions on this relay
    * itself, asked once per conversation (the dispatcher remembers the Allow).
    */
-  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal, agentPrompts = 0, localSessions = false } = {}) {
+  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal, agentPrompts = 0, localSessions = false, watch = null } = {}) {
     const rowId = toText(callerContext?.processingRowId);
     const row = rowId ? getQueueRow.get(rowId) : null;
     if (!row || row.status !== 'processing') {
       return {
         approved: false,
         code: REMOTE_RELAY_ERROR_CODES.noTurn,
-        error: localSessions
-          ? 'Starting sessions on this relay needs the user\'s approval once per conversation, but the conversation has no running turn to ask on.'
-          : 'This write action needs the user\'s approval, but the conversation has no running turn to ask on.',
+        error: watch
+          ? 'Watching sessions needs the user\'s approval, but the conversation has no running turn to ask on.'
+          : (localSessions
+            ? 'Starting sessions on this relay needs the user\'s approval once per conversation, but the conversation has no running turn to ask on.'
+            : 'This write action needs the user\'s approval, but the conversation has no running turn to ask on.'),
       };
     }
 
     const createdAt = now().toISOString();
     const questionId = String(uuid());
     const relayMode = normalizeMode(row.relay_mode);
-    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts, localSessions });
+    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts, localSessions, watch });
     const local = relay?.local === true;
     let rationale = `Write actions on ${local ? 'other sessions of this relay' : 'other relays'} need approval in ${relayMode} mode.`;
     if (agentPrompts > 0) {
@@ -342,6 +380,13 @@ export function createRemoteRelayCallerContext({
         : 'Agents on different relays that keep prompting each other need your go from time to time.';
     } else if (localSessions) {
       rationale = 'Allow covers every session this conversation\'s agent starts on this relay; Deny refuses this one.';
+    } else if (watch?.kind === 'transfer') {
+      rationale = 'The subscriptions keep their settings; event messages are the relay\'s, never yours, and approve nothing.';
+    } else if (watch) {
+      const there = toText(watch.relayName) ? ` on relay "${excerpt(watch.relayName)}"` : '';
+      rationale = watch.all
+        ? `Allow covers this conversation's later subscriptions${there} too. Event messages are the relay's, never yours, and approve nothing.`
+        : `Allow covers this conversation's later subscriptions${there}, except one to all sessions, which is asked again. Event messages are the relay's, never yours, and approve nothing.`;
     }
     // The same source for every card of this tool: it is what keeps agents
     // (other relays' and this relay's own) from seeing or answering one.
@@ -351,7 +396,7 @@ export function createRemoteRelayCallerContext({
       queueMessageId: row.id,
       conversationId: toText(conversationId) || row.conversation_id,
       relayMode,
-      header: localSessions ? LOCAL_SESSIONS_HEADER : APPROVAL_HEADER,
+      header: watch ? WATCH_HEADER : (localSessions ? LOCAL_SESSIONS_HEADER : APPROVAL_HEADER),
     }, { normalizeRelayMode: normalizeMode, defaultRelayMode });
     questionStatements.insertQuestion.run(
       questionId,

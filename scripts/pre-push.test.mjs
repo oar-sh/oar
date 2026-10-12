@@ -160,7 +160,7 @@ test('scanPushedCommits reads the real range from a repository', { skip: !hasGit
 test('a new ref is scanned only for commits the remote does not have yet', { skip: !hasGit() }, () => {
   const box = createSandbox();
   try {
-    box.git('switch', '-q', '-c', 'dev/topic');
+    box.git('checkout', '-q', '-b', 'dev/topic');
     box.commit('a.md', 'one\n', 'Add a');
     const tip = box.git('rev-parse', 'HEAD');
     const refs = [{ localRef: 'refs/heads/dev/topic', localSha: tip, remoteRef: 'refs/heads/dev/topic', remoteSha: ZERO }];

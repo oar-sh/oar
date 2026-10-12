@@ -86,9 +86,9 @@ test('a cloud conversation shows its repository and loses what does not apply', 
   assert.equal(el('cloud-session-line').hidden, false);
   assert.deepEqual(lineTexts(), ['☁ example-org/sample-repo', 'main']);
   assert.deepEqual(lineLinks(), [REPO_URL]);
-  // No working directory on the relay host to change, no session to open yet.
-  assert.equal(el('chat-menu-change-cwd').hidden, true);
-  assert.equal(el('chat-menu-open-cloud-session').hidden, true);
+  // No session to open yet; the ⋯ menu itself is decided elsewhere
+  // (chat-actions-menu-state.mjs) from this answer.
+  assert.equal(cloudUi.currentCloudSessionUrl(), null);
   assert.equal(el('image-input').getAttribute('accept'), 'image/jpeg,image/png,image/gif,image/webp');
   assert.match(el('attach-btn').title, /^Attach image \(Claude Cloud chats take images only/);
   // The header names the repository, not the local folder the fields came from.
@@ -117,7 +117,7 @@ test('a claude_cloud_session event adds the session link, the pushed branches an
     assert.equal(link.getAttribute('rel'), 'noopener');
   }
   assert.notEqual(el('cloud-session-line').firstElementChild, lineBefore, 'the line was redrawn for the new state');
-  assert.equal(el('chat-menu-open-cloud-session').hidden, false);
+  assert.equal(cloudUi.currentCloudSessionUrl(), SESSION_URL);
 
   // Syncing again with nothing new (every list render does) keeps the nodes:
   // a link must not be replaced under the finger that is tapping it.
@@ -149,8 +149,7 @@ test('switching to a local conversation gives everything back', () => {
   assert.equal(document.body.classList.contains('claude-cloud-conversation'), false);
   assert.equal(el('cloud-session-line').hidden, true);
   assert.equal(el('cloud-session-line').innerHTML, '');
-  assert.equal(el('chat-menu-change-cwd').hidden, false);
-  assert.equal(el('chat-menu-open-cloud-session').hidden, true);
+  assert.equal(cloudUi.currentCloudSessionUrl(), null);
   assert.equal(el('image-input').hasAttribute('accept'), false);
   assert.equal(el('attach-btn').title, 'Attach file');
   assert.equal(el('chat-title-cwd').textContent, '/home/dev/sample-repo');
@@ -159,13 +158,18 @@ test('switching to a local conversation gives everything back', () => {
   assert.deepEqual(opened, []);
 });
 
-test('an entry another owner had hidden is not brought back by leaving a cloud chat', () => {
+test('the ⋯ menu entries are left to their own owner', () => {
+  // Change CWD and Open on claude.ai are decided with the rest of the menu;
+  // this sync must not write them, or a later menu decision could be undone.
   const changeCwd = el('chat-menu-change-cwd');
+  const openSession = el('chat-menu-open-cloud-session');
   changeCwd.hidden = true;
+  openSession.hidden = true;
   show('conv-cloud');
   assert.equal(changeCwd.hidden, true);
+  assert.equal(openSession.hidden, true);
   show('conv-local');
-  assert.equal(changeCwd.hidden, true, 'it was hidden before the cloud chat and stays hidden after it');
+  assert.equal(changeCwd.hidden, true, 'left exactly as another owner set it');
   changeCwd.hidden = false;
 });
 

@@ -71,6 +71,16 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   answer: text('answer'),
   choices: z.array(z.string()).optional().describe(FIELDS.choices.description),
   if_busy: choice('if_busy', REMOTE_RELAY_IF_BUSY),
+  sessions: z.array(z.string()).optional().describe(FIELDS.sessions.description),
+  // Free text like effort: the relay checks the names and says which exist.
+  events: z.array(z.string()).optional().describe(FIELDS.events.description),
+  once: z.boolean().optional().describe(FIELDS.once.description),
+  match: text('match'),
+  stalled_minutes: number('stalled_minutes'),
+  heartbeat_minutes: number('heartbeat_minutes'),
+  subscription_id: text('subscription_id'),
+  watcher: text('watcher'),
+  from: text('from'),
 };
 
 export function createRemoteRelayToolDefinition({ api, getConversationId = () => '', dbg = () => {} } = {}) {

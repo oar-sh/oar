@@ -262,6 +262,13 @@ test('an effort on any other action is ignored, not validated', () => {
   }
 });
 
+test('usage needs a relay and read permission only', () => {
+  assert.equal(validateRemoteRelayToolInput({ action: 'usage' }).ok, false);
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'usage', relay: 'this' }).args.relay, 'this');
+  assert.equal(remoteRelayPermissionAllows('read', 'usage'), true);
+  assert.equal(isRemoteRelayWriteAction('usage'), false);
+});
+
 test('text longer than the limit is refused', () => {
   const text = 'x'.repeat(REMOTE_RELAY_LIMITS.textMax + 1);
   assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'r', session: 's', text }).ok, false);
@@ -407,4 +414,70 @@ test('the activity summary names the action, relay, session and prompt', () => {
     'send → linux-test session 01234567: “run the whole suite please”',
   );
   assert.match(summarizeRemoteRelayCall({ action: 'create_session', relay: 'r', text: 'x'.repeat(100) }), /…”$/);
+});
+
+test('event actions default to this relay and validate their arguments', () => {
+  const validate = validateRemoteRelayToolInput;
+  const summarize = summarizeRemoteRelayCall;
+  assert.deepEqual(validate({ action: 'subscribe', sessions: ['conv-a', 'conv-a', 'conv-b'], events: ['turn_end', 'TASK_STARTED'], once: true, match: 'tests? pass', stalled_minutes: 0, heartbeat_minutes: 99999 }), {
+    ok: true,
+    action: 'subscribe',
+    args: { relay: 'this', sessions: ['conv-a', 'conv-b'], events: ['turn_end', 'task_started'], once: true, match: 'tests? pass', stalled_minutes: 1, heartbeat_minutes: 1440 },
+  });
+  assert.equal(validate({ action: 'subscribe', sessions: 'all' }).args.scope, 'all');
+  assert.equal(validate({ action: 'subscribe', session: 'conv-a' }).args.sessions[0], 'conv-a');
+  assert.match(validate({ action: 'subscribe' }).error, /needs sessions/);
+  assert.match(validate({ action: 'subscribe', sessions: ['all', 'conv-a'] }).error, /not both/);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['nope'] }).error, /events must be some of/);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], match: '(' }).error, /not a valid regular expression/);
+  assert.match(validate({ action: 'unsubscribe' }).error, /subscription_id/);
+  assert.deepEqual(validate({ action: 'list_subscriptions', watcher: 'conv-old' }).args, { relay: 'this', watcher: 'conv-old' });
+  assert.match(validate({ action: 'transfer_subscriptions' }).error, /needs from/);
+  assert.equal(validate({ action: 'transfer_subscriptions', from: 'conv-old', relay: 'lab' }).args.relay, 'lab');
+  assert.equal(summarize({ action: 'subscribe', relay: 'this', sessions: ['all'] }), 'subscribe → this: all sessions');
+});
+
+test('what the input check hands on passes it again unchanged, for every action', () => {
+  // A call is checked twice: by the worker's tool, and by the relay that
+  // receives what the tool sent. ["all"] failed the second check (the
+  // first one hands it on as scope "all").
+  const inputs = [
+    { action: 'list_relays' },
+    { action: 'relay_info', relay: 'linux-test' },
+    { action: 'usage', relay: 'this' },
+    { action: 'list_sessions', relay: 'this', scope: 'all', limit: 5, query: 'docs', cursor: 'c1' },
+    { action: 'read_session', relay: 'this', session: 'conv-a', last: 3, max_chars: 900, include_activity: true, before: 'b1' },
+    { action: 'wait', relay: 'this', session: 'conv-a', message_id: 'm-1', wait_seconds: 30 },
+    { action: 'send', relay: 'this', session: 'conv-a', text: 'hello', mode: 'plan', effort: 'high', if_busy: 'fail', model: 'gpt-5.4-mini' },
+    { action: 'create_session', relay: 'this', text: 'start', provider: 'claude', cwd: '/home/dev/project', title: 'docs pass' },
+    { action: 'create_session', relay: 'this', text: 'start', provider: 'claude-cloud', repo: 'https://github.com/example-org/example-repo', branch: 'feature/x' },
+    { action: 'answer_question', relay: 'this', session: 'conv-a', question_id: 'q-1', choices: ['Yes'] },
+    { action: 'stop', relay: 'this', session: 'conv-a' },
+    { action: 'archive', relay: 'this', session: 'conv-a' },
+    { action: 'subscribe', sessions: ['all'] },
+    { action: 'subscribe', session: 'all' },
+    { action: 'subscribe', sessions: 'all', events: ['turn_end'], once: true, stalled_minutes: 20, heartbeat_minutes: 60 },
+    { action: 'subscribe', relay: 'linux-test', sessions: ['conv-a', 'conv-b'], match: 'done' },
+    { action: 'unsubscribe', subscription_id: 'all' },
+    { action: 'unsubscribe', subscription_id: 'sub_fixture1' },
+    { action: 'list_subscriptions', watcher: 'conv-b' },
+    { action: 'transfer_subscriptions', from: 'conv-old' },
+  ];
+  for (const input of inputs) {
+    const first = validateRemoteRelayToolInput(input);
+    assert.equal(first.ok, true, `${JSON.stringify(input)}: ${first.error}`);
+    const second = validateRemoteRelayToolInput({ ...first.args, action: first.action });
+    assert.deepEqual(second, first, JSON.stringify(input));
+  }
+  // The covered actions are all of them.
+  assert.deepEqual([...new Set(inputs.map((input) => input.action))].sort(), [...REMOTE_RELAY_ACTIONS].sort());
+});
+
+test('subscribe takes scope "all" as ["all"], and not together with session ids', () => {
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'subscribe', scope: 'all' }).args, { relay: 'this', scope: 'all' });
+  const mixed = validateRemoteRelayToolInput({ action: 'subscribe', scope: 'all', sessions: ['conv-a'] });
+  assert.equal(mixed.ok, false);
+  assert.match(mixed.error, /either \["all"\] or a list of session ids/);
+  // list_sessions' other scopes mean nothing to subscribe.
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'subscribe', scope: 'recent', sessions: ['conv-a'] }).args, { relay: 'this', sessions: ['conv-a'] });
 });

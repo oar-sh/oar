@@ -21,6 +21,7 @@ import {
 } from './claude-session-test-harness.mjs';
 import { STEERED_MESSAGE_NOTE, withSteerNote } from '../../shared/steer-note.mjs';
 import { SLASH_COMMAND_GUARD } from '../../shared/slash-command-guard.mjs';
+import { RELAY_EVENT_LEAD, RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
 
 const textOf = (content) => (Array.isArray(content)
   ? content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n')
@@ -145,6 +146,36 @@ test('a "/cmd" steered into a continuation carries the slash-command guard inste
   assert.equal(secondResponse.body.text, 'here is the status');
   await tick(20);
   assert.equal(runner._getProcess().pendingDelivered.length, 0);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a relay event message steers in without the note, which would speak as the user', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const eventText = `${RELAY_EVENT_LEAD}\n[relay event] session "Orbit camera" (conv-fixture-orbit): turn_end (done) "ok"`;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-event', text: eventText, messageKind: RELAY_EVENT_MESSAGE_KIND } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'the event was steered in' });
+  assert.equal(textOf(turn.pushed[1]), eventText);
+  assert.equal(textOf(turn.pushed[1]).includes(STEERED_MESSAGE_NOTE), false);
+
+  turn.emit(resultMessage('noted', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
   turn.endInput();
   await settled(runner);
 });

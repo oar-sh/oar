@@ -53,6 +53,7 @@ import {
   hasPendingUserMessageForConversation,
 } from './store.js';
 import { createTranscriptResizeKeeper } from './transcript-viewport-anchor.mjs';
+import { initTranscriptJumpToBottom } from './transcript-jump-bottom-view.mjs';
 import {
   verifyExistingSession,
   verifyToken,
@@ -103,6 +104,7 @@ import {
   renderMessages,
   appendMessage,
   compactCurrentConversation,
+  renderNoConversationState,
   sendMessage,
   handleKey,
   updateComposerSlashMenu,
@@ -126,11 +128,14 @@ import {
   syncRenderedPinState,
   isConversationWindowAtTail,
   getTranscriptJumpEpoch,
+  getTranscriptLiveRowEpoch,
+  syncAgentExchangeFoldsNow,
 } from './conversation-view.js';
+import { loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
 import { initPinnedMessagesView, setPinsConversation } from './pinned-messages-view.mjs';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
-import { handleAttachmentInput, retryAttachmentUpload, openAnnotateEditorForPending, openAnnotateEditorForPreview, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, copyFilePreviewImage, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick } from './attachments-view.js';
+import { handleAttachmentInput, retryAttachmentUpload, openAnnotateEditorForPending, openAnnotateEditorForPreview, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, copyFilePreviewImage, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick, startRepoNewFolder } from './attachments-view.js';
 import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import { initSlashAutocomplete } from './slash-autocomplete.mjs';
 import { initMentionAutocomplete } from './mention-autocomplete.mjs';
@@ -173,6 +178,7 @@ import {
   openMessageSearchModal,
   closeMessageSearchModal,
 } from './message-search-view.js';
+import { initSubagentViewer } from './subagent-viewer.mjs';
 import {
   initGitChangesView,
   openGitChangesModal,
@@ -274,6 +280,7 @@ import {
   updateTheme,
   openSettingsModal,
   closeSettingsModal,
+  isSuspendHostActionVisible,
   syncSuspendHostVisibility,
   updateShowSuspendHostSetting,
   syncDefaultSessionWorkspaceRootInput,
@@ -309,6 +316,7 @@ import {
   updateTurnCeilingSetting,
   previewBackgroundTaskTimeoutSetting,
   updateBackgroundTaskTimeoutSetting,
+  updateSubagentRecordRetentionSetting,
 } from './settings-modal.js';
 import {
   togglePushOnThisDevice,
@@ -356,14 +364,21 @@ import {
   subscribeClaudeCloudSettings,
   toggleClaudeCloudProvider,
 } from './claude-cloud-settings-ui.js';
-import { openCurrentCloudSession, syncClaudeCloudConversationUi } from './claude-cloud-conversation-ui.js';
+import { isCurrentConversationClaudeCloud, openCurrentCloudSession, syncClaudeCloudConversationUi } from './claude-cloud-conversation-ui.js';
+import {
+  CHAT_ACTIONS_MENU_ENTRY_IDS,
+  CHAT_ACTIONS_MENU_META_IDS,
+  resolveChatActionsMenuState,
+} from './chat-actions-menu-state.mjs';
+import { subscribeProviderReadiness, updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { syncConversationOriginHeader } from './conversation-origin-ui.js';
+import { loadRelayEventSubscriptions, onRelayEventSubscriptionsChanged, syncRelayEventHeader } from './relay-event-subscriptions-ui.js';
 import {
   previewAgentSessionsMaxWait,
   saveAgentSessionsMaxWait,
   toggleAgentSessions,
 } from './agent-sessions-settings-ui.js';
-import { CLAUDE_CLOUD_PROVIDER, claudeCloudComposerModelIds } from './claude-cloud-ui.mjs';
+import { CLAUDE_CLOUD_PROVIDER, buildCloudLineModel, claudeCloudComposerModelIds } from './claude-cloud-ui.mjs';
 import {
   confirmCliInstall,
   runCliInstall,
@@ -377,6 +392,7 @@ import {
   dismissAvailableUpdate,
   dismissUpdateOutcome,
 } from './update-ui.js';
+import { shouldAutofocusComposerOnLoad } from './composer-keyboard.mjs';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 // The New Chat modal used to keep its own model key, so a selection made there
@@ -953,6 +969,10 @@ function applySharedReaderUi() {
   if (modelSelect) modelSelect.hidden = true;
   if (effortSelect) effortSelect.hidden = true;
   if (modeSelect) modeSelect.hidden = true;
+  // One source for the menu: the resolver's shared branch (Day/Night only,
+  // trigger usable). The loop below stays as a guard for entries the resolver
+  // does not know.
+  applyChatActionsMenuState(resolveChatActionsMenuState({ sharedMode: true }));
   if (chatMenu && sharedThemeBtn) {
     for (const child of Array.from(chatMenu.children)) {
       if (child !== sharedThemeBtn) hideSharedMenuEntry(child);
@@ -1006,6 +1026,15 @@ function resolveStableScrollTopForLiveRefresh(messagesEl, capturedScrollTop) {
   return captured;
 }
 
+// Whether a reload keeps the reader at the end: as it was when the reload was
+// asked for, unless they have moved while it was on its way (scrolled up, or
+// jumped back to the end); then as it is now.
+function resolveLiveRefreshAtBottom(messagesEl, capturedScrollTop, capturedAtBottom) {
+  const current = Number(messagesEl?.scrollTop);
+  if (!Number.isFinite(current) || Math.abs(current - Number(capturedScrollTop)) <= 2) return capturedAtBottom;
+  return isMessagesAtBottom();
+}
+
 async function refreshSharedConversation() {
   if (sharedConversationPollInFlight) return;
   const sharedToken = resolveSharedTokenFromLocation();
@@ -1013,11 +1042,17 @@ async function refreshSharedConversation() {
   sharedConversationPollInFlight = true;
   const requestSeq = ++sharedConversationRequestSeq;
   const messagesEl = document.getElementById('messages');
-  const preserveBottom = isMessagesAtBottom();
+  const wasAtBottom = isMessagesAtBottom();
   const savedScrollTop = messagesEl?.scrollTop || 0;
   try {
-    const response = await loadSharedConversation(sharedToken, { limit: 120 });
+    // The reader has no socket today, so nothing moves the count; the guard
+    // keeps a rebuild from dropping a live row should one ever arrive.
+    const { response, stale } = await loadKeepingLiveRows(
+      () => loadSharedConversation(sharedToken, { limit: 120 }),
+      getTranscriptLiveRowEpoch,
+    );
     if (requestSeq < sharedConversationAppliedSeq) return;
+    if (stale) return;
     if (!response?.ok) {
       const message = String(response?.error || 'Could not load shared conversation.').trim();
       if (message && message !== sharedConversationLastError) {
@@ -1050,6 +1085,7 @@ async function refreshSharedConversation() {
       return;
     }
     sharedConversationRenderKey = renderKey;
+    const preserveBottom = resolveLiveRefreshAtBottom(messagesEl, savedScrollTop, wasAtBottom);
     const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
     applyLoadedConversationState(convId, response, {
       restoreScroll: !preserveBottom,
@@ -1382,6 +1418,8 @@ function syncComposerPlaceholder() {
   if (!input) return;
   if (isSharedReaderMode()) return;
   if (imageEditTarget) return;
+  // The composer is locked until a provider is ready; its text says why.
+  if (input.dataset.setupLocked === '1') return;
   const rawValue = String(document.getElementById('model-select')?.value || '');
   const { baseModelId } = splitModelVariantId(rawValue);
   input.placeholder = composerPlaceholderFor({
@@ -1616,6 +1654,8 @@ function updateModelCatalogState(payload) {
   // Shared readers never load the catalog, so this would only surface
   // "metadata unavailable" warnings for a picker they cannot see.
   if (isSharedReaderMode()) return;
+  // The catalog's `source` is the Copilot readiness signal (provider-readiness.mjs).
+  updateProviderReadinessInputs({ catalog: payload && typeof payload === 'object' ? payload : null });
   const select = document.getElementById('model-select');
   if (!select) return;
   const models = Array.isArray(payload?.models)
@@ -2180,6 +2220,8 @@ function initModeSelector() {
 function refreshModelCatalog(force = false) {
   return loadModelCatalog().then((r) => {
     if (!r) {
+      // A failed load leaves provider readiness unknown: no setup wall on a blip.
+      updateProviderReadinessInputs({ catalog: null });
       if (isModelMetadataHealthy(modelCatalogState) || isModelMetadataHealthy(lastHealthyModelCatalogState)) {
         setModelBanner('⚠️ Could not refresh model metadata; using last known good catalog.');
         syncModelMetadataBlocker();
@@ -3630,18 +3672,25 @@ async function pollAuthenticatedCurrentConversationLive() {
   liveConversationPollInFlight = true;
   try {
     const messagesEl = document.getElementById('messages');
-    const preserveBottom = isMessagesAtBottom();
+    const wasAtBottom = isMessagesAtBottom();
     const savedScrollTop = messagesEl?.scrollTop || 0;
     const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
     const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
     const jumpEpoch = getTranscriptJumpEpoch();
-    const response = await loadConversation(currentId, { limit: requestLimit });
+    const { response, stale } = await loadKeepingLiveRows(
+      () => loadConversation(currentId, { limit: requestLimit }),
+      getTranscriptLiveRowEpoch,
+    );
     if (!response) return;
     if (String(currentConvId || '').trim() !== currentId) return;
     // The user jumped into the history while this request was on its way: the
     // answer is the end of the conversation as it was asked for before that,
     // and would overwrite the window they jumped to. The next round asks again.
     if (getTranscriptJumpEpoch() !== jumpEpoch) return;
+    // Rows kept arriving through every request: the page has them, the answer
+    // does not. The next round asks again.
+    if (stale) return;
+    const preserveBottom = resolveLiveRefreshAtBottom(messagesEl, savedScrollTop, wasAtBottom);
     const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
     applyLoadedConversationState(currentId, response, {
       restoreScroll: !preserveBottom,
@@ -3793,6 +3842,19 @@ function initMessageScrollPersistence() {
   }, { passive: true });
 }
 
+// The jump-to-bottom button on a window in the middle of the history: the
+// end of the conversation replaces it, scrolled to the bottom.
+async function loadCurrentConversationEnd() {
+  const currentId = String(currentConvId || '').trim();
+  if (!currentId) return;
+  const jumpEpoch = getTranscriptJumpEpoch();
+  const response = await loadConversation(currentId, { limit: 20 });
+  if (!response || String(currentConvId || '').trim() !== currentId) return;
+  // A jump into the history while it was on its way wins.
+  if (getTranscriptJumpEpoch() !== jumpEpoch) return;
+  applyLoadedConversationState(currentId, response, { restoreScroll: false });
+}
+
 async function runConversationHistoryRefresh({ source = 'menu' } = {}) {
   const currentId = String(currentConvId || '').trim();
   if (!currentId) {
@@ -3851,9 +3913,8 @@ async function refreshCurrentView() {
   const capturedVersion = ++refreshViewVersion;
   const jumpEpoch = getTranscriptJumpEpoch();
   const messagesEl = document.getElementById('messages');
-  const preserveBottom = isMessagesAtBottom();
+  const wasAtBottom = isMessagesAtBottom();
   const scrollTop = messagesEl?.scrollTop || 0;
-  const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, scrollTop);
 
   await refreshConversations();
 
@@ -3869,13 +3930,19 @@ async function refreshCurrentView() {
 
   const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
   const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
-  const r = await loadConversation(currentId, { limit: requestLimit });
+  const { response: r, stale } = await loadKeepingLiveRows(
+    () => loadConversation(currentId, { limit: requestLimit }),
+    getTranscriptLiveRowEpoch,
+  );
   if (capturedVersion < refreshViewVersion) return;
   if (String(currentConvId || '').trim() !== currentId) return;
   // The user jumped into the history, before this refresh or while it was on
   // its way: title, tasks, pins and the rest are refreshed, the transcript
-  // and its scroll position are left as they are.
-  const keepTranscript = getTranscriptJumpEpoch() !== jumpEpoch || transcriptIsInHistory(currentId);
+  // and its scroll position are left as they are. So too when rows kept
+  // arriving through every request: the page has rows the answer lacks.
+  const keepTranscript = getTranscriptJumpEpoch() !== jumpEpoch || transcriptIsInHistory(currentId) || stale;
+  const preserveBottom = resolveLiveRefreshAtBottom(messagesEl, scrollTop, wasAtBottom);
+  const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, scrollTop);
   if (r) {
     applyLoadedConversationState(currentId, r, {
       restoreScroll: !preserveBottom,
@@ -3951,7 +4018,7 @@ function getChatTitleElements() {
   return {
     wrap: document.getElementById('chat-title-wrap'),
     title: document.getElementById('chat-title'),
-    editBtn: document.getElementById('chat-actions-menu-btn'),
+    menuBtn: document.getElementById('chat-actions-menu-btn'),
     editor: document.getElementById('chat-title-editor'),
     input: document.getElementById('chat-title-input'),
     saveBtn: document.getElementById('chat-title-save-btn'),
@@ -3968,10 +4035,61 @@ function closeChatActionsMenu() {
   if (backdrop && !window.__chatActionsMenuShieldTimer) backdrop.classList.remove('visible');
 }
 
+// Writes one resolver decision to the DOM, the way the shared view hides its
+// entries: `hidden` alone for the text chips, plus `disabled`, `aria-hidden`
+// and the tab order for the buttons.
+function applyChatActionsMenuState(state) {
+  const trigger = document.getElementById('chat-actions-menu-btn');
+  if (trigger && state?.trigger) {
+    trigger.hidden = !!state.trigger.hidden;
+    trigger.disabled = !!state.trigger.disabled;
+  }
+  const entries = state?.entries || {};
+  for (const id of CHAT_ACTIONS_MENU_ENTRY_IDS) {
+    const element = document.getElementById(id);
+    const decision = entries[id];
+    if (!element || !decision) continue;
+    element.hidden = !!decision.hidden;
+    if (CHAT_ACTIONS_MENU_META_IDS.includes(id)) continue;
+    if (decision.hidden) {
+      element.setAttribute('aria-hidden', 'true');
+      if ('disabled' in element) element.disabled = true;
+      if ('tabIndex' in element) element.tabIndex = -1;
+      continue;
+    }
+    element.removeAttribute('aria-hidden');
+    if ('disabled' in element) element.disabled = !!decision.disabled;
+    if ('tabIndex' in element) element.tabIndex = 0;
+  }
+}
+
+// The ⋯ menu as it should look right now: the trigger and every entry,
+// decided in chat-actions-menu-state.mjs from the conversation on screen.
+function syncChatActionsMenuState() {
+  const convId = String(currentConvId || '').trim();
+  const conversation = convId ? (conversations[convId] || null) : null;
+  const isCloud = !!convId && isCurrentConversationClaudeCloud();
+  const state = resolveChatActionsMenuState({
+    sharedMode: isSharedReaderMode(),
+    conversationId: convId,
+    conversation,
+    sdkSessionId: String(conversation?.sdkSessionId || '').trim(),
+    isCloud,
+    cloudSessionUrl: isCloud ? buildCloudLineModel(conversation?.cloud)?.sessionUrl || null : null,
+    editing: !!convId && chatTitleEditingConversationId === convId,
+    suspendVisible: isSuspendHostActionVisible(),
+  });
+  applyChatActionsMenuState(state);
+  return state;
+}
+
 function toggleChatActionsMenu() {
   const menu = document.getElementById('chat-actions-menu');
   const trigger = document.getElementById('chat-actions-menu-btn');
-  if (!menu || !trigger || trigger.hidden || trigger.disabled) return;
+  if (!menu || !trigger) return;
+  // The entries match the moment of the tap, as Refresh history already does.
+  syncChatActionsMenuState();
+  if (trigger.hidden || trigger.disabled) return;
   syncRefreshHistoryMenuState();
   syncThemeMenuLabel();
   const willOpen = !!menu.hidden;
@@ -4050,12 +4168,10 @@ function lockChatActionsMenuShield(ms = 300) {
 
 
 function syncChatTitleControls() {
-  const { title, editBtn, editor, input } = getChatTitleElements();
+  const { title, editor, input } = getChatTitleElements();
   const convId = String(currentConvId || '').trim();
   // No conversation open (deleted, new chat): its 📍 button goes with it.
   if (!convId) setPinsConversation(null);
-  const killBtn = document.getElementById('chat-menu-kill-session');
-  const sharedMode = isSharedReaderMode();
   const conversation = convId ? (conversations[convId] || null) : null;
   const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
   if (title) {
@@ -4079,17 +4195,11 @@ function syncChatTitleControls() {
   const editing = convId && chatTitleEditingConversationId === convId;
   document.body.classList.toggle('chat-title-editing', !!editing);
   if (title) title.hidden = editing;
-  if (editBtn) {
-    editBtn.hidden = !convId;
-    editBtn.disabled = !convId || editing;
-  }
-  if (killBtn) {
-    killBtn.disabled = sharedMode || !convId || !sdkSessionId;
-    killBtn.hidden = sharedMode || !convId;
-  }
+  // The ⋯ trigger and its entries: relay-wide ones stay with no conversation
+  // open, so Settings is always one tap away.
+  syncChatActionsMenuState();
   const archiveBtn = document.getElementById('chat-menu-archive');
   if (archiveBtn) {
-    archiveBtn.hidden = sharedMode || !convId;
     archiveBtn.textContent = conversation?.archived === true ? '📂 Unarchive conversation' : '🗄 Archive conversation';
   }
   if (editor) {
@@ -4112,19 +4222,21 @@ function syncChatTitleControls() {
   syncClaudeCloudConversationUi();
   // "via agent": the conversation an agent on this relay started this one from.
   syncConversationOriginHeader();
+  // Relay events: "watching N sessions" on a watcher, "watched" on a watched one.
+  syncRelayEventHeader();
   syncChatTitleWatcherIndicator();
 }
 
 function openChatTitleEditor() {
   const convId = String(currentConvId || '').trim();
   if (!convId) return;
-  const { title, editBtn, editor, input } = getChatTitleElements();
+  const { title, menuBtn, editor, input } = getChatTitleElements();
   closeChatActionsMenu();
   const currentTitle = String(conversations[convId]?.title || title?.textContent || convId).trim() || convId;
   chatTitleEditingConversationId = convId;
   document.body.classList.add('chat-title-editing');
   if (title) title.hidden = true;
-  if (editBtn) editBtn.disabled = true;
+  if (menuBtn) menuBtn.disabled = true;
   if (editor) editor.hidden = false;
   if (input) {
     input.maxLength = CHAT_TITLE_MAX_LENGTH;
@@ -4143,11 +4255,11 @@ function openChatTitleEditor() {
 function closeChatTitleEditor() {
   chatTitleEditingConversationId = null;
   document.body.classList.remove('chat-title-editing');
-  const { title, editBtn, editor, input } = getChatTitleElements();
+  const { title, editor, input } = getChatTitleElements();
   closeChatActionsMenu();
   if (editor) editor.hidden = true;
   if (title) title.hidden = !String(currentConvId || '').trim();
-  if (editBtn) editBtn.disabled = !String(currentConvId || '').trim();
+  // The trigger is decided by the syncChatTitleControls() call below.
   if (input) {
     const convId = String(currentConvId || '').trim();
     input.value = convId ? String(conversations[convId]?.title || title?.textContent || convId) : '';
@@ -4556,6 +4668,7 @@ async function initApp() {
     initConversationHistoryLazyLoading();
     initBubbleActionHandlers();
     initMessageScrollPersistence();
+    initTranscriptJumpToBottom();
     syncChatTitleControls();
     await initSharedConversationReader();
     return;
@@ -4578,14 +4691,25 @@ async function initApp() {
   const status = await refreshWorkspaceRootHints();
   syncQueueStatusMenuEntry(status);
   setSessionWorkerStatesFromStatusPayload(status?.sessionWorker || null);
-  await refreshOpenAISettingsState();
-  await refreshCursorSettingsState();
-  await refreshGrokSettingsState();
+  const openAISettings = await refreshOpenAISettingsState();
+  const cursorSettings = await refreshCursorSettingsState();
+  const grokSettings = await refreshGrokSettingsState();
+  // Loaded here for provider readiness: whether any provider can run a chat
+  // decides what the empty screen, New Chat and the composer offer.
+  const claudeSettings = await refreshClaudeSettingsState();
+  updateProviderReadinessInputs({
+    openai: openAISettings || null,
+    cursor: cursorSettings || null,
+    grok: grokSettings || null,
+    claude: claudeSettings || null,
+  });
   // Not awaited: only a Claude Cloud conversation needs it (its model list),
   // and the subscription below rebuilds that list when the answer arrives. A
   // relay without the provider answers nothing and nothing changes.
   subscribeClaudeCloudSettings(refreshClaudeCloudComposerModels);
-  void refreshClaudeCloudSettingsState();
+  void refreshClaudeCloudSettingsState().then((state) => {
+    updateProviderReadinessInputs({ claudeCloud: state || null });
+  });
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
@@ -4599,8 +4723,10 @@ async function initApp() {
   initConversationHistoryLazyLoading();
   initBubbleActionHandlers();
   initMessageScrollPersistence();
+  initTranscriptJumpToBottom({ loadEnd: loadCurrentConversationEnd });
   initComposerAttachmentInput();
   initMessageSearchView({ openConversation });
+  initSubagentViewer();
   initPinnedMessagesView({
     openConversation,
     focusMessage: focusConversationMessageById,
@@ -4608,6 +4734,13 @@ async function initApp() {
   });
   initGitChangesView();
   syncChatTitleControls();
+  // A provider turned on or off (a Settings save, a catalog change) redraws
+  // the empty screen and the composer without a reload.
+  subscribeProviderReadiness(() => {
+    renderNoConversationState();
+    syncComposerButtonState();
+    syncComposerPlaceholder();
+  });
   connectSocket();
   startRelayConnectionWatchdog();
   startDeviceVisibilityHeartbeat();
@@ -4619,6 +4752,9 @@ async function initApp() {
   // Browsers without Background Sync replay the outbox from the page instead.
   void initOutboxFallbackReplay();
   await loadConversations();
+  // The sidebar's "watched" badges follow the subscriptions.
+  onRelayEventSubscriptionsChanged(() => renderConvList());
+  void loadRelayEventSubscriptions();
   const pushConversationId = consumePushConversationDeepLink();
   if (pushConversationId) {
     await openConversation(pushConversationId).catch(() => {});
@@ -4626,7 +4762,19 @@ async function initApp() {
   await loadRelayQuestions(currentConvId);
   await loadRelayBoards();
   updateCompactButton();
-  document.getElementById('msg-input').focus();
+  // Nothing opened (fresh client, fresh relay, a last conversation that is
+  // gone): the static markup gives way to the real empty screen.
+  renderNoConversationState();
+  syncComposerButtonState();
+  syncComposerPlaceholder();
+  // A phone shows no keyboard for this focus, but the next tap that keeps it
+  // (the transcript's ⌄) would raise one.
+  if (shouldAutofocusComposerOnLoad({
+    coarsePointer: !!window.matchMedia?.('(pointer: coarse)')?.matches,
+    phoneLayout: isMobileComposerViewport(),
+  })) {
+    document.getElementById('msg-input').focus();
+  }
 }
 
 async function doAuth() {
@@ -4739,6 +4887,7 @@ window.previewTurnCeilingSetting = previewTurnCeilingSetting;
 window.updateTurnCeilingSetting = updateTurnCeilingSetting;
 window.previewBackgroundTaskTimeoutSetting = previewBackgroundTaskTimeoutSetting;
 window.updateBackgroundTaskTimeoutSetting = updateBackgroundTaskTimeoutSetting;
+window.updateSubagentRecordRetentionSetting = updateSubagentRecordRetentionSetting;
 window.togglePushOnThisDevice = togglePushOnThisDevice;
 window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;
 window.openSettingsModal = openSettingsModal;
@@ -4815,6 +4964,7 @@ window.toggleRepoBrowserHidden = toggleRepoBrowserHidden;
 window.toggleRepoBrowserHeavy = toggleRepoBrowserHeavy;
 window.focusRepoTree = focusRepoTree;
 window.setRepoCurrentPath = setRepoCurrentPath;
+window.startRepoNewFolder = startRepoNewFolder;
 window.confirmRepoBrowserCwdPick = confirmRepoBrowserCwdPick;
 window.toggleEmojiPicker = toggleEmojiPicker;
 window.submitRelayQuestionChoice = submitRelayQuestionChoice;
@@ -4827,6 +4977,7 @@ window.setRelayQuestionMultiMode = setRelayQuestionMultiMode;
 window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.submitRelayBoardAction = submitRelayBoardAction;
+window.syncAgentExchangeFolds = syncAgentExchangeFoldsNow;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
 window.syncComposerButtonState = syncComposerButtonState;

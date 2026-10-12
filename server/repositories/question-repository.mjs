@@ -1,7 +1,13 @@
 'use strict';
 
+import { createSubagentTimelineStatements } from './subagent-timeline-statements.mjs';
+
 export function createQuestionRepository(db) {
+    const subagentTimeline = createSubagentTimelineStatements(db);
+    const runColumns = subagentTimeline.subagentRunSelectColumns;
+    const runColumnsAs = (alias) => runColumns.split(', ').map((column) => `${alias}.${column}`).join(', ');
     return {
+        ...subagentTimeline,
         // relay questions
         insertQuestion: db.prepare(`INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, request_schema, status, answer, structured_answer, sdk_session_id, owner_worker_id, continuation_id, continuation_question_id, created_at, answered_at, expires_at, attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?)`),
         getQuestion:    db.prepare(`SELECT * FROM relay_questions WHERE id = ?`),
@@ -99,7 +105,7 @@ export function createQuestionRepository(db) {
           WHERE id = ?
         `),
         listSubagentRunsByQueueMessage: db.prepare(`
-          SELECT id, queue_message_id, conversation_id, parent_subagent_id, display_name, status, started_at, updated_at, completed_at
+          SELECT ${runColumns}
           FROM subagent_runs
           WHERE queue_message_id = ?
           ORDER BY started_at ASC, id ASC
@@ -108,7 +114,7 @@ export function createQuestionRepository(db) {
         // abort) also ends its subagent runs — nothing else ever will, and an
         // un-reconciled row renders as a bubble stuck "running" forever.
         listRunningSubagentRunsByQueueMessage: db.prepare(`
-          SELECT id, conversation_id, parent_subagent_id, display_name
+          SELECT ${runColumns}
           FROM subagent_runs
           WHERE queue_message_id = ? AND status = 'running'
         `),
@@ -121,7 +127,7 @@ export function createQuestionRepository(db) {
           WHERE queue_message_id = ? AND status = 'running'
         `),
         listSubagentRunsByResponse: db.prepare(`
-          SELECT sr.id, sr.queue_message_id, sr.conversation_id, sr.parent_subagent_id, sr.display_name, sr.status, sr.started_at, sr.updated_at, sr.completed_at
+          SELECT ${runColumnsAs('sr')}
           FROM subagent_runs sr
           WHERE sr.queue_message_id IN (
             SELECT id FROM queue WHERE response_message_id = ?

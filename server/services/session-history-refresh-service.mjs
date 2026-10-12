@@ -234,6 +234,11 @@ export function createSessionHistoryRefreshService({
   // replaces those ids, so the rows must go with the messages they annotated
   // (same lifecycle as subagent_runs). The fallback guards dbs opened before
   // the table existed.
+  // The sub-agent timeline goes with its runs. Null on a database the 0009
+  // migration has not reached (no table, nothing to delete).
+  const deleteConversationSubagentTimeline = typeof stmts?.deleteConvSubagentTimeline?.run === 'function'
+    ? stmts.deleteConvSubagentTimeline
+    : null;
   const deleteConversationWorkflowRuns = typeof stmts?.deleteConvWorkflowRuns?.run === 'function'
     ? stmts.deleteConvWorkflowRuns
     : db.prepare(`DELETE FROM workflow_runs WHERE conversation_id = ?`);
@@ -425,6 +430,7 @@ export function createSessionHistoryRefreshService({
     deleteConversationThoughts.run(conversationId);
     deleteConversationStreamEvents.run(conversationId);
     deleteConversationSubagentRuns.run(conversationId);
+    deleteConversationSubagentTimeline?.run(conversationId);
     deleteConversationWorkflowRuns.run(conversationId);
   });
 
@@ -441,6 +447,7 @@ export function createSessionHistoryRefreshService({
     deleteConversationThoughts.run(conversationId);
     deleteConversationStreamEvents.run(conversationId);
     deleteConversationSubagentRuns.run(conversationId);
+    deleteConversationSubagentTimeline?.run(conversationId);
     deleteConversationWorkflowRuns.run(conversationId);
     insertRebuiltMessages(conversationId, messages, attachmentCandidates);
     const rebuiltMessages = ensureArray(messages);

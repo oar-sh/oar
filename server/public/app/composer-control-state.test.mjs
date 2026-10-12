@@ -5,6 +5,7 @@ import {
   hasComposerDraft,
   countUploadingAttachments,
   hasUploadingAttachments,
+  SETUP_REQUIRED_TEXT,
 } from './composer-control-state.mjs';
 
 test('a draft exists when there is text or an attachment', () => {
@@ -239,4 +240,24 @@ test('a send already in flight disables the button', () => {
   const activeEmpty = deriveComposerControlState({ hasActiveTurn: true, sendInFlight: true });
   assert.equal(activeEmpty.action, 'send');
   assert.equal(activeEmpty.disabled, true);
+});
+
+// No conversation open and no provider known to be ready (a fresh install):
+// the composer is locked with a placeholder that says what to do, so a send
+// cannot create a Copilot chat that would not run.
+test('the setup state locks the composer and carries its placeholder', () => {
+  const state = deriveComposerControlState({ setupRequired: true, hasDraft: true });
+  assert.equal(state.action, 'send');
+  assert.equal(state.label, 'Send');
+  assert.equal(state.disabled, true);
+  assert.equal(state.composerDisabled, true);
+  assert.equal(state.placeholder, SETUP_REQUIRED_TEXT);
+  assert.equal(state.title, SETUP_REQUIRED_TEXT);
+  assert.match(state.placeholder, /set up a provider/i);
+  // It outranks every other input: nothing else applies with nothing open.
+  assert.equal(deriveComposerControlState({ setupRequired: true, archived: true }).composerDisabled, true);
+  // Every other state leaves the textarea alone.
+  for (const input of [{}, { hasActiveTurn: true, hasDraft: true }, { archived: true }, { sendInFlight: true }]) {
+    assert.equal(deriveComposerControlState(input).composerDisabled, undefined);
+  }
 });

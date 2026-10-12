@@ -29,6 +29,8 @@ import {
   updateTurnCeilingSetting as requestTurnCeilingSetting,
   loadBackgroundTaskTimeoutSetting,
   updateBackgroundTaskTimeoutSetting as requestBackgroundTaskTimeoutSetting,
+  loadSubagentRecordRetentionSetting,
+  updateSubagentRecordRetentionSetting as requestSubagentRecordRetentionSetting,
   loadFeatureFlagSettings,
   updateFeatureFlagSetting as requestFeatureFlagSetting,
   requestRelayRestart,
@@ -194,6 +196,54 @@ export async function refreshBackgroundTaskTimeoutSetting() {
     // Leave the slider at its last known value; the setting is not critical.
   } finally {
     syncBackgroundTaskTimeoutSlider();
+  }
+}
+
+// Mirrors shared/subagent-record-retention.mjs (the browser cannot import it):
+// the select starts at the relay's default until the relay's value loads.
+const DEFAULT_SUBAGENT_RECORD_RETENTION_DAYS = 90;
+let subagentRecordRetentionDays = DEFAULT_SUBAGENT_RECORD_RETENTION_DAYS;
+let subagentRecordRetentionUpdateInFlight = false;
+
+function syncSubagentRecordRetentionSelect() {
+  const select = document.getElementById('subagent-record-retention-select');
+  if (!select || select.tagName !== 'SELECT') return;
+  select.value = String(subagentRecordRetentionDays);
+  select.disabled = subagentRecordRetentionUpdateInFlight;
+}
+
+export async function refreshSubagentRecordRetentionSetting() {
+  syncSubagentRecordRetentionSelect();
+  try {
+    const result = await loadSubagentRecordRetentionSetting();
+    if (result && Number.isFinite(Number(result.retentionDays))) subagentRecordRetentionDays = Number(result.retentionDays);
+  } catch {
+    // Keep the last known value; the setting is not critical.
+  } finally {
+    syncSubagentRecordRetentionSelect();
+  }
+}
+
+export async function updateSubagentRecordRetentionSetting(value) {
+  if (subagentRecordRetentionUpdateInFlight) {
+    syncSubagentRecordRetentionSelect();
+    return;
+  }
+  subagentRecordRetentionUpdateInFlight = true;
+  syncSubagentRecordRetentionSelect();
+  try {
+    const result = await requestSubagentRecordRetentionSetting(Number(value));
+    if (result && Number.isFinite(Number(result.retentionDays))) subagentRecordRetentionDays = Number(result.retentionDays);
+    showTransientRelayNotice(
+      subagentRecordRetentionDays === 0
+        ? 'Sub-agent tool output is kept for good.'
+        : `Sub-agent tool output is removed after ${subagentRecordRetentionDays} days.`,
+    );
+  } catch (error) {
+    alert(error?.message || 'Failed to update how long sub-agent tool output is kept.');
+  } finally {
+    subagentRecordRetentionUpdateInFlight = false;
+    syncSubagentRecordRetentionSelect();
   }
 }
 
@@ -1534,7 +1584,7 @@ async function restartRelayForFeatureFlags() {
       alert('Failed to request a relay restart. Restarts can only be requested from the relay host itself.');
       return;
     }
-    showTransientRelayNotice('Relay restart requested. It will restart once the queue is idle.');
+    showTransientRelayNotice('Relay restart requested. It will restart once the running turns finish; queued messages wait for it.');
   } finally {
     featureFlagsUpdateInFlight = false;
     syncFeatureFlagsSection();
@@ -1708,6 +1758,8 @@ export function openSettingsModal(tab, providerTab) {
   void refreshTurnCeilingSetting();
   syncBackgroundTaskTimeoutSlider();
   void refreshBackgroundTaskTimeoutSetting();
+  syncSubagentRecordRetentionSelect();
+  void refreshSubagentRecordRetentionSetting();
   void refreshPushSettingsSection();
   void refreshPreviewsSection();
   void refreshRemoteRelaysSection();

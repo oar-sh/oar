@@ -14,6 +14,10 @@ import {
   getConversationCurrentWorkspaceRootPath,
   IS_SHARED_VIEW,
   conversations,
+  openSummaryModal,
+  closeSummaryModal,
+  renderSummaryModalContent,
+  setSummaryModalLoading,
 } from './store.js';
 import { openAnnotateEditor } from './annotate-editor.js';
 import {
@@ -25,7 +29,21 @@ import {
   loadDrivesRoots,
   loadDriveChildren,
   loadSessionRootTree,
+  createExplorerFolder,
+  renameExplorerEntry,
+  deleteExplorerEntry,
 } from './api-client.js';
+import { MENU_SEPARATOR, bindLongPress, openContextMenu } from './context-menu.mjs';
+import {
+  childPathOf,
+  descendantsOf,
+  dropPathsBelow,
+  entryNameOf,
+  isSameOrBelow,
+  parentPathOf,
+  rewritePathPrefix,
+  rewritePathSet,
+} from './explorer-edit-state.mjs';
 import {
   extractPastedFiles,
   extractDroppedFiles,
@@ -1752,6 +1770,371 @@ function updateRepoToolbarUi() {
   heavyBtn.textContent = workspaceRoot
     ? `Heavy: ${repoBrowserState.workspaceIncludeHeavy ? 'On' : 'Off'}`
     : 'Heavy: n/a';
+  const newFolderBtn = document.getElementById('repo-new-folder-btn');
+  if (newFolderBtn) newFolderBtn.disabled = !canCreateRepoFolderIn(String(repoBrowserState.currentPath || ''));
+}
+
+// ---------------------------------------------------------------------------
+// Explorer edits: new folder, rename, delete.
+//
+// The two inline editors live in module state, not in repoBrowserState: they
+// are transient, belong to one open explorer, and must not survive a root
+// switch or a close. Both are rendered by the normal render functions, which
+// capture the typed text and the focus before they replace the markup, so a
+// background re-render (a child load landing) does not eat a half-typed name.
+// ---------------------------------------------------------------------------
+
+/** `{ parentPath, value, error, busy }` while the New-folder row is open. */
+let repoNewFolderDraft = null;
+/** `{ path, value, busy }` while a name is being edited in place. */
+let repoRenameDraft = null;
+/** `{ path, name, kind }` while the delete confirmation is open. */
+let repoDeletePending = null;
+/** Set while a render swaps markup, so the blur it causes is not a cancel. */
+let repoInlineRenderInProgress = false;
+
+/** Rename and delete exist in the workspace and drives roots, outside the CWD picker. */
+function canEditRepoEntries() {
+  return repoBrowserState.activeRoot !== 'session' && !repoBrowserCwdPickModeActive();
+}
+
+/** A folder can be created wherever a real directory is open; the Windows "Drives" list is not one. */
+function canCreateRepoFolderIn(dirPath) {
+  if (repoBrowserState.loading || repoBrowserState.error || !repoBrowserState.tree) return false;
+  const node = repoBrowserState.nodeMap.get(String(dirPath || ''));
+  if (!node || node.type !== 'dir') return false;
+  if (repoBrowserState.activeRoot === 'drives' && !String(node.path || '')) return false;
+  return true;
+}
+
+function clearRepoInlineEdits() {
+  repoNewFolderDraft = null;
+  repoRenameDraft = null;
+}
+
+export function startRepoNewFolder(parentPath = null) {
+  const target = parentPath === null ? String(repoBrowserState.currentPath || '') : String(parentPath || '');
+  if (!canCreateRepoFolderIn(target)) return;
+  repoRenameDraft = null;
+  repoNewFolderDraft = { parentPath: target, value: '', error: '', busy: false };
+  renderRepoBrowser();
+  focusRepoInlineInput('[data-repo-new-folder-input]');
+}
+
+export function cancelRepoNewFolder() {
+  if (!repoNewFolderDraft || repoNewFolderDraft.busy) return;
+  repoNewFolderDraft = null;
+  renderRepoFolder();
+}
+
+export async function commitRepoNewFolder() {
+  const draft = repoNewFolderDraft;
+  if (!draft || draft.busy) return;
+  const name = String(draft.value || '').trim();
+  if (!name) {
+    draft.error = 'Enter a name';
+    renderRepoFolder();
+    focusRepoInlineInput('[data-repo-new-folder-input]');
+    return;
+  }
+  draft.busy = true;
+  draft.error = '';
+  renderRepoFolder();
+  const root = repoBrowserState.activeRoot;
+  try {
+    const result = await createExplorerFolder({
+      root,
+      path: draft.parentPath,
+      name,
+      conversationId: currentConversationId(),
+    });
+    if (repoNewFolderDraft !== draft) return;
+    repoNewFolderDraft = null;
+    const newPath = String(result?.path || childPathOf(draft.parentPath, name));
+    await reloadRepoDirectory(draft.parentPath);
+    if (repoBrowserState.activeRoot === root && repoBrowserState.nodeMap.has(newPath)) {
+      await setRepoCurrentPath(newPath);
+    }
+    showTransientRelayNotice(`Folder "${name}" created.`);
+  } catch (error) {
+    if (repoNewFolderDraft !== draft) return;
+    draft.busy = false;
+    draft.error = error?.message || 'Failed to create the folder';
+    renderRepoFolder();
+    focusRepoInlineInput('[data-repo-new-folder-input]');
+  }
+}
+
+export function startRepoRename(pathValue) {
+  const entryPath = String(pathValue || '');
+  const node = repoBrowserState.nodeMap.get(entryPath);
+  if (!node || !entryPath || !canEditRepoEntries()) return;
+  repoNewFolderDraft = null;
+  repoRenameDraft = { path: entryPath, value: String(node.name || entryNameOf(entryPath)), busy: false };
+  renderRepoBrowser();
+  focusRepoInlineInput('[data-repo-rename-input]', { select: true });
+}
+
+export function cancelRepoRename() {
+  if (!repoRenameDraft || repoRenameDraft.busy) return;
+  repoRenameDraft = null;
+  renderRepoBrowser();
+}
+
+export async function commitRepoRename() {
+  const draft = repoRenameDraft;
+  if (!draft || draft.busy) return;
+  const node = repoBrowserState.nodeMap.get(draft.path);
+  const oldName = String(node?.name || entryNameOf(draft.path));
+  const newName = String(draft.value || '').trim();
+  if (!node || !newName || newName === oldName) {
+    cancelRepoRename();
+    return;
+  }
+  draft.busy = true;
+  renderRepoBrowser();
+  const root = repoBrowserState.activeRoot;
+  try {
+    const result = await renameExplorerEntry({
+      root,
+      path: draft.path,
+      newName,
+      conversationId: currentConversationId(),
+    });
+    if (repoRenameDraft !== draft) return;
+    repoRenameDraft = null;
+    const parent = parentPathOf(draft.path);
+    const newPath = String(result?.path || childPathOf(parent, newName));
+    repoBrowserState.expandedPaths = rewritePathSet(repoBrowserState.expandedPaths, draft.path, newPath);
+    repoBrowserState.collapsedPaths = rewritePathSet(repoBrowserState.collapsedPaths, draft.path, newPath);
+    repoBrowserState.currentPath = rewritePathPrefix(repoBrowserState.currentPath, draft.path, newPath);
+    await reloadRepoDirectory(parent);
+    showTransientRelayNotice(`Renamed to "${newName}".`);
+  } catch (error) {
+    if (repoRenameDraft !== draft) return;
+    draft.busy = false;
+    renderRepoBrowser();
+    focusRepoInlineInput('[data-repo-rename-input]', { select: true });
+    showTransientRelayNotice(error?.message || 'Failed to rename', 6000);
+  }
+}
+
+function deleteConfirmationBody(pending, counts) {
+  const name = escHtml(pending.name);
+  const needsTypedName = counts.kind === 'dir' && (counts.files + counts.dirs) > 0;
+  let lead;
+  if (counts.kind !== 'dir') {
+    lead = `<p>Delete the file <strong>${name}</strong>?</p>`;
+  } else if (!needsTypedName) {
+    lead = `<p>Delete the empty folder <strong>${name}</strong>?</p>`;
+  } else {
+    const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+    const amount = counts.capped
+      ? 'more than 10,000 entries'
+      : `${plural(counts.files, 'file')} and ${plural(counts.dirs, 'folder')}`;
+    lead = `<p>Delete the folder <strong>${name}</strong> and everything in it?</p>
+      <p>It contains ${amount}.</p>
+      <label class="repo-delete-confirm-label">Type the folder name to confirm
+        <input type="text" class="repo-delete-confirm-input" data-repo-delete-confirm-input autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="${name}">
+      </label>`;
+  }
+  return `${lead}
+    <div class="summary-modal-actions">
+      <button class="chat-title-action-btn danger-btn" type="button" data-repo-delete-confirm${needsTypedName ? ' disabled data-keep-disabled="1"' : ''}>🗑 Delete</button>
+      <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
+    </div>`;
+}
+
+export async function openRepoDeleteConfirmation(pathValue) {
+  const entryPath = String(pathValue || '');
+  const node = repoBrowserState.nodeMap.get(entryPath);
+  if (!node || !entryPath || !canEditRepoEntries()) return;
+  const pending = { path: entryPath, name: String(node.name || entryNameOf(entryPath)), kind: node.type === 'dir' ? 'dir' : 'file', root: repoBrowserState.activeRoot };
+  repoDeletePending = pending;
+  openSummaryModal({
+    title: 'Delete',
+    subtitle: entryPath,
+    kind: 'explorer-delete',
+    bodyHtml: '<p class="repo-empty">Counting entries…</p>',
+  });
+  let counts;
+  try {
+    counts = await deleteExplorerEntry({ root: pending.root, path: entryPath, conversationId: currentConversationId(), dryRun: true });
+  } catch (error) {
+    if (repoDeletePending !== pending) return;
+    repoDeletePending = null;
+    closeSummaryModal();
+    showTransientRelayNotice(error?.message || 'Failed to read the entry', 6000);
+    return;
+  }
+  if (repoDeletePending !== pending) return;
+  renderSummaryModalContent({
+    title: 'Delete',
+    subtitle: entryPath,
+    kind: 'explorer-delete',
+    bodyHtml: deleteConfirmationBody(pending, {
+      kind: String(counts?.kind || pending.kind),
+      files: Number(counts?.files || 0),
+      dirs: Number(counts?.dirs || 0),
+      capped: counts?.capped === true,
+    }),
+  });
+  const input = document.querySelector('#summary-modal [data-repo-delete-confirm-input]');
+  if (input) input.focus();
+}
+
+async function confirmRepoDelete() {
+  const pending = repoDeletePending;
+  if (!pending) return;
+  const button = document.querySelector('#summary-modal [data-repo-delete-confirm]');
+  if (button?.disabled) return;
+  setSummaryModalLoading(true);
+  try {
+    await deleteExplorerEntry({ root: pending.root, path: pending.path, conversationId: currentConversationId() });
+  } catch (error) {
+    if (repoDeletePending !== pending) return;
+    setSummaryModalLoading(false);
+    showTransientRelayNotice(error?.message || 'Failed to delete', 6000);
+    return;
+  }
+  if (repoDeletePending !== pending) return;
+  repoDeletePending = null;
+  closeSummaryModal();
+  if (repoBrowserState.activeRoot !== pending.root) return;
+  const parent = parentPathOf(pending.path);
+  repoBrowserState.expandedPaths = dropPathsBelow(repoBrowserState.expandedPaths, pending.path);
+  repoBrowserState.collapsedPaths = dropPathsBelow(repoBrowserState.collapsedPaths, pending.path);
+  if (isSameOrBelow(repoBrowserState.currentPath, pending.path)) repoBrowserState.currentPath = parent;
+  await reloadRepoDirectory(parent);
+  showTransientRelayNotice(`Deleted "${pending.name}".`);
+}
+
+/**
+ * Refetch one folder's children after a change in it, then re-expand what was
+ * open below it. The session root itself is reloaded whole: its listing is
+ * special (a missing folder lists as empty, the transcript is a sibling) and
+ * the plain children route would not do.
+ */
+async function reloadRepoDirectory(dirPath) {
+  const target = String(dirPath || '');
+  const node = repoBrowserState.nodeMap.get(target);
+  const sessionRootItself = repoBrowserState.activeRoot === 'session' && target === String(repoBrowserState.tree?.path || '');
+  if (!node || node.type !== 'dir' || sessionRootItself) {
+    refreshRepoBrowser();
+    return;
+  }
+  const reopen = descendantsOf(repoBrowserState.expandedPaths, target);
+  node.childrenLoaded = false;
+  node.lazy = true;
+  await ensureRepoChildrenLoaded(target);
+  for (const descendant of reopen) {
+    if (repoBrowserState.nodeMap.has(descendant)) await ensureRepoChildrenLoaded(descendant);
+  }
+  if (!repoBrowserState.nodeMap.has(String(repoBrowserState.currentPath || ''))) {
+    repoBrowserState.currentPath = target;
+  }
+  renderRepoBrowser();
+}
+
+function focusRepoInlineInput(selector, { select = false } = {}) {
+  requestAnimationFrame(() => {
+    const input = document.querySelector(`#repo-browser-modal ${selector}`);
+    if (!input) return;
+    input.focus();
+    if (select) {
+      // Select the stem only: the common rename keeps the extension.
+      const value = String(input.value || '');
+      const dot = value.lastIndexOf('.');
+      input.setSelectionRange(0, dot > 0 ? dot : value.length);
+    }
+  });
+}
+
+/** Before a render replaces the markup: keep the typed text and whether it had focus. */
+function captureRepoInlineEdits() {
+  const newFolderInput = document.querySelector('#repo-folder [data-repo-new-folder-input]');
+  if (newFolderInput && repoNewFolderDraft) {
+    repoNewFolderDraft.value = newFolderInput.value;
+    repoNewFolderDraft.focused = document.activeElement === newFolderInput;
+  }
+  const renameInput = document.querySelector('#repo-browser-modal [data-repo-rename-input]');
+  if (renameInput && repoRenameDraft) {
+    repoRenameDraft.value = renameInput.value;
+    repoRenameDraft.focused = document.activeElement === renameInput;
+    repoRenameDraft.selection = [renameInput.selectionStart, renameInput.selectionEnd];
+  }
+}
+
+/** After the render: put the focus back where it was. */
+function restoreRepoInlineEditFocus() {
+  if (repoNewFolderDraft?.focused) {
+    const input = document.querySelector('#repo-folder [data-repo-new-folder-input]');
+    if (input && document.activeElement !== input) input.focus();
+  }
+  if (repoRenameDraft?.focused) {
+    const input = document.querySelector('#repo-browser-modal [data-repo-rename-input]');
+    if (input && document.activeElement !== input) {
+      input.focus();
+      const [start, end] = repoRenameDraft.selection || [];
+      if (Number.isFinite(start) && Number.isFinite(end)) input.setSelectionRange(start, end);
+    }
+  }
+}
+
+/** Run `swap` (which replaces markup) with the inline edits preserved across it. */
+function withRepoInlineEditsPreserved(swap) {
+  captureRepoInlineEdits();
+  repoInlineRenderInProgress = true;
+  try {
+    swap();
+  } finally {
+    repoInlineRenderInProgress = false;
+  }
+  restoreRepoInlineEditFocus();
+}
+
+function renameInputHtml(draft) {
+  return `<input type="text" class="repo-rename-input" data-repo-rename-input value="${escHtml(draft.value)}" autocomplete="off" spellcheck="false" autocapitalize="off" aria-label="New name"${draft.busy ? ' disabled' : ''}>`;
+}
+
+function newFolderRowHtml(draft) {
+  return `<form class="repo-inline-edit" data-repo-new-folder-form>
+    <span class="repo-inline-edit-icon">📁</span>
+    <input type="text" data-repo-new-folder-input value="${escHtml(draft.value)}" placeholder="New folder name" autocomplete="off" spellcheck="false" autocapitalize="off" aria-label="New folder name"${draft.busy ? ' disabled' : ''}>
+    <button type="submit" class="repo-browser-btn"${draft.busy ? ' disabled' : ''}>${draft.busy ? 'Creating…' : 'Create'}</button>
+    <button type="button" class="repo-browser-btn" data-repo-new-folder-cancel${draft.busy ? ' disabled' : ''}>Cancel</button>
+    <div class="repo-inline-edit-error" aria-live="polite">${escHtml(draft.error || '')}</div>
+  </form>`;
+}
+
+function repoEntryMenuItems(entryPath, isDir) {
+  const items = [];
+  if (isDir && canCreateRepoFolderIn(entryPath)) {
+    items.push({ id: 'new-folder', label: '📁 New folder here', onSelect: () => { void setRepoCurrentPath(entryPath).then(() => startRepoNewFolder(entryPath)); } });
+  }
+  // Roots are never renamed or deleted: the workspace root, `/`, the session
+  // root, and a drive (`C:`), which on Windows is a top-level child of the list.
+  const isRoot = !entryPath
+    || entryPath === '/'
+    || entryPath === String(repoBrowserState.tree?.path || '')
+    || (repoBrowserState.activeRoot !== 'workspace' && !parentPathOf(entryPath));
+  if (canEditRepoEntries() && !isRoot) {
+    if (items.length) items.push(MENU_SEPARATOR);
+    items.push({ id: 'rename', label: 'Rename', onSelect: () => startRepoRename(entryPath) });
+    items.push({ id: 'delete', label: 'Delete', danger: true, onSelect: () => { void openRepoDeleteConfirmation(entryPath); } });
+  }
+  return items;
+}
+
+function openRepoEntryMenu(element, x, y) {
+  const dirPath = element.getAttribute('data-repo-open-dir');
+  const filePath = element.getAttribute('data-repo-open-file');
+  const entryPath = dirPath !== null ? dirPath : filePath;
+  if (entryPath === null) return false;
+  const items = repoEntryMenuItems(String(entryPath), dirPath !== null);
+  if (!items.length) return false;
+  openContextMenu(x, y, items);
+  return true;
 }
 
 export function renderRepoTreeNode(node) {
@@ -1780,8 +2163,11 @@ export function renderRepoTreeNode(node) {
       : (lazyUnloaded
         ? '<div class="repo-empty">Expand to load entries…</div>'
         : children.map(renderRepoTreeNode).join(''));
+    const label = repoRenameDraft && repoRenameDraft.path === nodePath && nodePath
+      ? renameInputHtml(repoRenameDraft)
+      : escHtml(node.name || '/');
     return `<details class="repo-tree-node" data-repo-dir-path="${escHtml(nodePath)}"${openAttr}>
-      <summary class="repo-tree-summary" data-repo-open-dir="${escHtml(nodePath)}">${icon} ${escHtml(node.name || '/')}</summary>
+      <summary class="repo-tree-summary" data-repo-open-dir="${escHtml(nodePath)}">${icon} ${label}</summary>
       <div class="repo-tree-children">${childrenHtml}</div>
     </details>`;
   }
@@ -1895,8 +2281,13 @@ export function renderRepoFolder() {
   const children = Array.isArray(node.children)
     ? node.children.filter((child) => child?.type !== 'dir')
     : [];
+  const draftHtml = repoNewFolderDraft && repoNewFolderDraft.parentPath === String(node.path || '')
+    ? newFolderRowHtml(repoNewFolderDraft)
+    : '';
   if (!children.length) {
-    folderHost.innerHTML = '<div class="repo-empty">This folder has no files.</div>';
+    withRepoInlineEditsPreserved(() => {
+      folderHost.innerHTML = `${draftHtml}<div class="repo-empty">This folder has no files.</div>`;
+    });
     return;
   }
 
@@ -1906,6 +2297,8 @@ export function renderRepoFolder() {
     const childPath = String(child.path || '');
     const rawHref = repoRawHref(childPath);
     const icon = repoIcon(child);
+    const renaming = !!repoRenameDraft && repoRenameDraft.path === childPath;
+    const nameHtml = renaming ? renameInputHtml(repoRenameDraft) : escHtml(child.name || childPath);
     if (isGrid) {
       const ext = String(child.ext || '').replace('.', '');
       const isImage = String(child.previewKind || '').toLowerCase() === 'image' || REPO_IMAGE_EXTENSIONS.has(ext.toLowerCase());
@@ -1915,7 +2308,7 @@ export function renderRepoFolder() {
       const fileMeta = `${String(child.previewKind || 'file')} · ${formatBytes(child.size || 0)}`;
       return `<div class="repo-card repo-card-clickable" data-repo-open-file="${escHtml(childPath)}">
         <div class="repo-card-thumb">${thumb}</div>
-        <div class="repo-card-name" title="${escHtml(child.name || childPath)}">${escHtml(child.name || childPath)}</div>
+        <div class="repo-card-name" title="${escHtml(child.name || childPath)}">${nameHtml}</div>
         <div class="repo-entry-meta">${escHtml(fileMeta)}</div>
       </div>`;
     }
@@ -1925,7 +2318,7 @@ export function renderRepoFolder() {
       <div class="repo-entry-main">
         <span>${icon}</span>
         <div style="min-width:0">
-          <div class="repo-entry-name" title="${escHtml(child.name || childPath)}">${escHtml(child.name || childPath)}</div>
+          <div class="repo-entry-name" title="${escHtml(child.name || childPath)}">${nameHtml}</div>
           <div class="repo-entry-meta">${escHtml(mainMeta)}</div>
         </div>
       </div>
@@ -1933,7 +2326,9 @@ export function renderRepoFolder() {
   }).join('');
 
   const savedScrollTop = folderHost.scrollTop;
-  folderHost.innerHTML = `<div class="${wrapperClass}">${rows}</div>`;
+  withRepoInlineEditsPreserved(() => {
+    folderHost.innerHTML = `${draftHtml}<div class="${wrapperClass}">${rows}</div>`;
+  });
   folderHost.scrollTop = savedScrollTop;
 }
 
@@ -1956,7 +2351,9 @@ export function renderRepoTree() {
   // The rebuild resets the pane's scroll to 0; put it back so re-renders
   // (child loads, refreshes) don't rubber-band a scroll in progress.
   const savedScrollTop = treeHost.scrollTop;
-  treeHost.innerHTML = renderRepoTreeNode(root);
+  withRepoInlineEditsPreserved(() => {
+    treeHost.innerHTML = renderRepoTreeNode(root);
+  });
   updateRepoTreeSelection();
   treeHost.scrollTop = savedScrollTop;
   syncRepoTreeToCurrentPath();
@@ -2181,6 +2578,7 @@ export function setRepoBrowserRoot(root) {
   // A root switch invalidates any parked restore: the saved path belongs to the
   // tree we are leaving. The Set wipes below are correct here for the same reason.
   pendingRepoBrowserRestore = null;
+  clearRepoInlineEdits();
   setRepoBrowserState({
     tree: null,
     nodeMap: new Map(),
@@ -2330,6 +2728,7 @@ export function closeRepoBrowser() {
   modal.setAttribute('aria-hidden', 'true');
   repoBrowserState.open = false;
   repoBrowserCwdPickHandler = null;
+  clearRepoInlineEdits();
 }
 
 export function refreshRepoBrowser() {
@@ -2427,6 +2826,8 @@ export async function setRepoCurrentPath(pathValue) {
   updateRepoTreeSelection();
   syncRepoTreeToCurrentPath();
   updateRepoCwdPickBar();
+  // The New-folder button follows the open folder (a drive list has none).
+  updateRepoToolbarUi();
 }
 
 document.addEventListener('click', (event) => {
@@ -2596,7 +2997,105 @@ document.getElementById('repo-browser-modal').addEventListener('click', (event) 
   if (event.target.id === 'repo-browser-modal') closeRepoBrowser();
 });
 
+// The inline editors. Keys inside an input never reach the <summary> (Enter
+// would toggle the folder) or the document (Escape would close the explorer).
+function repoInlineInputOf(event) {
+  return eventClosest(event, '[data-repo-rename-input], [data-repo-new-folder-input]');
+}
+
+document.getElementById('repo-browser-modal').addEventListener('keydown', (event) => {
+  const input = repoInlineInputOf(event);
+  if (!input) return;
+  const isRename = input.hasAttribute('data-repo-rename-input');
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    event.stopPropagation();
+    if (isRename) void commitRepoRename();
+    else void commitRepoNewFolder();
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    event.stopPropagation();
+    if (isRename) cancelRepoRename();
+    else cancelRepoNewFolder();
+  } else if (event.key === ' ' && isRename) {
+    // A space in a <summary> toggles it; in a name it is a space.
+    event.stopPropagation();
+  }
+});
+
+document.getElementById('repo-browser-modal').addEventListener('input', (event) => {
+  const input = repoInlineInputOf(event);
+  if (!input) return;
+  if (input.hasAttribute('data-repo-rename-input') && repoRenameDraft) repoRenameDraft.value = input.value;
+  if (input.hasAttribute('data-repo-new-folder-input') && repoNewFolderDraft) repoNewFolderDraft.value = input.value;
+});
+
+// Leaving an untouched rename input ends the edit; a changed name stays open
+// until Enter, so a stray tap cannot lose or commit it. Renders swap the
+// input out and back, and that blur is not a cancel.
+document.getElementById('repo-browser-modal').addEventListener('focusout', (event) => {
+  if (repoInlineRenderInProgress) return;
+  const input = eventClosest(event, '[data-repo-rename-input]');
+  if (!input || !repoRenameDraft || repoRenameDraft.busy) return;
+  const node = repoBrowserState.nodeMap.get(repoRenameDraft.path);
+  const original = String(node?.name || entryNameOf(repoRenameDraft.path));
+  if (String(input.value || '').trim() === original) cancelRepoRename();
+});
+
+document.getElementById('repo-folder').addEventListener('submit', (event) => {
+  if (!eventClosest(event, '[data-repo-new-folder-form]')) return;
+  event.preventDefault();
+  void commitRepoNewFolder();
+});
+
+// Right-click on a desktop, long press on a phone: the entry's menu.
+for (const hostId of ['repo-tree', 'repo-folder']) {
+  const host = document.getElementById(hostId);
+  const selector = hostId === 'repo-tree' ? '[data-repo-open-dir]' : '[data-repo-open-file]';
+  host.addEventListener('contextmenu', (event) => {
+    if (repoInlineInputOf(event)) return;
+    const element = eventClosest(event, selector);
+    if (!element) return;
+    if (openRepoEntryMenu(element, event.clientX, event.clientY)) event.preventDefault();
+  });
+  bindLongPress(host, selector, (element, x, y) => {
+    if (element.querySelector('[data-repo-rename-input]')) return;
+    openRepoEntryMenu(element, x, y);
+  });
+}
+
+// The delete confirmation lives in the shared summary modal.
+document.getElementById('summary-modal').addEventListener('click', (event) => {
+  if (!eventClosest(event, '[data-repo-delete-confirm]')) return;
+  event.preventDefault();
+  void confirmRepoDelete();
+});
+
+document.getElementById('summary-modal').addEventListener('input', (event) => {
+  const input = eventClosest(event, '[data-repo-delete-confirm-input]');
+  if (!input || !repoDeletePending) return;
+  const button = document.querySelector('#summary-modal [data-repo-delete-confirm]');
+  if (!button) return;
+  // The modal's loading toggle re-enables every button it does not see as
+  // kept disabled; the name gate has to be expressed through that mark.
+  const mismatch = String(input.value || '').trim() !== repoDeletePending.name;
+  button.disabled = mismatch;
+  if (mismatch) button.dataset.keepDisabled = '1';
+  else delete button.dataset.keepDisabled;
+});
+
+document.getElementById('summary-modal').addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' || !eventClosest(event, '[data-repo-delete-confirm-input]')) return;
+  event.preventDefault();
+  void confirmRepoDelete();
+});
+
 document.getElementById('repo-tree').addEventListener('click', (event) => {
+  if (repoInlineInputOf(event)) {
+    // A click in the rename input must not toggle the folder it sits in.
+    event.preventDefault();
+    return;
+  }
   const fileButton = eventClosest(event, '[data-repo-open-file]');
   if (fileButton) {
     event.preventDefault();
@@ -2641,6 +3140,12 @@ document.getElementById('repo-tree').addEventListener('click', (event) => {
 });
 
 document.getElementById('repo-folder').addEventListener('click', (event) => {
+  if (eventClosest(event, '[data-repo-new-folder-cancel]')) {
+    event.preventDefault();
+    cancelRepoNewFolder();
+    return;
+  }
+  if (eventClosest(event, '[data-repo-new-folder-form]') || repoInlineInputOf(event)) return;
   const navDir = eventClosest(event, '[data-repo-nav-dir]');
   if (navDir) {
     event.preventDefault();
@@ -2677,7 +3182,12 @@ document.addEventListener('keydown', (event) => {
   const modal = document.getElementById('file-preview-modal');
   const repoModal = document.getElementById('repo-browser-modal');
   const summaryModal = document.getElementById('summary-modal');
+  // Topmost first. The summary modal sits above the explorer (a delete
+  // confirmation opened from it) except in CWD-pick mode, where the explorer
+  // is raised above the new-chat/summary modal that opened it.
+  const summaryOnTop = summaryModal.classList.contains('visible') && !repoBrowserCwdPickModeActive();
   if (modal.classList.contains('visible')) closeFilePreview();
+  else if (summaryOnTop) window.closeSummaryModal?.();
   else if (repoModal.classList.contains('visible')) closeRepoBrowser();
   else if (summaryModal.classList.contains('visible')) window.closeSummaryModal?.();
 });

@@ -346,6 +346,12 @@ export function createMessageRepository(db) {
         //
         // A turn blocked on an unanswered AskUserQuestion is never stale — it is
         // waiting on the human, and relay_questions carries its own expiry.
+        //
+        // The ceiling counts from the last human interaction with the turn, not
+        // from its start: answering a question restarts the clock. Otherwise an
+        // interview that waited hours for its answers would be cut off by the
+        // ceiling the moment the last answer arrived (live 2026-10-10: a
+        // five-question interview lost its reply that way).
         listRecoverableProcessing: db.prepare(`
           SELECT id, conversation_id, kind, relay_mode, model, retry_count, consumed_at
           FROM queue
@@ -353,7 +359,13 @@ export function createMessageRepository(db) {
             AND COALESCE(kind, '') != 'continuation'
             AND (
               COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
-              OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
+              OR (
+                @ceilingBefore IS NOT NULL
+                AND MAX(
+                  COALESCE(processing_at, timestamp),
+                  COALESCE((SELECT MAX(answered_at) FROM relay_questions WHERE queue_id = queue.id), '')
+                ) < @ceilingBefore
+              )
             )
             AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
         `),
@@ -431,15 +443,29 @@ export function createMessageRepository(db) {
         // A continuation with no live worker can only be torn down — replaying
         // it as deliverable work would send the CLI's own bookkeeping text back
         // to the CLI as a user prompt.
+        //
+        // Same staleness rules as listRecoverableProcessing: a continuation
+        // waiting on an unanswered question is never stale, and an answer
+        // restarts the ceiling clock. A background-agent interview hangs its
+        // question cards on the continuation row, so without this a long
+        // interview was torn down by the ceiling while the human was still
+        // answering (live 2026-10-10).
         listStaleProcessingContinuations: db.prepare(`
-          SELECT id, conversation_id
+          SELECT id, conversation_id, timestamp, processing_at, owner_last_claimed_at
           FROM queue
           WHERE status = 'processing'
             AND kind = 'continuation'
             AND (
               COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
-              OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
+              OR (
+                @ceilingBefore IS NOT NULL
+                AND MAX(
+                  COALESCE(processing_at, timestamp),
+                  COALESCE((SELECT MAX(answered_at) FROM relay_questions WHERE queue_id = queue.id), '')
+                ) < @ceilingBefore
+              )
             )
+            AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
         `),
         listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         // Authoritative "is a turn in flight" signal for the conversation list.

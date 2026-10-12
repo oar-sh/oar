@@ -5,8 +5,12 @@
 // `backgroundTasks` on reload; hidden whenever the set is empty.
 
 import { apiFetch } from './api-client.js';
-import { humanizeModelLabel } from './model-selector-options.mjs';
+import { formatTaskModelLabel, formatTaskTokens } from './task-row-format.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
+
+// Shared with the sub-agent rows (subagent-row.mjs); re-exported for the
+// transcript's finished-workflow card and the existing importers.
+export { formatTaskModelLabel, formatTaskTokens };
 import {
   getPreviewsForConversation,
   renderPreviewRowsInto,
@@ -71,16 +75,6 @@ function taskKindLabel(task) {
   return label === 'Subagent' && subagentType ? subagentType : label;
 }
 
-// "claude-opus-5-5" → "Opus 5.5". A bare alias ("opus") is what a spawn pin
-// carries until the subagent's first answer names the real model.
-export function formatTaskModelLabel(model) {
-  const value = String(model || '').trim();
-  if (!value) return '';
-  if (/^claude-/i.test(value)) return humanizeModelLabel(value);
-  if (/^[a-z]+(\[[^\]]+\])?$/i.test(value)) return value.charAt(0).toUpperCase() + value.slice(1);
-  return humanizeModelLabel(value);
-}
-
 // Detail line: the live tool call when the worker saw one ("🪓 Tool
 // (PowerShell): cd …", cropped to the row by CSS), else the SDK's progress
 // summary, else the bare tool name.
@@ -91,20 +85,6 @@ export function taskActivityText(task) {
   if (summary) return { text: summary, toolCall: false };
   const lastToolName = String(task?.lastToolName || '').trim();
   return { text: lastToolName ? `using ${lastToolName}` : '', toolCall: false };
-}
-
-// Compact token counts: "812 tok", "62.2k tok", "1.2M tok". Exported for the
-// transcript's finished-workflow card, which shares the panel's formatting.
-export function formatTaskTokens(totalTokens) {
-  const tokens = Number(totalTokens);
-  if (!Number.isFinite(tokens) || tokens <= 0) return '';
-  if (tokens < 1000) return `${tokens} tok`;
-  if (tokens < 1_000_000) {
-    const thousands = tokens / 1000;
-    return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k tok`;
-  }
-  const millions = tokens / 1_000_000;
-  return `${millions >= 100 ? Math.round(millions) : millions.toFixed(1)}M tok`;
 }
 
 function escHtml(value) {
@@ -377,6 +357,16 @@ async function stopBackgroundTask(conversationId, taskId) {
   }
 }
 
+// A sub-agent task opens its record in the viewer: the task's spawning
+// tool_use id is the run's id. Bash tasks, monitors and workflows have no
+// record, and Copilot's tasks carry no run id.
+export function subagentRunIdForTask(task) {
+  const runId = String(task?.toolUseId || '').trim();
+  if (!runId) return '';
+  const type = String(task?.taskType || '').trim();
+  return type === 'local_agent' || type === 'agent' || type === 'subagent' ? runId : '';
+}
+
 function renderTaskRow(conversationId, task) {
   const key = `${conversationId}:${task.taskId}`;
   const stopping = stopsInFlight.has(key);
@@ -403,7 +393,9 @@ function renderTaskRow(conversationId, task) {
     <div class="bg-task-row" data-task-id="${escHtml(task.taskId)}">
       ${foldButton}<span class="bg-task-icon" title="${escHtml(task.taskType || 'task')}">${taskIcon(task.taskType)}</span>
       <span class="bg-task-main">
-        <span class="bg-task-desc">${escHtml(task.description || task.taskId)}</span>
+        ${subagentRunIdForTask(task)
+          ? `<button type="button" class="subagent-open bg-task-desc" data-subagent-open="${escHtml(subagentRunIdForTask(task))}" title="Open this sub-agent's thoughts, tool calls and reply">${escHtml(task.description || task.taskId)}</button>`
+          : `<span class="bg-task-desc">${escHtml(task.description || task.taskId)}</span>`}
         ${activity.text ? `<span class="bg-task-detail${activity.toolCall ? ' bg-task-toolcall' : ''}" title="${escHtml(activity.text)}">${escHtml(activity.text)}</span>` : ''}
       </span>
       <span class="bg-task-side">

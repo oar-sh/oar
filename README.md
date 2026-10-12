@@ -35,25 +35,31 @@ OAR is under active development, so expect occasional rough edges and some provi
 
 <table>
 <tr>
-<td width="42%" rowspan="3" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.8"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.8" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></a>
+<td width="42%" rowspan="4" valign="top">
+<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.10"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.10" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></a>
 <br><sub>On a phone: the same conversations, installable as an app.</sub>
 </td>
 <td width="58%" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.8"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.8" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></a>
+<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.10"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.10" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></a>
 <br><sub>Agents working in parallel, each with live token counts and its own Stop.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.8"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.8" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></a>
+<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.10"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.10" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></a>
 <br><sub>When the agent needs a decision, it asks, and waits for your answer.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.8"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.8" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></a>
+<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.10"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.10" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></a>
 <br><sub>Read the reasoning, not just the answer.</sub>
+</td>
+</tr>
+<tr>
+<td valign="top">
+<a href="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.10"><img src="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.10" alt="A session watching two other sessions: a finished reply arrives as a compact relay-event row, the watching 2 sessions list is open with Unsubscribe, and a request to also watch a session on a paired relay waits on an Allow / Deny card"></a>
+<br><sub>Agents that watch agents: woken by events, approving nothing.</sub>
 </td>
 </tr>
 </table>
@@ -101,7 +107,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.9 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.10 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -114,7 +120,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.9'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.10'` before the command.
 
 ### npm
 
@@ -423,6 +429,16 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 
 ## Highlights
 
+### New in 0.9.10
+
+- **Watching sessions**: an agent subscribes to other sessions, on its own relay or on a paired one, and is woken by what happens there: a question waiting for an answer, an error, a reply, a background task that finished or failed, a session gone quiet, nothing running any more. Each wake-up is a short automated message in its conversation, shown as a compact row. Subscriptions only notify; they approve nothing. The first subscribe of a conversation asks you on a card, and the header shows **watching N sessions** with an Unsubscribe per subscription. See [Watching sessions](#watching-sessions).
+- **Notes between agents fold away**: a prompt another agent sent a session and the session's reply show as one row that opens to both.
+- **A sub-agent's whole record**: its title in the task panel, or its row under the finished reply, opens a viewer with its thoughts, every tool call with input and result, and its reply, live while it runs. **Keep sub-agent tool output** under Settings → General decides how long tool inputs and results are kept.
+- **What the plans have left**: `remote_relay`'s `usage` action tells an agent what each provider's plan has left on its own relay or a paired one, before it starts work that costs; `list_sessions` and `read_session` say whether a session is running a turn, only background work, or nothing.
+- **Folders in the file browser**: **📁+ New folder**, and a right-click (a long press on a phone) on a file or folder to rename or delete it.
+- **Back to the latest message**: a ⌄ button above the composer, with a count of the rows that arrived since, jumps back to the end, and the transcript follows new rows again.
+- **Fewer surprises**: archiving a session whose process is still active asks first, Settings opens with no conversation open (so a fresh install can turn on a provider), a queued relay restart no longer waits forever on a busy relay, and waking the host from sleep no longer restarts the running turns.
+
 ### New in 0.9.7
 
 - **Claude Cloud (experimental, off by default)**: a chat that runs Claude Code in a sandbox at Anthropic, on its own clone of a GitHub repository. Pick the repository and branch from a list, follow the turn live, answer its questions, stop it, change the model between turns; the results come back as pushed branches. See [Claude Cloud](#claude-cloud) for what it needs and what it does with the Claude login.
@@ -506,6 +522,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 - **Steer or queue.** On Claude, and on Copilot's SDK engine, a message you send during a live turn is pushed into that turn; the send button reads **Steer**. A folded message keeps a compact *merged* marker in the transcript, and one the agent answers separately gets its own reply. While the turn waits on a question card or plan approval, or is compacting, the button reads **Queue** and its tooltip says why: the message waits as a pending bubble (with **Cancel**) and steers in once the card is answered or the compaction ends. On the other runtimes, and on Copilot's Extension engine, messages sent during a turn queue behind it, and the button reads **Queue**.
 - **Stop** is on the running reply's bubble, whose header stays pinned at the top while a long reply scrolls; the send button never turns into Stop. Queued messages carry their own **Cancel** until they are picked up. A steered message that a Stop cut off is marked *Stopped with the turn — not answered* and offers **Resend**; the button then reads **Resent** on every device.
 - On Copilot, **Stop** ends only the reply: background agents the turn started keep running under their own **Stop** in the task panel.
+- The transcript follows new rows while you are at its end. Once you scroll about a screen up, a round **⌄** button fades in above the composer, with a badge counting the rows that arrived since; it takes you back to the end and the transcript follows again. From a search result or a pin deep in the history it loads the end first.
 
 ### Question cards
 
@@ -519,6 +536,7 @@ Use **🤗 Select Models** to choose which variants show up in the composer, the
 - The composer's task panel lists background work that outlives the reply that started it: backgrounded commands, subagents, monitors, and workflows on Claude; background agents and detached shells on Copilot's SDK engine. Each row shows its state, the model it runs on, the command it is running right now, its token count, and its own **Stop**. The panel scrolls when it holds more tasks than fit.
 - An **Ultracode** workflow folds out into a tree of its phases and agents (state, model, tokens). When it finishes, the summarizing reply keeps a collapsed *Finished background task* card holding the final tree, which survives reloads.
 - A background task's result arrives as its own *continuation* reply.
+- A sub-agent's title in the panel opens its whole record: its thoughts, every tool call with its full input and its result, its reply and the agents it started itself, in order and live while it runs, with its own **Stop**. The finished reply lists the turn's sub-agents as the same rows (model, type, tokens, time, how they ended), so the record stays one click away; a child agent opens in place and back returns to its parent. Claude records everything; Copilot and Cursor show what they report. A tool result is kept to its first 4 KB and a record to 2000 entries; **Keep sub-agent tool output** in Settings → General decides how long tool inputs and results are kept.
 - **⚙️ Settings → General → Background task timeout** (default 4 h; 0 = no limit, up to 10 h) caps how long background tasks alone may keep a Claude or Copilot session running after its reply. When the limit is reached, the tasks are stopped.
 
 ### Drafts across devices
@@ -530,13 +548,14 @@ The composer draft, attachments included, is saved per conversation on the relay
 - **Filter conversations…** above the list matches titles, ignoring case. It clears with **×** or Escape, and while it is active it loads older pages, so it searches every conversation, not just the loaded ones.
 - **🔍** in the conversation header searches message text across all conversations.
 - On startup, the relay imports the Copilot sessions stored on the host (through the installed Copilot runtime) into its database, so they appear in the list with their history. If the runtime is unavailable, the import is reported as failed rather than guessed from the filesystem.
-- **Archive** (🗄 on the row, or **Archive conversation** in the `⋯` menu) takes a conversation out of the list without deleting anything: its session worker is stopped, and a Claude Cloud chat's session at Anthropic is archived with it. The 🗄 toggle above the list shows the archived conversations; **Unarchive** (📂) brings one back, cloud session included. An archived chat that is opened cannot be sent to until it is unarchived; a message that reaches it anyway (an agent's through a paired relay, say) unarchives it. A conversation that is still working is not archived — stop it first.
+- **Archive** (🗄 on the row, or **Archive conversation** in the `⋯` menu) takes a conversation out of the list without deleting anything: its session worker is stopped, and a Claude Cloud chat's session at Anthropic is archived with it. The 🗄 toggle above the list shows the archived conversations; **Unarchive** (📂) brings one back, cloud session included. An archived chat that is opened cannot be sent to until it is unarchived; a message that reaches it anyway (an agent's through a paired relay, say) unarchives it. Archiving a conversation whose session process is still active (green in the list, idle or working) asks first, because archiving stops it. A conversation that is still working is not archived — stop it first.
 - A **right-click on a row** (a long press on a phone) opens a menu with Open, Edit title, Stop turn, Kill session, Archive or Unarchive, and Delete, so a session can be stopped or killed without opening it.
 - Deleting a conversation stops its session worker and removes its CLI session too (Copilot through the runtime, Claude by deleting that session's transcript). A Claude Cloud conversation's session at Anthropic is archived, not deleted. An imported Copilot session the relay never ran is only hidden: its CLI session stays, and nothing is stopped for it. A conversation that is still working — a running turn, one waiting on a question card or approval, or live background tasks — is not deleted, and the sidebar says why so you can stop it first.
 
 ### Files, git, and previews
 
 - Use **📁 Browse files** to inspect the workspace (💼), drives (📀), or the session's own folder (🕵️), and to open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.
+- **📁+ New folder** in the browser's toolbar opens a name field at the top of the folder pane; Enter creates the folder inside the open one and opens it. It works in the repository, on the drives, in the session folder, and in the folder picker of **New chat** and **Change CWD**. A right-click on a folder in the tree or a file in the folder pane (a long press on a phone) offers **Rename** and **Delete**, and on a folder **New folder here**. Delete says what goes, and a folder with content asks for its name to be typed first. Links are never followed or changed; roots (the repository root, `/`, a drive, the session folder) cannot be renamed or deleted, and the session folder is read-only apart from new folders.
 - Click the file and folder copy controls to insert `@file:...` / `@folder:...` tokens.
 - Workspace browsing follows the selected session's effective working directory. Running sessions keep their learned runtime directory, **🗂️ Change CWD** in the `⋯` menu changes the directory for the next launch, and `cd ...` typed in chat does not retarget the browser. A Claude Cloud chat has no **Change CWD**: it works on a clone at Anthropic.
 - Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **⬇ Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes** and **Full file** modes; closing it returns to the still-open list.
@@ -580,7 +599,7 @@ Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title
 
 ### Settings (⚙️ in the web UI)
 
-The modal is organised into six tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Claude Cloud**, **Grok**, and **Cursor** sub-tab), **Relays**, **Previews**, **Notifications**, and **Features** — and reopens on the tab you used last. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
+The modal is organised into six tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Claude Cloud**, **Grok**, and **Cursor** sub-tab), **Relays**, **Previews**, **Notifications**, and **Features** — and reopens on the tab you used last. The `⋯` menu opens it with no conversation open too, so a fresh install can turn on a provider before the first chat; until a provider is ready, the empty screen and **New Chat** point to Settings → Providers. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
 
 | Tab | Setting | Default | What it does |
 | --- | ------- | ------- | ------------ |
@@ -588,6 +607,7 @@ The modal is organised into six tabs — **General**, **Providers** (with a **Co
 | General | Show Suspend host action | on | Per browser: shows **💤 Suspend host** in the conversation menu |
 | General | Max turn duration | `60 min` | Hard cap on how long one turn may run before the relay requeues it (0 = no limit, up to 10 h; see below) |
 | General | Background task timeout | `4 h` | How long background tasks alone may keep a Claude or Copilot session running after its reply; then they are stopped (0 = no limit, up to 10 h) |
+| General | Keep sub-agent tool output | `90 days` | 7, 14, 30 or 90 days, or always: once a finished sub-agent's record is older, its tool inputs and results are removed (once a day); its thoughts, reply and the one-line summary of each tool call stay |
 | General | Autostart (Windows) | Off | *At sign-in* (a visible terminal after you log on) or *At system startup* (headless, no logon needed, one admin confirmation) |
 | General | Relay name | `OAR` (the hostname for paired relays) | Label of the installed PWA on every device, and this relay's name for [paired relays](#remote-relays) |
 | General | Check for updates automatically | off | Opt-in: the relay asks oar.sh for the latest version about twice a day. **Check for updates** works regardless; `OAR_NO_UPDATE_CHECK=1` blocks both |
@@ -839,6 +859,12 @@ is started with `provider: "claude-cloud"`, a `repo` (a GitHub URL or `owner/rep
 the default model of the other relay's Claude Cloud tab. Claude Cloud must be switched on there.
 A cloud session that exists can be read, prompted, waited for and stopped like any other.
 
+Two read actions help an agent plan: `usage` says what each provider's plan has left on a relay
+(Cursor's spend against its limit, Claude's windows and whether a usage limit has paused turns,
+Copilot and Grok where they are tracked; never account names, addresses or tokens), and
+`list_sessions` / `read_session` give each session's `state` (`running_turn`, `background_only` or
+`idle`) with its background agents and shell tasks.
+
 A `send`, `create_session` or `wait` call waits for the reply for as long as the agent asks, up to
 **Longest wait per tool call** of the relay the agent runs on (10 minutes unless you changed it,
 see [Agent sessions](#agent-sessions)). When the time is up the agent gets what there is so far
@@ -906,6 +932,49 @@ in steps of one minute. The agent can call `wait` again to keep waiting. The lim
 to this relay's agents when they wait for a session on a paired relay, so the slider can be moved
 whether or not the switch above it is on. A turn that waits is still subject to **Max turn duration**
 under **General** (60 minutes by default), which does not know about the wait.
+
+### Watching sessions
+
+An agent can watch other sessions instead of polling them: with `remote_relay`'s `subscribe` it
+asks to be woken when something happens there. It works for every provider, on this relay (with
+[agent sessions](#agent-sessions) switched on) and on a paired one.
+
+**What wakes it.** A question waiting for an answer (with its options), an error (a failed turn,
+the usage limit, a worker that died), a reply (with a preview), a background agent or shell task
+that finished or failed, a session that went quiet while working (15 minutes by default), and the
+moment nothing runs any more in the watched sessions. A subscription names sessions, or `all`
+for every session, later ones included; the watcher's own conversation is never watched. It can
+filter replies and task results by a regular expression, end after it fired once, and add a
+heartbeat while work runs.
+
+**What it looks like.** OAR writes a short message into the watcher's conversation: a new turn
+when the watcher is idle, a steer into the running turn on Claude and Copilot's SDK engine, the
+next turn otherwise. The message says it is automated, not from you, and that it approves
+nothing; it shows as a compact row, never as one of your messages. Events within 30 seconds come
+as one message; past 20 wake-ups an hour the rest comes as a digest every ten minutes, while
+questions and errors still come at once.
+
+**What it may do.** A subscription only notifies. It approves nothing and answers
+nothing; what an event asks for is decided as before, by you or by the agent within what
+it may do anyway. The first subscribe of a conversation, and any to `all`, asks you on an approval
+card naming the sessions (and the relay); `transfer_subscriptions`, which hands every subscription
+of an old watcher to a new one, always asks.
+
+**Where you see it.** The watcher's header shows **watching N sessions**; the chip opens the list
+of its subscriptions with an **Unsubscribe** button each. A watched session shows a **watched**
+badge.
+
+**Lifetime.** Subscriptions survive a restart and end on unsubscribe, when the watcher or the
+watched session is archived, after firing once (`once`), or, for a paired relay, when the pairing
+is removed.
+
+**On a paired relay** the relay must be unlocked in the conversation and allow at least reading,
+and the other relay must accept other relays' agents; nothing is asked there. This relay fetches
+the events every few seconds over the pairing (a pairing in one direction is enough), and their
+lines start with the other relay's name. If the link drops, the other relay keeps what happens
+(up to 500 events per subscription, for 7 days) and delivers it as one row tagged **replayed** once
+it answers again, questions and errors first, between "link lost" and "link restored". A relay
+that runs an older OAR answers that it needs an update.
 
 ## Security notes
 

@@ -330,6 +330,9 @@ export function renderRelayQuestions() {
     el.appendChild(wrapper);
   }
 
+  // An agent exchange whose turn asks this is shown whole, before anything
+  // scrolls (agent-exchange-fold-view.mjs).
+  window.syncAgentExchangeFolds?.();
   renderedRelayQuestionIds = nextRenderedQuestionIds;
   restoreFocusedQuestionControl(el, focusedControl);
   if (firstNewQuestionId) {

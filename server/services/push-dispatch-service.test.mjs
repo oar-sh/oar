@@ -420,6 +420,30 @@ test('an agent-started turn pushes neither "reply ready" nor "failed"; the user\
   assert.deepEqual(sends, ['turnComplete', 'turnFailed', 'turnComplete']);
 });
 
+test('a turn that answers relay events pushes neither "reply ready" nor "failed"; its questions still do', async () => {
+  const db = makeDb();
+  db.exec(`CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT, role TEXT, text TEXT, origin_json TEXT, kind TEXT)`);
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, kind) VALUES ('msg-event', 'conv-watcher', 'user', '[relay event · automated message from OAR]', 'relay-event')`).run();
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text) VALUES ('msg-user', 'conv-watcher', 'user', 'from the user')`).run();
+  const sends = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { sends.push(JSON.parse(body).data.type); } },
+  });
+  subscribeDevice(service);
+  assert.deepEqual(
+    await service.notifyTurnComplete({ conversationId: 'conv-watcher', messageId: 'reply-1', sourceMessageId: 'msg-event', text: 'noted' }),
+    { outcome: 'relay-event' },
+  );
+  assert.deepEqual(
+    await service.notifyTurnFailed({ conversationId: 'conv-watcher', messageId: 'reply-2', sourceMessageId: 'msg-event', text: 'failed' }),
+    { outcome: 'relay-event' },
+  );
+  assert.deepEqual(sends, []);
+  await service.notifyTurnComplete({ conversationId: 'conv-watcher', messageId: 'reply-3', sourceMessageId: 'msg-user', text: 'done' });
+  await service.notifyQuestion({ id: 'q-1', conversationId: 'conv-watcher', prompt: 'Merge now?', choices: ['Yes'] });
+  assert.deepEqual(sends, ['turnComplete', 'question']);
+});
+
 test('question pushes from an agent-started turn are unchanged', async () => {
   const db = makeDb();
   addMessagesTable(db);
