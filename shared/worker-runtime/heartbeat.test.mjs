@@ -102,3 +102,86 @@ test('requested pulses coalesce into one that carries the state at the end of th
   controller.requestPulse();
   assert.equal(timers.length, 3, 'a stop does not leave the window wedged');
 });
+
+// ─── Background tasks: the digest and the relay asking for the set again ─────
+
+function makeTaskController({ answers = [{ ok: true }], ids = () => ['task_fixture_b', 'task_fixture_a'], ...options } = {}) {
+  const calls = [];
+  const log = [];
+  let timer = null;
+  let beat = 0;
+  const controller = createHeartbeatController({
+    api: async (method, path, body) => {
+      calls.push({ method, path, body });
+      const answer = answers[Math.min(beat, answers.length - 1)];
+      beat += 1;
+      if (answer instanceof Error) throw answer;
+      return answer;
+    },
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => timer,
+    setHeartbeatTimer: (value) => { timer = value; },
+    getActiveQueueMessageId: () => '',
+    ...(ids ? { getBackgroundTaskIds: ids } : {}),
+    onResyncBackgroundTasks: () => { log.push('resync'); },
+    onAnswered: () => { log.push('answered'); },
+    ...options,
+  });
+  return { controller, calls, log };
+}
+
+test('the heartbeat body carries a digest of the live task ids, sorted ids only', async () => {
+  const { controller, calls } = makeTaskController();
+  await controller.pulseHeartbeat();
+  const sent = calls[0].body.backgroundTasks;
+  assert.equal(sent.count, 2);
+  assert.match(sent.digest, /^[0-9a-f]{16}$/);
+  const other = makeTaskController({ ids: () => ['task_fixture_a', 'task_fixture_b'] });
+  await other.controller.pulseHeartbeat();
+  assert.deepEqual(other.calls[0].body.backgroundTasks, sent, 'order does not matter');
+  const none = makeTaskController({ ids: () => [] });
+  await none.controller.pulseHeartbeat();
+  assert.equal(none.calls[0].body.backgroundTasks.count, 0, '"no tasks" is an opinion too');
+  assert.notEqual(none.calls[0].body.backgroundTasks.digest, sent.digest);
+});
+
+test('a worker that publishes no task sets sends no digest', async () => {
+  // Cursor, Grok and Claude Cloud workers: the relay reads a missing digest
+  // as no opinion and never asks them for a set.
+  const { controller, calls } = makeTaskController({ ids: null });
+  await controller.pulseHeartbeat();
+  assert.equal('backgroundTasks' in calls[0].body, false);
+});
+
+test('the relay asking for the set again reaches the worker, after the kept posts', async () => {
+  const { controller, log } = makeTaskController({ answers: [{ ok: true, resyncBackgroundTasks: true }, { ok: true }] });
+  await controller.pulseHeartbeat();
+  assert.deepEqual(log, ['answered', 'resync']);
+  await controller.pulseHeartbeat();
+  assert.deepEqual(log, ['answered', 'resync', 'answered'], 'not asked, not sent');
+});
+
+test('a relay that predates the digest answers without the field and nothing is sent again', async () => {
+  const { controller, calls, log } = makeTaskController({ answers: [{ ok: true, pendingCount: 0 }] });
+  assert.equal(await controller.pulseHeartbeat(), true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(log, ['answered']);
+});
+
+test('a resync that fails is asked for again by the next beat; a beat that fails asks for nothing', async () => {
+  let attempts = 0;
+  const { controller, log } = makeTaskController({
+    answers: [{ ok: true, resyncBackgroundTasks: true }, new Error('relay away'), { ok: true, resyncBackgroundTasks: true }],
+    onResyncBackgroundTasks: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('post failed');
+    },
+  });
+  assert.equal(await controller.pulseHeartbeat(), true, 'a failed resync does not fail the beat');
+  assert.equal(await controller.pulseHeartbeat(), false);
+  assert.equal(attempts, 1);
+  assert.equal(await controller.pulseHeartbeat(), true);
+  assert.equal(attempts, 2);
+  assert.deepEqual(log, ['answered', 'answered']);
+});

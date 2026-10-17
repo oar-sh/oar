@@ -14,6 +14,8 @@ export function registerCacheRoutes(app, deps) {
     bootstrapRuntimeSessionBindings,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
+    closeConversationPreviews,
+    conversationGroups = null,
   } = deps;
 
   const cacheRebuildService = createCacheRebuildService({
@@ -26,6 +28,8 @@ export function registerCacheRoutes(app, deps) {
     bootstrapRuntimeSessionBindings,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
+    closeConversationPreviews,
+    conversationGroups,
   });
 
   app.post('/api/cache/rebuild', auth, (req, res) => {

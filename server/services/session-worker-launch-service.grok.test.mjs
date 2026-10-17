@@ -60,7 +60,7 @@ test('tmux shell command for grok workers runs node without the script PTY wrapp
   const command = buildTmuxWorkerShellCommand('session-1', env);
   const workerScript = path.join('/repo', 'server', 'grok-worker', 'grok-session-worker.mjs')
     .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  assert.match(command, new RegExp(`exec 'node' '${workerScript}' --session-id 'session-1'$`));
+  assert.match(command, new RegExp(`exec '${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' '${workerScript}' --session-id 'session-1'$`));
   assert.doesNotMatch(command, /script -q/);
   assert.match(command, /export COPILOT_WEB_RELAY_WORKER_KIND='grok';/);
   assert.match(command, /export GROK_RELAY_MODEL='grok-4.5';/);
@@ -86,7 +86,7 @@ test('launchSessionCli spawns node for grok workers when tmux is unavailable', a
   });
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls.length, 1);
-  assert.equal(spawnCalls[0].command, 'node');
+  assert.equal(spawnCalls[0].command, process.execPath);
   assert.deepEqual(spawnCalls[0].args, [
     path.join('/repo', 'server', 'grok-worker', 'grok-session-worker.mjs'),
     '--session-id',

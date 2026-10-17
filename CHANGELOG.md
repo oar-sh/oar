@@ -3,7 +3,320 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
-## [Unreleased]
+## [0.9.11] — 2026-10-17
+
+Highlights: sessions an agent starts now sit in a group under the session
+that started it, with a pill that sums up what runs and what waits for you,
+and rows drag into, out of and within a group. Settings › Sharing lists every
+shared link with Copy, Renew and Stop and an access log of each open (the IP
+address optional), shared views hide the host's paths in one of three modes,
+**Preview as shared** shows what a viewer gets, and a 🙈 list gathers the
+messages hidden from viewers. The relay is harder to reach from outside: ten
+wrong tokens lock an address out for a minute, the live channel accepts only
+the relay's own origin, forwarded headers count only from a trusted proxy, and
+`?token=` signs in the page only. Day/Night is back in the ⋯ menu, next to the
+new **About OAR**.
+
+### Upgrade notes
+
+- **Behind a reverse proxy on another host or origin, set `trustProxy` and
+  `allowedOrigins`.** This is the first release that checks the origin of the
+  live Socket.IO channel and that reads the client address, host and scheme
+  from `X-Forwarded-*` headers only when the proxy is trusted. A proxy on the
+  relay host itself is trusted already (`trustProxy` defaults to
+  `"loopback"`). For one on another machine, or one that rewrites the `Host`
+  header, add to the config file (`~/.oar/config.json`, or `server/config.json`
+  in a git checkout) and restart the relay:
+
+  ```json
+  "trustProxy": "192.0.2.10",
+  "allowedOrigins": ["https://relay.example.com"]
+  ```
+
+  `trustProxy` takes what Express's `trust proxy` takes: the proxy's address,
+  a subnet such as `"10.0.0.0/8"`, or a hop count such as `1`.
+  `allowedOrigins` lists the public origins exactly as the browser shows them
+  (scheme, host, a port other than the default). Without them, the page loads
+  but its live connection is refused (the relay logs `Refused a handshake from
+  origin …`), and every client shares the proxy's address, so one client's
+  ten wrong tokens lock the rest out for a minute.
+- **Ten wrong tokens from one address within a minute answer `429`** with
+  `Retry-After` until the minute is over. Requests from the relay host itself
+  that no proxy forwarded are never counted.
+- **`?token=` works on the page address only.** Scripts that fetch API, file
+  or asset URLs with `?token=` must send `Authorization: Bearer <token>`
+  instead (or the cookie); a Socket.IO client passes it as `auth.token` (or
+  the cookie), not in the query.
+- **Restart web relay, cancelling a queued restart and Empty queue need only
+  the token**, from any signed-in device. The session-worker socket and the
+  image-operation run answer only requests from the relay host that no tunnel
+  or proxy forwarded.
+- Four database migrations (0013 previews, 0014 session groups, 0015 the place
+  in a group, 0016 the share access log) run by themselves on the first
+  start. The Node.js requirement is unchanged (22.13 or newer).
+
+### Added
+
+- **Session groups in the sidebar.** A session that an agent starts with the
+  `remote_relay` tool now sits under the session that started it. The head
+  row carries a fold button and a pill that sums up the members ("3 · 1 waiting
+  for you, 2 running"); the members are indented under it, folded away once
+  everything in the group has finished unless you fold or unfold it yourself.
+  A question or approval waiting in a folded member shows on the head row,
+  and a tap on it opens that member. A member's activity lifts the whole
+  group to the top of the list. The head row's menu archives the whole group
+  (members still working are kept and named) and stops everything running in
+  it, and dissolves it; any row's menu adds a conversation to a group,
+  moves it, or takes it out, and groups can be named by hand. The `remote_relay` tool's
+  `list_sessions` and `read_session` show the group a session is in (agents
+  only read it). Migration 0014 adds the `conversation_groups` table and the
+  `group_id` column; nothing is backfilled.
+- **Drag and drop for session groups.** Drag a session into a group, out of
+  it, or to another place inside it; the order you set stays, and later
+  arrivals join at the end. Drop one loose session onto the middle of another
+  and the two make a new group. On a phone a long press lifts the row and a
+  move drags it; with the keyboard, a member's menu has "Move up" and "Move
+  down". Migration 0015 adds the `group_position` column. Rolling back needs
+  no data change: older releases ignore the column, and a stale place they
+  leave behind is cleared when this release starts again.
+- **A 🙈 list of the messages hidden from shared viewers.** Next to 📍, a 🙈
+  button with a count appears while the open conversation hides messages
+  from its shared link (never in the shared view itself). It opens a list
+  like the pinned one: each row jumps to its message, also one far up in the
+  history, and has Unhide; "Unhide all" asks first and leaves only a message
+  whose turn is still running hidden, naming it. The count and the list cover
+  messages outside the loaded page, and other open tabs and devices follow a
+  change without a reload.
+- **Manage your shared links in Settings › Sharing.** Every shared
+  conversation is listed with when it was shared and last opened, how often
+  and by how many viewers. **Copy link** copies it, **Renew link** gives the
+  conversation a new link (the old one stops working at once), and **Stop
+  sharing** ends it; the `⋯` menu has **Stop sharing** too while the open
+  conversation is shared, and asks first. Each row unfolds into an access
+  log: one entry per open of the page (not per refresh) with time, IP
+  address, country and browser. The log carries over to a renewed link and
+  is deleted when you stop sharing or delete the conversation. Switch off
+  **Store viewer IP addresses** to log new opens without the address (the
+  status log of shared reads follows it); switching it off also offers to
+  remove the addresses already stored, from both logs. Distinct viewers are
+  still told apart. Migration 0016 adds the share lineage and the
+  `conversation_share_opens` table.
+- **Preview as shared.** The `⋯` menu's new entry opens the conversation as
+  a share link shows it, without creating one: what viewers get instead of a
+  path is marked green, whatever still looks like a path amber.
+- **Sub-agent records in shared views.** A sub-agent's row in a shared
+  conversation now opens its record, read-only and without Stop, filtered
+  like the rest of the share.
+
+- **Wrong tokens lock an address out for a minute.** Ten wrong tokens from
+  one address within a minute (a Bearer header, the cookie, the sign-in field
+  or a Socket.IO handshake) make the relay answer that address `429` with
+  `Retry-After` until the minute is over, the right token included, and the
+  sign-in page says how long to wait. The same stale value repeated counts
+  once, so a tab with an old cookie does not lock you out. Requests from the
+  relay host itself that no proxy forwarded are never locked out, so the
+  relay's own workers and agent tools keep working.
+- **About OAR in the ⋯ menu.** A new entry, "ℹ️ About OAR · <version>",
+  opens what this relay is and has done: version, commit (for a git
+  checkout) and when the relay started; each provider that is on, with its
+  CLI and SDK version and whether it is online; conversations, turns and
+  messages since the first conversation, turns per provider, and the usage
+  the providers report (Copilot premium requests, Cursor and Grok tokens and
+  cost, Claude Cloud cost); uptime, database size and running workers. With
+  the opt-in update check on it names the latest version, otherwise it says
+  where to turn the check on. Shared viewers do not get the entry. The data
+  comes from the new `GET /api/about`, which counts large databases in small
+  steps and keeps the totals for a minute.
+
+### Changed
+
+- **A stopped or renewed share link answers a plain 404**, the page included,
+  exactly like a link that never existed, and a shared page that is still open
+  stops at its next refresh instead of polling on. The address in the access
+  log and in the status log of shared reads is now the one the relay trusts
+  through its `trustProxy` setting; a forwarded header from an untrusted peer
+  no longer sets it.
+
+- **A share link no longer carries the relay host's paths.** The relay
+  filters what it serves to shared viewers, by **Paths and file names** in
+  Settings › Sharing: show every path, hide the path and keep the file name
+  (the default), or hide both. Tool lines, thoughts, replies, attachments and sub-agent records all
+  pass through it; before, only the viewer's browser shortened the paths in
+  tool lines, and attachments carried their full path on the host. Free text
+  is filtered on a best-effort basis: relative paths are left as they are.
+
+- **A long press on a sidebar row opens its menu when the finger lifts**, no
+  longer while it is still down: a long press that then moves drags the row
+  instead. Where rows cannot move (the Archived view, under a filter, on a
+  group's own line) the menu still opens during the press.
+
+- **A reply to another agent's note is no longer folded away.** Only the
+  note itself folds into its row now, "note from linux-test · report builder ·
+  answered below"; the session's reply to it always shows, like a reply to
+  you, because it may hold a line for you. A turn you steered a message into
+  folds its note too, since nothing of yours is behind the row any more. The
+  ⌄ button's badge counts the note and the reply as two rows.
+
+- **A conversation no longer scrolls down by itself while you read further
+  up.** It only moves when you are at its end, or when you have just sent a
+  message yourself. Anywhere else it stays exactly where it is, whatever
+  lands: a reply, a relay event, another agent's note, a question, an approval
+  or a plan board. The ⌄ button then tells you: it turns blue with a count
+  (or a dot while a reply is still being written) when something new is
+  below, and amber with a "?" when a question or an approval waits for your
+  answer; a screen reader hears both. The text you are reading also keeps its
+  place when the reply you are in the middle of is finished and when the
+  conversation reloads. New in Settings › General: "Jump to the end when I
+  send a message", on by default and saved in the browser; switch it off and
+  your own messages leave you where you are as well.
+
+- The npm package guard allows 7.25 MiB unpacked and 490 entries (was 6.75
+  MiB and 450); session groups, the stored previews, the background-task
+  resync, the transcript anchor, share management, path privacy in shared
+  views and About OAR grew the server and the app to about 7.05 MiB and 485
+  entries.
+
+- **Restart web relay, cancelling a queued restart and Empty queue work from
+  every signed-in device.** They were meant for the relay host only, but the
+  check let everything through a tunnel or a proxy on the same machine and
+  refused only a direct LAN connection; they now need the token and nothing
+  else. The other way round, the session-worker socket and the image-operation
+  run now answer only requests from the relay host itself: a loopback peer
+  with no `cf-ray` or other tunnel marker and no `X-Forwarded-For`,
+  `Forwarded` or `X-Real-IP`. A same-host proxy that adds no marker no longer
+  reaches them.
+
+- **A `?token=` signs in the page only.** The page takes it out of the address
+  and signs in with it as before; API, file and asset URLs now accept the
+  token in the `Authorization` header or the cookie only, and a Socket.IO
+  handshake no longer reads a `token` query.
+
+- **The live Socket.IO channel accepts the relay's own origin only** (it
+  accepted any). The host compared is the one the browser addressed,
+  `X-Forwarded-Host` included when a trusted proxy sends it; for a proxy that
+  rewrites the `Host` header, list the public origin in the new
+  `allowedOrigins` setting.
+
+### Fixed
+
+- **Day/Night is back in the ⋯ menu.** Since 0.9.10 the entry showed only in
+  a shared view; everywhere else, on every screen size, it was gone from the
+  menu. It is there again whenever you are signed in, with or without a
+  conversation open, and stays the one entry of a shared view.
+
+- **A shared conversation no longer marks every reply "ran on" its own
+  provider.** In a shared link to a Claude, Cursor, Grok or OpenAI
+  conversation, each reply carried the red `ran on claude` (etc.) chip, as if
+  the turn had run on the wrong provider. The shared view now knows which
+  provider the conversation is bound to, and shows the chip only when a reply
+  really ran on another one; with no provider bound it shows none.
+
+- **A wide table in the file reader scrolls sideways.** A markdown table wider
+  than the reader made the whole page scroll sideways, and a sideways swipe to
+  read the rest of it turned to the next file instead. The table now scrolls
+  in its own box, as code blocks do; a swipe that starts on it stays in the
+  file.
+
+- **A worker no longer stops reconnecting after a relay restart.** On Node
+  22, a worker whose reconnect reached a relay that was not ready yet gave up
+  for good: its process kept running without a connection, the relay started
+  no new one while that process lived, and every message to the session
+  stayed queued until the worker was killed and launched by hand. A failed
+  connect now always leads to the next attempt, with the usual backoff of up
+  to 8 seconds. As a safety net, the relay replaces a worker that has had no
+  connection for 60 seconds while a message waits for it: it stops the old
+  process and starts a new one, which then takes the message. It never does
+  so while a turn or background work of that session is running, and logs a
+  `WORKER DETACHED` line when it does.
+
+- **A relay restart no longer forgets running background tasks.** A session
+  with a background shell or sub-agent still running read as idle after the
+  relay restarted: its task panel was empty, **Suspend host** saw nothing
+  to wait for, and a watching session could be told `all_idle`. The relay
+  now asks each worker for its tasks again on the worker's next heartbeat,
+  and the tasks come back with their original start time. A session whose
+  worker was started before this update shows "background work, details not
+  reported since the relay restarted" until it reports. For the first 45
+  seconds after a relay start a suspend waits for sessions that are still
+  reporting, and a task that ended while the relay was away still reports
+  its end.
+
+- **Workers start when no `node` is on the relay's PATH.** A relay started
+  by the Windows system-startup task, before anyone signed in, ran fine, but
+  none of its workers ever started: they were launched with a bare `node`
+  that the task's PATH did not have, Windows reported the failure in a
+  dialog no one could see, and the log showed only a heartbeat timeout
+  every 90 seconds. Workers now run on the relay's own Node by its full path
+  on every platform, tmux included; `COPILOT_WEB_RELAY_NODE` still overrides
+  it. That Node's folder is added at the end of a worker's PATH when the PATH
+  lacks it, so the CLIs and commands a worker starts find a `node` too; a
+  PATH that has one keeps it.
+
+- **A worker that cannot be started says why.** On Windows, a launch whose
+  `start` command fails or never returns now fails at once, naming the
+  program, and the conversation's launch note shows it; before, the relay
+  waited for a heartbeat that never came. The relay log names the command
+  and the PATH, SystemRoot and ComSpec it was started with, also when a
+  launch saw no worker process yet, and a failed process-list read logs its
+  exit code and error output. Windows' own programs (PowerShell, schtasks,
+  taskkill and others) are called by their full path. Changing the launch
+  folder and the Windows autostart setting show the relay's reason when they
+  fail, not a bare "Failed to …", and an autostart read that fails is logged.
+
+- **The Windows system-startup launcher copes with an early boot.** The
+  launcher OAR generates adds Node's folder at the end of PATH and waits up
+  to two minutes for the `%TEMP%` folder to exist before it starts the relay
+  (a temp folder on a drive that a startup script creates later no longer
+  makes the relay and its CLIs fail); a wait that runs out is logged next to
+  the launcher. Settings now names how a boot task or launcher differs from
+  the generated one (a missing boot delay, an edited launcher) instead of
+  treating it as a failure; selecting "At system startup" again regenerates
+  both and keeps a changed launcher as a `.bak` copy. A boot task that cannot
+  be read no longer breaks the setting.
+
+- **Preview links survive a relay restart.** A preview lived only in the
+  relay's memory, so an update, a queued restart or a crash turned every
+  preview link into a 404, and publishing again gave a new link. Previews are
+  now kept in the relay's database and restored when it starts, each checked
+  again: a folder preview while its folder is still inside the workspace root,
+  a dev-server preview until the machine reboots (on Windows with fast
+  startup, until a Restart: Shut down and power-on is not seen as one).
+  Publishing the same port or folder again in a conversation returns the same
+  link. Deleting a conversation, also through a cache rebuild, closes its
+  previews; archiving keeps them. Settings → Previews shows when each preview
+  was published and last opened, and the limit of 8 names the oldest ones and
+  how to close them. Relay logs no longer carry a preview's token; a publicly
+  shared transcript shows a preview card with its label only and removes every
+  preview link quoted in its text, also one cut short by a reply still being
+  written. A preview the relay cannot check at a start (a busy database, an
+  unreadable folder) is not served, shows as such in Settings, and is checked
+  again every 15 s for ten minutes. The table comes with migration 0013, which
+  runs by itself on the first start; the npm package gains two modules for it.
+
+- **An install gets the dependency versions the release was tested with.**
+  The package asked for each of its dependencies "this version or newer", so
+  an install or update fetched whatever was newest that day, e.g. a newer
+  Copilot SDK than any release was tested with. The packages OAR depends on
+  directly (the Claude, Copilot and Cursor SDKs among them) are now pinned to
+  exact versions; a newer one arrives with an OAR update. Packages those
+  depend on still follow their own version ranges.
+
+- **Restart web relay no longer reports success when the relay refuses it.**
+  A refused request said "Relay restart requested"; it now shows the relay's
+  reason, and a request that got no answer says so instead of claiming
+  success. The restart after a feature-flag change and cancelling a queued
+  restart report their errors the same way, and Empty queue names the reason
+  it failed.
+
+- **Forwarded headers count only from a trusted proxy everywhere.** The
+  shared-view presence limit read `X-Forwarded-For` and `X-Real-IP` and the
+  share links read `X-Forwarded-Host` and `X-Forwarded-Proto` straight from the
+  request, so a direct client could pick its own rate-limit bucket or the
+  host of a new share link. Both now follow the `trustProxy` setting.
+
+- **`tunnelMarkerHeaders: []` in the config no longer switches off
+  `COPILOT_TUNNEL_MARKER_HEADERS`.** The two lists are merged, with `cf-ray`
+  always included.
 
 ## [0.9.10] — 2026-10-12
 

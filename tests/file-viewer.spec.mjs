@@ -54,16 +54,16 @@ test.describe("fullscreen file viewer", () => {
   });
 
   // A finger's swipe as the pointer events the viewer listens to.
-  const swipe = (page, from, to) => page.evaluate(({ from, to }) => {
+  const swipe = (page, from, to, selector = ".file-preview-image, .file-preview-card, article, .file-preview-code") => page.evaluate(({ from, to, selector }) => {
     const body = document.getElementById("file-preview-body");
-    const target = body.querySelector(".file-preview-image, .file-preview-card, article, .file-preview-code") || body;
+    const target = body.querySelector(selector) || body;
     const fire = (type, x, y) => target.dispatchEvent(new PointerEvent(type, {
       bubbles: true, cancelable: true, pointerId: 7, pointerType: "touch", isPrimary: true, clientX: x, clientY: y,
     }));
     fire("pointerdown", from.x, from.y);
     for (let i = 1; i <= 8; i += 1) fire("pointermove", from.x + (to.x - from.x) * (i / 8), from.y + (to.y - from.y) * (i / 8));
     fire("pointerup", to.x, to.y);
-  }, { from, to });
+  }, { from, to, selector });
 
   const modal = (page) => page.locator("#file-preview-modal");
   const position = (page) => page.locator("#file-preview-position");
@@ -124,6 +124,29 @@ test.describe("fullscreen file viewer", () => {
     await expect(position(page)).toHaveText("2 / 3");
     await swipe(page, { x: 80, y: 420 }, { x: 300, y: 420 });
     await expect(position(page)).toHaveText("1 / 3");
+  });
+
+  test("a wide table scrolls sideways in its own box, and a swipe on it stays in the file", async ({ page }) => {
+    const header = `| ${Array.from({ length: 8 }, (_, i) => `Column ${i + 1}`).join(" | ")} |`;
+    const rule = `|${" --- |".repeat(8)}`;
+    const row = `| ${Array.from({ length: 8 }, () => "a cell with several words in it").join(" | ")} |`;
+    fs.writeFileSync(path.join(dir, "wide.md"), `# Wide\n\nA line before the table.\n\n${header}\n${rule}\n${row}\n${row}\n`);
+    await open(page, "wide.md", galleryOf(["notes.md", "wide.md", "picture.png"], 1));
+    await expect(position(page)).toHaveText("2 / 3");
+    const layout = await page.evaluate(() => {
+      const body = document.getElementById("file-preview-body");
+      const table = body.querySelector("article table");
+      return {
+        tableScrolls: table.scrollWidth > table.clientWidth + 1 && getComputedStyle(table).overflowX === "auto",
+        bodyScrollsSideways: body.scrollWidth > body.clientWidth + 1,
+      };
+    });
+    expect(layout).toEqual({ tableScrolls: true, bodyScrollsSideways: false });
+
+    await swipe(page, { x: 300, y: 420 }, { x: 80, y: 420 }, "article table td");
+    await expect(position(page)).toHaveText("2 / 3");
+    await swipe(page, { x: 300, y: 420 }, { x: 80, y: 420 }, "article p");
+    await expect(position(page)).toHaveText("3 / 3");
   });
 
   test("the back gesture closes the viewer and leaves the address as it was", async ({ page }) => {

@@ -1,13 +1,14 @@
 // The header's ⋯ menu: one decision for its trigger and for every entry, with
 // or without a conversation open. No DOM here; bootstrap.js applies the result.
 //
-// The menu holds two kinds of entries. Relay-wide ones (Settings, Restart web
-// relay, Select Models, Check Usage, the queue, Day/Night, the PWA version)
-// are shown whenever the app is signed in, so Settings can be reached on a
-// fresh install, where no conversation exists yet. Per-conversation ones (Edit
-// title, Share, Archive, Inspect tmux, Change CWD, Git changes, Kill session,
-// Open on claude.ai) are hidden, not greyed, while nothing is open: an empty
-// screen offers what can be done there and nothing else.
+// The menu holds two kinds of entries. Relay-wide ones (Settings, About OAR,
+// Restart web relay, Select Models, Check Usage, the queue, Day/Night, the PWA
+// version) are shown whenever the app is signed in, so Settings can be reached
+// on a fresh install, where no conversation exists yet. Per-conversation ones
+// (Edit title, Share, Stop sharing, Preview as shared, Archive, Inspect tmux,
+// Change CWD, Git changes, Kill session, Open on claude.ai) are hidden, not
+// greyed, while nothing is open: an empty screen offers what can be done there
+// and nothing else.
 //
 // The shared read-only view is its own branch: Day/Night only, whatever the
 // conversation state, and the trigger stays usable even when the shared
@@ -26,11 +27,14 @@ export const CHAT_ACTIONS_MENU_ENTRY_IDS = Object.freeze([
   'chat-menu-pwa-version',
   'chat-menu-queue-status',
   'chat-menu-edit-title',
-  'chat-menu-shared-theme-toggle',
+  'chat-menu-theme-toggle',
   'chat-menu-usage',
   'chat-menu-compact',
   'chat-menu-share-conversation',
+  'chat-menu-stop-sharing',
+  'chat-menu-preview-shared',
   'chat-menu-archive',
+  'chat-menu-group',
   'chat-menu-refresh-history',
   'chat-menu-inspect-tmux',
   'chat-menu-select-models',
@@ -38,6 +42,7 @@ export const CHAT_ACTIONS_MENU_ENTRY_IDS = Object.freeze([
   'chat-menu-git-changes',
   'chat-menu-open-cloud-session',
   'chat-menu-settings',
+  'chat-menu-about',
   'chat-menu-restart-relay',
   'chat-menu-suspend-host',
   'chat-menu-kill-session',
@@ -59,6 +64,7 @@ const hidden = () => ({ hidden: true, disabled: true });
  * @param {string|null} [input.cloudSessionUrl] its claude.ai session link, if reported
  * @param {boolean} [input.editing] its title is being edited
  * @param {boolean} [input.suspendVisible] the "show Suspend host" setting
+ * @param {boolean} [input.hasActiveShare] it has a public share link
  * @returns {{ trigger: { hidden: boolean, disabled: boolean }, entries: Record<string, { hidden: boolean, disabled: boolean }> }}
  */
 export function resolveChatActionsMenuState({
@@ -70,11 +76,12 @@ export function resolveChatActionsMenuState({
   cloudSessionUrl = null,
   editing = false,
   suspendVisible = false,
+  hasActiveShare = false,
 } = {}) {
   const entries = {};
   if (sharedMode) {
     for (const id of CHAT_ACTIONS_MENU_ENTRY_IDS) entries[id] = hidden();
-    entries['chat-menu-shared-theme-toggle'] = shown();
+    entries['chat-menu-theme-toggle'] = shown();
     return { trigger: { hidden: false, disabled: false }, entries };
   }
 
@@ -87,10 +94,13 @@ export function resolveChatActionsMenuState({
 
   for (const id of CHAT_ACTIONS_MENU_ENTRY_IDS) entries[id] = shown();
   for (const id of ALWAYS_HIDDEN_IDS) entries[id] = hidden();
-  entries['chat-menu-shared-theme-toggle'] = hidden();
   entries['chat-menu-edit-title'] = perConversation();
   entries['chat-menu-share-conversation'] = perConversation();
+  // Only a conversation with a live link has something to stop.
+  entries['chat-menu-stop-sharing'] = hasConversation && hasActiveShare ? shown() : hidden();
+  entries['chat-menu-preview-shared'] = perConversation();
   entries['chat-menu-archive'] = perConversation();
+  entries['chat-menu-group'] = perConversation();
   entries['chat-menu-inspect-tmux'] = perConversation();
   entries['chat-menu-git-changes'] = perConversation();
   // A cloud session has no working directory on the relay host to change.

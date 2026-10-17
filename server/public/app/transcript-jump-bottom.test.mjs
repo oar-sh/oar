@@ -7,6 +7,7 @@ import {
   countNewRows,
   isNearBottom,
   jumpBadgeText,
+  jumpButtonPresentation,
   jumpScrollBehavior,
   nextJumpButtonState,
   shouldRepinOnResize,
@@ -42,7 +43,7 @@ test('once shown it stays on the way back down and fades out only at the bottom'
   state = nextJumpButtonState(state, at(NEAR + 1));
   assert.equal(state.visible, true);
   state = nextJumpButtonState(state, at(NEAR));
-  assert.deepEqual(state, { visible: false, baseline: null, count: 0 });
+  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false });
 });
 
 test('a transcript with no height never shows the button', () => {
@@ -68,27 +69,19 @@ test('the badge counts the rows that arrived after the reader left the bottom', 
   assert.equal(state.count, 0);
 });
 
-test('a folded agent exchange counts as one row, its prompt, reply and live bubble together', () => {
-  const prompt = transcriptRowKey({ messageId: 'msg_fixture_prompt', exchangePromptId: 'msg_fixture_prompt' });
-  const live = transcriptRowKey({ messageId: 'msg_fixture_prompt', exchangePromptId: 'msg_fixture_prompt', live: true });
-  const reply = transcriptRowKey({ messageId: 'msg_fixture_reply', exchangePromptId: 'msg_fixture_prompt' });
-  assert.equal(prompt, live);
-  assert.equal(prompt, reply);
+test('a folded agent prompt and its reply are two rows, like any turn', () => {
+  const prompt = transcriptRowKey({ messageId: 'msg_fixture_prompt' });
+  const live = transcriptRowKey({ messageId: 'msg_fixture_prompt', live: true });
+  const reply = transcriptRowKey({ messageId: 'msg_fixture_reply' });
   const baseline = ['msg:a'];
-  assert.equal(countNewRows(baseline, ['msg:a', prompt, live]), 1);
-  assert.equal(countNewRows(baseline, ['msg:a', prompt, reply]), 1);
-  assert.equal(countNewRows(baseline, ['msg:a', prompt, reply, 'msg:b']), 2);
-  // Two exchanges are two rows.
-  const other = transcriptRowKey({ messageId: 'msg_fixture_other', exchangePromptId: 'msg_fixture_other' });
-  assert.equal(countNewRows(baseline, ['msg:a', prompt, reply, other, other]), 2);
+  assert.equal(countNewRows(baseline, ['msg:a', prompt]), 1);
+  assert.equal(countNewRows(baseline, ['msg:a', prompt, live]), 2);
+  assert.equal(countNewRows(baseline, ['msg:a', prompt, reply]), 2);
+  // A fold's prompt id is no key of its own any more.
+  assert.equal(transcriptRowKey({ messageId: 'msg_fixture_reply', exchangePromptId: 'msg_fixture_prompt' }), reply);
 });
 
-test('an exchange already on the page when the reader left is not news when its reply folds in', () => {
-  const fold = transcriptRowKey({ messageId: 'msg_fixture_prompt', exchangePromptId: 'msg_fixture_prompt' });
-  assert.equal(countNewRows(['msg:a', fold], ['msg:a', fold, fold]), 0);
-});
-
-test('rows outside a fold keep keys of their own, the live bubble apart from its prompt', () => {
+test('rows keep keys of their own, the live bubble apart from its prompt', () => {
   assert.equal(transcriptRowKey({ messageId: 'msg_fixture_a' }), 'msg:msg_fixture_a');
   assert.equal(transcriptRowKey({ messageId: 'msg_fixture_a', live: true }), 'live:msg_fixture_a');
   assert.equal(transcriptRowKey({ messageId: '  ' }), '');
@@ -133,4 +126,77 @@ test('a resize re-pins a reader who was following while scrollTop has not moved 
   // geometry decides.
   assert.equal(shouldRepinOnResize({ pinned: true, pinnedScrollTop: 1200, scrollTop: 300, nearBottomNow: false }), false);
   assert.equal(shouldRepinOnResize({ pinned: false, pinnedScrollTop: 1200, scrollTop: 1500, nearBottomNow: true }), true);
+  // A reader who was not at the end and has not moved: a resize that brings
+  // the end within the margin (the composer shrank) does not take them there.
+  assert.equal(shouldRepinOnResize({ pinned: false, pinnedScrollTop: 1200, scrollTop: 1200, nearBottomNow: true }), false);
+});
+
+test('a new row shows the button at any distance from the end', () => {
+  // Half a screen up: the plain button would not show yet.
+  let state = nextJumpButtonState(null, at(SCREEN / 2, ['msg:a']));
+  assert.equal(state.visible, false);
+  state = nextJumpButtonState(state, at(SCREEN / 2 + 120, ['msg:a', 'msg:b']));
+  assert.equal(state.visible, true);
+  assert.equal(state.count, 1);
+  assert.equal(jumpButtonPresentation(state).state, 'new');
+});
+
+test('an update that was not followed marks the button until the bottom, without a row to count', () => {
+  // A reply growing in its live bubble: the rows are the same.
+  let state = nextJumpButtonState(null, at(SCREEN / 2, ['msg:a', 'live:a']));
+  state = nextJumpButtonState(state, { ...at(SCREEN / 2 + 300, ['msg:a', 'live:a']), unseen: true });
+  assert.equal(state.visible, true);
+  assert.equal(state.count, 0);
+  assert.equal(state.unseen, true);
+  // It holds through later rounds that have nothing new to say.
+  state = nextJumpButtonState(state, at(SCREEN / 2 + 300, ['msg:a', 'live:a']));
+  assert.equal(state.unseen, true);
+  assert.deepEqual(jumpButtonPresentation(state), {
+    state: 'new',
+    label: 'Jump to the latest message (new below)',
+    badge: '',
+    dot: true,
+    announcement: 'New messages below.',
+  });
+  state = nextJumpButtonState(state, at(0, ['msg:a', 'live:a']));
+  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false });
+});
+
+test('a waiting question shows the button and clears with the question, not with the distance', () => {
+  let state = nextJumpButtonState(null, { ...at(SCREEN / 2, ['msg:a']), question: true });
+  assert.equal(state.visible, true);
+  assert.equal(state.question, true);
+  assert.equal(jumpButtonPresentation(state).state, 'question');
+  // Answered elsewhere: the card is gone, the button stays as a plain one.
+  state = nextJumpButtonState(state, { ...at(SCREEN / 2, ['msg:a']), question: false });
+  assert.equal(state.question, false);
+  assert.equal(state.visible, true);
+  assert.equal(jumpButtonPresentation(state).state, 'plain');
+  // At the bottom a question is on screen: nothing to mark.
+  state = nextJumpButtonState(state, { ...at(NEAR, ['msg:a']), question: true });
+  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false });
+});
+
+test('how each state looks and reads', () => {
+  const plain = { state: 'plain', label: 'Jump to the latest message', badge: '', dot: false, announcement: '' };
+  assert.deepEqual(jumpButtonPresentation(), plain);
+  assert.deepEqual(jumpButtonPresentation({ visible: true }), plain);
+  // Hidden: plain whatever it knew.
+  assert.deepEqual(jumpButtonPresentation({ visible: false, count: 3, unseen: true, question: true }), plain);
+  assert.deepEqual(jumpButtonPresentation({ visible: true, count: 3, unseen: true }), {
+    state: 'new',
+    label: 'Jump to the latest message (3 new)',
+    badge: '3',
+    dot: false,
+    announcement: 'New messages below.',
+  });
+  assert.equal(jumpButtonPresentation({ visible: true, count: 250 }).badge, '99+');
+  // A question wins over news.
+  assert.deepEqual(jumpButtonPresentation({ visible: true, count: 3, unseen: true, question: true }), {
+    state: 'question',
+    label: 'A question is waiting for your answer. Jump to it',
+    badge: '?',
+    dot: false,
+    announcement: 'A question is waiting for your answer below.',
+  });
 });

@@ -1,11 +1,16 @@
 // The transcript's jump-to-bottom button, without the DOM: when it shows,
-// what its badge counts, how far a click scrolls smoothly, and whether a
-// resize of the transcript re-pins a reader who was following the end.
+// which of its three states it is in (plain, something new below, a question
+// waits below), what its badge counts, how far a click scrolls smoothly, and
+// whether a resize of the transcript re-pins a reader who was following the
+// end.
 // transcript-jump-bottom-view.mjs reads the scroller and the rows and applies
 // what this module decides.
 //
 // "At the bottom" is the composer's near-bottom rule (isMessagesNearBottom,
 // resolveNearBottomThresholdPx); the caller passes its threshold in.
+//
+// Also here: the setting that decides whether the reader's own send jumps to
+// the end.
 
 /** The button fades in once the reader is this many screens above the end. */
 export const JUMP_BUTTON_SHOW_SCREENS = 1;
@@ -14,15 +19,11 @@ export const JUMP_SMOOTH_MAX_SCREENS = 3;
 export const JUMP_BADGE_MAX = 99;
 
 /**
- * One key per row the reader sees. Every row of a folded agent exchange
- * (its prompt, its replies, its live bubble) carries the prompt's id, so the
- * fold counts once however many of its rows are on the page. The live
- * bubble of a turn outside a fold has the prompt's id as its message id, so
- * it gets a key of its own.
+ * One key per row the reader sees. The live bubble of a turn has the
+ * prompt's id as its message id, so it gets a key of its own. A folded agent
+ * prompt is a row like any other: its reply shows below it and counts too.
  */
-export function transcriptRowKey({ messageId = '', exchangePromptId = '', live = false } = {}) {
-  const fold = String(exchangePromptId || '').trim();
-  if (fold) return `fold:${fold}`;
+export function transcriptRowKey({ messageId = '', live = false } = {}) {
   const id = String(messageId || '').trim();
   if (!id) return '';
   return live ? `live:${id}` : `msg:${id}`;
@@ -57,18 +58,83 @@ export function isNearBottom(distance, nearBottomPx) {
 /**
  * The button's next state from the scroller's geometry. At the bottom it
  * hides and forgets the baseline. Away from it, the rows on the page when the
- * reader left are the baseline the badge counts from; the button shows from
- * one screen above the end and, once shown, stays until the bottom.
+ * reader left are the baseline the badge counts from; the plain button shows
+ * from one screen above the end and, once shown, stays until the bottom.
+ *
+ * The transcript does not move under a reader who is away from the end, so
+ * the button is how they learn of what landed there, at any distance:
+ * `unseen` is a live update that was not followed (it holds until the
+ * bottom: a reply growing in its bubble adds no row to count), `question` a
+ * card waiting for an answer below the viewport (as it is now: answered
+ * elsewhere, it is gone).
  */
-export function nextJumpButtonState(previous, { distance, clientHeight, nearBottomPx, rowKeys = [] } = {}) {
-  if (isNearBottom(distance, nearBottomPx)) return { visible: false, baseline: null, count: 0 };
+export function nextJumpButtonState(previous, {
+  distance,
+  clientHeight,
+  nearBottomPx,
+  rowKeys = [],
+  unseen = false,
+  question = false,
+} = {}) {
+  if (isNearBottom(distance, nearBottomPx)) {
+    return { visible: false, baseline: null, count: 0, unseen: false, question: false };
+  }
   const baseline = Array.isArray(previous?.baseline) ? previous.baseline : rowKeys.slice();
   const screens = Number(clientHeight) > 0 ? Number(distance) / Number(clientHeight) : 0;
+  const count = countNewRows(baseline, rowKeys);
+  const unseenNow = previous?.unseen === true || unseen === true;
+  const questionNow = question === true;
   return {
-    visible: previous?.visible === true || screens >= JUMP_BUTTON_SHOW_SCREENS,
+    visible: previous?.visible === true || screens >= JUMP_BUTTON_SHOW_SCREENS || count > 0 || unseenNow || questionNow,
     baseline,
-    count: countNewRows(baseline, rowKeys),
+    count,
+    unseen: unseenNow,
+    question: questionNow,
   };
+}
+
+export const JUMP_BUTTON_LABEL = 'Jump to the latest message';
+export const JUMP_BUTTON_QUESTION_LABEL = 'A question is waiting for your answer. Jump to it';
+export const JUMP_QUESTION_BADGE = '?';
+
+/**
+ * How a state looks and reads. `state` is 'plain', 'new' or 'question'; a
+ * waiting question wins over news. `badge` is the count, '?' for a question,
+ * or empty: with `dot`, an empty badge is drawn as a dot (news without a row
+ * to count). `announcement` is what a screen reader is told when the state is
+ * entered; the label alone is only read when the button is focused.
+ */
+export function jumpButtonPresentation({ visible = false, count = 0, unseen = false, question = false } = {}) {
+  if (!visible) return { state: 'plain', label: JUMP_BUTTON_LABEL, badge: '', dot: false, announcement: '' };
+  if (question) {
+    return {
+      state: 'question',
+      label: JUMP_BUTTON_QUESTION_LABEL,
+      badge: JUMP_QUESTION_BADGE,
+      dot: false,
+      announcement: 'A question is waiting for your answer below.',
+    };
+  }
+  const badge = jumpBadgeText(count);
+  if (badge) {
+    return {
+      state: 'new',
+      label: `${JUMP_BUTTON_LABEL} (${Math.trunc(Number(count))} new)`,
+      badge,
+      dot: false,
+      announcement: 'New messages below.',
+    };
+  }
+  if (unseen) {
+    return {
+      state: 'new',
+      label: `${JUMP_BUTTON_LABEL} (new below)`,
+      badge: '',
+      dot: true,
+      announcement: 'New messages below.',
+    };
+  }
+  return { state: 'plain', label: JUMP_BUTTON_LABEL, badge: '', dot: false, announcement: '' };
 }
 
 /** 'smooth' up to JUMP_SMOOTH_MAX_SCREENS above the end, else 'instant'. */
@@ -88,12 +154,57 @@ export function jumpBadgeText(count) {
 /**
  * Whether a resize of the transcript (the composer or the background-task
  * panel growing under it) re-pins it to the end. The scroller shrinking from
- * below keeps scrollTop and fires no scroll event, so a reader who was
- * following is still described by the last scroll: `pinned` and the
- * scrollTop it was taken at. Once scrollTop has moved since (a restore, a
- * clamp, the browser's anchoring), the geometry as it is now decides.
+ * below keeps scrollTop and fires no scroll event, so the reader is still
+ * described by the last note of their position: `pinned` (they followed the
+ * end, by a scroll event or when the content last changed) and the scrollTop
+ * it was taken at. While scrollTop is that one, the note alone decides: a
+ * reader who was not at the end is never taken there by a resize. Once
+ * scrollTop has moved since (a restore, a clamp, the browser's anchoring),
+ * the note is stale and the geometry as it is now decides.
  */
 export function shouldRepinOnResize({ pinned, pinnedScrollTop, scrollTop, nearBottomNow }) {
-  if (pinned && Number(scrollTop) === Number(pinnedScrollTop)) return true;
+  if (Number(scrollTop) === Number(pinnedScrollTop)) return pinned === true;
   return nearBottomNow === true;
+}
+
+// "Jump to the end when I send a message" (Settings › General). A setting of
+// this browser, kept in localStorage like the theme. On unless switched off:
+// with it off, the reader's own send follows the same rule as everything
+// else and only scrolls a transcript that is at its end already. The
+// document and the storage are passed in by the tests.
+
+export const SCROLL_ON_SEND_STORAGE_KEY = 'copilot_scroll_on_send';
+export const SCROLL_ON_SEND_TOGGLE_ID = 'scroll-on-send-toggle';
+
+/** Anything but an explicit off is on: a missing or damaged value included. */
+export function parseScrollOnSendSetting(stored) {
+  const value = String(stored ?? '').trim().toLowerCase();
+  if (!value) return true;
+  return value !== '0' && value !== 'false';
+}
+
+export function serializeScrollOnSendSetting(enabled) {
+  return enabled ? '1' : '0';
+}
+
+function storage() {
+  try { return globalThis.localStorage || null; } catch { return null; }
+}
+
+export function isScrollOnSendEnabled(store = storage()) {
+  try {
+    return parseScrollOnSendSetting(store?.getItem(SCROLL_ON_SEND_STORAGE_KEY));
+  } catch {
+    return true;
+  }
+}
+
+export function syncScrollOnSendToggle(doc = globalThis.document, store = storage()) {
+  const checkbox = doc?.getElementById?.(SCROLL_ON_SEND_TOGGLE_ID);
+  if (checkbox) checkbox.checked = isScrollOnSendEnabled(store);
+}
+
+export function updateScrollOnSendSetting(enabled, { doc = globalThis.document, store = storage() } = {}) {
+  try { store?.setItem(SCROLL_ON_SEND_STORAGE_KEY, serializeScrollOnSendSetting(!!enabled)); } catch {}
+  syncScrollOnSendToggle(doc, store);
 }

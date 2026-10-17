@@ -1,3 +1,4 @@
+import { unreportedBackgroundTaskCard } from '../services/background-work-view.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
@@ -11,6 +12,8 @@ import { createSessionRepository } from '../repositories/session-repository.mjs'
 import { claudeProjectDirSlug, createClaudeSessionRootResolver } from '../services/claude-session-root-service.mjs';
 import { createSdkSessionImportService } from '../services/sdk-session-import-service.mjs';
 import { createClaudeCloudSessionService } from '../services/claude-cloud-session-service.mjs';
+import { createPreviewRegistry, normalizePreviewsConfig } from '../services/preview-registry-service.mjs';
+import { createMemoryPreviewStore } from '../services/preview-store.mjs';
 
 // DELETE /api/conversation/:id — a conversation that is still working cannot
 // be deleted; an idle one has its worker stopped first, then its CLI session
@@ -156,6 +159,7 @@ function setup(state = {}) {
       get: (id) => state.backgroundTasks?.[id] || [],
       replace: (id, tasks) => events.push(`tasks-cleared:${id}:${tasks.length}`),
     },
+    backgroundWorkView: state.backgroundWorkView || null,
     sessionWorkerSupervisor: {
       markKilled: (sid) => events.push(`mark-killed:${sid}`),
       cancelPendingStart: state.cancelPendingStart || (async () => false),
@@ -193,6 +197,7 @@ function setup(state = {}) {
     getSharedWatcherCount: () => 0,
     statusEventService: { recordSharedAccess: () => ({ event: null }) },
     windowsAutostartService: null,
+    closeConversationPreviews: state.closeConversationPreviews || ((id) => events.push(`previews-closed:${id}`)),
     isSha256: () => false,
     uploadPathForSha: () => '',
   };
@@ -200,7 +205,8 @@ function setup(state = {}) {
   const app = createMockApp();
   registerSessionsRoutes(app, deps);
   const del = () => callRoute(app.routes.get('DELETE /api/conversation/:id'), { params: { id: 'conv-1' }, headers: {}, body: {} });
-  return { del, events };
+  const archive = () => callRoute(app.routes.get('POST /api/conversation/:id/archive'), { params: { id: 'conv-1' }, headers: {}, body: {} });
+  return { del, archive, events };
 }
 
 const deletedRows = (events) => events.filter((event) => event.startsWith('sql:DELETE'));
@@ -286,6 +292,31 @@ test('background tasks without a Stop button are refused with a way that works',
   assert.match(response.body.message, /Kill session/);
   assert.doesNotMatch(response.body.message, /task panel/);
   assert.deepEqual(events, []);
+});
+
+test('background work the relay only knows as a placeholder blocks the delete too', async () => {
+  // After a relay restart a worker on older code reports background work
+  // without its task set: the panel shows the placeholder, with no Stop button.
+  const asked = [];
+  const { del, events } = setup({
+    worker: { status: 'ready', pid: process.pid },
+    backgroundWorkView: { panelTasks: (...keys) => { asked.push(keys); return [unreportedBackgroundTaskCard()]; } },
+  });
+  const response = await del();
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.body.reason, 'background-tasks');
+  assert.match(response.body.message, /Kill session/);
+  assert.deepEqual(events, []);
+  assert.equal(asked.length, 1);
+  assert.ok(asked[0].includes('conv-1'));
+});
+
+test('a dead worker\'s placeholder does not make a conversation undeletable', async () => {
+  const { del } = setup({
+    worker: { status: 'ready', pid: 2_147_483_646 },
+    backgroundWorkView: { panelTasks: () => [unreportedBackgroundTaskCard()] },
+  });
+  assert.equal((await del()).statusCode, 200);
 });
 
 test('a dead worker\'s leftover rows and tasks do not make a conversation undeletable', async () => {
@@ -712,4 +743,73 @@ test('a cloud conversation that is still working is not archived, because it is 
   assert.equal((await del()).statusCode, 409);
   await settleBackground();
   assert.deepEqual(archived, []);
+});
+
+test('deleting a conversation closes its previews; a refused delete and an archive keep them', async () => {
+  const blocked = setup({ worker: { status: 'processing', pid: process.pid }, processingCount: 1 });
+  assert.equal((await blocked.del()).statusCode, 409);
+  assert.ok(!blocked.events.some((event) => event.startsWith('previews-closed:')));
+
+  const archived = setup({ worker: { status: 'ready', pid: DEAD_PID } });
+  const archiveResponse = await archived.archive();
+  assert.equal(archiveResponse.statusCode, 200, JSON.stringify(archiveResponse.body));
+  assert.ok(!archived.events.some((event) => event.startsWith('previews-closed:')));
+
+  const { del, events } = setup({ worker: { status: 'ready', pid: DEAD_PID } });
+  assert.equal((await del()).statusCode, 200);
+  const order = (prefix) => events.findIndex((event) => event.startsWith(prefix));
+  assert.ok(order('previews-closed:conv-1') > order('sql:UPDATE conversations SET status = \'deleted\''), events.join(' | '));
+  assert.ok(order('previews-closed:conv-1') < order('sql:DELETE FROM conversations'));
+});
+
+// Wired as server-runtime wires it: the route's hook is the registry's
+// closeForConversation, over a store that outlives the registry.
+function realPreviews() {
+  const store = createMemoryPreviewStore();
+  const make = () => createPreviewRegistry({
+    config: normalizePreviewsConfig({ enabled: true, publicBaseUrl: 'https://preview.example.com' }, { env: {}, relayPort: 3333 }),
+    store,
+    hostBootId: 'linux:boot-1',
+    checkConversation: () => true,
+    checkStaticRoot: (rootDir) => ({ ok: true, rootDir }),
+    logger: { log() {}, warn() {} },
+  });
+  const registry = make();
+  const mine = registry.createStatic({ conversationId: 'conv-1', rootDir: '/home/dev/site' }).preview;
+  const other = registry.create({ conversationId: 'conv-2', port: 5173 }).preview;
+  return { store, registry, mine, other, restart: make };
+}
+
+test('a delete through the real registry closes the conversation\'s links for good; archive keeps them', async () => {
+  const archivedPreviews = realPreviews();
+  const archived = setup({
+    worker: { status: 'ready', pid: DEAD_PID },
+    closeConversationPreviews: (id) => archivedPreviews.registry.closeForConversation(id),
+  });
+  assert.equal((await archived.archive()).statusCode, 200);
+  assert.ok(archivedPreviews.registry.resolve(archivedPreviews.mine.token));
+
+  const previews = realPreviews();
+  const { del } = setup({
+    worker: { status: 'ready', pid: DEAD_PID },
+    closeConversationPreviews: (id) => previews.registry.closeForConversation(id),
+  });
+  assert.equal((await del()).statusCode, 200);
+  assert.equal(previews.registry.resolve(previews.mine.token), null);
+  assert.ok(previews.registry.resolve(previews.other.token), 'another conversation keeps its preview');
+  assert.deepEqual(previews.store.list().map((row) => row.token), [previews.other.token]);
+  const restarted = previews.restart();
+  assert.equal(restarted.resolve(previews.mine.token), null);
+  assert.ok(restarted.resolve(previews.other.token));
+});
+
+test('a preview hook that throws does not fail the delete, and says so in the log', async (t) => {
+  const warnings = [];
+  t.mock.method(console, 'warn', (line) => warnings.push(String(line)));
+  const { del } = setup({
+    worker: { status: 'ready', pid: DEAD_PID },
+    closeConversationPreviews: () => { throw new Error('registry gone'); },
+  });
+  assert.equal((await del()).statusCode, 200);
+  assert.ok(warnings.some((line) => /closing the previews of a deleted conversation failed: registry gone/.test(line)), warnings.join('\n'));
 });

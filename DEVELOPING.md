@@ -33,8 +33,46 @@ These rules apply to any agent working in this repository (they were in the READ
 - Invent every name that goes into a fixture, a comment, a doc or a commit message. Do not copy
   what a live relay, a log or this machine shows you: session titles, repository slugs, branch
   names, ticket ids, accounts, hosts.
+- Do not add a dependency the repository does not use yet (a package, a binary, a tool the build
+  or the tests call) without a check of the exact version first: its public source and whether
+  the published artefact matches it, the licence, the publisher and release history, what the
+  artefact contains (binaries, WebAssembly, encoded blobs, install scripts, network calls), its
+  own dependencies, known advisories, and one or two alternatives. Record the result (adopt,
+  adopt with conditions, reject) with its evidence in the plan or the pull request; only a clear
+  adopt goes in. A package from the maintainers of something the repository already depends on,
+  or a long-established and widely used one, needs no such check; when in doubt, it does.
 
 `.github/copilot-instructions.md` carries the same restart policy for Copilot sessions.
+
+## Repository layout
+
+```text
+oar/
+├── .github/extensions/web-relay/   # Copilot CLI extension for the Extension engine (worker link, ask_user bridge, model snapshots)
+├── bin/                            # The `oar` command (oar.js) and a Windows cmd shim for checkouts (bat/oar.bat)
+├── docs/                           # User guides behind the README, preview-server guide, Copilot BYOK notes, SDK feature tracker
+├── server/
+│   ├── claude-cloud-worker/        # Claude Cloud session worker (follows a cloud session's event stream; runs no agent itself)
+│   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
+│   ├── copilot-worker/             # Copilot SDK engine session worker (steering, background tasks, questions)
+│   ├── cursor-worker/              # Cursor Agent SDK session worker (turn runner, mode nudges, auth retry)
+│   ├── grok-worker/                # Grok CLI session worker over ACP
+│   ├── migrations/                 # Database migrations
+│   ├── public/                     # Browser app (index.html, app/ modules, PWA shell)
+│   ├── repositories/               # SQLite data access
+│   ├── routes/                     # Express route registration
+│   ├── services/                   # Relay services (workers, usage, images, tunnels, previews, updates)
+│   ├── tools/                      # Diagnostic tools (OpenAI BYOK capture proxy)
+│   ├── server.js                   # Entry point: supervisor plus relay runtime
+│   └── server-runtime.mjs          # Express + Socket.IO relay server
+├── shared/                         # Code shared by the server, the extension, and the workers
+│   ├── claude-cloud/               # Claude Cloud API client, credentials reader, repository and branch rules
+│   └── worker-runtime/             # Common worker plumbing (relay API client, heartbeat, worker link)
+├── tests/                          # Playwright end-to-end suite and its isolated relay harness
+├── CHANGELOG.md
+├── DEVELOPING.md                   # Development workflows, tests, relay internals
+└── README.md
+```
 
 ## Relay internals
 
@@ -109,7 +147,7 @@ Do not restart the relay by killing processes; use `POST /api/relay/shutdown` in
 
 - `POST /api/relay/shutdown` without `restart` queues a normal relay shutdown.
 - `POST /api/relay/shutdown` with `restart: true` queues an intentional self-restart.
-- Requests are localhost-only and still require relay auth.
+- Requests require relay auth (the token); they are not limited to localhost, the browser app sends them from anywhere it is signed in.
 - The relay waits until the queue is idle before acting; this endpoint does not interrupt an in-flight turn.
 - `/api/status` exposes the queued relay exit state as `relayShutdown` so the UI/logs can distinguish idle, queued, and shutting-down restart/shutdown flows.
 - Restart ownership follows the argv role, so exactly one supervisor acts on exit code 75:
@@ -196,6 +234,7 @@ Common routes:
 - Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
 - Pinned messages: `/api/conversation/:id/message/:messageId/pin`
+- Session groups: `/api/conversation-groups` (POST: a group by hand), `/api/conversation-groups/:id` (PATCH: the name; DELETE: dissolve), `/api/conversation-groups/:id/archive`, `/api/conversation-groups/:id/stop`, `/api/conversation/:id/group` (PUT: move in; DELETE: move out). The list route carries `groupId`, `groupRole` and the page's `groups`, and never ends a page inside a group (`server/public/app/conversation-group-order.mjs`, shared with the sidebar); a session an agent creates here joins its creator's group at bootstrap (`server/repositories/conversation-group-repository.mjs`). Owner-only: a paired relay's request is refused, and the `remote_relay` tool only reads groups
 - Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
 - Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`, `/api/git/remote` (the New Chat modal of a Claude Cloud chat)
@@ -724,7 +763,7 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **5284 pass / 0 fail / 1 skip on Linux (0.9.10, 2026-10-12)** — the count
+Expected: **0 fail** everywhere; **5785 pass / 0 fail / 1 skip on Linux (0.9.11, 2026-10-16)** — the count
 grows with every change, so treat it as a floor. The Linux skip is a Windows-only drive check. Windows runs the
 same suite with **4 skips** that are host-gated (0600 file modes, symlinks) and run on Linux (0.9.9: **4927 pass /
 0 fail / 4 skip**).

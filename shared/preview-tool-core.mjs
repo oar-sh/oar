@@ -25,8 +25,10 @@ export const PREVIEW_TOOL_DESCRIPTION =
   + 'paths will not work. For plain files or a build output: pass {action:'
   + '"create", dir} instead and the relay serves the directory itself — no dev '
   + 'server needed. Always tell the user the returned URL and that the link is '
-  + 'public: anyone who has it can reach the app without logging in. Previews '
-  + 'never expire on their own; close them with {action:"close"} when the user '
+  + 'public: anyone who has it can reach the app without logging in. Publishing '
+  + 'the same port or directory again in this conversation returns the same '
+  + 'link. Previews never expire and survive a relay restart (a port preview '
+  + 'until the machine reboots); close them with {action:"close"} when the user '
   + 'is done.';
 
 export const PREVIEW_TOOL_INPUT_SCHEMA = {
@@ -126,6 +128,9 @@ export async function executePreviewTool(input, { api, conversationId = '' } = {
           target: entry.mode === 'static' ? entry.rootDir : `localhost:${entry.targetPort}`,
           online: entry.online,
           conversationId: entry.conversationId,
+          // Stored but not served: the relay could not check it after a
+          // restart and tries again. It can be closed.
+          ...(entry.unverified === true ? { unverified: true } : {}),
         })),
       };
     }
@@ -155,15 +160,20 @@ export async function executePreviewTool(input, { api, conversationId = '' } = {
       ...(parsed.port ? { port: parsed.port } : { dir: parsed.dir }),
     };
     const response = await api('POST', '/api/previews', body);
+    const existing = response?.existing === true;
+    const hint = parsed.port
+      ? `Serve the app under ${response?.basePath} (the proxy strips the prefix and sends X-Forwarded-Prefix). Tell the user the URL and that the link is public.`
+      : 'The directory is served as-is; relative asset paths work, root-absolute ones do not. Tell the user the URL and that the link is public.';
     return {
       ok: true,
+      existing,
       url: response?.url,
       basePath: response?.basePath,
       token: response?.preview?.token,
       mode: response?.preview?.mode || (parsed.port ? 'port' : 'static'),
-      hint: parsed.port
-        ? `Serve the app under ${response?.basePath} (the proxy strips the prefix and sends X-Forwarded-Prefix). Tell the user the URL and that the link is public.`
-        : 'The directory is served as-is; relative asset paths work, root-absolute ones do not. Tell the user the URL and that the link is public.',
+      hint: existing
+        ? `This conversation already publishes this ${parsed.port ? 'port' : 'directory'}: same link as before, label unchanged. ${hint}`
+        : hint,
     };
   } catch (error) {
     return { ok: false, error: String(error?.message || error) };

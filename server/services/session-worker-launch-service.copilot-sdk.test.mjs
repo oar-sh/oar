@@ -151,7 +151,7 @@ test('tmux shell command for the SDK engine runs node without the script PTY wra
   const command = buildTmuxWorkerShellCommand('session-1', env);
   const workerScript = path.join('/repo', 'server', 'copilot-worker', 'copilot-sdk-session-worker.mjs')
     .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  assert.match(command, new RegExp(`exec 'node' '${workerScript}' --session-id 'session-1'$`));
+  assert.match(command, new RegExp(`exec '${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' '${workerScript}' --session-id 'session-1'$`));
   assert.doesNotMatch(command, /script -q/);
   assert.match(command, /export COPILOT_WEB_RELAY_WORKER_KIND='copilot-sdk';/);
   // The one path the worker needs has to survive the tmux allowlist; it
@@ -198,7 +198,7 @@ test('launchSessionCli spawns node for the SDK engine when tmux is unavailable',
   });
   assert.equal(launched.pid, 4343);
   assert.equal(spawnCalls.length, 1);
-  assert.equal(spawnCalls[0].command, 'node');
+  assert.equal(spawnCalls[0].command, process.execPath);
   assert.deepEqual(spawnCalls[0].args, [
     path.join('/repo', 'server', 'copilot-worker', 'copilot-sdk-session-worker.mjs'),
     '--session-id',

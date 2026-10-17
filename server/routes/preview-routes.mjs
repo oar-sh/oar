@@ -95,7 +95,15 @@ export function registerPreviewRoutes(app, deps) {
     // Probe immediately so the card does not sit badge-less until the next
     // scheduled sweep — and so a typo'd port shows as offline right away.
     previewHealthProbe?.probeNow?.(created.preview.token);
-    res.json({ ok: true, preview: created.preview, url: created.preview.url, basePath: created.preview.basePath });
+    // `existing`: this conversation already had a preview of the same target,
+    // and this is it (same token, same link, label unchanged).
+    res.json({
+      ok: true,
+      existing: created.existing === true,
+      preview: created.preview,
+      url: created.preview.url,
+      basePath: created.preview.basePath,
+    });
   });
 
   // DELETE /api/previews/:token — the link stops resolving immediately. The dev

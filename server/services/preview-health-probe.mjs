@@ -2,7 +2,7 @@
 
 import net from 'net';
 
-// Liveness for preview cards. Previews never auto-close, so the card has to say
+// Liveness for preview cards. Previews never expire, so the card has to say
 // whether the dev server behind it is still up — a TCP connect is enough and,
 // unlike an HTTP request, leaves nothing in the app's request log.
 
@@ -55,6 +55,10 @@ export function createPreviewHealthProbe({
     // A slow sweep must not overlap itself; with the registry capped at 8
     // previews and a 250ms connect budget, one pass is bounded at ~2s anyway.
     if (sweeping) return;
+    // Store writes that failed (a locked database) are retried on this beat,
+    // so the table catches up with memory without a timer of its own, and
+    // rows a restore could not judge get their check again.
+    try { registry.maintain?.(); } catch {}
     const previews = registry.list().filter((entry) => entry.mode !== 'static');
     if (previews.length === 0) return;
     sweeping = true;
@@ -70,6 +74,9 @@ export function createPreviewHealthProbe({
     timer = setIntervalImpl(() => { sweep().catch(() => {}); }, intervalMs);
     // An idle relay should not be held awake by a probe that has nothing to do.
     if (typeof timer?.unref === 'function') timer.unref();
+    // One pass right away: port previews restored at boot start without a
+    // health state, and their cards should not wait a full interval for one.
+    sweep().catch(() => {});
   }
 
   function stop() {

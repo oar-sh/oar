@@ -208,6 +208,78 @@ test('a transcript card for a live preview links; a closed one badges instead', 
   assert.equal(buildTranscriptPreviewCard({ label: 'no token' }), null);
 });
 
+test('a transcript card drawn before the registry arrived turns live when it does, and closed when the preview goes', () => {
+  // A page load renders the transcript first and learns the live previews
+  // after; the card must not stay "closed" for a link that still works.
+  setPreviews([]);
+  const holder = document.createElement('div');
+  document.body.appendChild(holder);
+  holder.appendChild(buildTranscriptPreviewCard(preview()));
+  assert.ok(holder.querySelector('.msg-preview-card-closed'));
+
+  setPreviews([preview()]);
+  const live = holder.querySelector('.msg-preview-card');
+  assert.equal(live.classList.contains('msg-preview-card-closed'), false);
+  assert.equal(live.querySelector('.preview-open').getAttribute('href'), `https://preview.example.com/test_${TOKEN_A}/`);
+  assert.equal(holder.querySelectorAll('.msg-preview-card').length, 1);
+
+  setPreviews([]);
+  assert.ok(holder.querySelector('.msg-preview-card-closed'));
+  assert.equal(holder.querySelectorAll('.msg-preview-card').length, 1);
+  holder.remove();
+});
+
+test('a transcript card opens and copies the live link after the public address changed', async () => {
+  // The snapshot was published under the old address; the restored registry
+  // rebuilt the link from the current settings.
+  const moved = `https://moved.example.com/test_${TOKEN_A}/`;
+  setPreviews([preview({ url: moved })]);
+  const card = buildTranscriptPreviewCard(preview());
+  assert.equal(card.querySelector('.preview-open').getAttribute('href'), moved);
+  clipboardWrites.length = 0;
+  card.querySelector('.preview-copy').click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(clipboardWrites, [moved]);
+
+  // A card already on screen follows when the registry learns the new address.
+  setPreviews([preview()]);
+  const holder = document.createElement('div');
+  document.body.appendChild(holder);
+  holder.appendChild(buildTranscriptPreviewCard(preview()));
+  assert.equal(holder.querySelector('.preview-open').getAttribute('href'), `https://preview.example.com/test_${TOKEN_A}/`);
+  setPreviews([preview({ url: moved })]);
+  assert.equal(holder.querySelector('.preview-open').getAttribute('href'), moved);
+  assert.equal(holder.querySelectorAll('.msg-preview-card').length, 1);
+  holder.remove();
+  setPreviews([]);
+});
+
+test('the settings variant shows when a preview was published and last opened', () => {
+  const now = 10 * 3_600_000;
+  const opened = buildPreviewRow(
+    preview({ createdAt: now - 3 * 3_600_000, lastHitAt: now - 5 * 60_000 }),
+    { withConversation: true, withAge: true, now },
+  );
+  assert.match(opened.querySelector('.preview-detail').textContent, /published 3 h ago · last opened 5 min ago/);
+
+  const unopened = buildPreviewRow(preview({ createdAt: now }), { withAge: true, now: now + 3 * 86_400_000 });
+  assert.match(unopened.querySelector('.preview-detail').textContent, /published 3 d ago · never opened/);
+
+  const panelRow = buildPreviewRow(preview({ lastHitAt: 2000 }));
+  assert.doesNotMatch(panelRow.querySelector('.preview-detail').textContent, /published|opened/);
+});
+
+test('a shared transcript card without token or link renders a note, never a link', () => {
+  setPreviews([preview()]);
+  const card = buildTranscriptPreviewCard({ label: 'web app', mode: 'port', redacted: true });
+  assert.ok(card.classList.contains('msg-preview-card-redacted'));
+  assert.equal(card.querySelector('.preview-label').textContent, 'web app');
+  assert.equal(card.querySelector('.preview-detail').textContent, 'preview link not shared');
+  assert.equal(card.querySelector('a'), null);
+  assert.equal(card.querySelector('button'), null);
+  assert.ok(!card.textContent.includes('test_'));
+});
+
 test('renderPreviewRowsInto replaces prior content', () => {
   const container = document.createElement('div');
   container.appendChild(document.createElement('span'));
@@ -219,4 +291,25 @@ test('renderPreviewRowsInto replaces prior content', () => {
 
   renderPreviewRowsInto(container, []);
   assert.equal(container.children.length, 0);
+});
+
+test('a preview the relay could not check yet shows as not served, without a link, and can be closed', () => {
+  const held = preview({ online: false, unverified: true });
+  setPreviews([held]);
+  const row = buildPreviewRow(getPreviews()[0], { withConversation: true });
+  assert.match(row.querySelector('.preview-detail').textContent, /not served — could not be checked after the restart/);
+  assert.doesNotMatch(row.querySelector('.preview-detail').textContent, /dev server not responding/);
+  assert.equal(row.querySelector('.preview-open'), null);
+  assert.equal(row.querySelector('.preview-copy'), null);
+  assert.notEqual(row.querySelector('.preview-close'), null);
+
+  // Its transcript card offers no link either, until the check passes.
+  const card = buildTranscriptPreviewCard(preview());
+  assert.equal(card.classList.contains('msg-preview-card-closed'), true);
+  assert.equal(card.querySelector('.preview-open'), null);
+  document.body.appendChild(card);
+  setPreviews([preview({ online: true })]);
+  assert.notEqual(document.body.querySelector('.msg-preview-card .preview-open'), null);
+  document.body.textContent = '';
+  setPreviews([]);
 });

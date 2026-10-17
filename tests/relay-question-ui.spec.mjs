@@ -416,13 +416,16 @@ test("serves workspace files and blocks unsafe paths", async ({ request }) => {
   const unauthorized = await request.get("/api/files/README.md");
   expect(unauthorized.status()).toBe(401);
 
+  // A ?token= signs in the page only; file and API URLs take the header or the
+  // cookie. Asked before the Bearer request below stores the cookie.
+  const viaTokenQuery = await request.get(`/api/files/server/server.js?token=${encodeURIComponent(token)}`);
+  expect(viaTokenQuery.status()).toBe(401);
+
   const authorized = await request.get("/api/files/README.md", { headers });
   expect(authorized.ok()).toBeTruthy();
   expect(String(authorized.headers()["content-type"] || "")).toContain("text/markdown");
   expect(await authorized.text()).toContain("Copilot");
 
-  const viaTokenQuery = await request.get(`/api/files/server/server.js?token=${encodeURIComponent(token)}`);
-  expect(viaTokenQuery.ok()).toBeTruthy();
 
   const previewReadme = await request.get("/api/files-preview/README.md", { headers });
   expect(previewReadme.ok()).toBeTruthy();

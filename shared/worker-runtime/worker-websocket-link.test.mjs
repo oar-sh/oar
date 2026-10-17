@@ -13,7 +13,7 @@ class FakeWebSocket {
     this.readyState = this.CONNECTING;
     this.listeners = new Map();
     this.sent = [];
-    FakeWebSocket.instances.push(this);
+    this.constructor.instances.push(this);
   }
 
   addEventListener(type, listener) {
@@ -602,4 +602,149 @@ test("worker websocket link supports websocket implementations with static state
   assert.match(socket.sent[0], /"type":"worker.hello"/);
   assert.match(socket.sent[1], /"type":"worker.ready"/);
   link.stop();
+});
+
+// Node 22's WebSocket: closing a socket that is still connecting raises
+// another error and never a close event. The cap stands in for the stack
+// limit that ended the real loop.
+class FakeWebSocketCloseWhileConnectingErrors extends FakeWebSocket {
+  constructor(url) {
+    super(url);
+    this.closeCalls = 0;
+  }
+
+  close() {
+    this.closeCalls += 1;
+    if (this.closeCalls > 50) throw new RangeError("Maximum call stack size exceeded");
+    if (this.readyState === this.CONNECTING || this.readyState === 2) {
+      this.readyState = 2;
+      this.emit("error", { message: "Connection was closed before it was established." });
+      return;
+    }
+    super.close();
+  }
+
+  fail() {
+    this.emit("error", { message: "Received network error or non-101 status code." });
+  }
+}
+
+function createReconnectHarness(WebSocketImpl, overrides = {}) {
+  WebSocketImpl.instances = [];
+  const timers = [];
+  const logs = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-reconnect",
+    WebSocketImpl,
+    minBackoffMs: 1000,
+    maxBackoffMs: 8_000,
+    jitterMs: 0,
+    dbg: (...args) => logs.push(args.join(" ")),
+    setTimeoutImpl: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutImpl: (timer) => { if (timer) timer.cleared = true; },
+    setIntervalImpl: () => ({}),
+    clearIntervalImpl: () => {},
+    ...overrides,
+  });
+  const pending = () => timers.filter((timer) => !timer.cleared && !timer.fired);
+  const fireNext = () => {
+    const [timer] = pending();
+    assert.ok(timer, "a reconnect timer is pending");
+    timer.fired = true;
+    timer.fn();
+  };
+  return { link, timers, logs, pending, fireNext };
+}
+
+test("a connect that fails without a close event still leaves one reconnect timer (Node 22)", () => {
+  const { link, logs, pending, fireNext } = createReconnectHarness(FakeWebSocketCloseWhileConnectingErrors);
+  link.start();
+  const first = FakeWebSocketCloseWhileConnectingErrors.instances[0];
+  first.fail();
+
+  assert.equal(first.closeCalls, 1, "the socket is closed once, not from every error it raises");
+  assert.equal(logs.filter((line) => line.startsWith("worker ws error")).length, 1);
+  assert.equal(pending().length, 1);
+  assert.equal(pending()[0].delay, 1000);
+  assert.equal(link.status().connected, false);
+
+  // Late events from the given-up socket change nothing.
+  first.emit("close");
+  first.emit("error", { message: "late" });
+  assert.equal(pending().length, 1);
+
+  fireNext();
+  const second = FakeWebSocketCloseWhileConnectingErrors.instances[1];
+  assert.ok(second, "the link connected again");
+  second.open();
+  assert.equal(link.status().connected, true);
+  assert.equal(link.status().reconnectAttempt, 0);
+  assert.equal(pending().length, 0);
+  link.stop();
+});
+
+test("failed connects without close events back off without stacking timers", () => {
+  const { link, pending, fireNext } = createReconnectHarness(FakeWebSocketCloseWhileConnectingErrors);
+  link.start();
+  const delays = [];
+  for (let index = 0; index < 6; index += 1) {
+    FakeWebSocketCloseWhileConnectingErrors.instances.at(-1).fail();
+    assert.equal(pending().length, 1, `one timer after failure ${index + 1}`);
+    delays.push(pending()[0].delay);
+    fireNext();
+  }
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 8000, 8000]);
+  assert.equal(FakeWebSocketCloseWhileConnectingErrors.instances.length, 7);
+  link.stop();
+});
+
+test("an error followed by a close event schedules one reconnect, not two", () => {
+  const { link, pending } = createReconnectHarness(FakeWebSocket);
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  // Node 24 and browsers: the close called from the error handler fires close.
+  socket.emit("error", { message: "Received network error or non-101 status code." });
+  assert.equal(socket.readyState, socket.CLOSED);
+  assert.equal(pending().length, 1);
+  assert.equal(pending()[0].delay, 1000);
+  link.stop();
+  assert.equal(pending().length, 0, "stop clears the reconnect");
+});
+
+test("a stale connection reconnects even when its close never completes", () => {
+  class FakeWebSocketSilentClose extends FakeWebSocket {
+    close() { this.readyState = 2; }
+  }
+  let nowMs = 1000;
+  const intervals = [];
+  const { link, pending } = createReconnectHarness(FakeWebSocketSilentClose, {
+    now: () => nowMs,
+    readyRefreshMs: 1000,
+    staleConnectionMs: 5000,
+    setIntervalImpl: (fn) => { intervals.push(fn); return {}; },
+  });
+  link.start();
+  FakeWebSocketSilentClose.instances[0].open();
+  nowMs = 7000;
+  intervals[0]();
+  assert.equal(pending().length, 1);
+  assert.equal(link.status().connected, false);
+  link.stop();
+});
+
+test("a link stopped during a failing connect schedules nothing", () => {
+  const { link, pending } = createReconnectHarness(FakeWebSocketCloseWhileConnectingErrors);
+  link.start();
+  const socket = FakeWebSocketCloseWhileConnectingErrors.instances[0];
+  link.stop();
+  socket.fail();
+  assert.equal(pending().length, 0);
 });

@@ -32,6 +32,30 @@ test('message share visibility preserves owner history and filters shared histor
   assert.equal(repository.getSharedMessages.all('conv-1').length, 1);
 });
 
+test('hidden messages are listed per conversation in conversation order', () => {
+  const db = createTestDb();
+  const repository = createMessageRepository(db);
+  const insertConv = db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES (?, ?, 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`);
+  insertConv.run('conv-1', 'Demo');
+  insertConv.run('conv-2', 'Other');
+  const insertMessage = db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES (?, ?, ?, ?, ?)`);
+  insertMessage.run('msg-early', 'conv-1', 'user', 'early', '2026-01-01T00:00:00.000Z');
+  insertMessage.run('msg-middle', 'conv-1', 'assistant', 'middle', '2026-01-01T00:02:00.000Z');
+  insertMessage.run('msg-late', 'conv-1', 'assistant', 'late', '2026-01-01T00:05:00.000Z');
+  insertMessage.run('msg-other', 'conv-2', 'user', 'other', '2026-01-01T00:01:00.000Z');
+
+  // Hidden in reverse: the list still follows the messages' own order.
+  repository.setMessageShareVisibility.run(1, '2026-01-02T00:00:00.000Z', 'msg-late', 'conv-1');
+  repository.setMessageShareVisibility.run(1, '2026-01-02T00:01:00.000Z', 'msg-early', 'conv-1');
+  repository.setMessageShareVisibility.run(1, '2026-01-02T00:02:00.000Z', 'msg-other', 'conv-2');
+  const rows = repository.listHiddenMessages.all('conv-1');
+  assert.deepEqual(rows.map((row) => row.id), ['msg-early', 'msg-late']);
+  assert.equal(rows[0].share_hidden_at, '2026-01-02T00:01:00.000Z');
+
+  repository.setMessageShareVisibility.run(0, null, 'msg-early', 'conv-1');
+  assert.deepEqual(repository.listHiddenMessages.all('conv-1').map((row) => row.id), ['msg-late']);
+});
+
 test('pins are set and cleared per message and listed in conversation order', () => {
   const db = createTestDb();
   const repository = createMessageRepository(db);

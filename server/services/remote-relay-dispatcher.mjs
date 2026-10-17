@@ -1238,7 +1238,21 @@ export function createRemoteRelayDispatcher({
     }
   }
 
-  function mapSession(row, workerIds, ctx = null) {
+  /** The session group of a listed row: id, display name and the row's role. */
+  function sessionGroupField(row, groups) {
+    const groupId = toText(row?.groupId);
+    if (!groupId) return {};
+    const info = isPlainObject(groups?.[groupId]) ? groups[groupId] : null;
+    return {
+      group: {
+        id: groupId,
+        name: toText(info?.displayName) || toText(info?.name) || null,
+        role: toText(row?.groupRole) === 'head' ? 'head' : 'member',
+      },
+    };
+  }
+
+  function mapSession(row, workerIds, ctx = null, groups = null) {
     const id = toText(row?.id);
     const via = toText(row?.origin?.relayName);
     // A session an agent of that relay created there, and from which session.
@@ -1256,6 +1270,9 @@ export function createRemoteRelayDispatcher({
       ...(via ? { via } : {}),
       ...(createdBy ? { createdBy } : {}),
       ...(createdBy && ctx?.relay?.local && createdBy === ctx.conversationId ? { startedByYou: true } : {}),
+      // The session group it sits in (sessions an agent started here are
+      // grouped under that agent's session; the owner can group by hand).
+      ...sessionGroupField(row, groups),
     };
   }
 
@@ -1296,7 +1313,7 @@ export function createRemoteRelayDispatcher({
     // pages, all = the whole list page by page (only it honours the cursor).
     let cursor = null;
     if (scope === 'all' && args.cursor) {
-      cursor = decodeCursor(args.cursor, ['beforeConversationId', 'beforeUpdatedAt']);
+      cursor = decodeCursor(args.cursor, ['beforeConversationId', 'beforeUpdatedAt', 'beforeGroupId']);
       if (!cursor) throw invalidInput('cursor is not a nextCursor from list_sessions');
     }
     const workerIds = scope === 'active' ? await liveWorkerConversationIds(ctx) : null;
@@ -1305,6 +1322,7 @@ export function createRemoteRelayDispatcher({
       && (scope !== 'active' || row?.activeTurn === true || workerIds.has(toText(row?.id)) || isBusyState(row?.sessionState));
 
     const sessions = [];
+    const seen = new Set();
     let hasMore = false;
     let scanned = 0;
     for (let page = 0; page < (filtering ? LIST_SCAN_PAGES : 1); page += 1) {
@@ -1313,18 +1331,32 @@ export function createRemoteRelayDispatcher({
           limit: filtering ? LIST_PAGE_MAX : limit,
           beforeConversationId: cursor?.beforeConversationId,
           beforeUpdatedAt: cursor?.beforeUpdatedAt,
+          beforeGroupId: cursor?.beforeGroupId,
         },
       });
       const rows = Array.isArray(response?.conversations) ? response.conversations : [];
+      const groups = isPlainObject(response?.groups) ? response.groups : null;
       let consumed = 0;
       for (const row of rows) {
         consumed += 1;
-        if (keep(row)) sessions.push(mapSession(row, workerIds, ctx));
+        // A group served again whole (its cursor row vanished) repeats rows.
+        if (seen.has(toText(row?.id))) continue;
+        seen.add(toText(row?.id));
+        if (keep(row)) sessions.push(mapSession(row, workerIds, ctx, groups));
         if (sessions.length >= limit) break;
       }
       scanned += consumed;
       const last = rows[consumed - 1];
-      if (last) cursor = { beforeConversationId: toText(last.id), beforeUpdatedAt: toText(last.updatedAt) };
+      // The row's sort time (its group's newest row, `activityAt`) and its
+      // group, so the next page continues from the right place even if the
+      // row is archived or deleted before then.
+      if (last) {
+        cursor = {
+          beforeConversationId: toText(last.id),
+          beforeUpdatedAt: toText(last.activityAt) || toText(last.updatedAt),
+          ...(toText(last.groupId) ? { beforeGroupId: toText(last.groupId) } : {}),
+        };
+      }
       hasMore = consumed < rows.length || response?.pageInfo?.hasMore === true;
       if (sessions.length >= limit || !hasMore || !rows.length) break;
     }
@@ -1405,7 +1437,9 @@ export function createRemoteRelayDispatcher({
       if (!before) throw invalidInput('before is not an olderCursor from read_session');
     }
     const conversation = await call(ctx, 'GET', sessionPath(args.session), {
-      query: { limit: args.last, beforeMessageId: before?.beforeMessageId, beforeTimestamp: before?.beforeTimestamp },
+      // groupMembers: the session group's live members; the relay gives them
+      // to its own sessions only.
+      query: { limit: args.last, beforeMessageId: before?.beforeMessageId, beforeTimestamp: before?.beforeTimestamp, groupMembers: 1 },
     });
     const conversationId = toText(conversation?.id) || args.session;
     const pendingQuestions = await loadPendingQuestions(ctx, conversationId);
@@ -1425,6 +1459,23 @@ export function createRemoteRelayDispatcher({
     const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
     const via = toText(conversation?.origin?.relayName);
     const inFlight = progressSnapshot(conversation?.inFlight);
+    // Its session group, with the other members and what each is doing.
+    const groupInfo = isPlainObject(conversation?.group) ? conversation.group : null;
+    const group = groupInfo && toText(groupInfo.id) ? {
+      id: toText(groupInfo.id),
+      name: toText(groupInfo.displayName) || toText(groupInfo.name) || null,
+      role: toText(groupInfo.role) === 'head' ? 'head' : 'member',
+      members: (Array.isArray(groupInfo.members) ? groupInfo.members : [])
+        .filter(isPlainObject)
+        .slice(0, 50)
+        .map((member) => ({
+          id: toText(member.id),
+          title: toText(member.title),
+          role: toText(member.role) === 'head' ? 'head' : 'member',
+          state: SESSION_STATES.has(toText(member.state)) ? toText(member.state) : 'idle',
+          ...(member.archived === true ? { archived: true } : {}),
+        })),
+    } : null;
     return {
       summary: `read_session → ${ctx.relay.name} session ${shortId(conversationId)}: ${messages.length} message${messages.length === 1 ? '' : 's'}${inFlight ? ', turn running' : ''}${pendingQuestions.length ? `, ${pendingQuestions.length} question${pendingQuestions.length === 1 ? '' : 's'} pending` : ''}`,
       session: {
@@ -1438,6 +1489,7 @@ export function createRemoteRelayDispatcher({
         active: conversation?.activeTurn === true || isBusyState(conversation?.sessionState),
         ...sessionActivityFields(conversation),
         ...(via ? { via } : {}),
+        ...(group ? { group } : {}),
         openUrl: remoteConversationUrl(ctx.relay.url, conversationId) || null,
       },
       messages,

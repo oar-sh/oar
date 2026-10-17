@@ -119,6 +119,7 @@ async function main() {
     // A readiness flip is a hold starting or ending (question card,
     // compaction, a turn-opening delivery): the steering snapshot changed
     // with it, so it goes out now rather than on the next 10 s heartbeat.
+    onBackgroundTaskSetStale: () => heartbeat?.requestPulse(),
     onDeliveryReadinessChange: (ready) => {
       linkBridge.onDeliveryReadinessChange(ready);
       heartbeat?.requestPulse();
@@ -147,6 +148,12 @@ async function main() {
     // Consumed rows the runner could not fail itself; the relay fails them.
     getSettleFailed: () => turnRunner.getSettleFailed(),
     onSettleFailedHandled: (ids) => turnRunner.acknowledgeSettleFailed(ids),
+    // The relay holds the task set in memory only: the digest of the live
+    // task ids rides every beat, and a relay that is out of step (it
+    // restarted, a post was lost) asks for the set again.
+    getBackgroundTaskIds: () => turnRunner.backgroundTaskIds(),
+    onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
+    onAnswered: () => turnRunner.flushKeptTaskSettles(),
   });
 
   const wsLink = createWorkerWebSocketLink({
@@ -164,7 +171,8 @@ async function main() {
     // even between deliveries — a delivery drawn into it is only handed back.
     getDeliveryHeld: () => turnRunner.isDeliveryHeld(),
     // A relay that just (re)started knows nothing of this worker until it
-    // heartbeats; the composer's steering snapshot rides that beat.
+    // heartbeats; the composer's steering snapshot rides that beat, and so
+    // does the digest that makes the relay ask for the background tasks.
     onServerHello: () => heartbeat.requestPulse(),
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,

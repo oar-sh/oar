@@ -60,9 +60,9 @@ export function isRunningSubagentStatus(status) {
 
 /**
  * The row for one run. `clickable` makes the title the button that opens the
- * viewer (`data-subagent-open`); a shared view, which cannot read the record,
- * passes false. `context` lands in a class so the bubble and the viewer can
- * size the row differently.
+ * viewer (`data-subagent-open`); a shared view opens it too, read-only,
+ * through the share's sub-agent route. `context` lands in a class so the
+ * bubble and the viewer can size the row differently.
  */
 export function subagentRowHtml(run, { context = 'bubble', clickable = true, now = Date.now() } = {}) {
   const runId = String(run?.subagentRunId || '').trim();

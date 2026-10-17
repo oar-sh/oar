@@ -14,7 +14,12 @@ export function escapeBatchValue(value) {
 }
 
 export function resolveWindowsStartupDirectory(env = process.env, pathImpl = path) {
-  const appData = String(env?.APPDATA || '').trim();
+  // A relay started without a full profile (the boot task) may lack APPDATA;
+  // the roaming folder then is where resolveOarRoot looks too.
+  const appData = String(env?.APPDATA || '').trim()
+    || (String(env?.USERPROFILE || '').trim()
+      ? pathImpl.join(String(env.USERPROFILE).trim(), 'AppData', 'Roaming')
+      : '');
   if (!appData) {
     throw new Error('Windows autostart requires the current user APPDATA directory.');
   }

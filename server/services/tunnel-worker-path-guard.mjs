@@ -3,27 +3,7 @@
 import { URL } from 'url';
 
 import { buildAcceptedWorkerPaths } from './session-worker-websocket-service.mjs';
-
-// Cloudflare's edge stamps `cf-ray` on every proxied request and a remote client
-// cannot strip it, so its presence means the request came in over the tunnel
-// rather than from a local session worker on 127.0.0.1.
-const DEFAULT_TUNNEL_MARKER_HEADERS = ['cf-ray'];
-
-function normalizeHeaderName(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function normalizeMarkerHeaders(extraHeaders) {
-  const names = [...DEFAULT_TUNNEL_MARKER_HEADERS];
-  const extras = Array.isArray(extraHeaders)
-    ? extraHeaders
-    : String(extraHeaders || '').split(',');
-  for (const entry of extras) {
-    const name = normalizeHeaderName(entry);
-    if (name && !names.includes(name)) names.push(name);
-  }
-  return names;
-}
+import { createLocalRequestCheck, resolveTunnelMarkerHeaders } from './request-boundary.mjs';
 
 function requestPathname(req) {
   const rawUrl = String(req?.url || '/');
@@ -35,18 +15,24 @@ function requestPathname(req) {
 }
 
 /**
- * Blocks session-worker WebSocket paths when the request arrived through a
- * public tunnel. The guard keys off *the path being a worker path*, never off
- * "unauthenticated request bearing cf-ray" — shared conversations legitimately
- * arrive over Cloudflare with no credentials and must keep working.
+ * Blocks session-worker WebSocket paths for every request that is not truly
+ * local (request-boundary.mjs): a peer that is not loopback, an edge marker
+ * header, or a forwarding header. Session workers are spawned by the relay on
+ * its own machine and connect over 127.0.0.1 without any of these. The guard
+ * keys off *the path being a worker path*, never off "unauthenticated request
+ * bearing cf-ray" — shared conversations legitimately arrive over Cloudflare
+ * with no credentials and must keep working.
  */
 export function createTunnelWorkerPathGuard({
   pathPrefix = '',
   extraMarkerHeaders = [],
+  localRequestCheck = null,
   logger = console,
 } = {}) {
   const workerPaths = new Set(buildAcceptedWorkerPaths(pathPrefix));
-  const markerHeaders = normalizeMarkerHeaders(extraMarkerHeaders);
+  const localCheck = localRequestCheck
+    || createLocalRequestCheck({ markerHeaders: resolveTunnelMarkerHeaders(extraMarkerHeaders) });
+  const markerHeaders = localCheck.markerHeaders;
 
   function isWorkerPath(pathname) {
     if (workerPaths.has(pathname)) return true;
@@ -57,21 +43,18 @@ export function createTunnelWorkerPathGuard({
     return false;
   }
 
-  function matchedMarkerHeader(headers) {
-    if (!headers) return null;
-    for (const name of markerHeaders) {
-      const value = headers[name];
-      if (typeof value === 'string' ? value.trim() : value) return name;
-    }
-    return null;
+  function describeRefusal(refusal) {
+    if (!refusal) return null;
+    if (refusal.reason === 'peer') return 'a non-loopback peer';
+    return refusal.header;
   }
 
-  function evaluate(req) {
+  function evaluate(req, socket = null) {
     const pathname = requestPathname(req);
     if (!isWorkerPath(pathname)) return { blocked: false, pathname, marker: null };
-    const marker = matchedMarkerHeader(req?.headers);
-    if (!marker) return { blocked: false, pathname, marker: null };
-    return { blocked: true, pathname, marker };
+    const refusal = localCheck.explain({ headers: req?.headers, socket: req?.socket || socket });
+    if (!refusal) return { blocked: false, pathname, marker: null };
+    return { blocked: true, pathname, marker: describeRefusal(refusal), reason: refusal.reason };
   }
 
   // Express middleware: 403 the request before any auth middleware runs.
@@ -81,15 +64,15 @@ export function createTunnelWorkerPathGuard({
       next();
       return;
     }
-    logger?.warn?.(`[tunnel-guard] Blocked session-worker path ${result.pathname} carrying ${result.marker}`);
-    res.status(403).json({ error: 'Session worker endpoints are not reachable through the tunnel' });
+    logger?.warn?.(`[tunnel-guard] Blocked session-worker path ${result.pathname}: not local (${result.marker})`);
+    res.status(403).json({ error: 'Session worker endpoints are reachable from this machine only' });
   }
 
   // Raw upgrade guard: destroy the socket before the WebSocket handshake.
   function handleUpgrade(req, socket) {
-    const result = evaluate(req);
+    const result = evaluate(req, socket);
     if (!result.blocked) return false;
-    logger?.warn?.(`[tunnel-guard] Blocked session-worker upgrade ${result.pathname} carrying ${result.marker}`);
+    logger?.warn?.(`[tunnel-guard] Blocked session-worker upgrade ${result.pathname}: not local (${result.marker})`);
     try {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     } catch {}

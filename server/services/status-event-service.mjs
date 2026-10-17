@@ -79,17 +79,21 @@ export function createStatusEventService(db, {
     for (const [key] of oldest) sharedAccessDedupe.delete(key);
   }
 
+  // `viewerIp` null or empty: the relay does not store viewer addresses, and
+  // the event carries none. `viewerKey` (a hash of address and browser) then
+  // keeps the dedupe per viewer instead of folding every viewer into one.
   function recordSharedAccess({
     shareToken,
     viewerIp,
+    viewerKey = '',
     conversationId,
     timestamp = Date.now(),
   } = {}) {
     const now = normalizeTimestamp(timestamp);
     const token = String(shareToken || '').trim();
-    const ip = String(viewerIp || '').trim() || 'unknown';
+    const ip = String(viewerIp || '').trim();
     const normalizedConversationId = String(conversationId || '').trim();
-    const dedupeKey = `${token}:${ip}`;
+    const dedupeKey = `${token}:${String(viewerKey || '').trim() || ip || 'unknown'}`;
     const previousSeenAt = sharedAccessDedupe.get(dedupeKey);
     if (Number.isFinite(previousSeenAt) && (now - previousSeenAt) <= normalizedDedupeTtlMs) {
       // A dedupe hit slides the window — a persisted event already backs it.
@@ -105,7 +109,7 @@ export function createStatusEventService(db, {
       source: 'server',
       details: {
         shareId: shareIdentifier(token),
-        viewerIp: ip,
+        viewerIp: ip || undefined,
         conversationId: normalizedConversationId || undefined,
       },
     };

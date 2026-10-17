@@ -112,6 +112,20 @@ test('execute list maps previews to a compact model-facing shape', async () => {
   const result = await executePreviewTool({ action: 'list' }, { api });
   assert.equal(result.ok, true);
   assert.deepEqual(result.previews.map((entry) => entry.target), ['localhost:5173', '/repo/dist']);
+  assert.ok(result.previews.every((entry) => !('unverified' in entry)));
+});
+
+test('execute list marks a preview the relay could not check yet', async () => {
+  const { api } = fakeApi({
+    'GET /api/previews': {
+      enabled: true,
+      previews: [
+        { token: TOKEN, label: 'site', url: 'https://p/x/', mode: 'static', rootDir: '/repo/dist', online: false, unverified: true, conversationId: 'conv-1' },
+      ],
+    },
+  });
+  const result = await executePreviewTool({ action: 'list' }, { api });
+  assert.equal(result.previews[0].unverified, true);
 });
 
 test('execute close with no token resolves the single live preview', async () => {
@@ -173,4 +187,26 @@ test('schema and name stay in the shape adapters rely on', () => {
     Object.keys(PREVIEW_TOOL_INPUT_SCHEMA.properties).sort(),
     ['action', 'dir', 'label', 'port', 'token'],
   );
+});
+
+test('execute create says so when the conversation already publishes the target', async () => {
+  const { api } = fakeApi({
+    'POST /api/previews': {
+      existing: true,
+      url: `https://p.example.com/test_${TOKEN}/`,
+      basePath: `/test_${TOKEN}/`,
+      preview: { token: TOKEN, mode: 'static' },
+    },
+  });
+  const result = await executePreviewTool({ action: 'create', dir: './dist', label: 'renamed' }, { api, conversationId: 'conv-1' });
+  assert.equal(result.existing, true);
+  assert.equal(result.token, TOKEN);
+  assert.match(result.hint, /already publishes this directory: same link as before, label unchanged/);
+  assert.match(result.hint, /served as-is/);
+});
+
+test('the tool description states the lifecycle: same link again, survives a restart', () => {
+  assert.match(PREVIEW_TOOL_DESCRIPTION, /returns the same link/);
+  assert.match(PREVIEW_TOOL_DESCRIPTION, /survive a relay restart/);
+  assert.doesNotMatch(PREVIEW_TOOL_DESCRIPTION, /never expire on their own/);
 });

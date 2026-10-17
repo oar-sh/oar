@@ -121,6 +121,7 @@ async function main() {
     // A message became (or stopped being) cancellable: report it now rather
     // than on the next 10 s heartbeat (coalesced by the controller).
     onCancellableChange: () => heartbeat?.requestPulse(),
+    onBackgroundTaskSetStale: () => heartbeat?.requestPulse(),
     canHandBackHeldDelivery: () => linkBridge.canHandBackHeldDelivery(),
     dbg,
   });
@@ -144,6 +145,11 @@ async function main() {
     getSteeringState: () => turnRunner.steeringState(),
     getSettleFailed: () => turnRunner.getSettleFailed(),
     onSettleFailedHandled: (ids) => turnRunner.acknowledgeSettleFailed(ids),
+    // The relay holds the task set in memory only: the digest of the live
+    // task ids rides every beat, and a relay that is out of step (it
+    // restarted, a post was lost) asks for the set again.
+    getBackgroundTaskIds: () => turnRunner.backgroundTaskIds(),
+    onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
   });
 
   const wsLink = createWorkerWebSocketLink({

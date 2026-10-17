@@ -12,6 +12,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
+import { windowsSystemToolPath } from '../../shared/windows-system-tools.mjs';
 
 const DEFAULT_OUTPUT_BYTE_LIMIT = 1024 * 1024;
 const MAX_OUTPUT_BYTE_LIMIT = 8 * 1024 * 1024;
@@ -55,9 +56,9 @@ export function createAcpHostServices({
         timeout: 10_000,
         stdio: 'ignore',
       });
-      cachedWindowsShell = probe && probe.status === 0 ? 'pwsh' : 'powershell';
+      cachedWindowsShell = probe && probe.status === 0 ? 'pwsh' : windowsSystemToolPath('powershell');
     } catch {
-      cachedWindowsShell = 'powershell';
+      cachedWindowsShell = windowsSystemToolPath('powershell');
     }
     return cachedWindowsShell;
   }
@@ -178,7 +179,7 @@ export function createAcpHostServices({
     if (platform === 'win32' && entry.proc.pid) {
       // proc.kill() only reaches the shell; shells leave grandchildren behind.
       try {
-        spawnImpl('taskkill', ['/pid', String(entry.proc.pid), '/t', '/f'], {
+        spawnImpl(windowsSystemToolPath('taskkill'), ['/pid', String(entry.proc.pid), '/t', '/f'], {
           stdio: 'ignore',
           windowsHide: true,
         });

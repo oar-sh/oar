@@ -56,7 +56,7 @@ test('tmux shell command for claude workers runs node without the script PTY wra
   const command = buildTmuxWorkerShellCommand('session-1', env);
   const workerScript = path.join('/repo', 'server', 'claude-worker', 'claude-session-worker.mjs')
     .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  assert.match(command, new RegExp(`exec 'node' '${workerScript}' --session-id 'session-1'$`));
+  assert.match(command, new RegExp(`exec '${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' '${workerScript}' --session-id 'session-1'$`));
   assert.doesNotMatch(command, /script -q/);
   assert.match(command, /export COPILOT_WEB_RELAY_WORKER_KIND='claude';/);
   assert.match(command, /export CLAUDE_RELAY_MODEL='claude-sonnet-5';/);
@@ -94,7 +94,7 @@ test('launchSessionCli spawns node for claude workers when tmux is unavailable',
   });
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls.length, 1);
-  assert.equal(spawnCalls[0].command, 'node');
+  assert.equal(spawnCalls[0].command, process.execPath);
   assert.deepEqual(spawnCalls[0].args, [
     path.join('/repo', 'server', 'claude-worker', 'claude-session-worker.mjs'),
     '--session-id',

@@ -32,7 +32,7 @@ test('a pin change patches the bubbles instead of rebuilding the transcript, and
 
 test('the pin list reaches the page from the conversation payload and from the socket', () => {
   // Before the messages are rendered: their bubbles are drawn from the list.
-  assert.match(read('./journal-view.js'), /if \('pins' in response\) setConversationPins\(id, response\.pins, response\.pinsRevision\);\s*\n\s*setPinsConversation\(id\);\s*\n\s*const didRenderMessages = keepTranscript/);
+  assert.match(read('./journal-view.js'), /if \('pins' in response\) setConversationPins\(id, response\.pins, response\.pinsRevision\);\s*\n\s*setPinsConversation\(id\);\s*\n[^]*?setHiddenMessagesConversation\(id\);\s*\n\s*const didRenderMessages = keepTranscript/);
   assert.match(read('./socket-handlers.js'), /socket\.on\('conversation_pins_updated', \(\{ conversationId, pins, revision \}\) => \{\s*\n\s*setConversationPins\(conversationId, pins, revision\);/);
   assert.match(read('./bootstrap.js'), /initPinnedMessagesView\(\{\s*\n\s*openConversation,\s*\n\s*focusMessage: focusConversationMessageById,\s*\n\s*syncRenderedPinState,/);
 });
@@ -63,12 +63,12 @@ test('the pin list keeps its title on a phone, where the shared modal gives the 
   const store = read('./store.js');
   assert.match(store, /if \(modalEl\?\.dataset\) modalEl\.dataset\.kind = summaryModalState\.kind;/);
   assert.match(store, /if \(modal\?\.dataset\) delete modal\.dataset\.kind;/);
-  assert.match(read('../index.html'), /#summary-modal\[data-kind="pinned-messages"\] \.summary-header-actions \{\s*\n\s*width: auto;/);
+  assert.match(read('../index.html'), /#summary-modal\[data-kind="pinned-messages"\] \.summary-header-actions,\s*\n\s*#summary-modal\[data-kind="hidden-messages"\] \.summary-header-actions \{\s*\n\s*width: auto;/);
 });
 
-test('the header button is in the page hidden, before search, and its [hidden] is honoured', () => {
+test('the header buttons are in the page hidden, 📍 then 🙈 before search, and their [hidden] is honoured', () => {
   const source = read('../index.html');
 
-  assert.match(source, /<button id="pinned-messages-btn" class="header-icon-btn has-count" type="button"[^>]* hidden>📍<span class="header-icon-count"><\/span><\/button>\s*\n\s*<button id="message-search-btn"/);
-  assert.match(source, /#pinned-messages-btn\[hidden\] \{ display: none; \}/);
+  assert.match(source, /<button id="pinned-messages-btn" class="header-icon-btn has-count" type="button"[^>]* hidden>📍<span class="header-icon-count"><\/span><\/button>\s*\n\s*<button id="hidden-messages-btn" class="header-icon-btn has-count" type="button"[^>]* hidden>🙈<span class="header-icon-count"><\/span><\/button>\s*\n\s*<button id="message-search-btn"/);
+  assert.match(source, /#pinned-messages-btn\[hidden\],\s*\n\s*#hidden-messages-btn\[hidden\] \{ display: none; \}/);
 });

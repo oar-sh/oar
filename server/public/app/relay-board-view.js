@@ -3,6 +3,7 @@ import {
   currentConvId,
   escHtml,
   relayBoards,
+  scrollBottom,
 } from './store.js';
 import {
   boardBodyShownInReply,
@@ -16,6 +17,7 @@ import {
 } from './api-client.js';
 import { renderMarkdownPreview } from './router.js';
 import { attachCodeCopyButtons } from './code-copy.mjs';
+import { beginOwnSend, followsTranscriptEnd, refreshJumpButton, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
 
 // The conversation whose settled boards (acted on, dismissed) are loaded. They
 // are asked for per conversation: only the pending ones matter everywhere.
@@ -26,7 +28,18 @@ export function upsertRelayBoard(board) {
   if (!board || !board.id) return;
   relayBoards.set(board.id, board);
   window.renderConvList?.();
-  renderRelayBoards();
+  showNewRelayBoards();
+}
+
+// A board that arrives is shown to a reader who is at the end. Anyone further
+// up stays where they are; the jump-to-bottom button says that it waits.
+// "At the end" is read here, once, before the board is on the page: the
+// render itself reads no layout, it also runs inside a rebuild of the
+// transcript, where a read would clamp the scroll position to the few rows
+// that are on the page at that moment.
+function showNewRelayBoards() {
+  const atEnd = followsTranscriptEnd();
+  if (renderRelayBoards() && atEnd) scrollBottom();
 }
 
 export async function loadRelayBoards() {
@@ -40,7 +53,7 @@ export async function loadRelayBoards() {
   }
   for (const board of pending) relayBoards.set(board.id, board);
   window.renderConvList?.();
-  renderRelayBoards();
+  showNewRelayBoards();
 }
 
 async function loadBoardHistory(conversationId) {
@@ -186,10 +199,8 @@ export function renderRelayBoards() {
   // the live bubble into the reply, or one of another conversation.
   el.querySelectorAll('.relay-board-inline').forEach((node) => { if (!placed.has(node)) node.remove(); });
   el.querySelectorAll('.relay-board-container').forEach((node) => { if (!node.querySelector('.relay-board-inline')) node.remove(); });
-  // A folded agent exchange whose turn waits on a board opens to show it
-  // (agent-exchange-fold-view.mjs).
-  window.syncAgentExchangeFolds?.();
-  if (added) window.scrollBottom?.();
+  refreshJumpButton();
+  return added;
 }
 
 export async function submitRelayBoardAction(boardId, actionId) {
@@ -199,6 +210,7 @@ export async function submitRelayBoardAction(boardId, actionId) {
   const card = document.querySelector(`.relay-board-inline[data-board-id="${CSS.escape(id)}"]`);
   const controls = card ? card.querySelectorAll('button') : [];
   controls.forEach((control) => { control.disabled = true; });
+  const send = beginOwnSend();
 
   try {
     const r = await submitRelayBoardActionApi(id, nextActionId);
@@ -208,6 +220,7 @@ export async function submitRelayBoardAction(boardId, actionId) {
     relayBoards.set(id, r.board);
     window.renderConvList?.();
     renderRelayBoards();
+    scrollAfterOwnSend(send);
   } catch (error) {
     controls.forEach((control) => { control.disabled = false; });
     alert(error.message || 'Failed to submit board action');

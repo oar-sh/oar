@@ -7,17 +7,28 @@
  *
  * `list_sessions` / `read_session` read it as `state` and `tasks[]`; the
  * relay event service reads its edges (a task started or ended) and its quiet
- * time (stalled). Memory only: the background-task set is republished by the
- * workers on every change, sub-agent runs are read from the database, and a
- * restart forgets only the recently finished tasks and the activity clock
- * (which then starts at the restart, so nothing reads as stalled at boot).
+ * time (stalled). Memory only, and a restart of the relay starts it empty
+ * while the workers and their tasks keep running. What brings a running
+ * task back:
+ *  - the worker sends its set again when the relay asks for it on a
+ *    heartbeat (`noteTaskSet` with `resync`), which restores the task with
+ *    its original start time and without a second `task_started`;
+ *  - sub-agent runs are read from the database;
+ *  - a worker that cannot send its set again yet but says it has background
+ *    work shows one placeholder task (`hasUnreportedBackgroundWork`).
+ * Until the workers had time to report, `bootReporting()` says so: the
+ * suspend check and `all_idle` wait that long. The recently finished tasks
+ * and the activity clock are gone for good (the clock starts at the restart,
+ * so nothing reads as stalled at boot).
  *
  * Sources:
  *  - `noteTaskSet` — every POST /api/background-tasks (REPLACE semantics):
  *    a new task id is a start, a task gone from the set has ended, a changed
- *    task (tool call, summary, tokens) is activity.
+ *    task (tool call, summary, tokens) is activity. A task that started
+ *    before this runtime did was announced by the runtime before it.
  *  - `noteTaskSettled` — how a task ended, where the worker says so (the
- *    Claude worker's task_notification).
+ *    Claude worker's task_notification). A task this runtime never knew
+ *    still gets its end event when the worker describes it.
  *  - `noteSubagentRun` — every sub-agent run status the relay stores; a
  *    background run's terminal status is how its task ended, and a
  *    background run with no task in the set (Copilot, Cursor) ends here.
@@ -37,6 +48,44 @@ export const TASK_END_GRACE_MS = 5_000;
 // again and again). The sweep in stale-subagent-run-sweep.mjs closes such
 // rows; this bound keeps them out of the state meanwhile.
 export const STALE_RUNNING_RUN_MAX_AGE_MS = 24 * 60 * 60_000;
+// How long after a runtime start the surviving workers may still be
+// reporting their tasks: four heartbeat periods and a little. Inside it an
+// idle-looking relay is not known to be idle.
+export const BOOT_REPORTING_WINDOW_MS = 45_000;
+// The most an override may ask for: a window is a hold on suspends and on
+// all_idle, and timers take no delay above 2^31 ms.
+export const BOOT_REPORTING_WINDOW_MAX_MS = 10 * 60_000;
+/**
+ * The window of this runtime: BOOT_REPORTING_WINDOW_MS, unless
+ * OAR_BOOT_REPORTING_WINDOW_MS pins another, from 0 (no hold at all: a test
+ * relay that must read as idle straight after its start) to
+ * BOOT_REPORTING_WINDOW_MAX_MS. An override in effect is logged once; a
+ * value that is no number, or below 0, is ignored and logged too.
+ */
+export function resolveBootReportingWindowMs(env = process.env, log = () => {}) {
+  const raw = String(env?.OAR_BOOT_REPORTING_WINDOW_MS ?? '').trim();
+  if (!raw) return BOOT_REPORTING_WINDOW_MS;
+  const pinned = Number(raw);
+  if (!Number.isFinite(pinned) || pinned < 0) {
+    log(`OAR_BOOT_REPORTING_WINDOW_MS=${raw.slice(0, 40)} is not a number of milliseconds from 0; using ${BOOT_REPORTING_WINDOW_MS}`);
+    return BOOT_REPORTING_WINDOW_MS;
+  }
+  const windowMs = Math.min(BOOT_REPORTING_WINDOW_MAX_MS, Math.trunc(pinned));
+  log(windowMs === 0
+    ? 'OAR_BOOT_REPORTING_WINDOW_MS=0: no wait after a relay start; a suspend and all_idle do not wait for sessions that are still reporting'
+    : `OAR_BOOT_REPORTING_WINDOW_MS: a suspend and all_idle wait ${windowMs} ms after a relay start${windowMs === pinned ? '' : ` (asked for ${raw.slice(0, 40)}, kept within 0 to ${BOOT_REPORTING_WINDOW_MAX_MS})`}`);
+  return windowMs;
+}
+// The one task shown for a worker that reports background work the relay
+// was never told the details of.
+export const UNREPORTED_BACKGROUND_TASK_ID = 'unreported-background-work';
+// It stays until the worker reports, and a worker on older code never does
+// for a task that prints nothing: the way out is the session's Kill session.
+export const UNREPORTED_BACKGROUND_TASK_DESCRIPTION = 'background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)';
+// A `running` background run row that its worker's task set does not list
+// and nothing has updated for this long is not running work (see
+// `runListedByWorker`).
+export const UNLISTED_RUNNING_RUN_MAX_QUIET_MS = 15 * 60_000;
 const RECENT_TASKS_MAX = 5;
 const RECENT_TASK_TTL_MS = 60 * 60_000;
 const SHELL_TASK_TYPES = new Set(['local_bash', 'bash', 'shell', 'monitor', 'local_monitor']);
@@ -98,6 +147,20 @@ export function createSessionActivityTracker({
   },
   clearTimer = (timer) => clearTimeout(timer),
   onEdge = () => {},
+  // conversationId → whether its live worker reports background work that no
+  // task set describes (see the placeholder in `describe`).
+  hasUnreportedBackgroundWork = () => false,
+  // The conversations that may be true for, so that readers which only ask
+  // about the conversations this tracker knows ask about them too.
+  listUnreportedBackgroundWork = () => [],
+  // (conversationId, runRow) → whether the task set of the conversation's
+  // worker lists the run: true, false, or null when the worker has reported
+  // no set in this runtime or its sets do not speak for its runs. A
+  // `running` background row that is not listed and that nothing has
+  // updated for UNLISTED_RUNNING_RUN_MAX_QUIET_MS is a row whose end was
+  // never written: it is kept out of the state, as the day-old ones are.
+  runListedByWorker = () => null,
+  bootReportingWindowMs = BOOT_REPORTING_WINDOW_MS,
   logger = console,
 } = {}) {
   const startedAtMs = now();
@@ -105,6 +168,10 @@ export function createSessionActivityTracker({
   const sessions = new Map();
   // Edges already reported for an end, by `${conversationId}:${key}`.
   const endedKeys = new Map();
+  // `${conversationId}:${taskId}` of the ends nobody reported: the task was
+  // only missing from a set for the grace. A later set that lists it again
+  // says it never ended.
+  const endedByAbsence = new Set();
 
   let listRuns = null;
   let getQueueRows = null;
@@ -151,7 +218,10 @@ export function createSessionActivityTracker({
     }
     if (endedKeys.size > 2000) {
       for (const [key, when] of endedKeys) {
-        if (at - when > RECENT_TASK_TTL_MS) endedKeys.delete(key);
+        if (at - when > RECENT_TASK_TTL_MS) {
+          endedKeys.delete(key);
+          endedByAbsence.delete(key);
+        }
       }
     }
   }
@@ -179,7 +249,7 @@ export function createSessionActivityTracker({
     };
   }
 
-  function finishTask(conversationId, task, { status, summary = null, exitCode = null, reported = true } = {}) {
+  function finishTask(conversationId, task, { status, summary = null, exitCode = null, reported = true, absent = false } = {}) {
     if (task.graceTimer) {
       clearTimer(task.graceTimer);
       task.graceTimer = null;
@@ -194,6 +264,7 @@ export function createSessionActivityTracker({
     task.exitCode = code;
     task.endedAtMs = now();
     markEnded(conversationId, task);
+    if (absent) endedByAbsence.add(`${conversationId}:${task.taskId}`);
     entry.recent.unshift(task);
     entry.recent.length = Math.min(entry.recent.length, RECENT_TASKS_MAX);
     entry.lastActivityAt = Math.max(entry.lastActivityAt, task.endedAtMs);
@@ -227,11 +298,26 @@ export function createSessionActivityTracker({
       task.graceTimer = null;
       const late = runStatus(task.toolUseId);
       if (late && isTerminalSubagentRunStatus(late)) finishTask(conversationId, task, { status: late });
-      else finishTask(conversationId, task, { status: 'completed', reported: false });
+      else finishTask(conversationId, task, { status: 'completed', reported: false, absent: true });
     }, TASK_END_GRACE_MS);
   }
 
-  function noteTaskSet(conversationId, tasks) {
+  /** Takes back an end that was only an absence; the task's old row goes from the recent ones. */
+  function unEnd(conversationId, entry, taskId, toolUseId) {
+    endedByAbsence.delete(`${conversationId}:${taskId}`);
+    const index = entry.recent.findIndex((task) => task.taskId === taskId);
+    const [old] = index >= 0 ? entry.recent.splice(index, 1) : [null];
+    for (const key of [taskId, toolUseId ? `run:${toolUseId}` : '', old?.toolUseId ? `run:${old.toolUseId}` : '']) {
+      if (key) endedKeys.delete(`${conversationId}:${key}`);
+    }
+    return old;
+  }
+
+  /**
+   * `resync`: the set is the worker's answer to the relay asking for it
+   * again, not a change of the set.
+   */
+  function noteTaskSet(conversationId, tasks, { resync = false } = {}) {
     const id = toText(conversationId);
     if (!id) return;
     const entry = session(id);
@@ -262,15 +348,25 @@ export function createSessionActivityTracker({
         known.leftAtMs = 0;
         continue;
       }
-      // Settled already (its notice came before the set dropped it).
-      if (wasEnded(id, { taskId, toolUseId: toText(raw.toolUseId) })) continue;
+      let revived = null;
+      if (wasEnded(id, { taskId, toolUseId: toText(raw.toolUseId) })) {
+        // Settled already (its notice came before the set dropped it).
+        if (!endedByAbsence.has(`${id}:${taskId}`)) continue;
+        // Ended only because a set did not list it (a set that arrived out
+        // of turn, a worker that left it out for a moment) and listed
+        // again: it never ended. It comes back as the task it was, with no
+        // second start. The end that was reported for it stays reported;
+        // its real end will be another.
+        revived = unEnd(id, entry, taskId, toText(raw.toolUseId)) || {};
+      }
+      const taskStartedAtMs = msOf(raw.startedAt);
       const task = {
         taskId,
         toolUseId: toText(raw.toolUseId) || null,
         taskType: toText(raw.taskType),
         kind: taskKindOf(raw.taskType),
         description: toText(raw.description).slice(0, 500),
-        startedAtMs: msOf(raw.startedAt) || at,
+        startedAtMs: taskStartedAtMs || revived?.startedAtMs || at,
         lastActivityAtMs: at,
         summary: toText(raw.summary) || null,
         model: toText(raw.model) || null,
@@ -282,7 +378,12 @@ export function createSessionActivityTracker({
       };
       entry.live.set(taskId, task);
       entry.lastActivityAt = at;
-      emitEdge('task_started', id, task);
+      // A task older than this runtime was announced by the one before it,
+      // whichever post brings it back (the resync, or a progress update that
+      // overtakes it). One that started since is new even in a resync: its
+      // first post was lost. Without a start time a resync decides.
+      const announcedBefore = taskStartedAtMs ? taskStartedAtMs < startedAtMs : resync;
+      if (!announcedBefore && !revived) emitEdge('task_started', id, task);
     }
     for (const task of [...entry.live.values()]) {
       if (seen.has(task.taskId) || task.leftAtMs) continue;
@@ -290,7 +391,9 @@ export function createSessionActivityTracker({
     }
   }
 
-  function noteTaskSettled(conversationId, { taskId, toolUseId, status, summary, exitCode } = {}) {
+  function noteTaskSettled(conversationId, {
+    taskId, toolUseId, status, summary, exitCode, description, taskType, startedAt,
+  } = {}) {
     const id = toText(conversationId);
     if (!id) return;
     const entry = session(id);
@@ -305,11 +408,67 @@ export function createSessionActivityTracker({
       exitCode: Number.isInteger(exitCode) ? exitCode : null,
     };
     entry.lastActivityAt = now();
-    if (!task) return;
+    if (!task && key && endedByAbsence.delete(`${id}:${key}`)) {
+      // It was taken for ended when a set no longer listed it; this is the
+      // word on how it ended. A real end is final: no later set brings the
+      // task back.
+      const ended = entry.recent.find((candidate) => candidate.taskId === key);
+      if (ended) {
+        ended.status = settled.status;
+        ended.statusReported = true;
+        if (settled.summary) ended.summary = settled.summary.slice(0, 500);
+        ended.exitCode = settled.exitCode ?? exitCodeFromSummary(ended.summary);
+      }
+      return;
+    }
+    if (!task) {
+      // A task this runtime never knew (it ended while the relay was away, or
+      // its set never arrived): the end is still an event when the worker
+      // says what the task was. Once only, like every end: a sub-agent's
+      // end also comes as its run's status, so the notice is paired with
+      // the run that carries its task id when it names no run. (With no
+      // such link the two are two ends; rare, and better than a guess.)
+      if (!key || !toText(description)) return;
+      const runId = run || (taskKindOf(taskType) === 'subagent'
+        ? runOfUnknownTask(id, { taskId: key })
+        : '');
+      const unknown = {
+        taskId: key,
+        toolUseId: runId || null,
+        taskType: toText(taskType),
+        kind: taskKindOf(taskType),
+        description: toText(description).slice(0, 500),
+        startedAtMs: msOf(startedAt) || now(),
+        lastActivityAtMs: now(),
+        summary: null,
+        model: null,
+        status: 'running',
+      };
+      finishTask(id, unknown, settled);
+      return;
+    }
     task.settled = settled;
     // Gone from the set already, or about to: settle now either way. A task
     // still listed would leave with this status anyway.
     finishTask(id, task, settled);
+  }
+
+  /**
+   * The background run a described settle notice without a run id speaks
+   * of: the run that carries the task id. Nothing looser: a run picked by
+   * name or by start time can be another agent's, whose own end would then
+   * never be reported.
+   */
+  function runOfUnknownTask(conversationId, { taskId }) {
+    if (!listRuns) return '';
+    let rows = [];
+    try {
+      rows = listRuns.all(conversationId, new Date(now() - RECENT_TASK_TTL_MS).toISOString());
+    } catch {
+      return '';
+    }
+    const match = rows.find((row) => Number(row.background) === 1 && toText(row.task_id) === taskId);
+    return match ? toText(match.id) : '';
   }
 
   function noteSubagentRun(run) {
@@ -320,7 +479,21 @@ export function createSessionActivityTracker({
     entry.lastActivityAt = now();
     const status = normalizeSubagentRunStatus(run?.status);
     if (!isTerminalSubagentRunStatus(status)) return;
-    const task = [...entry.live.values()].find((candidate) => candidate.toolUseId === runId) || null;
+    const runTaskId = toText(run?.task_id || run?.taskId);
+    const task = [...entry.live.values()].find((candidate) => candidate.toolUseId === runId)
+      || (runTaskId && entry.live.get(runTaskId))
+      || null;
+    if (task) {
+      task.toolUseId = task.toolUseId || runId;
+    } else {
+      // The run of a task that was taken for ended by its absence: its end
+      // is real now, and final.
+      const ended = entry.recent.find((candidate) => candidate.toolUseId === runId || (runTaskId && candidate.taskId === runTaskId));
+      if (ended && endedByAbsence.delete(`${id}:${ended.taskId}`)) {
+        ended.status = normalizeTaskStatus(status);
+        ended.statusReported = true;
+      }
+    }
     if (task) {
       // The run's end is the task's: finish it once it has left the set,
       // which the grace timer is waiting for; a task still listed keeps
@@ -410,8 +583,13 @@ export function createSessionActivityTracker({
       return [];
     }
     const staleBefore = now() - STALE_RUNNING_RUN_MAX_AGE_MS;
+    const quietBefore = now() - UNLISTED_RUNNING_RUN_MAX_QUIET_MS;
+    const unlisted = (row) => {
+      if (Number(row.background) !== 1 || msOf(row.updated_at || row.started_at) >= quietBefore) return false;
+      try { return runListedByWorker(conversationId, row) === false; } catch { return false; }
+    };
     const staleRunning = (row) => normalizeTaskStatus(row.status) === 'running'
-      && msOf(row.updated_at || row.started_at) < staleBefore;
+      && (msOf(row.updated_at || row.started_at) < staleBefore || unlisted(row));
     return rows
       .filter((row) => !coveredRunIds.has(toText(row.id)) && !staleRunning(row))
       .map((row) => {
@@ -449,8 +627,23 @@ export function createSessionActivityTracker({
       .map((task) => toText(task.toolUseId))
       .filter(Boolean));
     const fromRuns = runTasks(id, covered);
+    const runningRuns = fromRuns.filter((task) => task.status === 'running' && !task.inTurn);
+    let unreported = false;
+    if (!live.length && !runningRuns.length) {
+      try { unreported = hasUnreportedBackgroundWork(id) === true; } catch {}
+    }
     const tasks = [
       ...live.map(publicTask),
+      ...(unreported ? [{
+        id: UNREPORTED_BACKGROUND_TASK_ID,
+        kind: 'unknown',
+        type: null,
+        description: UNREPORTED_BACKGROUND_TASK_DESCRIPTION,
+        startedAt: null,
+        lastActivityAt: null,
+        status: 'running',
+        placeholder: true,
+      }] : []),
       ...fromRuns.filter((task) => task.status === 'running'),
       ...[...recent.map(publicTask), ...fromRuns.filter((task) => task.status !== 'running')]
         .sort((a, b) => msOf(b.endedAt) - msOf(a.endedAt))
@@ -471,7 +664,21 @@ export function createSessionActivityTracker({
   }
 
   function knownConversationIds() {
-    return [...sessions.keys()];
+    const ids = new Set(sessions.keys());
+    try {
+      for (const id of listUnreportedBackgroundWork() || []) if (toText(id)) ids.add(toText(id));
+    } catch {}
+    return [...ids];
+  }
+
+  /**
+   * `{ active, ageMs, remainingMs }`: whether this runtime is young enough
+   * that workers which outlived the one before it may not have reported yet.
+   */
+  function bootReporting() {
+    const ageMs = Math.max(0, now() - startedAtMs);
+    const remainingMs = Math.max(0, bootReportingWindowMs - ageMs);
+    return { active: remainingMs > 0, ageMs, remainingMs };
   }
 
   return {
@@ -483,5 +690,6 @@ export function createSessionActivityTracker({
     forget,
     describe,
     knownConversationIds,
+    bootReporting,
   };
 }

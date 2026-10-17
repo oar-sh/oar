@@ -7,8 +7,10 @@ import { relayToken } from "./e2e-env.mjs";
 // Every listing and every write is stubbed via page.route against an in-memory
 // tree, so these specs never touch the host filesystem and no host path can
 // leak into an assertion.
-// platform-agnostic: the stub paths below are opaque strings to the client —
-// they never reach host path semantics.
+// platform-agnostic: the stub paths below are opaque strings to the client.
+// Only the CWD pick joins one with the relay's real workspace root, and a
+// drive-letter root makes that a native path with `\`, so those assertions
+// accept either separator.
 
 function makeTree() {
   // path -> { type, children: [names] } for the workspace stub.
@@ -255,9 +257,9 @@ test.describe("Repo browser folder operations", () => {
     const input = page.locator("#repo-folder [data-repo-new-folder-input]");
     await input.fill("project");
     await input.press("Enter");
-    await expect(page.locator("#repo-cwd-pick-path")).toContainText("docs/project");
+    await expect(page.locator("#repo-cwd-pick-path")).toContainText(/docs[\\/]project/);
     await page.locator("#repo-cwd-pick-confirm").click();
     await expect(explorer).not.toHaveClass(/visible/);
-    await expect(page.locator("#change-cwd-manual-path")).toHaveValue(/docs\/project$/);
+    await expect(page.locator("#change-cwd-manual-path")).toHaveValue(/docs[\\/]project$/);
   });
 });

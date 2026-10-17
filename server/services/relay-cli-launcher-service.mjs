@@ -3,6 +3,7 @@
 import { execFileSync, spawn } from 'child_process';
 import { createSessionWorkerProcessInspector } from './session-worker-process-service.mjs';
 import { launchSessionCli } from './session-worker-launch-service.mjs';
+import { windowsSystemToolPath } from '../../shared/windows-system-tools.mjs';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -79,7 +80,7 @@ export function createRelayCliLauncherService({
       '  try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch {}',
       '}',
     ].join('; ');
-    execFileSyncImpl('powershell.exe', ['-NoProfile', '-Command', script], {
+    execFileSyncImpl(windowsSystemToolPath('powershell.exe'), ['-NoProfile', '-Command', script], {
       stdio: ['ignore', 'ignore', 'ignore'],
     });
     return ids;
@@ -117,6 +118,7 @@ export function createRelayCliLauncherService({
       spawnImpl,
       execFileSyncImpl,
       processInspector,
+      log,
     });
     return launched;
   }

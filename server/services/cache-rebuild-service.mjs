@@ -62,6 +62,12 @@ export function createCacheRebuildService({
   bootstrapRuntimeSessionBindings,
   collectOrphanedUploadsFromConversation,
   deleteOrphanedUploads,
+  // (conversationId) => void: a hard-deleted conversation takes its preview
+  // links with it, as a delete from the UI does. Archiving keeps them.
+  closeConversationPreviews = null,
+  // Session groups: a purged head leaves its group, and a wipe is followed
+  // by a repair of what the wiped rows headed. Absent in older wiring.
+  conversationGroups = null,
 }) {
   const legacyConversationList = buildLegacyConversationList(db);
   const boundConversationList = buildBoundConversationList(db);
@@ -81,6 +87,7 @@ export function createCacheRebuildService({
     if (!sid) return [];
     const orphanedUploads = collectOrphanedUploadsFromConversation(sid);
     db.transaction(() => {
+      try { conversationGroups?.forgetConversation?.(sid); } catch {}
       db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM relay_boards WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`).run(sid);
@@ -91,8 +98,17 @@ export function createCacheRebuildService({
       db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM conversations WHERE id = ?`).run(sid);
     })();
+    closePreviews(sid);
     deleteOrphanedUploads(orphanedUploads);
     return orphanedUploads;
+  }
+
+  function closePreviews(conversationId) {
+    try {
+      closeConversationPreviews?.(conversationId);
+    } catch (error) {
+      console.warn(`[preview] closing the previews of a purged conversation failed: ${error?.message || error}`);
+    }
   }
 
   function archiveConversation(conversationId) {
@@ -112,6 +128,12 @@ export function createCacheRebuildService({
         AND title_source = 'manual'
     `).all().map((row) => normalizeId(row?.id)).filter(Boolean);
     const manualTitleConversationSet = new Set(manualTitleConversations);
+    // The groups headed by a row about to go keep the head's title as their
+    // name, so a group whose hand-titled members survive is not nameless; the
+    // head link stays for a re-import under the same id.
+    try {
+      conversationGroups?.freezeNamesForHeads?.(conversationIds.filter((id) => !manualTitleConversationSet.has(id)), now);
+    } catch {}
     const uploadHashes = [];
     for (const conversationId of conversationIds) {
       for (const hash of collectOrphanedUploadsFromConversation(conversationId)) {
@@ -147,7 +169,15 @@ export function createCacheRebuildService({
       db.prepare(`DELETE FROM sdk_session_imports`).run();
       db.prepare(`DELETE FROM upload_refs`).run();
       db.prepare(`DELETE FROM uploaded_files`).run();
+      // Groups whose rows are all gone go too; one whose head was wiped but
+      // whose hand-titled members stay keeps the frozen name and the head
+      // link (a re-imported head takes it up again).
+      try { conversationGroups?.sweepEmpty?.(); } catch {}
     })();
+
+    for (const conversationId of conversationIds) {
+      if (!manualTitleConversationSet.has(conversationId)) closePreviews(conversationId);
+    }
 
     deleteOrphanedUploads(uploadHashes);
 

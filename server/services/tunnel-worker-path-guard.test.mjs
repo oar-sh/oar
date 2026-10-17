@@ -28,6 +28,7 @@ function runRequest(guard, req) {
 }
 
 const quietLogger = { warn() {}, log() {} };
+const LOCAL_PEER = { remoteAddress: '127.0.0.1' };
 
 test('guard blocks a worker path carrying cf-ray', () => {
   const guard = createTunnelWorkerPathGuard({ logger: quietLogger });
@@ -39,14 +40,39 @@ test('guard blocks a worker path carrying cf-ray', () => {
   assert.equal(res.statusCode, 403);
 });
 
-test('guard allows a worker path without a tunnel marker', () => {
+test('guard allows a worker path from a local peer without proxy traces', () => {
   const guard = createTunnelWorkerPathGuard({ logger: quietLogger });
   const { res, nextCalled } = runRequest(guard, {
     url: '/api/session-worker/ws?token=abc',
     headers: { host: '127.0.0.1:3333' },
+    socket: LOCAL_PEER,
   });
   assert.equal(nextCalled, true);
   assert.equal(res.statusCode, null);
+});
+
+test('guard blocks a worker path from a non-loopback peer', () => {
+  const guard = createTunnelWorkerPathGuard({ logger: quietLogger });
+  const { res, nextCalled } = runRequest(guard, {
+    url: '/api/session-worker/ws',
+    headers: { host: '192.168.7.20:3333' },
+    socket: { remoteAddress: '192.168.7.31' },
+  });
+  assert.equal(nextCalled, false);
+  assert.equal(res.statusCode, 403);
+});
+
+test('guard blocks a worker path a same-host proxy forwarded without a marker', () => {
+  const guard = createTunnelWorkerPathGuard({ logger: quietLogger });
+  for (const header of ['x-forwarded-for', 'forwarded', 'x-real-ip']) {
+    const { res, nextCalled } = runRequest(guard, {
+      url: '/api/session-worker/ws',
+      headers: { [header]: '203.0.113.9' },
+      socket: LOCAL_PEER,
+    });
+    assert.equal(nextCalled, false, header);
+    assert.equal(res.statusCode, 403, header);
+  }
 });
 
 test('guard allows non-worker paths carrying cf-ray', () => {
@@ -67,7 +93,7 @@ test('guard honours a configured extra marker header', () => {
     headers: { 'x-relay-edge': '1' },
   });
   assert.equal(blocked.res.statusCode, 403);
-  const allowed = runRequest(guard, { url: '/api/session-worker/ws', headers: {} });
+  const allowed = runRequest(guard, { url: '/api/session-worker/ws', headers: {}, socket: LOCAL_PEER });
   assert.equal(allowed.nextCalled, true);
 });
 
@@ -76,6 +102,7 @@ test('guard ignores an empty marker header value', () => {
   const { nextCalled } = runRequest(guard, {
     url: '/api/session-worker/ws',
     headers: { 'cf-ray': '   ' },
+    socket: LOCAL_PEER,
   });
   assert.equal(nextCalled, true);
 });
@@ -107,12 +134,25 @@ test('guard destroys a worker upgrade carrying cf-ray', () => {
 test('guard lets a local worker upgrade through', () => {
   const guard = createTunnelWorkerPathGuard({ logger: quietLogger });
   const socket = createSocket();
+  socket.remoteAddress = '127.0.0.1';
   const handled = guard.handleUpgrade({
     url: '/api/session-worker/ws',
     headers: { host: '127.0.0.1:3333' },
   }, socket);
   assert.equal(handled, false);
   assert.equal(socket.destroyed, false);
+});
+
+test('guard destroys a worker upgrade from a LAN peer', () => {
+  const guard = createTunnelWorkerPathGuard({ logger: quietLogger });
+  const socket = createSocket();
+  socket.remoteAddress = '::ffff:192.168.7.31';
+  const handled = guard.handleUpgrade({
+    url: '/api/session-worker/ws',
+    headers: { host: '192.168.7.20:3333' },
+  }, socket);
+  assert.equal(handled, true);
+  assert.equal(socket.destroyed, true);
 });
 
 test('guard lets a socket.io upgrade through even over the tunnel', () => {

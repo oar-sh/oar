@@ -113,16 +113,39 @@ test('host suspend routes answer 501 when the service is not wired', async () =>
   assert.equal(post.status, 501);
 });
 
-test('POST /api/relay/shutdown/cancel is localhost-only and forwards to cancelRelayShutdown', async () => {
+test('POST /api/relay/shutdown/cancel answers any signed-in client and forwards to cancelRelayShutdown', async () => {
   const calls = [];
   const routes = captureRoutes(makeRouteDeps({
     cancelRelayShutdown: (args) => { calls.push(args); return { cancelled: true, status: 'idle' }; },
     requestRelayShutdown: () => ({ accepted: true }),
   }), registerMessagesRoutes);
-  const remote = await invokeRoute(routes, 'POST', '/api/relay/shutdown/cancel', { socket: { remoteAddress: '10.0.0.5' } });
-  assert.equal(remote.status, 403);
-  const local = await invokeRoute(routes, 'POST', '/api/relay/shutdown/cancel', { socket: { remoteAddress: '127.0.0.1' }, body: { requestedBy: 'phone' } });
+  const lan = await invokeRoute(routes, 'POST', '/api/relay/shutdown/cancel', { socket: { remoteAddress: '10.0.0.5' }, body: { requestedBy: 'phone' } });
+  assert.equal(lan.status, 200);
+  assert.equal(lan.body.cancelled, true);
+  const local = await invokeRoute(routes, 'POST', '/api/relay/shutdown/cancel', { socket: { remoteAddress: '127.0.0.1' }, body: { requestedBy: 'desk' } });
   assert.equal(local.status, 200);
-  assert.equal(local.body.cancelled, true);
-  assert.deepEqual(calls, [{ requestedBy: 'phone' }]);
+  assert.deepEqual(calls, [{ requestedBy: 'phone' }, { requestedBy: 'desk' }]);
+});
+
+test('POST /api/relay/shutdown and /api/queue/empty answer a LAN client too', async () => {
+  const calls = [];
+  const routes = captureRoutes(makeRouteDeps({
+    io: { emit() {} },
+    stmts: { listQueueForPauseDrop: { all: () => [] } },
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    requestRelayShutdown: (args) => { calls.push(args); return { accepted: true, status: 'queued' }; },
+  }), registerMessagesRoutes);
+  const lanSocket = { remoteAddress: '192.168.7.31' };
+  const restart = await invokeRoute(routes, 'POST', '/api/relay/shutdown', { socket: lanSocket, body: { restart: true, requestedBy: 'phone' } });
+  assert.equal(restart.status, 200);
+  assert.equal(calls[0].restart, true);
+  const empty = await invokeRoute(routes, 'POST', '/api/queue/empty', { socket: lanSocket });
+  assert.equal(empty.status, 200);
+  assert.equal(empty.body.droppedCount, 0);
+});
+
+test('POST /api/image-operations/:id/execute refuses a LAN peer', async () => {
+  const routes = captureRoutes(makeRouteDeps({ featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: true } }), registerMessagesRoutes);
+  const lan = await invokeRoute(routes, 'POST', '/api/image-operations/:operationId/execute', { socket: { remoteAddress: '192.168.7.31' }, params: { operationId: 'img_op_demo' } });
+  assert.equal(lan.status, 403);
 });

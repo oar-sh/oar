@@ -41,6 +41,7 @@ import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mj
 import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning-effort.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
+import { normalizeBackgroundTaskDigest } from '../../shared/worker-runtime/background-task-digest.mjs';
 import { ANSWERED_ELSEWHERE_KIND, STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { isLiveResend } from '../services/steer-resend.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
@@ -57,9 +58,11 @@ import { RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
 import { isRelayShutdownQueued, relayShutdownGateReply } from '../services/relay-shutdown-gate.mjs';
 import { createStaleAttemptLogLimiter } from '../services/stale-attempt-log-limiter.mjs';
 import { createSubagentTimelinePublisher } from '../services/subagent-viewer-rooms.mjs';
+import { createLocalRequestCheck } from '../services/request-boundary.mjs';
 import { buildClaudeCloudDelivery, isClaudeCloudProviderType } from '../services/claude-cloud-session-service.mjs';
 import {
   admitRemoteRelayRequest,
+  readRemoteRelayRequest,
   findMentionedRemoteRelays,
   findOriginRemoteRelay,
   formatRemoteRelayOriginHint,
@@ -1775,6 +1778,7 @@ export function registerMessagesRoutes(app, deps) {
     getModelCatalogState,
     buildRelayReadyBannerData,
     backgroundTaskStore,
+    backgroundWorkView = null,
     sendWorkerControl,
     ensureSessionId,
     touchCli,
@@ -1811,6 +1815,10 @@ export function registerMessagesRoutes(app, deps) {
     relayRestartOrchestrator,
     requestRelayShutdown,
     cancelRelayShutdown = null,
+    // Truly local = loopback peer, no tunnel marker, no forwarding header
+    // (services/request-boundary.mjs). The runtime passes the check built
+    // with the configured marker headers.
+    isTrulyLocalRequest = createLocalRequestCheck().isTrulyLocal,
     featureFlags,
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
@@ -1833,6 +1841,9 @@ export function registerMessagesRoutes(app, deps) {
     // agent-sent messages, the inbound switch, and mention unlocks. Absent in
     // older wiring and most tests, where every remote-relay step is a no-op.
     remoteRelayInbound = null,
+    // Session groups (repositories/conversation-group-repository.mjs): the
+    // group stop route. Absent in older wiring and most tests.
+    conversationGroups = null,
     // Relay event subscriptions (services/relay-event-service.mjs) and the
     // per-session activity they read (services/session-activity-tracker.mjs).
     // Absent in older wiring and most tests: every hook is then a no-op.
@@ -1934,21 +1945,6 @@ export function registerMessagesRoutes(app, deps) {
       || event.includes('failed')
       || event.includes('failure')
       || event.includes('blocked');
-  }
-
-  function isLoopbackAddress(value) {
-    const text = String(value || '').trim().toLowerCase();
-    if (!text) return false;
-    return text === '127.0.0.1'
-      || text === '::1'
-      || text === '::ffff:127.0.0.1'
-      || text === '::ffff:7f00:1';
-  }
-
-  function isLoopbackRequest(req) {
-    const socketAddress = req?.socket?.remoteAddress;
-    const ipAddress = req?.ip;
-    return isLoopbackAddress(socketAddress) || isLoopbackAddress(ipAddress);
   }
 
   function readBridgeIdentity(req) {
@@ -2966,36 +2962,54 @@ export function registerMessagesRoutes(app, deps) {
     if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     const conversationId = String(req.params.conversationId || '').trim();
     const requestedMessageId = String(req.body?.messageId || req.body?.queueMessageId || '').trim();
+    const outcome = requestTurnStop(conversationId, {
+      requestedMessageId,
+      clientId: String(req.body?.clientId || '').trim() || null,
+    });
+    if (!outcome.ok) return rejectSessionBinding(res, outcome.status, outcome.error);
+    return res.json(outcome.body);
+  });
+
+  /**
+   * The work of POST /api/conversation/:id/cancel-turn: an `abort_turn`
+   * control for the live turn. `{ ok: true, body }` with the route's answer,
+   * or `{ ok: false, status, error }` when the conversation is unknown.
+   */
+  function requestTurnStop(conversationId, { requestedMessageId = '', clientId = null } = {}) {
     const sessionState = getConversationSessionState(conversationId);
-    if (!sessionState.ok) {
-      return rejectSessionBinding(res, sessionState.status, sessionState.error);
-    }
+    if (!sessionState.ok) return { ok: false, status: sessionState.status, error: sessionState.error };
 
     // The live turn, not merely the newest processing row: a steered message
     // folded into the running turn is also `processing`, and Stop must target
     // the turn actually executing (which the worker interrupts as a whole).
     const queueRow = resolveLiveTurnQueueRow(conversationId) || null;
     if (!queueRow) {
-      return res.json({
+      return {
         ok: true,
-        queued: false,
-        acknowledgement: 'no-active-turn',
-        requestedMessageId: requestedMessageId || null,
-        activeMessageId: null,
-      });
+        body: {
+          ok: true,
+          queued: false,
+          acknowledgement: 'no-active-turn',
+          requestedMessageId: requestedMessageId || null,
+          activeMessageId: null,
+        },
+      };
     }
 
     const activeMessageId = String(queueRow.id || '').trim();
     if (requestedMessageId && activeMessageId && requestedMessageId !== activeMessageId) {
       const requestedRow = stmts.findQById.get(requestedMessageId) || null;
       const requestedStatus = String(requestedRow?.status || '').trim().toLowerCase();
-      return res.json({
+      return {
         ok: true,
-        queued: false,
-        acknowledgement: requestedStatus === 'processing' ? 'message-mismatch' : 'already-finished',
-        requestedMessageId,
-        activeMessageId,
-      });
+        body: {
+          ok: true,
+          queued: false,
+          acknowledgement: requestedStatus === 'processing' ? 'message-mismatch' : 'already-finished',
+          requestedMessageId,
+          activeMessageId,
+        },
+      };
     }
 
     const sdkSessionId = normalizeSessionWorkerId(
@@ -3004,33 +3018,39 @@ export function registerMessagesRoutes(app, deps) {
       || sessionState.conversationSdkSessionId,
     );
     if (!sdkSessionId) {
-      return res.json({
+      return {
         ok: true,
-        queued: false,
-        acknowledgement: 'active-turn-unbound',
-        requestedMessageId: activeMessageId || requestedMessageId || null,
-        activeMessageId,
-      });
+        body: {
+          ok: true,
+          queued: false,
+          acknowledgement: 'active-turn-unbound',
+          requestedMessageId: activeMessageId || requestedMessageId || null,
+          activeMessageId,
+        },
+      };
     }
 
     const existing = findActiveRelayControlByQueueMessage.get(activeMessageId, 'abort_turn') || null;
     if (existing) {
-      return res.json({
+      return {
         ok: true,
-        queued: true,
-        duplicate: true,
-        acknowledgement: 'already-requested',
-        requestedMessageId: activeMessageId || requestedMessageId || null,
-        activeMessageId,
-        control: formatRelayControlResponse(existing),
-      });
+        body: {
+          ok: true,
+          queued: true,
+          duplicate: true,
+          acknowledgement: 'already-requested',
+          requestedMessageId: activeMessageId || requestedMessageId || null,
+          activeMessageId,
+          control: formatRelayControlResponse(existing),
+        },
+      };
     }
 
     const now = new Date().toISOString();
     const controlId = uuidv4();
     const requestPayload = JSON.stringify({
       source: 'relay-ui',
-      requestedByClientId: String(req.body?.clientId || '').trim() || null,
+      requestedByClientId: clientId || null,
     });
     insertRelayControlRequest.run(
       controlId,
@@ -3043,14 +3063,59 @@ export function registerMessagesRoutes(app, deps) {
       now,
     );
     const control = getRelayControlRequestById.get(controlId) || null;
-    return res.json({
+    return {
       ok: true,
-      queued: true,
-      acknowledgement: 'stop-queued',
-      requestedMessageId: activeMessageId || requestedMessageId || null,
-      activeMessageId,
-      control: formatRelayControlResponse(control),
-    });
+      body: {
+        ok: true,
+        queued: true,
+        acknowledgement: 'stop-queued',
+        requestedMessageId: activeMessageId || requestedMessageId || null,
+        activeMessageId,
+        control: formatRelayControlResponse(control),
+      },
+    };
+  }
+
+  // POST /api/conversation-groups/:id/stop — "Stop all running" on a session
+  // group's head row: a stop for every member's live turn, and a stop for
+  // every stoppable background task. Tasks the panel shows no Stop button
+  // for are listed as `unstoppable`. The owner's action only: a paired
+  // relay's agent is refused.
+  app.post('/api/conversation-groups/:id/stop', auth, (req, res) => {
+    if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+      return res.status(403).json({ error: 'Session groups are managed by this relay\'s owner only.' });
+    }
+    const groupId = String(req.params.id || '').trim();
+    const group = groupId ? conversationGroups?.getGroup?.(groupId) : null;
+    if (!group) return res.status(404).json({ ok: false, error: 'Group not found' });
+    const clientId = String(req.body?.clientId || '').trim() || null;
+    const turns = [];
+    const tasks = [];
+    const unstoppable = [];
+    for (const member of conversationGroups.membersOf(groupId)) {
+      if (member.archived) continue;
+      const outcome = requestTurnStop(member.id, { clientId });
+      if (outcome.ok && outcome.body.queued === true) turns.push({ id: member.id, messageId: outcome.body.activeMessageId });
+      const conversation = stmts.getConvAnyStatus?.get?.(member.id) || null;
+      const sessionId = String(conversation?.sdk_session_id || member.id);
+      const liveTasks = [...new Set([member.id, sessionId])].flatMap((key) => backgroundTaskStore?.get?.(key) || []);
+      for (const task of liveTasks) {
+        // The store holds what the publish route keeps: `taskId`.
+        const taskId = String(task?.taskId || '').trim();
+        if (!taskId) continue;
+        if (task?.stoppable === false) {
+          unstoppable.push({ id: member.id, taskId, reason: 'no-stop' });
+          continue;
+        }
+        const sent = sendWorkerControl?.(sessionId, { type: 'stop_background_task', taskId });
+        if (sent) tasks.push({ id: member.id, taskId });
+        else unstoppable.push({ id: member.id, taskId, reason: 'worker-not-connected' });
+      }
+    }
+    if (turns.length || tasks.length) {
+      console.log(`[${ts()}] GROUP STOP ${groupId.slice(0, 12)} turns=${turns.length} tasks=${tasks.length}`);
+    }
+    return res.json({ ok: true, turns, tasks, unstoppable });
   });
 
   app.post('/api/conversation/:conversationId/subagent/:subagentRunId/cancel', auth, (req, res) => {
@@ -5313,6 +5378,7 @@ export function registerMessagesRoutes(app, deps) {
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
     const settleFailedHandled = [];
     const settleFailedSkipped = [];
+    let resyncBackgroundTasks = false;
     const activeQueueMessageId = String(req.body?.activeQueueMessageId || '').trim();
     // A persistent-process worker can hold several live rows at once (the
     // running turn plus a delivered message queued behind it plus a
@@ -5379,6 +5445,32 @@ export function registerMessagesRoutes(app, deps) {
         }
       }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
+      // The worker's digest of its live background-task ids against the set
+      // held for it (keyed as the worker posts, by its session id). They
+      // differ after a relay restart, which starts with no sets, and after a
+      // lost post either way round: the answer then asks for the full set
+      // again. A worker that sends no digest has no opinion and is never
+      // asked; a relay that holds a set while the worker reports none asks
+      // too, and the empty answer ends those tasks.
+      // The process this beat comes from holds the session: a set post of
+      // another process is a late one (see the task route).
+      backgroundTaskStore?.noteHolder?.(requesterSessionId, normalizedRequesterPid);
+      const taskDigest = normalizeBackgroundTaskDigest(req.body?.backgroundTasks);
+      if (taskDigest && typeof backgroundTaskStore?.matches === 'function') {
+        resyncBackgroundTasks = !backgroundTaskStore.matches(taskDigest, requesterSessionId, requesterConversationId);
+      }
+      // The placeholder for background work this runtime was never told the
+      // details of (a worker that cannot resync yet): the pages hear when it
+      // appears and when it goes without a set having replaced it.
+      if (!resyncBackgroundTasks && backgroundWorkView) {
+        const unreported = backgroundWorkView.hasUnreportedWork(requesterSessionId) === true;
+        if (backgroundTaskStore?.announce?.(requesterSessionId, unreported)) {
+          io.emit('background_tasks', {
+            conversationId: requesterSessionId,
+            tasks: backgroundWorkView.panelTasks(requesterSessionId, requesterConversationId),
+          });
+        }
+      }
       // Consumed steers whose settle the worker could not save within its
       // retry budget (e.g. its writes keep failing): the relay fails them
       // itself with the worker's terminal error, never requeueing them.
@@ -5438,6 +5530,7 @@ export function registerMessagesRoutes(app, deps) {
       pendingCount,
       ...(settleFailedHandled.length ? { settleFailedHandled } : {}),
       ...(settleFailedSkipped.length ? { settleFailedSkipped } : {}),
+      ...(resyncBackgroundTasks ? { resyncBackgroundTasks: true } : {}),
     });
   });
 
@@ -6421,10 +6514,10 @@ export function registerMessagesRoutes(app, deps) {
     return res.json({ ok: true, recovered: rows.length, maxAgeMs });
   });
 
+  // Emptying the queue, restarting the relay and withdrawing a restart are
+  // the user's own maintenance actions: the browser app calls them from a
+  // phone, over the tunnel and over the LAN. The token is the boundary.
   app.post('/api/queue/empty', auth, (req, res) => {
-    if (!isLoopbackRequest(req)) {
-      return res.status(403).json({ error: 'Queue empty endpoint is localhost-only' });
-    }
     const rows = stmts.listQueueForPauseDrop.all();
     const droppedCount = rows.length;
     if (!droppedCount) {
@@ -6452,9 +6545,6 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   app.post('/api/relay/shutdown', auth, (req, res) => {
-    if (!isLoopbackRequest(req)) {
-      return res.status(403).json({ error: 'Relay shutdown endpoint is localhost-only' });
-    }
     if (typeof requestRelayShutdown !== 'function') {
       return res.status(501).json({ error: 'Relay shutdown orchestration is unavailable' });
     }
@@ -6472,9 +6562,6 @@ export function registerMessagesRoutes(app, deps) {
   // Withdraw a queued (not yet started) shutdown/restart. Same trust boundary
   // as queueing one.
   app.post('/api/relay/shutdown/cancel', auth, (req, res) => {
-    if (!isLoopbackRequest(req)) {
-      return res.status(403).json({ error: 'Relay shutdown endpoint is localhost-only' });
-    }
     if (typeof cancelRelayShutdown !== 'function') {
       return res.status(501).json({ error: 'Relay shutdown orchestration is unavailable' });
     }
@@ -6483,9 +6570,11 @@ export function registerMessagesRoutes(app, deps) {
     return res.json({ ok: true, ...result });
   });
 
+  // Called by the relay's own worker on this machine; nothing that came in
+  // through a proxy or the tunnel may start a provider image request.
   app.post('/api/image-operations/:operationId/execute', auth, async (req, res) => {
-    if (!isLoopbackRequest(req)) {
-      return res.status(403).json({ error: 'Image operation execution is localhost-only' });
+    if (!isTrulyLocalRequest(req)) {
+      return res.status(403).json({ error: 'Image operation execution is reachable from this machine only' });
     }
     if (featureFlags?.IMAGE_CONVERSATION_CONTINUITY_ENABLED !== true) {
       return res.status(404).json({ error: 'Image continuity is not enabled' });
@@ -7560,12 +7649,21 @@ export function registerMessagesRoutes(app, deps) {
     const taskId = String(req.body?.taskId || '').trim();
     if (!conversationId || !taskId) return res.status(400).json({ error: 'Missing conversationId or taskId' });
     const exitCode = Number(req.body?.exitCode);
+    const settledDescription = String(req.body?.description || '').trim().slice(0, 500);
     sessionActivityTracker?.noteTaskSettled?.(conversationId, {
       taskId,
       toolUseId: sanitizeSubagentRunId(req.body?.toolUseId) || null,
       status: String(req.body?.status || '').trim().slice(0, 40) || 'completed',
       summary: String(req.body?.summary || '').trim().slice(0, 500) || null,
       exitCode: Number.isInteger(exitCode) ? exitCode : null,
+      // What the task was, from a worker that sends it: the end of a task
+      // this runtime never knew (it ended while the relay was away) is
+      // still an event then.
+      ...(settledDescription ? {
+        description: settledDescription,
+        taskType: String(req.body?.taskType || '').trim().slice(0, 80),
+        startedAt: Number(req.body?.startedAt) || null,
+      } : {}),
     });
     relayEventService?.afterStateChange?.(conversationId);
     res.json({ ok: true });
@@ -7574,6 +7672,10 @@ export function registerMessagesRoutes(app, deps) {
   // POST /api/background-tasks — a session worker publishes its live
   // background-task set (REPLACE semantics, mirroring the SDK's
   // background_tasks_changed signal) so the composer panel tracks it live.
+  // `resync: true` marks the set as the answer to a heartbeat that asked for
+  // it again (`resyncBackgroundTasks`): the same replace, and the pages get
+  // the set again, but a task the relay had forgotten is not a new start.
+  // `order` lets the relay drop a set that a newer one overtook.
   app.post('/api/background-tasks', auth, (req, res) => {
     touchCli();
     const conversationId = String(req.body?.conversationId || '').trim();
@@ -7602,13 +7704,30 @@ export function registerMessagesRoutes(app, deps) {
         toolUseId: sanitizeSubagentRunId(task?.toolUseId) || undefined,
       }))
       .filter((task) => task.taskId);
+    const resync = req.body?.resync === true;
+    // Posts can overtake each other on the way (an ordinary publish and the
+    // answer to a resync, two publishes): a worker numbers its sets
+    // (`order: { epoch, seq }`), and one older than the newest applied is
+    // dropped, or a task of the newer set would read as ended. A worker
+    // that numbers none is taken as it comes.
+    // A drop is never silent: it is logged, and the answer says `stale`,
+    // on which the worker asks for a heartbeat (which makes it the holder
+    // of the session if it was not yet, and has the relay ask for the set).
+    const setOrder = backgroundTaskStore?.acceptOrder?.(conversationId, req.body?.order, {
+      pid: readBridgeIdentity(req)?.pid,
+    });
+    if (setOrder && setOrder.accepted === false) {
+      console.log(`[${typeof ts === 'function' ? ts() : new Date().toISOString()}] BG-TASKS set dropped (${setOrder.reason}) session=${conversationId.slice(0, 8)} epoch=${Number(req.body?.order?.epoch) || 0} seq=${Number(req.body?.order?.seq) || 0} tasks=${tasks.length}`);
+      return res.json({ ok: true, count: tasks.length, stale: true, reason: setOrder.reason });
+    }
     backgroundTaskStore?.replace?.(conversationId, tasks);
+    backgroundTaskStore?.announce?.(conversationId, false);
     io.emit('background_tasks', { conversationId, tasks });
     // The store is keyed as the worker posts (its SDK session id); the
     // tracker by the conversation.
     try {
       const trackedConversationId = resolveTaskConversationId(conversationId);
-      sessionActivityTracker?.noteTaskSet?.(trackedConversationId, tasks);
+      sessionActivityTracker?.noteTaskSet?.(trackedConversationId, tasks, { resync });
       relayEventService?.afterStateChange?.(trackedConversationId);
     } catch {}
     // The panel's copy of a task lives in memory and goes when the task
@@ -7631,7 +7750,7 @@ export function registerMessagesRoutes(app, deps) {
         .some((column) => before[column] !== after[column]);
       if (changed) emitSubagentStatus(after);
     }
-    res.json({ ok: true, count: tasks.length });
+    res.json({ ok: true, count: tasks.length, ...(resync ? { resync: true } : {}) });
   });
 
   // POST /api/conversation/:conversationId/background-task/:taskId/stop —

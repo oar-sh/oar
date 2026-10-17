@@ -9,16 +9,20 @@ import {
 const RELAY_WIDE = [
   'chat-menu-pwa-version',
   'chat-menu-queue-status',
+  'chat-menu-theme-toggle',
   'chat-menu-usage',
   'chat-menu-select-models',
   'chat-menu-settings',
+  'chat-menu-about',
   'chat-menu-restart-relay',
 ];
 
 const PER_CONVERSATION = [
   'chat-menu-edit-title',
   'chat-menu-share-conversation',
+  'chat-menu-preview-shared',
   'chat-menu-archive',
+  'chat-menu-group',
   'chat-menu-inspect-tmux',
   'chat-menu-change-cwd',
   'chat-menu-git-changes',
@@ -39,7 +43,7 @@ test('with no conversation the trigger works and only the relay-wide entries sho
     assert.equal(state.entries[id].hidden, true, `${id} is hidden without a conversation`);
   }
   assert.equal(state.entries['chat-menu-open-cloud-session'].hidden, true);
-  assert.equal(state.entries['chat-menu-shared-theme-toggle'].hidden, true);
+  assert.deepEqual(state.entries['chat-menu-theme-toggle'], { hidden: false, disabled: false });
   assert.equal(state.entries['chat-menu-settings'].disabled, false);
 });
 
@@ -117,9 +121,11 @@ test('the shared view shows Day/Night only and keeps the trigger usable', () => 
   ]) {
     const state = resolveChatActionsMenuState(input);
     assert.deepEqual(state.trigger, { hidden: false, disabled: false });
-    assert.deepEqual(visibleChatActionsMenuEntryIds(state), ['chat-menu-shared-theme-toggle']);
+    assert.deepEqual(visibleChatActionsMenuEntryIds(state), ['chat-menu-theme-toggle']);
     assert.equal(state.entries['chat-menu-settings'].hidden, true);
     assert.equal(state.entries['chat-menu-settings'].disabled, true);
+    // About is the owner's: a shared viewer never sees the relay's facts.
+    assert.deepEqual(state.entries['chat-menu-about'], { hidden: true, disabled: true });
   }
 });
 
@@ -136,4 +142,14 @@ test('a hidden entry is also disabled, so it can never take focus or a tap', () 
   for (const id of CHAT_ACTIONS_MENU_ENTRY_IDS) {
     if (state.entries[id].hidden) assert.equal(state.entries[id].disabled, true, id);
   }
+});
+
+test('Stop sharing shows only for an open conversation with an active share', () => {
+  assert.equal(resolveChatActionsMenuState(localConversation).entries['chat-menu-stop-sharing'].hidden, true);
+  const shared = resolveChatActionsMenuState({ ...localConversation, hasActiveShare: true });
+  assert.deepEqual(shared.entries['chat-menu-stop-sharing'], { hidden: false, disabled: false });
+  // Share conversation stays: it copies the existing link.
+  assert.equal(shared.entries['chat-menu-share-conversation'].hidden, false);
+  assert.equal(resolveChatActionsMenuState({ conversationId: null, hasActiveShare: true }).entries['chat-menu-stop-sharing'].hidden, true);
+  assert.equal(resolveChatActionsMenuState({ sharedMode: true, ...localConversation, hasActiveShare: true }).entries['chat-menu-stop-sharing'].hidden, true);
 });

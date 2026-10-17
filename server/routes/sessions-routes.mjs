@@ -10,6 +10,7 @@ import { createSdkSessionSyncService } from '../services/sdk-session-sync-servic
 import { serveFileWithRangeSupport } from '../services/file-serving.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { MESSAGE_PIN_LIMIT, buildPinList } from '../services/message-pin-list.mjs';
+import { buildHiddenMessageList } from '../services/hidden-message-list.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import { CLAUDE_ATTRIBUTION_MODES, DEFAULT_CLAUDE_ATTRIBUTION_MODE, claudeAttributionModelLabel, claudeAttributionTrailer, normalizeClaudeAttributionMode, resolveClaudeAttributionMode } from '../../shared/claude-attribution.mjs';
@@ -34,10 +35,19 @@ import {
   readWorkspaceRootPathFromBody,
   validateRequestedWorkspaceRoot, normalizeWorkspaceRootKey } from '../services/workspace-root-path-policy.mjs';
 import { workspaceRootDisplayName } from '../workspace-root.mjs';
+import { redactPreviewTokens } from '../services/preview-registry-service.mjs';
+import { createSharePathRedactor } from '../services/share-path-redaction.mjs';
+import { createSubagentTimelineService, TIMELINE_READ_DEFAULT_LIMIT } from '../services/subagent-timeline-service.mjs';
+import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { createKeyedMutex } from '../services/keyed-mutex-service.mjs';
 import { createFixedWindowRateLimiter } from '../services/rate-limit-service.mjs';
+import { requestHostOf } from '../services/request-boundary.mjs';
 import { parseRemoteRelayOriginJson } from '../repositories/remote-relay-repository.mjs';
-import { admitRemoteRelayRequest, publicRemoteRelayOrigin } from '../services/remote-relay-inbound.mjs';
+import { createShareRepository } from '../repositories/share-repository.mjs';
+import { createShareAccessLog, readShareRequestViewer } from '../services/share-access-log-service.mjs';
+import { resolveGroupDisplayName } from '../repositories/conversation-group-repository.mjs';
+import { conversationGroupPosition, conversationGroupRole, groupActivityTimes, pageConversationRows } from '../public/app/conversation-group-order.mjs';
+import { admitRemoteRelayRequest, publicRemoteRelayOrigin, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import {
   RELAUNCH_COALESCE_WINDOW_MS,
   buildRelaunchRequestKey,
@@ -74,6 +84,12 @@ import {
   SUBAGENT_RECORD_RETENTION_CHOICES,
   parseSubagentRecordRetentionUpdate,
 } from '../../shared/subagent-record-retention.mjs';
+import {
+  DEFAULT_SHARE_PATH_PRIVACY_MODE,
+  SHARE_PATH_PRIVACY_LABELS,
+  SHARE_PATH_PRIVACY_MODES,
+  parseSharePathPrivacyUpdate,
+} from '../../shared/share-path-privacy.mjs';
 import {
   DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
   BACKGROUND_TASK_TIMEOUT_MAX_MINUTES,
@@ -1714,80 +1730,25 @@ export function normalizeConversationListLimit(value, fallback = DEFAULT_CONVERS
   return Math.min(MAX_CONVERSATION_LIST_LIMIT, Math.max(1, Math.trunc(parsed)));
 }
 
-function compareConversationListOrder(a, b) {
-  const aUpdatedAtMs = normalizeConversationTimestampMs(a?.updated_at || a?.updatedAt);
-  const bUpdatedAtMs = normalizeConversationTimestampMs(b?.updated_at || b?.updatedAt);
-  if (aUpdatedAtMs !== bUpdatedAtMs) return bUpdatedAtMs - aUpdatedAtMs;
-  return String(b?.id || '').trim().localeCompare(String(a?.id || '').trim());
-}
-
-function resolveConversationListCursor(rows = [], {
-  beforeConversationId = '',
-  beforeUpdatedAt = '',
-} = {}) {
-  const cursorConversationId = String(beforeConversationId || '').trim();
-  const cursorUpdatedAt = String(beforeUpdatedAt || '').trim();
-  const list = Array.isArray(rows) ? rows : [];
-
-  if (cursorConversationId) {
-    const cursorRow = list.find((row) => String(row?.id || '').trim() === cursorConversationId) || null;
-    if (cursorRow) {
-      return {
-        beforeConversationId: cursorConversationId,
-        beforeUpdatedAt: normalizeConversationTimestampIso(
-          cursorRow.updated_at || cursorRow.updatedAt,
-          String(cursorRow.updated_at || cursorRow.updatedAt || '').trim() || null,
-        ),
-        timestampMs: normalizeConversationTimestampMs(cursorRow.updated_at || cursorRow.updatedAt),
-      };
-    }
-  }
-
-  if (cursorUpdatedAt) {
-    return {
-      beforeConversationId: cursorConversationId || null,
-      beforeUpdatedAt: cursorUpdatedAt,
-      timestampMs: normalizeConversationTimestampMs(cursorUpdatedAt),
-    };
-  }
-
-  return null;
-}
-
+/**
+ * One page of the conversation list, newest first, with session groups kept
+ * whole: the order and the cursor are those of conversation-group-order.mjs,
+ * which the sidebar uses too. `groups` is the `Map<id, group>` of the rows'
+ * groups (the head of each group is needed for the order inside it).
+ */
 export function selectConversationListPage(rows = [], {
   limit = DEFAULT_CONVERSATION_LIST_LIMIT,
   beforeConversationId = '',
   beforeUpdatedAt = '',
+  beforeGroupId = '',
+  groups = null,
 } = {}) {
-  const pageLimit = normalizeConversationListLimit(limit);
-  const ordered = Array.isArray(rows)
-    ? rows.filter((row) => !!row).slice().sort(compareConversationListOrder)
-    : [];
-  const cursor = resolveConversationListCursor(ordered, { beforeConversationId, beforeUpdatedAt });
-  const olderRows = cursor
-    ? ordered.filter((row) => {
-        const rowUpdatedAtMs = normalizeConversationTimestampMs(row?.updated_at || row?.updatedAt);
-        if (rowUpdatedAtMs < cursor.timestampMs) return true;
-        if (rowUpdatedAtMs > cursor.timestampMs) return false;
-        if (!cursor.beforeConversationId) return false;
-        return String(row?.id || '').trim().localeCompare(cursor.beforeConversationId) < 0;
-      })
-    : ordered;
-  const pageRows = olderRows.slice(0, pageLimit);
-  const oldestRow = pageRows[pageRows.length - 1] || null;
-  return {
-    rows: pageRows,
-    pageInfo: {
-      hasMore: olderRows.length > pageRows.length,
-      nextCursor: oldestRow ? {
-        beforeConversationId: String(oldestRow.id || '').trim(),
-        beforeUpdatedAt: normalizeConversationTimestampIso(
-          oldestRow.updated_at || oldestRow.updatedAt,
-          String(oldestRow.updated_at || oldestRow.updatedAt || '').trim() || null,
-        ),
-      } : null,
-    },
-  };
+  return pageConversationRows(rows, groups, {
+    limit: normalizeConversationListLimit(limit),
+    beforeConversationId,
+    beforeUpdatedAt,
+    beforeGroupId,
+  });
 }
 
 export function buildConversationMessages({
@@ -2039,7 +2000,10 @@ export function registerSessionsRoutes(app, deps) {
     readContextFromSessionEvents,
     inFlightStateForConversation,
     backgroundTaskStore,
+    backgroundWorkView = null,
     listConversationPreviews,
+    listKnownPreviewTokens,
+    closeConversationPreviews,
     createCompactedConversation,
     collectOrphanedUploadsFromConversation,
     deleteOrphanedUploads,
@@ -2140,6 +2104,9 @@ export function registerSessionsRoutes(app, deps) {
     setGrokPlanAllowanceSettings = () => ({ ok: false, error: 'Grok allowance settings are unavailable' }),
     sessionHistoryRefreshService,
     sdkSessionImportService,
+    // Session groups (migration 0014): null in older wiring and most tests,
+    // where every conversation is ungrouped.
+    conversationGroups = null,
     ensureRuntimeSessionBinding,
     bootstrapRuntimeSessionBindings,
     configuredConversationSessionMode,
@@ -2167,6 +2134,9 @@ export function registerSessionsRoutes(app, deps) {
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
     getSubagentRecordRetentionDays = () => DEFAULT_SUBAGENT_RECORD_RETENTION_DAYS,
     setSubagentRecordRetentionDays = () => ({ ok: false, error: 'Sub-agent record settings are unavailable' }),
+    getSharePathPrivacyMode = () => DEFAULT_SHARE_PATH_PRIVACY_MODE,
+    setSharePathPrivacyMode = () => ({ ok: false, error: 'Path privacy settings are unavailable' }),
+    sharePathKnownRoots = () => ({ roots: [], userNames: [] }),
     getFeatureFlagsSettingsState = () => [],
     setFeatureFlagSetting = () => ({ ok: false, error: 'Feature settings are unavailable' }),
     getPwaAppName = () => '',
@@ -2192,8 +2162,16 @@ export function registerSessionsRoutes(app, deps) {
     // subscriptions that end with an archived or deleted conversation.
     relayEventService = null,
     sessionActivityTracker = null,
+    // Public shares and their access log (migration 0016); built on `db` when
+    // the wiring does not pass one.
+    shareRepository = null,
   } = deps;
   const sdkSessionSyncService = createSdkSessionSyncService(db);
+  // Built on first use: many route tests hand in a database without tables.
+  let shareRepositoryInstance = shareRepository;
+  let shareAccessLogInstance = null;
+  const shares = () => (shareRepositoryInstance ||= createShareRepository(db));
+  const shareAccessLog = () => (shareAccessLogInstance ||= createShareAccessLog({ repository: shares() }));
   let listRunningRunConversations = null;
   try {
     listRunningRunConversations = db.prepare(`SELECT DISTINCT conversation_id FROM subagent_runs WHERE status = 'running'`);
@@ -2272,19 +2250,47 @@ export function registerSessionsRoutes(app, deps) {
   function listConversationPins(conversationId) {
     return buildPinList(stmts.listPinnedMessages?.all?.(conversationId) || []);
   }
-  // Orders the pin lists a browser receives. A conversation load that left
-  // before a pin change can arrive after the change's own socket event; with
-  // the revision the browser can tell the older list from the newer one. In
-  // memory only: a restart starts above every revision handed out before.
-  const pinRevisionFloor = Date.now();
-  const pinRevisionByConversation = new Map();
-  function conversationPinRevision(conversationId) {
-    return pinRevisionByConversation.get(conversationId) || pinRevisionFloor;
+  function listConversationHiddenMessages(conversationId) {
+    return buildHiddenMessageList(stmts.listHiddenMessages?.all?.(conversationId) || []);
   }
-  function bumpConversationPinRevision(conversationId) {
-    const next = Math.max(Date.now(), conversationPinRevision(conversationId) + 1);
-    pinRevisionByConversation.set(conversationId, next);
-    return next;
+  // Orders the per-conversation lists a browser receives (pins, hidden
+  // messages). A conversation load that left before a change can arrive after
+  // the change's own socket event; with the revision the browser can tell the
+  // older list from the newer one. In memory only: a restart starts above
+  // every revision handed out before.
+  function createConversationListRevisions() {
+    const floor = Date.now();
+    const byConversation = new Map();
+    const current = (conversationId) => byConversation.get(conversationId) || floor;
+    return {
+      current,
+      bump(conversationId) {
+        const next = Math.max(Date.now(), current(conversationId) + 1);
+        byConversation.set(conversationId, next);
+        return next;
+      },
+    };
+  }
+  const pinRevisions = createConversationListRevisions();
+  const conversationPinRevision = pinRevisions.current;
+  const bumpConversationPinRevision = pinRevisions.bump;
+  const hiddenMessageRevisions = createConversationListRevisions();
+  const conversationHiddenMessagesRevision = hiddenMessageRevisions.current;
+  // Every open owner page follows a share-visibility change without a reload:
+  // the 🙈 list and count, the bubbles' Hide / Unhide, and the pin list's
+  // "hidden from shared" chip when a pinned message changed.
+  function broadcastShareVisibilityChange(conversationId, { pinnedChanged = false } = {}) {
+    const hiddenMessages = listConversationHiddenMessages(conversationId);
+    const revision = hiddenMessageRevisions.bump(conversationId);
+    io?.emit?.('conversation_hidden_messages_updated', { conversationId, hiddenMessages, revision });
+    if (pinnedChanged) {
+      io?.emit?.('conversation_pins_updated', {
+        conversationId,
+        pins: listConversationPins(conversationId),
+        revision: bumpConversationPinRevision(conversationId),
+      });
+    }
+    return { hiddenMessages, revision };
   }
   const listSessionWorkerQueueRows = db.prepare(`
     SELECT id, conversation_id, runtime_session_id, owner_sdk_session_id, status
@@ -2359,6 +2365,8 @@ export function registerSessionsRoutes(app, deps) {
     db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);
+    // The share access log goes with it; the share rows follow the foreign key.
+    shares().forgetConversation(conversationId);
     db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
   });
   const sharedPresenceRateLimiter = createFixedWindowRateLimiter({
@@ -2402,17 +2410,12 @@ export function registerSessionsRoutes(app, deps) {
     io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
   });
 
+  // The client address as Express derives it through `trust proxy`: a
+  // forwarded header counts only when a trusted proxy (by default one on
+  // loopback) sent it, so a direct client cannot pick its own bucket.
   function extractClientIp(req) {
-    const forwardedForHeader = String(req.headers?.['x-forwarded-for'] || '').trim();
-    if (forwardedForHeader) {
-      const firstHop = forwardedForHeader.split(',')[0].trim();
-      const forwardedFor = firstHop.replace(/^for=/i, '').replace(/^"|"$/g, '').trim();
-      if (forwardedFor) return forwardedFor.slice(0, 128);
-    }
-    const realIp = String(req.headers?.['x-real-ip'] || '').trim();
-    if (realIp) return realIp.slice(0, 128);
-    const reqIp = String(req.ip || req.socket?.remoteAddress || '').trim();
-    return reqIp.slice(0, 128) || 'unknown';
+    const ip = String(req.ip || req.socket?.remoteAddress || '').trim();
+    return ip.slice(0, 128) || 'unknown';
   }
 
   function consumeSharedPresenceRateLimit(token, req, nowMs = Date.now()) {
@@ -2484,7 +2487,10 @@ export function registerSessionsRoutes(app, deps) {
       : LIVE_WORKER_STATUSES.has(String(worker.status || '').trim().toLowerCase()));
     const processingCount = Number(countProcessingConversationQueueRows.get(conversationId)?.count || 0);
     const taskKeys = [...new Set([conversationId, workerSessionId])];
-    const liveTasks = workerAlive ? taskKeys.flatMap((key) => backgroundTaskStore?.get?.(key) || []) : [];
+    let liveTasks = workerAlive ? taskKeys.flatMap((key) => backgroundTaskStore?.get?.(key) || []) : [];
+    // No published set, but the worker says it has background work the
+    // relay was never told the details of: that counts, with no Stop button.
+    if (workerAlive && !liveTasks.length && backgroundWorkView) liveTasks = backgroundWorkView.panelTasks(...taskKeys);
     return {
       turnRunning: processingCount > 0 && (workerAlive || !worker),
       backgroundTaskCount: liveTasks.length,
@@ -2598,13 +2604,96 @@ export function registerSessionsRoutes(app, deps) {
         resolveSessionStateRoot,
       });
       const orphanedUploads = collectOrphanedUploadsFromConversation(conversationId);
+      const leftGroupId = conversationGroups?.forgetConversation?.(conversationId) || null;
       hardDeleteConversationRows(conversationId);
       deleteOrphanedUploads(orphanedUploads);
       io.emit('conversation_deleted', { conversationId });
+      if (leftGroupId) emitGroupChanged(leftGroupId, [conversationId]);
       try { relayEventService?.noteConversationGone?.(conversationId, { deleted: true }); } catch {}
       finalized.push(conversationId);
     }
     return finalized;
+  }
+
+  /**
+   * A session group as the list payload carries it: name, display name (the
+   * head's current title when none was given), head and member counts.
+   */
+  function groupSummaryPayload(group) {
+    if (!group) return null;
+    const members = conversationGroups?.membersOf?.(group.id) || [];
+    const head = group.parentConversationId
+      ? members.find((member) => member.id === group.parentConversationId) || null
+      : null;
+    return {
+      id: group.id,
+      name: group.name || null,
+      displayName: resolveGroupDisplayName({
+        name: group.name,
+        headTitle: head ? resolveConversationTitle({ title: head.title, titleSource: 'auto' }) : null,
+      }),
+      parentConversationId: group.parentConversationId || null,
+      memberCount: members.length,
+      liveMemberCount: members.filter((member) => !member.archived).length,
+    };
+  }
+
+  /** The `group` field of a single conversation payload: the summary plus the members. */
+  /**
+   * The `group` field of a single conversation payload: the summary and the
+   * conversation's role. The live members, with what each is doing, only
+   * when asked for (`groupMembers=1`, the remote_relay tool's read_session)
+   * and never for a paired relay's agent: the browser does not read them,
+   * and archived members' titles stay on this relay.
+   */
+  function conversationGroupPayload(conversationId, req = null) {
+    const group = conversationGroups?.groupOfConversation?.(conversationId) || null;
+    if (!group) return null;
+    const summary = groupSummaryPayload(group);
+    const payload = {
+      ...summary,
+      role: conversationId === group.parentConversationId ? 'head' : 'member',
+    };
+    const wantsMembers = String(req?.query?.groupMembers || '').trim() === '1';
+    const request = req ? readRemoteRelayRequest(req, remoteRelayInbound) : { remote: false };
+    if (wantsMembers && (!request.remote || request.local === true)) {
+      payload.members = (conversationGroups.membersOf(group.id) || [])
+        .filter((member) => member.archived !== true)
+        .slice(0, 50)
+        .map((member) => ({
+          id: member.id,
+          title: resolveConversationTitle({ title: member.title, titleSource: 'auto' }),
+          role: member.id === group.parentConversationId ? 'head' : 'member',
+          state: describeSessionActivity(member.id)?.sessionState || 'idle',
+        }));
+    }
+    return payload;
+  }
+
+  /** A conversation row's place in its group's hand order; null outside a group. */
+  function conversationGroupPositionOf(conv) {
+    if (!String(conv?.group_id || '').trim() || !conversationGroups?.getGroup?.(conv.group_id)) return null;
+    return conversationGroupPosition(conv);
+  }
+
+  /**
+   * Tells every page a group changed, with what the page can apply in place:
+   * the group's summary (null once dissolved), the named conversations'
+   * membership, the group's order (head first) and the positions of its
+   * members and of the named conversations.
+   */
+  function emitGroupChanged(groupId, conversationIds = []) {
+    const ids = [...new Set(conversationIds.map((id) => String(id || '').trim()).filter(Boolean))];
+    const group = groupId ? groupSummaryPayload(conversationGroups?.getGroup?.(groupId) || null) : null;
+    const order = group ? conversationGroups?.orderOf?.(groupId) || [] : [];
+    io.emit('conversation_group_changed', {
+      groupId: groupId || null,
+      conversationIds: ids,
+      group,
+      memberships: conversationGroups?.membershipsOf?.(ids) || {},
+      order,
+      positions: conversationGroups?.positionsOf?.([...order, ...ids]) || {},
+    });
   }
 
   /** The `cloud` field of a conversation payload; null unless it is a cloud one. */
@@ -2630,9 +2719,10 @@ export function registerSessionsRoutes(app, deps) {
   function buildShareUrl(req, token) {
     const shareToken = String(token || '').trim();
     if (!shareToken) return '';
-    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
-    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
-    const protocol = forwardedProto || req.protocol || 'http';
+    // Host and scheme follow `trust proxy`: X-Forwarded-Host/-Proto only
+    // from a trusted proxy, so a direct client cannot mint links elsewhere.
+    const host = requestHostOf(req);
+    const protocol = String(req.protocol || 'http').toLowerCase();
     const basePath = String(remotePath || '').trim().replace(/\/+$/, '');
     const relative = `${basePath}/shared/${shareToken}`.replace(/\/{2,}/g, '/');
     if (!host) return relative;
@@ -2700,6 +2790,15 @@ export function registerSessionsRoutes(app, deps) {
     };
   }
 
+  // A shared attachment is served by its share URL: the host path it is
+  // stored at (and the `@path` reference built from it) stays on the relay.
+  function shareSafeAttachment(attachment, shareToken) {
+    const rewritten = rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken);
+    if (!rewritten || typeof rewritten !== 'object') return rewritten;
+    const { path: _path, reference: _reference, ...rest } = rewritten;
+    return rest;
+  }
+
   function buildConversationPayloadForShare({
     conv,
     shareToken = '',
@@ -2709,6 +2808,9 @@ export function registerSessionsRoutes(app, deps) {
     afterMessageId = '',
     afterTimestamp = '',
     aroundMessageId = '',
+    // Filled with the tokens of the transcript's preview cards, for the route
+    // to redact wherever a reply or tool line quotes them.
+    previewTokens = null,
   } = {}) {
     const resolvedConversationId = String(conv?.id || '').trim();
     if (!resolvedConversationId) return null;
@@ -2751,10 +2853,22 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
     );
+    // A preview link is a capability that now outlives the turn and the
+    // restart: a public transcript keeps only the label, never token or link.
     const previewCardsByMessageId = new Map(
       dbMessages
         .filter((m) => m.role === 'assistant')
-        .map((m) => [m.id, previewCardsForResponse ? previewCardsForResponse(m.id) : []]),
+        .map((m) => [m.id, (previewCardsForResponse ? previewCardsForResponse(m.id) : [])
+          .filter((card) => card && typeof card === 'object')
+          .map((card) => {
+            if (card.token) previewTokens?.add?.(String(card.token));
+            return card;
+          })
+          .map((card) => ({
+            label: String(card.label || '').trim().slice(0, 120) || 'Preview',
+            mode: card.mode === 'static' ? 'static' : 'port',
+            redacted: true,
+          }))]),
     );
     const usageByResponseMessageId = new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
@@ -2767,7 +2881,7 @@ export function registerSessionsRoutes(app, deps) {
         attachments: parseAttachments(message.attachments)
           .map(hydrateAttachment)
           .filter(Boolean)
-          .map((attachment) => rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken)),
+          .map((attachment) => shareSafeAttachment(attachment, shareToken)),
       })),
       transcriptMessages: [],
       relayActivitiesByMessageId,
@@ -2789,7 +2903,7 @@ export function registerSessionsRoutes(app, deps) {
         ? { ...withSource, origin: publicRemoteRelayOrigin(withSource.origin) }
         : withSource;
       const attachments = Array.isArray(nextMessage?.attachments)
-        ? nextMessage.attachments.map((attachment) => rewriteSharedGeneratedImageAttachmentContentUrl(rewriteSharedAttachmentContentUrl(attachment, shareToken), shareToken))
+        ? nextMessage.attachments.map((attachment) => shareSafeAttachment(attachment, shareToken))
         : nextMessage?.attachments;
       return attachments === nextMessage?.attachments
         ? nextMessage
@@ -2811,6 +2925,10 @@ export function registerSessionsRoutes(app, deps) {
       compactedInto: conv.compacted_into || null,
       compactedFrom: conv.compacted_from || null,
       runtimeSession: null,
+      // The provider alone, null when the conversation has none bound: the
+      // view tells a reply that ran elsewhere from one that ran here by it.
+      // Not private, the model chip names it as well.
+      runtimeProviderType: String(stmts.getRuntimeSessionByConversation?.get?.(resolvedConversationId)?.provider_type || '').trim().toLowerCase() || null,
       sessionRootPath: null,
       sessionRootName: resolvedTitle || 'Session',
       configuredWorkspaceRootPath: null,
@@ -2883,11 +3001,19 @@ export function registerSessionsRoutes(app, deps) {
     const limit = normalizeConversationListLimit(req.query.limit, DEFAULT_CONVERSATION_LIST_LIMIT);
     const beforeConversationId = String(req.query.beforeConversationId || '').trim();
     const beforeUpdatedAt = String(req.query.beforeUpdatedAt || '').trim();
+    const beforeGroupId = String(req.query.beforeGroupId || '').trim();
     const rows = stmts.listConvs.all(archivedMode === 'true' ? 1 : 0, archivedMode === 'only' ? 1 : 0);
+    // The groups of the listed rows: the order inside a group needs its head.
+    const groups = conversationGroups?.listGroupsByIds?.(rows.map((row) => row?.group_id)) || new Map();
+    // The time a row sorts by (its group's newest row): a caller that pages
+    // by a row that is gone by then continues from this, not the row's own.
+    const activityTimes = groupActivityTimes(rows);
     const page = selectConversationListPage(rows, {
       limit,
       beforeConversationId,
       beforeUpdatedAt,
+      beforeGroupId,
+      groups,
     });
     const activeTurnConversationIds = new Set(
       (stmts.listConversationIdsWithActiveQueue?.all() || [])
@@ -2947,12 +3073,30 @@ export function registerSessionsRoutes(app, deps) {
           cloudSourceJson: r.cloud_source_json,
           costUsd: r.runtime_claude_cloud_cost_usd,
         }),
+        // Session group: its id and whether this row is the group's head.
+        groupId: groups.has(String(r.group_id || '')) ? String(r.group_id) : null,
+        groupRole: groups.has(String(r.group_id || '')) ? conversationGroupRole({ id: r.id, groupId: r.group_id }, groups) : null,
+        // Its place in the group's hand order; null for the head, for a
+        // group nobody reordered, and outside a group.
+        groupPosition: groups.has(String(r.group_id || '')) ? conversationGroupPosition(r) : null,
+        activityAt: (() => {
+          const own = normalizeConversationTimestampMs(r.updated_at);
+          const ms = groups.has(String(r.group_id || '')) ? Math.max(activityTimes.get(String(r.group_id)) || 0, own) : own;
+          return ms ? new Date(ms).toISOString() : normalizeConversationTimestampIso(r.updated_at, r.updated_at);
+        })(),
       };
     });
+    // The groups that have a row on this page, with what the sidebar's head
+    // row shows without the members' rows.
+    const groupsPayload = {};
+    for (const groupId of new Set(page.rows.map((row) => String(row?.group_id || '')).filter((id) => groups.has(id)))) {
+      groupsPayload[groupId] = groupSummaryPayload(groups.get(groupId));
+    }
 
     return res.json({
       conversations,
       pageInfo: page.pageInfo,
+      groups: groupsPayload,
     });
   });
 
@@ -3671,121 +3815,396 @@ export function registerSessionsRoutes(app, deps) {
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       origin: parseRemoteRelayOriginJson(conv.origin_json),
       cloud: conversationCloudPayload(conv, runtimeSession),
+      group: conversationGroupPayload(conversationId),
+      groupPosition: conversationGroupPositionOf(conv),
       messages: history.messages,
       pageInfo: history.pageInfo,
       // A re-import can move a pin onto a new message id.
       pins: listConversationPins(conversationId),
       pinsRevision: conversationPinRevision(conversationId),
+      // And a hidden mark.
+      hiddenMessages: listConversationHiddenMessages(conversationId),
+      hiddenMessagesRevision: conversationHiddenMessagesRevision(conversationId),
       refreshed: true,
     });
   });
 
-  app.post('/api/conversation/:id/share', auth, (req, res) => {
-    const conversationId = String(req.params.id || '').trim();
-    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
-    const conv = stmts.getConvAnyStatus.get(conversationId) || null;
-    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') {
-      return res.status(404).json({ error: 'Conversation not found' });
-    }
-    let share = stmts.getConversationShareByConversationId?.get(conversationId) || null;
-    if (!share) {
-      const now = new Date().toISOString();
-      let attempts = 0;
-      while (!share && attempts < 6) {
-        const token = buildConversationShareToken();
-        try {
-          stmts.insertConversationShare.run(token, conversationId, now, now);
-          share = stmts.getConversationShareByToken.get(token) || null;
-        } catch (error) {
-          if (String(error?.code || '') !== 'SQLITE_CONSTRAINT_PRIMARYKEY') throw error;
-        }
-        attempts += 1;
-      }
-    }
-    if (!share?.token) return res.status(500).json({ error: 'Failed to create share token' });
-    const now = new Date().toISOString();
-    stmts.touchConversationShare?.run(now, share.token);
-    const token = String(share.token || '').trim();
-    res.setHeader('Cache-Control', 'no-store');
-    res.json({
-      ok: true,
-      conversationId,
+  function shareLinkPayload(req, share) {
+    const token = String(share?.token || '').trim();
+    return {
       token,
       shareUrl: buildShareUrl(req, token),
       path: `${String(remotePath || '').replace(/\/+$/, '')}/shared/${token}`.replace(/\/{2,}/g, '/'),
-    });
+    };
+  }
+
+  function findShareableConversation(conversationId) {
+    const conv = conversationId ? stmts.getConvAnyStatus.get(conversationId) || null : null;
+    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') return null;
+    return conv;
+  }
+
+  // Get-or-create: a conversation has one active share, and asking again
+  // returns its link.
+  app.post('/api/conversation/:id/share', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    if (!findShareableConversation(conversationId)) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    const { share, created } = shares().getOrCreateShare(conversationId, buildConversationShareToken, new Date().toISOString());
+    if (!share?.token) return res.status(500).json({ error: 'Failed to create share token' });
+    if (created) io.emit('share_created', { conversationId });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, conversationId, created, ...shareLinkPayload(req, share) });
   });
 
-  // Revoke every active share for a conversation. Without this a share link was
-  // permanent (revoked_at existed in the schema and was checked on read, but no
-  // route ever set it), so a leaked URL could never be invalidated.
+  // A new link for the active share: the old token answers 404 from now on,
+  // the access log carries over.
+  app.post('/api/conversation/:id/share/renew', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    if (!findShareableConversation(conversationId)) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    const renewed = shares().renewShare(conversationId, buildConversationShareToken, new Date().toISOString());
+    if (!renewed?.share?.token) return res.status(404).json({ error: 'No active share to renew' });
+    io.emit('share_renewed', { conversationId });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, conversationId, renewed: true, ...shareLinkPayload(req, renewed.share) });
+  });
+
+  // Stop sharing: every token of the conversation is revoked and its access
+  // log deleted. An open shared page gets a 404 at its next poll.
   app.delete('/api/conversation/:id/share', auth, (req, res) => {
     const conversationId = String(req.params.id || '').trim();
     if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
-    const share = stmts.getConversationShareByConversationId?.get(conversationId) || null;
-    if (!share?.token) {
+    if (!shares().findActiveShare(conversationId)) {
       return res.status(404).json({ error: 'No active share to revoke' });
     }
     const now = new Date().toISOString();
-    const result = stmts.revokeConversationSharesByConversationId?.run(now, conversationId);
-    // Drop any live shared viewers so they lose access immediately.
+    const result = shares().stopSharing(conversationId, now);
     io.emit('share_revoked', { conversationId });
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ ok: true, conversationId, revokedAt: now, revokedCount: Number(result?.changes || 0) });
+    res.json({ ok: true, conversationId, revokedAt: now, revokedCount: result.revokedCount, opensDeleted: result.opensDeleted });
   });
 
+  // Every active share, for Settings → Sharing.
+  app.get('/api/shares', auth, (req, res) => {
+    const list = shares().listActiveShares().map((share) => ({
+      conversationId: share.conversationId,
+      title: share.title,
+      archived: share.archived,
+      sharedSince: share.sharedSince,
+      // The current link's date, when it is a renewed one.
+      renewedAt: share.createdAt && share.createdAt !== share.sharedSince ? share.createdAt : null,
+      lastOpenedAt: share.lastOpenedAt,
+      openCount: share.openCount,
+      viewerCount: share.viewerCount,
+      ...shareLinkPayload(req, share),
+    }));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ shares: list, storeViewerIp: shares().readStoreViewerIp(), accessLog: shares().logAvailable });
+  });
+
+  // The access log of a conversation's active share, newest first.
+  app.get('/api/conversation/:id/share/opens', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const share = conversationId ? shares().findActiveShare(conversationId) : null;
+    if (!share) return res.status(404).json({ error: 'No active share' });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ conversationId, ...shares().listOpens(share.lineageId, { limit: req.query.limit }) });
+  });
+
+  app.get('/api/settings/shares', auth, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ storeViewerIp: shares().readStoreViewerIp() });
+  });
+
+  // "Store viewer IP addresses": off keeps the address out of new access log
+  // rows and out of the status events of shared reads. Rows logged before
+  // keep theirs.
+  app.post('/api/settings/shares', auth, (req, res) => {
+    if (typeof req.body?.storeViewerIp !== 'boolean') {
+      return res.status(400).json({ error: 'storeViewerIp must be true or false' });
+    }
+    const storeViewerIp = shares().writeStoreViewerIp(req.body.storeViewerIp);
+    io.emit('share_settings_changed', { storeViewerIp });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ storeViewerIp });
+  });
+
+  // The viewer addresses stored before IP storage was switched off: how many,
+  // and removing them (Settings → Sharing offers it when the switch goes off).
+  app.get('/api/settings/shares/stored-viewer-ips', auth, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ count: shares().countStoredViewerIps() });
+  });
+
+  app.delete('/api/settings/shares/stored-viewer-ips', auth, (_req, res) => {
+    const cleared = shares().forgetStoredViewerIps();
+    io.emit('share_viewer_ips_forgotten', cleared);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, cleared, count: shares().countStoredViewerIps() });
+  });
+
+  // ─── Path privacy for shared views ─────────────────────────────────────────
+  // A share is served through one redactor per response
+  // (services/share-path-redaction.mjs): the relay's own roots, the
+  // conversation's workspace roots and the OS user name are what it knows to
+  // look for. The owner's own routes never pass through it.
+  function sharePathRedactorFor(conv, { annotate = false } = {}) {
+    let known = null;
+    try { known = sharePathKnownRoots?.() || null; } catch { known = null; }
+    const roots = [...(Array.isArray(known?.roots) ? known.roots : [])];
+    const conversationId = String(conv?.id || '').trim();
+    try {
+      const state = typeof resolveConversationWorkspaceState === 'function'
+        ? resolveConversationWorkspaceState({
+          conversationId,
+          sdkSessionId: conv?.sdk_session_id || conversationId,
+          discoveredWorkspaceRootPath: '',
+        })
+        : null;
+      roots.push(state?.configuredWorkspaceRootPath, state?.runtimeWorkspaceRootPath, state?.currentWorkspaceRootPath);
+    } catch {}
+    roots.push(...(Array.isArray(workspaceRootAllowList) ? workspaceRootAllowList : []));
+    let mode = DEFAULT_SHARE_PATH_PRIVACY_MODE;
+    try { mode = getSharePathPrivacyMode(); } catch {}
+    return createSharePathRedactor({
+      mode,
+      roots: roots.filter(Boolean),
+      userNames: Array.isArray(known?.userNames) ? known.userNames : [],
+      relayPathPrefix: remotePath,
+      annotate,
+    });
+  }
+
+  // Every preview token a shared response must not carry: the relay's known
+  // previews and the conversation's own. Null when the list cannot be read;
+  // then nothing is shared.
+  function collectSharePreviewTokens(conversationId) {
+    const tokens = new Set();
+    // Every preview of the relay, not only this conversation's: the preview
+    // tool's list covers them all, and a reply may quote any of its tokens.
+    try {
+      for (const knownToken of listKnownPreviewTokens?.() || []) tokens.add(String(knownToken));
+    } catch {
+      return null;
+    }
+    for (const preview of listConversationPreviews?.(conversationId) || []) {
+      if (preview?.token) tokens.add(String(preview.token));
+    }
+    return tokens;
+  }
+
+  function sharedHistoryPageQuery(query = {}) {
+    return {
+      limit: normalizeConversationHistoryLimit(query.limit, 120),
+      beforeMessageId: String(query.beforeMessageId || '').trim(),
+      beforeTimestamp: String(query.beforeTimestamp || '').trim(),
+      afterMessageId: String(query.afterMessageId || '').trim(),
+      afterTimestamp: String(query.afterTimestamp || '').trim(),
+      aroundMessageId: String(query.aroundMessageId || '').trim(),
+    };
+  }
+
+  // A revoked or renewed token is a plain 404, like one that never existed.
+  function resolveActiveShare(rawToken) {
+    const token = normalizeShareToken(rawToken);
+    if (!token) return null;
+    const share = shares().findLiveShare(token);
+    const conversationId = String(share?.conversationId || '').trim();
+    if (!conversationId) return null;
+    return { token, share, conversationId };
+  }
+
+  function resolveShareableConversation(conversationId) {
+    const conv = stmts.getConvAnyStatus.get(conversationId) || null;
+    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') return null;
+    return conv;
+  }
+
   app.get('/api/shared/:token', (req, res) => {
-    const token = normalizeShareToken(req.params.token);
-    if (!token) return res.status(404).json({ error: 'Shared conversation not found' });
-    const share = stmts.getConversationShareByToken?.get(token) || null;
-    if (!share || String(share.revoked_at || '').trim()) {
-      return res.status(404).json({ error: 'Shared conversation not found' });
+    const active = resolveActiveShare(req.params.token);
+    if (!active) return res.status(404).json({ error: 'Shared conversation not found' });
+    const { token, share, conversationId: convId } = active;
+    const conv = resolveShareableConversation(convId);
+    if (!conv) return res.status(404).json({ error: 'Shared conversation not found' });
+    const previewTokens = collectSharePreviewTokens(convId);
+    if (!previewTokens) {
+      res.setHeader('Retry-After', '15');
+      return res.status(503).json({ error: 'Shared conversation is not available right now' });
     }
-    const convId = String(share.conversation_id || '').trim();
-    if (!convId) return res.status(404).json({ error: 'Shared conversation not found' });
-    const conv = stmts.getConvAnyStatus.get(convId) || null;
-    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') {
-      return res.status(404).json({ error: 'Shared conversation not found' });
-    }
-    const limit = normalizeConversationHistoryLimit(req.query.limit, 120);
-    const beforeMessageId = String(req.query.beforeMessageId || '').trim();
-    const beforeTimestamp = String(req.query.beforeTimestamp || '').trim();
-    const afterMessageId = String(req.query.afterMessageId || '').trim();
-    const afterTimestamp = String(req.query.afterTimestamp || '').trim();
-    const aroundMessageId = String(req.query.aroundMessageId || '').trim();
     const payload = buildConversationPayloadForShare({
       conv,
       shareToken: token,
-      limit,
-      beforeMessageId,
-      beforeTimestamp,
-      afterMessageId,
-      afterTimestamp,
-      aroundMessageId,
+      ...sharedHistoryPageQuery(req.query),
+      previewTokens,
     });
     if (!payload) return res.status(404).json({ error: 'Shared conversation not found' });
+    // The access log: one row per open, not per poll (the page's first fetch
+    // says `open=1`; see share-access-log-service.mjs). A failing log never
+    // keeps a reader out.
+    const viewer = readShareRequestViewer(req);
+    const storeIp = shares().readStoreViewerIp();
+    let viewerKey = '';
+    try {
+      const noted = shareAccessLog().noteFetch({ share, viewer, opened: String(req.query.open || '') === '1', storeIp });
+      viewerKey = noted.viewerKey;
+      if (noted.recorded) io.emit('share_opened', { conversationId: convId });
+    } catch (error) {
+      console.warn(`[shares] could not log a shared read: ${error?.message || error}`);
+    }
     const sharedAccess = statusEventService.recordSharedAccess({
       shareToken: token,
-      viewerIp: extractClientIp(req),
+      viewerIp: storeIp ? viewer.ip : null,
+      viewerKey,
       conversationId: convId,
     });
     if (sharedAccess.event) {
       const details = sharedAccess.event.details;
-      console.log(`SHARED ACCESS shareId=${details.shareId} ip=${details.viewerIp || 'unknown'}`);
+      console.log(`SHARED ACCESS shareId=${details.shareId} ip=${storeIp ? details.viewerIp || 'unknown' : 'not stored'}`);
       io.emit('shared_access', sharedAccess.event);
     }
     const now = new Date().toISOString();
     stmts.touchConversationShare?.run(now, token);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
-    res.json({
+    // A preview link is a public capability that outlives the turn: no string
+    // of a shared transcript (reply text, thoughts, tool lines, sub-agent runs)
+    // carries one. One pass over the whole response, not a list of fields;
+    // then the host's paths, by the relay's path privacy setting.
+    const redactor = sharePathRedactorFor(conv);
+    res.json(redactor.payload(redactPreviewTokens({
       ...payload,
       shared: {
         token,
         readOnly: true,
         watcherCount: Number(getSharedWatcherCount?.(convId) || 0),
       },
+    }, { tokens: [...previewTokens] })));
+  });
+
+  // The owner's "Preview as shared": the payload a share link would serve, with
+  // every redaction and every leftover that still looks like a path marked
+  // (SHARE_PREVIEW_MARKS). Works without a share link and never creates one;
+  // records no access. Content URLs stay the owner's.
+  app.get('/api/conversation/:id/share-preview', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const conv = conversationId ? resolveShareableConversation(conversationId) : null;
+    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+    const previewTokens = collectSharePreviewTokens(conversationId);
+    if (!previewTokens) {
+      res.setHeader('Retry-After', '15');
+      return res.status(503).json({ error: 'The preview is not available right now' });
+    }
+    const payload = buildConversationPayloadForShare({
+      conv,
+      shareToken: '',
+      ...sharedHistoryPageQuery(req.query),
+      previewTokens,
     });
+    if (!payload) return res.status(404).json({ error: 'Conversation not found' });
+    const redactor = sharePathRedactorFor(conv, { annotate: true });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ...redactor.payload(redactPreviewTokens(payload, { tokens: [...previewTokens] })),
+      shared: {
+        token: null,
+        readOnly: true,
+        preview: true,
+        pathPrivacy: redactor.mode,
+        watcherCount: 0,
+      },
+    });
+  });
+
+  // ─── Sub-agent records in a shared view ────────────────────────────────────
+  const sharedSubagentTimeline = createSubagentTimelineService({ db, stmts });
+
+  // The runs a shared view shows a row for: those of the replies it shows,
+  // and those of the turn in flight.
+  function sharedConversationRunIds(conversationId) {
+    const ids = new Set();
+    const add = (run) => {
+      const id = String(run?.subagentRunId || run?.id || '').trim();
+      if (id) ids.add(id);
+    };
+    const rows = filterMessagesVisibleToSharedView(
+      (stmts.getSharedMessages || stmts.getMessages).all(conversationId),
+    );
+    for (const row of rows) {
+      if (row?.role !== 'assistant') continue;
+      for (const run of (subagentRunsForResponse ? subagentRunsForResponse(row.id) : []) || []) add(run);
+    }
+    for (const run of inFlightStateForConversation(conversationId)?.subagentRuns || []) add(run);
+    return ids;
+  }
+
+  // A run of the conversation whose row the shared view shows, or a child of
+  // one: a share never opens a run of another conversation or of a reply the
+  // owner hid from shares.
+  function shareMayReadSubagentRun(conversationId, run) {
+    if (!run || String(run.conversation_id || '') !== conversationId) return false;
+    const visible = sharedConversationRunIds(conversationId);
+    let current = run;
+    for (let depth = 0; current && depth < 16; depth += 1) {
+      if (visible.has(String(current.id || ''))) return true;
+      const parentId = String(current.parent_subagent_id || '').trim();
+      if (!parentId) return false;
+      current = stmts.getSubagentRun?.get?.(parentId) || null;
+      if (current && String(current.conversation_id || '') !== conversationId) return false;
+    }
+    return false;
+  }
+
+  // A reader cannot stop a run: no stop flag, no task handle.
+  function readerRunHeader(header) {
+    if (!header || typeof header !== 'object') return header;
+    const { taskId: _taskId, ...rest } = header;
+    return { ...rest, stoppable: false };
+  }
+
+  function sharedSubagentRecord(req, res, { conv, conversationId, annotate }) {
+    const runId = sanitizeSubagentRunId(req.params.subagentRunId);
+    const run = runId ? stmts.getSubagentRun?.get?.(runId) || null : null;
+    if (!run || !shareMayReadSubagentRun(conversationId, run)) {
+      return res.status(404).json({ error: 'Sub-agent run not found' });
+    }
+    const previewTokens = collectSharePreviewTokens(conversationId);
+    if (!previewTokens) {
+      res.setHeader('Retry-After', '15');
+      return res.status(503).json({ error: 'Shared conversation is not available right now' });
+    }
+    const page = sharedSubagentTimeline.readTimeline(run, {
+      afterSeq: Number(req.query?.after) || 0,
+      limit: Number(req.query?.limit) || TIMELINE_READ_DEFAULT_LIMIT,
+      isStoppable: () => false,
+    });
+    const readerPage = {
+      ...page,
+      run: readerRunHeader(page.run),
+      children: (Array.isArray(page.children) ? page.children : []).map(readerRunHeader),
+    };
+    const redactor = sharePathRedactorFor(conv, { annotate });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    return res.json(redactor.payload(redactPreviewTokens(readerPage, { tokens: [...previewTokens] })));
+  }
+
+  app.get('/api/shared/:token/subagent/:subagentRunId', (req, res) => {
+    const active = resolveActiveShare(req.params.token);
+    const conv = active ? resolveShareableConversation(active.conversationId) : null;
+    if (!conv) return res.status(404).json({ error: 'Sub-agent run not found' });
+    return sharedSubagentRecord(req, res, { conv, conversationId: active.conversationId, annotate: false });
+  });
+
+  app.get('/api/conversation/:id/share-preview/subagent/:subagentRunId', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    const conv = conversationId ? resolveShareableConversation(conversationId) : null;
+    if (!conv) return res.status(404).json({ error: 'Sub-agent run not found' });
+    return sharedSubagentRecord(req, res, { conv, conversationId, annotate: true });
   });
 
   app.get('/api/status/events', auth, (req, res) => {
@@ -3802,12 +4221,9 @@ export function registerSessionsRoutes(app, deps) {
   app.post('/api/shared/:token/presence', (req, res) => {
     const token = normalizeShareToken(req.params.token);
     if (!token) return res.status(404).json({ error: 'Shared conversation not found' });
-    const share = stmts.getConversationShareByToken?.get(token) || null;
-    if (!share || String(share.revoked_at || '').trim()) {
-      return res.status(404).json({ error: 'Shared conversation not found' });
-    }
-    const conversationId = String(share.conversation_id || '').trim();
-    if (!conversationId) return res.status(404).json({ error: 'Shared conversation not found' });
+    const share = shares().findLiveShare(token);
+    if (!share) return res.status(404).json({ error: 'Shared conversation not found' });
+    const conversationId = share.conversationId;
     const rateLimit = consumeSharedPresenceRateLimit(token, req);
     if (!rateLimit.ok) {
       res.setHeader('Cache-Control', 'no-store');
@@ -3835,17 +4251,24 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  // The download name of a shared file: with names hidden, only its type.
+  function sharedDownloadName(fileName) {
+    let mode = DEFAULT_SHARE_PATH_PRIVACY_MODE;
+    try { mode = getSharePathPrivacyMode(); } catch {}
+    if (mode !== 'hide' || !fileName) return fileName;
+    const extension = path.extname(fileName).replace(/[^.A-Za-z0-9]/g, '').slice(0, 12);
+    return `attachment${extension}`;
+  }
+
   app.get('/api/shared/:token/upload/:sha256/content', (req, res) => {
     const token = normalizeShareToken(req.params.token);
     const sha256 = String(req.params.sha256 || '').trim().toLowerCase();
     if (!token || !isSha256(sha256)) {
       return res.status(404).json({ error: 'Shared attachment not found' });
     }
-    const share = stmts.getConversationShareByToken?.get(token) || null;
-    if (!share || String(share.revoked_at || '').trim()) {
-      return res.status(404).json({ error: 'Shared attachment not found' });
-    }
-    const conversationId = String(share.conversation_id || '').trim();
+    const share = shares().findLiveShare(token);
+    if (!share) return res.status(404).json({ error: 'Shared attachment not found' });
+    const conversationId = share.conversationId;
     if (!conversationId || !conversationReferencesUploadSha(conversationId, sha256)) {
       return res.status(404).json({ error: 'Shared attachment not found' });
     }
@@ -3858,7 +4281,7 @@ export function registerSessionsRoutes(app, deps) {
     // as script on this origin; ranges let a shared video seek.
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
     serveFileWithRangeSupport(req, res, filePath, { contentType: file.mime_type }, {
-      safeName: String(file.name || file.file_name || '').replace(/"/g, ''),
+      safeName: sharedDownloadName(String(file.name || file.file_name || '').replace(/"/g, '')),
       cacheControl: SHARED_CONTENT_CACHE_CONTROL,
     });
   });
@@ -3870,11 +4293,9 @@ export function registerSessionsRoutes(app, deps) {
     if (!token || !messageId || !imageId) {
       return res.status(404).json({ error: 'Shared attachment not found' });
     }
-    const share = stmts.getConversationShareByToken?.get(token) || null;
-    if (!share || String(share.revoked_at || '').trim()) {
-      return res.status(404).json({ error: 'Shared attachment not found' });
-    }
-    const conversationId = String(share.conversation_id || '').trim();
+    const share = shares().findLiveShare(token);
+    if (!share) return res.status(404).json({ error: 'Shared attachment not found' });
+    const conversationId = share.conversationId;
     if (!conversationId) return res.status(404).json({ error: 'Shared attachment not found' });
     const rows = filterMessagesVisibleToSharedView(
       (stmts.getSharedMessages || stmts.getMessages).all(conversationId),
@@ -4060,12 +4481,19 @@ export function registerSessionsRoutes(app, deps) {
       // "cancelled" with it.
       activeTurn: Number(stmts.getConversationActiveQueueCount?.get?.(resolvedConversationId)?.count || 0) > 0,
       ...(describeSessionActivity(resolvedConversationId) || {}),
-      backgroundTasks: backgroundTaskStore?.get?.(resolvedConversationId) || [],
+      // The published set, else the placeholder for background work a live
+      // worker reports without this runtime knowing its details.
+      backgroundTasks: backgroundWorkView
+        ? backgroundWorkView.panelTasks(resolvedConversationId, runtimeSession?.sdk_session_id)
+        : (backgroundTaskStore?.get?.(resolvedConversationId) || []),
       usageLimitPause: usageLimitPauseService?.getPause?.(resolvedConversationId) || null,
       previews: listConversationPreviews?.(resolvedConversationId) || [],
       // Every pin of the conversation, also those outside this history page.
       pins: listConversationPins(resolvedConversationId),
       pinsRevision: conversationPinRevision(resolvedConversationId),
+      // Every message hidden from shared viewers, also those outside the page.
+      hiddenMessages: listConversationHiddenMessages(resolvedConversationId),
+      hiddenMessagesRevision: conversationHiddenMessagesRevision(resolvedConversationId),
       preferredRelayMode: preferences.preferredRelayMode,
       preferredModel: preferences.preferredModel,
       preferredReasoningEffort: preferences.preferredReasoningEffort,
@@ -4077,6 +4505,10 @@ export function registerSessionsRoutes(app, deps) {
       origin: parseRemoteRelayOriginJson(conv.origin_json),
       // Set on Claude Cloud conversations: repository, branch, session link.
       cloud: conversationCloudPayload(conv, runtimeSession),
+      // The session group it is in, with the other members; null when none.
+      group: conversationGroupPayload(resolvedConversationId, req),
+      // Its place in the group's hand order, as on the list rows.
+      groupPosition: conversationGroupPositionOf(conv),
       messages: history.messages,
       pageInfo: history.pageInfo,
     });
@@ -4104,6 +4536,7 @@ export function registerSessionsRoutes(app, deps) {
 
     const hiddenFromShares = req.body.hiddenFromShares === true;
     const currentlyHidden = Number(message.hidden_from_shares || 0) === 1;
+    let change = null;
     if (currentlyHidden !== hiddenFromShares) {
       if (!stmts.setMessageShareVisibility) {
         return res.status(503).json({ error: 'Message share visibility is unavailable until the relay restarts' });
@@ -4115,6 +4548,7 @@ export function registerSessionsRoutes(app, deps) {
         messageId,
         conversationId,
       );
+      change = broadcastShareVisibilityChange(conversationId, { pinnedChanged: !!message.pinned_at });
     }
 
     return res.json({
@@ -4122,6 +4556,52 @@ export function registerSessionsRoutes(app, deps) {
       conversationId,
       messageId,
       hiddenFromShares,
+      hiddenMessages: change?.hiddenMessages || listConversationHiddenMessages(conversationId),
+      hiddenMessagesRevision: change?.revision || conversationHiddenMessagesRevision(conversationId),
+    });
+  });
+
+  // Shows every hidden message to shared viewers again. A message whose turn
+  // is still running stays hidden (the single route refuses it the same way)
+  // and is named in `skipped`; the rest are unhidden.
+  app.post('/api/conversation/:id/share-visibility/unhide-all', auth, (req, res) => {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
+    const conv = stmts.getConvAnyStatus.get(conversationId);
+    if (!conv || String(conv.status || '').trim().toLowerCase() === 'deleted') {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    const hiddenRows = stmts.listHiddenMessages?.all?.(conversationId) || [];
+    if (hiddenRows.length && !stmts.setMessageShareVisibility) {
+      return res.status(503).json({ error: 'Message share visibility is unavailable until the relay restarts' });
+    }
+    const unhidden = [];
+    const skipped = [];
+    const unhideRows = db.transaction((rows) => {
+      for (const row of rows) {
+        const messageId = String(row?.id || '').trim();
+        if (!messageId) continue;
+        if (getActiveQueueForMessage.get(conversationId, messageId, messageId)) {
+          skipped.push({ messageId, reason: 'active-turn' });
+          continue;
+        }
+        stmts.setMessageShareVisibility.run(0, null, messageId, conversationId);
+        unhidden.push(messageId);
+      }
+    });
+    unhideRows(hiddenRows);
+    let change = null;
+    if (unhidden.length) {
+      const pinnedChanged = unhidden.some((messageId) => !!stmts.getMessageByConversation?.get(messageId, conversationId)?.pinned_at);
+      change = broadcastShareVisibilityChange(conversationId, { pinnedChanged });
+    }
+    return res.json({
+      ok: true,
+      conversationId,
+      unhidden,
+      skipped,
+      hiddenMessages: change?.hiddenMessages || listConversationHiddenMessages(conversationId),
+      hiddenMessagesRevision: change?.revision || conversationHiddenMessagesRevision(conversationId),
     });
   });
 
@@ -4828,7 +5308,9 @@ export function registerSessionsRoutes(app, deps) {
       // Re-armed after the stop, which can outlast the kill block's grace
       // window: nothing may respawn a worker for the rows deleted below.
       sessionWorkerSupervisor?.markKilled?.(workerSessionId);
-      for (const key of new Set([id, workerSessionId])) backgroundTaskStore?.replace?.(key, []);
+      try { sessionActivityTracker?.forget?.(id); } catch {}
+      if (typeof backgroundTaskStore?.forget === 'function') backgroundTaskStore.forget(id, workerSessionId);
+      else for (const key of new Set([id, workerSessionId])) backgroundTaskStore?.replace?.(key, []);
     }
 
     // A Claude Cloud conversation takes its cloud session along: archived
@@ -4843,6 +5325,13 @@ export function registerSessionsRoutes(app, deps) {
 
     const deletedAt = new Date().toISOString();
     markConversationDeleted.run(deletedAt, id);
+    // A deleted conversation takes its public preview links with it (archive
+    // keeps them: an archived conversation can come back).
+    try {
+      closeConversationPreviews?.(id);
+    } catch (error) {
+      console.warn(`[preview] closing the previews of a deleted conversation failed: ${error?.message || error}`);
+    }
     // Tombstones keep the SDK session importer from bringing it back.
     stmts.markDeletedSdkSession.run(sdkSessionId || id, deletedAt);
     if (sdkSessionId && sdkSessionId !== id) stmts.markDeletedSdkSession.run(id, deletedAt);
@@ -4865,11 +5354,17 @@ export function registerSessionsRoutes(app, deps) {
       resolveSessionStateRoot,
     });
     const orphanedUploads = collectOrphanedUploadsFromConversation(id);
+    // Before the row goes: a head leaves its group with its title frozen as
+    // the name, and a group left empty is removed.
+    const leftGroupId = conversationGroups?.forgetConversation?.(id, deletedAt) || null;
+    const wasShared = !!shares().findActiveShare(id);
     hardDeleteConversationRows(id);
     remoteRelayInbound?.repository?.forgetConversation?.(id);
     deleteOrphanedUploads(orphanedUploads);
     if (sdkSessionId && !cliSession.queued) stmts.deleteSdkDeleteRequest?.run?.(sdkSessionId);
     io.emit('conversation_deleted', { conversationId: id });
+    if (wasShared) io.emit('share_revoked', { conversationId: id });
+    if (leftGroupId) emitGroupChanged(leftGroupId, [id]);
     try { relayEventService?.noteConversationGone?.(id, { deleted: true }); } catch {}
     return { statusCode: 200, body: { ok: true, workerStopped, cliSessionDeleted: cliSession.deleted } };
   }
@@ -4884,14 +5379,24 @@ export function registerSessionsRoutes(app, deps) {
     const id = String(req.params.id || '').trim();
     if (!id) return res.status(400).json({ error: 'Missing conversation id' });
     try {
+      const outcome = await archiveConversationNow(id);
+      return res.status(outcome.statusCode).json(outcome.body);
+    } catch (error) {
+      console.warn(`[archive] Archive failed for ${id}: ${error?.message || error}`);
+      return res.status(500).json({ error: 'Failed to archive conversation' });
+    }
+  });
+
+  /** POST /api/conversation/:id/archive under its session's lock; see the route. */
+  async function archiveConversationNow(id) {
       const existing = stmts.getConvAnyStatus.get(id);
       if (!existing || String(existing.status || '').trim() === 'deleted') {
-        return res.json({ ok: true, alreadyDeleted: true });
+        return { statusCode: 200, body: { ok: true, alreadyDeleted: true } };
       }
-      if (Number(existing.archived || 0) === 1) return res.json({ ok: true, alreadyArchived: true });
+      if (Number(existing.archived || 0) === 1) return { statusCode: 200, body: { ok: true, alreadyArchived: true } };
       const sdkSessionId = String(existing.sdk_session_id || '').trim() || null;
       const workerSessionId = sdkSessionId || id;
-      const outcome = await sessionLaunchMutex.runExclusive(workerSessionId, async () => {
+      return sessionLaunchMutex.runExclusive(workerSessionId, async () => {
         const activity = describeConversationActivity(id, workerSessionId);
         if (activity.turnRunning) {
           return {
@@ -4965,11 +5470,41 @@ export function registerSessionsRoutes(app, deps) {
         }
         return { statusCode: 200, body: { ok: true, workerStopped } };
       });
-      return res.status(outcome.statusCode).json(outcome.body);
-    } catch (error) {
-      console.warn(`[archive] Archive failed for ${id}: ${error?.message || error}`);
-      return res.status(500).json({ error: 'Failed to archive conversation' });
+  }
+
+  // POST /api/conversation-groups/:id/archive — archive every live member of
+  // a session group that can be archived now. A member with a running turn
+  // or background work is skipped and named in the answer, so the owner can
+  // stop it ("Stop all running") and archive again.
+  app.post('/api/conversation-groups/:id/archive', auth, async (req, res) => {
+    if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+      return res.status(403).json({ error: 'Session groups are managed by this relay\'s owner only.' });
     }
+    const groupId = String(req.params.id || '').trim();
+    const group = groupId ? conversationGroups?.getGroup?.(groupId) : null;
+    if (!group) return res.status(404).json({ ok: false, error: 'Group not found' });
+    const archived = [];
+    const skipped = [];
+    try {
+      for (const member of conversationGroups.membersOf(groupId)) {
+        if (member.archived) continue;
+        const outcome = await archiveConversationNow(member.id);
+        if (outcome.statusCode === 200) {
+          archived.push(member.id);
+        } else {
+          skipped.push({
+            id: member.id,
+            title: resolveConversationTitle({ title: member.title, titleSource: 'auto' }),
+            reason: String(outcome.body?.reason || outcome.body?.error || 'refused'),
+          });
+        }
+      }
+    } catch (error) {
+      console.warn(`[archive] Group archive failed for ${groupId}: ${error?.message || error}`);
+      return res.status(500).json({ ok: false, error: 'Failed to archive the group', archived, skipped });
+    }
+    if (archived.length) emitGroupChanged(groupId, archived);
+    return res.json({ ok: true, archived, skipped });
   });
 
   // POST /api/conversation/:id/unarchive — back to the live list. A Claude
@@ -5355,9 +5890,16 @@ export function registerSessionsRoutes(app, deps) {
       // One transaction so a conversation can never exist without its runtime
       // binding and preferences: every later reader treats these three as a
       // single canonical tuple.
+      let attachedGroupId = null;
       const commitBootstrapState = db.transaction(() => {
         stmts.insertConv.run(conversationId, title, now, now);
         if (remoteRequest.origin) remoteRelayInbound?.repository?.setConversationOrigin?.(conversationId, remoteRequest.origin);
+        // A session an agent of this relay created joins its creator's group
+        // (or starts one with the creator as head). A creator on a paired
+        // relay has no local flag and groups nothing.
+        if (remoteRequest.origin?.local === true && remoteRequest.origin.conversationId) {
+          attachedGroupId = conversationGroups?.attachCreatedConversation?.(conversationId, remoteRequest.origin.conversationId, now) || null;
+        }
         const boundRuntimeSession = ensureRuntimeSessionBinding(
           conversationId,
           selectedModel,
@@ -5386,6 +5928,7 @@ export function registerSessionsRoutes(app, deps) {
         return { boundRuntimeSession, preferences };
       });
       const { boundRuntimeSession, preferences } = commitBootstrapState();
+      if (attachedGroupId) emitGroupChanged(attachedGroupId, [conversationId, remoteRequest.origin.conversationId]);
       const runtimeSession = boundRuntimeSession;
       const preferredRelayMode = preferences?.preferredRelayMode || bootstrapRelayMode;
       const preferredModel = preferences?.preferredModel || selectedModel;
@@ -6489,6 +7032,25 @@ export function registerSessionsRoutes(app, deps) {
     return res.json(subagentRecordRetentionPayload(result.retentionDays));
   });
 
+  // What a shared conversation shows of the host's paths and file names.
+  const sharePathPrivacyPayload = (mode) => ({
+    mode,
+    choices: SHARE_PATH_PRIVACY_MODES.map((value) => ({ value, label: SHARE_PATH_PRIVACY_LABELS[value] })),
+    defaultMode: DEFAULT_SHARE_PATH_PRIVACY_MODE,
+  });
+
+  app.get('/api/settings/share-path-privacy', auth, (_req, res) => {
+    res.json(sharePathPrivacyPayload(getSharePathPrivacyMode()));
+  });
+
+  app.post('/api/settings/share-path-privacy', auth, (req, res) => {
+    const parsed = parseSharePathPrivacyUpdate(req.body?.mode);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setSharePathPrivacyMode(parsed.mode);
+    if (!result.ok) return res.status(500).json({ error: result.error });
+    return res.json(sharePathPrivacyPayload(result.mode));
+  });
+
   app.get('/api/settings/background-task-timeout', auth, (_req, res) => {
     res.json({
       timeoutMinutes: getBackgroundTaskTimeoutMinutes(),
@@ -6566,9 +7128,18 @@ export function registerSessionsRoutes(app, deps) {
    */
   async function windowsAutostartMergedState() {
     const signin = windowsAutostartService.getState();
-    const boot = windowsBootAutostartService
-      ? await windowsBootAutostartService.getState()
-      : { supported: false };
+    // A boot task that cannot be read is reported (and logged), not allowed
+    // to fail the whole setting; the sign-in half above still does, since
+    // "off" would be a guess there.
+    let boot = { supported: false };
+    if (windowsBootAutostartService) {
+      try {
+        boot = await windowsBootAutostartService.getState();
+      } catch (error) {
+        console.warn(`[autostart] could not read the boot task: ${error?.message || error}`);
+        boot = { supported: true, taskStatus: 'unknown', taskName: null, legacyTaskPresent: false, readError: 'The boot task could not be read; the relay log has the details.' };
+      }
+    }
     const bootReady = boot.supported && boot.taskStatus === 'ready';
     const mode = bootReady ? 'boot' : (signin.enabled ? 'signin' : 'off');
     return {
@@ -6582,9 +7153,13 @@ export function registerSessionsRoutes(app, deps) {
         taskStatus: boot.taskStatus,
         taskName: boot.taskName,
         legacyTaskPresent: boot.legacyTaskPresent,
-        pendingElevation: boot.pendingElevation,
-        lastError: boot.lastError,
-        manualCommand: boot.manualCommand,
+        customised: boot.customised === true,
+        customisations: Array.isArray(boot.customisations) ? boot.customisations : [],
+        launcherBackupPath: boot.launcherBackupPath || null,
+        readError: boot.readError || null,
+        pendingElevation: boot.pendingElevation || null,
+        lastError: boot.lastError || null,
+        manualCommand: boot.manualCommand || null,
       } : null,
       signinEnabled: signin.enabled,
     };
@@ -6596,7 +7171,9 @@ export function registerSessionsRoutes(app, deps) {
     }
     try {
       return res.json(await windowsAutostartMergedState());
-    } catch {
+    } catch (error) {
+      // The details stay in the log: they name folders on the host.
+      console.warn(`[autostart] could not read the Windows autostart setting: ${error?.message || error}`);
       return res.status(500).json({
         error: 'Unable to read Windows autostart. Check access to your user Startup folder.',
       });
@@ -6646,7 +7223,8 @@ export function registerSessionsRoutes(app, deps) {
       }
       windowsAutostartService.setEnabled(mode === 'signin');
       return res.json({ ...(await windowsAutostartMergedState()), accepted });
-    } catch {
+    } catch (error) {
+      console.warn(`[autostart] could not change the Windows autostart setting to ${mode}: ${error?.message || error}`);
       return res.status(500).json({
         error: 'Unable to update Windows autostart. Check access to your user Startup folder.',
       });

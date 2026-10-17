@@ -417,6 +417,70 @@ test('sendMessage happy path: unswitched flow posts, renders the bubble, and cle
   assert.equal(getById('msg-input').value, '', 'the composer is cleared');
 });
 
+// The reader's own send takes them to the end, and keeps them there through
+// what the page does after the relay has answered. The transcript here is a
+// box 500 px tall; the test grows the content while the POST is on its way,
+// as a picture that loads or a note above the composer does.
+async function sendFromFarUp({ openedMeanwhile = null, startIn = null } = {}) {
+  const created = nextId('conv-created');
+  setCurrentConv(startIn);
+  // Its own text each time: the same one twice reads as a double send.
+  resetComposer(`my own message ${nextId('send')}`);
+  messagesEl.innerHTML = '';
+  messagesEl.clientHeight = 500;
+  messagesEl.scrollHeight = 5000;
+  messagesEl.scrollTop = 0;
+  const posted = deferred();
+  fetchHandler = async (url) => {
+    if (url.includes('/api/message')) return posted.promise;
+    if (startIn && url.includes(`/api/conversation/${startIn}?`)) return validationPayload('sess-a', '/root-a', 'A');
+    return { ok: true, draftText: '', draftUpdatedAt: new Date().toISOString() };
+  };
+  const sendPromise = view.sendMessage();
+  await settle();
+  await settle();
+  const afterSend = messagesEl.scrollTop;
+  if (openedMeanwhile) setCurrentConv(openedMeanwhile);
+  messagesEl.scrollHeight = 6500;
+  // Past the send's timed step.
+  await new Promise((resolve) => setTimeout(resolve, 160));
+  const afterGrowth = messagesEl.scrollTop;
+  // And more once that step is over: only the answer's steps are left.
+  messagesEl.scrollHeight = 8000;
+  posted.resolve({ conversationId: startIn || created, messageId: nextId('srv') });
+  await sendPromise;
+  const afterAnswer = messagesEl.scrollTop;
+  messagesEl.clientHeight = 0;
+  messagesEl.scrollHeight = null;
+  messagesEl._scrollHeight = null;
+  messagesEl.scrollTop = 0;
+  return { afterSend, afterGrowth, afterAnswer };
+}
+
+test('a send from the new-chat screen goes on in the conversation the relay creates for it', async () => {
+  const positions = await sendFromFarUp();
+  assert.equal(positions.afterSend, 5000, 'the send takes the reader to the end');
+  assert.equal(positions.afterGrowth, 6500, 'and again a moment later');
+  assert.equal(positions.afterAnswer, 8000, 'and once more when the relay has named the conversation');
+});
+
+test('a send in a conversation goes on to the end after the relay has answered', async () => {
+  const convA = nextId('conv-a');
+  conversations[convA] = { id: convA, title: 'A' };
+  const positions = await sendFromFarUp({ startIn: convA });
+  assert.equal(positions.afterSend, 5000);
+  assert.equal(positions.afterAnswer, 8000);
+});
+
+test('a new-chat send does not scroll a conversation that came on screen meanwhile', async () => {
+  const other = nextId('conv-other');
+  conversations[other] = { id: other, title: 'Other' };
+  const positions = await sendFromFarUp({ openedMeanwhile: other });
+  assert.equal(positions.afterSend, 5000);
+  assert.equal(positions.afterGrowth, 5000, 'the timed step of the send leaves the other conversation alone');
+  assert.equal(positions.afterAnswer, 5000, 'and so does what follows the relay\'s answer');
+});
+
 test('sendMessage posts the composer selection and image-edit target captured at send time, not the switched-to conversation\'s', async () => {
   const convA = nextId('conv-a');
   const convB = nextId('conv-b');

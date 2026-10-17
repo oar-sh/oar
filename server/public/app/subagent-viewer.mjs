@@ -9,8 +9,12 @@
 // and drops on a backed-up connection; a missed event shows up as a hole in
 // the seq numbers and is fetched again, and so is the end of a run. Full-screen on
 // phones; Escape, ×, a click outside and the system back close it.
+//
+// A shared view (and the owner's "Preview as shared") opens it read-only: the
+// record comes filtered from the share's sub-agent route, without a socket, so
+// a running agent's record is read again every few seconds; no Stop.
 
-import { apiFetch, cancelSubagentRun } from './api-client.js';
+import { apiFetch, cancelSubagentRun, loadSharedSubagentRecord } from './api-client.js';
 import { renderMarkdownPreview } from './router.js';
 import { currentConvId, getSubagentRun, IS_SHARED_VIEW, upsertSubagentRun } from './store.js';
 import { createViewerHistory } from './viewer-history.mjs';
@@ -30,6 +34,7 @@ import {
 const PAGE_LIMIT = 500;
 const MAX_PAGES = 10;
 const STOP_PENDING_MS = 15_000;
+const SHARED_POLL_MS = 3_000;
 
 const viewer = {
   open: false,
@@ -44,6 +49,7 @@ const viewer = {
   stopping: false,
   stopTimer: null,
   tickTimer: null,
+  sharedPollTimer: null,
   openFolds: new Set(),
 };
 
@@ -146,7 +152,7 @@ function buildEntryNode(entry) {
     renderMarkdown,
     children: viewer.children,
     openDetails: viewer.openFolds.has(entry.seq),
-    clickable: !IS_SHARED_VIEW,
+    clickable: true,
   });
   return holder.firstElementChild;
 }
@@ -215,6 +221,21 @@ function applyRunHeader(header) {
   }
   renderHeader();
   syncTicker();
+  syncSharedPoll();
+}
+
+// Without a socket a running record is read again while it is on screen.
+function syncSharedPoll() {
+  const want = IS_SHARED_VIEW && viewer.open && runIsRunning(viewer.run);
+  if (want && !viewer.sharedPollTimer) {
+    viewer.sharedPollTimer = setInterval(() => {
+      if (!viewer.loading && document.visibilityState !== 'hidden') void fetchRecord();
+    }, SHARED_POLL_MS);
+  }
+  if (!want && viewer.sharedPollTimer) {
+    clearInterval(viewer.sharedPollTimer);
+    viewer.sharedPollTimer = null;
+  }
 }
 
 /**
@@ -231,7 +252,9 @@ async function fetchRecord({ fromStart = false } = {}) {
   renderStatus();
   try {
     for (let page = 0; page < MAX_PAGES; page += 1) {
-      const data = await apiFetch(`/api/conversation/${encodeURIComponent(conversationId)}/subagent/${encodeURIComponent(runId)}?after=${after}&limit=${PAGE_LIMIT}`);
+      const data = IS_SHARED_VIEW
+        ? await loadSharedSubagentRecord(runId, { after, limit: PAGE_LIMIT })
+        : await apiFetch(`/api/conversation/${encodeURIComponent(conversationId)}/subagent/${encodeURIComponent(runId)}?after=${after}&limit=${PAGE_LIMIT}`);
       if (token !== viewer.fetchToken || !viewer.open || viewer.state?.runId !== runId) return;
       if (!data) {
         viewer.error = viewer.state.entries.size ? '' : 'This agent\'s record could not be loaded.';
@@ -272,7 +295,7 @@ async function loadRun(runId) {
   renderHeader();
   renderStatus();
   // Joined before the read, so nothing sent in between is lost.
-  await viewerWatch.watch(viewer.conversationId, id);
+  if (!IS_SHARED_VIEW) await viewerWatch.watch(viewer.conversationId, id);
   if (!viewer.open || viewer.state?.runId !== id) return;
   await fetchRecord({ fromStart: true });
   // A finished record reads from the top; a running one follows its end.
@@ -317,6 +340,7 @@ export function closeSubagentViewer({ fromHistory = false } = {}) {
   viewer.children = new Map();
   clearTimeout(viewer.stopTimer);
   syncTicker();
+  syncSharedPoll();
   if (!fromHistory) viewerHistory?.closed();
 }
 
@@ -338,7 +362,7 @@ async function openParent() {
 
 async function stopRun() {
   const run = viewer.run;
-  if (!run || viewer.stopping || !runIsRunning(run)) return;
+  if (IS_SHARED_VIEW || !run || viewer.stopping || !runIsRunning(run)) return;
   viewer.stopping = true;
   renderHeader();
   const task = liveTaskFor(run);
@@ -475,7 +499,7 @@ export function initSubagentViewer() {
   // (a child row) opens that child in place.
   document.addEventListener('click', (event) => {
     const trigger = event.target?.closest?.('[data-subagent-open]');
-    if (!trigger || IS_SHARED_VIEW) return;
+    if (!trigger) return;
     event.preventDefault();
     event.stopPropagation();
     const runId = trigger.getAttribute('data-subagent-open');

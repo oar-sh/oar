@@ -1,6 +1,7 @@
 'use strict';
 
 import { spawn } from 'node:child_process';
+import { windowsSystemToolPath } from '../../shared/windows-system-tools.mjs';
 
 /**
  * The actual suspend-to-RAM call. Windows only: `SetSuspendState 0,0,0` puts
@@ -25,7 +26,7 @@ export function runHostSuspendToRam({
     return { ok: true, command, dryRun: true };
   }
   try {
-    const child = spawnImpl('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,0,0'], {
+    const child = spawnImpl(windowsSystemToolPath('rundll32.exe'), ['powrprof.dll,SetSuspendState', '0,0,0'], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,

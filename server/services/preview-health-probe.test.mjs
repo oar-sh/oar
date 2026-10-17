@@ -113,6 +113,56 @@ test('an empty registry sweeps without probing', async () => {
   await health.sweep();
 });
 
+test('a sweep retries the store writes that failed, with or without port previews', async () => {
+  let failing = true;
+  const rows = new Map();
+  const store = {
+    list: () => [],
+    insert: (record) => { if (failing) throw new Error('database is locked'); rows.set(record.token, record); return true; },
+    remove: (token) => { if (failing) throw new Error('database is locked'); return rows.delete(token); },
+    removeForConversation: () => 0,
+    touch: () => true,
+  };
+  const registry = createPreviewRegistry({ config: previewConfig(), store, logger: { log() {}, warn() {} } });
+  const { preview } = registry.createStatic({ rootDir: '/home/dev/site' });
+  assert.equal(rows.size, 0);
+  const health = createPreviewHealthProbe({
+    registry,
+    probe: () => { throw new Error('a static preview is never probed'); },
+  });
+  failing = false;
+  await health.sweep();
+  assert.deepEqual([...rows.keys()], [preview.token]);
+  assert.equal(registry.pendingWriteCount, 0);
+});
+
+test('a sweep checks the rows a restore could not judge again', async () => {
+  const token = 'c'.repeat(32);
+  let readable = false;
+  const store = {
+    list: () => [{ token, mode: 'static', conversationId: 'conv-1', label: 'site', rootDir: '/home/dev/site', createdAt: 1_000 }],
+    insert: () => true,
+    remove: () => true,
+    removeForConversation: () => 0,
+    touch: () => true,
+  };
+  const registry = createPreviewRegistry({
+    config: previewConfig(),
+    store,
+    checkStaticRoot: (rootDir) => (readable ? { ok: true, rootDir } : { ok: false, error: 'EIO', transient: true }),
+    logger: { log() {}, warn() {} },
+  });
+  const health = createPreviewHealthProbe({
+    registry,
+    probe: () => { throw new Error('a static preview is never probed'); },
+  });
+  await health.sweep();
+  assert.equal(registry.resolve(token), null);
+  readable = true;
+  await health.sweep();
+  assert.equal(registry.resolve(token).rootDir, '/home/dev/site');
+});
+
 test('sweeps do not overlap', async () => {
   const registry = laneRegistry();
   registry.create({ port: 5001 });
@@ -165,4 +215,21 @@ test('start/stop drive an unref-ed interval', () => {
   assert.equal(health.running, false);
   health.stop();
   assert.equal(cleared.length, 1);
+});
+
+test('start sweeps once right away, so restored port previews get a state without waiting', async () => {
+  const registry = laneRegistry();
+  const { preview } = registry.create({ port: 5173 });
+  const probed = [];
+  const health = createPreviewHealthProbe({
+    registry,
+    probe: async ({ port }) => { probed.push(port); return true; },
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl: () => {},
+  });
+  health.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(probed, [5173]);
+  assert.equal(registry.get(preview.token).online, true);
+  health.stop();
 });

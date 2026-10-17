@@ -35,8 +35,14 @@ test('runtime builds the host-suspend service on the real activity collector and
 test('the activity collector reads turns, live background tasks and CI', () => {
   const body = sliceBetween(runtimeSource, 'function collectHostActivity(', '\nconst hostSuspendService');
   assert.match(body, /stmts\.listActiveQueueCountsByConversation/);
-  assert.match(body, /backgroundTaskStore\.sets/);
-  assert.match(body, /hostActivityWorkerAlive\(key\)/, 'background tasks only count for live workers');
+  // Background work and the blocker of a runtime that only just started
+  // come from the view (services/background-work-view.test.mjs), which
+  // counts tasks for live workers only.
+  // (what those blockers are, through the real modules:
+  // routes/messages-routes-background-task-resync.test.mjs).
+  assert.match(body, /backgroundWorkView\.blockers\(\)/);
+  assert.match(runtimeSource, /createBackgroundWorkView\(\{[\s\S]*?isWorkerAlive: hostActivityWorkerAlive,[\s\S]*?sessionIdOf:[\s\S]*?conversationIdOf:/);
+  assert.match(runtimeSource, /bootReportingWindowMs: resolveBootReportingWindowMs\(process\.env, /);
   assert.match(body, /stmts\.countRunningSubagentRuns/);
   assert.match(body, /githubCiActivityService\.describeRuns\(roots\)/);
   assert.match(body, /githubCiActivityService\.snapshot\(roots\)/);

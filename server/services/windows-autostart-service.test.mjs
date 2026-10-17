@@ -148,3 +148,10 @@ test('a pre-rebrand entry still reads as enabled and converges on the new name',
     context.cleanup();
   }
 });
+
+test('resolveWindowsStartupDirectory falls back to the roaming folder under USERPROFILE without APPDATA', () => {
+  assert.equal(
+    resolveWindowsStartupDirectory({ USERPROFILE: 'C:\\Users\\Example' }, path.win32),
+    'C:\\Users\\Example\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup',
+  );
+});

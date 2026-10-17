@@ -1,4 +1,4 @@
-import { BASE, TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform, setUpdateState } from './store.js';
+import { BASE, TOKEN, CLIENT_ID, IS_SHARE_PREVIEW, SHARE_PREVIEW_CONVERSATION_ID, SHARED_CONVERSATION_TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform, setUpdateState } from './store.js';
 
 // fetch() has no default timeout. Without one, a request issued while the app is
 // being backgrounded can hang indefinitely on a half-open mobile connection and
@@ -69,6 +69,58 @@ export async function apiFetch(url, opts = {}) {
     noteFetchFailure(url, error);
     return null;
   }
+}
+
+const SERVER_ERROR_MAX_CHARS = 300;
+
+/** A server's error text made fit for an alert or a status line. */
+export function readableServerError(value) {
+  const text = String(value == null ? '' : value)
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return text.length > SERVER_ERROR_MAX_CHARS ? `${text.slice(0, SERVER_ERROR_MAX_CHARS - 1)}…` : text;
+}
+
+/**
+ * apiFetch for the few callers that show the user why a request failed:
+ * throws an Error carrying the server's `error` text (or the HTTP status, or
+ * the network failure) instead of returning null. The error's `status` is the
+ * HTTP status the relay answered with, or 0 when no answer arrived. Paused
+ * networking still returns null, as apiFetch does.
+ */
+export async function apiFetchOrThrow(url, opts = {}) {
+  if (!networkRequestsEnabled && !opts.keepalive) return null;
+  let response;
+  try {
+    response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(),
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+        ...(opts.headers || {}),
+      },
+      ...opts,
+    });
+  } catch (error) {
+    noteFetchFailure(url, error);
+    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+    throw Object.assign(
+      new Error(timedOut ? 'The relay did not answer in time.' : `The relay could not be reached (${readableServerError(toErrorMessage(error))}).`),
+      { status: 0 },
+    );
+  }
+  noteFetchSuccess();
+  if (!response.ok) {
+    console.error('API error', response.status, url);
+    let serverText = '';
+    try {
+      const body = await response.json();
+      serverText = readableServerError(body?.error || body?.message || '');
+    } catch {}
+    throw Object.assign(new Error(serverText || `The relay answered HTTP ${response.status}.`), { status: response.status });
+  }
+  return response.json();
 }
 
 export async function verifyExistingSession(tokenCandidate = '') {
@@ -195,7 +247,7 @@ export async function updateWorkspaceRoot(rootPath, conversationId = null) {
   const endpoint = convId
     ? `/api/conversation/${encodeURIComponent(convId)}/workspace-root`
     : '/api/workspace-root';
-  const response = await apiFetch(endpoint, {
+  const response = await apiFetchOrThrow(endpoint, {
     method: 'POST',
     body: JSON.stringify({ rootPath: pathValue }),
   });
@@ -474,14 +526,14 @@ export async function updateCursorSettings({
 }
 
 export async function loadWindowsAutostartSetting() {
-  return apiFetch('/api/settings/windows-autostart');
+  return apiFetchOrThrow('/api/settings/windows-autostart');
 }
 
 export async function updateWindowsAutostartSetting(mode) {
   // Mode string ('off' | 'signin' | 'boot'); a boolean still works for the
   // pre-mode call sites and maps onto signin/off server-side.
   const body = typeof mode === 'boolean' ? { enabled: mode } : { mode: String(mode) };
-  return apiFetch('/api/settings/windows-autostart', {
+  return apiFetchOrThrow('/api/settings/windows-autostart', {
     method: 'POST',
     body: JSON.stringify(body),
   });
@@ -692,9 +744,12 @@ export async function relaunchSessionWorkerWithWorkspaceRoot(conversationId, roo
   // One key per user gesture, so a duplicate delivery (retried fetch, second tab,
   // stray touch event) is provably the same request and the relay replays it
   // instead of running a second stop/spawn cycle.
-  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/relaunch-with-workspace-root`, {
+  // A relaunch stops the worker and starts a new one; on Windows that alone
+  // can take longer than the default ceiling.
+  return apiFetchOrThrow(`/api/conversation/${encodeURIComponent(convId)}/relaunch-with-workspace-root`, {
     method: 'POST',
     body: JSON.stringify({ rootPath: pathValue, idempotencyKey: String(idempotencyKey || '') }),
+    signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
   });
 }
 
@@ -878,6 +933,64 @@ async function conversationActionRequest(url) {
   }
 }
 
+// Session groups: every call answers the relay's `{ ok, ... }`, or
+// `{ ok: false, status, error }` when it refuses, or null when offline.
+async function groupRequest(url, method, body = null) {
+  if (!areNetworkRequestsEnabled()) return null;
+  try {
+    const response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
+      method,
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: body === null ? undefined : JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) return { ...(payload || {}), ok: false, status: response.status };
+    noteFetchSuccess();
+    return payload || { ok: true };
+  } catch (error) {
+    noteFetchFailure(url, error);
+    return null;
+  }
+}
+
+export function createConversationGroup({ name = null, conversationIds = [] } = {}) {
+  return groupRequest('/api/conversation-groups', 'POST', { name, conversationIds });
+}
+
+export function renameConversationGroup(groupId, name) {
+  return groupRequest(`/api/conversation-groups/${encodeURIComponent(String(groupId || ''))}`, 'PATCH', { name });
+}
+
+export function moveConversationToGroup(conversationId, groupId) {
+  return groupRequest(`/api/conversation/${encodeURIComponent(String(conversationId || ''))}/group`, 'PUT', { groupId });
+}
+
+/**
+ * A conversation into a group at a place in its hand order: before
+ * `beforeConversationId`, or at the end with null. `groupId: null` takes it
+ * out of its group.
+ */
+export function placeConversationInGroup(conversationId, { groupId = null, beforeConversationId = null } = {}) {
+  return groupRequest(`/api/conversation/${encodeURIComponent(String(conversationId || ''))}/group`, 'PUT', { groupId, beforeConversationId });
+}
+
+export function removeConversationFromGroup(conversationId) {
+  return groupRequest(`/api/conversation/${encodeURIComponent(String(conversationId || ''))}/group`, 'DELETE');
+}
+
+export function dissolveConversationGroup(groupId) {
+  return groupRequest(`/api/conversation-groups/${encodeURIComponent(String(groupId || ''))}`, 'DELETE');
+}
+
+export function archiveConversationGroup(groupId) {
+  return groupRequest(`/api/conversation-groups/${encodeURIComponent(String(groupId || ''))}/archive`, 'POST', {});
+}
+
+export function stopConversationGroup(groupId) {
+  return groupRequest(`/api/conversation-groups/${encodeURIComponent(String(groupId || ''))}/stop`, 'POST', { clientId: CLIENT_ID });
+}
+
 export async function deleteConversation(id) {
   const convId = String(id || '').trim();
   if (!convId || !areNetworkRequestsEnabled()) return null;
@@ -901,14 +1014,50 @@ export async function deleteConversation(id) {
   }
 }
 
+// Keeps the relay's `error` text on a refusal (a turn still running), so the
+// notice can say why.
+async function shareVisibilityRequest(url, method, body = null) {
+  if (!networkRequestsEnabled) return null;
+  try {
+    const response = await fetch(`${BASE}${url}`, {
+      signal: requestTimeoutSignal(),
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: body === null ? undefined : JSON.stringify(body),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      console.error('API error', response.status, url);
+      return { ok: false, status: response.status, error: String(result?.error || '').trim() };
+    }
+    noteFetchSuccess();
+    return result;
+  } catch (error) {
+    noteFetchFailure(url, error);
+    return null;
+  }
+}
+
 export async function updateMessageShareVisibility(conversationId, messageId, hiddenFromShares) {
   const convId = String(conversationId || '').trim();
   const msgId = String(messageId || '').trim();
   if (!convId || !msgId) return null;
-  return apiFetch(`/api/conversation/${encodeURIComponent(convId)}/message/${encodeURIComponent(msgId)}/share-visibility`, {
-    method: 'PATCH',
-    body: JSON.stringify({ hiddenFromShares: hiddenFromShares === true }),
-  });
+  return shareVisibilityRequest(
+    `/api/conversation/${encodeURIComponent(convId)}/message/${encodeURIComponent(msgId)}/share-visibility`,
+    'PATCH',
+    { hiddenFromShares: hiddenFromShares === true },
+  );
+}
+
+// Every hidden message of the conversation visible to shared viewers again,
+// except those of a turn still running (the answer's `skipped`).
+export async function unhideAllMessagesFromShares(conversationId) {
+  const convId = String(conversationId || '').trim();
+  if (!convId) return null;
+  return shareVisibilityRequest(`/api/conversation/${encodeURIComponent(convId)}/share-visibility/unhide-all`, 'POST');
 }
 
 // Pin or unpin one message. Unlike apiFetch this keeps the relay's `error`
@@ -986,6 +1135,57 @@ export async function createConversationShareLink(id) {
   });
 }
 
+// Share management (Settings → Shared conversations, the ⋯ menu). These throw
+// with the relay's reason, so the caller can say why an action failed.
+export async function listConversationShares() {
+  return apiFetchOrThrow('/api/shares');
+}
+
+export async function renewConversationShareLink(id) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return apiFetchOrThrow(`/api/conversation/${encodeURIComponent(convId)}/share/renew`, { method: 'POST' });
+}
+
+export async function stopSharingConversation(id) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  return apiFetchOrThrow(`/api/conversation/${encodeURIComponent(convId)}/share`, { method: 'DELETE' });
+}
+
+export async function loadConversationShareOpens(id, { limit = 200 } = {}) {
+  const convId = String(id || '').trim();
+  if (!convId) return null;
+  const pageSize = Math.max(1, Math.trunc(Number(limit) || 200));
+  return apiFetchOrThrow(`/api/conversation/${encodeURIComponent(convId)}/share/opens?limit=${pageSize}`);
+}
+
+export async function updateShareSettings(settings = {}) {
+  return apiFetchOrThrow('/api/settings/shares', {
+    method: 'POST',
+    body: JSON.stringify(settings || {}),
+  });
+}
+
+export async function countStoredViewerIps() {
+  return apiFetchOrThrow('/api/settings/shares/stored-viewer-ips');
+}
+
+export async function forgetStoredViewerIps() {
+  return apiFetchOrThrow('/api/settings/shares/stored-viewer-ips', { method: 'DELETE' });
+}
+
+export async function loadSharePathPrivacySetting() {
+  return apiFetchOrThrow('/api/settings/share-path-privacy');
+}
+
+export async function updateSharePathPrivacySetting(mode) {
+  return apiFetchOrThrow('/api/settings/share-path-privacy', {
+    method: 'POST',
+    body: JSON.stringify({ mode }),
+  });
+}
+
 export async function loadServerStatusEventPage({ before = null, limit = 40 } = {}) {
   const params = new URLSearchParams();
   const pageSize = Math.max(1, Math.min(100, Math.trunc(Number(limit) || 40)));
@@ -1004,9 +1204,23 @@ export async function loadServerStatusEventPage({ before = null, limit = 40 } = 
   };
 }
 
-export async function loadSharedConversation(shareToken, options = {}) {
+// The shared reader's source: the share link's route, or for "Preview as
+// shared" the owner's preview route (cookie-authed, marked redactions).
+function sharedReaderEndpoint(shareToken, suffix = '') {
+  if (IS_SHARE_PREVIEW) return `${BASE}/api/conversation/${encodeURIComponent(SHARE_PREVIEW_CONVERSATION_ID)}/share-preview${suffix}`;
   const token = String(shareToken || '').trim().toLowerCase();
-  if (!token) return { ok: false, status: 400, error: 'Missing shared token' };
+  return token ? `${BASE}/api/shared/${encodeURIComponent(token)}${suffix}` : '';
+}
+
+function sharedReaderHeaders() {
+  return IS_SHARE_PREVIEW
+    ? { 'Content-Type': 'application/json', ...authHeaders() }
+    : { 'Content-Type': 'application/json' };
+}
+
+export async function loadSharedConversation(shareToken, options = {}) {
+  const endpoint = sharedReaderEndpoint(shareToken);
+  if (!endpoint) return { ok: false, status: 400, error: 'Missing shared token' };
   const params = new URLSearchParams();
   const limit = Math.max(1, Math.trunc(Number(options.limit) || 0));
   if (limit) params.set('limit', String(limit));
@@ -1020,11 +1234,13 @@ export async function loadSharedConversation(shareToken, options = {}) {
   if (afterTimestamp) params.set('afterTimestamp', afterTimestamp);
   const aroundMessageId = String(options.aroundMessageId || '').trim();
   if (aroundMessageId) params.set('aroundMessageId', aroundMessageId);
+  // The page's first fetch: the relay logs it as an open (polls are not).
+  if (options.open === true) params.set('open', '1');
   const query = params.toString();
   try {
-    const response = await fetch(`${BASE}/api/shared/${encodeURIComponent(token)}${query ? `?${query}` : ''}`, {
+    const response = await fetch(`${endpoint}${query ? `?${query}` : ''}`, {
       signal: requestTimeoutSignal(),
-      headers: { 'Content-Type': 'application/json' },
+      headers: sharedReaderHeaders(),
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
@@ -1045,6 +1261,23 @@ export async function loadSharedConversation(shareToken, options = {}) {
       status: 0,
       error: error?.message || 'Network error',
     };
+  }
+}
+
+/** One page of a sub-agent's record, as the shared view (or its preview) may read it. */
+export async function loadSharedSubagentRecord(runId, { after = 0, limit = 500 } = {}) {
+  const id = String(runId || '').trim();
+  const endpoint = id ? sharedReaderEndpoint(SHARED_CONVERSATION_TOKEN, `/subagent/${encodeURIComponent(id)}`) : '';
+  if (!endpoint) return null;
+  try {
+    const response = await fetch(`${endpoint}?after=${Number(after) || 0}&limit=${Number(limit) || 500}`, {
+      signal: requestTimeoutSignal(),
+      headers: sharedReaderHeaders(),
+    });
+    if (!response.ok) return null;
+    return await response.json().catch(() => null);
+  } catch {
+    return null;
   }
 }
 
@@ -1122,8 +1355,10 @@ export async function killSessionWorker(sdkSessionId, body = {}) {
   });
 }
 
+// The three relay maintenance calls throw on failure (apiFetchOrThrow), so
+// their callers can tell a refusal from a restart that cut the connection.
 export async function requestRelayRestart(body = {}) {
-  return apiFetch('/api/relay/shutdown', {
+  return apiFetchOrThrow('/api/relay/shutdown', {
     method: 'POST',
     body: JSON.stringify({
       reason: 'manual-restart',
@@ -1171,14 +1406,14 @@ export async function cancelUsageLimitPause(conversationId) {
 }
 
 export async function cancelRelayRestart(body = {}) {
-  return apiFetch('/api/relay/shutdown/cancel', {
+  return apiFetchOrThrow('/api/relay/shutdown/cancel', {
     method: 'POST',
     body: JSON.stringify({ requestedBy: 'localhost-api', ...(body || {}) }),
   });
 }
 
 export async function requestQueueEmpty(body = {}) {
-  return apiFetch('/api/queue/empty', {
+  return apiFetchOrThrow('/api/queue/empty', {
     method: 'POST',
     body: JSON.stringify({
       reason: 'manual-empty-queue',

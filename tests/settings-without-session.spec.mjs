@@ -23,9 +23,11 @@ import { startRelayServer } from "./relay-server-harness.mjs";
 const RELAY_WIDE_ENTRIES = [
   "chat-menu-pwa-version",
   "chat-menu-queue-status",
+  "chat-menu-theme-toggle",
   "chat-menu-usage",
   "chat-menu-select-models",
   "chat-menu-settings",
+  "chat-menu-about",
   "chat-menu-restart-relay",
   // Shown by default; Settings → General can hide it.
   "chat-menu-suspend-host",
@@ -34,6 +36,9 @@ const RELAY_WIDE_ENTRIES = [
 const PER_CONVERSATION_ENTRIES = [
   "chat-menu-edit-title",
   "chat-menu-share-conversation",
+  // Shown only while the open conversation has a live link.
+  "chat-menu-stop-sharing",
+  "chat-menu-preview-shared",
   "chat-menu-archive",
   "chat-menu-inspect-tmux",
   "chat-menu-change-cwd",
@@ -275,7 +280,7 @@ for (const profile of [
       expect(await conversationCount(request)).toBe(0);
     });
 
-    test("the shared view has no Settings, even for an unknown share", async ({ request, browser }) => {
+    test("the shared view has no Settings, and an unknown share is a plain 404", async ({ request, browser }) => {
       const conversationId = await seedConversation(request, "Sample chat to share");
       try {
         const share = await request.post(api(`/api/conversation/${conversationId}/share`), { headers });
@@ -283,26 +288,31 @@ for (const profile of [
         const sharePath = String((await share.json()).path || "").trim();
         expect(sharePath).toMatch(/^\/shared\//);
 
-        for (const path of [sharePath, "/shared/no-such-share-fixture"]) {
-          const context = await browser.newContext(profile.use);
-          try {
-            const sharedPage = await context.newPage();
-            await sharedPage.goto(`${relay.baseUrl}${path}`);
-            await sharedPage.waitForLoadState("networkidle");
-            const trigger = sharedPage.locator("#chat-actions-menu-btn");
-            await expect(trigger).toBeVisible();
-            await expect(trigger).toBeEnabled();
-            await (profile.touch ? trigger.tap() : trigger.click());
-            await expect(sharedPage.locator("#chat-actions-menu")).toBeVisible();
-            expect(await visibleMenuEntryIds(sharedPage)).toEqual(["chat-menu-shared-theme-toggle"]);
-            await expect(sharedPage.locator("#chat-menu-settings")).toBeHidden();
-            await expect(sharedPage.locator("#settings-modal")).not.toHaveClass(/visible/);
-            // None of the empty-screen actions exist in the shared view.
-            await expect(sharedPage.locator("#empty-state-open-settings")).toHaveCount(0);
-            await expect(sharedPage.locator("#msg-input")).toBeDisabled();
-          } finally {
-            await context.close();
-          }
+        // No app shell for a link that does not exist (or no longer does).
+        for (const path of ["/shared/no-such-share-fixture", `/shared/${"0".repeat(64)}`]) {
+          const missing = await request.get(`${relay.baseUrl}${path}`);
+          expect(missing.status()).toBe(404);
+          expect(await missing.text()).toBe("Not Found");
+        }
+
+        const context = await browser.newContext(profile.use);
+        try {
+          const sharedPage = await context.newPage();
+          await sharedPage.goto(`${relay.baseUrl}${sharePath}`);
+          await sharedPage.waitForLoadState("networkidle");
+          const trigger = sharedPage.locator("#chat-actions-menu-btn");
+          await expect(trigger).toBeVisible();
+          await expect(trigger).toBeEnabled();
+          await (profile.touch ? trigger.tap() : trigger.click());
+          await expect(sharedPage.locator("#chat-actions-menu")).toBeVisible();
+          expect(await visibleMenuEntryIds(sharedPage)).toEqual(["chat-menu-theme-toggle"]);
+          await expect(sharedPage.locator("#chat-menu-settings")).toBeHidden();
+          await expect(sharedPage.locator("#settings-modal")).not.toHaveClass(/visible/);
+          // None of the empty-screen actions exist in the shared view.
+          await expect(sharedPage.locator("#empty-state-open-settings")).toHaveCount(0);
+          await expect(sharedPage.locator("#msg-input")).toBeDisabled();
+        } finally {
+          await context.close();
         }
       } finally {
         await request.delete(api(`/api/conversation/${conversationId}`), { headers }).catch(() => {});
@@ -354,10 +364,13 @@ for (const profile of [
       const row = page.locator(`#conv-list .conv-item[data-conversation-id="${first}"]`);
       await expect(row).toBeVisible();
       if (profile.touch) {
-        await row.evaluate((node) => {
+        await row.evaluate(async (node) => {
           const box = node.getBoundingClientRect();
           const init = { bubbles: true, pointerType: "touch", clientX: box.x + 20, clientY: box.y + 10, pointerId: 7 };
           node.dispatchEvent(new PointerEvent("pointerdown", init));
+          // A long press opens the menu when the finger lifts.
+          await new Promise((resolve) => setTimeout(resolve, 650));
+          node.dispatchEvent(new PointerEvent("pointerup", init));
         });
       } else {
         await row.click({ button: "right" });

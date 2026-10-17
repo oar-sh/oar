@@ -103,38 +103,122 @@ export function openContextMenu(x, y, items, { documentRef = document, windowRef
   return menu;
 }
 
+// After a long press opened its menu on release, the click the release makes
+// must not reach the element underneath (it would open the row). Only that
+// click: the next press ends the guard.
+const RELEASE_CLICK_GUARD_MS = 400;
+
 /**
  * Long-press as the touch equivalent of right-click, on every descendant of
  * `root` that matches `selector`. Android fires no `contextmenu` for a long
  * press on a non-selectable element. Cancelled by movement, so it never fires
  * mid-scroll; mouse pointers are left to the real `contextmenu` event.
  * `handler(target, x, y)`.
+ *
+ * With `lift`, the press lifts the element at the delay instead
+ * (`lift.onLift(target, x, y)`), and what the finger does next decides:
+ * released without moving, the handler runs (the menu opens on release); moved
+ * past the slop, `lift.onMove(target, x, y, event)` is offered the gesture (a
+ * drag) and the press ends here when it returns true. `lift.onEnd(target)`
+ * follows every lift that did not turn into a move. `lift.canLift(target)`
+ * false keeps the plain long press for that press (the handler at the delay,
+ * a move cancels). A browser `contextmenu` during a touch press is swallowed,
+ * so the menu opens once. A page sent to the background ends the press
+ * without a menu.
  */
-export function bindLongPress(root, selector, handler, { setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
+export function bindLongPress(root, selector, handler, {
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+  now = () => Date.now(),
+  lift = null,
+} = {}) {
   let timer = null;
   let startX = 0;
   let startY = 0;
+  let pressed = null;
+  let lifted = false;
+  let swallowClicksUntil = 0;
   const cancel = () => {
     if (timer !== null) clearTimeoutImpl(timer);
     timer = null;
+    const target = pressed;
+    const wasLifted = lifted;
+    pressed = null;
+    lifted = false;
+    if (wasLifted) lift?.onEnd?.(target);
+  };
+  const release = () => {
+    if (!lifted) {
+      cancel();
+      return;
+    }
+    const target = pressed;
+    cancel();
+    swallowClicksUntil = now() + RELEASE_CLICK_GUARD_MS;
+    handler(target, startX, startY);
   };
   root.addEventListener('pointerdown', (event) => {
+    swallowClicksUntil = 0;
     if (event.pointerType === 'mouse') return;
     const target = event.target?.closest?.(selector);
     if (!target || !root.contains(target)) return;
+    cancel();
     startX = event.clientX;
     startY = event.clientY;
-    cancel();
+    pressed = target;
     timer = setTimeoutImpl(() => {
       timer = null;
-      handler(target, startX, startY);
+      if (!lift || lift.canLift?.(pressed) === false) {
+        const firing = pressed;
+        pressed = null;
+        handler(firing, startX, startY);
+        return;
+      }
+      lifted = true;
+      lift.onLift?.(pressed, startX, startY);
     }, LONG_PRESS_MS);
   }, { passive: true });
   root.addEventListener('pointermove', (event) => {
-    if (Math.abs(event.clientX - startX) > LONG_PRESS_SLOP_PX || Math.abs(event.clientY - startY) > LONG_PRESS_SLOP_PX) cancel();
+    if (!pressed) return;
+    if (Math.abs(event.clientX - startX) <= LONG_PRESS_SLOP_PX && Math.abs(event.clientY - startY) <= LONG_PRESS_SLOP_PX) return;
+    if (!lifted) {
+      cancel();
+      return;
+    }
+    // A lifted element moved: a drag, when the owner takes it.
+    const target = pressed;
+    if (lift.onMove?.(target, startX, startY, event) === true) {
+      pressed = null;
+      lifted = false;
+    }
   }, { passive: true });
-  for (const name of ['pointerup', 'pointercancel', 'pointerleave']) {
-    root.addEventListener(name, cancel, { passive: true });
+  if (!lift) {
+    for (const name of ['pointerup', 'pointercancel', 'pointerleave']) {
+      root.addEventListener(name, cancel, { passive: true });
+    }
+    return cancel;
   }
+  root.addEventListener('pointerup', release, { passive: true });
+  // A cancel while lifted (the browser claimed a long press of its own) still
+  // opens the menu: the finger was held without moving.
+  root.addEventListener('pointercancel', release, { passive: true });
+  root.addEventListener('pointerleave', () => {
+    if (!lifted) cancel();
+  }, { passive: true });
+  root.ownerDocument?.addEventListener('visibilitychange', () => {
+    if (root.ownerDocument.hidden) cancel();
+  });
+  root.addEventListener('contextmenu', (event) => {
+    if (!pressed) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+  root.addEventListener('click', (event) => {
+    // A click from the keyboard (Enter, Space) is never the release's.
+    if (event.detail === 0 || now() >= swallowClicksUntil) return;
+    swallowClicksUntil = 0;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
   return cancel;
 }

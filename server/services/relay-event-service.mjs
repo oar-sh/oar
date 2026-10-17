@@ -1701,6 +1701,14 @@ export function createRelayEventService({
     }
   }
 
+  function bootReporting() {
+    try {
+      return tracker?.bootReporting?.() || { active: false, remainingMs: 0 };
+    } catch {
+      return { active: false, remainingMs: 0 };
+    }
+  }
+
   /** Busy for events: a turn other than one answering events, or a running task. */
   function isSessionBusy(conversationId) {
     const view = describe(conversationId);
@@ -1785,6 +1793,15 @@ export function createRelayEventService({
         continue;
       }
       if (busyBySubscription.get(row.id) !== true) continue;
+      // A runtime that only just started may not have heard yet from the
+      // workers that outlived the one before it: a set that looks idle now
+      // is not known to be idle, so the look does not count.
+      const boot = bootReporting();
+      if (boot.active) {
+        idleSinceBySubscription.delete(row.id);
+        scheduleAllIdleCheck(Math.max(1_000, boot.remainingMs));
+        continue;
+      }
       const since = idleSinceBySubscription.get(row.id);
       if (!since) {
         idleSinceBySubscription.set(row.id, at);

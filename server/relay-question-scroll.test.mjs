@@ -21,8 +21,9 @@ test('new relay question cards scroll to their first card only', () => {
     askUserViewSource,
     /el\.scrollTop = Math\.max\(0, Math\.min\(top, el\.scrollHeight - el\.clientHeight\)\);/,
   );
+  // Only for a reader at the end: anyone further up stays where they are.
   assert.match(
     askUserViewSource,
-    /if \(firstNewQuestionId\) \{[\s\S]*?\} else if \(shouldAutoScroll\) \{/,
+    /if \(!shouldAutoScroll\) \{\s*\n\s*el\.scrollTop = previousScrollTop;\s*\n\s*\} else if \(firstNewQuestionId\) \{/,
   );
 });

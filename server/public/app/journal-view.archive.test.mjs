@@ -114,7 +114,7 @@ test('a right-click on a row opens its menu; Archive in it archives the chat', a
   assert.ok(menu, 'menu opened');
   const labels = [...menu.querySelectorAll('.context-menu-item')].map((item) => [item.dataset.menuItem, item.disabled]);
   assert.deepEqual(labels, [
-    ['open', false], ['edit-title', false], ['stop-turn', true], ['kill-session', true], ['archive', false], ['delete', false],
+    ['open', false], ['edit-title', false], ['stop-turn', true], ['kill-session', true], ['group-add', false], ['archive', false], ['delete', false],
   ]);
   menu.querySelector('[data-menu-item="archive"]').click();
   await flush();

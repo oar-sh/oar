@@ -9,7 +9,7 @@ import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 export const MESSAGE_PIN_LIMIT = 100;
 export const PIN_PREVIEW_MAX_LENGTH = 160;
 
-function countAttachments(raw) {
+export function countAttachments(raw) {
   if (Array.isArray(raw)) return raw.length;
   if (typeof raw !== 'string' || !raw) return 0;
   try {

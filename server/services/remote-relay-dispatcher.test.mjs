@@ -228,6 +228,8 @@ function createFakeRemote() {
         }
         const limit = Number(query.limit) || 40;
         const rows = ordered.slice(start, start + limit);
+        // A relay whose cursor row vanished serves that row's group again.
+        if (remote.repeatFirstRow && rows.length) rows.push(rows[0]);
         const last = rows[rows.length - 1];
         return {
           conversations: rows.map((conv) => ({
@@ -243,11 +245,14 @@ function createFakeRemote() {
             ...(conv.origin ? { origin: conv.origin } : {}),
             ...(conv.sessionState ? { sessionState: conv.sessionState } : {}),
             ...(conv.sessionTasks ? { sessionTasks: conv.sessionTasks } : {}),
+            ...(conv.groupId ? { groupId: conv.groupId, groupRole: conv.groupRole || 'member' } : {}),
+            ...(conv.activityAt ? { activityAt: conv.activityAt } : {}),
           })),
           pageInfo: {
             hasMore: start + limit < ordered.length,
             nextCursor: last ? { beforeConversationId: last.id, beforeUpdatedAt: last.updatedAt } : null,
           },
+          ...(remote.groups ? { groups: remote.groups } : {}),
         };
       }
 
@@ -291,6 +296,7 @@ function createFakeRemote() {
             backgroundTasks: conv.backgroundTasks || [],
             ...(conv.sessionState ? { sessionState: conv.sessionState } : {}),
             ...(conv.sessionTasks ? { sessionTasks: conv.sessionTasks } : {}),
+            ...(conv.group ? { group: conv.group } : {}),
             messages: page,
             pageInfo: {
               hasMoreOlder: firstIndex > 0,
@@ -2241,7 +2247,7 @@ test('through the real outbound client: query, path encoding, hop header and a 4
   const missing = await dispatcher.dispatch({ conversationId: 'c-1', action: 'read_session', args: { relay: 'linux-test', session: 'conv/../x' } });
   assert.equal(missing.status, 404);
   assert.equal(missing.body.code, CODES.notFound);
-  assert.equal(requests[1].url, 'https://relay-b.example.test/api/conversation/conv%2F..%2Fx?limit=10');
+  assert.equal(requests[1].url, 'https://relay-b.example.test/api/conversation/conv%2F..%2Fx?limit=10&groupMembers=1');
   assert.ok(!JSON.stringify(missing.body).includes(token));
 });
 
@@ -2709,6 +2715,63 @@ test('list_sessions here says which sessions an agent created, and which of them
   assert.equal('createdBy' in byId['conv-remote'], false);
   assert.equal(byId['conv-remote'].via, 'linux-test');
   assert.equal('createdBy' in byId['conv-human'], false);
+});
+
+test('list_sessions pages by the row\'s sort time and group, and drops a group served again', async () => {
+  const { run, local } = setupLocal();
+  local.groups = { grp_1: { id: 'grp_1', name: null, displayName: 'report builder', parentConversationId: 'c-1', memberCount: 2, liveMemberCount: 2 } };
+  local.addConversation({ id: 'c-1', title: 'report builder', updatedAt: '2026-09-20T10:00:00.000Z', activityAt: '2026-09-20T12:00:00.000Z', groupId: 'grp_1', groupRole: 'head' });
+  local.addConversation({ id: 'conv-kid', title: 'part one', updatedAt: '2026-09-20T12:00:00.000Z', activityAt: '2026-09-20T12:00:00.000Z', groupId: 'grp_1', groupRole: 'member' });
+  local.addConversation({ id: 'conv-human', title: 'part four', updatedAt: '2026-09-20T11:00:00.000Z' });
+  const first = await run('list_sessions', { relay: 'this', scope: 'all', limit: 1 });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.ok(first.body.nextCursor, 'more to come');
+  const second = await run('list_sessions', { relay: 'this', scope: 'all', limit: 1, cursor: first.body.nextCursor });
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  const query = local.callsTo('GET', '/api/conversations').at(-1).query;
+  // The cursor names the row's sort time (its group's), not its own updatedAt, and its group.
+  assert.equal(query.beforeUpdatedAt, '2026-09-20T12:00:00.000Z');
+  assert.equal(query.beforeGroupId, 'grp_1');
+  // A relay that serves a row again (its cursor row vanished, the group came whole) does not list it twice.
+  local.repeatFirstRow = true;
+  const all = await run('list_sessions', { relay: 'this', scope: 'all', limit: 10 });
+  assert.deepEqual(all.body.sessions.map((session) => session.id), ['conv-kid', 'conv-human', 'c-1']);
+});
+
+test('list_sessions and read_session show the session group a session sits in', async () => {
+  const { run, local } = setupLocal();
+  local.groups = { grp_1: { id: 'grp_1', name: null, displayName: 'report builder', parentConversationId: 'c-1', memberCount: 2, liveMemberCount: 2 } };
+  local.addConversation({ id: 'c-1', title: 'report builder', groupId: 'grp_1', groupRole: 'head' });
+  local.addConversation({ id: 'conv-mine', title: 'part one', origin: { relayName: 'win-test', conversationId: 'c-1', local: true }, groupId: 'grp_1', groupRole: 'member' });
+  local.addConversation({ id: 'conv-human', title: 'part four' });
+  const listed = await run('list_sessions', { relay: 'this' });
+  const byId = Object.fromEntries(listed.body.sessions.map((session) => [session.id, session]));
+  assert.deepEqual(byId['c-1'].group, { id: 'grp_1', name: 'report builder', role: 'head' });
+  assert.deepEqual(byId['conv-mine'].group, { id: 'grp_1', name: 'report builder', role: 'member' });
+  assert.equal('group' in byId['conv-human'], false);
+
+  local.conversations.get('conv-mine').group = {
+    id: 'grp_1',
+    name: null,
+    displayName: 'report builder',
+    role: 'member',
+    members: [
+      { id: 'c-1', title: 'report builder', role: 'head', state: 'running_turn', archived: false },
+      { id: 'conv-mine', title: 'part one', role: 'member', state: 'idle', archived: false },
+    ],
+  };
+  const read = await run('read_session', { relay: 'this', session: 'conv-mine' });
+  assert.deepEqual(read.body.session.group, {
+    id: 'grp_1',
+    name: 'report builder',
+    role: 'member',
+    members: [
+      { id: 'c-1', title: 'report builder', role: 'head', state: 'running_turn' },
+      { id: 'conv-mine', title: 'part one', role: 'member', state: 'idle' },
+    ],
+  });
+  const plain = await run('read_session', { relay: 'this', session: 'conv-human' });
+  assert.equal('group' in plain.body.session, false);
 });
 
 test('the rate limit and the loop guard count calls on this relay like any other', async () => {

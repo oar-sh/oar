@@ -297,3 +297,54 @@ test('Windows autostart routes do not expose filesystem error details', async ()
   assert.equal(response.body.error.includes('secret'), false);
   assert.match(response.body.error, /Startup folder/);
 });
+
+test('a customised boot task is passed on to the client as boot mode', async () => {
+  const signin = createSigninServiceDouble();
+  const boot = createBootServiceDouble({ taskStatus: 'ready' });
+  Object.assign(boot.state, { customised: true, customisations: ['boot-delay', 'launcher'], launcherBackupPath: null, readError: null });
+  const { app } = registerAutostartRoutes(signin, boot);
+  const response = await callRoute(app.routes.get('GET /api/settings/windows-autostart'));
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.mode, 'boot');
+  assert.equal(response.body.boot.customised, true);
+  assert.deepEqual(response.body.boot.customisations, ['boot-delay', 'launcher']);
+});
+
+test('a boot task that cannot be read does not fail the setting, and its details stay in the log', async () => {
+  const signin = createSigninServiceDouble({ enabled: true });
+  const boot = createBootServiceDouble();
+  boot.getState = async () => { throw new Error('EACCES: C:\\Users\\secret\\oar'); };
+  const { app } = registerAutostartRoutes(signin, boot);
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (line) => warnings.push(String(line));
+  let response;
+  try {
+    response = await callRoute(app.routes.get('GET /api/settings/windows-autostart'));
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.mode, 'signin');
+  assert.equal(response.body.boot.taskStatus, 'unknown');
+  assert.match(response.body.boot.readError, /could not be read/);
+  assert.equal(JSON.stringify(response.body).includes('secret'), false);
+  assert.ok(warnings.some((line) => line.includes('EACCES')), 'logged server-side');
+});
+
+test('a failed autostart read is logged server-side while the client gets the generic text', async () => {
+  const service = {
+    getState() { throw new Error('EACCES: C:\\Users\\secret\\Startup'); },
+    setEnabled() { throw new Error('unused'); },
+  };
+  const { app } = registerAutostartRoutes(service);
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (line) => warnings.push(String(line));
+  try {
+    await callRoute(app.routes.get('GET /api/settings/windows-autostart'));
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.ok(warnings.some((line) => line.startsWith('[autostart]') && line.includes('EACCES')));
+});

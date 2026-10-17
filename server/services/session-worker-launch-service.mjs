@@ -14,6 +14,12 @@ import {
   isOarMcpServerDisabled,
 } from '../mcp/oar-mcp-server.mjs';
 import { WORKER_LOG_FILE_ENV } from '../../shared/worker-runtime/worker-log-file.mjs';
+import {
+  describeSpawnEnvironment,
+  envPathKey,
+  readEnvValue,
+  windowsCmdPath,
+} from '../../shared/windows-system-tools.mjs';
 
 export { isOarMcpServerDisabled };
 
@@ -41,6 +47,87 @@ function isPidAlive(pidValue) {
 function normalizeText(value) {
   const text = String(value || '').trim();
   return text || null;
+}
+
+// ─── Which Node runs a worker ────────────────────────────────────────────────
+//
+// The relay's own Node by default: its absolute path works whatever PATH the
+// relay was started with. A relay started by the Windows boot task found no
+// `node` on that task's PATH, and every worker launch failed without a trace.
+// COPILOT_WEB_RELAY_NODE still overrides it.
+
+export function resolveWorkerNodeExecutable(env = {}, { execPath = process.execPath } = {}) {
+  return normalizeText(env?.COPILOT_WEB_RELAY_NODE) || execPath;
+}
+
+function pathImplFor(platform) {
+  return platform === 'win32' ? path.win32 : path.posix;
+}
+
+function isPathLike(value) {
+  return /[\\/]/.test(String(value || ''));
+}
+
+/** The folder of the worker's Node when it is a path, else null. */
+export function resolveWorkerNodeDirectory(env = {}, { platform = process.platform, execPath = process.execPath } = {}) {
+  const executable = resolveWorkerNodeExecutable(env, { execPath });
+  const pathImpl = pathImplFor(platform);
+  const candidate = isPathLike(executable) ? executable : execPath;
+  if (!isPathLike(candidate)) return null;
+  return pathImpl.dirname(candidate);
+}
+
+/**
+ * The environment with the worker's Node folder at the END of PATH when it is
+ * not on it yet. The CLIs a worker starts, and the commands its agent runs,
+ * may call a bare `node`; appending only matters when PATH has none, and never
+ * changes which one a PATH that has one picks.
+ */
+export function appendNodeDirectoryToPath(env = {}, nodeDirectory, { platform = process.platform } = {}) {
+  const dir = normalizeText(nodeDirectory);
+  if (!dir) return env;
+  const pathImpl = pathImplFor(platform);
+  const key = envPathKey(env, platform);
+  const current = String(env?.[key] || '');
+  const comparable = (entry) => {
+    const trimmed = String(entry || '').trim().replace(/[\\/]+$/, '');
+    return platform === 'win32' ? trimmed.toLowerCase() : trimmed;
+  };
+  const wanted = comparable(dir);
+  if (current.split(pathImpl.delimiter).some((entry) => comparable(entry) === wanted)) return env;
+  const separator = current && !current.endsWith(pathImpl.delimiter) ? pathImpl.delimiter : '';
+  return { ...env, [key]: `${current}${separator}${dir}` };
+}
+
+/**
+ * Where `command` resolves to with this environment's PATH (and PATHEXT on
+ * Windows), or null. A command with a folder part must be a file.
+ */
+export function locateExecutable(command, {
+  env = {},
+  platform = process.platform,
+  fsImpl = fs,
+} = {}) {
+  const name = String(command || '').trim();
+  if (!name) return null;
+  const pathImpl = pathImplFor(platform);
+  const isFile = (candidate) => {
+    try { return fsImpl.statSync(candidate).isFile(); } catch { return false; }
+  };
+  const extensions = platform === 'win32' && !pathImpl.extname(name)
+    ? (readEnvValue(env, 'PATHEXT') || '.COM;.EXE;.BAT;.CMD').split(';').map((ext) => ext.trim()).filter(Boolean)
+    : [''];
+  const names = extensions.map((ext) => `${name}${ext}`);
+  if (extensions[0] !== '') names.push(name);
+  if (isPathLike(name)) return names.find(isFile) || null;
+  const dirs = readEnvValue(env, 'PATH').split(pathImpl.delimiter).map((dir) => dir.trim()).filter(Boolean);
+  for (const dir of dirs) {
+    for (const candidate of names) {
+      const full = pathImpl.join(dir, candidate);
+      if (isFile(full)) return full;
+    }
+  }
+  return null;
 }
 
 export function resolveOpenAIWireApi(model = '') {
@@ -352,7 +439,7 @@ function resolveNodeWorkerDescriptor(env = {}) {
 function buildPosixWorkerLaunchCommand(targetSessionId, env = {}, extraCliArgs = []) {
   const nodeWorker = resolveNodeWorkerDescriptor(env);
   if (nodeWorker) {
-    const nodeExecutable = normalizeText(env?.COPILOT_WEB_RELAY_NODE) || 'node';
+    const nodeExecutable = resolveWorkerNodeExecutable(env);
     return `${shellQuote(nodeExecutable)} ${shellQuote(nodeWorker.scriptPath)} --session-id ${shellQuote(targetSessionId)}`;
   }
   const cliExecutable = normalizeText(env?.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
@@ -689,7 +776,16 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     if (!value) continue;
     exports.push(`${key}=${shellQuote(value)}`);
   }
-  const prefix = exports.length ? `${exports.map((entry) => `export ${entry};`).join(' ')} ` : '';
+  // `sh -lc` builds PATH from the login profile, not from the relay's; the
+  // relay's Node folder goes at its end when it is not on it (see
+  // appendNodeDirectoryToPath).
+  const statements = exports.map((entry) => `export ${entry};`);
+  const nodeDirectory = resolveWorkerNodeDirectory(launchEnv);
+  if (nodeDirectory) {
+    const quotedDir = shellQuote(nodeDirectory);
+    statements.push(`case ":$PATH:" in *:${quotedDir}:*) ;; *) PATH="$PATH:"${quotedDir};; esac; export PATH;`);
+  }
+  const prefix = statements.length ? `${statements.join(' ')} ` : '';
   const secretPrefix = normalizedSecretEnvFilePath
     ? `. ${shellQuote(normalizedSecretEnvFilePath)} || exit $?; rm -f ${shellQuote(normalizedSecretEnvFilePath)}; rmdir ${shellQuote(path.dirname(normalizedSecretEnvFilePath))}; `
     : '';
@@ -712,6 +808,43 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** How a spawned child ended, filled in as it happens. */
+function watchChildExit(child) {
+  const state = { tracked: typeof child?.on === 'function', exited: false, code: null, signal: null, error: null };
+  if (!state.tracked) return state;
+  try {
+    // A listener also keeps a failed spawn's 'error' from going unhandled.
+    child.on('error', (error) => { state.error = error; });
+    child.on('exit', (code, signal) => {
+      state.exited = true;
+      state.code = code;
+      state.signal = signal;
+    });
+  } catch {
+    state.tracked = false;
+  }
+  return state;
+}
+
+/**
+ * Why `cmd /c start <program>` did not start the worker, or null when nothing
+ * says it failed. Exported for the tests.
+ */
+export function describeWindowsStartFailure(state, { spawnCommand = 'cmd.exe', program = 'node' } = {}) {
+  if (!state?.tracked) return null;
+  if (state.error) {
+    return `worker-spawn-failed: could not run ${spawnCommand} (${state.error.code || state.error.message || 'error'})`;
+  }
+  if (!state.exited) {
+    return `worker-spawn-failed: Windows could not start ${program} (start did not return; it may be showing an error dialog)`;
+  }
+  if (state.code !== 0) {
+    const how = state.code === null || state.code === undefined ? `signal ${state.signal || 'unknown'}` : `exit code ${state.code}`;
+    return `worker-spawn-failed: Windows could not start ${program} (start ended with ${how})`;
+  }
+  return null;
 }
 
 function buildWorkerLaunchEnv({ processCwd, workspaceRoot, env = process.env } = {}) {
@@ -750,6 +883,9 @@ export async function launchSessionCli({
   tmuxPollDelayMs = 200,
   detachedPollAttempts = 10,
   detachedPollDelayMs = 200,
+  // win32: how much longer a `start` still running after the polls gets to
+  // return before the launch counts as failed (a busy boot can be slow).
+  windowsStartGraceMs = 3_000,
   allowProcessReuse = true,
   createSecretEnvFileImpl = createWorkerSecretEnvFile,
   // Extension engine: writes the session's OAR MCP config, returns its path
@@ -761,6 +897,9 @@ export async function launchSessionCli({
   // Told when the process list could not be read (the error); the launch
   // goes on without it.
   onProcessListError = null,
+  // Where a launch that went wrong explains itself (one line per call).
+  log = null,
+  locateExecutableImpl = locateExecutable,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
@@ -809,9 +948,13 @@ export async function launchSessionCli({
     env,
   });
   const launchSessionEnv = {
-    ...launchEnv,
+    ...appendNodeDirectoryToPath(launchEnv, resolveWorkerNodeDirectory(launchEnv, { platform }), { platform }),
     SESSION_ID: target,
   };
+  const explain = (message) => {
+    try { log?.(`worker launcher: session=${target.slice(0, 8)} ${message}`); } catch {}
+  };
+  const spawnEnvironmentText = () => describeSpawnEnvironment(launchSessionEnv, platform);
   // Set per launch below, never inherited: a relay started from inside a
   // worker session would otherwise hand its workers that session's log.
   delete launchSessionEnv[WORKER_LOG_FILE_ENV];
@@ -823,6 +966,17 @@ export async function launchSessionCli({
   // Tells the in-CLI web-relay extension that `preview` is a real tool in this
   // session, so its prompt context need not teach the HTTP fallback.
   if (extensionCliArgs.length) launchSessionEnv.OAR_MCP_SERVER_ATTACHED = '1';
+
+  // A Node that is not there fails loudly here instead of quietly later (on
+  // Windows, `start` shows its error in a dialog no one may be able to see).
+  if (resolveNodeWorkerDescriptor(launchSessionEnv)) {
+    const nodeExecutable = resolveWorkerNodeExecutable(launchSessionEnv);
+    if (!locateExecutableImpl(nodeExecutable, { env: launchSessionEnv, platform })) {
+      const overridden = Boolean(normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_NODE));
+      explain(`cannot start: Node "${nodeExecutable}"${overridden ? ' (COPILOT_WEB_RELAY_NODE)' : ''} was not found; ${spawnEnvironmentText()}`);
+      throw new Error(`worker-node-not-found: ${nodeExecutable}${overridden ? ' (set by COPILOT_WEB_RELAY_NODE)' : ''}`);
+    }
+  }
 
   if (isTmuxAvailable({ platform, execFileSyncImpl })) {
     const sessionName = normalizeTmuxSessionName(target);
@@ -897,14 +1051,20 @@ export async function launchSessionCli({
   }
 
   const nodeWorker = resolveNodeWorkerDescriptor(launchSessionEnv);
-  const nodeWorkerExecutable = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_NODE) || 'node';
+  const nodeWorkerExecutable = resolveWorkerNodeExecutable(launchSessionEnv);
   const posixCliExecutable = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
     || normalizeText(launchSessionEnv.COPILOT_CLI_EXECUTABLE)
     || normalizeText(launchSessionEnv.COPILOT_CLI_PATH)
     || 'copilot';
+  // win32: Node quotes every argument that holds a space or a tab, so
+  // `start "<title>" "C:\Program Files\nodejs\node.exe" ...` reaches cmd.exe
+  // with the title and the path each in one piece; `/s` strips nothing here
+  // because the line after `/c` starts with `start`, not a quote. The title
+  // always holds a space, so `start` never mistakes the program for it.
   const spawnCommand = platform === 'win32'
-    ? (launchSessionEnv.ComSpec || process.env.ComSpec || 'cmd.exe')
+    ? windowsCmdPath({ env: launchSessionEnv })
     : (nodeWorker ? nodeWorkerExecutable : posixCliExecutable);
+  const startedProgram = nodeWorker ? nodeWorkerExecutable : (platform === 'win32' ? 'gh' : posixCliExecutable);
   const spawnArgs = platform === 'win32'
     ? (nodeWorker
       ? [
@@ -964,6 +1124,7 @@ export async function launchSessionCli({
     stdio: detachedStdio,
     windowsHide: platform !== 'win32',
   });
+  const childState = watchChildExit(child);
   child.unref?.();
   if (Array.isArray(detachedStdio) && typeof detachedStdio[1] === 'number') {
     // The child inherited the descriptor; the parent's copy must not leak.
@@ -984,7 +1145,24 @@ export async function launchSessionCli({
           child,
         };
       }
+      if (childState.error || (childState.exited && childState.code !== 0)) break;
     }
+    const graceUntil = Date.now() + Math.max(0, Number(windowsStartGraceMs) || 0);
+    while (childState.tracked && !childState.exited && !childState.error && Date.now() < graceUntil) {
+      await sleep(50);
+    }
+    // `cmd /c start` returns at once when the program started. Still running,
+    // or ended with an error, means it did not: name the program, and log the
+    // command and the PATH it was looked up on.
+    const failure = describeWindowsStartFailure(childState, { spawnCommand, program: startedProgram });
+    if (failure) {
+      if (childState.tracked && !childState.exited) {
+        try { child.kill?.(); } catch {}
+      }
+      explain(`${failure}; command: ${spawnCommand} ${spawnArgs.join(' ')}; ${spawnEnvironmentText()}`);
+      throw new Error(failure);
+    }
+    explain(`no worker process seen after ${attempts} check${attempts === 1 ? '' : 's'}; it may still report in. program: ${startedProgram}; ${spawnEnvironmentText()}`);
     return {
       pid: null,
       reused: false,
@@ -994,7 +1172,13 @@ export async function launchSessionCli({
     };
   }
   const pid = parsePositiveInt(child?.pid);
-  if (!pid) throw new Error('worker-spawn-unhealthy:missing-pid');
+  if (!pid) {
+    // A failed spawn reports its error on the next tick.
+    await new Promise((resolve) => setImmediate(resolve));
+    const reason = childState.error?.code || childState.error?.message || '';
+    explain(`could not start ${spawnCommand}${reason ? ` (${reason})` : ''}; ${spawnEnvironmentText()}`);
+    throw new Error(`worker-spawn-unhealthy:missing-pid${reason ? ` (${spawnCommand}: ${reason})` : ''}`);
+  }
   return {
     pid,
     reused: false,

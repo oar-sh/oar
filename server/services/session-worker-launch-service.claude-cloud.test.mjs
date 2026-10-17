@@ -173,7 +173,7 @@ test('tmux shell command for cloud workers runs node, exports the model and no t
   });
   const workerScript = path.join('/repo', 'server', 'claude-cloud-worker', 'claude-cloud-session-worker.mjs')
     .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  assert.match(command, new RegExp(`exec 'node' '${workerScript}' --session-id 'session-1'$`));
+  assert.match(command, new RegExp(`exec '${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' '${workerScript}' --session-id 'session-1'$`));
   assert.doesNotMatch(command, /script -q/);
   assert.doesNotMatch(command, /--allow-all/);
   assert.match(command, /export COPILOT_WEB_RELAY_WORKER_KIND='claude-cloud';/);
@@ -344,7 +344,7 @@ test('launchSessionCli spawns the cloud worker script, never the Copilot CLI', a
   });
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls.length, 1);
-  assert.equal(spawnCalls[0].command, 'node');
+  assert.equal(spawnCalls[0].command, process.execPath);
   assert.deepEqual(spawnCalls[0].args, [
     path.join('/repo', 'server', 'claude-cloud-worker', 'claude-cloud-session-worker.mjs'),
     '--session-id',

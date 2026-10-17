@@ -170,7 +170,13 @@ async function runCancelRelayShutdown() {
   cancelInFlight = true;
   renderPendingActionBanner();
   try {
-    const result = await cancelRelayRestart();
+    let result = null;
+    try {
+      result = await cancelRelayRestart();
+    } catch (error) {
+      showTransientRelayNotice(`Failed to cancel the queued relay restart: ${error?.message || 'unknown error'}`, 6000);
+      return;
+    }
     if (!result?.ok) {
       showTransientRelayNotice('Failed to cancel the queued relay restart.', 5000);
       return;

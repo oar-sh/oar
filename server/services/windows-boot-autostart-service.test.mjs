@@ -6,7 +6,9 @@ import { EventEmitter } from 'node:events';
 import {
   BOOT_ELEVATION_SCRIPT_FILENAME,
   BOOT_LAUNCHER_FILENAME,
+  BOOT_LAUNCHER_LOG_FILENAME,
   BOOT_TASK_NAME,
+  BOOT_TEMP_WAIT_SECONDS,
   BOOT_TASK_XML_FILENAME,
   LEGACY_BOOT_TASK_NAME,
   buildBootLauncherScript,
@@ -14,7 +16,9 @@ import {
   buildElevationScript,
   classifyTaskXml,
   createWindowsBootAutostartService,
+  describeTaskCustomisations,
   encodeTaskXml,
+  launcherScriptsMatch,
   parseSidFromWhoami,
   parseTaskXml,
 } from './windows-boot-autostart-service.mjs';
@@ -148,6 +152,10 @@ function createFakeFs() {
     files,
     mkdirSync() {},
     existsSync: (p) => files.has(String(p)),
+    readFileSync: (p) => {
+      if (!files.has(String(p))) throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+      return String(files.get(String(p)));
+    },
     writeFileSync: (p, contents) => { files.set(String(p), contents); },
     renameSync: (from, to) => { files.set(String(to), files.get(String(from))); files.delete(String(from)); },
     unlinkSync: (p) => { files.delete(String(p)); },
@@ -182,7 +190,7 @@ function createManualTimers() {
   };
 }
 
-function createHarness({ tasks = {}, whoamiSid = SID } = {}) {
+function createHarness({ tasks = {}, whoamiSid = SID, schtasksStartError = null, logs = [] } = {}) {
   const fsImpl = createFakeFs();
   const timers = createManualTimers();
   const spawns = [];
@@ -201,6 +209,7 @@ function createHarness({ tasks = {}, whoamiSid = SID } = {}) {
           : { code: 1, stdout: '', stderr: 'failed' };
       }
       if (file === 'schtasks' && args[0] === '/query') {
+        if (schtasksStartError) return { code: 1, stdout: '', stderr: '', startError: schtasksStartError };
         const name = args[2];
         const xml = tasks[name];
         return xml != null ? { code: 0, stdout: xml, stderr: '' } : { code: 1, stdout: '', stderr: 'not found' };
@@ -215,9 +224,11 @@ function createHarness({ tasks = {}, whoamiSid = SID } = {}) {
     setTimeoutImpl: timers.setTimeoutImpl,
     clearTimeoutImpl: timers.clearTimeoutImpl,
     now: () => 1_000,
-    logger: { log() {} },
+    logger: { log: (line) => logs.push(line) },
+    // Bare names: nothing here may depend on the machine running the tests.
+    systemToolPath: (name) => name,
   });
-  return { service, fsImpl, timers, spawns, tasks };
+  return { service, fsImpl, timers, spawns, tasks, logs };
 }
 
 test('an unsupported platform reports itself instead of pretending', async () => {
@@ -338,4 +349,163 @@ test('the e2e kill switch blanks the state and refuses mutations', async () => {
   assert.equal(state.legacyTaskPresent, false);
   await assert.rejects(() => service.requestEnable(), /disabled on this relay/);
   await assert.rejects(() => service.requestDisable(), /disabled on this relay/);
+});
+
+// ─── Node on PATH, the TEMP wait ─────────────────────────────────────────────
+
+function launcherLines(options = {}) {
+  return buildBootLauncherScript({
+    packageRoot: PACKAGE_ROOT,
+    nodePath: NODE_PATH,
+    configPath: CONFIG_PATH,
+    workingDirectory: OAR_ROOT,
+    pathImpl: path.win32,
+    ...options,
+  }).split('\r\n');
+}
+
+test('the boot launcher puts the Node folder at the end of PATH, before anything runs', () => {
+  const lines = launcherLines();
+  const pathLine = lines.indexOf('set "PATH=%PATH%;C:\\Users\\dev\\node"');
+  assert.ok(pathLine > 0, 'Node folder appended to PATH');
+  assert.ok(pathLine < lines.findIndex((line) => line.startsWith('cd /d ')));
+  // The relay itself still runs on the absolute path.
+  assert.ok(lines.includes(`"${NODE_PATH}" "${PACKAGE_ROOT}\\server\\server.js"`));
+  assert.ok(!lines.some((line) => line.includes('COPILOT_WEB_RELAY_NODE')));
+});
+
+test('the boot launcher escapes % in the Node folder', () => {
+  const lines = launcherLines({ nodePath: 'C:\\Users\\dev\\100% node\\node.exe' });
+  assert.ok(lines.includes('set "PATH=%PATH%;C:\\Users\\dev\\100%% node"'));
+});
+
+test('the boot launcher waits for %TEMP% before cd and Node, and logs a wait that ran out', () => {
+  const lines = launcherLines();
+  const at = (prefix) => lines.findIndex((line) => line.startsWith(prefix));
+  // No TEMP: no wait at all.
+  assert.ok(lines.includes('if "%TEMP%"=="" goto oar_start'));
+  assert.ok(lines.includes('if exist "%TEMP%\\" goto oar_start'));
+  assert.ok(lines.includes(`if %OAR_TEMP_WAIT% geq ${BOOT_TEMP_WAIT_SECONDS} goto oar_temp_missing`));
+  assert.equal(BOOT_TEMP_WAIT_SECONDS, 120);
+  // About a second a round, by full path (an early boot's PATH may lack System32).
+  assert.ok(lines.includes('"%SystemRoot%\\System32\\ping.exe" -n 2 127.0.0.1 >nul'));
+  const logLine = lines.find((line) => line.startsWith('echo '));
+  assert.ok(logLine.endsWith(`>>"%~dp0${BOOT_LAUNCHER_LOG_FILENAME}"`), 'one line next to the launcher');
+  assert.ok(logLine.includes('"%TEMP%"'));
+  // Generic: no drive letter of any one machine.
+  assert.ok(!lines.some((line) => /\b[A-Z]:\\temp/i.test(line)));
+  // Order: the wait, then (whatever happened) cd and Node; the counter is not
+  // handed on to the relay.
+  assert.ok(at('if "%TEMP%"') < at(':oar_wait_temp'));
+  assert.ok(at(':oar_temp_missing') < at(':oar_start'));
+  assert.equal(lines[at(':oar_start') + 1], 'set "OAR_TEMP_WAIT="');
+  assert.ok(at(':oar_start') < at('cd /d '));
+  assert.ok(at('cd /d ') < at(`"${NODE_PATH}"`));
+});
+
+// ─── Customised task or launcher ─────────────────────────────────────────────
+
+const GENERATED_TASK_XML = buildBootTaskXml({ sid: SID, launcherPath: LAUNCHER, packageRoot: PACKAGE_ROOT, workingDirectory: OAR_ROOT });
+const GENERATED_LAUNCHER = buildBootLauncherScript({
+  packageRoot: PACKAGE_ROOT, nodePath: NODE_PATH, configPath: CONFIG_PATH, workingDirectory: OAR_ROOT, pathImpl: path.win32,
+});
+
+test('a generated task has no customisations; schtasks export noise does not count', () => {
+  assert.deepEqual(describeTaskCustomisations(GENERATED_TASK_XML, { launcherPath: LAUNCHER, workingDirectory: OAR_ROOT }), []);
+  // What Task Scheduler adds on export, and the run level OAR does not set.
+  const exported = GENERATED_TASK_XML
+    .replace('<LogonType>S4U</LogonType>', '<LogonType>S4U</LogonType>\r\n      <RunLevel>HighestAvailable</RunLevel>')
+    .replace('<StartWhenAvailable>', '<Enabled>true</Enabled>\r\n    <StartWhenAvailable>')
+    .replace(`/d /c "${LAUNCHER}"`, `/d /c &quot;${LAUNCHER}&quot;`);
+  assert.deepEqual(describeTaskCustomisations(exported, { launcherPath: LAUNCHER, workingDirectory: OAR_ROOT }), []);
+});
+
+test('a hand-edited task names what differs', () => {
+  const noDelay = GENERATED_TASK_XML.replace('      <Delay>PT30S</Delay>\r\n', '');
+  assert.deepEqual(describeTaskCustomisations(noDelay, { launcherPath: LAUNCHER, workingDirectory: OAR_ROOT }), ['boot-delay']);
+  const otherArgs = GENERATED_TASK_XML.replace(`/d /c "${LAUNCHER}"`, `/c "${LAUNCHER}" extra`);
+  assert.deepEqual(describeTaskCustomisations(otherArgs, { launcherPath: LAUNCHER, workingDirectory: OAR_ROOT }), ['action']);
+  const interactive = GENERATED_TASK_XML.replace('<LogonType>S4U</LogonType>', '<LogonType>InteractiveToken</LogonType>');
+  assert.deepEqual(describeTaskCustomisations(interactive, { launcherPath: LAUNCHER, workingDirectory: OAR_ROOT }), ['logon-type']);
+});
+
+test('launchers compare without regard to line endings or trailing blanks', () => {
+  assert.equal(launcherScriptsMatch(GENERATED_LAUNCHER.replaceAll('\r\n', '\n'), GENERATED_LAUNCHER), true);
+  assert.equal(launcherScriptsMatch(`${GENERATED_LAUNCHER}  \r\n`, GENERATED_LAUNCHER), true);
+  assert.equal(launcherScriptsMatch(GENERATED_LAUNCHER.replace('@echo off', '@echo off\r\nrem mine'), GENERATED_LAUNCHER), false);
+});
+
+test('a task that runs our launcher but differs reads as boot mode, customised, never as a failure', async () => {
+  const harness = createHarness({ tasks: { [BOOT_TASK_NAME]: GENERATED_TASK_XML.replace('      <Delay>PT30S</Delay>\r\n', '') } });
+  harness.fsImpl.files.set(LAUNCHER, GENERATED_LAUNCHER.replace(':oar_start', ':oar_start\r\nrem hand-added'));
+  const state = await harness.service.getState();
+  assert.equal(state.taskStatus, 'ready');
+  assert.equal(state.customised, true);
+  assert.deepEqual(state.customisations, ['boot-delay', 'launcher']);
+  assert.equal(state.readError, null);
+});
+
+test('the generated task and launcher read as not customised; a missing launcher is named', async () => {
+  const harness = createHarness({ tasks: { [BOOT_TASK_NAME]: GENERATED_TASK_XML } });
+  harness.fsImpl.files.set(LAUNCHER, GENERATED_LAUNCHER);
+  const state = await harness.service.getState();
+  assert.equal(state.customised, false);
+  assert.deepEqual(state.customisations, []);
+  harness.fsImpl.files.delete(LAUNCHER);
+  assert.deepEqual((await harness.service.getState()).customisations, ['launcher-missing']);
+});
+
+test('schtasks that cannot run reads as unknown (not missing), logged with the environment', async () => {
+  const harness = createHarness({ schtasksStartError: 'code=ENOENT spawn schtasks ENOENT' });
+  const state = await harness.service.getState();
+  assert.equal(state.taskStatus, 'unknown');
+  assert.match(state.readError, /schtasks could not be run/);
+  assert.ok(!state.readError.includes('ENOENT'), 'the details stay in the log');
+  assert.equal(state.legacyTaskPresent, false);
+  assert.ok(harness.logs.some((line) => line.includes('ENOENT') && line.includes('PATH=')));
+});
+
+test('enabling over a changed launcher keeps it as a .bak and reports where', async () => {
+  const harness = createHarness();
+  const custom = GENERATED_LAUNCHER.replace(':oar_start', ':oar_start\r\nrem hand-added');
+  harness.fsImpl.files.set(LAUNCHER, custom);
+  const state = await harness.service.requestEnable();
+  assert.equal(state.accepted, true);
+  assert.equal(harness.fsImpl.files.get(`${LAUNCHER}.bak`), custom);
+  assert.ok(launcherScriptsMatch(harness.fsImpl.files.get(LAUNCHER), GENERATED_LAUNCHER), 'regenerated');
+  assert.equal(state.launcherBackupPath, `${LAUNCHER}.bak`);
+});
+
+test('enabling over the generated launcher makes no backup', async () => {
+  const harness = createHarness();
+  harness.fsImpl.files.set(LAUNCHER, GENERATED_LAUNCHER);
+  const state = await harness.service.requestEnable();
+  assert.equal(harness.fsImpl.files.has(`${LAUNCHER}.bak`), false);
+  assert.equal(state.launcherBackupPath, null);
+});
+
+test('a launcher that cannot be backed up is not replaced', async () => {
+  const harness = createHarness();
+  const custom = 'rem mine\r\n';
+  harness.fsImpl.files.set(LAUNCHER, custom);
+  const write = harness.fsImpl.writeFileSync;
+  harness.fsImpl.writeFileSync = (p, contents) => {
+    if (String(p).endsWith('.bak')) throw new Error('EACCES');
+    write(p, contents);
+  };
+  const state = await harness.service.requestEnable();
+  assert.equal(state.accepted, false);
+  assert.equal(harness.fsImpl.files.get(LAUNCHER), custom);
+  assert.match(state.lastError, /not replaced/);
+  assert.equal(harness.spawns.length, 0, 'no elevation');
+});
+
+test('the sweep calls schtasks by full path through the call operator', () => {
+  const schtasksPath = 'C:\\Windows\\System32\\schtasks.exe';
+  const enable = buildElevationScript({ action: 'enable', xmlPath: 'C:\\Users\\dev\\task.xml', schtasksPath });
+  for (const line of enable.split('\r\n').filter((l) => l.includes('/tn'))) {
+    assert.ok(line.startsWith(`& "${schtasksPath}" /`), line);
+  }
+  const disable = buildElevationScript({ action: 'disable', schtasksPath });
+  assert.ok(disable.split('\r\n')[0].startsWith(`& "${schtasksPath}" /delete`));
 });

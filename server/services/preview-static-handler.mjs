@@ -72,11 +72,24 @@ export function isDeniedName(fileName) {
   return DENIED_NAME_RE.test(name);
 }
 
+// A path that is not there answers "no"; any other fs error (EACCES, EIO, too
+// many open files, …) may pass, so a caller that would delete something over
+// the answer can tell the two apart.
+const ABSENT_CODES = new Set(['ENOENT', 'ENOTDIR']);
+
+function refusal(error, cause) {
+  const code = toText(cause?.code);
+  return code && !ABSENT_CODES.has(code)
+    ? { ok: false, error: `${error} (${code})`, transient: true }
+    : { ok: false, error };
+}
+
 /**
  * Registration-time jail: resolve `dir` (absolute, or relative to the
  * workspace root), realpath it, and require it to live inside the workspace
  * root's realpath. Returns `{ ok, rootDir }` or `{ ok:false, error }` with a
- * message that names exactly what was refused.
+ * message that names exactly what was refused; `transient: true` marks a
+ * refusal over an fs error other than a missing path.
  */
 export function validateStaticRoot(dir, { workspaceRoot, fsImpl = fs, pathImpl = path } = {}) {
   const dirInput = toText(dir);
@@ -89,22 +102,22 @@ export function validateStaticRoot(dir, { workspaceRoot, fsImpl = fs, pathImpl =
   let workspaceReal;
   try {
     workspaceReal = fsImpl.realpathSync(pathImpl.resolve(workspaceInput));
-  } catch {
-    return { ok: false, error: `Workspace root does not exist: ${workspaceInput}` };
+  } catch (error) {
+    return refusal(`Workspace root does not exist: ${workspaceInput}`, error);
   }
 
   const resolved = pathImpl.resolve(workspaceReal, dirInput);
   let rootReal;
   try {
     rootReal = fsImpl.realpathSync(resolved);
-  } catch {
-    return { ok: false, error: `Directory not found: ${dirInput}` };
+  } catch (error) {
+    return refusal(`Directory not found: ${dirInput}`, error);
   }
   let stats;
   try {
     stats = fsImpl.statSync(rootReal);
-  } catch {
-    return { ok: false, error: `Directory not found: ${dirInput}` };
+  } catch (error) {
+    return refusal(`Directory not found: ${dirInput}`, error);
   }
   if (!stats.isDirectory()) {
     return { ok: false, error: `Not a directory: ${dirInput}` };
@@ -113,6 +126,26 @@ export function validateStaticRoot(dir, { workspaceRoot, fsImpl = fs, pathImpl =
     return { ok: false, error: `dir must live inside the workspace root (${workspaceReal})` };
   }
   return { ok: true, rootDir: rootReal };
+}
+
+/**
+ * validateStaticRoot against several workspace roots: the first that accepts
+ * wins. A transient refusal from any root is returned as such, so the caller
+ * keeps what it would otherwise drop; else the first root's refusal.
+ */
+export function validateStaticRootInAny(dir, workspaceRoots = [], options = {}) {
+  const roots = [...new Set((Array.isArray(workspaceRoots) ? workspaceRoots : [workspaceRoots])
+    .map(toText).filter(Boolean))];
+  if (roots.length === 0) return validateStaticRoot(dir, { ...options, workspaceRoot: '' });
+  let first = null;
+  let transient = null;
+  for (const workspaceRoot of roots) {
+    const checked = validateStaticRoot(dir, { ...options, workspaceRoot });
+    if (checked.ok) return checked;
+    if (checked.transient && !transient) transient = checked;
+    if (!first) first = checked;
+  }
+  return transient || first;
 }
 
 /**

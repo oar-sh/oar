@@ -24,6 +24,7 @@ import {
   normalizeWorkspaceRootKey,
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
+import { createDetachedWorkerWatch } from './services/detached-worker-watch-service.mjs';
 import { applyCdnNoStoreHeaders } from './services/file-serving.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
@@ -45,6 +46,9 @@ import { registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
 import { registerRelayEventRoutes } from './routes/relay-event-routes.mjs';
 import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
+import { createConversationGroupRepository } from './repositories/conversation-group-repository.mjs';
+import { createShareRepository } from './repositories/share-repository.mjs';
+import { registerConversationGroupRoutes } from './routes/conversation-group-routes.mjs';
 import { createRemoteRelayClient } from './services/remote-relay-client.mjs';
 import { createRemoteRelayLoopbackClient } from './services/remote-relay-loopback.mjs';
 import { createRemoteRelayRegistry } from './services/remote-relay-registry-service.mjs';
@@ -69,7 +73,9 @@ import webpush from 'web-push';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
 import { createHostSuspendService } from './services/host-suspend-service.mjs';
 import { USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, createUsageLimitPauseService } from './services/usage-limit-pause-service.mjs';
-import { createSessionActivityTracker } from './services/session-activity-tracker.mjs';
+import { createSessionActivityTracker, resolveBootReportingWindowMs } from './services/session-activity-tracker.mjs';
+import { createBackgroundTaskStore } from './services/background-task-store.mjs';
+import { createBackgroundWorkView } from './services/background-work-view.mjs';
 import { createRelayEventService } from './services/relay-event-service.mjs';
 import { createRelayEventLinkService } from './services/relay-event-link-service.mjs';
 import { buildClaudeAttributionSettings, normalizeClaudeAttributionMode, resolveClaudeAttributionMode, DEFAULT_CLAUDE_ATTRIBUTION_MODE } from '../shared/claude-attribution.mjs';
@@ -78,6 +84,8 @@ import { createGitHubCiActivityService } from './services/github-ci-activity-ser
 import { runHostSuspendToRam } from './services/host-suspend-command.mjs';
 import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
 import { registerPushRoutes } from './routes/push-routes.mjs';
+import { registerAboutRoutes } from './routes/about-routes.mjs';
+import { createAboutService, resolveBuildCommit } from './services/about-service.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
@@ -119,7 +127,16 @@ import {
 } from './services/preview-registry-service.mjs';
 import { createPreviewProxyServer } from './services/preview-proxy-server.mjs';
 import { createPreviewHealthProbe } from './services/preview-health-probe.mjs';
+import { createSqlitePreviewStore, isSameHostBoot, readHostBootId } from './services/preview-store.mjs';
+import { validateStaticRootInAny } from './services/preview-static-handler.mjs';
 import { createTunnelWorkerPathGuard } from './services/tunnel-worker-path-guard.mjs';
+import {
+  createLocalRequestCheck,
+  expressRequestView,
+  isSameOriginRequest,
+  resolveTunnelMarkerHeaders,
+} from './services/request-boundary.mjs';
+import { createRelayAuth } from './services/relay-auth.mjs';
 import { guardUpgradeSocket } from './services/upgrade-socket-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createWindowsBootAutostartService } from './services/windows-boot-autostart-service.mjs';
@@ -154,6 +171,11 @@ import {
   readSubagentRecordRetentionSetting,
 } from '../shared/subagent-record-retention.mjs';
 import { createSubagentRecordRetention } from './services/subagent-record-retention.mjs';
+import {
+  SHARE_PATH_PRIVACY_SETTING_KEY,
+  parseSharePathPrivacyUpdate,
+  readSharePathPrivacySetting,
+} from '../shared/share-path-privacy.mjs';
 import { isRelayShutdownQueued, queuedShutdownCanProceed, relayShutdownGateReply } from './services/relay-shutdown-gate.mjs';
 import { createStaleRecoveryClockGuard } from './services/stale-recovery-clock-guard.mjs';
 import {
@@ -198,6 +220,7 @@ import {
 import { createModelVariantCatalogService } from './services/model-variant-catalog-service.mjs';
 import { applyPwaManifestTheme, normalizePwaTheme } from './services/pwa-manifest-theme.mjs';
 import { mapSubagentRunHeader } from './services/subagent-timeline-service.mjs';
+import { describeExecError, describeSpawnEnvironment, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -215,6 +238,10 @@ const RUNNING_VERSION = (() => {
   }
 })();
 const INSTALL_METHOD = fs.existsSync(path.join(PACKAGE_ROOT, '.git')) ? 'git-checkout' : 'npm-global';
+// When this relay process started, and the commit its code came from (read
+// once: a checkout moved on later still runs the code it started with).
+const RELAY_STARTED_AT = new Date(Date.now() - process.uptime() * 1000).toISOString();
+const BUILD_COMMIT = resolveBuildCommit(PACKAGE_ROOT);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
 const PWA_MANIFEST_PATH = path.join(PUBLIC_DIR, 'manifest.webmanifest');
@@ -2038,6 +2065,35 @@ function setSubagentRecordRetentionDays(value) {
   return { ok: true, retentionDays: parsed.days };
 }
 
+function getSharePathPrivacyMode() {
+  return readSharePathPrivacySetting(readAppSettingValue(SHARE_PATH_PRIVACY_SETTING_KEY));
+}
+
+function setSharePathPrivacyMode(value) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Path privacy settings are unavailable' };
+  }
+  const parsed = parseSharePathPrivacyUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(SHARE_PATH_PRIVACY_SETTING_KEY, parsed.mode, new Date().toISOString());
+  return { ok: true, mode: parsed.mode };
+}
+
+// The relay host's own roots a shared view must not show: home, the relay's
+// checkout, data and upload dirs, the workspace roots it knows, and the OS
+// user name. The share routes add the conversation's own roots.
+function sharePathKnownRoots() {
+  const roots = [REPO_ROOT, DATA_DIR, UPLOAD_DIR, currentWorkspaceRootPath(), INITIAL_WORKSPACE_ROOT];
+  const userNames = [];
+  try { roots.push(os.homedir()); } catch {}
+  try { userNames.push(os.userInfo().username); } catch {}
+  try { roots.push(resolveDefaultSessionWorkspaceRootState()?.path || ''); } catch {}
+  try { roots.push(...listRecentWorkspaceRoots()); } catch {}
+  try { roots.push(resolveSessionStateRoot?.() || ''); } catch {}
+  roots.push(...workspaceRootAllowList);
+  return { roots: roots.filter(Boolean), userNames: userNames.filter(Boolean) };
+}
+
 const PWA_APP_NAME_SETTING_KEY = 'pwa_app_name';
 
 /** '' means "no custom name": the manifest falls back to the template default. */
@@ -2508,7 +2564,7 @@ function runCopilotCliCommand(args = [], timeoutMs = 30_000) {
     if (process.platform === 'win32') {
       const escapedArgs = commandArgs.map((part) => `'${String(part).replace(/'/g, "''")}'`).join(' ');
       const script = escapedArgs ? `& 'copilot' ${escapedArgs}` : "& 'copilot'";
-      execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true, timeout }, (error, stdout, stderr) => {
+      execFile(windowsSystemToolPath('powershell.exe'), ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true, timeout }, (error, stdout, stderr) => {
         if (error) {
           const detail = String(stderr || stdout || error.message || '').trim();
           reject(new Error(detail || error.message || 'copilot command failed'));
@@ -2579,6 +2635,21 @@ const stmts = {
   ...createImageConversationRepository(db),
 };
 const statusEventService = createStatusEventService(db);
+// Public shares and their access log (migration 0016).
+const shareRepository = createShareRepository(db);
+// Session groups in the sidebar (migration 0014). Without the migration it
+// sees no groups and writes nothing. What a delete that did not know groups
+// left behind (a head whose row is gone, a group without a member) is
+// repaired once at boot.
+const conversationGroups = createConversationGroupRepository(db);
+try {
+  const repaired = conversationGroups.repair();
+  if (repaired.headsDetached > 0 || repaired.groupsRemoved > 0) {
+    console.log(`[session-groups] repaired: ${repaired.headsDetached} headless group(s), ${repaired.groupsRemoved} empty group(s) removed`);
+  }
+} catch (error) {
+  console.warn(`[session-groups] repair failed: ${error?.message || error}`);
+}
 // Relay events (built further down, next to the usage-limit pause): declared
 // here so recovery code that runs before then finds null, not a TDZ error.
 let sessionActivityTracker = null;
@@ -2727,7 +2798,7 @@ const imageOperationService = createImageOperationService({
 
 modelVariantCatalog.bindDatabase(db);
 
-const deleteArchiveService = createDeleteArchiveService(db, null, { resolveSessionStateRoot });
+const deleteArchiveService = createDeleteArchiveService(db, null, { resolveSessionStateRoot, conversationGroups });
 void deleteArchiveService.retryPendingDeletesOnStartup()
   .then((result) => {
     if (result?.pendingCount > 0) {
@@ -2955,8 +3026,13 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   }
   // An unreadable process list must not stop every launch on the relay
   // (2026-10-01: a control byte in one command line did, for an hour).
+  // The environment goes with the first report of a launch only; the pid poll
+  // reads the list up to ten more times.
+  let processListEnvironmentLogged = false;
   const warnProcessListUnreadable = (error) => {
-    console.warn(`${runtimeLogPrefix()}worker launcher: process list unreadable, launching session=${normalizedTargetSessionId.slice(0, 8)} without the reuse check: ${error?.message || error}`);
+    const environment = processListEnvironmentLogged ? '' : `; ${describeSpawnEnvironment(process.env)}`;
+    processListEnvironmentLogged = true;
+    console.warn(`${runtimeLogPrefix()}worker launcher: process list unreadable, launching session=${normalizedTargetSessionId.slice(0, 8)} without the reuse check: ${describeExecError(error)}${environment}`);
   };
   if (allowProcessReuse) {
     let liveWorker = null;
@@ -2983,6 +3059,7 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
     processInspector: sessionWorkerProcessInspector,
     allowProcessReuse,
     onProcessListError: warnProcessListUnreadable,
+    log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
   });
   const workerPid = Number.isInteger(Number(launched?.pid)) ? Number(launched.pid) : null;
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
@@ -4372,7 +4449,7 @@ function fetchDriveDirectoryEntries(absoluteDirPath, { includeHidden = false } =
     '$rows | ConvertTo-Json -Depth 4 -Compress',
   ].join(' ');
 
-  execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psScript], { windowsHide: true }, (err, stdout, stderr) => {
+  execFile(windowsSystemToolPath('powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', psScript], { windowsHide: true }, (err, stdout, stderr) => {
     if (err) return cb(new Error(`drive list failed: ${stderr || err.message}`));
     const text = String(stdout || '').trim();
     if (!text) return cb(null, []);
@@ -4965,6 +5042,9 @@ function createCompactedConversation(sourceConversationId) {
     stmts.insertConv.run(targetConversationId, nextTitle, now, now);
     stmts.updateConvSeed.run(summarySeed, 1, sourceConversationId, now, targetConversationId);
     stmts.markConvCompacted.run(targetConversationId, now, sourceConversationId);
+    // The new conversation stays in the old one's session group, and heads
+    // it if the old one did; the archived source stays a member.
+    conversationGroups.carryToCompacted(sourceConversationId, targetConversationId, now);
     targetRuntimeSession = ensureRuntimeSessionBinding(targetConversationId, null, now);
   });
   tx();
@@ -5124,25 +5204,10 @@ function previewCardsForResponse(responseMessageId) {
     .slice(0, 5);
 }
 
-// Live background-task sets per conversation, published by Claude session
-// workers (REPLACE semantics, mirroring the SDK's background_tasks_changed
-// signal). In-memory only: the worker republishes on every change and clears
-// on teardown, so a relay restart simply starts empty until the next update.
-const backgroundTaskStore = {
-  sets: new Map(),
-  replace(conversationId, tasks) {
-    const id = String(conversationId || '').trim();
-    if (!id) return;
-    if (!Array.isArray(tasks) || tasks.length === 0) {
-      this.sets.delete(id);
-      return;
-    }
-    this.sets.set(id, { tasks, updatedAt: Date.now() });
-  },
-  get(conversationId) {
-    return this.sets.get(String(conversationId || '').trim())?.tasks || [];
-  },
-};
+// Live background-task sets, as the session workers publish them. Memory
+// only: after a runtime start the heartbeat's digest brings each set back
+// (services/background-task-store.mjs).
+const backgroundTaskStore = createBackgroundTaskStore();
 
 // ─── Deferred host suspend ───────────────────────────────────────────────────
 // "💤 Suspend host" waits until nothing runs any more: no queued/processing
@@ -5175,6 +5240,17 @@ function hostActivityTitle(conversationId, fallbackTitle = null) {
   const title = String(fallbackTitle || stmts.getConv?.get?.(conversationId)?.title || '').trim();
   return title || String(conversationId || '').slice(0, 8);
 }
+const backgroundWorkView = createBackgroundWorkView({
+  store: backgroundTaskStore,
+  db,
+  getRegistry: () => sessionWorkerRegistry,
+  getTracker: () => sessionActivityTracker,
+  isWorkerAlive: hostActivityWorkerAlive,
+  sessionIdOf: (conversationId) => stmts.getRuntimeSessionByConversation?.get?.(conversationId)?.sdk_session_id,
+  conversationIdOf: (sessionId) => resolveConversationRecord({ conversationId: sessionId, sdkSessionId: sessionId })?.id,
+  providerOf: (conversationId) => stmts.getRuntimeSessionByConversation?.get?.(conversationId)?.provider_type,
+  titleOf: (conversationId) => hostActivityTitle(conversationId),
+});
 function collectHostActivity({ request = null } = {}) {
   const blockers = [];
   const turnsByConversation = stmts.listActiveQueueCountsByConversation?.all?.() || [];
@@ -5198,20 +5274,11 @@ function collectHostActivity({ request = null } = {}) {
         : (count > 1 ? `${count} turns running` : 'turn running'),
     });
   }
-  for (const [key, entry] of backgroundTaskStore.sets) {
-    const tasks = Array.isArray(entry?.tasks) ? entry.tasks : [];
-    if (!tasks.length || !hostActivityWorkerAlive(key)) continue;
-    const worker = sessionWorkerRegistry?.getWorker?.(key) || sessionWorkerRegistry?.getWorkerByConversationId?.(key) || null;
-    const conversationId = String(worker?.conversationId || key);
-    hostSuspendWatchedConversationIds.add(conversationId);
-    const what = tasks.slice(0, 3).map((task) => String(task?.description || task?.taskType || 'task').slice(0, 80)).join('; ');
-    blockers.push({
-      kind: 'background',
-      conversationId,
-      title: hostActivityTitle(conversationId),
-      count: tasks.length,
-      detail: `${tasks.length} background agent${tasks.length === 1 ? '' : 's'}: ${what}`,
-    });
+  // Background work of live workers, and a runtime too young to know of it
+  // (services/background-work-view.mjs).
+  for (const blocker of backgroundWorkView.blockers()) {
+    if (blocker.conversationId) hostSuspendWatchedConversationIds.add(blocker.conversationId);
+    blockers.push(blocker);
   }
   const runningSubagents = Number(stmts.countRunningSubagentRuns?.get?.()?.cnt || 0);
   // CI is only worth a network round-trip for workspaces that were busy since
@@ -5259,6 +5326,10 @@ const usageLimitPauseService = createUsageLimitPauseService({
 sessionActivityTracker = createSessionActivityTracker({
   db,
   onEdge: (edge) => relayEventService?.noteTaskEdge(edge),
+  hasUnreportedBackgroundWork: (conversationId) => backgroundWorkView.hasUnreportedWork(conversationId),
+  listUnreportedBackgroundWork: () => backgroundWorkView.listUnreportedConversationIds(),
+  runListedByWorker: (conversationId, row) => backgroundWorkView.runListed(conversationId, row),
+  bootReportingWindowMs: resolveBootReportingWindowMs(process.env, (line) => console.log(`[activity] ${line}`)),
   logger: console,
 });
 relayEventService = createRelayEventService({
@@ -5804,9 +5875,11 @@ const app        = express();
 // Trust boundary for X-Forwarded-* headers. Default 'loopback' matches the
 // localhost-first deployment (a cloudflared/caddy tunnel runs on the same host
 // and connects over 127.0.0.1), so req.protocol/req.secure/req.ip reflect the
-// real edge only when the immediate peer is trusted — a direct client can no
-// longer forge those headers. Operators behind a remote proxy can widen this
-// via config.trustProxy (e.g. a hop count or subnet).
+// real edge only when the immediate peer is trusted — a direct client cannot
+// forge those headers. Code that needs the client's address, host or scheme
+// reads req.ip / req.protocol / requestHostOf (services/request-boundary.mjs),
+// never the raw X-Forwarded-* headers. Operators behind a remote proxy can
+// widen this via config.trustProxy (e.g. a hop count or subnet).
 app.set('trust proxy', config.trustProxy ?? 'loopback');
 const httpServer = http.createServer(app);
 // Node closes an idle keep-alive connection after 5 s. A client that pools
@@ -5826,15 +5899,23 @@ httpServer.prependListener('upgrade', (req, _socket, _head) => {
 httpServer.prependListener('upgrade', (_req, socket, _head) => {
   guardUpgradeSocket(socket);
 });
+// "Truly local": a loopback peer with no tunnel marker and no forwarding
+// header (services/request-boundary.mjs). The marker headers are `cf-ray`
+// plus config.tunnelMarkerHeaders plus COPILOT_TUNNEL_MARKER_HEADERS, merged:
+// neither source switches the other off.
+const localRequestCheck = createLocalRequestCheck({
+  markerHeaders: resolveTunnelMarkerHeaders(
+    config.tunnelMarkerHeaders,
+    process.env.COPILOT_TUNNEL_MARKER_HEADERS,
+  ),
+});
 // Public tunnels (Cloudflare, or a VPS/Caddy front) forward every path on the
 // bound hostname to this port, including the session-worker WebSocket plumbing.
-// Reject those before auth; local workers connect over 127.0.0.1 with no edge
-// marker header and are unaffected.
+// Reject every worker-path request that is not truly local before auth; local
+// workers connect over 127.0.0.1 without proxy traces and are unaffected.
 const tunnelWorkerPathGuard = createTunnelWorkerPathGuard({
   pathPrefix: remotePath,
-  extraMarkerHeaders: config.tunnelMarkerHeaders
-    || process.env.COPILOT_TUNNEL_MARKER_HEADERS
-    || [],
+  localRequestCheck,
   logger: console,
 });
 httpServer.prependListener('upgrade', (req, socket, _head) => {
@@ -5846,8 +5927,27 @@ httpServer.prependListener('upgrade', (req, socket, _head) => {
 // High-volume stream chunks are emitted volatile and deliberately excluded from
 // the replay buffer; see the io.volatile.emit('relay_stream') call site.
 const SOCKET_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
+// The browser app opens its socket on the page's own origin (same host, the
+// `remotePath` socket.io path), so a handshake from another origin is refused:
+// a page elsewhere must not ride the relay cookie into a live socket. The
+// host compared is the one the client addressed (X-Forwarded-Host only from a
+// trusted proxy); config.allowedOrigins lists extra origins for a proxy that
+// rewrites the Host header. Clients that send no Origin (Node) pass.
+const socketAllowedOrigins = Array.isArray(config.allowedOrigins) ? config.allowedOrigins : [];
+const refusedSocketOrigins = new Set();
 const io         = new Server(httpServer, {
-  cors: { origin: '*' },
+  allowRequest: (req, callback) => {
+    if (isSameOriginRequest(expressRequestView(app, req), { allowedOrigins: socketAllowedOrigins })) {
+      callback(null, true);
+      return;
+    }
+    const origin = String(req.headers?.origin || '').slice(0, 200);
+    if (refusedSocketOrigins.size < 32 && !refusedSocketOrigins.has(origin)) {
+      refusedSocketOrigins.add(origin);
+      console.warn(`[socket] Refused a handshake from origin ${origin} (host ${String(req.headers?.host || '').slice(0, 200)}); list it in allowedOrigins if a proxy rewrites the Host header`);
+    }
+    callback('Origin not allowed', false);
+  },
   path: socketIoPath(),
   connectionStateRecovery: {
     maxDisconnectionDuration: SOCKET_RECOVERY_WINDOW_MS,
@@ -6321,6 +6421,7 @@ function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
   if (runtimeShutdownStarted) return;
   const sid = String(sessionId || '').trim();
   if (!sid) return;
+  detachedWorkerWatch.noteSocketEnded(sid);
   const owned = stmts.listProcessingRowsForOwner?.all?.(sid) || [];
   // A dead worker's steering snapshot must not keep holding the composer even
   // when it owned no rows (the hold can outlive them, e.g. a continuation's).
@@ -6377,6 +6478,64 @@ async function sweepDeadWorkerProcessingRowsOnce() {
   }
   return recovered;
 }
+
+// A worker alive without its socket while a message waits: replaced after a
+// grace time (see the service). Stops the way the kill route does, but only
+// names the registry's pid when the process list confirms it is the
+// session's worker, then spawns the replacement.
+async function replaceDetachedSessionWorker(sid) {
+  const worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
+  const found = process.platform === 'win32'
+    ? await sessionWorkerProcessInspector.findWindowsProcessTreeForSessionAsync(sid, { fresh: true })
+    : await sessionWorkerProcessInspector.findProcessesForSessionAsync(sid, { fresh: true });
+  const foundPids = new Set((found || []).map((entry) => Number(entry?.processId)));
+  const stopped = await stopSessionWorkerProcesses({
+    sdkSessionId: sid,
+    worker: worker && foundPids.has(Number(worker.pid)) ? worker : null,
+    processInspector: sessionWorkerProcessInspector,
+    isPidAliveImpl: isProcessAlive,
+    killTmuxSessionImpl: killTmuxSession,
+  });
+  if (!stopped.ok) return { ok: false, error: stopped.error || 'worker-survived-stop' };
+  sessionWorkerRegistry?.removeWorker?.(sid);
+  sessionWorkerSupervisor?.clearRestartSchedule?.(sid);
+  sessionWorkerSupervisor?.resetHealth?.(sid, { clearFailureCount: false });
+  const launched = await sessionWorkerSupervisor?.ensureWorker?.(sid);
+  return { ok: launched?.ok === true, error: launched?.error || null };
+}
+
+function sessionHasBackgroundWork(sid) {
+  if ((stmts.listRunningBackgroundSubagentRunsForSession?.all?.(sid, sid) || []).length) return true;
+  if (backgroundWorkView.hasUnreportedWork(sid)) return true;
+  const conversationId = resolveConversationRecord({ conversationId: sid, sdkSessionId: sid })?.id || '';
+  if (backgroundTaskStore.get(sid).length || (conversationId && backgroundTaskStore.get(conversationId).length)) return true;
+  return backgroundWorkView.backgroundBlockers()
+    .some((blocker) => blocker.conversationId === sid || (conversationId && blocker.conversationId === conversationId));
+}
+
+const detachedWorkerWatch = createDetachedWorkerWatch({
+  isEnabled: () => featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
+    && !runtimeShutdownStarted
+    && !pendingRelayShutdownRequest,
+  listWaitingSessionIds: () => (stmts.listPendingWorkerOwnerSessionIds?.all?.(25) || [])
+    .map((row) => row?.sdk_session_id),
+  hasWorkerSocket: (sid) => sessionWorkerWebSocketService.hasWorkerSocket(sid) === true,
+  hasRunningTurn: (sid) => (stmts.listProcessingRowsForOwner?.all?.(sid) || []).length > 0,
+  hasBackgroundWork: sessionHasBackgroundWork,
+  isLaunchBlocked: (sid) => sessionWorkerSupervisor?.isKillBlocked?.(sid) === true,
+  getLaunchState: (sid) => {
+    const lifecycle = sessionWorkerSupervisor?.getLifecycleState?.(sid) || null;
+    if (!lifecycle) return null;
+    return {
+      launchMode: lifecycle.launchMode,
+      launchAtMs: lifecycle.launchAt ? Date.parse(lifecycle.launchAt) : null,
+      awaitingHeartbeat: lifecycle.awaitingHeartbeat === true,
+    };
+  },
+  isWorkerProcessAlive: async (sid) => Boolean(await sessionWorkerProcessInspector?.findProcessForSessionAsync?.(sid)),
+  replaceWorker: replaceDetachedSessionWorker,
+  log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
+});
 
 const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   WebSocketServerImpl: WebSocketServer,
@@ -6512,7 +6671,27 @@ app.get(['/shared/:token', '/shared/:token/'], (req, res, next) => {
   try {
     const rawToken = String(req.params?.token || '').trim().toLowerCase();
     const shareToken = /^[a-f0-9]{32,128}$/.test(rawToken) ? rawToken : '';
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    // An unknown, revoked or renewed link is a plain 404: no app shell, and
+    // nothing that tells it apart from a link that never existed.
+    if (!shareToken || !shareRepository.findLiveShare(shareToken)) {
+      res.status(404).type('text/plain').send('Not Found');
+      return;
+    }
     const html = renderIndexHtmlWithPwaVersion({ sharedToken: shareToken });
+    res.type('html').send(html);
+  } catch (error) {
+    next(error);
+  }
+});
+// "Preview as shared": the shared reader for the owner. The page holds
+// nothing of the conversation; its data comes from the owner-only preview route.
+app.get(['/share-preview/:conversationId', '/share-preview/:conversationId/'], (req, res, next) => {
+  try {
+    const conversationId = String(req.params?.conversationId || '').trim();
+    const sharePreviewConversationId = /^[A-Za-z0-9_.:-]{1,200}$/.test(conversationId) ? conversationId : '';
+    const html = renderIndexHtmlWithPwaVersion({ sharePreviewConversationId });
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
     res.type('html').send(html);
@@ -6659,6 +6838,7 @@ const remoteRelayDispatcher = createRemoteRelayDispatcher({
 
 const sharedRouteDeps = {
   auth,
+  isTrulyLocalRequest: localRequestCheck.isTrulyLocal,
   gitChangesService,
   gitRemoteService,
   currentWorkspaceRootPath,
@@ -6778,9 +6958,12 @@ const sharedRouteDeps = {
   inFlightStateForConversation,
   resolveLiveTurnQueueRow,
   backgroundTaskStore,
+  backgroundWorkView,
   // A closure, not the registry itself: this deps object is built before the
   // preview lane is constructed further down the file.
   listConversationPreviews: (conversationId) => previewRegistry.listForConversation(conversationId),
+  closeConversationPreviews: (conversationId) => previewRegistry.closeForConversation(conversationId),
+  listKnownPreviewTokens: () => previewRegistry.knownTokens(),
   sendWorkerControl: (sessionId, control) => sessionWorkerWebSocketService.sendControlToSession(sessionId, control),
   emitToClientsExceptSessionId,
   relayBridgeOwnerService,
@@ -6844,6 +7027,9 @@ const sharedRouteDeps = {
   setTurnCeilingMinutes,
   getSubagentRecordRetentionDays,
   setSubagentRecordRetentionDays,
+  getSharePathPrivacyMode,
+  setSharePathPrivacyMode,
+  sharePathKnownRoots,
   getBackgroundTaskTimeoutMinutes,
   setBackgroundTaskTimeoutMinutes,
   getFeatureFlagsSettingsState,
@@ -6874,9 +7060,12 @@ const sharedRouteDeps = {
   windowsBootAutostartService,
   pushDispatchService,
   remoteRelayInbound,
+  conversationGroups,
+  shareRepository,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
 registerSessionsRoutes(app, sharedRouteDeps);
+registerConversationGroupRoutes(app, sharedRouteDeps);
 registerAskUserRoutes(app, sharedRouteDeps);
 registerRelayBoardRoutes(app, sharedRouteDeps);
 registerCacheRoutes(app, sharedRouteDeps);
@@ -6898,6 +7087,30 @@ registerRelayEventRoutes(app, {
   auth,
   relayEventService,
   remoteRelayInbound,
+});
+registerAboutRoutes(app, {
+  auth,
+  aboutService: createAboutService({
+    db,
+    dbPath: DB_PATH,
+    version: RUNNING_VERSION,
+    commit: BUILD_COMMIT,
+    installMethod: INSTALL_METHOD,
+    startedAt: RELAY_STARTED_AT,
+    packageRoot: PACKAGE_ROOT,
+    getProviderSettings: () => ({
+      github: { enabled: true, engine: getCopilotEngine() },
+      openai: { enabled: getOpenAIProviderSettings()?.enabled === true },
+      claude: { enabled: getClaudeProviderSettings()?.enabled === true },
+      'claude-cloud': { enabled: getClaudeCloudProviderSettings()?.enabled === true },
+      cursor: { enabled: getCursorProviderSettings()?.enabled === true },
+      grok: { enabled: getGrokProviderSettings()?.enabled === true },
+    }),
+    getCachedCliProviders: () => cliInstallService.getCachedStatusSnapshot()?.providers || {},
+    isRelayCliOnline: () => runtimeState.cliOnline === true,
+    listWorkers: () => sessionWorkerRegistry.listWorkers(),
+    getUpdateState: () => buildUpdateStatePayload(),
+  }),
 });
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
   cliLastSeen = null;
@@ -7049,38 +7262,21 @@ function runtimeLogPrefix() {
 }
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
-// Constant-time comparison so the auth token can't be recovered through response
-// timing. The token length is fixed (a UUID), so the length short-circuit leaks
-// nothing secret; any empty/missing value is a non-match.
-function tokensMatch(presented, expected) {
-  const a = Buffer.from(String(presented || ''), 'utf8');
-  const b = Buffer.from(String(expected || ''), 'utf8');
-  if (a.length === 0 || b.length === 0 || a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
-}
+// Token check, wrong-token lockout and the Socket.IO handshake gate live in
+// services/relay-auth.mjs. `auth` stays a hoisted function: the route deps
+// above hand it out before this line runs.
+const relayAuth = createRelayAuth({
+  app,
+  getAuthToken: () => config.authToken,
+  cookieName: AUTH_COOKIE,
+  cookiePath: COOKIE_PATH,
+  parseCookies,
+  appendSetCookie,
+  localRequestCheck,
+  logger: console,
+});
 function auth(req, res, next) {
-  const cookies = parseCookies(req.headers.cookie);
-  // req.secure is derived through the configured `trust proxy` boundary, so a
-  // direct (untrusted) client can no longer force a non-Secure cookie by
-  // omitting X-Forwarded-Proto.
-  const secureAttr = req.secure ? '; Secure' : '';
-  // Note: the token is intentionally NOT read from req.body — a request body is
-  // an easy CSRF/logging vector and has no legitimate use here. Header, query
-  // (first-load bootstrap only), and the HttpOnly cookie remain.
-  const token =
-    (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
-    req.query.token ||
-    cookies[AUTH_COOKIE];
-  if (tokensMatch(token, config.authToken)) {
-    if (res && !tokensMatch(cookies[AUTH_COOKIE], config.authToken)) {
-      appendSetCookie(res, `${AUTH_COOKIE}=${encodeURIComponent(config.authToken)}; Path=${COOKIE_PATH}; Max-Age=2592000; SameSite=Lax; HttpOnly${secureAttr}`);
-    }
-    return next();
-  }
-  if (res && cookies[AUTH_COOKIE]) {
-    appendSetCookie(res, `${AUTH_COOKIE}=; Path=${COOKIE_PATH}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax; HttpOnly${secureAttr}`);
-  }
-  res.status(401).json({ error: 'Unauthorized' });
+  return relayAuth.auth(req, res, next);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -7244,6 +7440,9 @@ relayEventService.start();
 relayEventLinkService.start();
 runtimeTimers.pendingWorkerPrime = setInterval(() => {
   void primePendingSessionWorkers('maintenance');
+  detachedWorkerWatch.sweep().catch((error) => {
+    console.warn(`${runtimeLogPrefix()}WORKER DETACHED sweep failed: ${error?.message || error}`);
+  });
 }, 5_000);
 if (typeof runtimeTimers.pendingWorkerPrime.unref === 'function') runtimeTimers.pendingWorkerPrime.unref();
 
@@ -7284,18 +7483,13 @@ function sanitizeRelayQuestionContext(rawContext) {
 
 
 // ─── Socket.io Auth ───────────────────────────────────────────────────────────
-function socketAuthToken(socket) {
-  const cookies = parseCookies(socket.request.headers.cookie);
-  return socket.handshake.auth?.token || socket.handshake.query?.token || cookies[AUTH_COOKIE];
-}
 // A sub-agent's record goes live only to the pages whose viewer shows it.
 const subagentViewerRooms = createSubagentViewerRooms({
   getRun: (runId) => stmts.getSubagentRun?.get?.(runId) || null,
 });
-io.use((socket, next) => {
-  if (tokensMatch(socketAuthToken(socket), config.authToken)) return next();
-  next(new Error('Unauthorized'));
-});
+// The handshake presents the token as `auth.token` or the cookie; a query
+// `token` is not read (see services/relay-auth.mjs).
+io.use(relayAuth.socketMiddleware);
 
 io.engine.on('initial_headers', (headers, req) => {
   const sessionId = ensureSessionId(req);
@@ -7307,7 +7501,7 @@ io.on('connection', (socket) => {
   // socket bypasses the io.use() token gate above. Re-validate here and drop it
   // on mismatch so a recovered session still requires the auth token (and a
   // rotated token takes effect immediately).
-  if (socket.recovered && !tokensMatch(socketAuthToken(socket), config.authToken)) {
+  if (socket.recovered && !relayAuth.socketTokenValid(socket)) {
     socket.disconnect(true);
     return;
   }
@@ -7378,10 +7572,41 @@ const previewsConfig = normalizePreviewsConfig(config.previews || {}, {
 for (const previewConfigError of previewsConfig.errors) {
   console.warn(`${runtimeLogPrefix()}PREVIEW LANE disabled: ${previewConfigError}`);
 }
+// Static previews are jailed to the conversation's workspace root; a preview
+// registered without a conversation falls back to the server-wide root.
+const resolvePreviewWorkspaceRoot = (conversationId) => {
+  if (String(conversationId || '').trim()) {
+    const state = resolveConversationWorkspaceState({ conversationId });
+    const rootPath = String(state?.currentWorkspaceRootPath || '').trim();
+    if (rootPath) return rootPath;
+  }
+  return currentWorkspaceRootPath();
+};
+// Persisted in the previews table and restored here, each row checked again
+// with the registration rules (see createPreviewRegistry).
 const previewRegistry = createPreviewRegistry({
   config: previewsConfig,
   onChange: ({ previews }) => {
     try { io.emit('previews', { previews }); } catch {}
+  },
+  store: createSqlitePreviewStore(db, { logger: console }),
+  hostBootId: readHostBootId(),
+  isSameHostBoot,
+  checkConversation: (conversationId) => {
+    const row = stmts.getConvAnyStatus.get(conversationId);
+    return !!row && row.status !== 'deleted';
+  },
+  // At boot no worker has reported, so the configured root comes first while
+  // the preview may have been registered under the worker's runtime root:
+  // either of the conversation's roots keeps it.
+  checkStaticRoot: (rootDir, conversationId) => {
+    const state = String(conversationId || '').trim()
+      ? resolveConversationWorkspaceState({ conversationId }) : null;
+    return validateStaticRootInAny(rootDir, [
+      resolvePreviewWorkspaceRoot(conversationId),
+      state?.runtimeWorkspaceRootPath,
+      state?.configuredWorkspaceRootPath,
+    ]);
   },
 });
 const previewProxyServer = createPreviewProxyServer({
@@ -7406,16 +7631,7 @@ registerPreviewRoutes(app, {
   auth,
   previewRegistry,
   previewHealthProbe,
-  // Static previews are jailed to the conversation's workspace root; a preview
-  // registered without a conversation falls back to the server-wide root.
-  resolvePreviewWorkspaceRoot: (conversationId) => {
-    if (String(conversationId || '').trim()) {
-      const state = resolveConversationWorkspaceState({ conversationId });
-      const rootPath = String(state?.currentWorkspaceRootPath || '').trim();
-      if (rootPath) return rootPath;
-    }
-    return currentWorkspaceRootPath();
-  },
+  resolvePreviewWorkspaceRoot,
   // A preview published while a turn is processing gets pinned to that turn's
   // transcript (snapshot, keyed on the queue id and linked to the response at
   // finalize — the relay_activity two-step). No in-flight turn → no card.
@@ -7495,9 +7711,9 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   cloudflaredTunnelManager.stop();
   previewHealthProbe.stop();
   try { remoteRelayRegistry.stopHealthLoop(); } catch {}
-  // Previews are in-memory by design: a restart is the only implicit cleanup,
-  // so every public link dies with the process.
-  previewRegistry.clear();
+  // Previews persist across the restart (the next runtime restores them); only
+  // the throttled last-use times still need writing.
+  previewRegistry.flushHits();
   void previewProxyServer.stop().catch(() => {});
   try { relaySingletonGuard.release(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Failed to release singleton lock: ${error?.message || error}`);

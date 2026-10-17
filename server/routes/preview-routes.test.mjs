@@ -257,3 +257,29 @@ test('a misconfigured lane hands back its interlock errors', async (t) => {
   assert.match(created.body.error, /failed its startup checks/);
   assert.match(created.body.details.join(' '), /different hostname than the relay/);
 });
+
+test('POST for a target this conversation already publishes returns that preview', async (t) => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const pathMod = await import('node:path');
+  const workspace = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'route-static-'));
+  t.after(() => { try { fs.rmSync(workspace, { recursive: true, force: true }); } catch {} });
+  fs.mkdirSync(pathMod.join(workspace, 'dist'));
+
+  const api = await startApi({ workspaceRoot: workspace });
+  t.after(() => api.close());
+
+  const first = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', dir: './dist' } });
+  // Same folder spelled differently: it is the realpath that counts.
+  const again = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', dir: `${workspace}/dist/` } });
+  assert.equal(first.body.existing, false);
+  assert.equal(again.status, 200);
+  assert.equal(again.body.existing, true);
+  assert.equal(again.body.url, first.body.url);
+  assert.equal(api.registry.size, 1);
+
+  const port = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: 5173 } });
+  const portAgain = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: '5173', host: 'localhost' } });
+  assert.equal(portAgain.body.existing, true);
+  assert.equal(portAgain.body.preview.token, port.body.preview.token);
+});

@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { applyBackgroundTasksToConversation, applyFetchedTurnStateToConversation, applyTurnStatusToConversation } from './conversation-turn-state.mjs';
+
 // journal-view.js touches window/document at module scope, so mergeConversationRecord
 // is exercised through its source rather than imported. The behaviour under test is
 // the reconciliation rule, so the function body is extracted and evaluated directly.
@@ -64,4 +66,61 @@ test('the conversation list payload advertises activeTurn', () => {
   );
   assert.match(routes, /activeTurn:\s+activeTurnConversationIds\.has/);
   assert.match(routes, /listConversationIdsWithActiveQueue/);
+});
+
+// The record's turn fields between list fetches (conversation-turn-state.mjs).
+test('a turn that ends clears the running state the list fetch set, for a row that is not open', () => {
+  const conversation = { id: 'conv-a', activeTurn: true, sessionState: 'running_turn' };
+  assert.equal(applyTurnStatusToConversation(conversation, 'done'), true);
+  assert.deepEqual([conversation.activeTurn, conversation.sessionState], [false, 'idle']);
+  for (const status of ['failed', 'dropped', 'cancelled']) {
+    const row = { activeTurn: true, sessionState: 'running_turn' };
+    applyTurnStatusToConversation(row, status);
+    assert.deepEqual([row.activeTurn, row.sessionState], [false, 'idle'], status);
+  }
+});
+
+test('processing and queued statuses mark a turn active; unknown statuses change nothing', () => {
+  const conversation = { id: 'conv-a', activeTurn: false, sessionState: 'idle' };
+  assert.equal(applyTurnStatusToConversation(conversation, 'pending'), true);
+  assert.deepEqual([conversation.activeTurn, conversation.sessionState], [true, 'idle']);
+  assert.equal(applyTurnStatusToConversation(conversation, 'processing'), true);
+  assert.deepEqual([conversation.activeTurn, conversation.sessionState], [true, 'running_turn']);
+  assert.equal(applyTurnStatusToConversation(conversation, 'parked'), false, 'a parked row keeps the running state it had');
+  assert.equal(applyTurnStatusToConversation(conversation, 'mystery'), false);
+  assert.equal(applyTurnStatusToConversation(null, 'done'), false);
+});
+
+test('background work carries the state once the turn is over, and ends it when the set empties', () => {
+  const conversation = { id: 'conv-a', activeTurn: true, sessionState: 'running_turn' };
+  assert.equal(applyBackgroundTasksToConversation(conversation, [{ taskId: 't-1', status: 'running' }, { taskId: 't-2', status: 'completed' }]), true);
+  assert.equal(conversation.backgroundTaskCount, 1);
+  assert.equal(conversation.sessionState, 'running_turn', 'the turn still runs');
+  applyTurnStatusToConversation(conversation, 'done');
+  assert.deepEqual([conversation.activeTurn, conversation.sessionState], [false, 'background_only']);
+  assert.equal(applyBackgroundTasksToConversation(conversation, []), true);
+  assert.deepEqual([conversation.backgroundTaskCount, conversation.sessionState], [0, 'idle']);
+});
+
+test('a fetched payload is the truth: a row fetched while a task runs stays running when its turn then ends', () => {
+  const conversation = { id: 'conv-a' };
+  applyFetchedTurnStateToConversation(conversation, { activeTurn: true, sessionState: 'running_turn', sessionTasks: [{ taskId: 't-1', status: 'running' }, { taskId: 't-0', status: 'completed' }] });
+  assert.deepEqual([conversation.activeTurn, conversation.sessionState, conversation.backgroundTaskCount], [true, 'running_turn', 1]);
+  applyTurnStatusToConversation(conversation, 'done');
+  assert.deepEqual([conversation.activeTurn, conversation.sessionState], [false, 'background_only'], 'the task the fetch reported still runs');
+  // A list row that only names the state counts as one task.
+  const bare = { id: 'conv-b' };
+  applyFetchedTurnStateToConversation(bare, { activeTurn: false, sessionState: 'background_only' });
+  assert.equal(bare.backgroundTaskCount, 1);
+  applyBackgroundTasksToConversation(bare, []);
+  assert.equal(bare.sessionState, 'idle');
+  // A later fetch that says idle overrides what the events left (a reconnect).
+  const stale = { id: 'conv-c', activeTurn: true, sessionState: 'running_turn', backgroundTaskCount: 2 };
+  assert.equal(applyFetchedTurnStateToConversation(stale, { activeTurn: false, sessionState: 'idle' }), true);
+  assert.deepEqual([stale.activeTurn, stale.sessionState, stale.backgroundTaskCount], [false, 'idle', 0]);
+  // The single payload's live set.
+  const single = { id: 'conv-d', sessionState: 'idle', backgroundTaskCount: 0 };
+  applyFetchedTurnStateToConversation(single, { backgroundTasks: [{ taskId: 't-9', status: 'running' }] });
+  assert.deepEqual([single.sessionState, single.backgroundTaskCount], ['background_only', 1]);
+  assert.equal(applyFetchedTurnStateToConversation(single, null), false);
 });

@@ -19,6 +19,7 @@ import {
   refreshWorkspaceRootHints,
 } from './api-client.js';
 import { isSuspendHostActionVisible } from './settings-modal.js';
+import { describeRelayRestartError } from './relay-restart-error.mjs';
 import {
   applyHostSuspendState,
   describeHostSuspendBlocker,
@@ -311,10 +312,17 @@ export async function confirmEmptyQueue() {
   emptyQueueInFlight = true;
   setSummaryModalLoading(true);
   try {
-    const result = await requestQueueEmpty({
-      reason: 'manual-empty-queue',
-      requestedBy: 'localhost-api',
-    });
+    let result = null;
+    try {
+      result = await requestQueueEmpty({
+        reason: 'manual-empty-queue',
+        requestedBy: 'localhost-api',
+      });
+    } catch (error) {
+      closeSummaryModal();
+      alert(`Failed to empty queue: ${error?.message || 'unknown error'}`);
+      return;
+    }
     closeSummaryModal();
     if (!result?.ok) {
       alert('Failed to empty queue');
@@ -334,23 +342,32 @@ export async function confirmEmptyQueue() {
   }
 }
 
+/** A failed restart request: a refusal as an alert, no answer as a notice. */
+export function showRelayRestartRequestError(error) {
+  const { kind, text } = describeRelayRestartError(error);
+  if (kind === 'refused') alert(text);
+  else showTransientRelayNotice(text, 9000);
+}
+
 export async function confirmRestartWebRelay() {
   if (restartRelayInFlight) return;
   restartRelayInFlight = true;
   setSummaryModalLoading(true);
   try {
-    const result = await requestRelayRestart({
-      reason: 'manual-restart',
-      requestedBy: 'localhost-api',
-      restart: true,
-    });
-    closeSummaryModal();
-    // Restart can close the connection before the browser receives JSON.
-    if (!result) {
-      showTransientRelayNotice('Relay restart requested. Connection may briefly drop while it restarts.', 7000);
+    let result = null;
+    try {
+      result = await requestRelayRestart({
+        reason: 'manual-restart',
+        requestedBy: 'localhost-api',
+        restart: true,
+      });
+    } catch (error) {
+      closeSummaryModal();
+      showRelayRestartRequestError(error);
       return;
     }
-    if (!result.ok) {
+    closeSummaryModal();
+    if (!result?.ok) {
       alert('Failed to queue relay restart');
       return;
     }

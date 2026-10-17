@@ -8,6 +8,7 @@ import { Duplex } from 'node:stream';
 import {
   createPreviewRegistry,
   normalizePreviewsConfig,
+  previewLogId,
 } from './preview-registry-service.mjs';
 import {
   createPreviewProxyServer,
@@ -714,4 +715,29 @@ test('start() is a no-op while the lane is disabled', async () => {
   assert.equal(await proxy.start(), null);
   assert.equal(proxy.listening, false);
   await proxy.stop();
+});
+
+test('the hit log line names the preview by a hash, never by its token or query', async (t) => {
+  const upstream = await startUpstream((_req, res) => res.end('ok'));
+  const lines = [];
+  const registry = createPreviewRegistry({ config: previewConfig() });
+  const proxy = createPreviewProxyServer({
+    registry,
+    logger: { log: (line) => lines.push(String(line)), warn() {}, error() {} },
+    relayBearerTokens: ['relay-token'],
+  });
+  const address = await proxy.start();
+  t.after(async () => { await proxy.stop(); await upstream.close(); });
+  const origin = `http://127.0.0.1:${address.port}`;
+
+  const { preview } = registry.create({ port: upstream.port });
+  assert.equal((await fetchLane(origin, `${preview.basePath}docs/page?key=fixture-secret`)).status, 200);
+
+  const hits = lines.filter((line) => line.includes(' GET '));
+  assert.equal(hits.length, 1, lines.join('\n'));
+  assert.equal(hits[0], `[preview] ${previewLogId(preview.token)} → :${upstream.port} GET /docs/page from 127.0.0.1`);
+  for (const line of lines) {
+    assert.ok(!line.includes(preview.token.slice(0, 8)), `a log line carries the token: ${line}`);
+    assert.ok(!line.includes('fixture-secret'));
+  }
 });

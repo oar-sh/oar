@@ -439,3 +439,50 @@ test('all_idle fires under a subscription to all sessions although an old run ro
   assert.ok(message, 'all_idle fired');
   assert.match(message.text, /all_idle: no turn or task is running in any watched session/);
 });
+
+// ─── A relay runtime that starts while workers and their tasks keep running ──
+
+test('no all_idle inside the boot window, and none while a task sent again still runs', () => {
+  const { db, service, tracker, clock } = setup();
+  // The runtime starts under a session with a running turn and a background
+  // shell; of the two it knows only the turn, which is in the database.
+  startTurn(db, BUILDER, 'turn-busy');
+  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['all_idle'] });
+  db.prepare(`UPDATE queue SET status = 'done' WHERE id = 'turn-busy'`).run();
+  service.noteTurnEnd({ conversationId: BUILDER, replyText: 'done' });
+  clock.advance(30_000);
+  assert.equal(eventMessages(db).length, 0, 'idle to the relay, but the workers may not have reported yet');
+  // The worker's set arrives inside the window.
+  tracker.noteTaskSet(BUILDER, [{ taskId: 'task_fixture_shell', taskType: 'local_bash', description: 'npm run soak', startedAt: T0 - 60_000 }], { resync: true });
+  clock.advance(5 * 60_000);
+  assert.equal(eventMessages(db).length, 0, 'the shell is still running');
+  tracker.noteTaskSettled(BUILDER, { taskId: 'task_fixture_shell', status: 'completed' });
+  clock.advance(60_000);
+  assert.match(eventMessages(db)[0].text, /all_idle/);
+});
+
+test('all_idle fires once the boot window is over when nothing was reported', () => {
+  const { db, service, clock } = setup();
+  startTurn(db, BUILDER, 'turn-busy');
+  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['all_idle'] });
+  db.prepare(`UPDATE queue SET status = 'done' WHERE id = 'turn-busy'`).run();
+  service.noteTurnEnd({ conversationId: BUILDER, replyText: 'done' });
+  clock.advance(44_000);
+  assert.equal(eventMessages(db).length, 0);
+  clock.advance(60_000);
+  assert.match(eventMessages(db)[0].text, /all_idle/);
+});
+
+test('a task that ended while the relay was away ends with one event', () => {
+  const { db, service, tracker, clock } = setup();
+  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
+  // The worker's kept settle notice, sent again after the restart, twice.
+  const settle = { taskId: 'task_fixture_shell', status: 'completed', summary: 'exited with 0', description: 'npm run soak', taskType: 'local_bash', startedAt: T0 - 60_000 };
+  tracker.noteTaskSettled(BUILDER, settle);
+  tracker.noteTaskSettled(BUILDER, settle);
+  clock.advance(60_000);
+  const messages = eventMessages(db);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].text.match(/task_finished/g).length, 1);
+  assert.match(messages[0].text, /task_finished "npm run soak" \(shell, exit 0\)/);
+});

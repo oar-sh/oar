@@ -26,14 +26,40 @@ import {
   openSummaryModal,
   closeSummaryModal,
   setSummaryModalLeaveHandler,
+  conversationGroups,
+  mergeConversationGroups,
+  readConversationGroupFoldChoices,
+  pruneConversationGroups,
+  hasSessionWorkerStatus,
+  setConversationGroupFoldChoice,
 } from './store.js';
 import { archiveConfirmationFor } from './archive-confirm.mjs';
+import { arrangeConversationList, conversationGroupPosition } from './conversation-group-order.mjs';
+import { describeDragItems, dropAnnouncement, groupMoveStep } from './conversation-group-drag.mjs';
+import { bindConversationListDrag } from './conversation-list-drag.mjs';
+import { applyFetchedTurnStateToConversation } from './conversation-turn-state.mjs';
+import {
+  groupIsActive,
+  groupSummaryText,
+  memberStateClass,
+  resolveGroupFold,
+  summarizeGroupMembers,
+  toggledGroupFoldChoice,
+} from './conversation-group-state.mjs';
 import {
   loadConversations as loadConversationsApi,
   loadConversation,
   deleteConversation as deleteConversationApi,
   archiveConversation as archiveConversationApi,
   unarchiveConversation as unarchiveConversationApi,
+  createConversationGroup as createConversationGroupApi,
+  renameConversationGroup as renameConversationGroupApi,
+  moveConversationToGroup as moveConversationToGroupApi,
+  placeConversationInGroup as placeConversationInGroupApi,
+  removeConversationFromGroup as removeConversationFromGroupApi,
+  dissolveConversationGroup as dissolveConversationGroupApi,
+  archiveConversationGroup as archiveConversationGroupApi,
+  stopConversationGroup as stopConversationGroupApi,
   bootstrapConversationSession,
   scheduleContextUsageRefresh,
   loadModelCatalog,
@@ -49,10 +75,12 @@ import {
 import { isSetupRequired, updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { SETUP_TEXT } from './no-conversation-state.mjs';
 import { openSettingsModal } from './settings-modal.js';
+import { captureReadingBlock, restoreReadingBlock } from './transcript-viewport-anchor.mjs';
 import { renderMessages, renderNoConversationState, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn } from './conversation-view.js';
 import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
 import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setConversationPins, setPinsConversation } from './pinned-messages-view.mjs';
+import { setConversationHiddenMessages, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
 import { setUsageLimitConversation } from './usage-limit-ui.js';
 import { mergeConversationPreviews } from './preview-cards.mjs';
 import { loadRelayQuestions, getPendingQuestionCountsByConversation } from './ask-user-view.js';
@@ -95,6 +123,7 @@ import { renderConversationOriginMarkerHtml } from './remote-relay-origin-view.m
 import { relayEventWatchedMarkerHtml } from './relay-event-subscriptions-ui.js';
 import {
   normalizeConversationFilter,
+  conversationMatchesFilter,
   filterConversations,
   drainRemainingPages,
   describeFilterMatchCount,
@@ -119,6 +148,15 @@ const CONV_FILTER_DEBOUNCE_MS = 220;
 let processingDotFrame = 0;
 let processingDotTimer = null;
 let lastConvListHtml = '';
+// The list as last rendered, as drag items (conversation-group-drag.mjs).
+let lastConvListDragItems = [];
+// While a row is lifted or dragged the list is not re-rendered: what arrives
+// meanwhile is applied to the records and drawn once the row is let go.
+let convListRenderHeld = false;
+let convListRenderDeferred = false;
+// Groups held open without a stored choice: unfolded by hovering a drag over
+// them, or the target of a drop. Until the page reloads or the user folds them.
+const convListTransientOpenGroups = new Set();
 let conversationListFilterText = '';
 let conversationFilterDrainActive = false;
 let conversationFilterGeneration = 0;
@@ -165,6 +203,8 @@ let newConversationCloudBranchTimer = null;
 let newConversationCloudBranchAutoFill = '';
 const newConversationCloudSuggestActive = { repo: -1, branch: -1 };
 const NEW_CHAT_CLOUD_SUGGEST_BLUR_MS = 150;
+// Rows the fetches since the last page-one refresh brought (refreshLoadedConversations).
+let conversationRowsFetchedSinceRefresh = 0;
 let conversationListBoundaryCheckFrame = 0;
 let conversationListAutoLoadBlockedUntil = 0;
 let conversationListPaginationState = {
@@ -198,6 +238,9 @@ function upsertConversationRecord(record) {
   if (!id) return false;
   const hadExistingRecord = !!conversations[id];
   conversations[id] = mergeConversationRecord(conversations[id], record);
+  // The relay's view of the session (state and live task set) is the truth
+  // whenever a payload arrives; the events move it forward in between.
+  applyFetchedTurnStateToConversation(conversations[id], record);
   return !hadExistingRecord;
 }
 
@@ -238,6 +281,7 @@ const conversationListLoader = createInfiniteLoader({
       archived: conversationListArchivedView ? 'only' : '',
     });
     if (!response) throw new Error('Could not load conversations');
+    mergeConversationGroups(response.groups);
     return {
       items: response.conversations || [],
       hasMore: !!response.pageInfo?.hasMore,
@@ -246,6 +290,7 @@ const conversationListLoader = createInfiniteLoader({
   },
   applyPage: async (page) => {
     applyConversationPage(page.items);
+    conversationRowsFetchedSinceRefresh += Array.isArray(page.items) ? page.items.length : 0;
     conversationListPaginationState.hasLoadedOlderPages = true;
   },
   onError: (error) => {
@@ -275,6 +320,13 @@ function resetConversationListPageState(pageInfo = null, { preserveProgress = fa
   conversationListAutoLoadBlockedUntil = 0;
   conversationListLoader.reset(nextState);
   scheduleConversationListBoundaryCheck();
+}
+
+const LIVE_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
+
+/** A worker entry from the status poll that stands for a live process. */
+function isWorkerStateLive(workerState) {
+  return !!workerState && LIVE_WORKER_STATUSES.has(String(workerState?.status || '').trim().toLowerCase());
 }
 
 function isConversationProcessing(conversation, workerState) {
@@ -340,7 +392,12 @@ export async function refreshConversations(options = {}) {
       if (!knownConversationIds.has(id)) delete conversations[id];
     }
   }
+  mergeConversationGroups(r.groups);
   applyConversationPage(r.conversations || []);
+  conversationRowsFetchedSinceRefresh = Array.isArray(r.conversations) ? r.conversations.length : 0;
+  // A group no loaded row belongs to any more (dissolved, or its rows left)
+  // is forgotten: the picker offers the groups that exist.
+  pruneConversationGroups(Object.values(conversations).map((conversation) => conversation?.groupId));
   resetConversationListPageState(r.pageInfo || null, {
     preserveProgress: preservePagination,
   });
@@ -355,6 +412,116 @@ export async function refreshConversations(options = {}) {
   }
 }
 
+/**
+ * Fetches every loaded page again: page one, then as many older pages as
+ * the list had, so a change on a row far down the list (a group action on
+ * an old chat, a reconnect) shows without a reload. One refresh runs at a
+ * time: a call while one runs marks it to run once more afterwards, so the
+ * last state always lands and two refreshes never interleave their pages.
+ */
+let loadedConversationsRefreshRunning = null;
+let loadedConversationsRefreshAgain = false;
+export function refreshLoadedConversations() {
+  if (loadedConversationsRefreshRunning) {
+    loadedConversationsRefreshAgain = true;
+    return loadedConversationsRefreshRunning;
+  }
+  loadedConversationsRefreshRunning = (async () => {
+    try {
+      do {
+        loadedConversationsRefreshAgain = false;
+        await refreshLoadedConversationsOnce();
+      } while (loadedConversationsRefreshAgain);
+    } finally {
+      loadedConversationsRefreshRunning = null;
+    }
+  })();
+  return loadedConversationsRefreshRunning;
+}
+
+async function refreshLoadedConversationsOnce() {
+  const loadedBefore = Object.values(conversations)
+    .filter((conversation) => (conversation?.archived === true) === conversationListArchivedView).length;
+  // Rows of pages not fetched again stay in the map as they were, so the
+  // pages are counted by what the fetches bring, not by what the map holds.
+  await refreshConversations({ preservePagination: false });
+  let guard = 0;
+  while (conversationRowsFetchedSinceRefresh < loadedBefore && conversationListLoader.getState().hasMore && guard < 50) {
+    guard += 1;
+    const before = conversationRowsFetchedSinceRefresh;
+    await conversationListLoader.loadMore();
+    if (conversationRowsFetchedSinceRefresh === before) break;
+  }
+  pruneConversationGroups(Object.values(conversations).map((conversation) => conversation?.groupId));
+  renderConvList();
+}
+
+// Several events within a moment (a group action touches its members one by
+// one) give one refresh.
+const LOADED_REFRESH_COALESCE_MS = 150;
+let loadedConversationsRefreshTimer = null;
+export function scheduleLoadedConversationsRefresh() {
+  if (loadedConversationsRefreshTimer) return;
+  loadedConversationsRefreshTimer = setTimeout(() => {
+    loadedConversationsRefreshTimer = null;
+    refreshLoadedConversations().catch(() => {});
+  }, LOADED_REFRESH_COALESCE_MS);
+}
+
+/**
+ * A `conversation_group_changed` event. What it carries is applied in
+ * place: the group's summary (or its end) and the named conversations'
+ * membership. A fetch is scheduled only when the event names a conversation
+ * this page has not loaded (it may now belong under a loaded head), or
+ * carries no detail (an older relay).
+ */
+export function applyConversationGroupEvent(payload) {
+  const groupId = String(payload?.groupId || '').trim();
+  const memberships = payload?.memberships && typeof payload.memberships === 'object' ? payload.memberships : null;
+  if (!groupId || !memberships) {
+    scheduleLoadedConversationsRefresh();
+    return 'fetch';
+  }
+  if (payload.group && typeof payload.group === 'object') {
+    mergeConversationGroups({ [groupId]: payload.group });
+  } else {
+    delete conversationGroups[groupId];
+  }
+  let needsFetch = false;
+  for (const [conversationId, membership] of Object.entries(memberships)) {
+    const record = conversations[conversationId];
+    if (!record) {
+      needsFetch = true;
+      continue;
+    }
+    record.groupId = membership?.groupId ? String(membership.groupId) : null;
+    record.groupRole = record.groupId ? (membership?.role === 'head' ? 'head' : 'member') : null;
+    if (!record.groupId) record.groupPosition = null;
+  }
+  applyConversationGroupPositions(payload.positions);
+  pruneConversationGroups(Object.values(conversations).map((conversation) => conversation?.groupId));
+  renderConvList();
+  if (pendingConvRowFlash && Date.now() < pendingConvRowFlash.until && Object.hasOwn(memberships, pendingConvRowFlash.id)) {
+    flashConversationRow(pendingConvRowFlash.id);
+    pendingConvRowFlash = null;
+  }
+  if (needsFetch) scheduleLoadedConversationsRefresh();
+  return needsFetch ? 'fetch' : 'in-place';
+}
+
+/**
+ * The hand order of a group's rows (`{ [conversationId]: number | null }`),
+ * as the relay announces it. An older relay sends none.
+ */
+function applyConversationGroupPositions(positions) {
+  if (!positions || typeof positions !== 'object') return;
+  for (const [conversationId, position] of Object.entries(positions)) {
+    const record = conversations[conversationId];
+    if (!record) continue;
+    record.groupPosition = conversationGroupPosition({ groupPosition: position });
+  }
+}
+
 /** A sidebar row's state: its colour (green is 'ready') and whether its dots run. */
 function conversationRowState(conversation, pendingByConversation = getPendingQuestionCountsByConversation()) {
   const pendingCount = Number(pendingByConversation[conversation?.id] || 0);
@@ -365,21 +532,108 @@ function conversationRowState(conversation, pendingByConversation = getPendingQu
     workerState,
     hasPendingQuestion: pendingCount > 0,
   });
-  return { visualState, processing: isConversationProcessing(conversation, workerState) };
+  const processing = isConversationProcessing(conversation, workerState)
+    || String(conversation?.sessionState || '').trim() === 'running_turn';
+  // Background work lives in the session's worker: once the worker status is
+  // known, a session without a live worker has none, whatever the last
+  // event or fetch said (the worker was killed, or the relay restarted).
+  let sessionState = String(conversation?.sessionState || '').trim();
+  if (sessionState === 'background_only' && hasSessionWorkerStatus() && !isWorkerStateLive(workerState)) sessionState = 'idle';
+  return {
+    visualState,
+    processing,
+    pendingCount,
+    // A turn or background work, whether or not a card waits in it: what
+    // "Stop all running" acts on, and what keeps an archive from it.
+    live: processing || pendingCount > 0 || conversation?.activeTurn === true || sessionState === 'running_turn' || sessionState === 'background_only',
+    // The member class the group's head row sums up (conversation-group-state.mjs).
+    memberState: memberStateClass({
+      pendingCount,
+      visualState,
+      processing,
+      activeTurn: conversation?.activeTurn === true,
+      sessionState,
+    }),
+  };
+}
+
+/** The group's head and its name for the picker and the menus. */
+function groupDisplayName(groupId) {
+  const info = conversationGroups[groupId] || null;
+  const head = info?.parentConversationId ? conversations[info.parentConversationId] : null;
+  return String(info?.name || head?.title || info?.displayName || 'Group').trim() || 'Group';
+}
+
+/** The loaded rows of a group, in the current view and across it. */
+function groupMemberRows(groupId, { inViewOnly = true } = {}) {
+  return Object.values(conversations).filter((conversation) => String(conversation?.groupId || '') === groupId
+    && (!inViewOnly || (conversation?.archived === true) === conversationListArchivedView));
+}
+
+/**
+ * What a head row shows for its group: the classes of every row in it, the
+ * head included (the menu's "Archive group (N)" and "Stop all running (N)"
+ * count the same rows), their summary, and the first row a waiting card
+ * sits in.
+ */
+function describeGroupForHead(group, viewOf) {
+  const rows = group.head ? [group.head, ...group.members] : [...group.members];
+  const states = rows.map((row) => viewOf(row).memberState);
+  const summary = summarizeGroupMembers(states);
+  const firstWaiting = rows.find((row) => viewOf(row).memberState === 'waiting') || null;
+  return { summary, firstWaiting, forcedOpen: false };
 }
 
 export function renderConvList() {
+  if (convListRenderHeld) {
+    convListRenderDeferred = true;
+    return;
+  }
+  paintConvList();
+}
+
+function holdConvListRender(held) {
+  convListRenderHeld = held === true;
+  if (convListRenderHeld || !convListRenderDeferred) return;
+  convListRenderDeferred = false;
+  paintConvList();
+}
+
+function paintConvList() {
   const list = document.getElementById('conv-list');
-  const sorted = Object.values(conversations).sort((a, b) => {
-    const updatedAtDelta = parseTimestampMs(b.updatedAt) - parseTimestampMs(a.updatedAt);
-    if (updatedAtDelta !== 0) return updatedAtDelta;
-    return String(b?.id || '').trim().localeCompare(String(a?.id || '').trim());
-  });
   const activeFilter = normalizeConversationFilter(conversationListFilterText);
   // The live list and the Archived view are two views of the same records.
-  const inView = sorted.filter((conversation) => (conversation?.archived === true) === conversationListArchivedView);
-  const visible = activeFilter ? filterConversations(inView, activeFilter) : inView;
+  const inView = Object.values(conversations).filter((conversation) => (conversation?.archived === true) === conversationListArchivedView);
   const pendingByConversation = getPendingQuestionCountsByConversation();
+  const rowViews = new Map();
+  const viewOf = (conversation) => {
+    const id = String(conversation?.id || '');
+    if (!rowViews.has(id)) rowViews.set(id, conversationRowState(conversation, pendingByConversation));
+    return rowViews.get(id);
+  };
+  const foldChoices = readConversationGroupFoldChoices();
+  const groupDescriptions = new Map();
+  // Groups order with the same rules the list route pages by; a group is
+  // folded once nothing in it runs or waits, unless the user chose otherwise.
+  const items = arrangeConversationList(inView, conversationGroups, {
+    matches: activeFilter ? (row) => conversationMatchesFilter(row, activeFilter) : null,
+    groupNameMatches: activeFilter ? (info) => conversationMatchesFilter({ title: info?.displayName || info?.name }, activeFilter) : null,
+    isOpen: (groupId, group) => {
+      const described = describeGroupForHead(group, viewOf);
+      const holdsOpenConversation = !!currentConvId && group.members.some((row) => row.id === currentConvId);
+      // Open whatever the choice: the fold button then says so and does nothing.
+      described.forcedOpen = holdsOpenConversation || !!activeFilter;
+      groupDescriptions.set(groupId, described);
+      if (convListTransientOpenGroups.has(groupId)) return true;
+      return resolveGroupFold({
+        choice: foldChoices[groupId] || null,
+        active: groupIsActive(described.summary),
+        holdsOpenConversation,
+        filterActive: !!activeFilter,
+      });
+    },
+  });
+  lastConvListDragItems = describeDragItems(items);
   let hasProcessingConversation = false;
   const footerHtml = (() => {
     if (activeFilter) {
@@ -398,7 +652,7 @@ export function renderConvList() {
     }
     return '';
   })();
-  if (visible.length === 0) {
+  if (items.length === 0) {
     ensureProcessingDotTimer(false);
     const emptyText = activeFilter && inView.length > 0
       ? 'No conversations match your filter'
@@ -409,11 +663,31 @@ export function renderConvList() {
     return;
   }
   const conversationView = (conversation) => {
-    const view = conversationRowState(conversation, pendingByConversation);
+    const view = viewOf(conversation);
     if (view.processing) hasProcessingConversation = true;
     return view;
   };
-  const listHtml = `${visible.map((c) => {
+  // The head row's pill: the member count and what the members are doing;
+  // while folded, its "waiting" part opens the member the card sits in.
+  const groupPillHtml = (item) => {
+    const described = groupDescriptions.get(item.group.id) || describeGroupForHead(item.group, viewOf);
+    const text = groupSummaryText(described.summary);
+    if (!text) return '';
+    const waitingId = described.firstWaiting ? String(described.firstWaiting.id) : '';
+    // Inline like the row's own buttons: the row's click handler must not
+    // run (it would open the head and re-render the list first).
+    // The full text is the title: a narrow sidebar shortens the pill with an ellipsis.
+    const title = waitingId ? `${text} · open the session that is waiting for you` : text;
+    return `<span class="conv-group-summary conv-group-summary-${described.summary.strongest}" title="${escHtml(title)}"${waitingId ? ` data-open-waiting="${escHtml(waitingId)}" role="button" tabindex="0" onclick="event.stopPropagation();openConversation('${escHtml(waitingId)}')"` : ''}>${escHtml(text)}</span>`;
+  };
+  const foldButtonHtml = (item) => {
+    const forced = (groupDescriptions.get(item.group.id) || {}).forcedOpen === true || item.group.contextOnly === true || !!activeFilter;
+    const label = forced
+      ? (activeFilter ? 'Open while the filter is on' : 'Open while its chat is open')
+      : (item.group.open ? 'Fold group' : 'Unfold group');
+    return `<button class="conv-group-fold" type="button" data-group-fold="${escHtml(item.group.id)}" aria-expanded="${item.group.open ? 'true' : 'false'}" aria-label="${label}" title="${label}"${forced ? ' disabled' : ''} onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')">${item.group.open ? '▾' : '▸'}</button>`;
+  };
+  const rowHtml = (c, item) => {
     const view = conversationView(c);
     const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
     const providerIndicatorLabel = conversationProviderIndicatorLabel(c);
@@ -423,27 +697,86 @@ export function renderConvList() {
       : '';
     // "↗ win-test": another relay's agent created this conversation.
     // "via agent · “title”": an agent in that conversation on this relay did.
-    const originMarkerHtml = renderConversationOriginMarkerHtml(c, { conversations });
+    // A member under its creator's head row says that already, so it is left out there.
+    const originMarkerHtml = item.kind === 'member' && item.group.head && c.origin?.local === true && c.origin.conversationId === item.group.head.id
+      ? ''
+      : renderConversationOriginMarkerHtml(c, { conversations });
     // "watched": a session another conversation watches by id (relay events).
     const watchedMarkerHtml = relayEventWatchedMarkerHtml(c.id);
+    const groupClass = item.kind === 'head' ? ' conv-group-head' : (item.kind === 'member' ? ' conv-group-member' : '');
+    const groupAttr = item.kind === 'head' || item.kind === 'member' ? ` data-group-id="${escHtml(item.group.id)}"` : '';
+    // A head row shows the name the group was given by hand; until then the
+    // conversation's own title (the group's name follows it).
+    const handName = item.kind === 'head' ? String(item.group.info?.name || '').trim() : '';
+    const rowTitle = handName || c.title;
+    const titleAttr = handName && handName !== c.title ? ` title="${escHtml(`${handName} · ${c.title}`)}"` : '';
     return `
-    <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}" data-conversation-id="${c.id}" onclick="openConversation('${c.id}')">
-      <div class="conv-title">${escHtml(c.title)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${originMarkerHtml}${watchedMarkerHtml}${providerIndicatorHtml}</div>
+    <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}${groupClass}" data-conversation-id="${c.id}"${groupAttr} onclick="openConversation('${c.id}')">
+      <div class="conv-title"${titleAttr}>${item.kind === 'head' ? foldButtonHtml(item) : ''}${escHtml(rowTitle)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${item.kind === 'head' ? groupPillHtml(item) : ''}${originMarkerHtml}${watchedMarkerHtml}${providerIndicatorHtml}</div>
       ${c.archived
         ? `<button class="conv-archive" onclick="unarchiveConv(event,'${c.id}')" title="Unarchive" aria-label="Unarchive">📂</button>`
         : `<button class="conv-archive" onclick="archiveConv(event,'${c.id}')" title="Archive" aria-label="Archive">🗄</button>`}
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
-  }).join('')}${footerHtml}`;
+  };
+  // A group whose head is not in this view (made by hand, or its head is
+  // archived or deleted): a head line of its own, with the name and the pill.
+  const syntheticHeadHtml = (item) => {
+    const name = groupDisplayName(item.group.id);
+    const described = groupDescriptions.get(item.group.id) || describeGroupForHead(item.group, viewOf);
+    return `
+    <div class="conv-item conv-group-head conv-group-synthetic worker-ui-${described.summary.strongest === 'waiting' ? 'question' : 'offline'}" data-group-id="${escHtml(item.group.id)}" onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')">
+      <div class="conv-title">${foldButtonHtml(item)}${escHtml(name)}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">group</span>${groupPillHtml(item)}</div>
+    </div>`;
+  };
+  const listHtml = `${items.map((item) => (item.conversation ? rowHtml(item.conversation, item) : syntheticHeadHtml(item))).join('')}${footerHtml}`;
   if (listHtml !== lastConvListHtml) {
     list.innerHTML = listHtml;
     lastConvListHtml = listHtml;
   }
   bindConversationContextMenu(list);
+  bindConversationGroupControls(list);
   ensureProcessingDotTimer(hasProcessingConversation);
   window.syncChatTitleControls?.();
   scheduleConversationListBoundaryCheck();
+}
+
+/**
+ * Keyboard access to the waiting pill (its click is inline, like the rows'
+ * buttons; the fold is a real button). Bound once on the list.
+ */
+function bindConversationGroupControls(list) {
+  if (!list || list.dataset.groupControlsBound === '1') return;
+  list.dataset.groupControlsBound = '1';
+  list.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const waiting = event.target?.closest?.('[data-open-waiting]');
+    if (!waiting || !list.contains(waiting)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void (window.openConversation || openConversation)(waiting.dataset.openWaiting);
+  });
+}
+
+/**
+ * Folds or unfolds a group; the choice is kept until the user changes it. A
+ * group held open (its chat is open, or a filter is on) keeps its choice.
+ * The fold button keeps the focus across the re-render.
+ */
+export function toggleConversationGroupFold(event, groupId) {
+  event?.stopPropagation?.();
+  event?.preventDefault?.();
+  const id = String(groupId || '').trim();
+  if (!id) return;
+  const button = document.querySelector(`#conv-list [data-group-fold="${CSS.escape(id)}"]`);
+  if (button?.disabled) return;
+  const currentlyOpen = button ? button.getAttribute('aria-expanded') === 'true' : true;
+  convListTransientOpenGroups.delete(id);
+  setConversationGroupFoldChoice(id, toggledGroupFoldChoice(currentlyOpen));
+  renderConvList();
+  document.querySelector(`#conv-list [data-group-fold="${CSS.escape(id)}"]`)?.focus?.({ preventScroll: true });
 }
 
 // keepTranscript: the page shows a window this payload must not replace (the
@@ -481,15 +814,22 @@ export function applyLoadedConversationState(id, response, {
     runtimeWorkspaceRootName: response.runtimeWorkspaceRootName ?? existingConversation.runtimeWorkspaceRootName ?? null,
     currentWorkspaceRootPath: response.currentWorkspaceRootPath ?? existingConversation.currentWorkspaceRootPath ?? null,
     currentWorkspaceRootName: response.currentWorkspaceRootName ?? existingConversation.currentWorkspaceRootName ?? null,
+    // A shared payload has no runtime session, only the provider (null when
+    // none is bound); the shared view keeps an unknown one unknown.
     runtimeProviderType: response.runtimeSession?.providerType
+      ?? response.runtimeProviderType
       ?? existingConversation.runtimeProviderType
-      ?? 'github',
+      ?? (IS_SHARED_VIEW ? null : 'github'),
     runtimeProviderModel: response.runtimeSession?.providerModel
       ?? existingConversation.runtimeProviderModel
       ?? null,
     runtimeModel: response.runtimeSession?.model
       ?? existingConversation.runtimeModel
       ?? null,
+    // The session's state and live tasks, as the single payload reports them.
+    ...(typeof response.activeTurn === 'boolean' ? { activeTurn: response.activeTurn } : {}),
+    ...(response.sessionState ? { sessionState: response.sessionState } : {}),
+    ...(Array.isArray(response.backgroundTasks) ? { backgroundTasks: response.backgroundTasks } : {}),
     sessionUsageSummary: response.sessionUsageSummary ?? existingConversation.sessionUsageSummary ?? null,
     // Claude Cloud only: repository, branch, session link, pushed branches.
     // An explicit null is a real answer ("not a cloud chat"); only a payload
@@ -519,6 +859,9 @@ export function applyLoadedConversationState(id, response, {
   // Absent from an older relay's payload: keep what the socket said.
   if ('pins' in response) setConversationPins(id, response.pins, response.pinsRevision);
   setPinsConversation(id);
+  // Their Hide / Unhide too, from the hidden list (owner payloads only).
+  if ('hiddenMessages' in response) setConversationHiddenMessages(id, response.hiddenMessages, response.hiddenMessagesRevision);
+  setHiddenMessagesConversation(id);
   const didRenderMessages = keepTranscript
     ? false
     : renderMessages(response.messages, !restoreScroll, response);
@@ -639,10 +982,15 @@ export async function openConversation(id, options = {}) {
     return;
   }
   if (r) {
+    // The conversation on screen opened again (a worker bound its session):
+    // its rows are rebuilt under the reader, who keeps the text they are at.
+    const messagesEl = document.getElementById('messages');
+    const reading = !switchingConversation && restoreScroll ? captureReadingBlock(messagesEl) : null;
     // Counted when the window is put on the page, not when it is asked for:
     // a reload of the end that is still on its way must see the change.
     if (forceFreshWindow) noteTranscriptJump();
     applyLoadedConversationState(id, r, { restoreScroll, savedScrollTop });
+    if (reading) restoreReadingBlock(messagesEl, reading);
     if (focusMessageId) {
       requestAnimationFrame(() => {
         focusConversationMessageById(focusMessageId, { behavior: 'smooth', block: 'center' });
@@ -1886,7 +2234,7 @@ function announceConversationFilterResults() {
   if (status.textContent !== text) status.textContent = text;
 }
 
-function setConversationListFilter(text) {
+export function setConversationListFilter(text) {
   const next = String(text ?? '');
   if (next === conversationListFilterText) return;
   conversationListFilterText = next;
@@ -2053,12 +2401,43 @@ function conversationMenuItems(id) {
     if (!isCurrent) await openConversation(id);
     then();
   };
+  const groupId = String(conversation.groupId || '').trim();
+  const groupInfo = groupId ? conversationGroups[groupId] || null : null;
+  const isHead = !!groupId && groupInfo?.parentConversationId === id;
+  // Group entries: a head carries the group's actions; a member can leave or
+  // move, and step up or down the group's order (the keyboard's way to do
+  // what a drag does); an ungrouped conversation can join or start a group.
+  const memberIds = !groupId || isHead
+    ? []
+    : (lastConvListDragItems.find((item) => item.kind === 'head' && item.groupId === groupId)?.memberIds || []);
+  const stepEntries = memberIds.includes(id)
+    ? ['up', 'down'].map((direction) => {
+        const step = groupMoveStep(memberIds, id, direction);
+        return {
+          id: `group-move-${direction}`,
+          label: direction === 'up' ? 'Move up' : 'Move down',
+          disabled: !step,
+          onSelect: () => { if (step) void placeConversationInGroupOrder(id, groupId, step.beforeConversationId); },
+        };
+      })
+    : [];
+  const groupEntries = !groupId
+    ? [{ id: 'group-add', label: 'Add to group…', onSelect: () => { openConversationGroupPicker(id); } }]
+    : [
+        ...(isHead ? groupMenuItems(groupId) : []),
+        ...(isHead ? [MENU_SEPARATOR] : []),
+        ...stepEntries,
+        { id: 'group-move', label: 'Move to another group…', onSelect: () => { openConversationGroupPicker(id); } },
+        { id: 'group-remove', label: 'Remove from group', onSelect: () => { void removeConversationFromGroup(id); } },
+      ];
   return [
     { id: 'open', label: 'Open', onSelect: () => { void openConversation(id); } },
     { id: 'edit-title', label: 'Edit title', onSelect: () => { void openFirst(() => window.openChatTitleEditor?.()); } },
     MENU_SEPARATOR,
     { id: 'stop-turn', label: 'Stop turn', disabled: !running, onSelect: () => { void openFirst(() => openStopTurnConfirmationForConversation(id)); } },
     { id: 'kill-session', label: 'Kill session', disabled: !workerState && !sdkSessionId, onSelect: () => { void openFirst(() => window.openKillSessionConfirmation?.()); } },
+    MENU_SEPARATOR,
+    ...groupEntries,
     MENU_SEPARATOR,
     conversation.archived === true
       ? { id: 'unarchive', label: 'Unarchive', onSelect: () => { void unarchiveConv(null, id); } }
@@ -2067,14 +2446,390 @@ function conversationMenuItems(id) {
   ];
 }
 
-/** Right-click (and long press on touch) on a row opens its menu. Bound once; the list's rows are re-rendered freely. */
+/** The group actions of a head row (live or synthetic): archive, stop, rename, dissolve. */
+function groupMenuItems(groupId) {
+  const id = String(groupId || '').trim();
+  if (!id || !conversationGroups[id]) return [];
+  const pendingByConversation = getPendingQuestionCountsByConversation();
+  const rows = groupMemberRows(id, { inViewOnly: false });
+  const liveRows = rows.filter((row) => row.archived !== true);
+  // What the action stops: every turn and every stoppable background task,
+  // in a member that waits on a card as much as in one that works.
+  const running = liveRows.filter((row) => conversationRowState(row, pendingByConversation).live).length;
+  return [
+    { id: 'group-archive', label: `Archive group (${liveRows.length})`, disabled: !liveRows.length, onSelect: () => { void archiveConversationGroup(id); } },
+    { id: 'group-stop', label: `Stop all running (${running})`, disabled: !running, onSelect: () => { void stopConversationGroup(id); } },
+    { id: 'group-rename', label: 'Rename group', onSelect: () => { openConversationGroupRename(id); } },
+    { id: 'group-dissolve', label: 'Dissolve group', onSelect: () => { void dissolveConversationGroup(id); } },
+  ];
+}
+
+/** Resolves true when the user confirms; Cancel, Escape, the backdrop or × say no. */
+function askConfirmation({ title, subtitle = '', message, detail = '', confirmLabel, kind }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    openSummaryModal({
+      title,
+      subtitle,
+      kind,
+      bodyHtml: `
+        <p>${escHtml(message)}</p>
+        ${detail ? `<p>${escHtml(detail)}</p>` : ''}
+        <div class="summary-modal-actions">
+          <button class="chat-title-action-btn" type="button" data-confirm="1">${escHtml(confirmLabel)}</button>
+          <button class="chat-title-action-btn" type="button" data-cancel="1">Cancel</button>
+        </div>
+      `,
+    });
+    setSummaryModalLeaveHandler(kind, () => settle(false));
+    const body = document.getElementById('summary-modal-body');
+    body?.querySelector('[data-confirm]')?.addEventListener('click', (event) => {
+      event.preventDefault();
+      settle(true);
+      closeSummaryModal();
+    }, { once: true });
+    const cancel = body?.querySelector('[data-cancel]');
+    cancel?.addEventListener('click', (event) => {
+      event.preventDefault();
+      closeSummaryModal();
+    }, { once: true });
+    cancel?.focus?.();
+  });
+}
+
+function groupActionFailed(result, fallback) {
+  showTransientRelayNotice(String(result?.error || result?.message || '').trim() || fallback, 6000);
+}
+
+/** Archive every member that can be archived now; the skipped ones are named. */
+async function archiveConversationGroup(groupId) {
+  closeContextMenu();
+  const name = groupDisplayName(groupId);
+  const liveRows = groupMemberRows(groupId, { inViewOnly: false }).filter((row) => row.archived !== true);
+  const pendingByConversation = getPendingQuestionCountsByConversation();
+  const busy = liveRows.filter((row) => conversationRowState(row, pendingByConversation).live).length;
+  const confirmed = await askConfirmation({
+    title: 'Archive group',
+    subtitle: name,
+    kind: 'group-archive-confirm',
+    message: `Archive the ${liveRows.length} session${liveRows.length === 1 ? '' : 's'} of this group?`,
+    detail: busy
+      ? `${busy} of them ${busy === 1 ? 'is' : 'are'} still working and will stay; stop them first to archive everything.`
+      : 'Archiving stops their idle processes. The chats stay in the Archived view.',
+    confirmLabel: '🗄 Archive group',
+  });
+  if (!confirmed) return;
+  const result = await archiveConversationGroupApi(groupId);
+  if (!result) return;
+  if (result.ok === false) {
+    groupActionFailed(result, 'The group could not be archived.');
+    return;
+  }
+  const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+  for (const id of result.archived || []) if (conversations[id]) conversations[id].archived = true;
+  renderConvList();
+  if (skipped.length) {
+    const names = skipped.map((entry) => `“${String(entry.title || entry.id).trim()}”`).join(', ');
+    showTransientRelayNotice(`${result.archived?.length || 0} archived; still working and kept: ${names}.`, 8000);
+  } else {
+    showTransientRelayNotice(`${result.archived?.length || 0} session${result.archived?.length === 1 ? '' : 's'} archived.`, 4000);
+  }
+  // The relay's conversation_group_changed event applies the change in place.
+}
+
+/** A stop for every member's live turn and stoppable background task. */
+async function stopConversationGroup(groupId) {
+  closeContextMenu();
+  const name = groupDisplayName(groupId);
+  const confirmed = await askConfirmation({
+    title: 'Stop all running',
+    subtitle: name,
+    kind: 'group-stop-confirm',
+    message: 'Stop every running turn and background task in this group?',
+    detail: 'Each session stops at its next safe point; the chats stay where they are.',
+    confirmLabel: '⏹ Stop all',
+  });
+  if (!confirmed) return;
+  const result = await stopConversationGroupApi(groupId);
+  if (!result) return;
+  if (result.ok === false) {
+    groupActionFailed(result, 'The group could not be stopped.');
+    return;
+  }
+  const turns = result.turns?.length || 0;
+  const tasks = result.tasks?.length || 0;
+  const unstoppable = result.unstoppable?.length || 0;
+  const parts = [];
+  if (turns) parts.push(`${turns} turn${turns === 1 ? '' : 's'}`);
+  if (tasks) parts.push(`${tasks} background task${tasks === 1 ? '' : 's'}`);
+  let text = parts.length ? `Stop requested for ${parts.join(' and ')}.` : 'Nothing was running in this group.';
+  if (unstoppable) text += ` ${unstoppable} task${unstoppable === 1 ? ' has' : 's have'} no Stop button; use Kill session there.`;
+  showTransientRelayNotice(text, 6000);
+}
+
+/** Members become ungrouped rows; nothing else changes. */
+async function dissolveConversationGroup(groupId) {
+  closeContextMenu();
+  const confirmed = await askConfirmation({
+    title: 'Dissolve group',
+    subtitle: groupDisplayName(groupId),
+    kind: 'group-dissolve-confirm',
+    message: 'Dissolve this group? Its sessions stay, as single rows.',
+    confirmLabel: 'Dissolve',
+  });
+  if (!confirmed) return;
+  const result = await dissolveConversationGroupApi(groupId);
+  if (!result) return;
+  if (result.ok === false) {
+    groupActionFailed(result, 'The group could not be dissolved.');
+    return;
+  }
+  // The relay's conversation_group_changed event applies the change in place.
+}
+
+async function removeConversationFromGroup(conversationId) {
+  closeContextMenu();
+  const result = await removeConversationFromGroupApi(conversationId);
+  if (!result) return;
+  if (result.ok === false) {
+    groupActionFailed(result, 'The conversation could not leave its group.');
+    return;
+  }
+  // The relay's conversation_group_changed event applies the change in place.
+}
+
+const GROUP_RENAME_KIND = 'group-rename';
+const GROUP_PICKER_KIND = 'group-picker';
+const GROUP_NAME_MAX_LENGTH = 60;
+
+/** A name for the group; empty returns it to the head's title. */
+export function openConversationGroupRename(groupId) {
+  closeContextMenu();
+  const id = String(groupId || '').trim();
+  const info = conversationGroups[id];
+  if (!info) return;
+  openSummaryModal({
+    title: 'Rename group',
+    subtitle: groupDisplayName(id),
+    kind: GROUP_RENAME_KIND,
+    bodyHtml: `
+      <form id="conv-group-rename-form" class="conv-group-form">
+        <input id="conv-group-rename-input" class="conv-group-input" type="text" maxlength="${GROUP_NAME_MAX_LENGTH}" value="${escHtml(info.name || '')}" placeholder="${escHtml(info.parentConversationId ? 'Leave empty to use the head session’s title' : 'Group name')}" autocomplete="off" spellcheck="false" aria-label="Group name">
+        <div class="summary-modal-actions">
+          <button class="chat-title-action-btn" type="submit" data-rename-save="1">Save</button>
+          <button class="chat-title-action-btn" type="button" data-cancel="1">Cancel</button>
+        </div>
+      </form>
+    `,
+  });
+  const body = document.getElementById('summary-modal-body');
+  const form = body?.querySelector('#conv-group-rename-form');
+  const input = body?.querySelector('#conv-group-rename-input');
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = String(input?.value || '').trim();
+    closeSummaryModal();
+    const result = await renameConversationGroupApi(id, name);
+    if (!result) return;
+    if (result.ok === false) {
+      groupActionFailed(result, 'The group could not be renamed.');
+      return;
+    }
+    // The relay's conversation_group_changed event applies the change in place.
+  });
+  body?.querySelector('[data-cancel]')?.addEventListener('click', (event) => {
+    event.preventDefault();
+    closeSummaryModal();
+  }, { once: true });
+  requestAnimationFrame(() => {
+    input?.focus({ preventScroll: true });
+    input?.select?.();
+  });
+}
+
+/**
+ * The groups a conversation can join (the loaded ones, by name, with their
+ * counts) and a new group with a name. Desktop and phone share it; it also
+ * reaches the groups a drag cannot: on another page, or in the other view.
+ */
+export function openConversationGroupPicker(conversationId) {
+  closeContextMenu();
+  const id = String(conversationId || '').trim();
+  const conversation = conversations[id];
+  if (!conversation) return;
+  const currentGroupId = String(conversation.groupId || '').trim();
+  const choices = Object.values(conversationGroups)
+    .map((info) => ({
+      id: info.id,
+      name: groupDisplayName(info.id),
+      count: Number(info.memberCount || groupMemberRows(info.id, { inViewOnly: false }).length || 0),
+      current: info.id === currentGroupId,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const listHtml = choices.length
+    ? choices.map((choice) => `
+        <button class="conv-group-choice" type="button" data-group-choice="${escHtml(choice.id)}"${choice.current ? ' disabled aria-current="true"' : ''}>
+          <span class="conv-group-choice-name">${escHtml(choice.name)}</span>
+          <span class="conv-group-choice-count">${choice.count} session${choice.count === 1 ? '' : 's'}${choice.current ? ' · current' : ''}</span>
+        </button>`).join('')
+    : '<p class="conv-group-picker-empty">No groups yet. Make one below.</p>';
+  openSummaryModal({
+    title: currentGroupId ? 'Move to another group' : 'Add to group',
+    subtitle: String(conversation.title || '').trim(),
+    kind: GROUP_PICKER_KIND,
+    bodyHtml: `
+      <div id="conv-group-picker" class="conv-group-picker">
+        <div class="conv-group-choices">${listHtml}</div>
+        <form id="conv-group-create-form" class="conv-group-form">
+          <label class="conv-group-form-label" for="conv-group-create-input">New group</label>
+          <div class="conv-group-form-row">
+            <input id="conv-group-create-input" class="conv-group-input" type="text" maxlength="${GROUP_NAME_MAX_LENGTH}" placeholder="Group name" autocomplete="off" spellcheck="false" aria-label="New group name">
+            <button class="chat-title-action-btn" type="submit" data-group-create="1">Create</button>
+          </div>
+        </form>
+      </div>
+    `,
+  });
+  const body = document.getElementById('summary-modal-body');
+  body?.querySelector('.conv-group-choices')?.addEventListener('click', async (event) => {
+    const button = event.target?.closest?.('[data-group-choice]');
+    if (!button || button.disabled) return;
+    event.preventDefault();
+    closeSummaryModal();
+    const result = await moveConversationToGroupApi(id, button.dataset.groupChoice);
+    if (!result) return;
+    if (result.ok === false) {
+      groupActionFailed(result, 'The conversation could not join that group.');
+      return;
+    }
+    // The relay's conversation_group_changed event applies the change in place.
+  });
+  const form = body?.querySelector('#conv-group-create-form');
+  const input = body?.querySelector('#conv-group-create-input');
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = String(input?.value || '').trim();
+    closeSummaryModal();
+    const result = await createConversationGroupApi({ name: name || null, conversationIds: [id] });
+    if (!result) return;
+    if (result.ok === false) {
+      groupActionFailed(result, 'The group could not be made.');
+      return;
+    }
+    // The relay's conversation_group_changed event applies the change in place.
+  });
+  requestAnimationFrame(() => {
+    (choices.length ? body?.querySelector('[data-group-choice]:not([disabled])') : input)?.focus?.({ preventScroll: true });
+  });
+}
+
+/** A move inside a group's order from the row menu (Move up / Move down). */
+async function placeConversationInGroupOrder(conversationId, groupId, beforeConversationId) {
+  closeContextMenu();
+  await applyConversationListDrop({ action: 'reorder', groupId, beforeConversationId }, conversationId);
+}
+
+/** Says what a drop did, for a screen reader. */
+function announceConversationList(text) {
+  const region = document.getElementById('conv-list-announce');
+  if (!region || !text) return;
+  // Emptied first so the same sentence twice is announced twice.
+  region.textContent = '';
+  requestAnimationFrame(() => { region.textContent = text; });
+}
+
+const CONV_ROW_FLASH_MS = 1200;
+// The relay's event moves the row; it may arrive after the call's answer, so
+// the row flashes again where the event puts it, for a moment after a drop.
+const CONV_ROW_FLASH_PENDING_MS = 3000;
+let pendingConvRowFlash = null;
+
+/** The moved row, briefly highlighted and brought into view. */
+function flashConversationRow(conversationId) {
+  const row = document.querySelector(`#conv-list .conv-item[data-conversation-id="${CSS.escape(String(conversationId))}"]`);
+  if (!row) return;
+  row.classList.remove('conv-drop-flash');
+  // Restarts the animation on a row that is still flashing.
+  void row.offsetWidth;
+  row.classList.add('conv-drop-flash');
+  setTimeout(() => row.classList.remove('conv-drop-flash'), CONV_ROW_FLASH_MS);
+  row.scrollIntoView?.({ block: 'nearest' });
+}
+
+/**
+ * A drop from the sidebar (conversation-group-drag.mjs), or a step from the
+ * row menu: the relay call, then the row flashed and the move announced. The
+ * records change only by the relay's `conversation_group_changed` event, as
+ * for every group action: an answer that arrives after a newer event must
+ * not undo it. A refusal says why and reloads the list.
+ */
+async function applyConversationListDrop(result, conversationId) {
+  const id = String(conversationId || '').trim();
+  const title = String(conversations[id]?.title || '').trim();
+  const groupName = result.groupId ? groupDisplayName(result.groupId) : '';
+  let response = null;
+  let fallback = '';
+  let announcement = dropAnnouncement(result.action, { title, groupName });
+  if (result.action === 'new-group') {
+    const otherId = String(result.targetConversationId || '').trim();
+    response = await createConversationGroupApi({ name: null, conversationIds: [otherId, id] });
+    fallback = 'The group could not be made.';
+    // Shown open, though nothing in it runs (which would fold it).
+    if (response && response.ok !== false && response.group?.id) convListTransientOpenGroups.add(String(response.group.id));
+    announcement = dropAnnouncement('new-group', { title, otherTitle: conversations[otherId]?.title });
+  } else if (result.action === 'leave') {
+    response = await removeConversationFromGroupApi(id);
+    fallback = 'The conversation could not leave its group.';
+  } else if (result.action === 'reorder' || result.action === 'join') {
+    response = await placeConversationInGroupApi(id, { groupId: result.groupId, beforeConversationId: result.beforeConversationId ?? null });
+    fallback = result.action === 'join' ? 'The conversation could not join that group.' : 'The conversation could not be moved.';
+    if (response && response.ok !== false) convListTransientOpenGroups.add(result.groupId);
+  } else {
+    return;
+  }
+  if (!response || response.ok === false) {
+    if (response) groupActionFailed(response, fallback);
+    scheduleLoadedConversationsRefresh();
+    return;
+  }
+  renderConvList();
+  flashConversationRow(id);
+  pendingConvRowFlash = { id, until: Date.now() + CONV_ROW_FLASH_PENDING_MS };
+  announceConversationList(announcement);
+}
+
+/**
+ * Right-click (and long press on touch) on a row opens its menu; a mouse
+ * drag, or a long press that moves, drags it. Bound once; the list's rows
+ * are re-rendered freely.
+ */
 function bindConversationContextMenu(list) {
   if (!list || list.dataset.contextMenuBound === '1') return;
   list.dataset.contextMenuBound = '1';
+  // Rows move only where their place means something: not in the Archived
+  // view and not under a title filter (the menu entries still work there).
+  const drag = bindConversationListDrag(list, {
+    isEnabled: () => !IS_SHARED_VIEW && !conversationListArchivedView && !normalizeConversationFilter(conversationListFilterText),
+    describeItems: () => lastConvListDragItems,
+    onHold: (held) => holdConvListRender(held),
+    rerender: () => paintConvList(),
+    setDragOpen: (groupId, open) => {
+      if (open) convListTransientOpenGroups.add(groupId);
+      else convListTransientOpenGroups.delete(groupId);
+    },
+    onDrop: (result, conversationId) => { void applyConversationListDrop(result, conversationId); },
+  });
   const openFor = (row, x, y) => {
     const id = String(row?.dataset?.conversationId || '').trim();
-    if (!id) return;
-    const items = conversationMenuItems(id);
+    // A synthetic head row stands for its group: the group's actions only.
+    const items = id
+      ? conversationMenuItems(id)
+      : (row?.classList?.contains('conv-group-synthetic') ? groupMenuItems(row.dataset.groupId) : []);
     if (items.length) openContextMenu(x, y, items);
   };
   list.addEventListener('contextmenu', (event) => {
@@ -2083,7 +2838,17 @@ function bindConversationContextMenu(list) {
     event.preventDefault();
     openFor(row, event.clientX, event.clientY);
   });
-  bindLongPress(list, '.conv-item', (row, x, y) => openFor(row, x, y));
+  // A long press lifts the row: released in place it opens the menu, moved
+  // it becomes a drag. Where rows cannot move (a synthetic head, the
+  // Archived view, a filter) it opens the menu at the delay, as it always did.
+  bindLongPress(list, '.conv-item', (row, x, y) => openFor(row, x, y), {
+    lift: {
+      canLift: (row) => drag.canLift(row),
+      onLift: (row) => drag.lift(row),
+      onMove: (row, x, y, event) => drag.beginTouchDrag(row, x, y, event),
+      onEnd: () => drag.unlift(),
+    },
+  });
 }
 
 export async function deleteConv(e, id) {

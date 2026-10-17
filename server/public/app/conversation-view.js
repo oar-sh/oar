@@ -23,7 +23,6 @@ import {
   updateWorkspaceRootHints,
   applyContextUsageBar,
   scrollBottom,
-  scrollBottomAfterSend,
   isMobileComposerViewport,
   releaseComposerFocusAfterSend,
   autoResize,
@@ -47,9 +46,6 @@ import {
   getSessionWorkerState,
   openSummaryModal,
   closeSummaryModal,
-  parseTimestampMs,
-  relayQuestions,
-  relayBoards,
   toggleSidebar,
 } from './store.js';
 import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
@@ -62,6 +58,7 @@ import { buildWorkflowRunCard } from './background-tasks-view.mjs';
 import { mergeLiveSubagentRun, subagentRowsMarkup } from './subagent-row.mjs';
 import { rememberSubagentRuns, syncSubagentRowClock } from './subagent-viewer.mjs';
 import { isMessagePinned, toggleMessagePin } from './pinned-messages-view.mjs';
+import { isMessageHiddenFromShares, setConversationHiddenMessages } from './hidden-messages-view.mjs';
 import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
 import { buildTranscriptPreviewCard } from './preview-cards.mjs';
 import { closeSlashAutocomplete, handleSlashAutocompleteKey, updateSlashAutocomplete } from './slash-autocomplete.mjs';
@@ -71,7 +68,6 @@ import { isRelayEventMessage, renderRelayEventRowHtml } from './relay-event-view
 import {
   AGENT_EXCHANGE_CLOSED_CLASS,
   AGENT_EXCHANGE_HEAD_CLASS,
-  AGENT_EXCHANGE_MEMBER_CLASS,
   agentExchangeFoldOpen,
   agentExchangeRowOf,
   agentExchangeSummary,
@@ -135,6 +131,7 @@ import {
   shouldApplyIncomingDraftToComposer,
 } from './conversation-draft-sync.mjs';
 import { isChatInteractionHeld, selectionIntersectsNode } from './selection-guard.mjs';
+import { captureReadingBlock, restoreReadingBlock } from './transcript-viewport-anchor.mjs';
 import {
   applyThinkingFollow,
   getThinkingFollowMode,
@@ -145,6 +142,7 @@ import {
   toggleThinkingFollowMode,
   unobserveThinkingBubble,
 } from './thinking-follow.js';
+import { beginOwnSend, followsTranscriptEnd, nameOwnSendConversation, ownSendFollows, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
 import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
 import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
@@ -1289,38 +1287,20 @@ function createRelayEventNode(msg, msgId) {
   return div;
 }
 
-// Agent exchanges (agent-exchange-fold-view.mjs): an agent's prompt and this
-// session's reply fold into one row. What the fold pass needs of a message is
-// kept on its node when the row is built, so the pass reads the transcript
-// itself and not the payload it came from.
+// Agent exchanges (agent-exchange-fold-view.mjs): an agent's prompt folds
+// into one row; this session's reply to it always shows. What the fold pass
+// needs of a message is kept on its node when the row is built, so the pass
+// reads the transcript itself and not the payload it came from.
 const AGENT_EXCHANGE_ROW_KEY = '__agentExchangeRow';
-// The user's toggle of an exchange, by its prompt's id: true opened, false
+// The user's toggle of a folded prompt, by its id: true opened, false
 // closed, unset none (agentExchangeFoldOpen: open while it works, else
 // folded). Kept through any re-render.
 const agentExchangeFoldChoices = new Map();
-// Exchanges shown for the user while this page lives: a turn that had an open
-// card, or ran while a message of the user's waited, stays shown once that
-// has passed instead of folding away under them. A reload folds it again.
-const agentExchangesShownForUser = new Set();
-// Each folded row's prompt id, by message id, and each folded exchange's
-// status, by prompt id, as of the last pass.
-let agentExchangePromptIdByMessageId = new Map();
+// Each folded prompt's status, by its id, as of the last pass.
 let agentExchangeStatusByPromptId = new Map();
 
 function setAgentExchangeRow(div, msg, msgId) {
-  div[AGENT_EXCHANGE_ROW_KEY] = agentExchangeRowOf(msg, { id: msgId || msg?.id || '', parseTimestamp: parseTimestampMs });
-}
-
-// The turns an open question or approval card (a plan board) belongs to.
-function openCardMessageIds() {
-  const ids = new Set();
-  for (const card of [...relayQuestions.values(), ...relayBoards.values()]) {
-    if (card?.status !== 'pending') continue;
-    for (const id of [card.messageId, card.queueId]) {
-      if (id) ids.add(String(id).trim());
-    }
-  }
-  return ids;
+  div[AGENT_EXCHANGE_ROW_KEY] = agentExchangeRowOf(msg, { id: msgId || msg?.id || '' });
 }
 
 // The rows the plan reads, in order, and the node of each. The live bubble
@@ -1345,58 +1325,45 @@ function agentExchangeTranscriptRows(el) {
 }
 
 /**
- * Fold the transcript's agent exchanges. One idempotent pass, run after every
+ * Fold the transcript's agent prompts. One idempotent pass, run after every
  * render and update of the list like the separator and merge passes. The
  * folded row lives in the prompt's own node, as its first child, so no
- * insertion path has to place it; closed, classes hide the prompt's bubble and
- * the exchange's other rows, which stay in the list and go on updating.
+ * insertion path has to place it; closed, a class hides the prompt's bubble.
+ * The replies and the live bubble are read for the row's status and are
+ * otherwise left alone.
  */
 function syncAgentExchangeFolds(el = getMessagesElement()) {
   if (!el) return;
   const { rows, nodes } = agentExchangeTranscriptRows(el);
   const plan = planAgentExchangeFolds(rows, {
     runningIds: [getActiveTurnForConversation(currentConvId)?.messageId],
-    openCardIds: openCardMessageIds(),
-    keptShownIds: agentExchangesShownForUser,
   });
   const states = new Map();
-  const promptIdByMessageId = new Map();
   const statusByPromptId = new Map();
   for (const group of plan) {
-    if (group.transient) agentExchangesShownForUser.add(group.promptId);
     if (!group.fold) continue;
     const open = agentExchangeFoldOpen(group.status, agentExchangeFoldChoices.get(group.promptId));
-    states.set(nodes.get(group.prompt), { group, head: true, open });
-    promptIdByMessageId.set(group.promptId, group.promptId);
+    states.set(nodes.get(group.prompt), { group, open });
     statusByPromptId.set(group.promptId, group.status);
-    for (const member of group.members) {
-      states.set(nodes.get(member), { group, head: false, open });
-      promptIdByMessageId.set(member.id, group.promptId);
-    }
   }
-  agentExchangePromptIdByMessageId = promptIdByMessageId;
   agentExchangeStatusByPromptId = statusByPromptId;
   for (const node of el.children) {
     if (node.classList?.contains('msg')) applyAgentExchangeState(node, states.get(node) || null);
   }
 }
 
-// For the paths that change the list outside a render: the live bubble, a
-// card opening. A bulk render runs the pass once at its end.
+// For the paths that change the list outside a render: the live bubble
+// coming and going. A bulk render runs the pass once at its end.
 export function syncAgentExchangeFoldsNow() {
   if (separatorSyncSuspended > 0) return;
   syncAgentExchangeFolds();
 }
 
 function applyAgentExchangeState(node, state) {
-  node.classList.toggle(AGENT_EXCHANGE_HEAD_CLASS, !!state?.head);
-  node.classList.toggle(AGENT_EXCHANGE_MEMBER_CLASS, !!state && !state.head);
+  node.classList.toggle(AGENT_EXCHANGE_HEAD_CLASS, !!state);
   node.classList.toggle(AGENT_EXCHANGE_CLOSED_CLASS, !!state && !state.open);
-  // The jump-to-bottom badge counts a fold's rows as one by this id.
-  if (state) node.dataset.agentExchangePromptId = state.group.promptId;
-  else delete node.dataset.agentExchangePromptId;
   const existing = node.querySelector(':scope > .agent-exchange-row');
-  if (!state?.head) {
+  if (!state) {
     existing?.remove();
     return;
   }
@@ -1430,11 +1397,11 @@ function onAgentExchangeToggle(row) {
   syncAgentExchangeFolds();
 }
 
-// A search result, a pin or a jump inside a folded exchange opens it first:
-// a hidden row has nowhere to scroll to.
+// A search result, a pin or a jump to a folded prompt opens it first, so
+// the message jumped to is the one on screen.
 function revealAgentExchangeMessage(messageId) {
-  const promptId = agentExchangePromptIdByMessageId.get(String(messageId || '').trim());
-  if (!promptId || agentExchangeFoldChoices.get(promptId) === true) return;
+  const promptId = String(messageId || '').trim();
+  if (!agentExchangeStatusByPromptId.has(promptId) || agentExchangeFoldChoices.get(promptId) === true) return;
   agentExchangeFoldChoices.set(promptId, true);
   syncAgentExchangeFolds();
 }
@@ -1523,10 +1490,11 @@ function createMessageNode(msg, msgId = null, force = false) {
   // (e.g. the Copilot relay answering a Cursor conversation) must be visible,
   // not silent: it ran on another plan than the header indicates.
   const executedProvider = String(msg?.executedProvider || '').trim().toLowerCase();
-  const boundProvider = String(conversations[currentConvId]?.runtimeProviderType || 'github').trim().toLowerCase();
+  const boundProvider = String(conversations[currentConvId]?.runtimeProviderType || '').trim().toLowerCase();
   // 'unknown' means the responder identity did not resolve, not that another
-  // provider ran the turn — no chip for it.
-  const crossProviderTag = (msg.role === 'assistant' && executedProvider && executedProvider !== 'unknown' && executedProvider !== boundProvider)
+  // provider ran the turn — no chip for it. Nor without a bound provider to
+  // compare with (a shared view of a conversation that has none).
+  const crossProviderTag = (msg.role === 'assistant' && executedProvider && executedProvider !== 'unknown' && boundProvider && executedProvider !== boundProvider)
     ? ` <span class="msg-provider-mismatch" title="This turn was executed by the ${escHtml(executedProvider)} provider, not the conversation's ${escHtml(boundProvider)} provider.">ran on ${escHtml(executedProvider)}</span>`
     : '';
   const usage = (msg.role === 'assistant' && msg?.usage && typeof msg.usage === 'object') ? msg.usage : null;
@@ -1585,7 +1553,7 @@ function createMessageNode(msg, msgId = null, force = false) {
   rememberSubagentRuns(subagentRuns);
   const subagentHtml = subagentRowsMarkup(
     subagentRuns.map((run) => mergeLiveSubagentRun(run, getSubagentRun(run.subagentRunId))),
-    { clickable: !IS_SHARED_VIEW },
+    { clickable: true },
   );
   // Finished background workflows persisted with this assistant message
   // (docs/plans/workflow-progress-tree.md, Phase 4). The template only
@@ -1614,7 +1582,9 @@ function createMessageNode(msg, msgId = null, force = false) {
     && cancellableSteerIdsForConversation(currentConvId).has(msgId);
   const showsCancelButton = isQueuedUserMessage || isCancellableSteer;
   const isCancelInFlight = showsCancelButton && bubbleCancelInFlight.has(msgId);
-  const hiddenFromShares = msg?.hiddenFromShares === true;
+  // The conversation's hidden list once it is known (a change on another
+  // device arrives there), else the message's own mark.
+  const hiddenFromShares = isMessageHiddenFromShares(currentConvId, msgId) ?? (msg?.hiddenFromShares === true);
   const activeTurnMessageId = String(getActiveTurnForConversation(currentConvId)?.messageId || '').trim();
   const sourceMessageId = String(msg?.sourceMessageId || '').trim();
   const belongsToActiveTurn = !!activeTurnMessageId
@@ -1627,8 +1597,8 @@ function createMessageNode(msg, msgId = null, force = false) {
   const shareVisibilityActionHtml = canToggleShareVisibility
     ? `<div class="msg-share-visibility">
         ${buildMessagePinControlsHtml(msgId, pinned)}
-        ${hiddenFromShares ? '<span class="msg-hidden-label">Hidden from shared viewers</span>' : ''}
-        <button type="button" class="msg-share-visibility-btn" data-action="toggle-share-visibility" data-message-id="${escHtml(msgId)}" data-hidden-from-shares="${hiddenFromShares ? 'true' : 'false'}" title="${hiddenFromShares ? 'Shows this message in shared conversations' : 'Hides this message from shared conversations'}">${hiddenFromShares ? 'Unhide' : 'Hide'}</button>
+        ${hiddenFromShares ? HIDDEN_LABEL_HTML : ''}
+        <button type="button" class="msg-share-visibility-btn" data-action="toggle-share-visibility" data-message-id="${escHtml(msgId)}" data-hidden-from-shares="${hiddenFromShares ? 'true' : 'false'}" title="${shareVisibilityButtonTitle(hiddenFromShares)}">${hiddenFromShares ? 'Unhide' : 'Hide'}</button>
       </div>`
     : '';
   // A terminal failure whose fix lives in the relay UI gets the fix as a button
@@ -1763,21 +1733,12 @@ function prependMessageNodes(msgs) {
   return { inserted, firstMessageId };
 }
 
+// A shared view's tool lines arrive filtered by the relay's path privacy
+// setting (server/services/share-path-redaction.mjs); they are shown as sent.
 export function decorateActivityText(text) {
   const value = String(text || '').trim();
   if (!value) return '';
-  const maskSharedPathSegments = (input) => {
-    const source = String(input || '');
-    const tokenMasked = source.replace(/@(file|folder):([^\s`]+)/gi, (_m, kind, rawPath) => {
-      const normalized = String(rawPath || '').replace(/\\/g, '/').replace(/\/+$/, '');
-      const segments = normalized.split('/').filter(Boolean);
-      const basename = segments[segments.length - 1] || normalized;
-      return `@${String(kind || '').toLowerCase()}:${basename}`;
-    });
-    return tokenMasked.replace(/([A-Za-z]:)?(?:[\\/~.]?[\\/])(?:[^\\/\s]+[\\/])+([^\\/\s]+)/g, (_m, _prefix, basename) => basename);
-  };
-  const sharedSafeValue = IS_SHARED_VIEW ? maskSharedPathSegments(value) : value;
-  return prefixToolActivityEmoji(sharedSafeValue);
+  return prefixToolActivityEmoji(value);
 }
 
 export function renderThoughtsMarkup(thoughts) {
@@ -1895,8 +1856,7 @@ function anchorThinkingBubble(div, messageId) {
     if (next) el.insertBefore(div, next);
     else el.appendChild(div);
     if (div.dataset.compactBoundary) syncSeparatorsNow();
-    // Under a folded agent prompt the bubble folds with it, and the row says
-    // the turn is working.
+    // A folded agent prompt's row says the turn is working.
     else syncAgentExchangeFoldsNow();
   } else if (div.parentNode !== el) {
     el.appendChild(div);
@@ -1983,6 +1943,43 @@ export function removeThinking() {
   if (wasCompacting) queueMicrotask(syncSeparatorsNow);
   // A turn that ended without a reply (cancelled) stops saying "working".
   if (hadBubble) syncAgentExchangeFoldsNow();
+}
+
+// The turn ends under a reader who is not at the end: the live bubble is
+// taken off the page and the reply row is put in its place. The page is
+// shorter for a moment (scrollTop can be clamped), and the reply is not as
+// tall as the bubble was (its thoughts are folded). Whatever the reader looks
+// at stays where it is: the block of text at the top of the viewport is noted
+// before the swap and put back after it. Read in the bubble's stream, it is
+// found again in the reply; in a row above or below the bubble, in that row.
+export function captureLiveReplyReadingPosition() {
+  const el = getMessagesElement();
+  if (!el) return null;
+  const bubble = document.getElementById('thinking-indicator');
+  return {
+    scrollTop: el.scrollTop,
+    block: captureReadingBlock(el),
+    // Below the bubble the pixel position is the wrong fallback: everything
+    // the reader sees moves up or down with the swap, and scrollTop with it.
+    belowBubble: !!bubble && bubble.getBoundingClientRect().bottom <= el.getBoundingClientRect().top,
+  };
+}
+
+export function restoreLiveReplyReadingPosition(position) {
+  const el = getMessagesElement();
+  if (!el || !position || isChatInteractionHeld()) return;
+  if (restoreReadingBlock(el, position.block)) return;
+  if (!position.belowBubble) el.scrollTop = position.scrollTop;
+}
+
+// A rebuild of the transcript on the page that nobody asked to scroll: the
+// reader keeps the text they are at, or failing that the pixel position.
+function renderMessagesInPlace(msgs, meta) {
+  const el = getMessagesElement();
+  const reading = el ? { scrollTop: el.scrollTop, block: captureReadingBlock(el) } : null;
+  const rendered = renderMessages(msgs, false, meta);
+  if (el && reading && rendered && !restoreReadingBlock(el, reading.block)) el.scrollTop = reading.scrollTop;
+  return rendered;
 }
 
 // The live turn's compaction line: the bubble stamps the turn's compaction
@@ -2749,11 +2746,16 @@ export function applyRelayStreamEvent({
 
 export function flushDeferredMessageRender() {
   if (!deferredMessageRender) return;
-  const { msgs, scroll, meta } = deferredMessageRender;
+  const { msgs, meta } = deferredMessageRender;
   deferredMessageRender = null;
   const deferredConversationId = String(meta?.conversationId || '').trim();
   if (deferredConversationId && deferredConversationId !== String(currentConvId || '').trim()) return;
-  renderMessages(msgs, scroll, meta);
+  // Whoever asked for this render has long returned, and with it whatever
+  // would have put the reader back; and where the reader was when it was
+  // held back is not where they are now. Decided as it runs: at the end it
+  // follows, anywhere else it leaves them at the text they read.
+  if (followsTranscriptEnd()) renderMessages(msgs, true, meta);
+  else renderMessagesInPlace(msgs, meta);
 }
 
 // Blacklists the id from further live relay_stream frames. Kept separate from
@@ -3077,6 +3079,7 @@ export function replaceRenderedMessage(msg, msgId) {
 }
 
 async function resendStoppedSteer(conversationId, markerId) {
+  const send = beginOwnSend();
   const conversationKey = String(conversationId || '').trim();
   const id = String(markerId || '').trim();
   if (!conversationKey || !id || stoppedSteerResends.has(id)) return;
@@ -3128,7 +3131,7 @@ async function resendStoppedSteer(conversationId, markerId) {
         mode: selectedMode,
         timestamp: new Date().toISOString(),
         attachments,
-      }, true, clientMessageId, true);
+      }, ownSendFollows(send), clientMessageId, true);
       bubbleAppended = true;
     }
     const r = await sendMessageApi({
@@ -3172,7 +3175,7 @@ async function resendStoppedSteer(conversationId, markerId) {
       showTransientRelayNotice(`Resent without ${dropped} attachment${dropped === 1 ? '' : 's'} that ${dropped === 1 ? 'is' : 'are'} no longer available.`, 7000);
     }
     if (cliOnline && isCurrentConversation(conversationKey) && !getActiveTurnForConversation(conversationKey)?.messageId) {
-      showThinking(r.messageId || null);
+      showThinking(r.messageId || null, ownSendFollows(send));
     }
   } catch (error) {
     if (!hasSendEchoArrived(clientMessageId)) {
@@ -3341,6 +3344,35 @@ export function syncRenderedPinState(pinnedIds) {
   }
 }
 
+const HIDDEN_LABEL_HTML = '<span class="msg-hidden-label">Hidden from shared viewers</span>';
+
+function shareVisibilityButtonTitle(hidden) {
+  return hidden ? 'Shows this message in shared conversations' : 'Hides this message from shared conversations';
+}
+
+// The hidden list changed (this page, another device): bring the bubbles on
+// the page in line without rebuilding them. A button whose own round trip is
+// still out keeps its "Hiding…" until the answer.
+export function syncRenderedShareVisibility(hiddenIds) {
+  const el = getMessagesElement();
+  if (!el) return;
+  const ids = hiddenIds instanceof Set ? hiddenIds : new Set(hiddenIds || []);
+  for (const button of el.querySelectorAll('.msg-share-visibility-btn')) {
+    const messageId = String(button.dataset.messageId || '').trim();
+    if (shareVisibilityInFlight.has(messageId)) continue;
+    const hidden = ids.has(messageId);
+    if ((button.dataset.hiddenFromShares === 'true') === hidden) continue;
+    button.dataset.hiddenFromShares = hidden ? 'true' : 'false';
+    button.disabled = false;
+    button.textContent = hidden ? 'Unhide' : 'Hide';
+    button.title = shareVisibilityButtonTitle(hidden);
+    const sibling = button.previousElementSibling;
+    const label = sibling?.classList?.contains('msg-hidden-label') ? sibling : null;
+    if (hidden && !label) button.insertAdjacentHTML('beforebegin', HIDDEN_LABEL_HTML);
+    if (!hidden && label) label.remove();
+  }
+}
+
 async function toggleMessageShareVisibility(conversationId, messageId, hiddenFromShares) {
   const conversationKey = String(conversationId || '').trim();
   const targetMessageId = String(messageId || '').trim();
@@ -3359,13 +3391,17 @@ async function toggleMessageShareVisibility(conversationId, messageId, hiddenFro
       button.disabled = false;
       button.textContent = hiddenFromShares ? 'Unhide' : 'Hide';
     }
-    showTransientRelayNotice('Could not update shared-message visibility.');
+    showTransientRelayNotice(String(result?.error || '').trim() || 'Could not update shared-message visibility.');
     return;
   }
 
   showTransientRelayNotice(result.hiddenFromShares
     ? 'Message hidden from shared viewers.'
     : 'Message visible to shared viewers.');
+  // Stored under its own conversation: the 🙈 count, even after a switch.
+  if ('hiddenMessages' in result) {
+    setConversationHiddenMessages(conversationKey, result.hiddenMessages, result.hiddenMessagesRevision);
+  }
   // The reload below only refreshes the open view; if the user switched
   // conversations while the toggle round trip was in flight, rendering it
   // would replace the new conversation's messages with this one's.
@@ -3375,7 +3411,7 @@ async function toggleMessageShareVisibility(conversationId, messageId, hiddenFro
   });
   if (String(currentConvId || '').trim() !== conversationKey) return;
   if (response?.messages) {
-    renderMessages(response.messages, false, response);
+    renderMessagesInPlace(response.messages, response);
   }
 }
 
@@ -3545,8 +3581,8 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
   const node = createMessageNode(msg, msgId, force);
   const isNewNode = !!node && !node.parentNode;
   // A reply the socket delivers without its prompt's id in the message (a
-  // failed turn's note) is placed under that prompt, and belongs to its
-  // agent exchange too.
+  // failed turn's note) is placed under that prompt, and an agent prompt's
+  // row reads its status from it.
   const exchangeRow = isNewNode ? node[AGENT_EXCHANGE_ROW_KEY] : null;
   const anchorId = String(insertAfterId || '').trim();
   if (exchangeRow?.role === 'assistant' && !exchangeRow.sourceMessageId && anchorId && anchorId !== String(msgId || '').trim()) {
@@ -3947,7 +3983,7 @@ export function focusConversationMessageById(messageId, { behavior = 'smooth', b
   if (!id) return false;
   const el = getMessagesElement();
   if (!el) return false;
-  // A message in a folded agent exchange is shown before it is scrolled to.
+  // A folded agent prompt is opened before it is scrolled to.
   revealAgentExchangeMessage(id);
   const target = el.querySelector(`.msg[data-message-id="${CSS.escape(id)}"]`);
   if (!target) return false;
@@ -3990,6 +4026,9 @@ export function compactCurrentConversation() {
 let unknownCommandWarned = null;
 
 export async function sendMessage() {
+  // The reader's own send, as of now: what follows it scrolls to the end
+  // only while they have not scrolled since.
+  const send = beginOwnSend();
   const input = document.getElementById('msg-input');
   const originalComposerText = String(input?.value || '');
   const text = originalComposerText.trim();
@@ -4030,7 +4069,7 @@ export async function sendMessage() {
     releaseComposerFocusAfterSend(input);
     void flushConversationDraft(currentConvId);
     compactCurrentConversation();
-    scrollBottomAfterSend();
+    scrollAfterOwnSend(send);
     return;
   }
 
@@ -4107,8 +4146,10 @@ export async function sendMessage() {
       input.value = '';
       autoResize(input);
       releaseComposerFocusAfterSend(input);
-      appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, true, clientMessageId, true);
-      scrollBottomAfterSend();
+      // Asked before the bubble is on the page.
+      const follow = ownSendFollows(send);
+      appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, follow, clientMessageId, true);
+      scrollAfterOwnSend(send);
     }
 
     const body = {
@@ -4196,7 +4237,8 @@ export async function sendMessage() {
         await window.openConversation?.(r.compactedConversationId);
         removeComposerAttachments(draftAttachments);
         if (!mobileSend) input.focus();
-        scrollBottomAfterSend();
+        // The send goes on in the conversation the compaction opened.
+        scrollAfterOwnSend({ ...send, conversationId: String(r.compactedConversationId || '').trim() });
       }
       return;
     }
@@ -4217,6 +4259,7 @@ export async function sendMessage() {
       if (adoptNewConversation) {
         setCurrentConv(r.conversationId);
         composerConversationId = r.conversationId;
+        nameOwnSendConversation(send, r.conversationId);
       }
       conversations[r.conversationId] = {
         id: r.conversationId,
@@ -4263,7 +4306,7 @@ export async function sendMessage() {
     // pinned to the newest message. Re-pin now rather than after the draft
     // save's round trip below, or the new bubble sits under the composer
     // for as long as that request takes.
-    if (viewingSendConversation()) scrollBottom();
+    if (viewingSendConversation() && ownSendFollows(send)) scrollBottom();
     const persistedConversationId = String(r.conversationId || targetConversationId || '').trim();
     if (persistedConversationId) {
       restorableDraftByConversation.delete(persistedConversationId);
@@ -4295,7 +4338,7 @@ export async function sendMessage() {
       // A turn already running here owns the live bubble; adopting the
       // just-queued id would re-anchor it under the newest user message.
       const activeTurn = getActiveTurnForConversation(composerConversationId);
-      if (!activeTurn?.messageId) showThinking(r.messageId || null);
+      if (!activeTurn?.messageId) showThinking(r.messageId || null, ownSendFollows(send));
     }
 
     // Only what this message took leaves the composer: attachments added (or
@@ -4304,7 +4347,7 @@ export async function sendMessage() {
     if (viewingSendConversation()) {
       removeComposerAttachments(draftAttachments);
       if (!mobileSend) input.focus();
-      scrollBottomAfterSend();
+      scrollAfterOwnSend(send);
     }
   } catch (e) {
     const sendLanded = hasSendEchoArrived(clientMessageId);

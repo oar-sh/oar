@@ -1,0 +1,33 @@
+# Troubleshooting
+
+Symptoms and what to check. This is the detail behind the [README](../README.md#troubleshooting); the most complete guide is [Troubleshooting on oar.sh](https://oar.sh/docs/troubleshooting/).
+
+| Symptom                            | What to check                                                                    |
+| ---------------------------------- | -------------------------------------------------------------------------------- |
+| Banner says *CLI is offline*       | No session worker has reported in during the last 10 seconds, which can be normal on an idle relay. Send a message: the relay starts that conversation's worker, and the banner clears once it connects. If it stays, check `/api/status` and the worker's `worker-<session>.log` in the log directory |
+| `oar copilot` says the GitHub CLI is missing | It runs `gh copilot` beside the relay. Install the GitHub CLI, or [run only the relay](install.md#start-the-relay) |
+| WSL: the browser on Windows shows another relay, or refuses the token | In WSL's default networking a port can be free in the distro while a Windows program listens on it; `localhost:<port>` in a Windows browser then reaches that program. `oar setup` picks a port that is free on both sides, and `oar status`, `oar start` and `oar doctor` warn when Windows holds the relay's port: choose another with `oar setup --port <port>` |
+| Settings refuses the **SDK** engine | Install or upgrade the Copilot CLI, run `copilot` once, and restart the relay (see [engine choice](providers.md#github-copilot--engine-choice)) |
+| Messages stuck pending             | Only one relay may run per data directory (a second one exits on the singleton lock), and only one process may own port `3333`. `oar doctor` shows the config and database in use |
+| Wrong or old model list            | **🤗 Select Models → Refresh** reruns discovery; `/api/model-variants` shows the Copilot catalog's `source` and `refreshedAt` |
+| Clarification card not progressing | Answer via the web card; the turn resumes once the question status becomes `answered` |
+| File links fail                    | Verify auth token/cookie and that paths are inside allowed workspace/drive roots |
+| Claude missing from New Chat       | Enable it in **⚙️ Settings → Providers → Claude**; the toggle is off by default   |
+| Claude reply says it cannot authenticate | Press **Claude settings** on the failed reply, then **Relogin** (or run `claude` on the relay host), and retry the turn |
+| Claude Cloud missing from New Chat | Enable it in **⚙️ Settings → Providers → Claude Cloud**; it is off by default and needs a Claude login on the relay host |
+| Claude Cloud reply says GitHub is not connected, or the Claude GitHub app has no access | Connect GitHub to the Claude account at [claude.ai/connect-github](https://claude.ai/connect-github), or add the repository to the Claude GitHub app's repository access on GitHub; then send the message again |
+| New Chat says *No cloud environment is set* | Choose one in **⚙️ Settings → Providers → Claude Cloud**; an account without any gets its default one when you open claude.ai/code once |
+| Grok reply says the CLI was not found | Press **Install Grok CLI** on the failed reply, or install it from **⚙️ Settings → Providers → Grok**; no relay restart is needed afterwards |
+| Grok reply says authentication failed | Press **Sign in to Grok** on the failed reply and confirm the device code in a browser |
+| Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
+| Background agent or shell stopped on its own | It reached the **Background task timeout** (default 4 h); raise it or set 0 for no limit |
+| A conversation will not delete     | It is still working: a running turn, one waiting on a question card or approval, or live background tasks. Stop it, then delete |
+| A conversation seems wedged        | **☠️ Kill session** in the `⋯` menu stops its worker; retry the turn or send a new message |
+| Sign-in says *Too many failed sign-in attempts* | Ten wrong tokens from one address within a minute lock that address out until the minute is over (see [Security notes](security.md)); wait, then use the right token. Behind a reverse proxy on another host, set `trustProxy`, or every visitor shares the proxy's address and its lockout (see [Behind a reverse proxy](remote-access.md#behind-a-reverse-proxy)) |
+| Behind a reverse proxy the page loads but nothing updates live, and the log says `Refused a handshake from origin` | The proxy rewrites the `Host` header: list the public origin in `allowedOrigins`, or have the proxy pass `Host` on (see [Behind a reverse proxy](remote-access.md#behind-a-reverse-proxy)) |
+| A shared link answers 404 | Its sharing was stopped or the link was renewed; **Settings → Sharing** lists the links that work |
+| `npm install -g @oar-sh/oar` fails with `EACCES` | npm's global folder needs root (a distribution or NodeSource Node.js). Do not use `sudo`; run the installer (`curl -fsSL oar.sh/install \| sh`), which installs into `~/.oar/npm` instead |
+| The relay does not start after an install with npm 12 (a `better-sqlite3` error in `server-err.log`) | npm 12 skipped the install scripts of OAR's native dependencies. Reinstall with `npm install -g --allow-scripts=better-sqlite3,koffi @oar-sh/oar` |
+| The Cloudflare tunnel stays off and the status dot's tooltip says `cloudflared is not installed` | OAR runs the `cloudflared` on the relay host and ships none. Install it (see [Cloudflare Tunnel](remote-access.md#optional-remote-internet-access-cloudflare-tunnel)); the tunnel starts within a minute |
+| `npm install -g @oar-sh/oar` fails with node-gyp or prebuild errors | `better-sqlite3` has no prebuilt binary for your platform; install a C/C++ build toolchain and Python, then retry |
+| No usage line under a reply        | Expected for OpenAI, Claude, Claude Cloud, Cursor, and Grok turns; only Copilot turns record plan usage |

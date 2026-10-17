@@ -5,6 +5,7 @@ import {
   escHtml,
   relayQuestions,
   relayQuestionDrafts,
+  scrollBottom,
 } from './store.js';
 import { loadRelayQuestions as loadRelayQuestionsApi, answerRelayQuestion, answerRelayQuestionStructured } from './api-client.js';
 import { enqueueOutboxRequest, registerOutboxSync } from './sync-outbox.mjs';
@@ -13,6 +14,7 @@ import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 import { composeMultiSelectAnswer, isMultiSelectQuestion, offersMultiSelectToggle } from './question-multi-select.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
 import { questionCardHeadLabel } from './conversation-provider-indicator.mjs';
+import { beginOwnSend, followsTranscriptEnd, refreshJumpButton, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
 
 let relayQuestionRenderHash = '';
 let renderedRelayQuestionIds = new Set();
@@ -26,12 +28,6 @@ const relayQuestionMultiMode = new Map();
 
 function multiModeFor(question) {
   return question ? relayQuestionMultiMode.get(question.id) : undefined;
-}
-const RELAY_QUESTION_AUTO_SCROLL_THRESHOLD_PX = 80;
-
-function distanceFromBottom(el) {
-  if (!el) return Number.POSITIVE_INFINITY;
-  return Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
 }
 
 function captureFocusedQuestionControl(messagesEl) {
@@ -200,7 +196,8 @@ export async function openPendingQuestionFromBanner() {
     return;
   }
   renderRelayQuestions();
-  window.scrollBottom?.();
+  // The reader asked for the question: it waits at the end.
+  scrollBottom();
 }
 
 // Scoped to #messages on purpose: scrollIntoView walks every ancestor
@@ -218,7 +215,9 @@ export function renderRelayQuestions() {
   const el = document.getElementById('messages');
   if (!el) return;
   const previousScrollTop = el.scrollTop;
-  const shouldAutoScroll = distanceFromBottom(el) <= RELAY_QUESTION_AUTO_SCROLL_THRESHOLD_PX;
+  // A card is shown to a reader who is at the end. Anyone further up stays
+  // where they are; the jump-to-bottom button says that a question waits.
+  const shouldAutoScroll = followsTranscriptEnd();
   const focusedControl = captureFocusedQuestionControl(el);
   const questions = Array.from(relayQuestions.values())
     .filter((q) => q && q.conversationId === currentConvId && q.status === 'pending')
@@ -254,6 +253,7 @@ export function renderRelayQuestions() {
   if (!questions.length) {
     renderedRelayQuestionIds = nextRenderedQuestionIds;
     if (!shouldAutoScroll) el.scrollTop = previousScrollTop;
+    refreshJumpButton();
     return;
   }
 
@@ -330,19 +330,17 @@ export function renderRelayQuestions() {
     el.appendChild(wrapper);
   }
 
-  // An agent exchange whose turn asks this is shown whole, before anything
-  // scrolls (agent-exchange-fold-view.mjs).
-  window.syncAgentExchangeFolds?.();
   renderedRelayQuestionIds = nextRenderedQuestionIds;
   restoreFocusedQuestionControl(el, focusedControl);
-  if (firstNewQuestionId) {
+  if (!shouldAutoScroll) {
+    el.scrollTop = previousScrollTop;
+  } else if (firstNewQuestionId) {
     const target = el.querySelector(`.relay-question-container[data-question-id="${CSS.escape(firstNewQuestionId)}"]`);
     scrollQuestionCardIntoMessages(el, target);
-  } else if (shouldAutoScroll) {
-    window.scrollBottom?.();
   } else {
-    el.scrollTop = previousScrollTop;
+    scrollBottom();
   }
+  refreshJumpButton();
 }
 
 function fieldDomId(questionId, index) {
@@ -489,6 +487,7 @@ export async function submitRelayStructuredAnswer(questionId) {
   const card = document.querySelector(`.relay-question-container[data-question-id="${questionId}"]`);
   const controls = card ? card.querySelectorAll('button, input, select, textarea') : [];
   controls.forEach((el) => { el.disabled = true; });
+  const send = beginOwnSend();
 
   try {
     const sdkSessionId = String(question?.sdkSessionId || '').trim();
@@ -513,6 +512,7 @@ export async function submitRelayStructuredAnswer(questionId) {
     window.renderConvList?.();
     window.syncComposerButtonState?.();
     renderRelayQuestions();
+    scrollAfterOwnSend(send);
     window.showTransientRelayNotice?.(`✅ Answer received · Agent continuing…`, 7000);
   } catch (e) {
     controls.forEach((el) => { el.disabled = false; });
@@ -594,6 +594,7 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
   const card = document.querySelector(`.relay-question-container[data-question-id="${questionId}"]`);
   const controls = card ? card.querySelectorAll('button, textarea') : [];
   controls.forEach((el) => { el.disabled = true; });
+  const send = beginOwnSend();
 
   try {
     const question = relayQuestions.get(questionId) || null;
@@ -618,6 +619,7 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
     window.renderConvList?.();
     window.syncComposerButtonState?.();
     renderRelayQuestions();
+    scrollAfterOwnSend(send);
     window.showTransientRelayNotice?.(`✅ Answer received: ${answer} · Agent continuing…`, 7000);
   } catch (e) {
     controls.forEach((el) => { el.disabled = false; });

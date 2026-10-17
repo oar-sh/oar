@@ -5,6 +5,7 @@ import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
 import { nextSubagentStatus } from './subagent-fold.mjs';
 import { useStrictStrikethrough } from './markdown-strikethrough.mjs';
+import { parseGroupFoldChoices, pruneGroupFoldChoices } from './conversation-group-state.mjs';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -16,6 +17,8 @@ function resolveAppBase() {
   const pathname = String(window.location.pathname || '/');
   const sharedIndex = pathname.indexOf('/shared/');
   if (sharedIndex >= 0) return pathname.slice(0, sharedIndex).replace(/\/+$/, '');
+  const previewIndex = pathname.indexOf('/share-preview/');
+  if (previewIndex >= 0) return pathname.slice(0, previewIndex).replace(/\/+$/, '');
   return pathname.replace(/\/+$/, '');
 }
 
@@ -32,8 +35,24 @@ function resolveSharedConversationToken() {
   if (configured) return configured;
   return extractSharedTokenFromPathname(window.location.pathname);
 }
-export const SHARED_CONVERSATION_TOKEN = resolveSharedConversationToken();
-export const IS_SHARED_VIEW = !!SHARED_CONVERSATION_TOKEN;
+// "Preview as shared": the owner reads a conversation as a share link would
+// serve it (marked redactions), through the owner-only preview routes. It is a
+// shared view in every other respect.
+function resolveSharePreviewConversationId() {
+  const configured = String(window.__COPILOT_APP_CONFIG?.sharePreviewConversationId || '').trim();
+  if (configured) return configured;
+  const match = String(window.location.pathname || '/').match(/\/share-preview\/([^/?#]+)\/?$/i);
+  if (!match) return '';
+  try {
+    return decodeURIComponent(String(match[1] || '')).trim();
+  } catch {
+    return '';
+  }
+}
+export const SHARE_PREVIEW_CONVERSATION_ID = resolveSharePreviewConversationId();
+export const IS_SHARE_PREVIEW = !!SHARE_PREVIEW_CONVERSATION_ID;
+export const SHARED_CONVERSATION_TOKEN = IS_SHARE_PREVIEW ? '' : resolveSharedConversationToken();
+export const IS_SHARED_VIEW = !!SHARED_CONVERSATION_TOKEN || IS_SHARE_PREVIEW;
 export let TOKEN = '';
 export let socket = null;
 export let currentConvId = null;
@@ -82,6 +101,9 @@ export let updateState = null;
 export let activeRuntimeSessionCount = 0;
 export let runtimeSessionBindingCount = 0;
 export let conversations = {};
+// Session groups by id, as the list payload describes them (`groups`):
+// name, display name, head and member counts. Merged with every page.
+export const conversationGroups = {};
 export let selectedAttachments = [];
 export let imageEditTarget = null;
 export const RELAY_QUESTION_POLL_MS = 3000;
@@ -172,6 +194,8 @@ const SIDEBAR_WIDTH_PERCENT_FALLBACK = 24;
 const SIDEBAR_WIDTH_PORTRAIT_STORAGE_KEY = 'copilot_sidebar_width_pct_portrait';
 const SIDEBAR_WIDTH_LANDSCAPE_STORAGE_KEY = 'copilot_sidebar_width_pct_landscape';
 const SIDEBAR_COLLAPSED_DESKTOP_STORAGE_KEY = 'copilot_sidebar_collapsed_desktop';
+// The user's fold choices for session groups in the sidebar: { [groupId]: 'open' | 'folded' }.
+const CONVERSATION_GROUP_FOLDS_STORAGE_KEY = 'copilot_conv_group_folds';
 let sidebarWidthPercent = SIDEBAR_WIDTH_PERCENT_FALLBACK;
 const CONVERSATION_SCROLL_STORAGE_PREFIX = 'copilot_message_scroll_';
 
@@ -195,6 +219,59 @@ export function setCurrentConv(id) {
   if (id) localStorage.setItem('copilot_last_conv', id);
   else localStorage.removeItem('copilot_last_conv');
   updateCompactButton();
+}
+
+/** Merges a list payload's `groups` (by id) into the known session groups. */
+export function mergeConversationGroups(groups) {
+  if (!groups || typeof groups !== 'object') return;
+  for (const [groupId, group] of Object.entries(groups)) {
+    const id = String(groupId || '').trim();
+    if (!id || !group || typeof group !== 'object') continue;
+    conversationGroups[id] = { ...(conversationGroups[id] || {}), ...group, id };
+  }
+}
+
+/** Forgets a session group the relay no longer lists. */
+export function forgetConversationGroup(groupId) {
+  delete conversationGroups[String(groupId || '').trim()];
+}
+
+/**
+ * Keeps only the groups that a loaded row still belongs to: after a list
+ * refresh a dissolved group has no row left, and the picker must not offer
+ * it. Returns the ids dropped.
+ */
+export function pruneConversationGroups(keepGroupIds) {
+  const keep = new Set((Array.isArray(keepGroupIds) ? keepGroupIds : []).map((id) => String(id || '').trim()).filter(Boolean));
+  const dropped = [];
+  for (const id of Object.keys(conversationGroups)) {
+    if (keep.has(id)) continue;
+    delete conversationGroups[id];
+    dropped.push(id);
+  }
+  return dropped;
+}
+
+export function readConversationGroupFoldChoices() {
+  return parseGroupFoldChoices(localStorage.getItem(CONVERSATION_GROUP_FOLDS_STORAGE_KEY) || '');
+}
+
+// The stored fold choices are trimmed to the loaded groups only past this
+// size: a choice for a group on an older page or in the other view must
+// not go with every toggle.
+const CONVERSATION_GROUP_FOLDS_MAX = 300;
+
+/** Stores the user's fold choice for a group. */
+export function setConversationGroupFoldChoice(groupId, choice) {
+  const id = String(groupId || '').trim();
+  if (!id) return;
+  let next = readConversationGroupFoldChoices();
+  if (Object.keys(next).length > CONVERSATION_GROUP_FOLDS_MAX) {
+    next = pruneGroupFoldChoices(next, [...Object.keys(conversationGroups), id]);
+  }
+  if (choice === 'open' || choice === 'folded') next[id] = choice;
+  else delete next[id];
+  localStorage.setItem(CONVERSATION_GROUP_FOLDS_STORAGE_KEY, JSON.stringify(next));
 }
 
 export function setConversationWatcherCount(conversationId, count) {
@@ -612,37 +689,18 @@ export function getMessagesDistanceFromBottom() {
   return Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
 }
 
-function resolveMessagesNearBottomThreshold(el, thresholdPx = null) {
-  if (Number.isFinite(Number(thresholdPx)) && Number(thresholdPx) >= 0) {
-    return Math.trunc(Number(thresholdPx));
-  }
-  return resolveNearBottomThresholdPx(el?.clientHeight);
-}
-
-export function isMessagesNearBottom(thresholdPx = null) {
+/**
+ * "At the end" of the transcript, wherever that is decided: within the
+ * near-bottom margin (8% of the viewport, between 12 and 48 px). One margin
+ * and no parameter: a caller with a margin of its own (there was one with
+ * 80 px, one with 1 px, and a default that read as 0 px) breaks the rule that
+ * the transcript follows a reader who is at the end and nobody else.
+ */
+export function isMessagesNearBottom() {
   const el = document.getElementById('messages');
   if (!el) return true;
   const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
-  const threshold = resolveMessagesNearBottomThreshold(el, thresholdPx);
-  return distance <= threshold;
-}
-
-export function isMessagesAtBottom(epsilonPx = 1) {
-  const el = document.getElementById('messages');
-  if (!el) return true;
-  const epsilon = Math.max(0, Number.isFinite(Number(epsilonPx)) ? Number(epsilonPx) : 1);
-  const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
-  return distance <= epsilon;
-}
-
-export function scrollBottomAfterSend() {
-  scrollBottom();
-  requestAnimationFrame(() => {
-    scrollBottom();
-  });
-  setTimeout(() => {
-    scrollBottom();
-  }, 120);
+  return distance <= resolveNearBottomThresholdPx(el.clientHeight);
 }
 
 export function isMobileComposerViewport() {
@@ -944,8 +1002,16 @@ function buildSessionWorkerStateHash(map) {
 
 let sessionWorkerStateHash = '';
 
+// Whether a status poll has answered yet: before that, a session's reported
+// background work is taken as it is; after it, only a live worker carries it.
+let sessionWorkerStatusKnown = false;
+export function hasSessionWorkerStatus() {
+  return sessionWorkerStatusKnown;
+}
+
 export function setSessionWorkerStatesFromStatusPayload(payload) {
   const workers = Array.isArray(payload?.workers) ? payload.workers : [];
+  sessionWorkerStatusKnown = true;
   const next = new Map();
   for (const worker of workers) {
     const normalized = normalizeWorkerStateEntry(worker);

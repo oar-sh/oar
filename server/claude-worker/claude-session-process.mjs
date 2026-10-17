@@ -43,6 +43,7 @@ import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import { createTurnLiveness, resolveTurnStallWindows } from '../../shared/worker-runtime/turn-liveness.mjs';
+import { createKeptPosts } from '../../shared/worker-runtime/kept-posts.mjs';
 import {
   ANSWERED_ELSEWHERE_KIND,
   DELIVERY_ANSWERED_ELSEWHERE_TEXT,
@@ -546,6 +547,10 @@ export function createClaudeSessionRunner({
   // the socket link: a hold withdraws the relay's readiness, and its end
   // re-arms it at once so a held message steers into the resumed turn.
   onDeliveryReadinessChange = () => {},
+  // The relay turned this worker's newest task set away (`stale`): the
+  // worker asks for a heartbeat, on which the relay learns which process
+  // holds the session and asks for the set again.
+  onBackgroundTaskSetStale = () => {},
   // Whether CLI processes carry the relay's `remote_relay` tool
   // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
   remoteRelayToolGate = null,
@@ -604,6 +609,34 @@ export function createClaudeSessionRunner({
   // id → terminalError for settling rows the worker gave up posting; reported
   // in the heartbeat's `settleFailed` until the relay confirms it failed them.
   const settleFailedTerminals = new Map();
+  // Settle notices of background tasks whose post failed (the relay was
+  // away): sent again after the next heartbeat it answers.
+  // Every post of the task set carries its place in this worker's order:
+  // two posts can overtake each other on the way, and the relay applies the
+  // newer one only. `epoch` tells this process from one before it.
+  const taskSetEpoch = Date.now();
+  let taskSetSeq = 0;
+  const nextTaskSetOrder = () => ({ epoch: taskSetEpoch, seq: ++taskSetSeq });
+  let taskSetStaleNotedAt = 0;
+  /**
+   * The relay's answer to a set post. `stale` for the newest one means the
+   * relay holds no current set of this worker; an older one was simply
+   * overtaken. At most one extra heartbeat per ten seconds: the periodic
+   * beat repeats the request anyway.
+   */
+  function noteTaskSetAnswer(answer, order) {
+    if (answer?.stale !== true || order.seq !== taskSetSeq) return;
+    dbg('the relay dropped the newest background task set', answer.reason || '');
+    if (Date.now() - taskSetStaleNotedAt < 10_000) return;
+    taskSetStaleNotedAt = Date.now();
+    try { onBackgroundTaskSetStale(); } catch {}
+  }
+  const postTaskSet = (body) => {
+    const order = nextTaskSetOrder();
+    return api('POST', '/api/background-tasks', { conversationId: sdkSessionId, ...body, order })
+      .then((answer) => noteTaskSetAnswer(answer, order));
+  };
+  const keptTaskSettles = createKeptPosts({ api, dbg: (...args) => dbg('background task settle:', ...args) });
   // Row id → the latest in-flight /api/queue-consumed POST touching it.
   const consumedMarkChains = new Map();
 
@@ -1694,10 +1727,19 @@ export function createClaudeSessionRunner({
    * which renders it as the composer's background-tasks panel. Membership
    * changes post immediately; chatty progress updates are trailing-edge
    * throttled. Advisory: failures must never disturb the stream consumer.
+   *
+   * `resync`: the relay asked for the set again on a heartbeat, because its
+   * own set for this worker differs (it restarted, or a post was lost). The
+   * same set, flagged, and "no tasks" is an answer too. Returns the post.
    */
-  function publishBackgroundTasks({ throttled = false } = {}) {
+  function publishBackgroundTasks({ throttled = false, resync = false } = {}) {
     const processRef = proc;
-    if (!processRef) return;
+    if (!processRef) {
+      if (!resync) return Promise.resolve();
+      return postTaskSet({ tasks: [], resync: true }).catch((error) => {
+        dbg('background task resync failed', error?.message || String(error));
+      });
+    }
     const send = () => {
       processRef.taskPublishTimer = null;
       const tasks = [...processRef.liveTasks.entries()].map(([taskId, task]) => {
@@ -1729,7 +1771,7 @@ export function createClaudeSessionRunner({
           ...(task.workflowProgress ? { workflowProgress: task.workflowProgress } : {}),
         };
       });
-      api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks }).catch((error) => {
+      return postTaskSet({ tasks, ...(resync ? { resync: true } : {}) }).catch((error) => {
         dbg('background task publish failed', error?.message || String(error));
       });
     };
@@ -1738,12 +1780,12 @@ export function createClaudeSessionRunner({
         clearTimeout(processRef.taskPublishTimer);
         processRef.taskPublishTimer = null;
       }
-      send();
-      return;
+      return send();
     }
-    if (processRef.taskPublishTimer) return;
+    if (processRef.taskPublishTimer) return Promise.resolve();
     processRef.taskPublishTimer = setTimeout(send, 2_000);
     processRef.taskPublishTimer.unref?.();
+    return Promise.resolve();
   }
 
   // ---------------------------------------------------------------------------
@@ -2441,7 +2483,12 @@ export function createClaudeSessionRunner({
       // capture a settling workflow's final digest for the transcript card
       // (the notification then refines the status when it lands).
       for (const [taskId, task] of previous) {
-        if (!proc.liveTasks.has(taskId)) bufferSettledWorkflowRun(taskId, task);
+        if (proc.liveTasks.has(taskId)) continue;
+        bufferSettledWorkflowRun(taskId, task);
+        // What the task was, for its settle notice: the row is gone by the
+        // time the notification says how it ended.
+        proc.departedTasks.set(taskId, task);
+        if (proc.departedTasks.size > 50) proc.departedTasks.delete(proc.departedTasks.keys().next().value);
       }
       syncWorkflowPoller(proc);
       publishBackgroundTasks();
@@ -2491,14 +2538,24 @@ export function createClaudeSessionRunner({
       // this session (the live set only says it is gone). Ambient tasks are
       // not activity. Advisory: a failed post never disturbs the stream.
       if (taskId && sdkMessage.ambient !== true) {
-        api('POST', '/api/background-task-settled', {
+        // A task that was in the published set is described too, so that a
+        // relay which no longer knows it (it restarted meanwhile) can still
+        // tell its watchers the end. A failed post is kept and sent again.
+        const published = proc.liveTasks.get(taskId) || proc.departedTasks.get(taskId) || null;
+        proc.departedTasks.delete(taskId);
+        void keptTaskSettles.post('/api/background-task-settled', {
           conversationId: sdkSessionId,
           taskId,
-          toolUseId: String(sdkMessage.tool_use_id || '').trim() || null,
+          toolUseId: String(sdkMessage.tool_use_id || published?.toolUseId || '').trim() || null,
           status: String(sdkMessage.status || '').trim() || 'completed',
           summary: String(sdkMessage.summary || '').trim().slice(0, 500) || null,
           ...(sdkMessage.reason ? { reason: String(sdkMessage.reason).slice(0, 40) } : {}),
-        }).catch((error) => dbg('background task settle publish failed', error?.message || String(error)));
+          ...(published?.description ? {
+            description: String(published.description).slice(0, 500),
+            taskType: String(published.taskType || ''),
+            startedAt: published.startedAt || null,
+          } : {}),
+        });
       }
       // A settled session-level task means the CLI is about to dequeue a
       // continuation turn — the process must not idle out under it. The SDK
@@ -3249,7 +3306,7 @@ export function createClaudeSessionRunner({
     if (processRef.liveTasks.size) {
       processRef.liveTasks = new Map();
       if (wasCurrent) {
-        api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks: [] }).catch(() => {});
+        postTaskSet({ tasks: [] }).catch(() => {});
       }
     }
     // Steers pushed into a turn the user stopped: if the Stop fell back to
@@ -3331,6 +3388,9 @@ export function createClaudeSessionRunner({
       permissionMode: permissionModeForRelayMode(relayMode),
       liveTasks: new Map(),
       knownTasks: new Set(),
+      // taskId → the row of a task that left the live set, until its
+      // notification arrives.
+      departedTasks: new Map(),
       // taskId → { runId, labels, digestJson } for live local_workflow tasks;
       // pruned by syncWorkflowPoller when a task leaves the live set.
       workflowStates: new Map(),
@@ -4034,6 +4094,21 @@ export function createClaudeSessionRunner({
     return false;
   }
 
+  /** The ids of the live background tasks, for the heartbeat's digest. */
+  function backgroundTaskIds() {
+    return proc ? [...proc.liveTasks.keys()] : [];
+  }
+
+  /** The relay asked for the task set again (heartbeat answer). */
+  function resyncBackgroundTasks() {
+    return publishBackgroundTasks({ resync: true });
+  }
+
+  /** The relay answered a heartbeat: settle notices kept for it go out. */
+  function flushKeptTaskSettles() {
+    return keptTaskSettles.flush();
+  }
+
   return {
     handlePendingPayload,
     canAcceptSteering,
@@ -4046,6 +4121,9 @@ export function createClaudeSessionRunner({
     isTurnActive,
     stopBackgroundTask,
     stopBackgroundTaskByToolUseId,
+    backgroundTaskIds,
+    resyncBackgroundTasks,
+    flushKeptTaskSettles,
     shutdown,
     // Test seams / observability.
     _getProcess: () => proc,

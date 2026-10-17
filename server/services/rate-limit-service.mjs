@@ -59,5 +59,16 @@ export function createFixedWindowRateLimiter({
     return { ok: true, retryAfterSeconds: 0 };
   }
 
-  return { consume, prune, size: () => buckets.size };
+  // Whether consume() would refuse now, without counting a hit.
+  function peek(key, reference = nowMs()) {
+    const bucket = buckets.get(String(key || '').trim());
+    if (!bucket || !Number.isFinite(bucket.windowStartAt) || (reference - bucket.windowStartAt) >= windowMs) {
+      return { ok: true, retryAfterSeconds: 0 };
+    }
+    if (bucket.count < limit) return { ok: true, retryAfterSeconds: 0 };
+    const retryAfterMs = Math.max(250, windowMs - (reference - bucket.windowStartAt));
+    return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)) };
+  }
+
+  return { consume, peek, prune, size: () => buckets.size };
 }

@@ -608,7 +608,7 @@ async function submitChangeCwd(launchAfterChange = false) {
       ? `Next launch CWD saved as ${updatedPath}. The running CLI keeps its current CWD.`
       : `Next launch CWD saved as ${updatedPath}.`);
   } catch (error) {
-    alert(error?.message || 'Failed to update the launch CWD');
+    alert(error?.message ? `Failed to update the launch CWD: ${error.message}` : 'Failed to update the launch CWD');
   } finally {
     changeCwdInFlight = false;
     setSummaryModalLoading(false);

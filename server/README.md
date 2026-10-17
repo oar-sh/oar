@@ -212,12 +212,18 @@ at confirm time). While a suspend is queued every connected client shows a
 banner with the blockers or the countdown and a **Cancel** button, the menu entry
 reads **💤 Suspend pending…**, and reopening the modal offers to cancel. A relay
 restart drops the queued suspend; a push notification (event **Host suspend**)
-reports both the actual suspend and such a drop. A queued **🌄 Restart web relay**
+reports both the actual suspend and such a drop. For the first 45 seconds after
+a relay start the check lists one more blocker, "the relay just started,
+sessions are still reporting": the workers that outlived the previous runtime
+may not have reported their background work yet. A queued **🌄 Restart web relay**
 gets the same banner and can be cancelled from it too.
 
 API: `GET /api/host/suspend` (state plus current blockers), `POST /api/host/suspend`,
 `POST /api/host/suspend/cancel`, and `POST /api/relay/shutdown/cancel`
-(localhost-only). Set `OAR_HOST_SUSPEND_DRY_RUN=1` to log instead of sleeping.
+(token only, like the restart itself). Set `OAR_HOST_SUSPEND_DRY_RUN=1` to log instead of sleeping;
+`OAR_BOOT_REPORTING_WINDOW_MS` changes the 45 seconds (0 to 600000; test relays
+pin `0`, which switches the wait off; a negative value is ignored); an override in effect is
+logged at start.
 
 You can also hide the **💤 Suspend host** action from **⚙️ Settings** with the
 **Show Suspend host action** checkbox. This only controls the menu entry; the
@@ -371,6 +377,41 @@ that started them. The live task set is posted to `POST /api/background-tasks` (
 and broadcast as the `background_tasks` socket event; the composer's task panel renders it and can
 stop an individual task over a `worker.control` push.
 
+The relay holds the task sets in memory (`services/background-task-store.mjs`), so a relay restart
+starts without them while the workers and their tasks keep running. The worker is the source of
+truth, and the relay asks:
+
+- **Digest and resync.** A worker's heartbeat carries `backgroundTasks: { count, digest }`, a digest
+  of its sorted task ids (`shared/worker-runtime/background-task-digest.mjs`). When it differs from
+  the set held for that worker (a restart, or a lost post either way round), the heartbeat answer
+  says `resyncBackgroundTasks: true` and the worker posts its full set with `resync: true`; the
+  request repeats on every beat until the two agree. A task restored this way keeps its start time
+  and is not announced as started again. Every post of a set carries `order: { epoch, seq }` (the
+  worker process and its count of set posts): two posts can overtake each other on the way, and the
+  relay drops one that is older than the newest it applied from that process, or that comes from a
+  process other than the one whose heartbeat came last for the session. A drop is logged and
+  answered `stale: true` with a `reason`; a worker told so for its newest set asks for a heartbeat,
+  on which the relay asks for the set again. `epoch` only names the process and is never compared
+  as a time. A task that ended only because a set did not list it comes back, without a second
+  start, when a later set lists it, unless a settle notice or its run's status has confirmed the
+  end meanwhile. A worker that sends no digest (Cursor, Grok, Claude Cloud, or a worker on older
+  code) has no opinion and is never asked.
+- **Placeholder.** A live Claude worker on older code cannot answer, but its heartbeat says whether
+  background work holds its process (`steering.autoCompactWindow.backgroundWork`). While this
+  runtime has not heard from that worker about its tasks, the session reads `background_only` with
+  one task "background work, details not reported since the relay restarted (Kill session in its ⋯
+  menu ends it)", the panel shows the
+  same row without a Stop button, and a host suspend waits. It is derived on read
+  (`services/background-work-view.mjs`), raises no event, and goes when the set arrives, the flag
+  goes false or the worker is gone.
+- **Ends.** The Claude worker keeps a settle notice whose post failed (the newest 20, for 10
+  minutes) and sends it again after the next heartbeat the relay answers; such a post is given up
+  after 10 s without an answer.
+- **Run rows left `running`.** A background sub-agent's row whose end was never written would count
+  as running work for a day. For a Claude worker that has reported its task set in this runtime, a
+  `running` background row that the set does not list and that nothing has updated for 15 minutes
+  is left out of the session state, `all_idle` and the suspend blockers.
+
 Tasks of type `local_workflow` carry an extra `workflowProgress` digest, because the SDK exposes no
 workflow-progress surface — the worker reads it off disk:
 
@@ -517,7 +558,7 @@ conversation that speaks the usual worker contracts (WebSocket link, heartbeat, 
 crash guard) but runs no agent: it sends the user's messages to the cloud session and follows the
 session's event stream (`claude-cloud-session-process.mjs`, `claude-cloud-event-normalizer.mjs`).
 The user-facing description, including what the provider does with the Claude CLI's login, is in
-the [README](../README.md#claude-cloud); the tracker is
+the [providers guide](../docs/providers.md#claude-cloud); the tracker is
 [docs/feature-tracker/claude-cloud.md](../docs/feature-tracker/claude-cloud.md).
 
 ### The cloud client and the login
@@ -845,7 +886,12 @@ posts it from `task_notification`), the sub-agent run statuses and the activity,
 timeline posts (the activity clock). A task that leaves the set without word ends after 5 s with
 its run's status, else `completed` with `statusReported: false`; an exit code is read from the task
 summary when it names one (the SDK has no field for it). Memory only: a restart forgets the recently
-finished tasks and starts the clock at boot.
+finished tasks and starts the clock at boot. Running tasks come back when the workers send their
+sets again (see [Background tasks and workflow progress](#background-tasks-and-workflow-progress)):
+a task that started before this runtime did is not announced as started a second time, and the end
+of a task this runtime never knew is still an event when the settle notice describes the task
+(`description`, `taskType`, `startedAt`). `all_idle` waits out the first 45 seconds after a relay
+start, like the suspend check.
 
 `GET /api/conversations` and `GET /api/conversation/:id` carry `sessionState` (`running_turn`: a
 turn processing, or queued and not held by a usage-limit pause; `background_only`: tasks running;
@@ -871,18 +917,19 @@ socket event (the whole active list after every change).
 ### Folded agent exchanges
 
 A prompt another agent sent the session (a paired relay's, or one of this relay's own: a user row
-with `origin`) and the session's reply to it fold into one row, `note from <relay> · <session> ·
-replied` (`working…`, `failed`, `stopped`, `no reply yet`), which opens to both as they render
-otherwise. Presentation only (`agent-exchange-fold-view.mjs` decides, `syncAgentExchangeFolds` in
+with `origin`) folds into one row, `note from <relay> · <session> · answered below` (`working…`,
+`failed`, `stopped`, `no reply yet`), which opens to the prompt as it renders otherwise.
+Presentation only (`agent-exchange-fold-view.mjs` decides, `syncAgentExchangeFolds` in
 `conversation-view.js` applies it as one more idempotent pass after every render and update, beside
 the separator and steering passes); the transcript data is unchanged. Nothing addressed to the user
-folds away: not a turn a message was steered into (the reply `absorbed`, or another message folded
-into or stopped with it), not an agent prompt that was itself steered into a turn, not an answer on
-a continuation row, and, while the page lives, not a turn that had an open question, approval card
-or plan board, or ran while a message of the user's waited. A folded exchange shows open while its
-turn is `working…` and closes by itself once it is replied, failed or stopped
-(`agentExchangeFoldOpen`); the user's own toggle, kept by prompt id, always wins over that, and a
-jump to a message inside (search, pins, image parent) opens it.
+folds away: the fold covers the agent's prompt alone. The session's reply to it can hold a line for
+the user, so the reply, the live bubble of the running turn and the turn's question, approval and
+plan cards always show, as for a message of the user's own; they are read for the row's status
+only. One prompt is left unfolded: an agent's prompt that was itself steered into a running turn,
+which renders as part of that turn's flow. A folded prompt shows open while its turn is `working…`
+and closes by itself once it is replied, failed or stopped (`agentExchangeFoldOpen`); the user's
+own toggle, kept by prompt id, always wins over that, and a jump to the prompt (search, pins, image
+parent) opens it.
 
 ## Image conversations (OpenAI BYOK)
 
@@ -911,6 +958,24 @@ images, calling the OpenAI Images API directly rather than going through a CLI w
 - The control appears on message hover; already-hidden messages keep their label visible so the state
   is never silently lost.
 - `POST /api/shared/:token/presence` tracks shared-viewer presence, surfaced as a watcher count.
+  `sharedPresenceMaxPerConversation` and `sharedPresenceMaxGlobal` cap how many viewers that count
+  tracks; they do not limit who can read a link.
+- A revoked or renewed token answers a plain 404 on every shared route, the `/shared/:token` page
+  included, exactly like a token that never existed. An open shared page stops at its next poll.
+- Settings → Sharing lists the active shares (`GET /api/shares`) with **Copy link**, **Renew link**
+  and **Stop sharing**, and each share's access log. Renewing adds a token to the share's lineage
+  (`conversation_shares.lineage_id`, migration 0016) and revokes the old one, so the log, keyed to
+  the lineage, carries over. Stopping a share or deleting the conversation deletes its log; nothing
+  else prunes it.
+- The access log (`conversation_share_opens`) has one row per open, not per poll: the shared page's
+  first fetch carries `open=1` and counts unless the same viewer opened it in the last 10 s; a
+  fetch without the flag counts only when that viewer has not fetched the share for 30 minutes
+  (a page back from the background, a script). A row keeps the time, the IP address (unless
+  **Store viewer IP addresses** is off), the user agent, the country from `cf-ipcountry` (only when
+  the request came through a proxy the `trustProxy` setting trusts) and a viewer key: an HMAC of
+  address and user agent under a per-relay secret, which counts distinct viewers without the
+  address. The address is the one Express derives through `trustProxy`; a forwarded header from an
+  untrusted peer is ignored.
 
 ## Pinned messages
 
@@ -1219,14 +1284,15 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/stream` | (CLI) Push in-flight assistant text stream for current pending message |
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
 | POST | `/api/relay/resume` | Resume dequeueing after pause |
-| POST | `/api/relay/shutdown` | Queue a localhost-only authenticated relay shutdown or self-restart |
+| POST | `/api/relay/shutdown` | Queue an authenticated relay shutdown or self-restart |
 | GET | `/api/relay-questions` | (CLI/UI) List relay questions by `status` (for example `pending` or `answered`) |
 | GET | `/api/relay-question/:id` | (CLI) Fetch a single relay question |
 | POST | `/api/relay-question` | (CLI) Create a relay question for the browser |
 | POST | `/api/relay-question/:id/answer` | (UI) Submit an answer for a relay question |
 | POST | `/api/relay-question/:id/timeout` | (CLI/UI) Mark a relay question timed out |
-| POST | `/api/heartbeat` | (CLI) Keep CLI status alive |
+| POST | `/api/heartbeat` | (CLI) Keep CLI status alive. A session worker may send `backgroundTasks: { count, digest }`; the answer carries `resyncBackgroundTasks: true` when the relay's set for that worker differs |
 | GET | `/api/status` | Overall status |
+| GET | `/api/about` | The About OAR modal: `version`, `commit` (the checkout's HEAD read from `.git`, else a `gitHead` stamp in package.json, else `null`), `startedAt` and `uptimeSeconds` of the relay process; `providers[]` (enabled ones only: `cliVersion` from the CLI probe cache, never a new probe, `sdkVersion` from node_modules, `state` `online`/`offline` for the relay CLI that runs Copilot's extension engine and OpenAI, `online`/`idle` with `runningWorkers` for the others); `stats` (conversations, messages, turns = replies, `turnsByProvider`, `firstConversationAt`); `usage` (only what is stored: Copilot premium requests, Cursor and Grok tokens and cost, Claude Cloud cost); `relay` (`dbBytes` = database + WAL, `runningWorkers`); `update` (latest version only while the opt-in check is on). The totals are read in rowid ranges of 10 000 messages with the event loop free in between, and kept for 60 s |
 | GET | `/api/models` | Live/cached model catalog used by the UI picker |
 | POST | `/api/models/snapshot` | (CLI/relay) Publish discovered model snapshot |
 | POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
@@ -1256,9 +1322,14 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Request cancellation of one subagent run (unsupported by the Claude runtime) |
 | PATCH | `/api/conversation/:id/message/:messageId/share-visibility` | Hide or unhide a single message from shared views |
 | PATCH | `/api/conversation/:id/message/:messageId/pin` | `{ pinned }` → pin or unpin a single message; answers with the conversation's pin list and broadcasts `conversation_pins_updated` |
-| POST | `/api/conversation/:id/share` | Create or update the conversation's read-only share token |
-| GET | `/api/shared/:token` | Read-only shared conversation view (hidden messages filtered out) |
-| POST | `/api/shared/:token/presence` | Report shared-viewer presence for the watcher count |
+| POST | `/api/conversation/:id/share` | The conversation's read-only share link, made if it has none (one active share per conversation): `{ token, shareUrl, path, created }`; a new one sends `share_created` |
+| POST | `/api/conversation/:id/share/renew` | A new token for the active share; the old one answers 404 from then on and the access log carries over. Sends `share_renewed`; 404 without an active share |
+| DELETE | `/api/conversation/:id/share` | Stop sharing: revokes every token of the conversation and deletes its access log → `{ revokedAt, revokedCount, opensDeleted }`. Sends `share_revoked`; 404 without an active share |
+| GET | `/api/shares` | Every active share: `{ shares: [{ conversationId, title, archived, token, shareUrl, path, sharedSince, renewedAt, lastOpenedAt, openCount, viewerCount }], storeViewerIp, accessLog }` |
+| GET | `/api/conversation/:id/share/opens` | The active share's access log, newest first: `?limit=<n>` (default 200, max 1000) → `{ opens: [{ openedAt, ip, country, userAgent, viewer }], total, limit }` |
+| GET/POST | `/api/settings/shares` | `{ storeViewerIp }`: whether new access log entries (and the status events of shared reads) keep the viewer's IP address; on by default. A change sends `share_settings_changed` |
+| GET | `/api/shared/:token` | (No auth) Read-only shared conversation view (hidden messages filtered out). `?open=1` marks the page's first fetch, which the access log counts as an open |
+| POST | `/api/shared/:token/presence` | (No auth) Report shared-viewer presence for the watcher count |
 | POST | `/api/openai/images/generate` | Generate images for an OpenAI Image conversation |
 | POST | `/api/image-operations/:operationId/execute` | Execute a queued image generation/edit operation |
 | GET | `/api/generated-image/:conversationId/:messageId/:imageId/content` | Stream a generated image blob |
@@ -1275,7 +1346,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | DELETE | `/api/relay-events/subscriptions/:id` | The user's Unsubscribe (a paired relay's subscription too: it learns with its next fetch); refused to other relays' agents |
 | POST | `/api/relay-events/remote/subscribe` | (Relay to relay) A paired relay's agent subscribes to sessions here: `{ watcher: { conversationId, title }, subscriber: { name }, scope, sessions, events?, once?, match?, stalled_minutes?, heartbeat_minutes?, dry_run? }` → `{ ok, subscription }`. Another relay's request only, inbound switch on; see [Across paired relays](#across-paired-relays) |
 | POST | `/api/relay-events/remote/pull` | (Relay to relay) That relay fetches its events: `{ after, subscriptions: [{ id, watcher }], ended: [ids] }` → `{ ok, events, cursor, more, subscriptions, ended, dropped }` |
-| POST | `/api/background-task-settled` | (Worker) How a background task ended: `{ conversationId, taskId, toolUseId?, status, summary?, reason? }` (Claude worker, from `task_notification`) |
+| POST | `/api/background-task-settled` | (Worker) How a background task ended: `{ conversationId, taskId, toolUseId?, status, summary?, reason?, description?, taskType?, startedAt? }` (Claude worker, from `task_notification`; the last three describe a task that was in its published set) |
 | GET | `/api/remote-relays/inflight` | (Worker) Number of `remote_relay` calls running for `conversationId` |
 | GET/POST | `/api/settings/remote-relays` | This relay's `publicUrl` and `inboundEnabled` (accept prompts from other relays' agents) |
 | GET | `/api/settings/agent-sessions` | Agent sessions: `{ enabled, maxWaitSeconds, limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 }, maxActiveSessions: 4 }`. `enabled` (default `false`) lets this relay's agents start and use sessions on it through `remote_relay`; `maxWaitSeconds` (default `600`) is the longest wait of one `remote_relay` call, for this relay and paired ones |
@@ -1283,7 +1354,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 
 ### Manual relay shutdown / self-restart
 
-- `POST /api/relay/shutdown` is localhost-only even when the relay is otherwise reachable on the network.
+- `POST /api/relay/shutdown`, `POST /api/relay/shutdown/cancel` and `POST /api/queue/empty` need the
+  token and nothing else: the browser app calls them from a phone, over a tunnel and over the LAN.
 - The request body accepts:
   - `reason` (optional string)
   - `requestedBy` (optional string)
@@ -1671,7 +1743,8 @@ service).
 | `cloudflaredTunnel.token` | — | Tunnel token from the router panel (never logged) |
 | `cloudflaredTunnel.binary` | `cloudflared` | Path or command name of the `cloudflared` you installed (OAR ships none); defaults to `cloudflared` on `PATH`. Without one the tunnel stays off and the status says how to install it |
 | `cloudflaredTunnel.extraArgs` | `[]` | Extra arguments appended to `cloudflared tunnel run` |
-| `tunnelMarkerHeaders` | `[]` | Extra edge-injected header names that mark tunnel traffic for the session-worker path guard |
+| `tunnelMarkerHeaders` | `[]` | Extra edge-injected header names that mark tunnel traffic; merged with `COPILOT_TUNNEL_MARKER_HEADERS` and `cf-ray` (an empty list does not switch the env value off). A request carrying one is never "from this machine" (session-worker path guard, image-operation run, sign-in lockout exemption) |
+| `allowedOrigins` | `[]` | Extra browser origins the Socket.IO channel accepts besides the relay's own origin |
 
 ### SDK auto-detection behavior
 

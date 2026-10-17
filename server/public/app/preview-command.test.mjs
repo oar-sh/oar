@@ -78,6 +78,12 @@ test('create-port posts and reports the URL', async () => {
   assert.deepEqual(fetchCalls[0].body, { conversationId: 'conv-1', label: 'app', port: 5173 });
 });
 
+test('create says so when the link already existed', async () => {
+  fetchRoutes['POST /api/previews'] = { ok: true, existing: true, url: `https://p/test_${TOKEN_A}/` };
+  const result = await runPreviewCommand({ kind: 'create-port', port: 5173, label: null }, { conversationId: 'conv-1' });
+  assert.match(result.notice, /^Preview already published \(same link\): https:\/\/p\/test_a+\/$/);
+});
+
 test('create-dir posts dir', async () => {
   fetchRoutes['POST /api/previews'] = { ok: true, url: 'https://p/x/' };
   await runPreviewCommand({ kind: 'create-dir', dir: './dist', label: null }, { conversationId: 'conv-1' });
@@ -104,6 +110,18 @@ test('list renders one line per preview with offline flag', async () => {
   assert.equal(lines.length, 2);
   assert.match(lines[0], /aaaaaaaa · app \(:5173\) — offline/);
   assert.match(lines[1], /site \(\/repo\/dist\)/);
+});
+
+test('list shows a preview the relay could not check yet as not served, without its link', async () => {
+  fetchRoutes['GET /api/previews'] = {
+    enabled: true,
+    previews: [
+      { token: TOKEN_A, label: 'site', mode: 'static', rootDir: '/repo/dist', online: false, unverified: true, url: 'https://p/a/' },
+    ],
+  };
+  const { notice } = await runPreviewCommand({ kind: 'list' }, {});
+  assert.match(notice, /aaaaaaaa · site \(\/repo\/dist\) — not served, could not be checked after the restart$/);
+  assert.doesNotMatch(notice, /offline|https:/);
 });
 
 test('list reports a disabled lane and an empty registry distinctly', async () => {

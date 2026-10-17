@@ -20,7 +20,6 @@ import {
   updateCompactButton,
   clearPendingUserMessage,
   hasPendingUserMessageDuplicate,
-  isMessagesAtBottom,
   upsertSubagentRun,
   getSubagentRun,
   addSubagentActivity,
@@ -35,7 +34,8 @@ import {
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { capLiveActivityEntries } from './activity-replay-state.mjs';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
-import { clearOpenConversation, renderConvList, refreshConversations, openConversation } from './journal-view.js';
+import { clearOpenConversation, renderConvList, refreshConversations, scheduleLoadedConversationsRefresh, applyConversationGroupEvent, openConversation } from './journal-view.js';
+import { applyBackgroundTasksToConversation, applyTurnStatusToConversation } from './conversation-turn-state.mjs';
 import { applyRelayEventSubscriptions, loadRelayEventSubscriptions } from './relay-event-subscriptions-ui.js';
 import {
   upsertRelayQuestion,
@@ -45,7 +45,10 @@ import {
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
 import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
 import { setConversationPins } from './pinned-messages-view.mjs';
+import { setConversationHiddenMessages } from './hidden-messages-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
+import { applyShareSettings, hasActiveShare, refreshShares } from './share-state.js';
+import { handleShareOpened, handleViewerIpsForgotten } from './shared-conversations-settings.js';
 import { setRemoteRelaysSnapshot } from './remote-relays-store.mjs';
 import { REMOTE_RELAY_SOCKET_EVENT } from './remote-relay-shared.mjs';
 import { AGENT_SESSIONS_SOCKET_EVENT } from './agent-sessions-settings.mjs';
@@ -74,6 +77,8 @@ import {
   applyConversationTurnStatus,
   renderMessages,
   appendMessage,
+  captureLiveReplyReadingPosition,
+  restoreLiveReplyReadingPosition,
   replaceRenderedMessage,
   noteTranscriptLiveRow,
   applyIncomingConversationDraftUpdate,
@@ -85,6 +90,7 @@ import {
   syncComposerButtonState,
   syncCancellableSteerButtons,
 } from './conversation-view.js';
+import { followsTranscriptEnd, noteTranscriptNews } from './transcript-jump-bottom-view.mjs';
 import { loadRepoBrowserTree, refreshRepoBrowserIfWorkspaceOpen } from './attachments-view.js';
 import { clearMessageSearchRuntimeState } from './message-search-view.js';
 import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
@@ -333,12 +339,17 @@ export async function connectSocket(overrideDeps) {
     setCliOnline(true);
     renderConvList();
     resyncAfterConnect();
+    // Every loaded page again, not page one only: events missed while the
+    // socket was down touched rows anywhere in the list.
+    scheduleLoadedConversationsRefresh();
     refreshSessionWorkerStatus().catch(() => {});
     refreshModelCatalog().catch(() => {});
     // An open sub-agent viewer fetches whatever it missed while away.
     handleSubagentViewerReconnect();
     // Subscriptions that changed while away.
     void loadRelayEventSubscriptions();
+    // Shares made or stopped while away.
+    void refreshShares().catch(() => {});
   });
   socket.on('connect_error', (e) => {
     setRelayOnline(false);
@@ -511,13 +522,16 @@ export async function connectSocket(overrideDeps) {
       // Another client's message (an agent's prompt included) follows the
       // end like any live row: a reader scrolled up stays where they are,
       // and the jump-to-bottom badge counts it.
-      appendMessage(normalizedMessage, isMessagesAtBottom(), messageId);
+      appendMessage(normalizedMessage, followsTranscriptEnd(), messageId);
       noteTranscriptLiveRow();
     }
   });
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
     const isCurrentConversation = conversationId === currentConvId;
-    const autoScroll = isCurrentConversation ? isMessagesAtBottom() : false;
+    const autoScroll = isCurrentConversation ? followsTranscriptEnd() : false;
+    // A reader who is not at the end keeps what they read where it is while
+    // the reply takes the live bubble's place.
+    const reading = isCurrentConversation && !autoScroll ? captureLiveReplyReadingPosition() : null;
     // A background conversation finishing its turn must not wipe the viewed
     // conversation's live bubble.
     if (isCurrentConversation) {
@@ -536,9 +550,13 @@ export async function connectSocket(overrideDeps) {
         message.thoughts = mergedThoughts;
       }
     }
-    if (messageId && seenMessageIds?.has(messageId)) return;
+    if (messageId && seenMessageIds?.has(messageId)) {
+      restoreLiveReplyReadingPosition(reading);
+      return;
+    }
     if (isCurrentConversation) {
       appendMessage(message, autoScroll, messageId || null, false, sourceMessageId || null);
+      restoreLiveReplyReadingPosition(reading);
       noteTranscriptLiveRow();
       scheduleContextUsageRefresh(conversationId, 120);
     }
@@ -558,7 +576,7 @@ export async function connectSocket(overrideDeps) {
   socket.on('message_updated', ({ conversationId, messageId, message }) => {
     if (!messageId || conversationId !== currentConvId || !message) return;
     if (!replaceRenderedMessage(message, messageId)) {
-      appendMessage(message, isMessagesAtBottom(), messageId, false);
+      appendMessage(message, followsTranscriptEnd(), messageId, false);
     }
     noteTranscriptLiveRow();
   });
@@ -578,16 +596,48 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('background_tasks', ({ conversationId, tasks }) => {
     setConversationBackgroundTasks(conversationId, tasks);
+    // The sidebar's row (and its group's head) count background work as
+    // running; the set arrives under the conversation or its session id.
+    const id = String(conversationId || '').trim();
+    const record = conversations[id]
+      || Object.values(conversations).find((conversation) => String(conversation?.sdkSessionId || '') === id)
+      || null;
+    if (record && applyBackgroundTasksToConversation(record, tasks)) renderConvList();
   });
   // A message was pinned or unpinned (any client): the conversation's whole
   // pin list, replacing what this page had.
   socket.on('conversation_pins_updated', ({ conversationId, pins, revision }) => {
     setConversationPins(conversationId, pins, revision);
   });
+  // A message was hidden from or shown to shared viewers (any client): the
+  // conversation's whole hidden list, replacing what this page had.
+  socket.on('conversation_hidden_messages_updated', ({ conversationId, hiddenMessages, revision }) => {
+    setConversationHiddenMessages(conversationId, hiddenMessages, revision);
+  });
   // REPLACE semantics for the whole set: the preview registry is relay-owned
   // and global, so every change ships the full list.
   socket.on('previews', ({ previews }) => {
     setPreviews(previews);
+  });
+  // Public shares: the events name the conversation only; the list (Settings
+  // → Sharing, the ⋯ menu's Stop sharing) is read again.
+  for (const event of ['share_created', 'share_renewed', 'share_revoked']) {
+    socket.on(event, () => {
+      void refreshShares().catch(() => {});
+    });
+  }
+  // A deleted conversation takes its share along.
+  socket.on('conversation_deleted', ({ conversationId } = {}) => {
+    if (hasActiveShare(conversationId)) void refreshShares().catch(() => {});
+  });
+  socket.on('share_opened', ({ conversationId } = {}) => {
+    handleShareOpened(conversationId);
+  });
+  socket.on('share_settings_changed', (payload) => {
+    applyShareSettings(payload || null);
+  });
+  socket.on('share_viewer_ips_forgotten', () => {
+    handleViewerIpsForgotten();
   });
   // REPLACE semantics too: the relay ships the whole remote-relay list (no
   // tokens) whenever a remote is added, removed, renamed or changes status.
@@ -613,16 +663,17 @@ export async function connectSocket(overrideDeps) {
     const last = items[items.length - 1];
     const lastText = typeof last === 'string' ? last : String(last?.text || '');
     const lastSubagentRunId = typeof last === 'object' && last ? (last.subagentRunId || null) : null;
-    if (lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId) {
-      relayActivities.set(messageId, capLiveActivityEntries(items.concat(entry)));
-    }
+    // The same line again (a repeated event) adds nothing.
+    const added = lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId;
+    if (added) relayActivities.set(messageId, capLiveActivityEntries(items.concat(entry)));
     if (entry.subagentRunId) {
       upsertSubagentRun({ subagentRunId: entry.subagentRunId, messageId, conversationId });
       addSubagentActivity(entry.subagentRunId, entry.text);
     }
     if (conversationId === currentConvId) {
-      const autoScroll = isMessagesAtBottom();
+      const autoScroll = followsTranscriptEnd();
       appendThinkingActivity(entry, entry.subagentRunId, autoScroll);
+      if (added && !autoScroll) noteTranscriptNews();
     }
   });
   socket.on('relay_stream', ({ conversationId, messageId, text, done, seq, subagentRunId }) => {
@@ -631,8 +682,8 @@ export async function connectSocket(overrideDeps) {
       upsertSubagentRun({ subagentRunId: String(subagentRunId).trim(), messageId, conversationId });
     }
     if (conversationId !== currentConvId) return;
-    const autoScroll = isMessagesAtBottom();
-    applyRelayStreamEvent({
+    const autoScroll = followsTranscriptEnd();
+    const accepted = applyRelayStreamEvent({
       messageId,
       text: String(text || ''),
       done: !!done,
@@ -640,11 +691,16 @@ export async function connectSocket(overrideDeps) {
       subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
       autoScroll,
     });
+    // A frame that was dropped (out of order, a finished turn) is no news.
+    if (accepted && !autoScroll) noteTranscriptNews();
   });
   socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done, subagentRunId }) => {
     if (!messageId) return;
     const key = String(reasoningId || 'reasoning');
     const thoughtMap = relayThoughts.get(messageId) || new Map();
+    const known = thoughtMap.get(key);
+    // The same thought again (a repeated event) adds nothing.
+    const added = !known || known.text !== String(text || '') || known.done !== !!done;
     thoughtMap.set(key, { reasoningId: key, text: String(text || ''), done: !!done, subagentRunId: subagentRunId || null });
     relayThoughts.set(messageId, thoughtMap);
     if (subagentRunId) {
@@ -652,8 +708,9 @@ export async function connectSocket(overrideDeps) {
       addSubagentThought(subagentRunId, { reasoningId: key, text: String(text || ''), done: !!done });
     }
     if (conversationId === currentConvId) {
-      const autoScroll = isMessagesAtBottom();
+      const autoScroll = followsTranscriptEnd();
       appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
+      if (added && !autoScroll) noteTranscriptNews();
     }
   });
   socket.on('subagent_status', (payload = {}) => {
@@ -770,6 +827,9 @@ export async function connectSocket(overrideDeps) {
     applyConversationTurnStatus({ conversationId, messageId, status });
     if (conversationId && conversations[conversationId]) {
       const conversation = conversations[conversationId];
+      // The row's turn fields follow the event, open or not: the dots, a
+      // group head's pill and its fold read them between list fetches.
+      applyTurnStatusToConversation(conversation, normalizedStatus);
       if (normalizedStatus === 'processing') {
         conversation.localTurnStatus = 'processing';
         conversation.localTurnStatusUpdatedAt = Date.now();
@@ -785,7 +845,7 @@ export async function connectSocket(overrideDeps) {
       }
     }
     if (conversationId === currentConvId && normalizedStatus === 'processing') {
-      const autoScroll = isMessagesAtBottom();
+      const autoScroll = followsTranscriptEnd();
       showThinking(messageId || null, autoScroll);
       renderThinkingActivities();
       renderThinkingThoughts();
@@ -820,6 +880,12 @@ export async function connectSocket(overrideDeps) {
       refreshRepoBrowserIfWorkspaceOpen();
     }
     renderConvList();
+  });
+  // A session group changed (a member joined or left, a name, a dissolve,
+  // here or from another device): every loaded page is fetched again with
+  // its groups, so a row far down the list changes too.
+  socket.on('conversation_group_changed', (payload) => {
+    applyConversationGroupEvent(payload);
   });
   socket.on('conversation_archived', ({ conversationId, archived }) => {
     const id = String(conversationId || '').trim();

@@ -187,7 +187,7 @@ test('an authenticated share revoke route exists and invalidates active shares (
   const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   assert.match(source, /app\.delete\('\/api\/conversation\/:id\/share', auth/);
-  assert.match(source, /stmts\.revokeConversationSharesByConversationId\?\.run\(now, conversationId\)/);
+  assert.match(source, /shares\(\)\.stopSharing\(conversationId, now\)/);
   assert.match(source, /io\.emit\('share_revoked'/);
 });
 

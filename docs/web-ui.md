@@ -1,0 +1,157 @@
+# Using the web UI
+
+Everything you do in the browser: conversations, running turns, files, usage, and the app itself. This is the detail behind the [README](../README.md#what-you-can-do); the most complete guide is [The conversation on oar.sh](https://oar.sh/docs/conversation/).
+
+## Starting a conversation
+
+*On oar.sh: [Starting a conversation](https://oar.sh/docs/sessions/starting-a-conversation/)*
+
+- Start a chat with **+ New Chat**, which asks for the **Working directory**, **Provider**, **Model**, and **Reasoning effort** (or **Quality** and **Size**, for image chats; **Context window** where a model offers several) before the conversation exists. The working-directory list offers the known directories (current session, relay workspace, browser folder, recent roots), a **Custom path…** entry, and a 📁 folder picker; it defaults to the directory you picked last, and the chosen directory is applied before the session worker first launches. With Copilot as the only provider the provider row is hidden. For **Claude Cloud** the modal asks for a **Repository** and a **Branch** instead of a reasoning effort, filled in from the chosen folder (see [Claude Cloud](providers.md#claude-cloud)).
+- Choose the **mode** and **model** per message in the composer.
+- The composer knows two slash commands, with autocomplete: **`/compact`** branches to a fresh conversation seeded with summary context, and **`/preview`** publishes a local dev server or directory on the public preview host without involving the agent (`/preview 5173 [label]`, `/preview ./dist [label]`, `/preview list`, `/preview close`). Agents can do the same through the `preview` tool (Claude and Cursor) or the documented API (see [docs/preview-servers.md](preview-servers.md)). Any other single-line text starting with `/` is held back once with an *Unknown command* notice; press send again to send it as text.
+
+## Relay modes
+
+*On oar.sh: [Relay modes](https://oar.sh/docs/sessions/relay-modes/)*
+
+| Mode        | Behavior                                                     |
+| ----------- | ------------------------------------------------------------ |
+| `ask`       | Clarification-first behavior before implementation           |
+| `plan`      | Planning response style (no implementation unless requested) |
+| `agent`     | Interactive coding agent behavior                            |
+| `autopilot` | Action-first behavior; asks only when truly blocking         |
+
+## While a turn runs
+
+*On oar.sh: [While a turn runs](https://oar.sh/docs/conversation/while-a-turn-runs/)*
+
+- Assistant text streams into the pending bubble as it is generated, next to the turn's tool activity and thoughts. Any subagent the turn spawns gets its own nested bubble with its own thoughts, activity, and text.
+- **Steer or queue.** On Claude, and on Copilot's SDK engine, a message you send during a live turn is pushed into that turn; the send button reads **Steer**. A folded message keeps a compact *merged* marker in the transcript, and one the agent answers separately gets its own reply. While the turn waits on a question card or plan approval, or is compacting, the button reads **Queue** and its tooltip says why: the message waits as a pending bubble (with **Cancel**) and steers in once the card is answered or the compaction ends. On the other runtimes, and on Copilot's Extension engine, messages sent during a turn queue behind it, and the button reads **Queue**.
+- **Stop** is on the running reply's bubble, whose header stays pinned at the top while a long reply scrolls; the send button never turns into Stop. Queued messages carry their own **Cancel** until they are picked up. A steered message that a Stop cut off is marked *Stopped with the turn — not answered* and offers **Resend**; the button then reads **Resent** on every device.
+- On Copilot, **Stop** ends only the reply: background agents the turn started keep running under their own **Stop** in the task panel.
+- The transcript scrolls by itself only while you are at its end, or right after you sent a message. Anywhere else it stays where you are reading, whatever lands below (a reply, a relay event, another agent's note, a question, an approval, a plan board), and keeps your place when the reply you are in the middle of finishes or the conversation reloads. **Jump to the end when I send a message** in **Settings → General** (on by default, per browser) decides whether your own message takes you to the end; switched off, it leaves you where you are as well.
+- Once you are about a screen above the end, or something new lands below you, a round **⌄** button fades in above the composer. It turns blue with a count of the rows that arrived (a dot while a reply is still being written), and amber with a **?** when a question or an approval below waits for your answer; a screen reader hears both. It takes you back to the end and the transcript follows again. From a search result or a pin deep in the history it loads the end first.
+
+## Question cards
+
+*On oar.sh: [Question cards](https://oar.sh/docs/conversation/question-cards/)*
+
+<p><a href="https://oar.sh/assets/shots/cfmail-multi-select.png?v=0.9.11"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-multi-select.light.png?v=0.9.11"><img src="https://oar.sh/assets/shots/cfmail-multi-select.png?v=0.9.11" alt="A multi-select question card: four mailbox events with checkmarks, three of them ticked, a free-text field and a Reply with selection button" width="720"></picture></a></p>
+
+- Agents ask clarifying questions through question cards: `ask_user` on Copilot and Cursor, `AskUserQuestion` on Claude and Claude Cloud. A choice answers with one click; a question that allows several answers shows checkmarks and one **Reply with selection** button, whose reply lists every ticked choice plus anything you typed. Structured requests render as multi-field forms.
+- On Copilot's SDK engine, the model gets OAR's own `ask_user` tool, which can mark a question as multi-select; a question worded "select all that apply" counts too, and every Copilot choice card that accepts free text has a **Select several** switch.
+- A card waits 8 hours for an answer (2 hours on Copilot's Extension engine). After that the agent is told nobody answered and continues according to the conversation's mode. A turn that is waiting on a card is never treated as stuck.
+- Grok has no question cards: ACP has no ask-user surface.
+
+## Background tasks
+
+*On oar.sh: [Background tasks](https://oar.sh/docs/conversation/background-tasks/)*
+
+<p><a href="https://oar.sh/assets/shots/pagewright-subagent-viewer.png?v=0.9.11"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-subagent-viewer.light.png?v=0.9.11"><img src="https://oar.sh/assets/shots/pagewright-subagent-viewer.png?v=0.9.11" alt="A sub-agent's record: its thoughts, each Bash and Read call with input and result, and its final summary" width="720"></picture></a></p>
+
+- The composer's task panel lists background work that outlives the reply that started it: backgrounded commands, subagents, monitors, and workflows on Claude; background agents and detached shells on Copilot's SDK engine. Each row shows its state, the model it runs on, the command it is running right now, its token count, and its own **Stop**. The panel scrolls when it holds more tasks than fit.
+- An **Ultracode** workflow folds out into a tree of its phases and agents (state, model, tokens). When it finishes, the summarizing reply keeps a collapsed *Finished background task* card holding the final tree, which survives reloads.
+- A background task's result arrives as its own *continuation* reply.
+- A sub-agent's title in the panel opens its whole record: its thoughts, every tool call with its full input and its result, its reply and the agents it started itself, in order and live while it runs, with its own **Stop**. The finished reply lists the turn's sub-agents as the same rows (model, type, tokens, time, how they ended), so the record stays one click away; a child agent opens in place and back returns to its parent. Claude records everything; Copilot and Cursor show what they report. A tool result is kept to its first 4 KB and a record to 2000 entries; **Keep sub-agent tool output** in Settings → General decides how long tool inputs and results are kept.
+- **⚙️ Settings → General → Background task timeout** (default 4 h; 0 = no limit, up to 10 h) caps how long background tasks alone may keep a Claude or Copilot session running after its reply. When the limit is reached, the tasks are stopped.
+
+## Drafts across devices
+
+*On oar.sh: [The composer](https://oar.sh/docs/conversation/composer/)*
+
+The composer draft, attachments included, is saved per conversation on the relay and follows you to your other devices. Saves happen only on real edits and are version-checked, so an idle device never overwrites the draft you are typing on another one, and a device you are not typing on picks up the other's draft. When two devices edit at once, the newest keystroke wins and the replaced text is offered back with **Restore** (and **Undo**). A draft longer than 20,000 characters is saved up to that length, and the composer says the rest is not saved.
+
+## The conversation list
+
+*On oar.sh: [The conversation list](https://oar.sh/docs/sessions/conversation-list/)*
+
+- **Filter conversations…** above the list matches titles, ignoring case. It clears with **×** or Escape, and while it is active it loads older pages, so it searches every conversation, not just the loaded ones.
+- **🔍** in the conversation header searches message text across all conversations.
+- On startup, the relay imports the Copilot sessions stored on the host (through the installed Copilot runtime) into its database, so they appear in the list with their history. If the runtime is unavailable, the import is reported as failed rather than guessed from the filesystem.
+- **Archive** (🗄 on the row, or **Archive conversation** in the `⋯` menu) takes a conversation out of the list without deleting anything: its session worker is stopped, and a Claude Cloud chat's session at Anthropic is archived with it. The 🗄 toggle above the list shows the archived conversations; **Unarchive** (📂) brings one back, cloud session included. An archived chat that is opened cannot be sent to until it is unarchived; a message that reaches it anyway (an agent's through a paired relay, say) unarchives it. Archiving a conversation whose session process is still active (green in the list, idle or working) asks first, because archiving stops it. A conversation that is still working is not archived — stop it first.
+- A **right-click on a row** (a long press on a phone) opens a menu with Open, Edit title, Stop turn, Kill session, the [group](#session-groups) entries, Archive or Unarchive, and Delete, so a session can be stopped or killed without opening it. A long press opens the menu when your finger lifts; a long press that then moves drags the row instead. Where rows cannot move (the Archived view, under a filter, a group's own name line) the menu opens during the press.
+- Deleting a conversation stops its session worker and removes its CLI session too (Copilot through the runtime, Claude by deleting that session's transcript). A Claude Cloud conversation's session at Anthropic is archived, not deleted. An imported Copilot session the relay never ran is only hidden: its CLI session stays, and nothing is stopped for it. A conversation that is still working — a running turn, one waiting on a question card or approval, or live background tasks — is not deleted, and the sidebar says why so you can stop it first.
+
+## Session groups
+
+A session that an agent starts with the `remote_relay` tool ([agent sessions](agents-together.md#agent-sessions)) sits under the session that started it, in a group (or in the group that session is already in). You can also make groups by hand.
+
+- **The head row** is the session that started the others (or, for a group made by hand or one whose starter is archived or deleted, a line with the group's name). It carries a fold button (▾/▸) and a pill that sums up the members, such as "3 · 1 waiting for you, 2 running". The members are indented under it.
+- **Folding.** A group is open while something in it runs or waits, and folds away once everything in it has finished, unless you fold or unfold it yourself (remembered per browser). The group that holds the open conversation, and every group while the list is filtered, stays open. When a member waits for a question or approval, the pill says so; a tap on it opens that member, also while the group is folded.
+- **Order.** A member's activity lifts the whole group to the top of the list.
+- **The head row's menu** has **Archive group** (members still working are kept, and named), **Stop all running** (every turn and background task in the group; both ask first), **Rename group** and **Dissolve group** (the sessions stay, as single rows). A group that was never renamed shows the starter's title.
+- **Any row's menu** has **Add to group…** for a single session (pick a group, or type a name to make a new one), and on a grouped row **Move to another group…** and **Remove from group**. **🧩 Session group…** in the `⋯` menu opens the same picker for the open conversation.
+- **Drag and drop.** Drag a session into a group, out of it, or to another place inside it; the order you set stays, and later arrivals join at the end. Drop one single session onto the middle of another and the two make a new group. On a phone, a long press lifts the row and moving the finger drags it. With the keyboard, a member's menu has **Move up** and **Move down**.
+
+<p><a href="https://oar.sh/assets/shots/pagewright-groups.png?v=0.9.11"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-groups.light.png?v=0.9.11"><img src="https://oar.sh/assets/shots/pagewright-groups.png?v=0.9.11" alt="Session groups in the sidebar: a release session with the three sessions it started indented under it, its pill reading 4 · 1 waiting for you, 2 running, and a folded group whose pill shows 1 running" width="720"></picture></a></p>
+
+## Files, git, and previews
+
+*On oar.sh: [Files](https://oar.sh/docs/files/)*
+
+- Use **📁 Browse files** to inspect the workspace (💼), drives (📀), or the session's own folder (🕵️), and to open previews. The **Hidden** and **Heavy** toolbar filters are remembered per browser, and a refresh re-opens the folders you had expanded.
+- **📁+ New folder** in the browser's toolbar opens a name field at the top of the folder pane; Enter creates the folder inside the open one and opens it. It works in the repository, on the drives, in the session folder, and in the folder picker of **New chat** and **Change CWD**. A right-click on a folder in the tree or a file in the folder pane (a long press on a phone) offers **Rename** and **Delete**, and on a folder **New folder here**. Delete says what goes, and a folder with content asks for its name to be typed first. Links are never followed or changed; roots (the repository root, `/`, a drive, the session folder) cannot be renamed or deleted, and the session folder is read-only apart from new folders.
+- Click the file and folder copy controls to insert `@file:...` / `@folder:...` tokens.
+- Workspace browsing follows the selected session's effective working directory. Running sessions keep their learned runtime directory, **🗂️ Change CWD** in the `⋯` menu changes the directory for the next launch, and `cd ...` typed in chat does not retarget the browser. A Claude Cloud chat has no **Change CWD**: it works on a clone at Anthropic.
+- Use **🌿 Git changes** in the conversation `⋯` menu to review the workspace repository: the header shows the branch with ahead/behind counts and a **⬇ Pull** button, and the list shows every staged, unstaged, and untracked file (deleted files struck through). Clicking a file opens a diff viewer with **Changes** and **Full file** modes; closing it returns to the still-open list.
+- Agents can embed images, video, and audio in a reply by absolute path; they render inline.
+- Tap an image attachment in the composer (it carries a 🖍️ badge), or use **🖍️ Annotate** in the file viewer, to mark it up with highlighter strokes. The annotated copy is uploaded; the original stays untouched.
+- External links in chat open in a new tab with `noopener`/`noreferrer`; workspace file mentions stay in the in-app preview.
+
+## Formulas in replies
+
+Replies render TeX/LaTeX equations and chemical formulas written as `$…$`, `\(…\)`, `$$…$$` or `\[…\]`. A single `$` opens a formula only when a non-space character follows it directly and the next `$` has a non-space character directly before it and no digit directly after it (a digit is allowed after something that looks like TeX, as in `$x^2$3`), so prices such as `$5 and $9` stay text.
+
+## Usage and context
+
+*On oar.sh: [Usage](https://oar.sh/docs/usage/)*
+
+<p><a href="https://oar.sh/assets/shots/context-window.png?v=0.9.11"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/context-window.light.png?v=0.9.11"><img src="https://oar.sh/assets/shots/context-window.png?v=0.9.11" alt="The Context usage modal of a Claude session: tokens per category, free space, the auto-compact window slider and the thinking controls" width="560"></picture></a></p>
+
+- Use **📊 Check Usage** in the conversation `⋯` menu for plan usage across every configured provider: remaining credits, rate-limit windows, reset countdowns, and collapsible cost/token detail. Each provider gets its own tab, opening on the conversation's own provider, and the card names the signed-in account (email and plan) beneath its title. The modal opens on the reading it showed last time and reads only the open tab's provider live (its card says "updating…" until the answer is in); a tab you switch to is read live when its reading is older than a minute, **Refresh** reads the open tab, and the relay keeps the last live answer of every provider so the other cards are never empty. Sources differ per provider:
+  - **Copilot** — live quota (AI credits or premium requests, chat, plan), plus per-model/product billed cost when your GitHub token can read personal billing. Conversations on the SDK engine add a **Last SDK worker turn** section (AI credits actually spent, tokens, model calls, overage) with the model and how long ago it was captured; it is one turn's numbers rather than a running total, and it stops being shown once it is more than seven days old.
+  - **Claude** — subscription limit windows (5-hour, weekly, per-model), extra-usage credits, session cost, and local usage attribution. Read from the live session at the end of a turn; the relay never starts a hidden turn to refresh it, so the newest reading is from your last Claude turn. With **Claude Cloud** switched on, the limits are read live from the account each time the modal opens (kept for a minute), with no turn involved: the card then carries a **Live** badge, a limit that is getting close carries Anthropic's own warning word, and it adds **This week by product** (Claude Code, chats and the other products as shares of the week) and the organisation's **Prepaid credits** when there are any. Limit resets (full and 5-hour) are shown on claude.ai only; the card links there. When the live read fails, the card falls back to the last turn's reading and says why.
+  - **Claude Cloud** — shown while the provider is on. A meter per dollar credit the account holds, with what is used, what is left and when it expires; **Cloud spend (OAR sessions)**, the cost Anthropic reports per cloud session, summed over the cloud conversations this relay still has, with this conversation's own cost when the modal was opened from a cloud chat; and the latest cloud session report (its cost, and cost and tokens by model). These figures are Anthropic's reported cost, not a billing statement, and sessions started elsewhere are not counted. A credit that is offered but not yet claimed is mentioned with a link to claude.ai. Cloud turns spend the cloud credit first; without a credit they count against the Claude limits above.
+  - **Cursor** — spend from the Cursor SDK measured against the monthly allowances you enter in Settings, split into the Cursor Models and Other Models pools; these figures are estimates, and Cursor's Spending dashboard remains authoritative. With a dashboard session token, the card adds live *Included in plan* bars.
+  - **Grok** — the live weekly subscription quota, read with the host's Grok CLI login, plus per-turn tokens and estimated cost from the agent's prompt result. An optional monthly USD allowance in Settings adds an estimated remaining meter; the card is hidden when Grok is disabled. Billing: [console.x.ai](https://console.x.ai).
+- Per-reply usage lines are recorded only for Copilot turns — OpenAI, Claude, Claude Cloud, Cursor, and Grok turns do not consume Copilot premium requests, and no usage line is attached to them.
+- Use the **🧠** context button for a per-category breakdown of the conversation's context window (Claude sessions also show the auto-compact window, the thinking controls and the folder's commit attribution there): a usage bar, a token/percentage table, and free space. Claude sessions report exact SDK categories; Copilot sessions show the coarser system/tools + messages + buffer split, labelled as a lower-bound estimate when the runtime no longer emits full buckets. A Claude Cloud session reports how much of its window is used after each turn, without categories.
+- Claude conversations additionally get an **auto-compact window** slider in that modal. Claude Code compacts a session once it approaches a model-tuned window (around 967k tokens on a 1M-context model), which is why long conversations rarely compact at all; setting a smaller window makes it happen sooner and keeps turns cheaper. *Auto* hands the choice back to the CLI. The smallest window is 100k, because the CLI silently ignores anything below that and falls back to its own default. The line beneath the slider reports the window actually in force and where it came from — your setting, the model default, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment override — and fills in once the conversation's first turn completes. The slider is saved when the modal closes. Claude Code reads the window only when a session starts, so a running session restarts once, before the next message, to pick up a new one; while a turn or background work is running the change waits, and the note under the slider says for what. A window below what the conversation already uses compacts it on the next message, which the slider warns about. The modal's headline shows the tokens in use, the compaction window and, when known, the model's own limit.
+- The transcript marks day boundaries, and marks the point where a Claude session compacted its context with the tokens before and after. While a compaction runs, the line reads *Compacting context…* and the turn's bubble says so; it turns into the final line when the compaction ends. Both kinds appear as dots beside the scrollbar for the messages currently loaded.
+
+<p><a href="https://oar.sh/assets/shots/usage-claude-mobile.png?v=0.9.11"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/usage-claude-mobile.light.png?v=0.9.11"><img src="https://oar.sh/assets/shots/usage-claude-mobile.png?v=0.9.11" alt="The Claude card in Check Usage on a phone: the 5-hour and weekly limits with reset times, and the latest session totals by model" width="300"></picture></a></p>
+
+## Sharing
+
+*On oar.sh: [Sharing](https://oar.sh/docs/conversation/sharing/)*
+
+Use **➡️ Share conversation** in the `⋯` menu to publish a read-only link. Each message has a **Hide** button that keeps it out of the shared view without deleting it; hidden messages stay fully visible to you, marked *Hidden from shared viewers*, with an **Unhide** button. Anyone with the link can read the shared view, without signing in.
+
+While a conversation hides messages, a **🙈** button with their count sits next to **📍** in its header (never in the shared view). It opens the list of hidden messages, like the pinned one: a row jumps to its message, also one far up in the history, and has **Unhide**; **Unhide all** asks first, and leaves hidden only a message whose turn is still running, naming it. The count and the list cover messages that are not loaded yet, and other tabs and devices follow a change without a reload.
+
+**Settings → Sharing** lists every shared conversation with when it was shared and last opened, how often and by how many viewers. **Copy link** copies it; **Renew link** gives the conversation a new link and the old one stops working at once; **Stop sharing** (also in the `⋯` menu while the conversation is shared) ends the link. A stopped or renewed link answers a plain 404, and a page still open on it stops at its next refresh. Each row unfolds into its access log: one entry per open (not per refresh), with time, IP address, country and browser. The log carries over to a renewed link, is deleted when you stop sharing or delete the conversation, and is kept otherwise. Switch off **Store viewer IP addresses** to log new opens without the address; when addresses are already stored, OAR offers to remove them too, from the access log and from the status log of shared reads. Distinct viewers are still counted.
+
+A shared view never carries the relay host's paths in full. The relay filters what a link serves, by **Paths and file names** in **Settings → Sharing**: show every path and file name, hide the path and show the file name (the default), or hide both. Paths in tool arguments, file mentions, attachments, sub-agent records and diff headers are always caught; in free text (replies, thoughts, tool output, code blocks) the relay replaces the folders it knows (the conversation's workspace, your home, its own data folder) and anything shaped like an absolute Windows or Unix path. Relative paths and paths in screenshots are not caught. **🔍 Preview as shared** in the `⋯` menu shows the conversation as a viewer would see it, without creating a link: green marks what viewers get instead of a path, amber what still looks like one. Your own view always shows everything. In the shared view a sub-agent's row opens its record read-only, filtered the same way.
+
+<p><a href="https://oar.sh/assets/shots/pagewright-sharing.png?v=0.9.11"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-sharing.light.png?v=0.9.11"><img src="https://oar.sh/assets/shots/pagewright-sharing.png?v=0.9.11" alt="Settings › Sharing: three shared conversations with their opens and viewers, and one link's access log open with time, country, IP address and browser for each open" width="720"></picture></a></p>
+
+## Pinned messages
+
+Each message has a **Pin** button next to **Hide**; a pinned message is marked *📍 Pinned* and offers **Unpin**. Once a conversation has pins, a **📍** button with their count appears in its header. It opens the list of pinned messages in conversation order, each with a short preview. A row closes the list and scrolls to its message, also when that message is far up in the history; **🗑** in a row unpins it. Pins are kept on the relay and show on every device at once, up to 100 per conversation. They are your own bookmarks: the shared view does not show them, and a conversation continued with `/compact` starts without them.
+
+## Notifications and the app
+
+*On oar.sh: [Devices](https://oar.sh/docs/devices/)*
+
+- **⚙️ Settings → Notifications** turns on push notifications per device: for questions from the agent, completed or failed turns, plan boards, and the CLI going offline. They need a secure context (HTTPS, or `localhost`), are sent only while no device has the app in the foreground, and show generic text unless you opt in to message previews on that device.
+- The **⬇** button in the sidebar installs OAR as an app (PWA). The installed app has a fullscreen preference, with fallbacks when OAR runs in a plain browser tab. **Relay name** in Settings sets its label on every device that connects to this relay, and is the name [paired relays](agents-together.md#remote-relays) know it by.
+
+## The conversation menu
+
+*On oar.sh: [The conversation menu](https://oar.sh/docs/conversation/menu/)*
+
+Besides the entries above, the `⋯` menu holds **✍️ Edit conversation title**, **🗄 Archive conversation** (**📂 Unarchive** on an archived chat), **🧩 Session group…** (see [Session groups](#session-groups)), **🖥️ Inspect tmux console** (a read-only view of the session's tmux pane), **🤗 Select Models**, **☁️ Open on claude.ai** (Claude Cloud chats, once their session exists), **⚙️ Settings**, **🌙/☀️ Day/Night mode** (the theme; there whenever you are signed in, with or without a conversation open, and the one entry of a shared view), **ℹ️ About OAR · *version*** (see below), **🌄 Restart web relay** (queued until the current turn is idle), **💤 Suspend host** (Windows; see below), and **☠️ Kill session** (stops the conversation's worker; an active turn then needs a retry or a new message). Its header shows the queue counts with **🚮 Empty queue**.
+
+**ℹ️ About OAR** shows what this relay is and has done: its version, the commit (for a git checkout) and when it started; each provider that is on, with its CLI and SDK version and whether it is online; conversations, turns and messages since the first conversation, turns per provider, and the usage the providers report (Copilot premium requests, Cursor and Grok tokens and cost, Claude Cloud cost); uptime, database size and running workers. With the opt-in update check (**Settings → General → Check for updates automatically**) on it names the latest version; otherwise it says where to turn the check on. Shared viewers do not get the entry. The data comes from `GET /api/about` (see [server/README.md](../server/README.md#api-reference)), which keeps its totals for a minute.
+
+**💤 Suspend host** puts the machine the relay runs on to sleep, once the work is done. The confirmation lists what is still active. The relay then queues the suspend and fires it after 2 minutes with nothing active: no queued, running or parked turn, no background task of a live worker, and no open GitHub Actions run in the repository of a conversation that was busy since the request (read through `gh`; a repository whose state cannot be read blocks for 15 minutes, then is ignored). With nothing running when you confirm, it fires after a 30-second countdown. While a suspend is queued, every device shows a banner with the blockers or the countdown and a **Cancel** button, and a push notification reports the suspend. A relay restart drops a queued suspend and says so. **Show Suspend host action** in Settings hides the entry per browser.

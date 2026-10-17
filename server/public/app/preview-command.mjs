@@ -74,6 +74,10 @@ export async function runPreviewCommand(parsed, { conversationId = '' } = {}) {
       if (!previews.length) return { ok: true, notice: 'No live previews.' };
       const lines = previews.map((entry) => {
         const target = entry.mode === 'static' ? entry.rootDir : `:${entry.targetPort}`;
+        // Stored but not served until the relay could check it: no link.
+        if (entry.unverified === true) {
+          return `${entry.token.slice(0, 8)} · ${entry.label} (${target}) — not served, could not be checked after the restart`;
+        }
         const state = entry.online === false ? ' — offline' : '';
         return `${entry.token.slice(0, 8)} · ${entry.label} (${target})${state} → ${entry.url}`;
       });
@@ -96,7 +100,12 @@ export async function runPreviewCommand(parsed, { conversationId = '' } = {}) {
       // point at the panel where the states are visible instead.
       return { ok: false, notice: 'Preview failed — check the port/path, or whether the preview lane is enabled (Settings → Live previews).' };
     }
-    return { ok: true, notice: `Preview published: ${created.url}` };
+    return {
+      ok: true,
+      notice: created.existing === true
+        ? `Preview already published (same link): ${created.url}`
+        : `Preview published: ${created.url}`,
+    };
   } catch {
     return { ok: false, notice: 'Preview command failed — could not reach the relay.' };
   }

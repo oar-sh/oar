@@ -1,4 +1,5 @@
 import {
+  BASE,
   CLIENT_ID,
   currentConvId,
   conversations,
@@ -24,7 +25,7 @@ import {
   showTransientRelayNotice,
   applyContextUsageBar,
   scrollBottom,
-  isMessagesAtBottom,
+  isMessagesNearBottom,
   setHistoryRefreshInFlight,
   isHistoryRefreshInFlight,
   setSummaryModalLoading,
@@ -46,14 +47,20 @@ import {
   resolveConversationUiState,
   summaryModalState,
   IS_SHARED_VIEW,
+  IS_SHARE_PREVIEW,
   SHARED_CONVERSATION_TOKEN,
   getConversationWatcherCount,
   generateId,
   imageEditTarget,
   hasPendingUserMessageForConversation,
 } from './store.js';
-import { createTranscriptResizeKeeper } from './transcript-viewport-anchor.mjs';
-import { initTranscriptJumpToBottom } from './transcript-jump-bottom-view.mjs';
+import {
+  captureReadingBlock,
+  createTranscriptResizeKeeper,
+  restoreReadingBlock,
+} from './transcript-viewport-anchor.mjs';
+import { initTranscriptJumpToBottom, onTranscriptEndLeft } from './transcript-jump-bottom-view.mjs';
+import { syncScrollOnSendToggle, updateScrollOnSendSetting } from './transcript-jump-bottom.mjs';
 import {
   verifyExistingSession,
   verifyToken,
@@ -92,6 +99,8 @@ import {
   isArchivedConversationsView,
   refreshNewConversationCloudRepoList,
   openOriginConversation,
+  openConversationGroupPicker,
+  toggleConversationGroupFold,
 } from './journal-view.js';
 import {
   loadRelayQuestions,
@@ -126,13 +135,14 @@ import {
   conversationHasActiveTurn,
   focusConversationMessageById,
   syncRenderedPinState,
+  syncRenderedShareVisibility,
   isConversationWindowAtTail,
   getTranscriptJumpEpoch,
   getTranscriptLiveRowEpoch,
-  syncAgentExchangeFoldsNow,
 } from './conversation-view.js';
 import { loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
 import { initPinnedMessagesView, setPinsConversation } from './pinned-messages-view.mjs';
+import { initHiddenMessagesView, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
 import { handleAttachmentInput, retryAttachmentUpload, openAnnotateEditorForPending, openAnnotateEditorForPreview, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, copyFilePreviewImage, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick, startRepoNewFolder } from './attachments-view.js';
@@ -179,6 +189,7 @@ import {
   closeMessageSearchModal,
 } from './message-search-view.js';
 import { initSubagentViewer } from './subagent-viewer.mjs';
+import { watchPreviewMarks } from './share-preview-marks.mjs';
 import {
   initGitChangesView,
   openGitChangesModal,
@@ -371,6 +382,9 @@ import {
   resolveChatActionsMenuState,
 } from './chat-actions-menu-state.mjs';
 import { subscribeProviderReadiness, updateProviderReadinessInputs } from './provider-readiness.mjs';
+import { hasActiveShare, refreshShares, subscribeShares } from './share-state.js';
+import { openStopSharingConfirmation } from './shared-conversations-settings.js';
+import { showAbout, syncAboutMenuLabel } from './about-ui.js';
 import { syncConversationOriginHeader } from './conversation-origin-ui.js';
 import { loadRelayEventSubscriptions, onRelayEventSubscriptionsChanged, syncRelayEventHeader } from './relay-event-subscriptions-ui.js';
 import {
@@ -458,6 +472,8 @@ let liveConversationPollInFlight = false;
 let sharedViewerIdFallback = '';
 let sharedConversationRenderKey = '';
 let sharedConversationLastError = '';
+// The share was stopped or renewed while the page was open: the reader stops.
+let sharedConversationEnded = false;
 let networkLifecycleBound = false;
 let foregroundRecoveryTimer = null;
 let foregroundRecoveryInFlight = false;
@@ -876,14 +892,14 @@ function initNetworkLifecycleHandling() {
 }
 
 function syncThemeMenuLabel() {
-  const button = document.getElementById('chat-menu-shared-theme-toggle');
+  const button = document.getElementById('chat-menu-theme-toggle');
   if (!button) return;
   const isLight = document.documentElement.getAttribute('data-theme') === 'light';
   button.textContent = isLight ? '🌙 Night mode' : '☀️ Day mode';
 }
 
 function initThemeMenuToggle() {
-  const themeBtn = document.getElementById('chat-menu-shared-theme-toggle');
+  const themeBtn = document.getElementById('chat-menu-theme-toggle');
   if (!themeBtn) return;
   themeBtn.hidden = false;
   syncThemeMenuLabel();
@@ -940,7 +956,7 @@ function applySharedReaderUi() {
   const modeSelect = document.getElementById('mode-select');
   const chatMenuBtn = document.getElementById('chat-actions-menu-btn');
   const chatMenu = document.getElementById('chat-actions-menu');
-  const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
+  const themeBtn = document.getElementById('chat-menu-theme-toggle');
   const installBtn = document.getElementById('install-btn');
   const activeElement = document.activeElement;
   if (chatMenu && activeElement instanceof Element && chatMenu.contains(activeElement)) {
@@ -957,7 +973,7 @@ function applySharedReaderUi() {
   if (input) {
     input.readOnly = true;
     input.disabled = true;
-    input.placeholder = 'Shared conversation (read-only)';
+    input.placeholder = IS_SHARE_PREVIEW ? 'Preview as shared (read-only)' : 'Shared conversation (read-only)';
   }
   disableSharedControl(sendBtn);
   disableSharedControl(attachBtn);
@@ -973,19 +989,19 @@ function applySharedReaderUi() {
   // trigger usable). The loop below stays as a guard for entries the resolver
   // does not know.
   applyChatActionsMenuState(resolveChatActionsMenuState({ sharedMode: true }));
-  if (chatMenu && sharedThemeBtn) {
+  if (chatMenu && themeBtn) {
     for (const child of Array.from(chatMenu.children)) {
-      if (child !== sharedThemeBtn) hideSharedMenuEntry(child);
+      if (child !== themeBtn) hideSharedMenuEntry(child);
     }
-    sharedThemeBtn.hidden = false;
-    sharedThemeBtn.removeAttribute('aria-hidden');
-    sharedThemeBtn.disabled = false;
-    sharedThemeBtn.tabIndex = 0;
+    themeBtn.hidden = false;
+    themeBtn.removeAttribute('aria-hidden');
+    themeBtn.disabled = false;
+    themeBtn.tabIndex = 0;
     syncThemeMenuLabel();
   } else if (chatMenuBtn) {
     chatMenuBtn.hidden = true;
   }
-  if (chatMenuBtn && !sharedThemeBtn) chatMenuBtn.hidden = true;
+  if (chatMenuBtn && !themeBtn) chatMenuBtn.hidden = true;
 }
 
 function syncChatTitleWatcherIndicator() {
@@ -1032,25 +1048,42 @@ function resolveStableScrollTopForLiveRefresh(messagesEl, capturedScrollTop) {
 function resolveLiveRefreshAtBottom(messagesEl, capturedScrollTop, capturedAtBottom) {
   const current = Number(messagesEl?.scrollTop);
   if (!Number.isFinite(current) || Math.abs(current - Number(capturedScrollTop)) <= 2) return capturedAtBottom;
-  return isMessagesAtBottom();
+  return isMessagesNearBottom();
 }
 
-async function refreshSharedConversation() {
-  if (sharedConversationPollInFlight) return;
+// A stopped or renewed share answers 404. The page stops polling at once and
+// keeps nothing of the conversation on screen; one neutral line stays.
+function endSharedConversationReader() {
+  if (sharedConversationEnded) return;
+  sharedConversationEnded = true;
+  stopSharedModeTimers();
+  document.getElementById('messages')?.replaceChildren();
+  const titleEl = document.getElementById('chat-title');
+  if (titleEl) titleEl.textContent = 'Shared conversation';
+  sharedConversationLastError = '';
+  setModelBanner('This shared conversation is not available.');
+}
+
+async function refreshSharedConversation({ open = false } = {}) {
+  if (sharedConversationPollInFlight || sharedConversationEnded) return;
   const sharedToken = resolveSharedTokenFromLocation();
-  if (!sharedToken) return;
+  if (!sharedToken && !IS_SHARE_PREVIEW) return;
   sharedConversationPollInFlight = true;
   const requestSeq = ++sharedConversationRequestSeq;
   const messagesEl = document.getElementById('messages');
-  const wasAtBottom = isMessagesAtBottom();
+  const wasAtBottom = isMessagesNearBottom();
   const savedScrollTop = messagesEl?.scrollTop || 0;
   try {
     // The reader has no socket today, so nothing moves the count; the guard
     // keeps a rebuild from dropping a live row should one ever arrive.
     const { response, stale } = await loadKeepingLiveRows(
-      () => loadSharedConversation(sharedToken, { limit: 120 }),
+      () => loadSharedConversation(sharedToken, { limit: 120, open }),
       getTranscriptLiveRowEpoch,
     );
+    if (response?.status === 404) {
+      endSharedConversationReader();
+      return;
+    }
     if (requestSeq < sharedConversationAppliedSeq) return;
     if (stale) return;
     if (!response?.ok) {
@@ -1101,15 +1134,29 @@ async function refreshSharedConversation() {
 
 async function pulseSharedViewerPresence() {
   const sharedToken = resolveSharedTokenFromLocation();
-  if (!sharedToken) return;
+  if (!sharedToken || sharedConversationEnded) return;
   await reportSharedViewerPresence(sharedToken, sharedViewerId()).catch(() => {});
+}
+
+// "Preview as shared": the owner's own page, so it says what it is and what
+// the highlights mean; the marks come with the preview payload.
+function initSharePreviewUi() {
+  if (!IS_SHARE_PREVIEW) return;
+  document.body.classList.add('share-preview-mode');
+  const banner = document.getElementById('share-preview-banner');
+  if (banner) {
+    banner.textContent = 'Preview as shared: this is what a share link shows. Green marks what viewers get instead of a path; amber marks what still looks like one. Free text is filtered on a best-effort basis.';
+  }
+  watchPreviewMarks(document.body);
 }
 
 async function initSharedConversationReader() {
   applySharedReaderUi();
-  await refreshSharedConversation();
+  initSharePreviewUi();
+  await refreshSharedConversation({ open: true });
   await pulseSharedViewerPresence();
   stopSharedModeTimers();
+  if (sharedConversationEnded) return;
   sharedConversationPollTimer = setInterval(() => {
     if (!shouldRunForegroundNetworkWork()) return;
     void refreshSharedConversation();
@@ -1126,6 +1173,12 @@ function showAuthError(msg) {
 
 function resolveAuthErrorMessage(result = null) {
   if (result?.status === 401) return 'Invalid token';
+  if (result?.status === 429) {
+    const seconds = Number(result?.payload?.retryAfterSeconds);
+    return Number.isFinite(seconds) && seconds > 0
+      ? `Too many failed sign-in attempts. Try again in ${Math.ceil(seconds)} seconds.`
+      : 'Too many failed sign-in attempts. Try again in a minute.';
+  }
   if (result?.status === 403) return 'Access denied';
   if (result?.status > 0) return `Authentication failed (${result.status})`;
   return String(result?.error || 'Could not reach the relay').trim() || 'Could not reach the relay';
@@ -3672,7 +3725,7 @@ async function pollAuthenticatedCurrentConversationLive() {
   liveConversationPollInFlight = true;
   try {
     const messagesEl = document.getElementById('messages');
-    const wasAtBottom = isMessagesAtBottom();
+    const wasAtBottom = isMessagesNearBottom();
     const savedScrollTop = messagesEl?.scrollTop || 0;
     const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
     const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
@@ -3692,11 +3745,15 @@ async function pollAuthenticatedCurrentConversationLive() {
     if (stale) return;
     const preserveBottom = resolveLiveRefreshAtBottom(messagesEl, savedScrollTop, wasAtBottom);
     const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, savedScrollTop);
+    // The rows are rebuilt: a reader who is not at the end keeps the text
+    // they read where it is, whatever the rows above it measure now.
+    const reading = preserveBottom ? null : captureReadingBlock(messagesEl);
     applyLoadedConversationState(currentId, response, {
       restoreScroll: !preserveBottom,
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
       followLiveUpdates: preserveBottom,
     });
+    if (reading) restoreReadingBlock(messagesEl, reading);
   } finally {
     liveConversationPollInFlight = false;
   }
@@ -3713,6 +3770,7 @@ function startLiveConversationPolling() {
 const transcriptResizeKeeper = createTranscriptResizeKeeper({
   getElement: () => document.getElementById('messages'),
 });
+onTranscriptEndLeft(() => transcriptResizeKeeper.recordEndLeft());
 
 function setupViewportTracking() {
   syncViewportMetrics();
@@ -3913,7 +3971,7 @@ async function refreshCurrentView() {
   const capturedVersion = ++refreshViewVersion;
   const jumpEpoch = getTranscriptJumpEpoch();
   const messagesEl = document.getElementById('messages');
-  const wasAtBottom = isMessagesAtBottom();
+  const wasAtBottom = isMessagesNearBottom();
   const scrollTop = messagesEl?.scrollTop || 0;
 
   await refreshConversations();
@@ -3943,6 +4001,9 @@ async function refreshCurrentView() {
   const keepTranscript = getTranscriptJumpEpoch() !== jumpEpoch || transcriptIsInHistory(currentId) || stale;
   const preserveBottom = resolveLiveRefreshAtBottom(messagesEl, scrollTop, wasAtBottom);
   const stableSavedScrollTop = resolveStableScrollTopForLiveRefresh(messagesEl, scrollTop);
+  // As in the live poll: the text the reader is at stays where it is.
+  const reading = preserveBottom || keepTranscript ? null : captureReadingBlock(messagesEl);
+  let restoredAt = null;
   if (r) {
     applyLoadedConversationState(currentId, r, {
       restoreScroll: !preserveBottom,
@@ -3950,6 +4011,9 @@ async function refreshCurrentView() {
       followLiveUpdates: preserveBottom && !keepTranscript,
       keepTranscript,
     });
+    // At once, and again below once the cards are back on the page.
+    restoreReadingBlock(messagesEl, reading);
+    restoredAt = { scrollTop: messagesEl?.scrollTop };
   } else {
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
@@ -3958,7 +4022,12 @@ async function refreshCurrentView() {
   await loadRelayBoards();
   scheduleContextUsageRefresh(currentId, 0);
   if (messagesEl && !keepTranscript && String(currentConvId || '').trim() === currentId) {
-    if (!preserveBottom && Number.isFinite(stableSavedScrollTop) && stableSavedScrollTop >= 0) {
+    // Two requests later: a reader who has scrolled, pressed the jump
+    // button or sent something meanwhile is where they want to be.
+    const readerMoved = !restoredAt
+      || Math.abs(Number(messagesEl.scrollTop) - Number(restoredAt.scrollTop)) > 2;
+    if (!preserveBottom && !readerMoved && !restoreReadingBlock(messagesEl, reading)
+      && Number.isFinite(stableSavedScrollTop) && stableSavedScrollTop >= 0) {
       messagesEl.scrollTop = stableSavedScrollTop;
     }
     saveConversationScrollTop(currentId, messagesEl.scrollTop);
@@ -4078,10 +4147,14 @@ function syncChatActionsMenuState() {
     cloudSessionUrl: isCloud ? buildCloudLineModel(conversation?.cloud)?.sessionUrl || null : null,
     editing: !!convId && chatTitleEditingConversationId === convId,
     suspendVisible: isSuspendHostActionVisible(),
+    hasActiveShare: hasActiveShare(convId),
   });
   applyChatActionsMenuState(state);
   return state;
 }
+
+// The menu follows the relay's share list (made, renewed, stopped anywhere).
+subscribeShares(() => syncChatActionsMenuState());
 
 function toggleChatActionsMenu() {
   const menu = document.getElementById('chat-actions-menu');
@@ -4092,6 +4165,7 @@ function toggleChatActionsMenu() {
   if (trigger.hidden || trigger.disabled) return;
   syncRefreshHistoryMenuState();
   syncThemeMenuLabel();
+  syncAboutMenuLabel();
   const willOpen = !!menu.hidden;
   menu.hidden = !willOpen;
   trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
@@ -4170,8 +4244,11 @@ function lockChatActionsMenuShield(ms = 300) {
 function syncChatTitleControls() {
   const { title, editor, input } = getChatTitleElements();
   const convId = String(currentConvId || '').trim();
-  // No conversation open (deleted, new chat): its 📍 button goes with it.
-  if (!convId) setPinsConversation(null);
+  // No conversation open (deleted, new chat): its 📍 and 🙈 buttons go with it.
+  if (!convId) {
+    setPinsConversation(null);
+    setHiddenMessagesConversation(null);
+  }
   const conversation = convId ? (conversations[convId] || null) : null;
   const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
   if (title) {
@@ -4429,19 +4506,19 @@ async function initApp() {
   appSharedMode = sharedMode;
   initNetworkLifecycleHandling();
   setForegroundNetworkWorkEnabled(document.visibilityState === 'visible');
-  const sharedThemeBtn = document.getElementById('chat-menu-shared-theme-toggle');
   initTheme();
   initScrollbarHover();
   initThemeMenuToggle();
-  if (sharedThemeBtn && sharedMode) sharedThemeBtn.hidden = false;
   initFontScaling();
   if (!sharedMode) {
     clearLegacyKnownCwdHistoryStorage();
   }
   syncPwaVersionMenuEntry();
   syncQueueStatusMenuEntry();
+  if (!sharedMode) syncAboutMenuLabel();
   if (!sharedMode) {
     syncSuspendHostVisibility();
+    syncScrollOnSendToggle();
     initHostSuspendUi();
     initUsageLimitUi();
   }
@@ -4506,6 +4583,16 @@ async function initApp() {
         });
       });
     }
+    // "Session group…": the picker for the open conversation, reachable on
+    // the phone with the drawer closed.
+    bindMenuAction(document.getElementById('chat-menu-group'), (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      const convId = String(currentConvId || '').trim();
+      if (convId) openConversationGroupPicker(convId);
+    });
     const chatMenuArchiveBtn = document.getElementById('chat-menu-archive');
     bindMenuAction(chatMenuArchiveBtn, (event) => {
       event.preventDefault();
@@ -4536,9 +4623,34 @@ async function initApp() {
         }
         const copied = await copyTextToClipboard(shareUrl);
         showTransientRelayNotice(copied ? 'Share link copied to clipboard.' : shareUrl);
+        void refreshShares().catch(() => {});
       }).catch((error) => {
         showTransientRelayNotice(error?.message || 'Could not create share link.');
       });
+    });
+    // "Stop sharing": only shown while the open conversation has a live link.
+    bindMenuAction(document.getElementById('chat-menu-stop-sharing'), (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      const convId = String(currentConvId || '').trim();
+      if (!convId) return;
+      openStopSharingConfirmation(convId, conversations[convId]?.title || '');
+    });
+    const chatMenuPreviewSharedBtn = document.getElementById('chat-menu-preview-shared');
+    bindMenuAction(chatMenuPreviewSharedBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      const convId = String(currentConvId || '').trim();
+      if (!convId) {
+        showTransientRelayNotice('Select a conversation first.');
+        return;
+      }
+      // Never creates a share link: the preview reads through the owner's route.
+      window.open(`${BASE}/share-preview/${encodeURIComponent(convId)}`, '_blank', 'noopener');
     });
     const chatMenuRefreshHistoryBtn = document.getElementById('chat-menu-refresh-history');
     if (chatMenuRefreshHistoryBtn && !chatMenuRefreshHistoryBtn.hidden && !chatMenuRefreshHistoryBtn.disabled) {
@@ -4591,6 +4703,14 @@ async function initApp() {
       lockChatActionsMenuShield(350);
       closeChatActionsMenu();
       openSettingsModal();
+    });
+    const chatMenuAboutBtn = document.getElementById('chat-menu-about');
+    bindMenuAction(chatMenuAboutBtn, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      void showAbout();
     });
     const chatMenuRestartRelayBtn = document.getElementById('chat-menu-restart-relay');
     bindMenuAction(chatMenuRestartRelayBtn, (event) => {
@@ -4669,6 +4789,7 @@ async function initApp() {
     initBubbleActionHandlers();
     initMessageScrollPersistence();
     initTranscriptJumpToBottom();
+    initSubagentViewer();
     syncChatTitleControls();
     await initSharedConversationReader();
     return;
@@ -4732,6 +4853,7 @@ async function initApp() {
     focusMessage: focusConversationMessageById,
     syncRenderedPinState,
   });
+  initHiddenMessagesView({ syncRenderedShareVisibility });
   initGitChangesView();
   syncChatTitleControls();
   // A provider turned on or off (a Settings save, a catalog change) redraws
@@ -4795,7 +4917,9 @@ async function doAuth() {
 async function bootstrap() {
   if (ensureTrailingSlashPath()) return;
   const sharedMode = isSharedReaderMode();
-  if (sharedMode && navigator.serviceWorker?.getRegistrations) {
+  // The preview runs in the owner's own browser: their app's service worker
+  // (and its push subscription) stays.
+  if (sharedMode && !IS_SHARE_PREVIEW && navigator.serviceWorker?.getRegistrations) {
     navigator.serviceWorker.getRegistrations()
       .then((registrations) => Promise.all(registrations.map((registration) => registration.unregister().catch(() => false))))
       .catch(() => {});
@@ -4882,6 +5006,7 @@ window.saveGrokAllowanceSettings = saveGrokAllowanceSettings;
 window.resetGrokAllowanceAccounting = resetGrokAllowanceAccounting;
 window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
+window.updateScrollOnSendSetting = (enabled) => updateScrollOnSendSetting(enabled);
 window.updateWindowsAutostartMode = updateWindowsAutostartMode;
 window.previewTurnCeilingSetting = previewTurnCeilingSetting;
 window.updateTurnCeilingSetting = updateTurnCeilingSetting;
@@ -4936,6 +5061,8 @@ window.confirmNewConversationModel = confirmNewConversationModel;
 window.closeNewConversationModelModal = closeNewConversationModelModal;
 window.deleteConv = deleteConv;
 window.archiveConv = archiveConv;
+window.openConversationGroupPicker = openConversationGroupPicker;
+window.toggleConversationGroupFold = toggleConversationGroupFold;
 window.unarchiveConv = unarchiveConv;
 window.toggleArchivedConversations = toggleArchivedConversations;
 window.refreshNewConversationCloudRepoList = refreshNewConversationCloudRepoList;
@@ -4977,7 +5104,6 @@ window.setRelayQuestionMultiMode = setRelayQuestionMultiMode;
 window.handleRelayQuestionKey = handleRelayQuestionKey;
 window.openPendingQuestionFromBanner = openPendingQuestionFromBanner;
 window.submitRelayBoardAction = submitRelayBoardAction;
-window.syncAgentExchangeFolds = syncAgentExchangeFoldsNow;
 window.compactCurrentConversation = compactCurrentConversation;
 window.sendMessage = sendMessage;
 window.syncComposerButtonState = syncComposerButtonState;

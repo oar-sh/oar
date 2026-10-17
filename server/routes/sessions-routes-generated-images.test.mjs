@@ -42,6 +42,21 @@ function createMockDb() {
   };
 }
 
+// The share routes read the share through the share repository; the mock
+// database has no tables, so the test hands in the one share it serves.
+function stubShareRepository(token, conversationId) {
+  const share = { token, conversationId, lineageId: token, createdAt: null, revokedAt: null };
+  return {
+    findLiveShare: (value) => (value === token ? share : null),
+    findActiveShare: () => share,
+    readStoreViewerIp: () => true,
+    readViewerKeySecret: () => 'fixture-secret',
+    lastOpenAt: () => null,
+    recordOpen: () => true,
+    forgetConversation: () => 0,
+  };
+}
+
 async function callRoute(handlers, req = {}) {
   const response = {
     statusCode: 200,
@@ -76,8 +91,8 @@ test('shared conversation payload rewrites generated image attachment URLs', asy
     auth: (_req, _res, next) => next(),
     io: { emit() {} },
     db: createMockDb(),
+    shareRepository: stubShareRepository(shareToken, 'conv-1'),
     stmts: {
-      getConversationShareByToken: { get: () => ({ token: shareToken, conversation_id: 'conv-1', revoked_at: null }) },
       touchConversationShare: { run() {} },
       getConvAnyStatus: { get: () => ({ id: 'conv-1', status: 'active', title: 'Demo', sdk_session_id: 'sdk-1', created_at: '2026-01-01', updated_at: '2026-01-01' }) },
       getConvBySdkSessionId: { get: () => null },
@@ -188,8 +203,8 @@ test('shared generated image route blocks traversal-style relative paths', async
     auth: (_req, _res, next) => next(),
     io: { emit() {} },
     db: createMockDb(),
+    shareRepository: stubShareRepository(shareToken, 'conv-1'),
     stmts: {
-      getConversationShareByToken: { get: () => ({ token: shareToken, conversation_id: 'conv-1', revoked_at: null }) },
       touchConversationShare: { run() {} },
       getConvAnyStatus: { get: () => ({ id: 'conv-1', status: 'active', title: 'Demo', sdk_session_id: 'sdk-1', created_at: '2026-01-01', updated_at: '2026-01-01' }) },
       getConvBySdkSessionId: { get: () => null },

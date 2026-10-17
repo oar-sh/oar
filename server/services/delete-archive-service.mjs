@@ -25,7 +25,7 @@ function createSdkDeleteSessionCaller(sdkClient) {
 
 import { cleanupGeneratedImagesForConversation } from './generated-image-cleanup-service.mjs';
 
-export function createDeleteArchiveService(db, sdkClient, { resolveSessionStateRoot = null } = {}) {
+export function createDeleteArchiveService(db, sdkClient, { resolveSessionStateRoot = null, conversationGroups = null } = {}) {
   const callDeleteSession = createSdkDeleteSessionCaller(sdkClient);
 
   const stmts = {
@@ -87,6 +87,9 @@ export function createDeleteArchiveService(db, sdkClient, { resolveSessionStateR
       messageRows: stmts.listConversationMessages.all(conversationId),
       resolveSessionStateRoot,
     });
+    // A head leaves its session group (title frozen as the name) before its
+    // row goes; a group left empty goes with it.
+    try { conversationGroups?.forgetConversation?.(conversationId); } catch {}
     stmts.hardDeleteConversation(conversationId);
   }
 

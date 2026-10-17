@@ -29,6 +29,7 @@ export function createMessageRepository(db) {
         getSharedMessages: shareVisibility.getSharedMessages,
         getMessageByConversation: db.prepare(`SELECT * FROM messages WHERE id = ? AND conversation_id = ? LIMIT 1`),
         setMessageShareVisibility: shareVisibility.setMessageShareVisibility,
+        listHiddenMessages: shareVisibility.listHiddenMessages,
         setMessagePinnedAt: messagePins.setMessagePinnedAt,
         listPinnedMessages: messagePins.listPinnedMessages,
         countPinnedMessages: messagePins.countPinnedMessages,

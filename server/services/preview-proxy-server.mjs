@@ -2,7 +2,7 @@
 
 import http from 'http';
 
-import { parsePreviewPath } from './preview-registry-service.mjs';
+import { parsePreviewPath, previewLogId } from './preview-registry-service.mjs';
 import { serveStaticPreview } from './preview-static-handler.mjs';
 
 // The preview listener. A bare http.Server on its own loopback port whose
@@ -270,12 +270,16 @@ export function createPreviewProxyServer({
     socket.once('error', forget);
   }
 
-  function logHit(entry, req) {
+  // The token is the capability and the request URL carries it, so the line
+  // names the preview by a hash and logs only the upstream path, without query.
+  function logHit(entry, req, upstreamPath) {
     const now = Date.now();
     const last = lastHitLogAt.get(entry.token) || 0;
     if (now - last < 60_000) return;
     lastHitLogAt.set(entry.token, now);
-    logger?.log?.(`[preview] ${entry.token.slice(0, 8)} → :${entry.targetPort} ${req.method} ${req.url} from ${clientIp(req)}`);
+    const target = entry.mode === 'static' ? 'static' : `:${entry.targetPort}`;
+    const pathOnly = String(upstreamPath || '/').split('?')[0];
+    logger?.log?.(`[preview] ${previewLogId(entry.token)} → ${target} ${req.method} ${pathOnly} from ${clientIp(req)}`);
   }
 
   function resolveRequest(req) {
@@ -309,7 +313,7 @@ export function createPreviewProxyServer({
 
     const { entry, upstreamPath } = resolved;
     registry.recordHit(entry.token);
-    logHit(entry, req);
+    logHit(entry, req, upstreamPath);
 
     // Static previews are answered in-process — no upstream, no forwarding.
     if (entry.mode === 'static') {

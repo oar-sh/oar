@@ -20,5 +20,15 @@ export function createShareVisibilityStatements(db) {
           WHERE id = ? AND conversation_id = ?
         `)
       : null,
+    // Conversation order, like the pin list. Null on a database without the
+    // columns: every caller treats that as "nothing hidden".
+    listHiddenMessages: messagesSupportShareVisibility
+      ? db.prepare(`
+          SELECT id, role, text, mode, attachments, timestamp, share_hidden_at
+          FROM messages
+          WHERE conversation_id = ? AND hidden_from_shares = 1
+          ORDER BY timestamp ASC
+        `)
+      : null,
   };
 }

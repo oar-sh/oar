@@ -32,6 +32,7 @@ import {
   extractModelDescriptors,
   normalizeContextLimitTokens,
 } from '../shared/model-descriptors.mjs';
+import { windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -379,7 +380,7 @@ async function spawnForegroundCliViaPowerShell(tcpConnectionToken, port) {
   ].join(' ');
 
   const psCommand = `$env:COPILOT_CONNECTION_TOKEN='${tcpConnectionToken}'; & '${NODE_PATH}' ${nodeArgs}`;
-  const child = await waitForProcessSpawn('powershell.exe', [
+  const child = await waitForProcessSpawn(windowsSystemToolPath('powershell.exe'), [
     '-NoExit',
     '-Command',
     psCommand,

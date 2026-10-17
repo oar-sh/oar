@@ -18,6 +18,10 @@ import { migrateSubagentTimeline } from './migrations/0009-subagent-timeline.mjs
 import { migrateSubagentTimelinePruning } from './migrations/0010-subagent-timeline-pruning.mjs';
 import { migrateRelayEventSubscriptions } from './migrations/0011-relay-event-subscriptions.mjs';
 import { migrateCrossRelayEventSubscriptions } from './migrations/0012-cross-relay-event-subscriptions.mjs';
+import { migratePreviews } from './migrations/0013-previews.mjs';
+import { migrateConversationGroups } from './migrations/0014-conversation-groups.mjs';
+import { migrateConversationGroupPosition } from './migrations/0015-conversation-group-position.mjs';
+import { migrateShareAccessLog } from './migrations/0016-share-access-log.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -426,8 +430,8 @@ export const SCHEMA_SQL = `
     ON workflow_runs(conversation_id);
 
   -- Previews published mid-turn, pinned to the transcript. Snapshot JSON, not a
-  -- registry reference: the registry is in-memory and the card must still
-  -- render after the preview closes or the relay restarts. Written with the
+  -- registry reference: the card must still render after the preview closes
+  -- (or after a restart dropped it as no longer valid). Written with the
   -- queue id (the response id does not exist yet mid-turn) and linked to the
   -- response at finalize, exactly like relay_activity.
   CREATE TABLE IF NOT EXISTS preview_cards (
@@ -444,6 +448,24 @@ export const SCHEMA_SQL = `
     ON preview_cards(response_message_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_preview_cards_queue
     ON preview_cards(queue_message_id);
+
+  -- Published previews, restored at boot so their public links survive a
+  -- restart. Existing databases get the table from migration 0013 (same
+  -- columns; a test keeps the two declarations equal). Times are epoch ms.
+  -- Its index comes from the migration only, which skips a previews table of
+  -- other columns instead of failing the boot over it.
+  CREATE TABLE IF NOT EXISTS previews (
+    token           TEXT PRIMARY KEY,
+    mode            TEXT NOT NULL,
+    conversation_id TEXT,
+    label           TEXT NOT NULL,
+    target_host     TEXT,
+    target_port     INTEGER,
+    root_dir        TEXT,
+    created_at      INTEGER NOT NULL,
+    last_hit_at     INTEGER,
+    host_boot_id    TEXT
+  );
 
   CREATE TABLE IF NOT EXISTS uploaded_files (
     sha256        TEXT PRIMARY KEY,
@@ -777,6 +799,41 @@ try {
   migrateCrossRelayEventSubscriptions(db);
 } catch (error) {
   console.warn(`[relay-events] migration 0012 failed; retrying on next boot: ${error?.message || error}`);
+}
+// Persisted previews: one new table. The preview store checks for it and keeps
+// previews in memory only without it, so a failure is logged and retried next
+// boot like 0012.
+try {
+  migratePreviews(db);
+} catch (error) {
+  console.warn(`[previews] migration 0013 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Session groups: the group table and the conversations' group column. The
+// group repository checks for them and sees no groups without them, so a
+// failure is logged and retried next boot like 0012.
+try {
+  migrateConversationGroups(db);
+} catch (error) {
+  console.warn(`[session-groups] migration 0014 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// A hand order inside a session group: one column. The group repository
+// checks for it and keeps the activity order without it, so a failure is
+// logged and retried next boot like 0014.
+try {
+  migrateConversationGroupPosition(db);
+} catch (error) {
+  console.warn(`[session-groups] migration 0015 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Share lineages and the share access log: one column, one table. The share
+// repository checks for them; without them a renew starts a fresh lineage and
+// no open is logged, so a failure is logged and retried next boot like 0015.
+try {
+  migrateShareAccessLog(db);
+} catch (error) {
+  console.warn(`[shares] migration 0016 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

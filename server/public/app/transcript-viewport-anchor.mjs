@@ -94,6 +94,135 @@ export function restoreTranscriptAnchor(el, anchor) {
   return Number(el.scrollTop || 0) !== before;
 }
 
+/** The blocks of a rendered message a reader reads one at a time. */
+export const READING_BLOCK_SELECTOR = 'p, li, pre, h1, h2, h3, h4, h5, h6, tr';
+
+// The live bubble of a running turn: a row under its prompt, with the
+// prompt's message id.
+const LIVE_ROW_ID = 'thinking-indicator';
+// How many rows after the prompt the reply is looked for in.
+const REPLY_SEARCH_ROWS = 3;
+
+// A block's text without its controls: a finished reply's code block holds
+// its Copy button, the same block of the streamed reply does not.
+function blockText(block) {
+  if (typeof block.querySelector !== 'function' || !block.querySelector('button')) {
+    return String(block.textContent || '');
+  }
+  const copy = block.cloneNode(true);
+  copy.querySelectorAll('button').forEach((node) => node.remove());
+  return String(copy.textContent || '');
+}
+
+function sameBlocks(scope, tag, text) {
+  return Array.from(scope.querySelectorAll(tag)).filter((node) => blockText(node) === text);
+}
+
+// A block the reader can see. Inside a closed fold (a reply's thoughts, an
+// event row) it cannot be read, yet the browser still gives it a box there:
+// the fold's content is skipped, not removed from the layout.
+function isReadable(block, rect) {
+  if (!(rect.bottom - rect.top > 0)) return false;
+  if (typeof block.checkVisibility === 'function') return block.checkVisibility();
+  return typeof block.closest !== 'function' || !block.closest('details:not([open]) > :not(summary)');
+}
+
+/**
+ * The block of text the reader is at: the first one that starts inside the
+ * viewport, else the one that reaches into it from above (a code block
+ * taller than the screen). Finer than the row anchor above, for the times
+ * the rows themselves are rebuilt: a reload of the conversation, or the reply
+ * that takes the live bubble's place. There the same text comes back in a
+ * row whose other parts (folded thoughts, tool lines, the usage line) have
+ * another height, and a row or a pixel anchor moves the text by that much.
+ *
+ * `scope` limits the search to one element (the live bubble's stream);
+ * without it the rows that cross the viewport are searched. Returns null
+ * when no block is there (the reader looks at an image, or at a card).
+ */
+export function captureReadingBlock(el, { scope = null } = {}) {
+  if (!el) return null;
+  const view = el.getBoundingClientRect();
+  const scopes = scope ? [scope] : transcriptRows(el).filter((row) => {
+    const rect = row.getBoundingClientRect();
+    return rect.bottom > view.top && rect.top < view.bottom;
+  });
+  let found = null;
+  let foundScope = null;
+  for (const candidate of scopes) {
+    for (const block of candidate.querySelectorAll(READING_BLOCK_SELECTOR)) {
+      const rect = block.getBoundingClientRect();
+      if (!isReadable(block, rect) || rect.bottom <= view.top) continue;
+      if (rect.top >= view.bottom) break;
+      found = { block, rect };
+      foundScope = candidate;
+      // The first block that starts in view ends the search; one that only
+      // reaches into it is kept until a later one does.
+      if (rect.top >= view.top) break;
+    }
+    if (found && found.rect.top >= view.top) break;
+  }
+  if (!found) return null;
+  const { block, rect } = found;
+  const tag = String(block.tagName || '').toLowerCase();
+  const text = blockText(block);
+  const height = Math.max(0, rect.bottom - rect.top);
+  const offset = rect.top - view.top;
+  return {
+    messageId: String(foundScope?.dataset?.messageId || '').trim() || null,
+    // Read in the live bubble: the reply that replaces it is another row.
+    live: foundScope?.id === LIVE_ROW_ID,
+    tag,
+    text,
+    // Which of the row's blocks with this very text (a repeated line).
+    occurrence: Math.max(0, sameBlocks(foundScope, tag, text).indexOf(block)),
+    offset,
+    // Scaled to the block's height when its top is scrolled past, so the
+    // same share of it stays hidden if it comes back with another height.
+    offsetFraction: offset < 0 && height > 0 ? offset / height : null,
+  };
+}
+
+// The rows the captured block can be in now. A block read in the live bubble
+// is in that bubble while the turn runs, and in the reply once it has ended:
+// one of the rows that follow the prompt.
+function readingBlockHosts(el, anchor) {
+  const messageId = String(anchor.messageId || '').trim();
+  if (!messageId) return [];
+  const rows = transcriptRows(el);
+  const matches = (row) => String(row.dataset?.messageId || '').trim() === messageId;
+  if (!anchor.live) return rows.filter((row) => matches(row) && row.id !== LIVE_ROW_ID).slice(0, 1);
+  const live = rows.find((row) => matches(row) && row.id === LIVE_ROW_ID);
+  if (live) return [live];
+  const prompt = rows.findIndex(matches);
+  return prompt < 0 ? [] : rows.slice(prompt + 1, prompt + 1 + REPLY_SEARCH_ROWS);
+}
+
+/**
+ * Scrolls so the captured block sits where it was. It is looked for in
+ * `scope` when given (the reply that replaced the live bubble), else in the
+ * row it was captured in. Returns false when it is not there; the caller
+ * falls back to what it did before.
+ */
+export function restoreReadingBlock(el, anchor, { scope = null } = {}) {
+  if (!el || !anchor?.tag) return false;
+  let block = null;
+  for (const host of (scope ? [scope] : readingBlockHosts(el, anchor))) {
+    const matches = sameBlocks(host, anchor.tag, anchor.text).filter((node) => isReadable(node, node.getBoundingClientRect()));
+    block = matches[anchor.occurrence] || matches[0] || null;
+    if (block) break;
+  }
+  if (!block) return false;
+  const view = el.getBoundingClientRect();
+  const rect = block.getBoundingClientRect();
+  const target = anchor.offsetFraction === null || anchor.offsetFraction === undefined
+    ? Number(anchor.offset || 0)
+    : Number(anchor.offsetFraction) * Math.max(0, rect.bottom - rect.top);
+  const delta = rect.top - view.top - target;
+  if (Math.abs(delta) > 0.5) el.scrollTop = Number(el.scrollTop || 0) + delta;
+  return true;
+}
+
 const KEYBOARD_INPUT_TYPES = new Set(['', 'text', 'search', 'email', 'url', 'tel', 'number', 'password']);
 
 /**
@@ -201,8 +330,19 @@ export function createTranscriptResizeKeeper({
     return apply(el);
   }
 
+  // Content landed under a reader who followed the end and was not followed
+  // (no scroll event tells): the position is what it is now, not "the end".
+  function recordEndLeft() {
+    if (settleTimer !== null) return false;
+    const el = element();
+    const next = el ? capture(el) : null;
+    if (next) committed = next;
+    return Boolean(next);
+  }
+
   return {
     recordScroll,
+    recordEndLeft,
     handleResize,
     isSettling: () => settleTimer !== null,
     committedAnchor: () => committed,

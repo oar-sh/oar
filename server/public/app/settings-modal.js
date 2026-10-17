@@ -36,6 +36,7 @@ import {
   requestRelayRestart,
 } from './api-client.js';
 import { DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES } from './background-task-timeout-options.mjs';
+import { describeRelayRestartError } from './relay-restart-error.mjs';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncInstalledAppUiState, syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
@@ -48,6 +49,8 @@ import { refreshCliInstallSections } from './cli-install-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
 import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
 import { refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
+import { refreshSharedConversationsSection } from './shared-conversations-settings.js';
+import { syncScrollOnSendToggle } from './transcript-jump-bottom.mjs';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -1337,14 +1340,32 @@ export async function removeOpenAISettings() {
   }
 }
 
+const WINDOWS_BOOT_CUSTOMISATION_LABELS = Object.freeze({
+  action: 'what it runs',
+  'working-directory': 'working folder',
+  'logon-type': 'logon type',
+  trigger: 'trigger',
+  'boot-delay': 'boot delay',
+  launcher: 'launcher edited or from an older OAR',
+  'launcher-missing': 'launcher missing',
+});
+
 function windowsAutostartStatusText() {
   const boot = windowsAutostartState?.boot;
   if (boot?.pendingElevation) {
     return 'Confirm the admin prompt on the PC… (it only appears on the physical desktop)';
   }
   if (boot?.lastError) return boot.lastError;
+  if (boot?.readError) return `The boot task could not be read: ${boot.readError}`;
   if (windowsAutostartState?.mode === 'boot' && windowsAutostartState?.signinEnabled) {
     return 'A sign-in Startup entry also exists and can double-start the relay. Re-select "At system startup" to clean it up.';
+  }
+  if (windowsAutostartState?.mode === 'boot' && boot?.customised) {
+    const labels = (boot.customisations || []).map((name) => WINDOWS_BOOT_CUSTOMISATION_LABELS[name] || name);
+    return `The boot task or its launcher differs from what OAR generates (${labels.join(', ')}). Re-selecting "At system startup" regenerates both and keeps a changed launcher as a .bak copy.`;
+  }
+  if (windowsAutostartState?.mode === 'boot' && boot?.launcherBackupPath) {
+    return `The previous launcher was replaced and kept as ${boot.launcherBackupPath}.`;
   }
   if (boot?.taskStatus === 'foreign') {
     return `A task named "${boot.taskName}" exists but was not created by OAR. Selecting "At system startup" replaces it.`;
@@ -1425,7 +1446,7 @@ export async function refreshWindowsAutostartSetting() {
     }
     windowsAutostartState = result;
   } catch (error) {
-    alert(error?.message || 'Failed to read the Windows autostart setting.');
+    alert(error?.message ? `Failed to read the Windows autostart setting: ${error.message}` : 'Failed to read the Windows autostart setting.');
   } finally {
     windowsAutostartUpdateInFlight = false;
     syncWindowsAutostartSetting();
@@ -1459,7 +1480,7 @@ export async function updateWindowsAutostartMode(mode) {
       );
     }
   } catch (error) {
-    alert(error?.message || 'Failed to update the Windows autostart setting.');
+    alert(error?.message ? `Failed to update the Windows autostart setting: ${error.message}` : 'Failed to update the Windows autostart setting.');
   } finally {
     windowsAutostartUpdateInFlight = false;
     syncWindowsAutostartSetting();
@@ -1579,9 +1600,17 @@ async function restartRelayForFeatureFlags() {
   featureFlagsUpdateInFlight = true;
   syncFeatureFlagsSection();
   try {
-    const result = await requestRelayRestart({ reason: 'feature-flags-changed' });
-    if (!result) {
-      alert('Failed to request a relay restart. Restarts can only be requested from the relay host itself.');
+    let result = null;
+    try {
+      result = await requestRelayRestart({ reason: 'feature-flags-changed' });
+    } catch (error) {
+      const { kind, text } = describeRelayRestartError(error);
+      if (kind === 'refused') alert(text);
+      else showTransientRelayNotice(text, 9000);
+      return;
+    }
+    if (!result?.ok) {
+      alert('Failed to request a relay restart.');
       return;
     }
     showTransientRelayNotice('Relay restart requested. It will restart once the running turns finish; queued messages wait for it.');
@@ -1684,14 +1713,15 @@ export async function updateDefaultSessionWorkspaceRootSetting(rawValue) {
 }
 
 // "Live previews": every preview across every session, not just this
-// conversation's. Previews never expire, so this list is the one place that can
-// close a link left behind in a conversation you have moved on from.
+// conversation's. Previews never expire and survive a relay restart, so this
+// list is the one place that can close a link left behind in a conversation
+// you have moved on from; age and last use show which ones are stale.
 export function renderPreviewsSection() {
   const list = document.getElementById('settings-previews-list');
   const empty = document.getElementById('settings-previews-empty');
   if (!list) return;
   const previews = getPreviews();
-  renderPreviewRowsInto(list, previews, { withConversation: true });
+  renderPreviewRowsInto(list, previews, { withConversation: true, withAge: true });
   if (empty) {
     empty.hidden = previews.length > 0;
     empty.textContent = 'No previews are published right now.';
@@ -1726,6 +1756,7 @@ export function openSettingsModal(tab, providerTab) {
     themeSelect.value = readLocalStorage(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
   }
   syncSuspendHostVisibility();
+  syncScrollOnSendToggle();
   syncFontScaleSelect();
   syncPwaAppNameInput();
   syncDefaultSessionWorkspaceRootInput();
@@ -1762,6 +1793,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshSubagentRecordRetentionSetting();
   void refreshPushSettingsSection();
   void refreshPreviewsSection();
+  void refreshSharedConversationsSection();
   void refreshRemoteRelaysSection();
   void refreshAgentSessionsSection();
   void refreshFeatureFlagsSection();

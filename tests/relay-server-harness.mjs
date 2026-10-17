@@ -186,6 +186,10 @@ export function buildRelayServerEnv({
   return {
     ...process.env,
     COPILOT_WORKSPACE_ROOT: repoRoot,
+    // The package root, which a relay exports to its sessions: inherited, the
+    // test server would report that install's version and commit and start
+    // its workers from there instead of from this checkout.
+    COPILOT_WEB_RELAY_ROOT: repoRoot,
     COPILOT_WEB_RELAY_DATA_DIR: dataDir,
     // The host's log folder must not be inherited (a relay that starts the
     // suite from one of its own sessions exports it): this server's console
@@ -282,6 +286,12 @@ export function buildRelayServerEnv({
     // deferred suspend (tests/host-suspend.spec.mjs) logs instead of running
     // SetSuspendState.
     OAR_HOST_SUSPEND_DRY_RUN: "1",
+    // A relay that only just started holds a suspend back and keeps `all_idle`
+    // waiting for 45 s, in case workers that outlived the runtime before it
+    // have not reported yet. A test relay has no such workers and is asked
+    // within seconds of its start; the spec about restarts
+    // (tests/background-tasks-relay-restart.spec.mjs) un-pins this.
+    OAR_BOOT_REPORTING_WINDOW_MS: "0",
 
     // --- Claude Cloud -----------------------------------------------------
     // A test relay must never reach the Anthropic API. The cloud client sends

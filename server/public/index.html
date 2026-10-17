@@ -29,6 +29,10 @@
     if (sharedIdx >= 0) {
       return path.slice(0, sharedIdx).replace(/\/+$/, '');
     }
+    const previewIdx = path.indexOf('/share-preview/');
+    if (previewIdx >= 0) {
+      return path.slice(0, previewIdx).replace(/\/+$/, '');
+    }
     return path.replace(/\/+$/, '');
   };
   const __APP_BASE = typeof __APP_CONFIG?.basePath === 'string' && __APP_CONFIG.basePath.trim()
@@ -526,6 +530,31 @@
     opacity: 0;
     pointer-events: none;
   }
+  /* "Preview as shared": what a viewer gets instead of a path, and what still
+     looks like one (share-preview-marks.mjs). */
+  mark.share-preview-redacted,
+  mark.share-preview-suspect {
+    color: inherit;
+    border-radius: 3px;
+    padding: 0 2px;
+  }
+  mark.share-preview-redacted {
+    background: rgba(63, 185, 80, 0.18);
+    box-shadow: inset 0 -1px 0 rgba(63, 185, 80, 0.65);
+  }
+  mark.share-preview-suspect {
+    background: rgba(210, 153, 34, 0.2);
+    box-shadow: inset 0 -2px 0 rgba(210, 153, 34, 0.9);
+  }
+  #share-preview-banner {
+    display: none;
+    padding: 6px 12px;
+    font-size: var(--fs-meta-sm);
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+  }
+  body.share-preview-mode #share-preview-banner { display: block; }
   body.shared-reader-mode #sidebar,
   body.shared-reader-mode #sidebar-resizer,
   body.shared-reader-mode #sidebar-overlay,
@@ -586,7 +615,8 @@
   .header-icon-count:empty { display: none; }
   /* The display rule above outranks the UA [hidden] rule, same trap as the
      other [hidden] overrides in this file. */
-  #pinned-messages-btn[hidden] { display: none; }
+  #pinned-messages-btn[hidden],
+  #hidden-messages-btn[hidden] { display: none; }
   /* Same trap: without this the ⋯ trigger stays drawn as a dead button. */
   #chat-actions-menu-btn[hidden] { display: none; }
   #cli-dot {
@@ -660,7 +690,8 @@
   /* The display rule above outranks the UA [hidden] rule, same trap as the
      other [hidden] overrides in this file. */
   #conv-filter-clear[hidden] { display: none; }
-  #conv-filter-status {
+  #conv-filter-status,
+  #conv-list-announce {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -906,6 +937,118 @@
     font-weight: 600;
     vertical-align: middle;
   }
+  /* ── Session groups in the sidebar ──
+     A head row (the session that created the others, or a line of its own for
+     a hand-made or headless group) with a fold button and a pill that sums up
+     the members; the members indented under it while the group is open. */
+  .conv-group-fold {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; margin: 0 2px 0 -4px; padding: 0;
+    border: none; border-radius: 6px; background: transparent; color: var(--muted);
+    font: inherit; font-size: var(--fs-meta-md); line-height: 1; cursor: pointer; vertical-align: middle;
+  }
+  .conv-group-fold:hover { background: var(--bg3); color: var(--text); }
+  .conv-item.conv-group-synthetic { cursor: default; }
+  .conv-item.conv-group-synthetic .conv-title { color: var(--text); font-weight: 600; }
+  .conv-item.conv-group-synthetic.worker-ui-question .conv-title { color: var(--conversation-title-question); }
+  .conv-item.conv-group-member {
+    margin-left: 14px;
+    border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+    border-top-left-radius: 0; border-bottom-left-radius: 0;
+  }
+  /* The head row keeps its title and meta line clear of the archive and
+     delete icons (absolute, at the row's right), so nothing sits under them
+     on hover; a synthetic head has no icons. The margin is outside the
+     rectangles, so a measurement sees the clearance. */
+  .conv-item.conv-group-head:not(.conv-group-synthetic) .conv-title,
+  .conv-item.conv-group-head:not(.conv-group-synthetic) .conv-meta {
+    padding-right: 0;
+    margin-right: 48px;
+  }
+  /* In a head row's meta line the date gives way first and completely, then
+     the pill shortens with an ellipsis (its full text is its title), and the
+     provider chip always stays inside. Both shrink factors are 1 or more:
+     a factor below 1 that is left alone shrinks only that share of the
+     overflow, which is how the chip once left the row. */
+  .conv-item.conv-group-head .conv-meta-primary { flex: 0 1000 auto; }
+  .conv-group-summary {
+    display: inline-block; flex: 0 1 auto; min-width: 2.5em;
+    padding: 0 6px; border-radius: 999px;
+    border: 1px solid color-mix(in srgb, currentColor 40%, transparent);
+    background: color-mix(in srgb, currentColor 12%, transparent);
+    color: var(--muted); font-size: var(--fs-ui-chip); font-weight: 600; line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+  }
+  .conv-group-summary-running { color: var(--conversation-title-ready); }
+  .conv-group-summary-waiting { color: var(--conversation-title-question); cursor: pointer; }
+  .conv-group-summary-error { color: var(--conversation-title-error); }
+  .conv-group-summary[data-open-waiting]:hover { border-color: currentColor; }
+  /* Drag and drop (conversation-list-drag.mjs): a long press lifts a row, the
+     dragged row stays dimmed in place while a ghost follows the pointer, a
+     line shows where it lands, the target group is tinted, and a loose row
+     that would make a new group with it is highlighted. */
+  .conv-item.conv-drag-lifted {
+    background: var(--bg3);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+    transform: scale(1.02);
+    transition: transform 0.12s ease-out, box-shadow 0.12s ease-out;
+    z-index: 1;
+  }
+  #conv-list.conv-list-dragging { cursor: grabbing; }
+  #conv-list.conv-list-dragging .conv-item { cursor: grabbing; }
+  #conv-list.conv-list-dragging .conv-item:hover:not(.conv-drop-group):not(.conv-drop-new-group) { background: transparent; }
+  .conv-item.conv-drag-source { opacity: 0.35; }
+  .conv-item.conv-drag-ghost {
+    position: fixed; z-index: 12900; margin: 0; pointer-events: none;
+    background: var(--bg2); border-color: var(--accent);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45); opacity: 0.95;
+    cursor: grabbing; will-change: transform;
+  }
+  .conv-item.conv-drop-group {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  .conv-item.conv-drop-new-group,
+  .conv-item.conv-drop-inside {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-color: var(--accent);
+  }
+  .conv-item.conv-drop-before::before,
+  .conv-item.conv-drop-after::after {
+    content: ''; position: absolute; left: 4px; right: 4px; height: 3px;
+    border-radius: 2px; background: var(--accent); pointer-events: none;
+  }
+  .conv-item.conv-drop-before::before { top: -3px; }
+  .conv-item.conv-drop-after::after { bottom: -3px; }
+  .conv-item.conv-drop-flash { animation: conv-drop-flash 1.1s ease-out; }
+  @keyframes conv-drop-flash {
+    0%, 30% { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+    100% { background: transparent; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .conv-item.conv-drag-lifted { transform: none; transition: none; }
+    .conv-item.conv-drop-flash { animation: none; outline: 2px solid var(--accent); outline-offset: -2px; }
+  }
+  /* The group picker and the rename form (inside the summary modal). */
+  .conv-group-choices { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+  .conv-group-choice {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 10px; width: 100%;
+    padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg3); color: var(--text);
+    font: inherit; font-size: var(--fs-meta-md); text-align: left; cursor: pointer;
+  }
+  .conv-group-choice:hover:not([disabled]), .conv-group-choice:focus-visible { border-color: var(--accent); outline: none; }
+  .conv-group-choice[disabled] { opacity: 0.6; cursor: default; }
+  .conv-group-choice-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .conv-group-choice-count { flex: 0 0 auto; color: var(--muted); font-size: var(--fs-meta-xs); }
+  .conv-group-picker-empty { color: var(--muted); font-size: var(--fs-meta-md); margin: 0 0 6px; }
+  .conv-group-form { margin-top: 14px; }
+  .conv-group-form-label { display: block; color: var(--muted); font-size: var(--fs-meta-xs); margin-bottom: 4px; }
+  .conv-group-form-row { display: flex; gap: 8px; align-items: center; }
+  .conv-group-input {
+    flex: 1 1 auto; min-width: 0; width: 100%; padding: 7px 10px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit;
+  }
+  .conv-group-input:focus { outline: none; border-color: var(--accent); }
   /* ── Main Chat ── */
   #main {
     /* Containing block for #transcript-separator-rail. Safe to add: every
@@ -2229,9 +2372,42 @@
     text-align: center;
   }
   .jump-to-bottom-badge[hidden] { display: none; }
+  /* Something new landed below a reader who is scrolled up: the accent
+     colour, and a count or (news without a row to count) a dot. */
+  #jump-to-bottom-btn[data-state="new"] { border-color: var(--accent); color: var(--accent); }
+  .jump-to-bottom-badge.jump-to-bottom-badge-dot {
+    top: -3px;
+    right: -3px;
+    min-width: 12px;
+    width: 12px;
+    height: 12px;
+    padding: 0;
+    border-radius: 50%;
+    border: 2px solid var(--bg2);
+  }
+  /* A question, an approval or a board waits below: the button is filled. */
+  #jump-to-bottom-btn[data-state="question"] {
+    border-color: var(--warn);
+    background: var(--warn);
+    color: #000;
+    animation: jump-to-bottom-attention 1.6s ease-out 2;
+  }
+  :root[data-theme="light"] #jump-to-bottom-btn[data-state="question"] { color: #fff; }
+  #jump-to-bottom-btn[data-state="question"] .jump-to-bottom-badge {
+    background: var(--bg2);
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    line-height: 16px;
+    font-size: 12px;
+  }
+  @keyframes jump-to-bottom-attention {
+    0% { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), 0 0 0 0 var(--warn); }
+    100% { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), 0 0 0 12px transparent; }
+  }
   @media (prefers-reduced-motion: reduce) {
     #jump-to-bottom-btn,
     #jump-to-bottom-btn.visible { transition: none; }
+    #jump-to-bottom-btn[data-state="question"] { animation: none; }
   }
   /* ── Context usage modal ── */
   .ctx-usage-model {
@@ -2565,6 +2741,25 @@
   }
   .plan-usage-link { color: var(--accent); text-decoration: none; }
   .plan-usage-link:hover { text-decoration: underline; }
+  /* About OAR: the plan-usage cards and tables, stacked. */
+  .about-modal { display: flex; flex-direction: column; gap: 12px; }
+  .about-section .plan-usage-card-head { margin-bottom: 4px; }
+  .about-section code { font-size: 0.82rem; }
+  .about-usage-provider { font-size: 0.82rem; font-weight: 600; margin-top: 8px; }
+  .about-usage-provider:first-child { margin-top: 0; }
+  .about-state { font-weight: 600; }
+  .about-state[data-state="online"] { color: var(--success); }
+  .about-state[data-state="offline"] { color: var(--warn); }
+  .about-state[data-state="idle"] { color: var(--muted); }
+  .about-inline-button {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .about-links { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; font-size: 0.86rem; padding: 2px 0 4px; }
   @media (prefers-reduced-motion: reduce) {
     .plan-usage-bar-fill { transition: none; }
   }
@@ -3213,6 +3408,32 @@
   .preview-close:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
   .preview-close:disabled { opacity: 0.5; cursor: default; }
   #settings-previews-empty { color: var(--muted); font-size: var(--fs-meta-sm); }
+  /* Settings → Sharing: one row per shared conversation, the preview row's
+     grammar, with its access log folded underneath. */
+  #settings-shares-list { width: 100%; }
+  .share-row { margin-top: 8px; padding: 6px 8px; border-radius: 8px; background: var(--bg2); }
+  .share-row-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .share-row-main { flex: 1 1 220px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .share-row-title {
+    background: none; border: 0; padding: 0; text-align: left; cursor: pointer;
+    color: var(--text); font: inherit; overflow-wrap: anywhere;
+  }
+  .share-row-title:hover { color: var(--accent); text-decoration: underline; }
+  .share-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .share-row-actions button {
+    flex-shrink: 0; background: transparent; border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 3px 10px; cursor: pointer;
+    font-size: var(--fs-meta-sm); line-height: 1.5;
+  }
+  .share-row-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .share-row-actions button.share-stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
+  .share-row-actions button:disabled { opacity: 0.5; cursor: default; }
+  .share-opens { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 4px; }
+  .share-open { padding: 4px 0; font-size: var(--fs-meta-sm); border-bottom: 1px solid var(--border); }
+  .share-open:last-child { border-bottom: 0; }
+  .share-open-meta { color: var(--text); }
+  .share-open-agent { color: var(--muted); overflow-wrap: anywhere; }
+  #settings-shares-empty { color: var(--muted); font-size: var(--fs-meta-sm); }
   /* Remote relays (Settings → Relays, the @mention popup): a health dot —
      online green, unreachable/refused red, never checked grey. */
   .remote-relay-dot {
@@ -3332,17 +3553,15 @@
   .relay-event-line.relay-event-error,
   .relay-event-line.relay-event-task-failed,
   .relay-event-line.relay-event-stalled { color: var(--text, inherit); }
-  /* Agent exchanges: an agent's prompt and this session's reply folded into
-     one row in the event rows' look (agent-exchange-fold-view.mjs). The row
-     is the first child of the prompt's own node; closed, the prompt's bubble
-     and the exchange's other rows (the reply, the live bubble) are hidden.
-     The prompt's node spans the pane for the row; its bubble keeps a user
-     bubble's width. */
+  /* Agent exchanges: an agent's prompt folded into one row in the event
+     rows' look (agent-exchange-fold-view.mjs). The row is the first child of
+     the prompt's own node; closed, the prompt's bubble is hidden. The reply
+     and the live bubble are never part of it. The prompt's node spans the
+     pane for the row; its bubble keeps a user bubble's width. */
   .msg.agent-exchange-head { align-self: stretch; max-width: 100%; }
   .msg.agent-exchange-head > .msg-bubble { max-width: 82%; }
   .msg.agent-exchange-head.agent-exchange-closed > .msg-bubble,
-  .msg.agent-exchange-head.agent-exchange-closed > .msg-label,
-  #messages > .msg.agent-exchange-member.agent-exchange-closed { display: none; }
+  .msg.agent-exchange-head.agent-exchange-closed > .msg-label { display: none; }
   .agent-exchange-row {
     align-self: stretch; min-width: 0;
     border: 1px dashed var(--border); border-left: 3px solid var(--accent);
@@ -3719,7 +3938,19 @@
   .file-preview-markdown p { margin-bottom: 0.55em; }
   .file-preview-markdown h1, .file-preview-markdown h2, .file-preview-markdown h3 { margin: 0.6em 0 0.35em; }
   .file-preview-markdown ul, .file-preview-markdown ol { margin-left: 1.3em; margin-bottom: 0.55em; }
-  .file-preview-markdown table { border-collapse: collapse; width: 100%; max-width: 100%; margin: 0.55em 0; font-size: 0.88em; }
+  /* A table wider than the text scrolls sideways in its own box, as code
+     does: the body itself never scrolls sideways, and the gallery swipe
+     knows to leave a sideways scroller alone. */
+  .file-preview-markdown table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border-collapse: collapse;
+    margin: 0.55em 0;
+    font-size: 0.88em;
+  }
   .file-preview-markdown th, .file-preview-markdown td { border: 1px solid var(--border); padding: 6px 9px; }
   .file-preview-markdown th { background: var(--bg3); }
   .file-preview-markdown img { display: block; max-width: 100%; height: auto; }
@@ -4763,6 +4994,44 @@
     font-size: var(--fs-meta-sm);
     padding: 8px 6px;
   }
+  /* Hidden messages list (kind 'hidden-messages'): the pin list's rows, with
+     Unhide as a word where the pin list has 🗑, and Unhide all above. */
+  .hidden-row-unhide {
+    appearance: none;
+    border: 0;
+    border-left: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    flex: 0 0 auto;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 12px;
+    font: inherit;
+    font-size: var(--fs-meta-sm);
+  }
+  .hidden-row-unhide:hover:not(:disabled) {
+    color: var(--accent);
+    background: var(--bg2);
+  }
+  .hidden-row-unhide:disabled { cursor: wait; opacity: 0.55; }
+  .hidden-list-actions,
+  .hidden-unhide-all-confirm {
+    margin-bottom: 10px;
+  }
+  .hidden-list-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .hidden-unhide-all-confirm {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  .hidden-unhide-all-confirm p {
+    margin: 0 0 8px;
+    font-size: var(--fs-meta-sm);
+  }
 
   #git-changes-modal,
   #git-diff-modal {
@@ -5755,6 +6024,14 @@
     }
     .conv-meta { font-size: var(--fs-meta-sm); margin-top: 5px; }
     .conv-delete { opacity: 1; right: 4px; font-size: var(--fs-ui-icon); }
+    /* Session groups on a phone: a shallower indent, and a fold target that
+       is easy to hit without stealing the row's width. */
+    .conv-item.conv-group-member { margin-left: 10px; }
+    .conv-group-fold { width: 24px; height: 24px; margin-left: -6px; }
+    /* The finger covers the row it lifts: the ghost sits a little higher. */
+    .conv-item.conv-drag-ghost { margin: -18px 0 0; }
+    .conv-item.conv-drop-before::before,
+    .conv-item.conv-drop-after::after { height: 4px; }
     #chat-header {
       padding: var(--chat-header-top-pad-mobile) 10px 10px;
       gap: 6px 8px;
@@ -6125,10 +6402,31 @@
     }
     /* The pin list has one action, Close: the full-width action row above
        would leave its title no room. Title left, close button right. */
-    #summary-modal[data-kind="pinned-messages"] .summary-header-actions {
+    #summary-modal[data-kind="pinned-messages"] .summary-header-actions,
+    #summary-modal[data-kind="hidden-messages"] .summary-header-actions {
       width: auto;
     }
-    #summary-modal[data-kind="pinned-messages"] .summary-header-actions .summary-close {
+    #summary-modal[data-kind="pinned-messages"] .summary-header-actions .summary-close,
+    #summary-modal[data-kind="hidden-messages"] .summary-header-actions .summary-close {
+      flex: 0 0 auto;
+      min-width: 40px;
+    }
+    /* The session-group picker, rename and confirmations: the same layout,
+       so their title ("Add to group", the chat's name) stays readable. */
+    #summary-modal[data-kind^="group-"] .summary-header-actions {
+      width: auto;
+    }
+    #summary-modal[data-kind^="group-"] .summary-header-actions .summary-close {
+      flex: 0 0 auto;
+      min-width: 40px;
+    }
+    /* About OAR: the same, with Refresh beside the close button. */
+    #summary-modal[data-kind="about"] .summary-header-actions {
+      width: auto;
+      flex: 0 0 auto;
+    }
+    #summary-modal[data-kind="about"] .summary-header-actions .summary-btn,
+    #summary-modal[data-kind="about"] .summary-header-actions .summary-close {
       flex: 0 0 auto;
       min-width: 40px;
     }
@@ -6389,6 +6687,7 @@
     </div>
     <div id="conv-archived-banner" hidden>Archived conversations <button type="button" class="conv-archived-back" onclick="toggleArchivedConversations()">Back to the list</button></div>
     <div id="conv-list"></div>
+    <div id="conv-list-announce" role="status" aria-live="polite"></div>
   </div>
   <div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize conversations sidebar"></div>
 
@@ -6405,6 +6704,7 @@
       </div>
       <div id="chat-header-actions">
         <button id="pinned-messages-btn" class="header-icon-btn has-count" type="button" title="Pinned messages" aria-label="Pinned messages" hidden>📍<span class="header-icon-count"></span></button>
+        <button id="hidden-messages-btn" class="header-icon-btn has-count" type="button" title="Hidden from shared viewers" aria-label="Hidden from shared viewers" hidden>🙈<span class="header-icon-count"></span></button>
         <button id="message-search-btn" class="header-icon-btn" onclick="openMessageSearchModal()" title="Search messages" aria-label="Search messages">🔍</button>
         <button id="context-btn" class="header-icon-btn" onclick="showContext()" title="Check current context" aria-label="Check current context">🧠</button>
         <div id="chat-actions-menu-wrap">
@@ -6413,11 +6713,14 @@
             <div id="chat-menu-pwa-version" class="chat-actions-menu-meta chat-actions-menu-meta-stacked" aria-hidden="true"><span class="chat-actions-menu-meta-primary">PWA shell version</span><span class="chat-actions-menu-meta-secondary" id="chat-menu-pwa-version-value">v?</span></div>
             <div id="chat-menu-queue-status" class="chat-actions-menu-meta chat-actions-menu-meta-stacked" aria-hidden="true"><div class="chat-actions-menu-meta-top"><span class="chat-actions-menu-meta-primary">Queue</span><button id="chat-menu-empty-queue" class="chat-actions-menu-meta-label" type="button">🚮 Empty queue</button></div><span class="chat-actions-menu-meta-secondary" id="chat-menu-queue-status-value">pending=?, processing=?, parked=?</span></div>
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
-            <button id="chat-menu-shared-theme-toggle" class="chat-actions-menu-item" type="button" role="menuitem" hidden>🌙/☀️ Day/Night mode</button>
+            <button id="chat-menu-theme-toggle" class="chat-actions-menu-item" type="button" role="menuitem" hidden>🌙/☀️ Day/Night mode</button>
             <button id="chat-menu-usage" class="chat-actions-menu-item" type="button" role="menuitem">📊 Check Usage</button>
             <button id="chat-menu-compact" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🗜️ Compact</button>
             <button id="chat-menu-share-conversation" class="chat-actions-menu-item" type="button" role="menuitem">➡️ Share conversation</button>
+            <button id="chat-menu-stop-sharing" class="chat-actions-menu-item" type="button" role="menuitem" hidden>⛔ Stop sharing</button>
+            <button id="chat-menu-preview-shared" class="chat-actions-menu-item" type="button" role="menuitem">🔍 Preview as shared</button>
             <button id="chat-menu-archive" class="chat-actions-menu-item" type="button" role="menuitem">🗄 Archive conversation</button>
+            <button id="chat-menu-group" class="chat-actions-menu-item" type="button" role="menuitem">🧩 Session group…</button>
             <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🔄️ Refresh history</button>
             <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
@@ -6425,6 +6728,7 @@
             <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
             <button id="chat-menu-open-cloud-session" class="chat-actions-menu-item" type="button" role="menuitem" hidden>☁️ Open on claude.ai</button>
             <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
+            <button id="chat-menu-about" class="chat-actions-menu-item" type="button" role="menuitem">ℹ️ About OAR</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
             <button id="chat-menu-kill-session" class="chat-actions-menu-item" type="button" role="menuitem">☠️ Kill session</button>
@@ -6445,6 +6749,7 @@
     <div id="input-area">
       <button id="jump-to-bottom-btn" type="button" title="Jump to the latest message" aria-label="Jump to the latest message"><span class="jump-to-bottom-icon" aria-hidden="true">⌄</span><span class="jump-to-bottom-badge" hidden></span></button>
       <div id="offline-banner">⚠️ CLI is offline — messages will queue until it reconnects</div>
+      <div id="share-preview-banner" role="note"></div>
       <div id="model-banner"></div>
       <div id="usage-limit-banner" role="status" aria-live="polite" hidden></div>
       <div id="model-lock-note" hidden></div>
@@ -6628,6 +6933,16 @@
         data-settings-tab="previews"
       >Previews</button>
       <button
+        id="settings-tab-shares"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-shares"
+        tabindex="-1"
+        data-settings-tab="shares"
+      >Sharing</button>
+      <button
         id="settings-tab-notifications"
         class="settings-tab"
         type="button"
@@ -6679,6 +6994,17 @@
           >
         </div>
         <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
+        <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="scroll-on-send-toggle">Jump to the end when I send a message</label>
+          <input
+            id="scroll-on-send-toggle"
+            type="checkbox"
+            onchange="updateScrollOnSendSetting(this.checked)"
+            aria-label="Jump to the end when I send a message"
+            checked
+          >
+        </div>
+        <div class="settings-help" style="margin-top: 6px;">A conversation only scrolls by itself while you are at its end. Anywhere else it stays where you are reading, and the round button above the composer shows that something new or a question is waiting below. Your own message is the exception: sending one takes you to the end. Switch this off to stay put then too. Saved in this browser.</div>
         <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
           <label for="turn-ceiling-slider">Max turn duration <span id="turn-ceiling-value">No limit</span></label>
           <input
@@ -7436,7 +7762,52 @@
           <label>Live previews</label>
           <div id="settings-previews-list"></div>
           <div id="settings-previews-empty" class="settings-help">Loading previews…</div>
-          <div class="settings-help">Local dev servers published on the preview host. Previews never expire on their own — they live until you close them here or the relay restarts. Every link is public: anyone with the URL reaches the app without logging in.</div>
+          <div class="settings-help">Local dev servers and folders published on the preview host. Previews never expire and survive a relay restart — they live until you close them here or delete their conversation (a dev-server preview also ends when the machine reboots). Every link is public: anyone with the URL reaches the app without logging in.</div>
+        </div>
+      </div>
+      <div
+        id="settings-panel-shares"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-shares"
+        data-settings-panel="shares"
+        hidden
+      >
+        <!-- One section per concern; further sharing settings (such as how
+             paths show in a shared view) get their own section in here. -->
+        <div id="shares-settings-sections" class="shares-settings-sections">
+          <div id="shares-settings-section" class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label>Shared conversations</label>
+            <div id="settings-shares-list"></div>
+            <div id="settings-shares-empty" class="settings-help">Loading shared conversations…</div>
+            <div class="settings-help">Every link is public: anyone with the URL can read the conversation without logging in, until you stop sharing it. Renew link gives the conversation a new link; the old one stops working at once and the access log carries over. Stop sharing ends the link and deletes its access log.</div>
+          </div>
+          <div id="shares-access-log-section" class="settings-row settings-row-column" style="margin-top: 16px; margin-bottom: 0;">
+            <label>Access log</label>
+            <div class="settings-row" style="width: 100%; margin-bottom: 0;">
+              <label for="settings-shares-store-ip">Store viewer IP addresses</label>
+              <input id="settings-shares-store-ip" type="checkbox" aria-label="Store viewer IP addresses" checked>
+            </div>
+            <div class="settings-help">Each open of a shared link is logged with its time, browser and country. Off: new entries keep no IP address (entries logged before keep theirs), and distinct viewers are still told apart by a keyed hash. The log is kept until you stop sharing the link or delete the conversation.</div>
+            <div id="settings-shares-status" class="settings-help" role="status"></div>
+          </div>
+          <div id="shares-path-privacy-section" class="settings-row settings-row-column" style="margin-top: 16px; margin-bottom: 0;">
+            <label id="settings-shares-path-privacy-label">Paths and file names</label>
+            <div role="radiogroup" aria-labelledby="settings-shares-path-privacy-label" style="display: flex; flex-direction: column; gap: 4px;">
+              <label style="font-weight: normal;">
+                <input type="radio" name="settings-shares-path-privacy" value="show"> Show every path and file name
+              </label>
+              <label style="font-weight: normal;">
+                <input type="radio" name="settings-shares-path-privacy" value="filename"> Hide the path, show the file name
+              </label>
+              <label style="font-weight: normal;">
+                <input type="radio" name="settings-shares-path-privacy" value="hide"> Hide paths and file names
+              </label>
+            </div>
+            <div class="settings-help">What every shared link shows of this relay's paths; your own view always shows everything. Free text (replies, thoughts, tool output) is filtered on a best-effort basis: check a conversation with ⋯ → Preview as shared.</div>
+            <div id="settings-shares-path-privacy-status" class="settings-help" role="status"></div>
+          </div>
         </div>
       </div>
       <div

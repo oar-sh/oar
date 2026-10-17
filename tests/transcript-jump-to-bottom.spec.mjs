@@ -190,7 +190,7 @@ for (const [name, device] of Object.entries(DEVICES)) {
     test.use(device);
     const touch = !!device.hasTouch;
 
-    test("scrolling up shows the button, its badge counts new rows with a fold as one, and a click follows the end again", async ({ page, request }) => {
+    test("scrolling up shows the button, its badge counts new rows, a folded prompt and its reply each, and a click follows the end again", async ({ page, request }) => {
       test.setTimeout(120_000);
       const relay = createRelay(request);
       try {
@@ -224,8 +224,8 @@ for (const [name, device] of Object.entries(DEVICES)) {
         expect((await transcript(page)).distance).toBeGreaterThan(clientHeight);
         await settleAfterTurn(page);
 
-        // An agent's prompt, its live bubble and its reply fold into one row:
-        // one more, whatever the stage.
+        // An agent's prompt folds into a row and counts once; its live
+        // bubble and then its reply are a row of their own, as in any turn.
         const prompt = await relay.queue("report builder: list the totals", { origin: REMOTE_ORIGIN });
         const fold = page.locator(`#messages > .msg[data-message-id="${prompt.messageId}"] details.agent-exchange-row`);
         await expect(fold).toHaveCount(1);
@@ -233,13 +233,12 @@ for (const [name, device] of Object.entries(DEVICES)) {
         await relay.dequeue(prompt.messageId);
         await expect(fold.locator(".agent-exchange-status")).toHaveText("working…");
         await expect(page.locator("#thinking-indicator")).toHaveCount(1);
-        await page.waitForTimeout(300);
-        await expect(badge).toHaveText("3");
+        await expect(badge).toHaveText("4");
         await relay.answer(prompt.messageId, "Totals: 42 rows, 3 sheets.");
-        await expect(fold.locator(".agent-exchange-status")).toHaveText("replied");
+        await expect(fold.locator(".agent-exchange-status")).toHaveText("answered below");
         await page.waitForTimeout(300);
-        await expect(badge).toHaveText("3");
-        await expect(button).toHaveAttribute("aria-label", "Jump to the latest message (3 new)");
+        await expect(badge).toHaveText("4");
+        await expect(button).toHaveAttribute("aria-label", "Jump to the latest message (4 new)");
         await settleAfterTurn(page);
 
         // Two to three screens away the click scrolls smoothly: right after

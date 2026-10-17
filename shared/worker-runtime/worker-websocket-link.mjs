@@ -84,6 +84,8 @@ export function createWorkerWebSocketLink({
   let readyRefreshTimer = null;
   let reconnectAttempt = 0;
   let reconnectDelayMs = 0;
+  // Ends the current socket's connection (see connect).
+  let endCurrentSocket = null;
   // Insertion-ordered: the first entry is the oldest in-flight delivery, which
   // is what a legacy worker's coalesced delivery waits on.
   const deliveriesInFlight = new Set();
@@ -246,7 +248,11 @@ export function createWorkerWebSocketLink({
   function closeStaleSocket(reason) {
     if (!isSocketOpen()) return false;
     dbg("worker ws stale connection closing", reason);
-    try { ws?.close?.(); } catch {}
+    const socket = ws;
+    // A dead peer may never complete the close handshake: the reconnect does
+    // not wait for the close event.
+    endCurrentSocket?.(`stale:${reason}`);
+    try { socket?.close?.(); } catch {}
     return true;
   }
 
@@ -286,7 +292,9 @@ export function createWorkerWebSocketLink({
 
   function scheduleReconnect() {
     if (stopped) return;
-    clearReconnectTimer();
+    // One timer at a time: a second end reported for the same outage must not
+    // stack another attempt or push the backoff up.
+    if (reconnectTimer) return;
     reconnectAttempt += 1;
     const backoff = Math.min(maxBackoffMs, minBackoffMs * (2 ** Math.max(0, reconnectAttempt - 1)));
     const jitter = Math.floor(Math.random() * Math.max(0, jitterMs));
@@ -309,10 +317,34 @@ export function createWorkerWebSocketLink({
       dbg("worker ws unavailable: global WebSocket is missing");
       return;
     }
+    clearReconnectTimer();
     const url = toWebSocketUrl(serverUrl, token, getSessionId, getPid);
-    ws = new WebSocketImpl(url);
+    const socket = new WebSocketImpl(url);
+    ws = socket;
     let serverHelloSeen = false;
-    ws.addEventListener("open", () => {
+    // Set once this socket's end has been handled, by whichever of error and
+    // close comes first; every later event from it is ignored. Node 22 fires
+    // no close for a socket closed while still connecting, and closing it
+    // from its own error handler raised the error again, so the reconnect
+    // has to be scheduled from the error as well, and only once.
+    let ended = false;
+    function endSocket(reason) {
+      if (ended) return false;
+      ended = true;
+      if (ws === socket) {
+        ws = null;
+        clearReadyRefreshTimer();
+        // The next connection may reach a different (restarted) relay.
+        serverCapabilities = new Set();
+      }
+      if (stopped) return true;
+      dbg("worker ws disconnected", reason);
+      scheduleReconnect();
+      return true;
+    }
+    endCurrentSocket = endSocket;
+    socket.addEventListener("open", () => {
+      if (ended) return;
       const openedAt = getNowMs();
       reconnectAttempt = 0;
       reconnectDelayMs = 0;
@@ -323,7 +355,8 @@ export function createWorkerWebSocketLink({
       void notifyReady("ws-open");
       startReadyRefreshTimer();
     });
-    ws.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
+      if (ended) return;
       lastMessageAt = getNowMs();
       let payload = null;
       try {
@@ -355,7 +388,7 @@ export function createWorkerWebSocketLink({
       }
       if (payload?.type === "server.draining") {
         dbg("worker ws draining", payload.reason || "relay-shutdown");
-        try { ws?.close?.(); } catch {}
+        try { socket.close?.(); } catch {}
         return;
       }
       if (payload?.type === "queue.changed") {
@@ -375,17 +408,16 @@ export function createWorkerWebSocketLink({
         dbg("worker ws blocked", payload.reason || "blocked");
       }
     });
-    ws.addEventListener("close", () => {
-      clearReadyRefreshTimer();
-      // The next connection may reach a different (restarted) relay.
-      serverCapabilities = new Set();
-      if (stopped) return;
-      dbg("worker ws disconnected");
-      scheduleReconnect();
+    socket.addEventListener("close", () => {
+      endSocket("close");
     });
-    ws.addEventListener("error", (error) => {
+    socket.addEventListener("error", (error) => {
+      if (ended) return;
       dbg("worker ws error", error?.message || String(error));
-      try { ws?.close?.(); } catch {}
+      // Ended before the close call, so an error or close it raises
+      // (synchronously on some runtimes) finds the socket already handled.
+      endSocket("error");
+      try { socket.close?.(); } catch {}
     });
   }
 

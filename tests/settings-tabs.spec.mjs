@@ -125,9 +125,17 @@ const LEGACY_SETTINGS_IDS = [
   "remote-relays-pair-back-toggle",
   "remote-relays-add-btn",
   "remote-relays-add-status",
+  // Sharing (added with the tab; shared-conversations-settings.js looks these
+  // up by ID)
+  "settings-panel-shares",
+  "shares-settings-sections",
+  "settings-shares-list",
+  "settings-shares-empty",
+  "settings-shares-store-ip",
+  "settings-shares-status",
 ];
 
-const TABS = ["general", "providers", "relays", "previews", "notifications", "features"];
+const TABS = ["general", "providers", "relays", "previews", "shares", "notifications", "features"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
 const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-cloud", "grok", "cursor"];
@@ -178,7 +186,7 @@ async function expectActiveProviderTab(page, providerTab) {
 }
 
 test.describe("tabbed settings modal", () => {
-  test("renders six top-level tabs with one panel visible at a time", async ({ page }) => {
+  test("renders seven top-level tabs with one panel visible at a time", async ({ page }) => {
     await loadApp(page);
     await openSettings(page, "general");
 

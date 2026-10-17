@@ -13,12 +13,25 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // Raise deliberately (with a changelog entry) — never because a run went red.
-const MAX_ENTRIES = 450;
+// 450 until 2026-10-13; four changes of that day added small modules:
+// keeping background tasks across a relay restart (the task store, the view
+// of unreported background work, the task digest, the kept posts), previews
+// that survive a restart (the preview store and its migration), session
+// groups (migration 0014, the group repository, the group routes, the
+// list-order, group-state and turn-state modules) and the transcript that
+// stays where the reader is (the viewport anchor): 462 entries. 470 until
+// 2026-10-16; share management (migration 0016, the share repository, the
+// access log, the share list and the Sharing tab) took it to 473. 480 until
+// 2026-10-16; path privacy in shared views and About OAR (its service, route,
+// view and modal) took it to 482.
+const MAX_ENTRIES = 490;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
-// their reach across paired relays took it to 6.54 MiB.
-const MAX_UNPACKED_BYTES = 6.75 * 1024 * 1024;
+// their reach across paired relays took it to 6.54 MiB. 6.75 MiB until
+// 2026-10-13; the same four changes together took it to about 6.9 MiB. 7 MiB
+// until 2026-10-16; share management took it to 7.02 MiB.
+const MAX_UNPACKED_BYTES = 7.25 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },

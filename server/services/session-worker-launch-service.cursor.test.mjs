@@ -120,7 +120,7 @@ test('tmux shell command for cursor workers runs node without the script PTY wra
   const command = buildTmuxWorkerShellCommand('session-1', env);
   const workerScript = path.join('/repo', 'server', 'cursor-worker', 'cursor-session-worker.mjs')
     .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  assert.match(command, new RegExp(`exec 'node' '${workerScript}' --session-id 'session-1'$`));
+  assert.match(command, new RegExp(`exec '${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' '${workerScript}' --session-id 'session-1'$`));
   assert.doesNotMatch(command, /script -q/);
   assert.match(command, /export COPILOT_WEB_RELAY_WORKER_KIND='cursor';/);
   assert.match(command, /export CURSOR_RELAY_MODEL='cursor-fast-1';/);
@@ -238,7 +238,7 @@ test('launchSessionCli spawns node for cursor workers when tmux is unavailable',
   });
   assert.equal(launched.pid, 4242);
   assert.equal(spawnCalls.length, 1);
-  assert.equal(spawnCalls[0].command, 'node');
+  assert.equal(spawnCalls[0].command, process.execPath);
   assert.deepEqual(spawnCalls[0].args, [
     path.join('/repo', 'server', 'cursor-worker', 'cursor-session-worker.mjs'),
     '--session-id',
@@ -275,7 +275,7 @@ test('launchSessionCli opens a cursor-titled console for cursor workers on windo
     '/c',
     'start',
     'Cursor Worker cursor-w',
-    'node',
+    process.execPath,
     path.join('/repo', 'server', 'cursor-worker', 'cursor-session-worker.mjs'),
     '--session-id',
     'cursor-win-1',
@@ -333,12 +333,15 @@ test('copilot tmux command output is byte-identical to the pre-cursor expectatio
   const command = buildTmuxWorkerShellCommand('session-2', {
     COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
     COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
+    COPILOT_WEB_RELAY_NODE: '/opt/node/bin/node',
   });
   assert.equal(
     command,
     "export COPILOT_WEB_RELAY_CONFIG='/repo/server/config.json'; "
     + "export COPILOT_WEB_RELAY_CLI_EXECUTABLE='/usr/bin/copilot'; "
     + "export SESSION_ID='session-2'; "
+    // The CLI is a Node program too: the relay's Node folder ends its PATH.
+    + `case ":$PATH:" in *:'/opt/node/bin':*) ;; *) PATH="$PATH:"'/opt/node/bin';; esac; export PATH; `
     + "exec script -q -c ''\\''/usr/bin/copilot'\\'' --allow-all --session-id '\\''session-2'\\''' /dev/null",
   );
 });
@@ -349,6 +352,7 @@ test('claude tmux command output is byte-identical to the pre-cursor expectation
     CLAUDE_RELAY_MODEL: 'claude-sonnet-5',
     COPILOT_WEB_RELAY_ROOT: '/repo',
     COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
+    COPILOT_WEB_RELAY_NODE: '/opt/node/bin/node',
   });
   const workerScript = path.join('/repo', 'server', 'claude-worker', 'claude-session-worker.mjs');
   assert.equal(
@@ -358,6 +362,7 @@ test('claude tmux command output is byte-identical to the pre-cursor expectation
     + "export COPILOT_WEB_RELAY_WORKER_KIND='claude'; "
     + "export CLAUDE_RELAY_MODEL='claude-sonnet-5'; "
     + "export SESSION_ID='session-1'; "
-    + `exec 'node' '${workerScript}' --session-id 'session-1'`,
+    + `case ":$PATH:" in *:'/opt/node/bin':*) ;; *) PATH="$PATH:"'/opt/node/bin';; esac; export PATH; `
+    + `exec '/opt/node/bin/node' '${workerScript}' --session-id 'session-1'`,
   );
 });

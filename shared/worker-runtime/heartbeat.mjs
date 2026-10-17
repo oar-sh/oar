@@ -1,3 +1,5 @@
+import { backgroundTaskDigest } from "./background-task-digest.mjs";
+
 export function createHeartbeatController({
   api,
   pollMs,
@@ -19,6 +21,18 @@ export function createHeartbeatController({
   // `settleFailedHandled`, which `onSettleFailedHandled` receives.
   getSettleFailed,
   onSettleFailedHandled = () => {},
+  // Optional: the ids of the worker's live background tasks (an array, empty
+  // for none). The body then carries their digest, and a relay whose own set
+  // for this worker differs (it restarted, or a post was lost) answers
+  // `resyncBackgroundTasks`: `onResyncBackgroundTasks` publishes the full
+  // set again. It is asked again by every beat until the sets agree, so a
+  // failed publish needs no retry of its own. Workers that publish no task
+  // sets leave both unset; the relay reads a missing digest as no opinion.
+  getBackgroundTaskIds,
+  onResyncBackgroundTasks = () => {},
+  // Optional: called after every beat the relay answered, for work that
+  // waits for a reachable relay (posts kept after a failure).
+  onAnswered = () => {},
   // requestPulse's window: one turn transition can flip the steering
   // snapshot several times in quick succession, and each flip only needs to
   // reach the relay once.
@@ -43,11 +57,15 @@ export function createHeartbeatController({
       const settleFailed = typeof getSettleFailed === "function"
         ? (getSettleFailed() || []).filter((entry) => entry && String(entry.id || "").trim())
         : [];
+      const backgroundTaskIds = typeof getBackgroundTaskIds === "function"
+        ? getBackgroundTaskIds()
+        : null;
       const body = {
         ...(activeQueueMessageId ? { activeQueueMessageId } : {}),
         ...(activeQueueMessageIds.length ? { activeQueueMessageIds } : {}),
         ...(steering && typeof steering === "object" ? { steering } : {}),
         ...(settleFailed.length ? { settleFailed } : {}),
+        ...(Array.isArray(backgroundTaskIds) ? { backgroundTasks: backgroundTaskDigest(backgroundTaskIds) } : {}),
       };
       const response = await api("POST", "/api/heartbeat", body);
       // Failed by the relay, or skipped because this worker has no claim on
@@ -58,6 +76,12 @@ export function createHeartbeatController({
       ];
       if (handled.length) {
         try { onSettleFailedHandled(handled); } catch {}
+      }
+      // Kept posts first: an end the relay has not heard of yet goes before
+      // the set that no longer lists the task.
+      try { await onAnswered(); } catch {}
+      if (response?.resyncBackgroundTasks === true) {
+        try { await onResyncBackgroundTasks(); } catch {}
       }
       return true;
     } catch {

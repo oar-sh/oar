@@ -12,6 +12,7 @@ import {
   createTurnStalledError,
   resolveTurnStallWindows,
 } from '../../shared/worker-runtime/turn-liveness.mjs';
+import { windowsSystemToolPath } from '../../shared/windows-system-tools.mjs';
 
 function whichCommand(command = 'grok') {
   const value = String(command || 'grok').trim() || 'grok';
@@ -522,7 +523,7 @@ export class AcpClient extends EventEmitter {
       this.proc.kill();
       if (process.platform === 'win32' && this.proc.pid) {
         try {
-          this.spawnImpl('taskkill', ['/pid', String(this.proc.pid), '/t', '/f'], {
+          this.spawnImpl(windowsSystemToolPath('taskkill'), ['/pid', String(this.proc.pid), '/t', '/f'], {
             stdio: 'ignore',
             windowsHide: true,
           });

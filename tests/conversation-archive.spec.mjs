@@ -73,10 +73,13 @@ for (const profile of [
 
         // From the context menu: right-click, or a long press on touch.
         if (profile.touch) {
-          await row(second).evaluate((node) => {
+          await row(second).evaluate(async (node) => {
             const box = node.getBoundingClientRect();
             const init = { bubbles: true, pointerType: "touch", clientX: box.x + 20, clientY: box.y + 10, pointerId: 7 };
             node.dispatchEvent(new PointerEvent("pointerdown", init));
+            // A long press opens the menu when the finger lifts.
+            await new Promise((resolve) => setTimeout(resolve, 650));
+            node.dispatchEvent(new PointerEvent("pointerup", init));
           });
         } else {
           await row(second).click({ button: "right" });

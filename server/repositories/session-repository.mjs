@@ -24,6 +24,16 @@ export function createSessionRepository(db) {
         ? 'rs.claude_cloud_cost_usd AS runtime_claude_cloud_cost_usd'
         : 'NULL AS runtime_claude_cloud_cost_usd',
     ].join(', ');
+    // Session groups (migration 0014). NULL on a schema that predates it.
+    const conversationsHaveGroup = db.prepare(`PRAGMA table_info(conversations)`).all()
+      .some((column) => String(column?.name || '').trim() === 'group_id');
+    // The hand order inside a group (migration 0015).
+    const conversationsHaveGroupPosition = db.prepare(`PRAGMA table_info(conversations)`).all()
+      .some((column) => String(column?.name || '').trim() === 'group_position');
+    const conversationGroupSelect = [
+      conversationsHaveGroup ? 'c.group_id' : 'NULL AS group_id',
+      conversationsHaveGroupPosition ? 'c.group_position' : 'NULL AS group_position',
+    ].join(', ');
     return {
         // conversations
         getConv:        db.prepare(`SELECT * FROM conversations WHERE id = ? AND status != 'deleted'`),
@@ -31,7 +41,7 @@ export function createSessionRepository(db) {
         getConvBySdkSessionId: db.prepare(`SELECT * FROM conversations WHERE sdk_session_id = ? AND status != 'deleted' ORDER BY updated_at DESC LIMIT 1`),
         listConvIdsMissingRuntimeSession: db.prepare(`SELECT c.id AS id FROM conversations c LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE rs.id IS NULL AND c.status != 'deleted'`),
         runtimeSessionsSupportProviders,
-        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.draft_attachments, ${conversationOriginSelect}, ${conversationCloudSelect}, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = ?) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
+        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.draft_attachments, ${conversationOriginSelect}, ${conversationCloudSelect}, ${conversationGroupSelect}, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = ?) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
         insertConv:     db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
         updateConvTime: db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`),
         updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`),
@@ -301,46 +311,11 @@ export function createSessionRepository(db) {
           FROM conversations
           WHERE status = 'deleted' AND sdk_session_id = ?
         `),
-        // public conversation shares
-        getConversationShareByConversationId: db.prepare(`
-          SELECT token, conversation_id, created_at, last_accessed_at, revoked_at
-          FROM conversation_shares
-          WHERE conversation_id = ?
-            AND (revoked_at IS NULL OR revoked_at = '')
-          ORDER BY created_at DESC
-          LIMIT 1
-        `),
-        getConversationShareByToken: db.prepare(`
-          SELECT token, conversation_id, created_at, last_accessed_at, revoked_at
-          FROM conversation_shares
-          WHERE token = ?
-          LIMIT 1
-        `),
-        insertConversationShare: db.prepare(`
-          INSERT INTO conversation_shares (
-            token,
-            conversation_id,
-            created_at,
-            last_accessed_at,
-            revoked_at
-          ) VALUES (?, ?, ?, ?, NULL)
-        `),
+        // public conversation shares (the rest lives in share-repository.mjs)
         touchConversationShare: db.prepare(`
           UPDATE conversation_shares
           SET last_accessed_at = ?
           WHERE token = ?
-            AND (revoked_at IS NULL OR revoked_at = '')
-        `),
-        revokeConversationShareByToken: db.prepare(`
-          UPDATE conversation_shares
-          SET revoked_at = ?
-          WHERE token = ?
-            AND (revoked_at IS NULL OR revoked_at = '')
-        `),
-        revokeConversationSharesByConversationId: db.prepare(`
-          UPDATE conversation_shares
-          SET revoked_at = ?
-          WHERE conversation_id = ?
             AND (revoked_at IS NULL OR revoked_at = '')
         `),
     };

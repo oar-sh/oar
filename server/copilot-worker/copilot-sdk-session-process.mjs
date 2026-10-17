@@ -461,6 +461,10 @@ export function createCopilotSdkSessionRunner({
   // heartbeat snapshot, and a 10 s wait would often outlast the window in
   // which the runtime still holds the message (live check 2026-09-25).
   onCancellableChange = () => {},
+  // The relay turned this worker's newest task set away (`stale`): the
+  // worker asks for a heartbeat, on which the relay learns which process
+  // holds the session and asks for the set again.
+  onBackgroundTaskSetStale = () => {},
   dbg = () => {},
 } = {}) {
   let client = null;
@@ -628,7 +632,15 @@ export function createCopilotSdkSessionRunner({
   let taskRefreshQueued = 0;
   let lastTaskRefreshAt = 0;
   let taskPublishTimer = null;
+  // The last set the relay took, as JSON, and the one on its way to it.
   let lastPublishedTasksSignature = '';
+  let inFlightTasksSignature = null;
+  let taskPublishSeq = 0;
+  // Every post of the set carries its place in this worker's order
+  // (`epoch` tells this process from one before it): posts can overtake
+  // each other on the way, and the relay applies the newer one only.
+  const taskSetEpoch = Date.now();
+  let taskSetStaleNotedAt = 0;
   // Cap expiry is bounded: a task whose cancel the runtime refuses (or that
   // keeps failing) this many times is abandoned — dropped from the live set so
   // it stops pinning the runtime — rather than held forever.
@@ -1570,27 +1582,77 @@ export function createCopilotSdkSessionRunner({
    * semantics, the same route the Claude worker publishes on). Set changes
    * publish at once; enrichment-only changes (a tool call, tokens) ride a
    * trailing throttle. Advisory: a failed post never disturbs events.
+   *
+   * A set equal to the last one the relay TOOK (or to the one on its way)
+   * is not sent again: the signature is recorded when the post succeeds, so
+   * a failed post is retried by the next publish instead of being
+   * remembered as sent.
+   * `resync`: the relay asked for the set again on a heartbeat (it
+   * restarted, or a post was lost); that goes out whatever the signature
+   * says, flagged. Returns the post.
    */
-  function publishBackgroundTasks({ immediate = false } = {}) {
+  function publishBackgroundTasks({ immediate = false, resync = false } = {}) {
     const run = () => {
       if (taskPublishTimer) {
         clearTimeout(taskPublishTimer);
         taskPublishTimer = null;
       }
-      const tasks = sessionRpc.tasks ? registryCards() : shellTrackerCards();
+      const tasks = currentTaskCards();
       const signature = JSON.stringify(tasks);
-      if (signature === lastPublishedTasksSignature) return;
-      lastPublishedTasksSignature = signature;
-      api('POST', '/api/background-tasks', { conversationId: sdkSessionId, tasks })
-        .catch((error) => dbg('background task publish failed', error?.message || String(error)));
+      const unchanged = inFlightTasksSignature === null
+        ? signature === lastPublishedTasksSignature
+        : signature === inFlightTasksSignature;
+      if (!resync && unchanged) return Promise.resolve();
+      const seq = ++taskPublishSeq;
+      inFlightTasksSignature = signature;
+      return api('POST', '/api/background-tasks', {
+        conversationId: sdkSessionId,
+        tasks,
+        order: { epoch: taskSetEpoch, seq },
+        ...(resync ? { resync: true } : {}),
+      })
+        .then((answer) => {
+          // Only the newest post says what the relay holds now.
+          if (seq !== taskPublishSeq) return;
+          inFlightTasksSignature = null;
+          if (answer?.stale === true) {
+            // Turned away, not taken: nothing is recorded as sent, and a
+            // heartbeat is asked for (at most one per ten seconds; the
+            // periodic beat repeats the relay's request anyway).
+            dbg('the relay dropped the newest background task set', answer.reason || '');
+            if (Date.now() - taskSetStaleNotedAt < 10_000) return;
+            taskSetStaleNotedAt = Date.now();
+            try { onBackgroundTaskSetStale(); } catch {}
+            return;
+          }
+          lastPublishedTasksSignature = signature;
+        })
+        .catch((error) => {
+          // Not taken: the signature stays at what the relay last took, so
+          // the next publish of this set is sent, not skipped.
+          if (seq === taskPublishSeq) inFlightTasksSignature = null;
+          dbg('background task publish failed', error?.message || String(error));
+        });
     };
-    if (immediate || !(taskPublishThrottleMs > 0)) {
-      run();
-      return;
-    }
-    if (taskPublishTimer) return;
+    if (resync || immediate || !(taskPublishThrottleMs > 0)) return run();
+    if (taskPublishTimer) return Promise.resolve();
     taskPublishTimer = setTimeout(run, taskPublishThrottleMs);
     taskPublishTimer.unref?.();
+    return Promise.resolve();
+  }
+
+  function currentTaskCards() {
+    return sessionRpc.tasks ? registryCards() : shellTrackerCards();
+  }
+
+  /** The ids of the live background tasks, for the heartbeat's digest. */
+  function backgroundTaskIds() {
+    return currentTaskCards().map((task) => task.taskId);
+  }
+
+  /** The relay asked for the task set again (heartbeat answer). */
+  function resyncBackgroundTasks() {
+    return publishBackgroundTasks({ resync: true });
   }
 
   // ------------------------------------------------------- background tasks --
@@ -4700,6 +4762,8 @@ export function createCopilotSdkSessionRunner({
     steeringState,
     getSettleFailed,
     acknowledgeSettleFailed,
+    backgroundTaskIds,
+    resyncBackgroundTasks,
     cancelPushedMessage,
     // The task panel's per-card Stop (`rpc.tasks.cancel`); also what a
     // subagent lane's Stop tries — the runtime tracks sync agents in the same
@@ -4726,6 +4790,7 @@ export function createCopilotSdkSessionRunner({
       ? new Promise((resolve) => { setTimeout(resolve, taskRefreshMs + 5); }).then(() => taskRefreshChain)
       : taskRefreshChain),
     // Test seams / observability.
+    _publishBackgroundTasks: publishBackgroundTasks,
     _getState: () => ({
       hasClient: !!client,
       hasSession: !!session,
