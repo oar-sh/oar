@@ -2,6 +2,7 @@
 
 import { createShareVisibilityStatements } from './share-visibility-statements.mjs';
 import { createMessagePinStatements } from './message-pin-statements.mjs';
+import { createConversationHistoryPageStatements } from '../services/conversation-history-page.mjs';
 import { sessionWorkerProviderSqlList } from '../../shared/provider-routing.mjs';
 
 export function createMessageRepository(db) {
@@ -27,6 +28,8 @@ export function createMessageRepository(db) {
         // messages
         getMessages:    db.prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC`),
         getSharedMessages: shareVisibility.getSharedMessages,
+        // One history page in SQL (conversation-history-page.mjs).
+        conversationHistoryPage: createConversationHistoryPageStatements(db),
         getMessageByConversation: db.prepare(`SELECT * FROM messages WHERE id = ? AND conversation_id = ? LIMIT 1`),
         setMessageShareVisibility: shareVisibility.setMessageShareVisibility,
         listHiddenMessages: shareVisibility.listHiddenMessages,
@@ -115,6 +118,11 @@ export function createMessageRepository(db) {
           WHERE conversation_id = ?
           ORDER BY captured_at DESC
           LIMIT 1
+        `),
+        getMessageUsageSnapshotByResponse: db.prepare(`
+          SELECT *
+          FROM message_usage_snapshots
+          WHERE response_message_id = ? AND conversation_id = ?
         `),
         listMessageUsageSnapshotsByConversation: db.prepare(`
           SELECT *

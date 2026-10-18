@@ -453,6 +453,29 @@ export function promptWithPrefix(body, mode = 'agent', options = {}) {
   return `${expectedPromptPrefix(mode, options)} ${body}`;
 }
 
+/**
+ * A task output spool kept in memory (the shape of
+ * shared/worker-runtime/task-output-spool.mjs): no suite writes into, or
+ * sweeps, the host's temp dir.
+ */
+export function createMemorySpool({ root = '/tmp/oar-task-output-fixture/conv-1' } = {}) {
+  const files = new Map();
+  const spool = {
+    root,
+    files,
+    sweeps: 0,
+    ended: [],
+    pathFor: (taskId) => `${root}/${taskId}.log`,
+    append(taskId, text) {
+      files.set(taskId, (files.get(taskId) || '') + String(text));
+      return { ok: true, bytes: Buffer.byteLength(files.get(taskId)), capped: false };
+    },
+    end(taskId) { spool.ended.push(taskId); },
+    sweep() { spool.sweeps += 1; return 0; },
+  };
+  return spool;
+}
+
 export function makeRunner({
   stub,
   client,
@@ -475,6 +498,7 @@ export function makeRunner({
       relayToolInstructions: '',
       getPreviewInstructionsImpl: () => '',
       createQuestionBridgeImpl: () => questionBridge,
+      taskOutputSpool: createMemorySpool(),
       // No patience with an unreachable relay by default: a stub route that
       // fails is a relay that refuses, and the suites written against that
       // expect the refusal's outcome at once. The outage tests opt in.

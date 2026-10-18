@@ -58,6 +58,13 @@ import {
   withSlashCommandGuardContent,
 } from '../../shared/slash-command-guard.mjs';
 import { createUsageLimitTracker } from '../../shared/claude-usage-limit.mjs';
+import {
+  discoverTaskOutputPaths,
+  exitCodeFromSummary,
+  isShellTaskType,
+  outputDirOf,
+  usableOutputPath,
+} from './task-output-discovery.mjs';
 
 /**
  * Which system-prompt append a relay mode gets (claude-sdk-adapter's
@@ -77,6 +84,8 @@ export { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT };
 /** Task types that run a model of their own (vs. bash/monitor/workflow). */
 const AGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
 const MAX_TASK_TOOL_CALL_CHARS = 300;
+/** Output paths remembered per process (one per backgrounded shell). */
+const MAX_TASK_OUTPUT_PATHS = 200;
 
 // ---------------------------------------------------------------------------
 // Workflow progress sources (CLI 2.1.226 on-disk formats)
@@ -460,6 +469,10 @@ export function createClaudeSessionRunner({
   // leaves the CLI's own attribution. Piggybacked on deliveries like the
   // window above.
   getAttribution = () => null,
+  // How long a backgrounded Bash command may run without its own timeout
+  // (ms; the relay's Claude setting). Read at spawn only: the CLI takes it
+  // from its environment, so a change applies to the next process.
+  getBackgroundCommandLimitMs = () => null,
   // The per-conversation thinking state ({enabled, display}); read per turn
   // like the window, so a settings change reaches a running process on its
   // next delivery.
@@ -1769,6 +1782,9 @@ export function createClaudeSessionRunner({
           // The workflow digest (poller below) rides the same row; the relay
           // sanitizer whitelists and re-clamps it before storing.
           ...(task.workflowProgress ? { workflowProgress: task.workflowProgress } : {}),
+          ...(agentLike && Number.isInteger(task.steps) ? { steps: task.steps } : {}),
+          // Where the relay reads the task's console from.
+          ...(isShellTaskType(task.taskType) ? taskOutputFields(processRef, taskId) : {}),
         };
       });
       return postTaskSet({ tasks, ...(resync ? { resync: true } : {}) }).catch((error) => {
@@ -1786,6 +1802,89 @@ export function createClaudeSessionRunner({
     processRef.taskPublishTimer = setTimeout(send, 2_000);
     processRef.taskPublishTimer.unref?.();
     return Promise.resolve();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Task output files
+  //
+  // The relay reads a shell task's console straight from the file the CLI
+  // writes (`<tasks dir>/<taskId>.output`); the worker only names it. Bash
+  // results announce the path (task-output-discovery.mjs); a Monitor result
+  // does not, but its file follows the same scheme next to any known one, and
+  // is named only once it exists. Without a path the relay falls back to the
+  // CLI's `getTaskOutput` snapshot (task_output_snapshot control).
+
+  function rememberTaskOutputPath(processRef, taskId, outputPath) {
+    const id = String(taskId || '').trim();
+    const usable = usableOutputPath(outputPath);
+    if (!id || !usable) return false;
+    const dir = outputDirOf(usable);
+    if (dir) processRef.taskOutputDir = dir;
+    // The first path a task names wins, here as on the relay.
+    if (processRef.taskOutputPaths.has(id)) return false;
+    processRef.taskOutputPaths.set(id, usable);
+    while (processRef.taskOutputPaths.size > MAX_TASK_OUTPUT_PATHS) {
+      processRef.taskOutputPaths.delete(processRef.taskOutputPaths.keys().next().value);
+    }
+    return true;
+  }
+
+  function taskOutputFields(processRef, taskId) {
+    const known = processRef.taskOutputPaths.get(taskId);
+    if (known) return { outputPath: known, outputKind: 'file' };
+    if (processRef.taskOutputDir) {
+      const candidate = nodePath.join(processRef.taskOutputDir, `${taskId}.output`);
+      let exists = false;
+      try { exists = nodeFs.existsSync(candidate); } catch {}
+      if (exists && rememberTaskOutputPath(processRef, taskId, candidate)) {
+        return { outputPath: candidate, outputKind: 'file' };
+      }
+    }
+    return { outputKind: 'snapshot' };
+  }
+
+  /** A backgrounded Bash/Monitor result: note its file, and show it on the live row. */
+  function recordTaskOutputPaths(sdkMessage) {
+    let liveChanged = false;
+    for (const { taskId, outputPath } of discoverTaskOutputPaths(sdkMessage)) {
+      if (rememberTaskOutputPath(proc, taskId, outputPath) && proc.liveTasks.has(taskId)) liveChanged = true;
+    }
+    if (liveChanged) publishBackgroundTasks();
+  }
+
+  /**
+   * The relay's fallback for a shell task with no file: the CLI's last 8 KiB
+   * (`Query.getTaskOutput`, implemented in sdk.mjs though sdk.d.ts does not
+   * declare it), posted for the relay to serve. Asked once per viewer open.
+   */
+  async function snapshotTaskOutput(taskId) {
+    const id = String(taskId || '').trim();
+    const processRef = proc;
+    if (!id || typeof processRef?.turn?.getTaskOutput !== 'function') {
+      dbg('task output snapshot unavailable', id || '(no task)');
+      return false;
+    }
+    let answer;
+    try {
+      answer = await processRef.turn.getTaskOutput(id);
+    } catch (error) {
+      dbg('getTaskOutput failed', id, error?.message || String(error));
+      return false;
+    }
+    const output = typeof answer?.output === 'string' ? answer.output : '';
+    const totalBytes = Number(answer?.total_bytes);
+    try {
+      await api('POST', `/api/background-tasks/${encodeURIComponent(id)}/output-snapshot`, {
+        conversationId: sdkSessionId,
+        output,
+        totalBytes: Number.isFinite(totalBytes) && totalBytes >= 0 ? totalBytes : Buffer.byteLength(output),
+        truncated: answer?.truncated === true,
+      });
+      return true;
+    } catch (error) {
+      dbg('task output snapshot post failed', id, error?.message || String(error));
+      return false;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -2226,6 +2325,11 @@ export function createClaudeSessionRunner({
       recordSubagentActivity(sdkMessage);
       return;
     }
+    if (type === 'user') {
+      // Any agent's backgrounded shell, the main thread's or a subagent's.
+      recordTaskOutputPaths(sdkMessage);
+      return;
+    }
     if (type !== 'system') return;
     const subtype = String(sdkMessage.subtype || '');
     if (subtype === 'init') {
@@ -2524,6 +2628,9 @@ export function createClaudeSessionRunner({
         known.toolUseId = String(sdkMessage.tool_use_id || '').trim() || known.toolUseId || '';
         const totalTokens = Number(sdkMessage.usage?.total_tokens);
         if (Number.isFinite(totalTokens)) known.totalTokens = totalTokens;
+        // The sub-agent's tool calls so far: the panel row's step count.
+        const toolUses = Number(sdkMessage.usage?.tool_uses);
+        if (Number.isFinite(toolUses) && toolUses >= 0) known.steps = Math.floor(toolUses);
         publishBackgroundTasks({ throttled: true });
       }
       return;
@@ -2543,6 +2650,16 @@ export function createClaudeSessionRunner({
         // tell its watchers the end. A failed post is kept and sent again.
         const published = proc.liveTasks.get(taskId) || proc.departedTasks.get(taskId) || null;
         proc.departedTasks.delete(taskId);
+        // A shell's file and exit code make the relay's ended row: its
+        // console stays readable after the task is gone.
+        rememberTaskOutputPath(proc, taskId, sdkMessage.output_file);
+        const shellLike = isShellTaskType(published?.taskType);
+        const outputPath = shellLike ? (proc.taskOutputPaths.get(taskId) || '') : '';
+        const exitCode = shellLike ? exitCodeFromSummary(sdkMessage.summary) : null;
+        const toolUses = Number(sdkMessage.usage?.tool_uses);
+        const steps = AGENT_TASK_TYPES.has(String(published?.taskType || '')) && Number.isFinite(toolUses) && toolUses >= 0
+          ? Math.floor(toolUses)
+          : null;
         void keptTaskSettles.post('/api/background-task-settled', {
           conversationId: sdkSessionId,
           taskId,
@@ -2555,6 +2672,9 @@ export function createClaudeSessionRunner({
             taskType: String(published.taskType || ''),
             startedAt: published.startedAt || null,
           } : {}),
+          ...(outputPath ? { outputPath } : {}),
+          ...(exitCode !== null ? { exitCode } : {}),
+          ...(steps !== null ? { steps } : {}),
         });
       }
       // A settled session-level task means the CLI is about to dequeue a
@@ -3365,6 +3485,7 @@ export function createClaudeSessionRunner({
     const thinkingEnabled = parseThinkingEnabled(thinkingState.enabled);
     const thinkingDisplay = parseThinkingDisplay(thinkingState.display);
     const attribution = getAttribution() || null;
+    const backgroundCommandLimitMs = getBackgroundCommandLimitMs() ?? null;
     const abortController = new AbortController();
     const processRef = {
       turn: null,
@@ -3391,6 +3512,11 @@ export function createClaudeSessionRunner({
       // taskId → the row of a task that left the live set, until its
       // notification arrives.
       departedTasks: new Map(),
+      // taskId → the file a shell task's output goes to (first named wins),
+      // and the directory of the last one seen: a Monitor task's file sits
+      // next to it.
+      taskOutputPaths: new Map(),
+      taskOutputDir: '',
       // taskId → { runId, labels, digestJson } for live local_workflow tasks;
       // pruned by syncWorkflowPoller when a task leaves the live set.
       workflowStates: new Map(),
@@ -3538,6 +3664,7 @@ export function createClaudeSessionRunner({
       thinkingEnabled,
       thinkingDisplay,
       attribution,
+      backgroundCommandLimitMs,
       abortController,
       canUseTool,
       pathToClaudeCodeExecutable,
@@ -4121,6 +4248,7 @@ export function createClaudeSessionRunner({
     isTurnActive,
     stopBackgroundTask,
     stopBackgroundTaskByToolUseId,
+    snapshotTaskOutput,
     backgroundTaskIds,
     resyncBackgroundTasks,
     flushKeptTaskSettles,

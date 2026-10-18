@@ -120,6 +120,10 @@ import {
   probeRuntime,
   resolveTurnStallWindows,
 } from '../../shared/worker-runtime/turn-liveness.mjs';
+import { createTaskOutputSpool } from '../../shared/worker-runtime/task-output-spool.mjs';
+import { createShellOutputMirror } from './copilot-shell-output-mirror.mjs';
+import { isTransientProgressText, settleForTask, shellExitFromEvent } from './copilot-task-settle.mjs';
+import { createKeptPosts } from '../../shared/worker-runtime/kept-posts.mjs';
 
 // How long the runtime may sit with no session activity before the worker
 // closes it. The worker process itself stays up and reconnects lazily on the
@@ -235,6 +239,8 @@ const STOPPED_ROW_PUBLISH_WAIT_MS = 5_000;
  * (which carries no payload and fires ~20 times per shell call).
  */
 const DEFAULT_TASK_REFRESH_MS = 250;
+/** How often the task output spool drops files of tasks that ended over an hour ago. */
+const SPOOL_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 /** Trailing throttle for enrichment-only card updates (a live tool call, tokens). */
 const DEFAULT_TASK_PUBLISH_THROTTLE_MS = 2_000;
 /**
@@ -465,6 +471,9 @@ export function createCopilotSdkSessionRunner({
   // worker asks for a heartbeat, on which the relay learns which process
   // holds the session and asks for the set again.
   onBackgroundTaskSetStale = () => {},
+  // Where attached shells' output is mirrored for the task console
+  // (shared/worker-runtime/task-output-spool.mjs). Tests pass their own.
+  taskOutputSpool = null,
   dbg = () => {},
 } = {}) {
   let client = null;
@@ -619,6 +628,24 @@ export function createCopilotSdkSessionRunner({
   // cards; the registry alone decides liveness (the lifecycle pin).
   let backgroundTasks = new Map();
   const agentDetails = new Map();
+  // A detached shell names its own log (`TaskShellInfo.logPath`); an attached
+  // one has only the runtime's recent-output window, mirrored into a spool
+  // file here so the task console can read it like any other log.
+  const spool = taskOutputSpool || (() => {
+    try { return createTaskOutputSpool({ sessionId: sdkSessionId }); } catch (error) {
+      dbg('task output spool unavailable', error?.message || String(error));
+      return null;
+    }
+  })();
+  const shellOutputMirror = createShellOutputMirror({ spool, dbg });
+  // Ended tasks' files are kept about an hour for the relay; swept at start
+  // and hourly.
+  const sweepSpool = () => {
+    try { spool?.sweep(); } catch (error) { dbg('task output spool sweep failed', error?.message || String(error)); }
+  };
+  sweepSpool();
+  const spoolSweepTimer = setInterval(sweepSpool, SPOOL_SWEEP_INTERVAL_MS);
+  spoolSweepTimer.unref?.();
   let taskRefreshTimer = null;
   let taskRefreshChain = Promise.resolve();
   // Reads of the registry that failed in a row. While there are some, "no
@@ -678,6 +705,16 @@ export function createCopilotSdkSessionRunner({
   // The detached shells this session has running. The lifecycle's pin, and the
   // reason a settled one is worth waiting for.
   const backgroundShells = createBackgroundShellTracker();
+  // How a background task ended, told to the relay (its live set only says
+  // the task is gone). A failed post is kept and sent again after the next
+  // heartbeat answer.
+  const keptTaskSettles = createKeptPosts({ api, dbg: (...args) => dbg('background task settle:', ...args) });
+  // shellId → the exit code the events reported (a `shell_completed`
+  // notification, a `read_bash` result), and the ends already noted
+  // (taskId → { body, exitCode, registryStatus }): a detached shell's code
+  // usually comes with the `read_bash` after its end, and is posted then.
+  const shellExitCodes = new Map();
+  const postedSettles = new Map();
   // When a shell settled and the continuation it should trigger has not opened
   // yet. Holds the runtime for `continuationGraceMs`; cleared by the
   // continuation opening, or by the grace expiring on a runtime that decided it
@@ -1553,6 +1590,7 @@ export function createCopilotSdkSessionRunner({
           startedAt,
           stoppable: true,
           ...(task.progressSummary ? { summary: task.progressSummary } : {}),
+          ...shellOutputFields(task),
         });
         continue;
       }
@@ -1572,9 +1610,20 @@ export function createCopilotSdkSessionRunner({
         ...(detail.lastToolCall ? { lastToolCall: detail.lastToolCall } : {}),
         ...(Number.isFinite(detail.totalTokens) && detail.totalTokens > 0 ? { totalTokens: detail.totalTokens } : {}),
         ...(task.progressSummary ? { summary: task.progressSummary } : {}),
+        ...(Number.isInteger(detail.steps) ? { steps: detail.steps } : {}),
       });
     }
     return cards;
+  }
+
+  /** Where the task console reads a shell's output: its own log, or the spool mirror. */
+  function shellOutputFields(task) {
+    const logPath = String(task.logPath || '').trim();
+    if (logPath) return { outputPath: logPath, outputKind: 'file' };
+    if (spool && shellOutputMirror.has(task.id)) {
+      try { return { outputPath: spool.pathFor(task.id), outputKind: 'spool' }; } catch {}
+    }
+    return {};
   }
 
   /**
@@ -1682,6 +1731,8 @@ export function createCopilotSdkSessionRunner({
         model: String(data.model || '').trim(),
         lastToolCall: '',
         totalTokens: 0,
+        // Tool calls so far: the panel row's step count.
+        steps: 0,
         startedAt: Date.now(),
       });
       scheduleTaskRefresh();
@@ -1706,6 +1757,7 @@ export function createCopilotSdkSessionRunner({
       const detail = agentDetails.get(agentId);
       if (type === 'tool.execution_start') {
         detail.lastToolCall = formatToolActivityText(data.toolName, data.arguments);
+        detail.steps += 1;
         publishBackgroundTasks();
       } else if (type === 'assistant.usage') {
         const used = (Number(data.inputTokens) || 0) + (Number(data.outputTokens) || 0);
@@ -1716,6 +1768,9 @@ export function createCopilotSdkSessionRunner({
       } else if (type === 'subagent.completed' || type === 'subagent.failed') {
         const total = Number(data.totalTokens);
         if (Number.isFinite(total) && total > 0) detail.totalTokens = total;
+        // The runtime's own count wins over the events this worker saw.
+        const toolCalls = Number(data.totalToolCalls);
+        if (Number.isFinite(toolCalls) && toolCalls >= 0) detail.steps = Math.floor(toolCalls);
         scheduleTaskRefresh();
       }
     }
@@ -1758,6 +1813,8 @@ export function createCopilotSdkSessionRunner({
     }
     if (session !== target) return;
     taskRefreshFailures = 0;
+    const listedById = new Map((Array.isArray(listed?.tasks) ? listed.tasks : [])
+      .map((task) => [String(task?.id || '').trim(), task]));
     const next = new Map();
     for (const task of Array.isArray(listed?.tasks) ? listed.tasks : []) {
       const id = String(task?.id || '').trim();
@@ -1773,6 +1830,10 @@ export function createCopilotSdkSessionRunner({
         next.set(id, { ...task, id, status, progressSummary: backgroundTasks.get(id)?.progressSummary || '' });
       }
     }
+    // Tasks that left the live set, with where a shell's output is (before
+    // its mirror ends below).
+    const departed = [...backgroundTasks.values()].filter((task) => !next.has(task.id));
+    const departedOutput = new Map(departed.map((task) => [task.id, task.type === 'shell' ? shellOutputFields(task) : {}]));
     // Progress lines for the live set: the agent's latest intent / last
     // activity, a shell's last output line. One RPC per live task per refresh
     // (refreshes are debounced), best effort.
@@ -1781,26 +1842,68 @@ export function createCopilotSdkSessionRunner({
         try {
           const progress = (await askRuntime('tasks.getProgress', () => target.rpc.tasks.getProgress({ id: task.id })))?.progress || null;
           task.progressSummary = summarizeTaskProgress(progress);
+          mirrorShellProgress(task, progress);
         } catch { /* a card without a progress line */ }
+      }
+      // A mirrored shell that just left the live set: its last window, once
+      // (the runtime still tracks a finished task), then the mirror ends.
+      for (const id of shellOutputMirror.ids()) {
+        if (next.has(id)) continue;
+        try {
+          const progress = (await askRuntime('tasks.getProgress', () => target.rpc.tasks.getProgress({ id })))?.progress || null;
+          if (progress?.type === 'shell') shellOutputMirror.mirror(id, progress.recentOutput);
+        } catch { /* the file keeps what it had */ }
+        shellOutputMirror.forget(id);
       }
     }
     if (session !== target) return;
     const setChanged = next.size !== backgroundTasks.size
       || [...next.keys()].some((id) => !backgroundTasks.has(id));
     backgroundTasks = next;
+    // How they ended: the registry's finished entry (its status, an agent's
+    // result) and a shell's exit code.
+    for (const task of departed) {
+      if (task.type !== 'shell' && task.type !== 'agent') continue;
+      const finished = listedById.get(task.id) || task;
+      const shell = task.type === 'shell';
+      postTaskSettle(task.id, {
+        ...settleForTask(finished, { exitCode: shell ? (shellExitCodes.get(task.id) ?? null) : null }),
+        description: task.description || task.displayName || task.command || (shell ? 'Background shell' : 'Background agent'),
+        taskType: shell ? 'local_bash' : 'local_agent',
+        startedAt: Date.parse(String(task.startedAt || '')) || null,
+        ...(task.toolCallId ? { toolUseId: String(task.toolCallId) } : {}),
+        ...(departedOutput.get(task.id) || {}),
+      }, { registryStatus: String(finished.status || '') });
+    }
     publishBackgroundTasks({ immediate: setChanged });
     // The lifecycle poll (every `lifecyclePollMs`) picks the new set up; a
     // re-evaluation here would re-schedule a refresh and spin.
   }
 
+  /**
+   * An attached shell's recent-output window into the spool (a detached one
+   * writes its own log). The refresh cadence is the registry's, unchanged:
+   * the window only stops being thrown away.
+   */
+  function mirrorShellProgress(task, progress) {
+    if (task.type !== 'shell' || progress?.type !== 'shell') return;
+    if (String(task.logPath || '').trim()) return;
+    shellOutputMirror.mirror(task.id, progress.recentOutput);
+  }
+
   function summarizeTaskProgress(progress) {
     if (!progress || typeof progress !== 'object') return '';
     if (progress.type === 'agent') {
+      // A spinner or status line ("⟳ Thinking…") says nothing the row does
+      // not; the newest line with content does, else none.
       const intent = String(progress.latestIntent || '').trim();
-      if (intent) return intent.slice(0, 300);
+      if (intent && !isTransientProgressText(intent)) return intent.slice(0, 300);
       const lines = Array.isArray(progress.recentActivity) ? progress.recentActivity : [];
-      const last = lines.length ? String(lines[lines.length - 1]?.message || '').trim() : '';
-      return last.slice(0, 300);
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = String(lines[index]?.message || '').trim();
+        if (line && !isTransientProgressText(line)) return line.slice(0, 300);
+      }
+      return '';
     }
     if (progress.type === 'shell') {
       const output = String(progress.recentOutput || '').trim();
@@ -1972,7 +2075,46 @@ export function createCopilotSdkSessionRunner({
     dbg(`copilot session rpc surfaces: queue=${sessionRpc.queue} interruptMainTurn=${sessionRpc.interruptMainTurn} tasks=${sessionRpc.tasks}`);
   }
 
+  /** A shell's exit code from an event; a settle already posted without it goes again. */
+  function noteShellExit(event) {
+    let exit = null;
+    try { exit = shellExitFromEvent(event); } catch {}
+    if (!exit) return;
+    shellExitCodes.set(exit.shellId, exit.exitCode);
+    while (shellExitCodes.size > 200) shellExitCodes.delete(shellExitCodes.keys().next().value);
+    const posted = postedSettles.get(exit.shellId);
+    if (!posted || posted.exitCode !== null || posted.body.taskType !== 'local_bash') return;
+    postTaskSettle(exit.shellId, {
+      ...posted.body,
+      ...settleForTask({ type: 'shell', status: posted.registryStatus || '' }, { exitCode: exit.exitCode }),
+    }, { registryStatus: posted.registryStatus });
+  }
+
+  /**
+   * Tell the relay how a background task ended (advisory, kept on failure).
+   * An end nothing has told yet (`unknown`) is only noted: the relay already
+   * calls a task that left its set without a word unknown, and an exit code
+   * that comes later is posted then.
+   */
+  function postTaskSettle(taskId, { status, exitCode, summary, ...rest }, { registryStatus } = {}) {
+    const id = String(taskId || '').trim();
+    if (!id) return;
+    const body = {
+      conversationId: sdkSessionId,
+      taskId: id,
+      status,
+      summary: summary || null,
+      ...rest,
+      ...(Number.isInteger(exitCode) ? { exitCode } : {}),
+    };
+    postedSettles.set(id, { body, exitCode: Number.isInteger(exitCode) ? exitCode : null, registryStatus: registryStatus || '' });
+    while (postedSettles.size > 200) postedSettles.delete(postedSettles.keys().next().value);
+    if (status === 'unknown') return;
+    void keptTaskSettles.post('/api/background-task-settled', body);
+  }
+
   function observeBackgroundShells(event) {
+    noteShellExit(event);
     let changed;
     try {
       changed = backgroundShells.observe(event);
@@ -1986,6 +2128,17 @@ export function createCopilotSdkSessionRunner({
     }
     for (const shell of changed.settled) {
       dbg('detached shell settled', shell.shellId);
+      // Without the task registry the tracker's set is the panel's: the end
+      // of a shell it listed is told here (an id it never saw open, as a
+      // foreground shell's result names one, was never a task).
+      if (!sessionRpc.tasks && shell.startedAt) {
+        postTaskSettle(shell.shellId, {
+          ...settleForTask({ type: 'shell', status: '' }, { exitCode: shellExitCodes.get(shell.shellId) ?? null }),
+          description: shell.description || 'Detached shell',
+          taskType: 'local_bash',
+          startedAt: shell.startedAt || null,
+        });
+      }
       const note = describeSettledShell(shell);
       // Only carried when there is no turn to publish into: inside a turn the
       // normalizer already narrates the `read_bash` that reads the output. A
@@ -4741,6 +4894,7 @@ export function createCopilotSdkSessionRunner({
   async function dispose() {
     disposed = true;
     stopLifecycleTimer();
+    clearInterval(spoolSweepTimer);
     if (queueLaneTimer) {
       clearTimeout(queueLaneTimer);
       queueLaneTimer = null;
@@ -4764,6 +4918,8 @@ export function createCopilotSdkSessionRunner({
     acknowledgeSettleFailed,
     backgroundTaskIds,
     resyncBackgroundTasks,
+    // The relay answered a heartbeat: settle notices kept for it go out.
+    flushKeptTaskSettles: () => keptTaskSettles.flush(),
     cancelPushedMessage,
     // The task panel's per-card Stop (`rpc.tasks.cancel`); also what a
     // subagent lane's Stop tries — the runtime tracks sync agents in the same

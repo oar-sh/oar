@@ -280,6 +280,7 @@
     --warn:      #d29922;
     --conversation-title-offline: #f0f6fc;
     --conversation-title-ready: #3fb950;
+    --conversation-title-idle: #238636;
     --conversation-title-question: #f85149;
     --conversation-title-error: #d29922;
     /* Relay reachability tones, shared by the sidebar dot and the mobile
@@ -347,6 +348,8 @@
     --warn:      #9a6700;
     --conversation-title-offline: #1F2328;
     --conversation-title-ready: #1a7f37;
+    /* Muted, not darker: a darker green would stand out more on white. */
+    --conversation-title-idle: #4c8b5c;
     --conversation-title-question: #cf222e;
     --conversation-title-error: #9a6700;
     --provider-github: #0969da;
@@ -842,17 +845,17 @@
   .conv-provider-indicator[data-provider="claude-cloud"] { color: var(--provider-claude-cloud); }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
+  /* Ready and idle: the darker green. Ready and working (a turn or
+     background work): the bright one. :where() keeps the working rule as
+     specific as the others, so an archived row stays muted. */
   .conv-item.worker-ui-ready .conv-title,
-  #chat-title[data-ui-state="ready"] { color: var(--conversation-title-ready); }
+  #chat-title[data-ui-state="ready"] { color: var(--conversation-title-idle); }
+  .conv-item.worker-ui-ready:where(.conv-working) .conv-title,
+  #chat-title[data-ui-state="ready"][data-working] { color: var(--conversation-title-ready); }
   .conv-item.worker-ui-question .conv-title,
   #chat-title[data-ui-state="question"] { color: var(--conversation-title-question); }
   .conv-item.worker-ui-error .conv-title,
   #chat-title[data-ui-state="error"] { color: var(--conversation-title-error); }
-  .conv-processing-dots {
-    display: inline-block;
-    min-width: 1.8ch;
-    letter-spacing: 0.02em;
-  }
   .conv-delete {
     position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
     background: none; border: none; color: var(--muted); cursor: pointer; font-size: var(--fs-ui-icon);
@@ -3378,6 +3381,166 @@
     #subagent-viewer-modal { padding: 0; }
     .subagent-viewer-dialog { width: 100%; height: 100%; border: 0; border-radius: 0; }
     #subagent-viewer-body { padding: 8px 10px 28px; }
+  }
+  /* The task console: a shell or Monitor task's output (task-console.mjs).
+     Same shell as the sub-agent viewer; the 16 terminal colours follow the
+     theme so red and green stay readable on Day and Night. */
+  :root {
+    --tc-ansi-0: #484f58;
+    --tc-ansi-1: #ff7b72;
+    --tc-ansi-2: #3fb950;
+    --tc-ansi-3: #d29922;
+    --tc-ansi-4: #58a6ff;
+    --tc-ansi-5: #bc8cff;
+    --tc-ansi-6: #39c5cf;
+    --tc-ansi-7: #b1bac4;
+    --tc-ansi-8: #6e7681;
+    --tc-ansi-9: #ffa198;
+    --tc-ansi-10: #56d364;
+    --tc-ansi-11: #e3b341;
+    --tc-ansi-12: #79c0ff;
+    --tc-ansi-13: #d2a8ff;
+    --tc-ansi-14: #56d4dd;
+    --tc-ansi-15: #f0f6fc;
+  }
+  :root[data-theme="light"] {
+    --tc-ansi-0: #24292f;
+    --tc-ansi-1: #cf222e;
+    --tc-ansi-2: #116329;
+    --tc-ansi-3: #4d2d00;
+    --tc-ansi-4: #0969da;
+    --tc-ansi-5: #8250df;
+    --tc-ansi-6: #1b7c83;
+    --tc-ansi-7: #6e7781;
+    --tc-ansi-8: #57606a;
+    --tc-ansi-9: #a40e26;
+    --tc-ansi-10: #1a7f37;
+    --tc-ansi-11: #633c01;
+    --tc-ansi-12: #218bff;
+    --tc-ansi-13: #a475f9;
+    --tc-ansi-14: #3192aa;
+    --tc-ansi-15: #8c959f;
+  }
+  #task-console-modal {
+    position: fixed; inset: 0; z-index: 10900; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.68); padding: 18px;
+  }
+  #task-console-modal.visible { display: flex; }
+  #task-console-title { flex: 1; min-width: 0; margin: 0; font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; }
+  .task-console-meta-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); font-size: var(--fs-meta-sm); }
+  #task-console-meta { overflow-wrap: anywhere; }
+  .tc-stall { color: var(--muted); }
+  .tc-stall-warn { color: var(--warn); font-weight: 600; }
+  #task-console-chip { cursor: pointer; font: inherit; }
+  #task-console-failure {
+    background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer;
+    font-size: var(--fs-meta-sm); text-decoration: underline; text-underline-offset: 3px;
+  }
+  #task-console-stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
+  #task-console-scroll {
+    flex: 1; overflow: auto; overscroll-behavior: contain; padding: 8px 14px 28px;
+    background: var(--bg);
+  }
+  #task-console-earlier {
+    display: block; margin: 0 auto 8px; border: 1px solid var(--border); background: var(--bg2);
+    color: var(--text); border-radius: 999px; padding: 3px 14px; font-size: var(--fs-meta-sm); cursor: pointer;
+  }
+  #task-console-earlier:disabled { opacity: 0.6; cursor: default; }
+  #task-console-earlier[hidden] { display: none; }
+  #task-console-body {
+    margin: 0; font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+    font-size: var(--fs-meta-sm); line-height: 1.45; color: var(--text);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .tc-line { min-height: 1.45em; }
+  .tc-line-partial { opacity: 0.85; }
+  .tc-line-target { background: rgba(248, 81, 73, 0.16); border-radius: 3px; }
+  .tc-line-count {
+    display: inline-block; margin-left: 8px; padding: 0 6px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); font-size: 0.85em; user-select: none;
+  }
+  .tc-bold { font-weight: 700; }
+  .tc-dim { opacity: 0.65; }
+  .tc-italic { font-style: italic; }
+  .tc-underline { text-decoration: underline; }
+  .tc-fg-0 { color: var(--tc-ansi-0); }
+  .tc-fg-1 { color: var(--tc-ansi-1); }
+  .tc-fg-2 { color: var(--tc-ansi-2); }
+  .tc-fg-3 { color: var(--tc-ansi-3); }
+  .tc-fg-4 { color: var(--tc-ansi-4); }
+  .tc-fg-5 { color: var(--tc-ansi-5); }
+  .tc-fg-6 { color: var(--tc-ansi-6); }
+  .tc-fg-7 { color: var(--tc-ansi-7); }
+  .tc-fg-8 { color: var(--tc-ansi-8); }
+  .tc-fg-9 { color: var(--tc-ansi-9); }
+  .tc-fg-10 { color: var(--tc-ansi-10); }
+  .tc-fg-11 { color: var(--tc-ansi-11); }
+  .tc-fg-12 { color: var(--tc-ansi-12); }
+  .tc-fg-13 { color: var(--tc-ansi-13); }
+  .tc-fg-14 { color: var(--tc-ansi-14); }
+  .tc-fg-15 { color: var(--tc-ansi-15); }
+  .tc-bg-0 { background: var(--tc-ansi-0); }
+  .tc-bg-1 { background: var(--tc-ansi-1); }
+  .tc-bg-2 { background: var(--tc-ansi-2); }
+  .tc-bg-3 { background: var(--tc-ansi-3); }
+  .tc-bg-4 { background: var(--tc-ansi-4); }
+  .tc-bg-5 { background: var(--tc-ansi-5); }
+  .tc-bg-6 { background: var(--tc-ansi-6); }
+  .tc-bg-7 { background: var(--tc-ansi-7); }
+  .tc-bg-8 { background: var(--tc-ansi-8); }
+  .tc-bg-9 { background: var(--tc-ansi-9); }
+  .tc-bg-10 { background: var(--tc-ansi-10); }
+  .tc-bg-11 { background: var(--tc-ansi-11); }
+  .tc-bg-12 { background: var(--tc-ansi-12); }
+  .tc-bg-13 { background: var(--tc-ansi-13); }
+  .tc-bg-14 { background: var(--tc-ansi-14); }
+  .tc-bg-15 { background: var(--tc-ansi-15); }
+  #task-console-status { color: var(--muted); padding: 10px 0; font-size: var(--fs-meta-sm); }
+  #task-console-status[hidden] { display: none; }
+  #task-console-jump {
+    position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+    border: 1px solid var(--accent); background: var(--bg3); color: var(--accent);
+    border-radius: 999px; padding: 5px 14px; font-size: var(--fs-meta-sm); cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  }
+  #task-console-jump[hidden] { display: none; }
+  /* Rows in the composer panel: the console opener, the health hints, the
+     ended rows. */
+  .bg-task-desc.task-console-open {
+    display: block; -webkit-line-clamp: unset; background: none; border: 0; padding: 0; margin: 0;
+    font: inherit; color: var(--text); text-align: left; cursor: pointer;
+    text-decoration: underline; text-decoration-color: transparent; text-underline-offset: 3px;
+  }
+  .bg-task-desc.task-console-open:hover, .bg-task-desc.task-console-open:focus-visible {
+    color: var(--accent); text-decoration-color: currentColor; outline: none;
+  }
+  .bg-task-desc-no-output { cursor: help; }
+  .bg-task-steps { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bg-task-stall { color: var(--muted); flex-shrink: 0; white-space: nowrap; }
+  .bg-task-stall[hidden] { display: none; }
+  .bg-task-stall-warn { color: var(--warn); font-weight: 600; }
+  .bg-task-chip {
+    flex-shrink: 0; border: 1px solid var(--success); color: var(--success); background: transparent;
+    border-radius: 999px; padding: 0 7px; font-size: var(--fs-meta-sm); white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .bg-task-chip[hidden] { display: none; }
+  .bg-task-chip-fail { border-color: var(--danger); color: var(--danger); }
+  .bg-task-row-ended { opacity: 0.62; }
+  .bg-task-row-ended:hover, .bg-task-row-ended:focus-within { opacity: 0.9; }
+  .bg-task-outcome { flex-shrink: 0; font-weight: 700; }
+  .bg-task-outcome-ok { color: var(--success); }
+  .bg-task-outcome-fail { color: var(--danger); }
+  .bg-task-dismiss {
+    flex-shrink: 0; background: transparent; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 8px; width: 26px; height: 24px; line-height: 1; cursor: pointer; font-size: 1rem;
+  }
+  .bg-task-dismiss:hover { color: var(--text); border-color: var(--text); }
+  @media (max-width: 680px) {
+    #task-console-modal { padding: 0; }
+    #task-console-modal .subagent-viewer-dialog { width: 100%; height: 100%; border: 0; border-radius: 0; }
+    #task-console-scroll { padding: 8px 10px 28px; }
   }
   /* Preview cards: same row grammar as a background task, with a link-shaped
      primary action. Shared by the composer panel and the settings list. */
@@ -7006,6 +7169,22 @@
         </div>
         <div class="settings-help" style="margin-top: 6px;">A conversation only scrolls by itself while you are at its end. Anywhere else it stays where you are reading, and the round button above the composer shows that something new or a question is waiting below. Your own message is the exception: sending one takes you to the end. Switch this off to stay put then too. Saved in this browser.</div>
         <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="conversation-window-retention-slider">Messages kept per conversation for switching back <span id="conversation-window-retention-value">200 messages</span></label>
+          <input
+            id="conversation-window-retention-slider"
+            type="range"
+            min="100"
+            max="1100"
+            step="100"
+            value="200"
+            aria-label="Messages kept per conversation for switching back"
+            aria-valuetext="200 messages"
+            oninput="previewConversationWindowRetention(this.value)"
+            onchange="updateConversationWindowRetention(this.value)"
+          >
+        </div>
+        <div class="settings-help" style="margin-top: 6px;">A conversation you switch away from and back to opens where you were reading, with the older messages you had loaded. This many are kept around that place for each of the last eight conversations; No limit keeps them all, at the cost of memory. Saved in this browser.</div>
+        <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
           <label for="turn-ceiling-slider">Max turn duration <span id="turn-ceiling-value">No limit</span></label>
           <input
             id="turn-ceiling-slider"
@@ -7035,6 +7214,21 @@
           >
         </div>
         <div class="settings-help" style="margin-top: 6px;">How long background tasks may keep a session alive after its turn ends: backgrounded commands, subagents and monitors on Claude; background agents and detached shells on Copilot's SDK engine. When the limit is reached the tasks are stopped. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
+        <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+          <label for="task-stall-minutes-slider">Mark a background task as quiet after <span id="task-stall-minutes-value">10 min</span></label>
+          <input
+            id="task-stall-minutes-slider"
+            type="range"
+            min="1"
+            max="120"
+            step="1"
+            value="10"
+            aria-label="Minutes without output before a background task is marked as quiet"
+            oninput="previewTaskStallMinutesSetting(this.value)"
+            onchange="updateTaskStallMinutesSetting(this.value)"
+          >
+        </div>
+        <div class="settings-help" style="margin-top: 6px;">A shell or Monitor task that has written no output for this long gets an amber "no output for N min" note in the composer panel and its console.</div>
         <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
           <label for="subagent-record-retention-select">Keep sub-agent tool output</label>
           <select id="subagent-record-retention-select" onchange="updateSubagentRecordRetentionSetting(this.value)" aria-label="Keep sub-agent tool output">
@@ -7372,6 +7566,18 @@
               <option value="off">Off — no attribution</option>
             </select>
             <div id="claude-attribution-example" class="settings-help"></div>
+            <label for="claude-background-command-limit-slider" style="margin-top: 8px;">Claude background command limit <span id="claude-background-command-limit-value">2 h</span></label>
+            <input
+              id="claude-background-command-limit-slider"
+              type="range"
+              min="30"
+              max="480"
+              step="30"
+              value="120"
+              aria-label="Claude background command limit in minutes"
+              oninput="window.previewClaudeBackgroundCommandLimit?.(this.value)"
+            >
+            <div class="settings-help">How long a command Claude runs in the background may take before Claude Code stops it, unless Claude gives it its own timeout (up to 8 h). Commands in the foreground move to the background after 2 min. Applies to Claude sessions started after you save; a running session keeps its limit until it restarts.</div>
             <div id="claude-settings-status" class="settings-help settings-provider-status">Loading Claude settings…</div>
             <div style="display: flex; gap: 8px; margin-top: 8px;">
               <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
@@ -8026,6 +8232,33 @@
       <div id="subagent-viewer-status"></div>
     </div>
     <button id="subagent-viewer-jump" type="button" hidden>New entries ↓</button>
+  </div>
+</div>
+
+<!-- Task console: a shell or Monitor task's output, live while it runs
+     (task-console.mjs). -->
+<div id="task-console-modal" aria-hidden="true">
+  <div class="subagent-viewer-dialog task-console-dialog" role="dialog" aria-modal="true" aria-labelledby="task-console-title">
+    <div class="subagent-viewer-header">
+      <div class="subagent-viewer-title-row">
+        <span aria-hidden="true">⌨️</span>
+        <h2 id="task-console-title">Task</h2>
+        <button id="task-console-stop" class="subagent-viewer-btn" type="button" hidden>Stop</button>
+        <button class="subagent-viewer-btn task-console-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="task-console-meta-row">
+        <span id="task-console-meta"></span>
+        <span id="task-console-stall" class="tc-stall" hidden></span>
+        <button id="task-console-chip" class="bg-task-chip" type="button" hidden></button>
+        <button id="task-console-failure" type="button" hidden>first failure</button>
+      </div>
+    </div>
+    <div id="task-console-scroll">
+      <button id="task-console-earlier" type="button" hidden>Load earlier</button>
+      <pre id="task-console-body"></pre>
+      <div id="task-console-status" hidden></div>
+    </div>
+    <button id="task-console-jump" type="button" hidden>Jump to end ↓</button>
   </div>
 </div>
 

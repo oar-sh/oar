@@ -1,4 +1,5 @@
 import { resolveNearBottomThresholdPx } from './transcript-viewport-anchor.mjs';
+import { normalizeReadingAnchor } from './transcript-reading-anchor.mjs';
 import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
 import { resolveRelayDotState } from './relay-dot-state.mjs';
 import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
@@ -313,6 +314,7 @@ function readConversationViewState(conversationId) {
         loadedMessageCount: Number.isFinite(Number(parsed.loadedMessageCount)) && Number(parsed.loadedMessageCount) >= 0
           ? Math.trunc(Number(parsed.loadedMessageCount))
           : null,
+        anchor: normalizeReadingAnchor(parsed.anchor),
       };
     }
   } catch {
@@ -323,6 +325,7 @@ function readConversationViewState(conversationId) {
   return {
     scrollTop: Math.trunc(legacyScrollTop),
     loadedMessageCount: null,
+    anchor: null,
   };
 }
 
@@ -337,6 +340,7 @@ function writeConversationViewState(conversationId, nextState = {}) {
     loadedMessageCount: Number.isFinite(Number(nextState.loadedMessageCount)) && Number(nextState.loadedMessageCount) >= 0
       ? Math.trunc(Number(nextState.loadedMessageCount))
       : current.loadedMessageCount ?? null,
+    anchor: 'anchor' in nextState ? normalizeReadingAnchor(nextState.anchor) : (current.anchor ?? null),
   };
   localStorage.setItem(key, JSON.stringify(next));
   return true;
@@ -371,6 +375,27 @@ export function loadConversationScrollTop(conversationId) {
 
 export function loadConversationLoadedMessageCount(conversationId) {
   return readConversationViewState(conversationId)?.loadedMessageCount ?? null;
+}
+
+// The message read and its offset, or "at the end" (transcript-reading-anchor.mjs):
+// what a switch back and a reload restore. scrollTop is still written for
+// older pages of this app reading the same storage.
+export function saveConversationReadingAnchor(conversationId, anchor) {
+  const value = normalizeReadingAnchor(anchor);
+  if (!value) return false;
+  try {
+    return writeConversationViewState(conversationId, { anchor: value });
+  } catch {
+    return false;
+  }
+}
+
+export function loadConversationReadingAnchor(conversationId) {
+  try {
+    return readConversationViewState(conversationId)?.anchor ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizePendingMessageText(text) {

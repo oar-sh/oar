@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { LIVE_ROW_RELOAD_ATTEMPTS, loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
+import {
+  LIVE_ROW_RELOAD_ATTEMPTS,
+  loadKeepingLiveRows,
+  shouldKeepTranscriptOnReload,
+} from './transcript-reload-freshness.mjs';
 
 // A conversation on the relay, a page that renders reload answers, and a
 // socket that appends a stored row to the page.
@@ -74,4 +78,27 @@ test('a failed request is handed back at once', async () => {
   assert.equal(response, null);
   assert.equal(stale, false);
   assert.equal(requests, 1);
+});
+
+test('a stale answer is kept off the live transcript but replaces a drawn copy', async () => {
+  // The live poll: the page already has every row, the answer lacks some.
+  assert.equal(shouldKeepTranscriptOnReload({ stale: true }), true);
+  assert.equal(shouldKeepTranscriptOnReload({ stale: false }), false);
+  // After a switch drew the kept copy: rows stored while the reader was away
+  // are only in the answer, so it goes on the page even when stale.
+  assert.equal(shouldKeepTranscriptOnReload({ stale: true, showsLiveTranscript: false }), false);
+  assert.equal(shouldKeepTranscriptOnReload({ stale: false, showsLiveTranscript: false }), false);
+  // A jump into the history wins either way.
+  assert.equal(shouldKeepTranscriptOnReload({ jumped: true, showsLiveTranscript: false }), true);
+  assert.equal(shouldKeepTranscriptOnReload({ jumped: true, stale: true }), true);
+
+  // End to end: the drawn copy lacks a row stored while the reader was away,
+  // and live rows land during every attempt.
+  const relay = harness();
+  relay.render({ messages: ['msg_fixture_1'] });
+  for (let index = 0; index < LIVE_ROW_RELOAD_ATTEMPTS; index += 1) relay.arriveDuringRequest(`msg_fixture_burst_${index}`);
+  const { response, stale } = await loadKeepingLiveRows(relay.load, relay.getLiveRowEpoch);
+  assert.equal(stale, true);
+  if (!shouldKeepTranscriptOnReload({ stale, showsLiveTranscript: false })) relay.render(response);
+  assert.ok(relay.page.includes('msg_fixture_2'), 'the row stored while away is on the page');
 });

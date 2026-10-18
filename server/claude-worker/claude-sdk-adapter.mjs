@@ -1,5 +1,6 @@
 import { createSdkMcpServer, query } from '@anthropic-ai/claude-agent-sdk';
 
+import { formatClaudeBackgroundCommandLimitLabel } from '../../shared/claude-background-command-limit.mjs';
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
 import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructions.mjs';
 import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-tool-core.mjs';
@@ -136,11 +137,57 @@ export function permissionModeForRelayMode(relayMode) {
   return 'default';
 }
 
-export function systemPromptForRelayMode(relayMode) {
+// Bash timeouts the CLI reads from its environment (measured against CLI
+// 2.1.292). BASH_DEFAULT_TIMEOUT_MS is the only lever on the background
+// default (`max(30 min, BASH_DEFAULT_TIMEOUT_MS)`), but it also becomes the
+// foreground default; CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS therefore caps a
+// main-agent foreground command at 2 min and then moves it to the background
+// instead of letting it block the turn. BASH_MAX_TIMEOUT_MS lifts the ceiling
+// an explicit `timeout` may ask for (foreground and background) to 8 h.
+// Commands that start with `sleep` are never moved to the background by the
+// CLI, and subagents get no auto-background; both run in the foreground for
+// up to the default.
+export const CLAUDE_BASH_MAX_TIMEOUT_MS = 8 * 3_600_000;
+export const CLAUDE_AUTO_BACKGROUND_TIMEOUT_MS = 120_000;
+
+/**
+ * The environment a Claude CLI spawn gets, or null to inherit the worker's
+ * own. `env` REPLACES the subprocess environment in the SDK, so the base is
+ * spread in.
+ */
+export function claudeSpawnEnv({ backgroundCommandLimitMs = null, baseEnv = process.env } = {}) {
+  const limit = Number(backgroundCommandLimitMs);
+  if (backgroundCommandLimitMs === null || !Number.isFinite(limit) || limit <= 0) return null;
+  return {
+    ...baseEnv,
+    BASH_DEFAULT_TIMEOUT_MS: String(Math.round(limit)),
+    BASH_MAX_TIMEOUT_MS: String(Math.max(CLAUDE_BASH_MAX_TIMEOUT_MS, Math.round(limit))),
+    CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS: String(CLAUDE_AUTO_BACKGROUND_TIMEOUT_MS),
+  };
+}
+
+/** How to run long commands, with the session's limit when it is known. */
+export function longCommandInstructionText(backgroundCommandLimitMs = null) {
+  const limit = Number(backgroundCommandLimitMs);
+  const known = backgroundCommandLimitMs !== null && Number.isFinite(limit) && limit > 0;
+  const limitClause = known
+    ? `Background Bash commands are stopped after ${formatClaudeBackgroundCommandLimitLabel(limit / 60_000)} unless you pass a longer timeout (up to 8 h); `
+    : 'For long background Bash commands, ';
+  return `${limitClause}write the full output to a log file instead of piping it into tail or head, `
+    + 'since the pipe holds the output back and loses it if the command is stopped. '
+    + 'Start runs that must survive a session restart detached with nohup and a log file.';
+}
+
+export function systemPromptForRelayMode(relayMode, { backgroundCommandLimitMs = null } = {}) {
   const mode = String(relayMode || 'agent').trim().toLowerCase();
   // The media-embed capability rides every session — unlike the mode nudges it
-  // is renderer knowledge the model cannot discover any other way.
-  const append = [MEDIA_EMBED_INSTRUCTION_TEXT, MODE_SYSTEM_PROMPT_APPEND[mode]]
+  // is renderer knowledge the model cannot discover any other way. The long
+  // command note rides every session too: the limit is the relay's setting.
+  const append = [
+    MEDIA_EMBED_INSTRUCTION_TEXT,
+    longCommandInstructionText(backgroundCommandLimitMs),
+    MODE_SYSTEM_PROMPT_APPEND[mode],
+  ]
     .filter(Boolean)
     .join('\n\n');
   return {
@@ -233,6 +280,10 @@ export function startClaudeSession({
   autoCompactWindow = null,
   thinkingEnabled = null,
   attribution = null,
+  // How long a backgrounded Bash command may run without its own timeout
+  // (ms, the relay's setting); null leaves the CLI's defaults and the
+  // worker's environment alone.
+  backgroundCommandLimitMs = null,
   thinkingDisplay = '',
   abortController,
   canUseTool,
@@ -259,14 +310,16 @@ export function startClaudeSession({
   const relayMcpServer = typeof api === 'function'
     ? createRelayMcpServer({ api, getConversationId, dbg, remoteRelayTool: remoteRelayTool === true })
     : null;
+  const env = claudeSpawnEnv({ backgroundCommandLimitMs });
   const options = {
     cwd,
     permissionMode: permissionModeForRelayMode(relayMode),
-    systemPrompt: systemPromptForRelayMode(relayMode),
+    systemPrompt: systemPromptForRelayMode(relayMode, { backgroundCommandLimitMs: env ? backgroundCommandLimitMs : null }),
     includePartialMessages: true,
     forwardSubagentText: true,
     ...(effortOption ? { effort: effortOption } : {}),
     ...(spawnSettings ? { settings: spawnSettings } : {}),
+    ...(env ? { env } : {}),
     ...(normalizedModel && normalizedModel !== 'auto' ? { model: String(model).trim() } : {}),
     ...(String(resume || '').trim() ? { resume: String(resume).trim() } : {}),
     ...(abortController ? { abortController } : {}),

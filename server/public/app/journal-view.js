@@ -19,9 +19,10 @@ import {
   applyContextUsageBar,
   isMobileComposerViewport,
   releaseComposerFocusAfterSend,
-  loadConversationScrollTop,
-  loadConversationLoadedMessageCount,
   saveConversationScrollTop,
+  loadConversationReadingAnchor,
+  saveConversationReadingAnchor,
+  isMessagesNearBottom,
   IS_SHARED_VIEW,
   openSummaryModal,
   closeSummaryModal,
@@ -76,9 +77,16 @@ import { isSetupRequired, updateProviderReadinessInputs } from './provider-readi
 import { SETUP_TEXT } from './no-conversation-state.mjs';
 import { openSettingsModal } from './settings-modal.js';
 import { captureReadingBlock, restoreReadingBlock } from './transcript-viewport-anchor.mjs';
-import { renderMessages, renderNoConversationState, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn } from './conversation-view.js';
+import { renderMessages, renderNoConversationState, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, getTranscriptJumpEpoch, getTranscriptLiveRowEpoch, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn, captureConversationReadingAnchor, restoreConversationReadingAnchor, detachConversationWindowFromTail, mergeMessagesIntoTranscript, isConversationWindowAtTail } from './conversation-view.js';
+import { mergeTailPage } from './transcript-reading-anchor.mjs';
+import { readWindowRetention } from './conversation-window-retention.mjs';
 import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
-import { setBackgroundTasksConversation, setConversationBackgroundTasks } from './background-tasks-view.mjs';
+import {
+  setBackgroundTasksConversation,
+  setConversationBackgroundTasks,
+  setConversationEndedBackgroundTasks,
+  setConversationTaskStallMinutes,
+} from './background-tasks-view.mjs';
 import { setConversationPins, setPinsConversation } from './pinned-messages-view.mjs';
 import { setConversationHiddenMessages, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
 import { setUsageLimitConversation } from './usage-limit-ui.js';
@@ -88,6 +96,8 @@ import { loadRelayBoards } from './relay-board-view.js';
 import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRepoBrowserLaunchCwdPath, openRepoBrowserForCwdPick } from './attachments-view.js';
 import { buildKnownCwdOptions, normalizeKnownCwdPath } from './known-cwd-options.mjs';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
+import { conversationPayloadCache, payloadHasMoreOlder, windowPageInfo } from './conversation-payload-cache.mjs';
+import { loadKeepingLiveRows, shouldKeepTranscriptOnReload } from './transcript-reload-freshness.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import {
   buildNewConversationModelChoices,
@@ -129,8 +139,6 @@ import {
   describeFilterMatchCount,
 } from './conversation-list-filter.mjs';
 
-const PROCESSING_DOT_FRAMES = ['   ', '.  ', '.. ', '...'];
-const PROCESSING_DOT_INTERVAL_MS = 1000;
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const CONVERSATION_LIST_PAGE_SIZE = 40;
 const REASONING_STORAGE_KEY = 'copilot_selected_reasoning_effort';
@@ -145,8 +153,6 @@ const OPENAI_IMAGE_SIZE_STORAGE_KEY = 'copilot_openai_image_size';
 const NEW_CHAT_CWD_STORAGE_KEY = 'copilot_new_chat_cwd';
 const NEW_CHAT_CUSTOM_CWD_VALUE = '__custom__';
 const CONV_FILTER_DEBOUNCE_MS = 220;
-let processingDotFrame = 0;
-let processingDotTimer = null;
 let lastConvListHtml = '';
 // The list as last rendered, as drag items (conversation-group-drag.mjs).
 let lastConvListDragItems = [];
@@ -224,7 +230,7 @@ function mergeConversationRecord(current, next) {
   // localTurnStatus is optimistic client state driven by one-shot message_status
   // socket events. If the socket drops between a turn finishing and the event
   // being delivered — a relay restart is the obvious case — the flag would stay
-  // 'processing' until it aged out, leaving the list spinner running forever.
+  // 'processing' until it aged out, leaving the list row marked as working forever.
   // The server's activeTurn flag is authoritative, so let it clear the flag.
   if (next && typeof next === 'object' && next.activeTurn === false) {
     delete merged.localTurnStatus;
@@ -346,27 +352,6 @@ function isConversationProcessing(conversation, workerState) {
     || '',
   ).trim().toLowerCase();
   return runtimeStatus === 'processing';
-}
-
-function ensureProcessingDotTimer(enabled) {
-  if (enabled) {
-    if (processingDotTimer) return;
-    processingDotTimer = setInterval(() => {
-      processingDotFrame = (processingDotFrame + 1) % PROCESSING_DOT_FRAMES.length;
-      // Touch only the dot spans: rewriting the whole list every second kills
-      // sidebar selections and burns battery for a spinner frame.
-      const frame = PROCESSING_DOT_FRAMES[processingDotFrame];
-      document.querySelectorAll('#conv-list .conv-processing-dots').forEach((el) => {
-        el.textContent = ` ${frame}`;
-      });
-    }, PROCESSING_DOT_INTERVAL_MS);
-    return;
-  }
-  if (processingDotTimer) {
-    clearInterval(processingDotTimer);
-    processingDotTimer = null;
-  }
-  processingDotFrame = 0;
 }
 
 export async function loadConversations() {
@@ -522,7 +507,10 @@ function applyConversationGroupPositions(positions) {
   }
 }
 
-/** A sidebar row's state: its colour (green is 'ready') and whether its dots run. */
+/**
+ * A sidebar row's state: its colour (green is 'ready') and whether it works
+ * (a turn or background work), which keeps a ready title bright green.
+ */
 function conversationRowState(conversation, pendingByConversation = getPendingQuestionCountsByConversation()) {
   const pendingCount = Number(pendingByConversation[conversation?.id] || 0);
   const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
@@ -542,6 +530,7 @@ function conversationRowState(conversation, pendingByConversation = getPendingQu
   return {
     visualState,
     processing,
+    working: processing || sessionState === 'background_only',
     pendingCount,
     // A turn or background work, whether or not a card waits in it: what
     // "Stop all running" acts on, and what keeps an archive from it.
@@ -555,6 +544,11 @@ function conversationRowState(conversation, pendingByConversation = getPendingQu
       sessionState,
     }),
   };
+}
+
+/** Whether the conversation works now: the chat header's title follows the row's. */
+export function isConversationWorking(conversation) {
+  return !!conversation && conversationRowState(conversation).working;
 }
 
 /** The group's head and its name for the picker and the menus. */
@@ -634,7 +628,6 @@ function paintConvList() {
     },
   });
   lastConvListDragItems = describeDragItems(items);
-  let hasProcessingConversation = false;
   const footerHtml = (() => {
     if (activeFilter) {
       // While a filter is active the drain loads older pages by itself; a
@@ -653,7 +646,6 @@ function paintConvList() {
     return '';
   })();
   if (items.length === 0) {
-    ensureProcessingDotTimer(false);
     const emptyText = activeFilter && inView.length > 0
       ? 'No conversations match your filter'
       : (conversationListArchivedView ? 'No archived conversations' : 'No conversations yet');
@@ -662,11 +654,6 @@ function paintConvList() {
     scheduleConversationListBoundaryCheck();
     return;
   }
-  const conversationView = (conversation) => {
-    const view = viewOf(conversation);
-    if (view.processing) hasProcessingConversation = true;
-    return view;
-  };
   // The head row's pill: the member count and what the members are doing;
   // while folded, its "waiting" part opens the member the card sits in.
   const groupPillHtml = (item) => {
@@ -688,8 +675,7 @@ function paintConvList() {
     return `<button class="conv-group-fold" type="button" data-group-fold="${escHtml(item.group.id)}" aria-expanded="${item.group.open ? 'true' : 'false'}" aria-label="${label}" title="${label}"${forced ? ' disabled' : ''} onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')">${item.group.open ? '▾' : '▸'}</button>`;
   };
   const rowHtml = (c, item) => {
-    const view = conversationView(c);
-    const processingDots = view.processing ? PROCESSING_DOT_FRAMES[processingDotFrame] : '';
+    const view = viewOf(c);
     const providerIndicatorLabel = conversationProviderIndicatorLabel(c);
     const providerIndicatorKey = conversationProviderIndicatorKey(c);
     const providerIndicatorHtml = providerIndicatorLabel
@@ -711,8 +697,8 @@ function paintConvList() {
     const rowTitle = handName || c.title;
     const titleAttr = handName && handName !== c.title ? ` title="${escHtml(`${handName} · ${c.title}`)}"` : '';
     return `
-    <div class="conv-item worker-ui-${view.visualState}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}${groupClass}" data-conversation-id="${c.id}"${groupAttr} onclick="openConversation('${c.id}')">
-      <div class="conv-title"${titleAttr}>${item.kind === 'head' ? foldButtonHtml(item) : ''}${escHtml(rowTitle)}${processingDots ? `<span class="conv-processing-dots">${escHtml(` ${processingDots}`)}</span>` : ''}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
+    <div class="conv-item worker-ui-${view.visualState}${view.working ? ' conv-working' : ''}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}${groupClass}" data-conversation-id="${c.id}"${groupAttr} onclick="openConversation('${c.id}')">
+      <div class="conv-title"${titleAttr}>${item.kind === 'head' ? foldButtonHtml(item) : ''}${escHtml(rowTitle)}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
       <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${item.kind === 'head' ? groupPillHtml(item) : ''}${originMarkerHtml}${watchedMarkerHtml}${providerIndicatorHtml}</div>
       ${c.archived
         ? `<button class="conv-archive" onclick="unarchiveConv(event,'${c.id}')" title="Unarchive" aria-label="Unarchive">📂</button>`
@@ -738,7 +724,6 @@ function paintConvList() {
   }
   bindConversationContextMenu(list);
   bindConversationGroupControls(list);
-  ensureProcessingDotTimer(hasProcessingConversation);
   window.syncChatTitleControls?.();
   scheduleConversationListBoundaryCheck();
 }
@@ -782,18 +767,47 @@ export function toggleConversationGroupFold(event, groupId) {
 // keepTranscript: the page shows a window this payload must not replace (the
 // user jumped into the history; the payload is the end of the conversation).
 // Everything but the messages still applies.
+// fromCache: the payload is the window kept from an earlier visit
+// (conversation-payload-cache.mjs), drawn while the fresh one is on its way.
+// Only the transcript and what goes with it is drawn: the record, the
+// composer, the draft, the live bubble and the tasks wait for the fresh answer.
+// viewAnchor: the place read (transcript-reading-anchor.mjs) the restore
+// puts back, in place of savedScrollTop.
+// mergeFrom: the messages on the page; the payload's are merged into them
+// rather than drawn anew (mergeMessagesIntoTranscript).
+// windowPayload: with keepTranscript, the window the page keeps, kept for
+// the next visit in place of nothing.
 export function applyLoadedConversationState(id, response, {
   restoreScroll = false,
   savedScrollTop = null,
+  viewAnchor = null,
   followLiveUpdates = !restoreScroll,
   keepTranscript = false,
+  fromCache = false,
+  mergeFrom = null,
+  windowPayload = null,
 } = {}) {
   if (!response) {
+    if (!IS_SHARED_VIEW) conversationPayloadCache.forget(id);
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
     renderMessages([]);
     window.syncChatTitleControls?.();
     return;
+  }
+  if (fromCache) {
+    applyCachedConversationState(id, response, { viewAnchor });
+    return;
+  }
+  if (!IS_SHARED_VIEW) {
+    // The page keeps a window this payload does not show: what it shows is
+    // not this payload, so only a window the caller names is kept for the
+    // next visit. Without one the entry already there stays: it follows the
+    // page (its pages and live rows are added to it), so it still is the
+    // window on screen. The cache keeps this very object, uncopied: nothing
+    // below may change it.
+    if (windowPayload) conversationPayloadCache.remember(id, windowPayload);
+    else if (!keepTranscript) conversationPayloadCache.remember(id, response);
   }
   const existingConversation = conversations[id] || {};
   upsertConversationRecord({
@@ -862,9 +876,12 @@ export function applyLoadedConversationState(id, response, {
   // Their Hide / Unhide too, from the hidden list (owner payloads only).
   if ('hiddenMessages' in response) setConversationHiddenMessages(id, response.hiddenMessages, response.hiddenMessagesRevision);
   setHiddenMessagesConversation(id);
-  const didRenderMessages = keepTranscript
-    ? false
-    : renderMessages(response.messages, !restoreScroll, response);
+  let didRenderMessages = false;
+  if (!keepTranscript) {
+    didRenderMessages = mergeFrom
+      ? mergeMessagesIntoTranscript(mergeFrom, response.messages, response)
+      : renderMessages(response.messages, !restoreScroll, response);
+  }
   hydrateConversationDraft(id, {
     draftText: response.draftText,
     draftAttachments: response.draftAttachments,
@@ -873,7 +890,11 @@ export function applyLoadedConversationState(id, response, {
   });
   restoreInFlightThinking(response.inFlight || null, followLiveUpdates);
   setBackgroundTasksConversation(id);
+  // Absent from an older relay's payload: the threshold keeps its default.
+  if ('taskStallMinutes' in response) setConversationTaskStallMinutes(id, response.taskStallMinutes);
   setConversationBackgroundTasks(id, response.backgroundTasks || []);
+  // Absent from an older relay's payload: keep what the socket said.
+  if (Array.isArray(response.endedBackgroundTasks)) setConversationEndedBackgroundTasks(id, response.endedBackgroundTasks);
   setUsageLimitConversation(id, {
     // Absent from an older relay's payload: keep what the socket said.
     pause: 'usageLimitPause' in response ? response.usageLimitPause : undefined,
@@ -884,8 +905,18 @@ export function applyLoadedConversationState(id, response, {
   updateSessionPill(conversations[id], response.runtimeSession || null);
   window.syncChatTitleControls?.();
   if (!restoreScroll || !didRenderMessages) return;
+  restoreConversationScroll(id, savedScrollTop, viewAnchor);
+}
+
+// The place read when it is on the page, else the pixel position given, else
+// the end.
+function restoreConversationScroll(id, savedScrollTop, viewAnchor = null) {
   const el = document.getElementById('messages');
   if (!el) return;
+  if (viewAnchor && restoreConversationReadingAnchor(viewAnchor)) {
+    saveConversationScrollTop(id, el.scrollTop);
+    return;
+  }
   if (Number.isFinite(savedScrollTop)) {
     el.scrollTop = savedScrollTop;
     saveConversationScrollTop(id, el.scrollTop);
@@ -893,6 +924,54 @@ export function applyLoadedConversationState(id, response, {
   }
   el.scrollTop = el.scrollHeight;
   saveConversationScrollTop(id, el.scrollTop);
+}
+
+function payloadHasMessage(response, messageId) {
+  const id = String(messageId || '').trim();
+  return !!id && Array.isArray(response?.messages) && response.messages.some((message) => String(message?.id || '').trim() === id);
+}
+
+// The kept window of a conversation, when it holds the place read: a window
+// without it (a row edited since dropped it, the kept rows were cut) would
+// put the reader somewhere else.
+function readCachedWindow(id, anchor) {
+  const cached = conversationPayloadCache.read(id);
+  if (!cached) return null;
+  if (anchor && !anchor.atTail && anchor.messageId && !payloadHasMessage(cached, anchor.messageId)) return null;
+  return cached;
+}
+
+// The conversation being left: its place is noted as it is on the page, and
+// its kept window is cut down to the retention cap around that place.
+function keepPlaceOfConversationLeft(conversationId) {
+  const captured = captureConversationReadingAnchor();
+  const shown = captured?.conversationId === conversationId;
+  // During a quick run through several conversations the page still shows
+  // an earlier one: the place saved for this one stands.
+  const anchor = shown ? captured.anchor : loadConversationReadingAnchor(conversationId);
+  if (shown) saveConversationReadingAnchor(conversationId, anchor);
+  conversationPayloadCache.trim(conversationId, {
+    cap: readWindowRetention(),
+    anchorMessageId: anchor?.messageId || '',
+    atTail: anchor?.atTail === true,
+  });
+}
+
+// The kept window of a conversation, drawn on a switch back to it, at the
+// place read. Pins and the hidden list are revision-guarded, so an older copy
+// cannot undo a newer change the socket brought.
+function applyCachedConversationState(id, response, { viewAnchor = null } = {}) {
+  setRepoBrowserSessionInfo(response.sessionRootPath || '', response.sessionRootName || response.title || '');
+  if ('pins' in response) setConversationPins(id, response.pins, response.pinsRevision);
+  setPinsConversation(id);
+  if ('hiddenMessages' in response) setConversationHiddenMessages(id, response.hiddenMessages, response.hiddenMessagesRevision);
+  setHiddenMessagesConversation(id);
+  const didRenderMessages = renderMessages(response.messages, false, response);
+  // The panel shows this conversation's tasks as the socket keeps them.
+  setBackgroundTasksConversation(id);
+  window.syncChatTitleControls?.();
+  if (!didRenderMessages) return;
+  restoreConversationScroll(id, null, viewAnchor);
 }
 
 // The "via agent" marker (sidebar row, header, message badge): opens the
@@ -912,6 +991,67 @@ export function openOriginConversation(event, element) {
   return openConversation(id);
 }
 
+// The fresh answer for a conversation whose kept window is on the page (drawn
+// on the switch back, or still there when the conversation on screen is
+// opened again). A window that reaches the end takes the answer's rows: those
+// it has are replaced (a reply may have finished since), the new ones join
+// it, nothing else is rebuilt. A reader at the end stays at the end, one who
+// is not keeps the message they are at where it is, wherever they scrolled
+// to while the answer was on its way. A window in the middle of the history
+// keeps its rows: they do not change (an edit comes as message_updated, which
+// drops the window of a conversation not on screen and updates the one on
+// screen); the rest of the answer applies.
+function applyFreshOverCachedConversation(id, response, { cached, keepTranscript = false } = {}) {
+  const atEnd = isMessagesNearBottom() && isConversationWindowAtTail();
+  if (keepTranscript) {
+    applyLoadedConversationState(id, response, { keepTranscript: true, followLiveUpdates: false });
+    return;
+  }
+  const keptWindow = (hasMoreNewer) => ({
+    ...response,
+    messages: cached.messages,
+    hasMoreOlder: cached.hasMoreOlder,
+    hasMoreNewer,
+  });
+  if (cached.hasMoreNewer) {
+    applyLoadedConversationState(id, response, { keepTranscript: true, followLiveUpdates: false, windowPayload: keptWindow(true) });
+    return;
+  }
+  // The kept copy was read before the request: every row of it predates the
+  // answer, so a newer one the answer lacks was deleted while away.
+  const merged = mergeTailPage(cached.messages, response.messages, {
+    pageHasMoreOlder: payloadHasMoreOlder(response),
+    windowPredatesPage: true,
+  });
+  if (!merged) {
+    // More was written than the answer holds: a reader at the end gets the
+    // end; anyone else keeps the window, which no longer reaches it.
+    if (atEnd) {
+      applyLoadedConversationState(id, response, { restoreScroll: false });
+      return;
+    }
+    detachConversationWindowFromTail();
+    applyLoadedConversationState(id, response, { keepTranscript: true, followLiveUpdates: false, windowPayload: keptWindow(true) });
+    return;
+  }
+  const place = atEnd ? null : captureConversationReadingAnchor()?.anchor;
+  const flags = { hasMoreOlder: cached.hasMoreOlder, hasMoreNewer: false };
+  applyLoadedConversationState(id, {
+    ...response,
+    messages: merged.messages,
+    ...flags,
+    pageInfo: windowPageInfo(merged.messages, flags),
+  }, {
+    mergeFrom: cached.messages,
+    followLiveUpdates: atEnd,
+  });
+  const messagesEl = document.getElementById('messages');
+  if (!messagesEl) return;
+  if (atEnd) messagesEl.scrollTop = messagesEl.scrollHeight;
+  else if (place) restoreConversationReadingAnchor(place);
+  saveConversationScrollTop(id, messagesEl.scrollTop);
+}
+
 export async function openConversation(id, options = {}) {
   const didLeaveStatusView = leaveStatusView();
   document.getElementById('input-area')?.removeAttribute('hidden');
@@ -925,6 +1065,7 @@ export async function openConversation(id, options = {}) {
     window.clearImageEditTarget?.();
   }
   const switchingConversation = !!nextConversationId && previousConversationId !== nextConversationId;
+  if (switchingConversation && previousConversationId && !IS_SHARED_VIEW) keepPlaceOfConversationLeft(previousConversationId);
   const capturedVersion = ++openConversationVersion;
   setCurrentConv(id);
   if (repoBrowserState.activeRoot === 'workspace') {
@@ -961,35 +1102,74 @@ export async function openConversation(id, options = {}) {
   const focusMessageId = String(options.focusMessageId || '').trim();
   const aroundMessageId = String(options.aroundMessageId || focusMessageId || '').trim();
   const forceFreshWindow = !!aroundMessageId;
-  const savedScrollTop = loadConversationScrollTop(id);
-  const restoreScroll = !forceFreshWindow && Number.isFinite(savedScrollTop);
-  const savedLoadedCount = loadConversationLoadedMessageCount(id);
-  const requestLimit = forceFreshWindow
-    ? 40
-    : (Number.isFinite(savedLoadedCount)
-      ? Math.max(20, savedLoadedCount)
-      : 20);
-  const r = await loadConversation(id, {
-    limit: requestLimit,
-    aroundMessageId: aroundMessageId || undefined,
+  const keepsPlace = !forceFreshWindow && !IS_SHARED_VIEW;
+  const savedAnchor = keepsPlace ? loadConversationReadingAnchor(id) : null;
+  // Switching back to a conversation seen before on this page: its kept
+  // window is drawn at once, at the place read, and the fresh answer below
+  // is merged into it.
+  const cached = keepsPlace ? readCachedWindow(id, savedAnchor) : null;
+  if (cached && (switchingConversation || didLeaveStatusView)) {
+    applyLoadedConversationState(id, cached, { fromCache: true, viewAnchor: savedAnchor });
+  }
+  // Nothing kept (a reload, a window dropped): a reader who was not at the
+  // end gets the messages around the one they read, as after a search jump.
+  // Only when the page does not show the conversation already: reopening the
+  // one on screen (a session bound, a click on it, a push) rebuilds its end
+  // under the reader, a jump would throw away the window they scrolled.
+  const showsOtherTranscript = switchingConversation || didLeaveStatusView;
+  const anchorMessageId = !cached && showsOtherTranscript && savedAnchor && !savedAnchor.atTail
+    ? String(savedAnchor.messageId || '').trim()
+    : '';
+  const cachedJumpEpoch = cached ? getTranscriptJumpEpoch() : 0;
+  const load = (around = aroundMessageId || anchorMessageId) => loadConversation(id, {
+    limit: around ? 40 : 20,
+    aroundMessageId: around || undefined,
   });
-  if (!shouldApplyConversationLoad({
+  const stillWanted = () => shouldApplyConversationLoad({
     requestedConversationId: id,
     activeConversationId: currentConvId,
     capturedVersion,
     currentVersion: openConversationVersion,
-  })) {
-    return;
+  });
+  // The drawn copy takes live rows from the socket while the answer is on its
+  // way; an answer that may lack them is asked again, as the live poll does.
+  const { response: fetched, stale } = cached
+    ? await loadKeepingLiveRows(load, getTranscriptLiveRowEpoch)
+    : { response: await load(), stale: false };
+  if (!stillWanted()) return;
+  let r = fetched;
+  const anchorFound = !!anchorMessageId && payloadHasMessage(r, anchorMessageId);
+  if (r && anchorMessageId && !anchorFound) {
+    // The message read is gone (deleted, compacted away): the end instead.
+    r = await load('');
+    if (!stillWanted()) return;
   }
-  if (r) {
+  if (r && cached) {
+    applyFreshOverCachedConversation(id, r, {
+      cached,
+      // A jump into the history from the drawn copy (a pin) wins. A stale
+      // answer is still merged, unlike on the live poll: the drawn copy
+      // predates the rows stored while the reader was away.
+      keepTranscript: shouldKeepTranscriptOnReload({
+        stale,
+        jumped: getTranscriptJumpEpoch() !== cachedJumpEpoch,
+        showsLiveTranscript: false,
+      }),
+    });
+  } else if (r) {
     // The conversation on screen opened again (a worker bound its session):
     // its rows are rebuilt under the reader, who keeps the text they are at.
     const messagesEl = document.getElementById('messages');
-    const reading = !switchingConversation && restoreScroll ? captureReadingBlock(messagesEl) : null;
+    const rereading = !switchingConversation && !anchorFound && !isMessagesNearBottom();
+    const reading = rereading ? captureReadingBlock(messagesEl) : null;
     // Counted when the window is put on the page, not when it is asked for:
     // a reload of the end that is still on its way must see the change.
-    if (forceFreshWindow) noteTranscriptJump();
-    applyLoadedConversationState(id, r, { restoreScroll, savedScrollTop });
+    if (forceFreshWindow || anchorFound) noteTranscriptJump();
+    applyLoadedConversationState(id, r, {
+      restoreScroll: rereading || anchorFound,
+      savedScrollTop: rereading ? (messagesEl?.scrollTop ?? null) : null,
+      viewAnchor: anchorFound ? savedAnchor : null,
+    });
     if (reading) restoreReadingBlock(messagesEl, reading);
     if (focusMessageId) {
       requestAnimationFrame(() => {
@@ -997,6 +1177,7 @@ export async function openConversation(id, options = {}) {
       });
     }
   } else {
+    conversationPayloadCache.forget(id);
     setRepoBrowserSessionInfo('', '');
     restoreInFlightThinking(null);
     renderMessages([]);
@@ -2319,6 +2500,7 @@ async function setConversationArchived(id, archived) {
     return false;
   }
   if (conversations[id]) conversations[id].archived = archived;
+  conversationPayloadCache.forget(id);
   renderConvList();
   window.syncChatTitleControls?.();
   window.syncComposerButtonState?.();
@@ -2531,7 +2713,10 @@ async function archiveConversationGroup(groupId) {
     return;
   }
   const skipped = Array.isArray(result.skipped) ? result.skipped : [];
-  for (const id of result.archived || []) if (conversations[id]) conversations[id].archived = true;
+  for (const id of result.archived || []) {
+    if (conversations[id]) conversations[id].archived = true;
+    conversationPayloadCache.forget(id);
+  }
   renderConvList();
   if (skipped.length) {
     const names = skipped.map((entry) => `“${String(entry.title || entry.id).trim()}”`).join(', ');
@@ -2861,6 +3046,7 @@ export async function deleteConv(e, id) {
     return;
   }
   delete conversations[id];
+  conversationPayloadCache.forget(id);
   renderConvList();
   if (currentConvId === id) clearOpenConversation();
 }

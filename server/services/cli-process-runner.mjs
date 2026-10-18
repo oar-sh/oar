@@ -37,10 +37,6 @@ const OTHER_ESCAPE_PATTERN = /\x1b[@-Z\\-_]/g;
 // differently-sized terminal this degrades to the pre-wrap behaviour.
 const PTY_WRAP_COLUMNS = 80;
 
-function normalizeText(value) {
-  return String(value == null ? '' : value).trim();
-}
-
 /**
  * Removes OSC sequences (including OSC-8 hyperlink wrappers), ANSI CSI
  * sequences and the CR the PTY adds to every line, leaving the human-visible
@@ -74,23 +70,10 @@ export function joinWrappedLines(value) {
   return joined.join('\n');
 }
 
-/**
- * Redacts anything token-shaped plus an exact secret the caller knows it
- * handed over (the pasted Claude login code), so an error tail can be surfaced
- * to the UI without leaking a credential. Long PKCE segments in an authorize
- * URL get caught by the generic rule too, which is fine: the URL is already
- * carried in the login payload.
- */
-export function scrubSecrets(text, submittedCode = '') {
-  let output = String(text == null ? '' : text);
-  const code = normalizeText(submittedCode);
-  if (code.length >= 4) {
-    output = output.split(code).join('[redacted]');
-  }
-  return output
-    .replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]')
-    .replace(/[A-Za-z0-9_-]{32,}/g, '[redacted]');
-}
+// Redacts anything token-shaped plus an exact secret the caller handed over.
+// The rules live in the shared text pipeline, which also scrubs background
+// task output (browser-safe, so it cannot import this module).
+export { scrubSecrets } from '../../shared/task-output-text.mjs';
 
 /** Collapses captured output into one short single-line tail for an error. */
 export function tailOf(text, limit = MAX_ERROR_TAIL_CHARS) {

@@ -2,7 +2,7 @@
 // `backgroundTaskCount`) kept in step with the live events, for every row
 // and not only the open one. The list fetch sets them; between fetches the
 // `message_status` and `background_tasks` events are the only word on what
-// a session is doing, and the sidebar's dots, a group head's pill and its
+// a session is doing, and the sidebar's title colour, a group head's pill and its
 // fold read these fields. DOM-free.
 
 const TERMINAL_STATUSES = new Set(['done', 'failed', 'dropped', 'cancelled']);

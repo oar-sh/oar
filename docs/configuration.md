@@ -13,8 +13,10 @@ The modal is organised into seven tabs — **General**, **Providers** (with a **
 | General | Theme, Text scaling | dark theme | Per browser |
 | General | Show Suspend host action | on | Per browser: shows **💤 Suspend host** in the conversation menu |
 | General | Jump to the end when I send a message | on | Per browser: sending a message takes you to the end of the conversation; off, you stay where you are reading (see [While a turn runs](web-ui.md#while-a-turn-runs)) |
+| General | Messages kept per conversation for switching back | `200` | Per browser: how many loaded messages each of the last eight conversations keeps around the place you were reading, so switching back returns there (100 to 1,000, or no limit; see [While a turn runs](web-ui.md#while-a-turn-runs)) |
 | General | Max turn duration | `60 min` | Hard cap on how long one turn may run before the relay requeues it (0 = no limit, up to 10 h; see below) |
 | General | Background task timeout | `4 h` | How long background tasks alone may keep a Claude or Copilot session running after its reply; then they are stopped (0 = no limit, up to 10 h) |
+| General | Mark a background task as quiet after | `10 min` | A background command or monitor that has written nothing for this long shows an amber **no output for N min** on its row (1 to 120 minutes; see [Background tasks](web-ui.md#background-tasks)) |
 | General | Keep sub-agent tool output | `90 days` | 7, 14, 30 or 90 days, or always: once a finished sub-agent's record is older, its tool inputs and results are removed (once a day); its thoughts, reply and the one-line summary of each tool call stay |
 | General | Autostart (Windows) | Off | *At sign-in* (a visible terminal after you log on) or *At system startup* (headless, no logon needed, one admin confirmation) |
 | General | Relay name | `OAR` (the hostname for paired relays) | Label of the installed PWA on every device, and this relay's name for [paired relays](agents-together.md#remote-relays) |
@@ -124,6 +126,7 @@ The config file is `server/config.json` in a git checkout and `~/.oar/config.jso
 | `CLAUDE_CONFIG_DIR` | Claude configuration directory, instead of `~/.claude`; Claude Cloud reads the CLI's login (`.credentials.json`) from it |
 | `CLAUDE_CODE_OAUTH_TOKEN` | A Claude login token for Claude Cloud, used instead of the CLI's credentials file, by the relay (settings tab, **Check Usage**, archiving) and by its cloud workers. Under tmux the relay hands it to cloud workers only, through an owner-only file; a worker started without tmux inherits the relay's environment as it is |
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Overrides the Claude auto-compact window |
+| `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS` | Not read from the relay's environment: OAR sets them for every Claude session it starts, from **Claude background command limit** (the limit, 8 h and 2 min) |
 | `COPILOT_CLOUDFLARED_MODE`, `COPILOT_CLOUDFLARED_TOKEN`, `COPILOT_CLOUDFLARED_BINARY` | Override `cloudflaredTunnel.mode`, `.token`, and `.binary` |
 | `COPILOT_WORKSPACE_ROOT_ALLOW_LIST` | Same as `workspaceRootAllowList` |
 | `COPILOT_REMOTE_<FLAG>` | Pins a feature flag from the **Features** tab (`1`/`0`, `true`/`false`) |

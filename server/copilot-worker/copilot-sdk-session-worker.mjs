@@ -150,6 +150,8 @@ async function main() {
     // restarted, a post was lost) asks for the set again.
     getBackgroundTaskIds: () => turnRunner.backgroundTaskIds(),
     onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
+    // The relay answered: settle notices it missed go out.
+    onAnswered: () => turnRunner.flushKeptTaskSettles?.(),
   });
 
   const wsLink = createWorkerWebSocketLink({

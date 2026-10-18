@@ -150,6 +150,8 @@ test('a settle notice the relay was not there to take is kept and sent again, de
     description: 'npm run soak',
     taskType: 'local_bash',
     startedAt,
+    // A shell's summary names its exit code.
+    exitCode: 2,
   });
   // Taken: not sent a second time.
   await runner.flushKeptTaskSettles();

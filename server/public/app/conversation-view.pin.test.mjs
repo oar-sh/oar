@@ -32,7 +32,7 @@ test('a pin change patches the bubbles instead of rebuilding the transcript, and
 
 test('the pin list reaches the page from the conversation payload and from the socket', () => {
   // Before the messages are rendered: their bubbles are drawn from the list.
-  assert.match(read('./journal-view.js'), /if \('pins' in response\) setConversationPins\(id, response\.pins, response\.pinsRevision\);\s*\n\s*setPinsConversation\(id\);\s*\n[^]*?setHiddenMessagesConversation\(id\);\s*\n\s*const didRenderMessages = keepTranscript/);
+  assert.match(read('./journal-view.js'), /if \('pins' in response\) setConversationPins\(id, response\.pins, response\.pinsRevision\);\s*\n\s*setPinsConversation\(id\);\s*\n[^]*?setHiddenMessagesConversation\(id\);\s*\n\s*let didRenderMessages = false;\s*\n\s*if \(!keepTranscript\)/);
   assert.match(read('./socket-handlers.js'), /socket\.on\('conversation_pins_updated', \(\{ conversationId, pins, revision \}\) => \{\s*\n\s*setConversationPins\(conversationId, pins, revision\);/);
   assert.match(read('./bootstrap.js'), /initPinnedMessagesView\(\{\s*\n\s*openConversation,\s*\n\s*focusMessage: focusConversationMessageById,\s*\n\s*syncRenderedPinState,/);
 });

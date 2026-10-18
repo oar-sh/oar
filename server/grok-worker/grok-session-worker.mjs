@@ -16,6 +16,7 @@ import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-fil
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
+import { createGrokTaskPublisher } from './grok-background-tasks.mjs';
 
 // Windows console launch: the launcher names the worker log, this copies
 // stdout/stderr into it. A no-op wherever the launcher redirects instead.
@@ -70,6 +71,16 @@ async function main() {
     abortAckNote: 'grok run cancelled',
     dbg,
   });
+  // Late-bound: the heartbeat controller is built after the runner.
+  let heartbeat = null;
+  // The agent's terminals, published as background tasks with a console
+  // (spooled output), a Stop and a settle notice.
+  const taskPublisher = createGrokTaskPublisher({
+    api,
+    sdkSessionId,
+    onBackgroundTaskSetStale: () => heartbeat?.requestPulse(),
+    dbg,
+  });
   const turnRunner = createGrokTurnRunner({
     api,
     sdkSessionId,
@@ -78,17 +89,23 @@ async function main() {
     command,
     alwaysApprove,
     controlPoller,
+    taskPublisher,
     dbg,
   });
 
   let heartbeatTimer = null;
-  const heartbeat = createHeartbeatController({
+  heartbeat = createHeartbeatController({
     api,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,
     getHeartbeatTimer: () => heartbeatTimer,
     setHeartbeatTimer: (timer) => { heartbeatTimer = timer; },
     getActiveQueueMessageId: () => turnRunner.getActiveQueueMessageId(),
+    // The relay holds the task set in memory only: the live terminal ids
+    // ride every beat, and a relay that is out of step asks for the set again.
+    getBackgroundTaskIds: () => turnRunner.backgroundTaskIds(),
+    onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
+    onAnswered: () => turnRunner.flushKeptTaskSettles(),
   });
 
   const wsLink = createWorkerWebSocketLink({
@@ -96,6 +113,9 @@ async function main() {
     token,
     dbg,
     getSessionReady: () => true,
+    // A relay that just (re)started learns of the terminals from the digest
+    // on the next beat; ask for it now.
+    onServerHello: () => heartbeat.requestPulse(),
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
     onDeliver: async (pending, reason) => {
@@ -111,6 +131,17 @@ async function main() {
         return false;
       }
     },
+    onControl: async (control) => {
+      const type = String(control?.type || '').trim();
+      if (type === 'stop_background_task') {
+        // The panel's Stop on a terminal row: kill its process.
+        const taskId = String(control?.taskId || '').trim();
+        dbg('stop background task control', taskId);
+        turnRunner.stopBackgroundTask(taskId);
+        return;
+      }
+      dbg('unknown worker control ignored', type || '(none)');
+    },
   });
 
   const shutdown = async (signal) => {
@@ -118,6 +149,7 @@ async function main() {
     try { wsLink.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
+    try { taskPublisher.close(); } catch {}
     // Bounded: a hung ACP agent teardown must never leave the process
     // ignoring the supervisor's SIGTERM.
     try {

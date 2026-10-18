@@ -10,6 +10,7 @@ import {
   parseWorkspaceRootAttributionUpdate,
   buildWorkspaceRootAttributionPayload,
 } from './sessions-routes.mjs';
+import { claudeBackgroundCommandLimitSettingsFields } from '../../shared/claude-background-command-limit.mjs';
 
 test('parseClaudeSettingsUpdateRequest requires at least one field', () => {
   assert.equal(parseClaudeSettingsUpdateRequest({}).ok, false);
@@ -34,6 +35,35 @@ test('parseClaudeSettingsUpdateRequest accepts an enabledModels selection', () =
   const result = parseClaudeSettingsUpdateRequest({ enabledModels: ['claude-sonnet-5', 'claude-opus-5[1m]'] });
   assert.equal(result.ok, true);
   assert.deepEqual(result.enabledModels, ['claude-sonnet-5', 'claude-opus-5[1m]']);
+});
+
+test('parseClaudeSettingsUpdateRequest clamps and snaps the background command limit', () => {
+  assert.deepEqual(parseClaudeSettingsUpdateRequest({ backgroundCommandLimitMinutes: 240 }), { ok: true, backgroundCommandLimitMinutes: 240 });
+  assert.equal(parseClaudeSettingsUpdateRequest({ backgroundCommandLimitMinutes: 5 }).backgroundCommandLimitMinutes, 30);
+  assert.equal(parseClaudeSettingsUpdateRequest({ backgroundCommandLimitMinutes: 1000 }).backgroundCommandLimitMinutes, 480);
+  assert.equal(parseClaudeSettingsUpdateRequest({ backgroundCommandLimitMinutes: 100 }).backgroundCommandLimitMinutes, 90);
+  assert.equal(parseClaudeSettingsUpdateRequest({ backgroundCommandLimitMinutes: '150' }).backgroundCommandLimitMinutes, 150);
+  assert.equal('backgroundCommandLimitMinutes' in parseClaudeSettingsUpdateRequest({ enabled: true }), false);
+});
+
+test('parseClaudeSettingsUpdateRequest rejects a background command limit that is not a number', () => {
+  for (const backgroundCommandLimitMinutes of ['abc', null, '', true, {}]) {
+    const result = parseClaudeSettingsUpdateRequest({ enabled: true, backgroundCommandLimitMinutes });
+    assert.equal(result.ok, false, String(backgroundCommandLimitMinutes));
+    assert.match(result.error, /backgroundCommandLimitMinutes must be a number/);
+  }
+});
+
+test('claudeBackgroundCommandLimitSettingsFields reports the value with its bounds', () => {
+  assert.deepEqual(claudeBackgroundCommandLimitSettingsFields({ backgroundCommandLimitMinutes: 300 }), {
+    backgroundCommandLimitMinutes: 300,
+    backgroundCommandLimitMinMinutes: 30,
+    backgroundCommandLimitMaxMinutes: 480,
+    backgroundCommandLimitStepMinutes: 30,
+    backgroundCommandLimitDefaultMinutes: 120,
+  });
+  assert.equal(claudeBackgroundCommandLimitSettingsFields({}).backgroundCommandLimitMinutes, 120);
+  assert.equal(claudeBackgroundCommandLimitSettingsFields(null).backgroundCommandLimitMinutes, 120);
 });
 
 test('claude catalog is unchanged when the provider is disabled', () => {

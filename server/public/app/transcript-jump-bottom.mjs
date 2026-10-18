@@ -75,21 +75,31 @@ export function nextJumpButtonState(previous, {
   rowKeys = [],
   unseen = false,
   question = false,
+  windowAtTail = true,
+  waiting = 0,
 } = {}) {
-  if (isNearBottom(distance, nearBottomPx)) {
-    return { visible: false, baseline: null, count: 0, unseen: false, question: false };
+  // Live rows held back for a window that ends above the conversation's end
+  // (transcript-island.mjs): the bottom of the page is not the end, so the
+  // button stays while they wait.
+  const waitingNow = windowAtTail ? 0 : Math.max(0, Math.trunc(Number(waiting) || 0));
+  if (isNearBottom(distance, nearBottomPx) && !waitingNow) {
+    return { visible: false, baseline: null, count: 0, unseen: false, question: false, waiting: 0 };
   }
-  const baseline = Array.isArray(previous?.baseline) ? previous.baseline : rowKeys.slice();
+  // Below such a window the rows put on the page are the newer pages, older
+  // than anything live: they are not counted, and the baseline is taken once
+  // the window meets the end.
+  const baseline = !windowAtTail ? null : (Array.isArray(previous?.baseline) ? previous.baseline : rowKeys.slice());
   const screens = Number(clientHeight) > 0 ? Number(distance) / Number(clientHeight) : 0;
-  const count = countNewRows(baseline, rowKeys);
+  const count = windowAtTail ? countNewRows(baseline, rowKeys) : 0;
   const unseenNow = previous?.unseen === true || unseen === true;
   const questionNow = question === true;
   return {
-    visible: previous?.visible === true || screens >= JUMP_BUTTON_SHOW_SCREENS || count > 0 || unseenNow || questionNow,
+    visible: previous?.visible === true || screens >= JUMP_BUTTON_SHOW_SCREENS || count > 0 || waitingNow > 0 || unseenNow || questionNow,
     baseline,
     count,
     unseen: unseenNow,
     question: questionNow,
+    waiting: waitingNow,
   };
 }
 
@@ -98,13 +108,21 @@ export const JUMP_BUTTON_QUESTION_LABEL = 'A question is waiting for your answer
 export const JUMP_QUESTION_BADGE = '?';
 
 /**
+ * How the rows held back for a window above the end show on the badge:
+ * 'count' adds them to the count, 'dot' draws the dot of news without a row.
+ */
+export const HELD_BACK_ROWS_BADGE = 'count';
+
+/**
  * How a state looks and reads. `state` is 'plain', 'new' or 'question'; a
  * waiting question wins over news. `badge` is the count, '?' for a question,
  * or empty: with `dot`, an empty badge is drawn as a dot (news without a row
- * to count). `announcement` is what a screen reader is told when the state is
- * entered; the label alone is only read when the button is focused.
+ * to count). `waiting` rows are held back below the page
+ * (HELD_BACK_ROWS_BADGE). `announcement` is what a screen reader is told
+ * when the state is entered; the label alone is only read when the button is
+ * focused.
  */
-export function jumpButtonPresentation({ visible = false, count = 0, unseen = false, question = false } = {}) {
+export function jumpButtonPresentation({ visible = false, count = 0, unseen = false, question = false, waiting = 0 } = {}, { heldBackRowsBadge = HELD_BACK_ROWS_BADGE } = {}) {
   if (!visible) return { state: 'plain', label: JUMP_BUTTON_LABEL, badge: '', dot: false, announcement: '' };
   if (question) {
     return {
@@ -115,17 +133,19 @@ export function jumpButtonPresentation({ visible = false, count = 0, unseen = fa
       announcement: 'A question is waiting for your answer below.',
     };
   }
-  const badge = jumpBadgeText(count);
+  const held = Math.max(0, Math.trunc(Number(waiting) || 0));
+  const counted = Math.max(0, Math.trunc(Number(count) || 0)) + (heldBackRowsBadge === 'count' ? held : 0);
+  const badge = jumpBadgeText(counted);
   if (badge) {
     return {
       state: 'new',
-      label: `${JUMP_BUTTON_LABEL} (${Math.trunc(Number(count))} new)`,
+      label: `${JUMP_BUTTON_LABEL} (${counted} new)`,
       badge,
       dot: false,
       announcement: 'New messages below.',
     };
   }
-  if (unseen) {
+  if (unseen || held > 0) {
     return {
       state: 'new',
       label: `${JUMP_BUTTON_LABEL} (new below)`,
@@ -165,6 +185,23 @@ export function jumpBadgeText(count) {
 export function shouldRepinOnResize({ pinned, pinnedScrollTop, scrollTop, nearBottomNow }) {
   if (Number(scrollTop) === Number(pinnedScrollTop)) return pinned === true;
   return nearBottomNow === true;
+}
+
+/**
+ * Whether a live update follows the end. A reader at the end now is
+ * followed. So is one the re-pin above is on its way to: the transcript
+ * shrank from below (`clientHeight` under the height the last
+ * ResizeObserver round saw) and at that height the reader is at the end.
+ * An update that lands between the shrink and that round would otherwise
+ * find them the panel's height above the end, stay put, and leave them
+ * there. The geometry decides, not the last note of the position: a scroll
+ * to the end (the update before) is noted only by its scroll event a frame
+ * later, and the shrink and this update can both land before it.
+ */
+export function followsEndThroughResize({ nearBottomNow, clientHeight, observedClientHeight, distanceAtObservedHeight, nearBottomPxAtObservedHeight }) {
+  if (nearBottomNow === true) return true;
+  if (!(Number(clientHeight) < Number(observedClientHeight))) return false;
+  return isNearBottom(distanceAtObservedHeight, nearBottomPxAtObservedHeight);
 }
 
 // "Jump to the end when I send a message" (Settings › General). A setting of

@@ -899,7 +899,12 @@ turn processing, or queued and not held by a usage-limit pause; `background_only
 `subagent` | `shell`, `description`, `startedAt`, `lastActivityAt`, `status` `running` |
 `completed` | `failed` | `stopped`, `exitCode`, `summary`, `endedAt`) and `lastActivityAt`.
 `remote_relay`'s `list_sessions` and `read_session` pass them on as `state`, `tasks` and
-`lastActivityAt`; `active` stays and is true for background work too.
+`lastActivityAt`; `active` stays and is true for background work too. `read_session` adds to each
+task its `taskId`, `output` (whether it has output to read) and, for a task with an output file,
+`health` (`minutesSinceOutput`, `quiet`, `quietAfterMinutes`, test-run `counts`);
+`read_task_output {session, task_id, lines?}` (read permission; default 200 lines, at most 500 or
+32 KB) reads the end of that output through `GET /api/conversation/:id/background-task/:taskId/output`,
+scrubbed of credentials.
 
 ### Browser
 
@@ -1301,8 +1306,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
 | GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
 | POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
-| GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`) |
-| POST | `/api/settings/claude` | Enable/disable Claude, set the default model or the enabled model subset; triggers discovery and unstarted-conversation reconciliation |
+| GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`, `attributionMode`, `backgroundCommandLimitMinutes` with the slider bounds `backgroundCommandLimitMinMinutes`, `backgroundCommandLimitMaxMinutes`, `backgroundCommandLimitStepMinutes`, `backgroundCommandLimitDefaultMinutes`) |
+| POST | `/api/settings/claude` | Enable/disable Claude, set the default model, the enabled model subset, the attribution mode or `backgroundCommandLimitMinutes` (clamped to 30…480 and snapped to 30-minute steps; not a number is `400`; read by Claude sessions spawned afterwards); triggers discovery and unstarted-conversation reconciliation |
 | GET | `/api/settings/claude-cloud` | Read Claude Cloud settings: `{ enabled, defaultModel, environmentId, environments: [{ id, name }] \| null, environmentsError, account: { loggedIn, email, orgName, subscriptionType } \| null, token: { source, hasToken, expiresAt }, models }`. `token` says where the login is read from (`env`, `file`, `none`) and when it runs out, never the token. `environments` is `null` while the provider is off or the host has no login: nothing is asked of Anthropic then |
 | POST | `/api/settings/claude-cloud` | `{ enabled?, defaultModel?, environmentId? }` → `{ ok: true, …the GET body }`. Enabling without a Claude login on the host is `400` with `code: 'claude_cloud_login_missing'`; an empty `environmentId` clears the stored one. Emits `claude_cloud_settings_updated` |
 | GET | `/api/settings/cursor` | Read Cursor provider settings — same shape as Claude's: `models` is the enabled subset, `availableModels` the full discovered list, plus per-model `efforts` |
@@ -1936,6 +1941,15 @@ relays need (on the watching relay `remote_subscription_id`, `remote_meta_json`,
 the watched one `subscriber_relay_id`, `subscriber_relay_name`, `subscriber_watcher_id`,
 `subscriber_watcher_title`, `last_pull_at`, `dropped_count`) and `relay_event_links` (per paired
 relay the fetch cursor and the link's health). See [Across paired relays](#across-paired-relays).
+
+`0017-conversation-history-indexes.mjs` adds two indexes and nothing else:
+`queue(response_message_id)` for the sub-agent records of each reply on a history page, and
+`messages(conversation_id, timestamp, id)` for selecting the page itself. `GET
+/api/conversation/:id` and the shared view select the requested page in SQL in conversation order
+(timestamp, then id) and hydrate only its replies, so a page costs the same in a conversation of
+any length. A conversation with a row whose timestamp is not the relay's ISO form
+(`YYYY-MM-DDTHH:MM:SS.mmmZ`) or whose id is not lowercase letters, digits and dashes is paged the
+old way: every row loaded, the page cut afterwards.
 
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next

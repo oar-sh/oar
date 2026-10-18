@@ -59,6 +59,9 @@ Copilot and Grok where they are tracked; never account names, addresses or token
 `list_sessions` / `read_session` give each session's `state` (`running_turn`, `background_only` or
 `idle`) with its background agents and shell tasks, and the [session group](web-ui.md#session-groups)
 it is in (agents only read groups; they do not change them).
+`read_task_output` returns the tail of a shell or monitor task's output on a relay (up to 500
+lines), how many minutes it has been quiet, and the pass/fail counts when the output is a known
+test runner's; secrets are blanked, as in the owner's console view. Share links never expose it.
 
 A `send`, `create_session` or `wait` call waits for the reply for as long as the agent asks, up to
 **Longest wait per tool call** of the relay the agent runs on (10 minutes unless you changed it,

@@ -21,6 +21,7 @@ Symptoms and what to check. This is the detail behind the [README](../README.md#
 | Grok reply says authentication failed | Press **Sign in to Grok** on the failed reply and confirm the device code in a browser |
 | Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
 | Background agent or shell stopped on its own | It reached the **Background task timeout** (default 4 h); raise it or set 0 for no limit |
+| A task row says *no output for N min* in amber | The command has written nothing for longer than **Mark a background task as quiet after** (default 10 min). Open its console to see the last lines; a long, silent step is normal for some commands, so raise the setting, or **Stop** the task if it hangs |
 | A conversation will not delete     | It is still working: a running turn, one waiting on a question card or approval, or live background tasks. Stop it, then delete |
 | A conversation seems wedged        | **☠️ Kill session** in the `⋯` menu stops its worker; retry the turn or send a new message |
 | Sign-in says *Too many failed sign-in attempts* | Ten wrong tokens from one address within a minute lock that address out until the minute is over (see [Security notes](security.md)); wait, then use the right token. Behind a reverse proxy on another host, set `trustProxy`, or every visitor shares the proxy's address and its lockout (see [Behind a reverse proxy](remote-access.md#behind-a-reverse-proxy)) |

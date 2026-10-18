@@ -249,7 +249,9 @@ export function createSessionActivityTracker({
     };
   }
 
-  function finishTask(conversationId, task, { status, summary = null, exitCode = null, reported = true, absent = false } = {}) {
+  // `replaceSummary`: the end as the worker reported it, whose summary (or
+  // none) replaces the live row's, which was a progress line.
+  function finishTask(conversationId, task, { status, summary = null, exitCode = null, reported = true, absent = false, replaceSummary = false } = {}) {
     if (task.graceTimer) {
       clearTimer(task.graceTimer);
       task.graceTimer = null;
@@ -260,6 +262,7 @@ export function createSessionActivityTracker({
     task.status = normalizeTaskStatus(status || 'completed');
     task.statusReported = reported;
     if (summary) task.summary = toText(summary).slice(0, 500);
+    else if (replaceSummary) task.summary = null;
     const code = Number.isInteger(exitCode) ? exitCode : exitCodeFromSummary(task.summary);
     task.exitCode = code;
     task.endedAtMs = now();
@@ -406,6 +409,7 @@ export function createSessionActivityTracker({
       status: normalizeTaskStatus(status || 'completed'),
       summary: toText(summary) || null,
       exitCode: Number.isInteger(exitCode) ? exitCode : null,
+      replaceSummary: true,
     };
     entry.lastActivityAt = now();
     if (!task && key && endedByAbsence.delete(`${id}:${key}`)) {
@@ -416,7 +420,7 @@ export function createSessionActivityTracker({
       if (ended) {
         ended.status = settled.status;
         ended.statusReported = true;
-        if (settled.summary) ended.summary = settled.summary.slice(0, 500);
+        ended.summary = settled.summary ? settled.summary.slice(0, 500) : null;
         ended.exitCode = settled.exitCode ?? exitCodeFromSummary(ended.summary);
       }
       return;

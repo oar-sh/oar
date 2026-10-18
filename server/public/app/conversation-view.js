@@ -47,6 +47,8 @@ import {
   openSummaryModal,
   closeSummaryModal,
   toggleSidebar,
+  hasPendingUserMessageForConversation,
+  isMessagesNearBottom,
 } from './store.js';
 import { getPendingQuestionCountsByConversation } from './ask-user-view.js';
 import { sendMessage as sendMessageApi, cancelConversationTurn, cancelQueuedConversationTurn, cancelSubagentRun, compactConversation as compactConversationApi, scheduleContextUsageRefresh, loadConversation as loadConversationApi, loadSharedConversation, updateConversationDraft as updateConversationDraftApi, updateMessageShareVisibility, launchSessionWorker } from './api-client.js';
@@ -131,6 +133,7 @@ import {
   shouldApplyIncomingDraftToComposer,
 } from './conversation-draft-sync.mjs';
 import { isChatInteractionHeld, selectionIntersectsNode } from './selection-guard.mjs';
+import { captureReadingAnchor, readingAnchorContentTop, readingAnchorHoldStep, readingAnchorScrollDelta } from './transcript-reading-anchor.mjs';
 import { captureReadingBlock, restoreReadingBlock } from './transcript-viewport-anchor.mjs';
 import {
   applyThinkingFollow,
@@ -142,10 +145,12 @@ import {
   toggleThinkingFollowMode,
   unobserveThinkingBubble,
 } from './thinking-follow.js';
-import { beginOwnSend, followsTranscriptEnd, nameOwnSendConversation, ownSendFollows, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
+import { beginOwnSend, followsTranscriptEnd, jumpTranscriptToBottom, nameOwnSendConversation, ownSendFollows, refreshJumpButton, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
+import { createHeldBackLiveRows, newerPageReachesEnd } from './transcript-island.mjs';
 import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
 import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
+import { conversationPayloadCache } from './conversation-payload-cache.mjs';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
@@ -239,6 +244,20 @@ let conversationHistoryState = {
   loadingOlder: false,
   loadingNewer: false,
 };
+// Live rows for a window that ends above the conversation's end: held back
+// until the newer pages bring them (transcript-island.mjs).
+const heldBackLiveRows = createHeldBackLiveRows();
+
+// After every change of conversationHistoryState: a window that meets the
+// end, or another conversation's, holds no rows back. The button's count
+// changes without the page changing, so it is told.
+function syncHeldBackLiveRows() {
+  const released = heldBackLiveRows.follow({
+    conversationId: conversationHistoryState.conversationId,
+    atTail: !conversationHistoryState.hasMoreNewer,
+  });
+  if (released) refreshJumpButton();
+}
 
 function renderImageEditTarget() {
   const chip = document.getElementById('image-edit-target');
@@ -354,6 +373,8 @@ const conversationHistoryLoader = createInfiniteLoader({
     const previousScrollTop = el.scrollTop;
     const previousScrollHeight = el.scrollHeight;
     const inserted = prependMessageNodes(page.items || []);
+    // The kept window grows with the page: a switch back shows these rows too.
+    if (!IS_SHARED_VIEW) conversationPayloadCache.addOlder(currentId, page.items || [], { hasMoreOlder: page.hasMore });
     setConversationHistoryState({
       conversationId: currentId,
       hasMoreOlder: page.hasMore,
@@ -381,6 +402,10 @@ const conversationHistoryLoader = createInfiniteLoader({
       if (!el || String(currentConvId || '').trim() !== currentId) return;
       const nextScrollHeight = el.scrollHeight;
       el.scrollTop = previousScrollTop + (nextScrollHeight - previousScrollHeight);
+      // The page's images have no height yet: the place read is held while
+      // they come in, as after a restore.
+      const place = captureConversationReadingAnchor();
+      if (place?.conversationId === currentId) holdReadingAnchorWhileMediaLoads(el, place.anchor);
       void conversationHistoryLoader.handleBoundaryDistance(el.scrollTop);
     });
   },
@@ -427,6 +452,24 @@ const conversationFutureLoader = createInfiniteLoader({
     const currentId = String(currentConvId || '').trim();
     if (!currentId || conversationPaginationCursorIsStale(currentId)) return;
     const ordered = sortConversationMessages(page.items || []);
+    // The last page may predate a row held back meanwhile: one more is asked
+    // for, from this page's newest row. The loader reads hasMore and the
+    // cursor off this page once it is applied.
+    const heldBackIds = heldBackLiveRows.ids(currentId);
+    if (!page.hasMore && heldBackIds.length && !newerPageReachesEnd({
+      pageHasMore: page.hasMore,
+      pageMessageIds: ordered.map((m) => m?.id),
+      heldBackIds,
+      renderedIds: renderedMessageIds(),
+    })) {
+      const newest = ordered[ordered.length - 1];
+      page.hasMore = true;
+      page.nextCursor = {
+        afterMessageId: String(newest?.id || '').trim() || null,
+        afterTimestamp: String(newest?.timestamp || '').trim() || null,
+      };
+    }
+    if (!IS_SHARED_VIEW) conversationPayloadCache.addNewer(currentId, ordered, { hasMoreNewer: page.hasMore });
     let inserted = 0;
     withSuspendedSeparatorSync(() => {
       for (const m of ordered) {
@@ -448,6 +491,9 @@ const conversationFutureLoader = createInfiniteLoader({
       loadingOlder: conversationHistoryState.loadingOlder,
       loadingNewer: false,
     });
+    // The window meets the end: a turn still running gets its live bubble,
+    // which was not drawn under the window while it ended above.
+    if (!page.hasMore) showLiveBubbleOfRunningTurn();
   },
   onError: (error, { mode }) => {
     if (mode === 'load') {
@@ -460,6 +506,7 @@ const conversationFutureLoader = createInfiniteLoader({
       hasMoreNewer: state.hasMore,
       loadingNewer: state.isLoading,
     };
+    syncHeldBackLiveRows();
   },
 });
 
@@ -1177,6 +1224,7 @@ function resetConversationHistoryState() {
   conversationFutureLoader.reset({ hasMore: false, nextCursor: null });
   saveConversationLoadedMessageCount(conversationId, 0);
   syncHistoryLoadMoreControl();
+  syncHeldBackLiveRows();
 }
 
 function setConversationHistoryState(next = {}) {
@@ -1197,6 +1245,7 @@ function setConversationHistoryState(next = {}) {
     conversationHistoryState.loadedMessageCount,
   );
   syncHistoryLoadMoreControl();
+  syncHeldBackLiveRows();
 }
 
 function getConversationHistoryCursor() {
@@ -1873,6 +1922,16 @@ export function showThinking(messageId = null, autoScroll = true) {
   const nextMessageId = String(messageId || '').trim();
   if (nextMessageId) thinkingMessageId = nextMessageId;
   const existing = document.getElementById('thinking-indicator');
+  // A window that ends above the conversation's end shows no live bubble:
+  // under it, it would sit below rows that are not loaded. The turn's
+  // thoughts, tools and text are kept all the same; the bubble is drawn once
+  // the window meets the end.
+  if (!isConversationWindowAtTail()) {
+    // Through the same path as removeThinking, so the separators and the
+    // agent folds no longer show the bubble either; the turn's id stays.
+    if (existing) takeThinkingBubbleOff();
+    return;
+  }
   if (existing
     && existing.dataset.conversationId === thinkingConversationKey()
     && (!nextMessageId || String(existing.dataset.messageId || '') === nextMessageId)) {
@@ -1933,6 +1992,14 @@ export function showThinking(messageId = null, autoScroll = true) {
 export function removeThinking() {
   thinkingMessageId = null;
   lastInFlightSnapshotKey = '';
+  takeThinkingBubbleOff();
+}
+
+// The live bubble leaves the page, with what hangs on it (its compaction
+// line, the agent folds' "working"). The turn it shows is not forgotten:
+// removeThinking does that; a window that stops reaching the end only hides
+// the bubble until it meets the end again (showThinking).
+function takeThinkingBubbleOff() {
   const hadBubble = !!document.getElementById('thinking-indicator');
   const wasCompacting = !!document.getElementById('thinking-indicator')?.dataset?.compactBoundary;
   unobserveThinkingBubble();
@@ -3121,9 +3188,12 @@ async function resendStoppedSteer(conversationId, markerId) {
       showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
       return;
     }
+    // As a send from the composer (loadEndForOwnSend): the Resend goes to
+    // the end.
+    if (isCurrentConversation(conversationKey)) await loadEndForOwnSend();
     trackPendingUserMessage(clientMessageId, conversationKey, text, { attachments });
     pendingUserMessageIds.add(clientMessageId);
-    if (isCurrentConversation(conversationKey)) {
+    if (isCurrentConversation(conversationKey) && isConversationWindowAtTail()) {
       appendMessage({
         role: 'user',
         text,
@@ -3807,6 +3877,8 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
     return false;
   }
   deferredMessageRender = null;
+  // Other rows: whoever renders them puts the reader in place.
+  releaseReadingAnchorHold();
   const messageById = new Map(
     ordered
       .map((item) => [String(item?.id || '').trim(), item])
@@ -3864,7 +3936,9 @@ export function renderMessages(msgs, scroll = true, meta = {}) {
   // in as an extra row, and another conversation's bubble must not leak into
   // this one (it is dropped instead, so the next restore builds afresh).
   const thinkingNodeInTranscript = !!thinkingNode && thinkingNode.parentNode === el;
+  // Nor under a window that ends above the conversation's end (showThinking).
   const preservedThinkingNode = (thinkingNodeInTranscript
+    && !hasMoreNewer
     && thinkingNode.dataset.conversationId === renderConversationKey) ? thinkingNode : null;
   if (thinkingNodeInTranscript && !preservedThinkingNode) removeThinking();
   if (!ordered.length && !preservedPendingNodes.length && !preservedThinkingNode) {
@@ -3978,6 +4052,342 @@ export function isConversationWindowAtTail() {
   return !conversationHistoryState.hasMoreNewer;
 }
 
+/**
+ * A live row for `conversationId` arrived (a message, a reply). True when it
+ * is held back instead of put on the page: the window on the page is that
+ * conversation's and ends above its end (transcript-island.mjs). The window
+ * keeps loading newer pages from its own newest row, and the jump-to-bottom
+ * button counts the row.
+ */
+export function holdBackLiveRow(conversationId, messageId) {
+  const id = String(conversationId || '').trim();
+  if (!id || isConversationWindowAtTail() || getRenderedConversationId() !== id) return false;
+  heldBackLiveRows.note(id, messageId);
+  // A reload whose request was on its way may lack this row as it would one
+  // put on the page: counted, so it is asked again (loadKeepingLiveRows)
+  // rather than rendered over the rows held.
+  noteTranscriptLiveRow();
+  refreshJumpButton();
+  return true;
+}
+
+/** How many live rows wait below the window on the page. */
+export function getHeldBackLiveRowCount() {
+  return heldBackLiveRows.count(getRenderedConversationId());
+}
+
+/** The ids of the live rows that wait below the window on the page, oldest first. */
+export function getHeldBackLiveRowIds() {
+  return heldBackLiveRows.ids(getRenderedConversationId());
+}
+
+function renderedMessageIds() {
+  const el = getMessagesElement();
+  if (!el) return [];
+  return Array.from(readingAnchorRows(el), (node) => String(node.dataset.messageId || '').trim());
+}
+
+// The running turn's live bubble, drawn from what the page kept of it (its
+// thoughts, tools and text arrived while no bubble was drawn).
+function showLiveBubbleOfRunningTurn() {
+  if (document.getElementById('thinking-indicator')) return;
+  const turn = getActiveTurnForConversation(currentConvId);
+  const messageId = String(turn?.messageId || '').trim();
+  if (!messageId || String(turn?.status || '').trim().toLowerCase() !== 'processing') return;
+  showThinking(messageId, false);
+  renderThinkingStream();
+  renderThinkingActivities();
+  renderThinkingThoughts();
+  renderRestoredSubagentBubbles(messageId);
+}
+
+/** The conversation whose rows the transcript holds; during a switch, still the one left. */
+export function getRenderedConversationId() {
+  return String(conversationHistoryState.conversationId || '').trim();
+}
+
+// The message rows, without the live bubble: it carries its prompt's id.
+function readingAnchorRows(el) {
+  return el.querySelectorAll(':scope > .msg[data-message-id]:not(#thinking-indicator)');
+}
+
+/**
+ * Where the reader is in the transcript on the page
+ * (transcript-reading-anchor.mjs), for the conversation whose rows it holds;
+ * null when no row is there.
+ */
+export function captureConversationReadingAnchor() {
+  const el = getMessagesElement();
+  const conversationId = getRenderedConversationId();
+  if (!el || !conversationId) return null;
+  const rows = readingAnchorRows(el);
+  if (!rows.length) return null;
+  const paneTop = el.getBoundingClientRect().top;
+  const rectAt = (index) => rows[index].getBoundingClientRect();
+  const anchor = captureReadingAnchor({
+    rowCount: rows.length,
+    rowAt: (index) => {
+      const rect = rectAt(index);
+      return { messageId: rows[index].dataset.messageId, top: rect.top, bottom: rect.bottom };
+    },
+    paneTop,
+    atTail: isMessagesNearBottom() && isConversationWindowAtTail(),
+  });
+  return anchor ? { conversationId, anchor } : null;
+}
+
+function readingAnchorRow(el, messageId) {
+  const id = String(messageId || '').trim();
+  return id ? el.querySelector(`:scope > .msg[data-message-id="${CSS.escape(id)}"]:not(#thinking-indicator)`) : null;
+}
+
+/**
+ * Puts the anchored message at its saved offset, or the reader at the end.
+ * False when the message is not on the page. The place is then held while
+ * the images on the page are still loading (holdReadingAnchorWhileMediaLoads).
+ */
+export function restoreConversationReadingAnchor(anchor) {
+  const el = getMessagesElement();
+  if (!el || !anchor) return false;
+  if (anchor.atTail) {
+    releaseReadingAnchorHold();
+    el.scrollTop = el.scrollHeight;
+    return true;
+  }
+  const row = readingAnchorRow(el, anchor.messageId);
+  if (!row) return false;
+  const delta = readingAnchorScrollDelta({
+    rowTop: row.getBoundingClientRect().top,
+    paneTop: el.getBoundingClientRect().top,
+    offsetPx: anchor.offsetPx,
+  });
+  if (Math.abs(delta) > 0.5) el.scrollTop += delta;
+  holdReadingAnchorWhileMediaLoads(el, anchor);
+  return true;
+}
+
+// Images reserve no height until their bytes are in (the attachment payload
+// carries no dimensions), so one above the place read that arrives after the
+// place was put back pushes it down by its height. Chrome's scroll anchoring
+// absorbs that; browsers without it (iOS Safari) do not. Long enough for a
+// slow link, short enough that a forgotten hold cannot surprise anyone.
+const READING_ANCHOR_HOLD_MAX_MS = 10_000;
+let readingAnchorHold = null;
+
+/**
+ * Lets go of the place held while images load: whoever calls this moves the
+ * reader themselves (the jump to the end, an own send).
+ */
+export function releaseReadingAnchorHold() {
+  const hold = readingAnchorHold;
+  if (!hold) return;
+  readingAnchorHold = null;
+  hold.cleanup();
+}
+
+function pendingTranscriptImages(el) {
+  return Array.from(el.querySelectorAll('img')).filter((img) => !img.complete);
+}
+
+/**
+ * Keeps the anchored message at its offset while images in the transcript
+ * are loading: each one that is laid out at its height (a ResizeObserver
+ * fires before the frame is painted; load and error events as a fallback)
+ * scrolls by what it pushed. Lets go when they are all in, after
+ * READING_ANCHOR_HOLD_MAX_MS, or as soon as the reader scrolls: a wheel, a
+ * touch or a key, or a change of scrollTop that no growth above the row
+ * explains (a drag of the scrollbar, a jump to the end, an own send). Growth
+ * below the row (a reply streaming in at the end) is not the hold's to
+ * correct (readingAnchorHoldStep). A reader at the end has nothing to hold
+ * here: the jump-to-bottom follower keeps them at the end.
+ */
+function holdReadingAnchorWhileMediaLoads(el, anchor) {
+  releaseReadingAnchorHold();
+  if (!el || !anchor || anchor.atTail || !anchor.messageId) return;
+  const pending = pendingTranscriptImages(el);
+  if (!pending.length) return;
+  const startRow = readingAnchorRow(el, anchor.messageId);
+  if (!startRow) return;
+  // Where the row sits in the content and the scroll, as of the last look:
+  // the next look corrects by what moved the row in the content only.
+  const seen = {
+    rowContentTop: readingAnchorContentTop({
+      rowTop: startRow.getBoundingClientRect().top,
+      paneTop: el.getBoundingClientRect().top,
+      scrollTop: el.scrollTop,
+    }),
+    scrollTop: el.scrollTop,
+  };
+  const check = () => {
+    if (readingAnchorHold !== hold) return;
+    const row = readingAnchorRow(el, anchor.messageId);
+    if (!row) {
+      releaseReadingAnchorHold();
+      return;
+    }
+    const step = readingAnchorHoldStep({
+      rowTop: row.getBoundingClientRect().top,
+      paneTop: el.getBoundingClientRect().top,
+      scrollTop: el.scrollTop,
+      seen,
+    });
+    if (step.action === 'release') {
+      releaseReadingAnchorHold();
+      return;
+    }
+    if (step.action === 'correct') el.scrollTop += step.delta;
+    seen.rowContentTop = step.rowContentTop;
+    // Read back: the browser can clamp the correction.
+    seen.scrollTop = el.scrollTop;
+  };
+  const onMediaSettled = () => {
+    check();
+    if (readingAnchorHold === hold && !pendingTranscriptImages(el).length) releaseReadingAnchorHold();
+  };
+  const onReaderInput = () => releaseReadingAnchorHold();
+  // A key can scroll the pane from anywhere but a field being typed in (the
+  // composer, a card's reply): typing there moves nothing.
+  const onKeyDown = (event) => {
+    const target = event?.target;
+    if (target && (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT' || target.isContentEditable === true)) return;
+    releaseReadingAnchorHold();
+  };
+  const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(check) : null;
+  for (const img of pending) observer?.observe(img);
+  el.addEventListener('load', onMediaSettled, true);
+  el.addEventListener('error', onMediaSettled, true);
+  // A video's box changes when its metadata is in.
+  el.addEventListener('loadedmetadata', check, true);
+  el.addEventListener('scroll', check, { passive: true });
+  el.addEventListener('wheel', onReaderInput, { passive: true });
+  el.addEventListener('touchstart', onReaderInput, { passive: true });
+  document.addEventListener('keydown', onKeyDown, true);
+  const timer = setTimeout(releaseReadingAnchorHold, READING_ANCHOR_HOLD_MAX_MS);
+  const hold = {
+    cleanup() {
+      clearTimeout(timer);
+      observer?.disconnect();
+      el.removeEventListener('load', onMediaSettled, true);
+      el.removeEventListener('error', onMediaSettled, true);
+      el.removeEventListener('loadedmetadata', check, true);
+      el.removeEventListener('scroll', check);
+      el.removeEventListener('wheel', onReaderInput);
+      el.removeEventListener('touchstart', onReaderInput);
+      document.removeEventListener('keydown', onKeyDown, true);
+    },
+  };
+  readingAnchorHold = hold;
+}
+
+/**
+ * The window on the page no longer meets the end of the conversation (more
+ * was written than one page holds): newer rows load as after a jump into
+ * the history, and the jump-to-bottom button loads the end.
+ */
+export function detachConversationWindowFromTail() {
+  const newestMessageId = String(conversationHistoryState.newestMessageId || '').trim();
+  setConversationHistoryState({ ...conversationHistoryState, hasMoreNewer: true });
+  // A live bubble on the page now sits under a window that ends above the
+  // end, below rows that are not loaded: it goes until the window meets the
+  // end again (showThinking draws none meanwhile).
+  takeThinkingBubbleOff();
+  conversationFutureLoader.reset({
+    hasMore: true,
+    nextCursor: {
+      afterMessageId: newestMessageId || null,
+      afterTimestamp: String(conversationHistoryState.newestMessageTimestamp || '').trim() || null,
+    },
+  });
+}
+
+// One message as the transcript's snapshot key sees it.
+function messageRenderKey(message) {
+  return buildMessageSnapshotKey([message], { conversationId: '', hasMoreOlder: false, hasMoreNewer: false });
+}
+
+/**
+ * Whether the transcript on the page can take a merge of `previousMessages`'
+ * window (mergeMessagesIntoTranscript) rather than a full render: not while
+ * a bubble still waits for its send, the status view is up, a selection is
+ * held, another conversation's rows are on the page, or a row of the window
+ * is missing from it (what is merged in is placed next to those rows, and a
+ * changed one is rebuilt where it stands).
+ */
+export function canMergeIntoTranscript(previousMessages, conversationId) {
+  const el = getMessagesElement();
+  const id = String(conversationId || '').trim();
+  if (!el || !id) return false;
+  if (isChatInteractionHeld()
+    || el.querySelector('.status-view')
+    || getRenderedConversationId() !== id
+    || hasPendingUserMessageForConversation(id)) {
+    return false;
+  }
+  const rendered = new Set(Array.from(readingAnchorRows(el), (node) => String(node.dataset.messageId || '').trim()));
+  for (const message of previousMessages || []) {
+    const messageId = String(message?.id || '').trim();
+    if (messageId && !rendered.has(messageId)) return false;
+  }
+  return true;
+}
+
+/**
+ * Puts a merged window (mergeTailPage) on the page without rebuilding it:
+ * the rows the newest page changed are rebuilt where they stand, its new ones
+ * are put in their place, the rows it dropped are taken off, every other row
+ * stays as it is under the reader.
+ * Falls back to a full render when the page holds rows the merge cannot
+ * place (a bubble still waiting for its send, the status view, a held
+ * selection). Returns true when the transcript changed.
+ */
+export function mergeMessagesIntoTranscript(previousMessages, msgs, meta = {}) {
+  const el = getMessagesElement();
+  if (!el) return false;
+  const conversationId = String(meta.conversationId || currentConvId || '').trim();
+  if (!canMergeIntoTranscript(previousMessages, conversationId)) return renderMessages(msgs, false, meta);
+  const ordered = sortConversationMessages(msgs || []);
+  const snapshotKey = buildMessageSnapshotKey(ordered, meta);
+  if (snapshotKey === lastRenderedMessageSnapshotKey) return false;
+  const previousById = new Map((previousMessages || []).map((m) => [String(m?.id || '').trim(), m]));
+  const messageById = new Map(ordered.map((m) => [String(m?.id || '').trim(), m]).filter(([id]) => !!id));
+  let previousId = '';
+  withSuspendedSeparatorSync(() => {
+    // A window row the merge left out was deleted while the reader was away
+    // (mergeTailPage drops it): it leaves the page too. Taken off first, so
+    // nothing merged in is placed next to it.
+    for (const id of previousById.keys()) {
+      if (!id || messageById.has(id)) continue;
+      el.querySelector(`:scope > .msg[data-message-id="${CSS.escape(id)}"]:not(#thinking-indicator)`)?.remove();
+      seenMessageIds.delete(id);
+    }
+    for (const m of ordered) {
+      const id = String(m?.id || '').trim();
+      if (!id) continue;
+      const before = previousById.get(id);
+      if (!before) {
+        const threadAnchor = getMessageThreadAnchor(m, messageById);
+        appendMessage(m, false, id, true, threadAnchor !== id ? threadAnchor : (previousId || null), false);
+      } else if (messageRenderKey(before) !== messageRenderKey(m)) {
+        replaceRenderedMessage(m, id);
+      }
+      previousId = id;
+    }
+  });
+  const newest = ordered[ordered.length - 1] || null;
+  setConversationHistoryState({
+    ...conversationHistoryState,
+    conversationId,
+    newestMessageId: String(newest?.id || conversationHistoryState.newestMessageId || '').trim(),
+    newestMessageTimestamp: String(newest?.timestamp || conversationHistoryState.newestMessageTimestamp || '').trim(),
+    loadedMessageCount: ordered.length,
+  });
+  syncSeparatorsNow();
+  renderRelayQuestions();
+  renderRelayBoards();
+  lastRenderedMessageSnapshotKey = snapshotKey;
+  return true;
+}
+
 export function focusConversationMessageById(messageId, { behavior = 'smooth', block = 'center' } = {}) {
   const id = String(messageId || '').trim();
   if (!id) return false;
@@ -4024,6 +4434,19 @@ export function compactCurrentConversation() {
 // Warn-once slot for the unknown-command guard; keyed by exact text so any
 // edit re-arms the warning.
 let unknownCommandWarned = null;
+
+// An own message goes to the end of the conversation. Sent from a window that
+// ends above it, its row put under the window would sit below rows that are
+// not loaded, and would move the newer pages' cursor past them; no live
+// bubble or reply would be drawn there either. So the end is loaded first,
+// as the jump-to-bottom button does, and the row, the bubble and the reply
+// follow at the end, whatever the scroll-on-send setting says: the end is
+// where the message is. Resolves once the end is on the page, or its load
+// failed (then the window still ends above, and no row is put under it).
+function loadEndForOwnSend() {
+  if (isConversationWindowAtTail()) return Promise.resolve();
+  return jumpTranscriptToBottom();
+}
 
 export async function sendMessage() {
   // The reader's own send, as of now: what follows it scrolls to the end
@@ -4126,7 +4549,10 @@ export async function sendMessage() {
   let attachments = [];
   let clientMessageId = null;
   try {
+    // Alongside the upload: the end is loaded while the files go up.
+    const endLoaded = viewingSendConversation() ? loadEndForOwnSend() : null;
     attachments = await uploadAttachments(draftAttachments);
+    await endLoaded;
 
     const isNew = !targetConversationId;
     const msgTimestamp = new Date().toISOString();
@@ -4148,7 +4574,11 @@ export async function sendMessage() {
       releaseComposerFocusAfterSend(input);
       // Asked before the bubble is on the page.
       const follow = ownSendFollows(send);
-      appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, follow, clientMessageId, true);
+      // Not under a window that still ends above the end (loadEndForOwnSend
+      // failed): the row comes with the end.
+      if (isConversationWindowAtTail()) {
+        appendMessage({ role: 'user', text, model: selectedModel, mode: selectedMode, timestamp: msgTimestamp, attachments }, follow, clientMessageId, true);
+      }
       scrollAfterOwnSend(send);
     }
 

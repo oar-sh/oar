@@ -103,6 +103,13 @@ const {
   buildWorkflowRunCard,
   formatTaskModelLabel,
   taskActivityText,
+  setConversationTaskHealth,
+  setConversationTaskStallMinutes,
+  setConversationEndedBackgroundTasks,
+  dismissEndedBackgroundTask,
+  findBackgroundTask,
+  setSubagentStepCounter,
+  panelSummaryText,
 } = await import('./background-tasks-view.mjs');
 
 // Normalized digest shape (values lifted from the reference run record in
@@ -482,4 +489,109 @@ test('a non-stoppable task (Copilot detached shell) renders without a Stop butto
   // (the Copilot runtime offers no host-side shell stop).
   assert.equal((listEl.innerHTML.match(/bg-task-stop/g) || []).length, 1);
   assert.match(listEl.innerHTML, /data-task-id="bash-2"[^>]*>Stop</);
+});
+
+// ─── Task console rows ───────────────────────────────────────────────────────
+
+function rowHtml(taskId) {
+  const html = listEl.innerHTML;
+  const at = html.indexOf(`data-task-id="${taskId}"`);
+  if (at === -1) return '';
+  const from = html.lastIndexOf('<div class="bg-task-row', at);
+  const next = html.indexOf('<div class="bg-task-row', at);
+  return html.slice(from, next === -1 ? html.length : next);
+}
+
+test('shell and Monitor rows open the console; a provider without output keeps a plain title', () => {
+  setBackgroundTasksConversation('conv-console');
+  setConversationBackgroundTasks('conv-console', [
+    { taskId: 'shell-a', taskType: 'local_bash', description: 'npm run build <fast>', startedAt: Date.now(), outputKind: 'file' },
+    { taskId: 'monitor-b', taskType: 'monitor', description: 'watch the queue', startedAt: Date.now() },
+    { taskId: 'shell-c', taskType: 'local_bash', description: 'cloud shell', startedAt: Date.now(), outputKind: 'none' },
+    { taskId: 'agent-d', taskType: 'local_agent', description: 'Survey the parser', startedAt: Date.now(), toolUseId: 'toolu_fixture_d' },
+  ]);
+  assert.match(rowHtml('shell-a'), /<button type="button" class="task-console-open bg-task-desc" data-task-console="shell-a"[^>]*>npm run build &lt;fast&gt;<\/button>/);
+  assert.match(rowHtml('monitor-b'), /data-task-console="monitor-b"/);
+  const none = rowHtml('shell-c');
+  assert.doesNotMatch(none, /data-task-console/);
+  assert.match(none, /<span class="bg-task-desc bg-task-desc-no-output" title="output not available for this provider">cloud shell<\/span>/);
+  assert.doesNotMatch(rowHtml('agent-d'), /data-task-console/, 'a sub-agent opens its record instead');
+  assert.match(rowHtml('agent-d'), /data-subagent-open="toolu_fixture_d"/);
+});
+
+test('ended rows stay dimmed with ✓/✘, no Stop, a dismiss ×, and still open', () => {
+  setBackgroundTasksConversation('conv-ended');
+  setConversationBackgroundTasks('conv-ended', [
+    { taskId: 'live-1', taskType: 'local_bash', description: 'dev server', startedAt: Date.now() },
+  ], {
+    endedTasks: [
+      { taskId: 'ended-fail', taskType: 'local_bash', description: 'unit run', startedAt: 1_000, endedAt: 66_000, status: 'failed', exitCode: 1, outputKind: 'file' },
+      { taskId: 'ended-ok', taskType: 'monitor', description: 'log tail', startedAt: 1_000, endedAt: 3_000, status: 'completed', exitCode: 0 },
+    ],
+  });
+  const failed = rowHtml('ended-fail');
+  assert.match(failed, /class="bg-task-row bg-task-row-ended"/);
+  assert.match(failed, /<span class="bg-task-outcome bg-task-outcome-fail" title="failed, exit code 1">✘<\/span>/);
+  assert.match(failed, /<span class="bg-task-elapsed">1m 5s<\/span>/);
+  assert.match(failed, /data-task-console="ended-fail"/, 'still opens');
+  assert.doesNotMatch(failed, /bg-task-stop/);
+  assert.match(failed, /<button type="button" class="bg-task-dismiss" data-task-id="ended-fail"/);
+  assert.match(rowHtml('ended-ok'), /bg-task-outcome-ok[^>]*>✓</);
+  assert.match(summaryEl.innerHTML, /1 background task running · 2 finished$/);
+  assert.deepEqual(findBackgroundTask('conv-ended', 'ended-fail')?.ended, true);
+  assert.deepEqual(findBackgroundTask('conv-ended', 'live-1')?.ended, false);
+
+  // An older relay's event without endedTasks leaves them alone.
+  setConversationBackgroundTasks('conv-ended', []);
+  assert.match(listEl.innerHTML, /ended-fail/);
+  assert.equal(panelEl.hidden, false, 'the panel stays up for ended rows');
+  assert.match(summaryEl.innerHTML, /^2 finished$/, 'no spinner without a live task');
+
+  dismissEndedBackgroundTask('ended-fail');
+  assert.doesNotMatch(listEl.innerHTML, /ended-fail/);
+  assert.match(summaryEl.innerHTML, /^1 finished$/);
+  setConversationEndedBackgroundTasks('conv-ended', []);
+  assert.equal(panelEl.hidden, true);
+});
+
+test('the panel summary counts only live tasks as running', () => {
+  assert.equal(panelSummaryText(2, 0, 1), '2 background tasks running · 1 finished');
+  assert.equal(panelSummaryText(1, 1, 0), '1 background task running · 1 preview');
+  assert.equal(panelSummaryText(0, 0, 3), '3 finished');
+});
+
+test('health brings the stall hint (amber at the threshold) and the runner chip', () => {
+  const now = Date.now();
+  setBackgroundTasksConversation('conv-health');
+  setConversationBackgroundTasks('conv-health', [
+    { taskId: 'quiet', taskType: 'local_bash', description: 'long build', startedAt: now - 3_600_000, health: { lastOutputAt: now - 4 * 60_000 } },
+    { taskId: 'tests', taskType: 'local_bash', description: 'test run', startedAt: now },
+  ]);
+  assert.match(rowHtml('quiet'), /<span class="bg-task-stall">no output for 4 min<\/span>/, 'below the default 10 min: muted');
+  assert.match(rowHtml('tests'), /<span class="bg-task-stall" hidden><\/span>/, 'no health yet: hidden holder');
+
+  setConversationTaskStallMinutes('conv-health', 3);
+  assert.match(rowHtml('quiet'), /<span class="bg-task-stall bg-task-stall-warn">no output for 4 min<\/span>/);
+
+  setConversationTaskHealth('conv-health', { tests: { lastOutputAt: now, counts: { passed: 412, failed: 2, skipped: 0 }, runner: 'vitest' } });
+  assert.match(rowHtml('tests'), /<span class="bg-task-chip bg-task-chip-fail" title="vitest: 412 passed, 2 failed">✓ 412 ✘ 2<\/span>/);
+  assert.match(rowHtml('quiet'), /bg-task-stall-warn/, 'health of one task leaves the other alone');
+  setConversationTaskHealth('conv-health', { tests: { lastOutputAt: now, counts: { passed: 414, failed: 0 } } });
+  assert.match(rowHtml('tests'), /<span class="bg-task-chip" title="414 passed, 0 failed">✓ 414<\/span>/);
+});
+
+test('sub-agent rows show their steps, from the worker or the run record', () => {
+  setBackgroundTasksConversation('conv-steps');
+  setSubagentStepCounter((runId) => (runId === 'toolu_fixture_counted' ? 7 : null));
+  setConversationBackgroundTasks('conv-steps', [
+    { taskId: 'a1', taskType: 'local_agent', description: 'Map the routes', startedAt: Date.now(), steps: 22, toolUseId: 'toolu_fixture_counted' },
+    { taskId: 'a2', taskType: 'local_agent', description: 'Check the fixtures', startedAt: Date.now(), toolUseId: 'toolu_fixture_counted' },
+    { taskId: 'a3', taskType: 'local_agent', description: 'No record', startedAt: Date.now(), toolUseId: 'toolu_fixture_unknown' },
+    { taskId: 'a4', taskType: 'agent', description: 'Copilot agent', startedAt: Date.now(), steps: 1 },
+  ]);
+  assert.match(rowHtml('a1'), /<span class="bg-task-steps">22 steps<\/span>/, 'the worker count wins');
+  assert.match(rowHtml('a2'), /<span class="bg-task-steps">7 steps<\/span>/, 'fallback: the run record');
+  assert.doesNotMatch(rowHtml('a3'), /bg-task-steps/);
+  assert.match(rowHtml('a4'), /<span class="bg-task-steps">1 step<\/span>/);
+  setSubagentStepCounter(null);
 });

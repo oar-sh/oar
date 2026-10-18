@@ -634,6 +634,62 @@ test('a pending bubble is not appended to a window that has newer messages unloa
   store.clearPendingUserMessage(pendingId);
 });
 
+test('a window that ends above the end holds live rows back and draws no live bubble until it meets the end', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([
+    { id: 'w1', role: 'user', text: 'old question', timestamp: at(100) },
+    { id: 'w2', role: 'assistant', text: 'old answer', timestamp: at(110), sourceMessageId: 'w1' },
+  ], false, { conversationId: conv, hasMoreNewer: true });
+  assert.equal(view.isConversationWindowAtTail(), false);
+  // Rows of another conversation are not this window's to hold.
+  assert.equal(view.holdBackLiveRow('conv-elsewhere', 'x1'), false);
+  assert.equal(view.holdBackLiveRow(conv, 'live-1'), true);
+  assert.equal(view.holdBackLiveRow(conv, 'live-2'), true);
+  assert.equal(view.holdBackLiveRow(conv, 'live-2'), true);
+  assert.equal(view.getHeldBackLiveRowCount(), 2);
+  view.showThinking('live-1', false);
+  assert.equal(document.getElementById('thinking-indicator'), null, 'no live bubble under the window');
+  assert.deepEqual(rowIds(), ['w1', 'w2']);
+  // The end of the conversation replaces the window: nothing is held back.
+  view.renderMessages([
+    { id: 'live-1', role: 'user', text: 'new question', timestamp: at(500) },
+    { id: 'live-2', role: 'assistant', text: 'new answer', timestamp: at(510), sourceMessageId: 'live-1' },
+  ], false, { conversationId: conv, hasMoreNewer: false });
+  assert.equal(view.getHeldBackLiveRowCount(), 0);
+  assert.equal(view.holdBackLiveRow(conv, 'live-3'), false);
+  view.showThinking('live-3', false);
+  assert.ok(document.getElementById('thinking-indicator'), 'at the end the live bubble is drawn');
+  view.removeThinking();
+});
+
+test('a live bubble on the page is not carried into a window that ends above the end', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([{ id: 'e1', role: 'user', text: 'running question', timestamp: at(900) }], false, { conversationId: conv });
+  view.showThinking('e1', false);
+  assert.ok(document.getElementById('thinking-indicator'));
+  view.renderMessages([
+    { id: 'h1', role: 'user', text: 'pinned question', timestamp: at(100) },
+  ], false, { conversationId: conv, hasMoreNewer: true });
+  assert.equal(document.getElementById('thinking-indicator'), null);
+  assert.deepEqual(rowIds(), ['h1']);
+});
+
+test('a window that stops reaching the end takes its live bubble off until it meets the end again', () => {
+  resetView();
+  const conv = openConversation();
+  view.renderMessages([{ id: 'd1', role: 'user', text: 'running question', timestamp: at(900) }], false, { conversationId: conv });
+  view.showThinking('d1', false);
+  assert.ok(document.getElementById('thinking-indicator'));
+  view.detachConversationWindowFromTail();
+  assert.equal(view.isConversationWindowAtTail(), false);
+  assert.equal(document.getElementById('thinking-indicator'), null, 'no bubble left under the window');
+  view.showThinking('d1', false);
+  assert.equal(document.getElementById('thinking-indicator'), null);
+  assert.deepEqual(rowIds(), ['d1']);
+});
+
 test('another conversation\'s pending bubble is never carried into the one being rendered', () => {
   resetView();
   const convA = openConversation();

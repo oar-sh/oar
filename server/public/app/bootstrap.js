@@ -43,6 +43,8 @@ import {
   loadConversationScrollTop,
   loadConversationLoadedMessageCount,
   saveConversationScrollTop,
+  loadConversationReadingAnchor,
+  saveConversationReadingAnchor,
   getSessionWorkerState,
   resolveConversationUiState,
   summaryModalState,
@@ -61,6 +63,8 @@ import {
 } from './transcript-viewport-anchor.mjs';
 import { initTranscriptJumpToBottom, onTranscriptEndLeft } from './transcript-jump-bottom-view.mjs';
 import { syncScrollOnSendToggle, updateScrollOnSendSetting } from './transcript-jump-bottom.mjs';
+import { previewWindowRetention, syncWindowRetentionSlider, updateWindowRetention } from './conversation-window-retention.mjs';
+import { conversationPayloadCache, mergeReloadIntoWindow } from './conversation-payload-cache.mjs';
 import {
   verifyExistingSession,
   verifyToken,
@@ -101,6 +105,7 @@ import {
   openOriginConversation,
   openConversationGroupPicker,
   toggleConversationGroupFold,
+  isConversationWorking,
 } from './journal-view.js';
 import {
   loadRelayQuestions,
@@ -139,8 +144,12 @@ import {
   isConversationWindowAtTail,
   getTranscriptJumpEpoch,
   getTranscriptLiveRowEpoch,
+  getHeldBackLiveRowIds,
+  captureConversationReadingAnchor,
+  canMergeIntoTranscript,
 } from './conversation-view.js';
 import { loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
+import { newerPageReachesEnd } from './transcript-island.mjs';
 import { initPinnedMessagesView, setPinsConversation } from './pinned-messages-view.mjs';
 import { initHiddenMessagesView, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
@@ -189,6 +198,7 @@ import {
   closeMessageSearchModal,
 } from './message-search-view.js';
 import { initSubagentViewer } from './subagent-viewer.mjs';
+import { initTaskConsole } from './task-console.mjs';
 import { watchPreviewMarks } from './share-preview-marks.mjs';
 import {
   initGitChangesView,
@@ -327,6 +337,8 @@ import {
   updateTurnCeilingSetting,
   previewBackgroundTaskTimeoutSetting,
   updateBackgroundTaskTimeoutSetting,
+  previewTaskStallMinutesSetting,
+  updateTaskStallMinutesSetting,
   updateSubagentRecordRetentionSetting,
 } from './settings-modal.js';
 import {
@@ -3703,6 +3715,23 @@ function transcriptIsInHistory(conversationId) {
   return !isConversationWindowAtTail() && !hasPendingUserMessageForConversation(conversationId);
 }
 
+// A reload of the end of the conversation on screen, when the page holds
+// more rows than the answer can (the relay caps a page at 100): the answer
+// is merged into the window (mergeReloadIntoWindow) rather than rendered,
+// which would cut the page and its kept window down to the answer. Null
+// means the plain render, as before: nothing to merge, or a transcript that
+// cannot take a merge (a bubble waiting for its send, the status view, a
+// held selection, a row missing from the page). Both callers merge only an
+// answer no live row overtook (loadKeepingLiveRows not stale), so the window
+// predates it: a newer row the answer lacks was deleted (a cancelled
+// follow-up) and leaves the page.
+function reloadMergeFor(conversationId, response) {
+  if (IS_SHARED_VIEW) return null;
+  const merge = mergeReloadIntoWindow(conversationPayloadCache.peekWindow(conversationId), response, { windowPredatesPage: true });
+  if (!merge || !canMergeIntoTranscript(merge.mergeFrom, conversationId)) return null;
+  return merge;
+}
+
 async function pollAuthenticatedCurrentConversationLive() {
   if (liveConversationPollInFlight) return;
   if (isSharedReaderMode()) return;
@@ -3748,11 +3777,16 @@ async function pollAuthenticatedCurrentConversationLive() {
     // The rows are rebuilt: a reader who is not at the end keeps the text
     // they read where it is, whatever the rows above it measure now.
     const reading = preserveBottom ? null : captureReadingBlock(messagesEl);
-    applyLoadedConversationState(currentId, response, {
+    const merge = reloadMergeFor(currentId, response);
+    applyLoadedConversationState(currentId, merge?.payload || response, {
       restoreScroll: !preserveBottom,
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
       followLiveUpdates: preserveBottom,
+      mergeFrom: merge?.mergeFrom || null,
     });
+    // A merge does not scroll as the full render does: a reader at the end
+    // is taken to the new end here.
+    if (merge && preserveBottom && messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
     if (reading) restoreReadingBlock(messagesEl, reading);
   } finally {
     liveConversationPollInFlight = false;
@@ -3888,6 +3922,21 @@ function initComposerAttachmentInput() {
   window.addEventListener('dragend', clearHighlight);
 }
 
+// The place read is noted once per frame: it measures rows, a scroll event
+// can come many times a frame. It is noted for the conversation whose rows
+// are on the page, and only while that is the one open: during a switch the
+// page still shows the conversation left.
+let readingAnchorSaveFrame = 0;
+function scheduleReadingAnchorSave() {
+  if (readingAnchorSaveFrame || IS_SHARED_VIEW) return;
+  readingAnchorSaveFrame = requestAnimationFrame(() => {
+    readingAnchorSaveFrame = 0;
+    const captured = captureConversationReadingAnchor();
+    if (!captured || captured.conversationId !== String(currentConvId || '').trim()) return;
+    saveConversationReadingAnchor(captured.conversationId, captured.anchor);
+  });
+}
+
 function initMessageScrollPersistence() {
   const el = document.getElementById('messages');
   if (!el || el.dataset.scrollPersistenceBound === '1') return;
@@ -3897,19 +3946,43 @@ function initMessageScrollPersistence() {
     const convId = String(currentConvId || '').trim();
     if (!convId) return;
     saveConversationScrollTop(convId, el.scrollTop);
+    scheduleReadingAnchorSave();
   }, { passive: true });
 }
 
-// The jump-to-bottom button on a window in the middle of the history: the
-// end of the conversation replaces it, scrolled to the bottom.
+// The end's answer can predate a row held back below the window while it
+// was on its way (stored after the request read the conversation), and its
+// render lets the held rows go. The newest row held is the one to look for:
+// older ones can lie before a page of the end and are not missing.
+function endAnswerLacksHeldBackRow(response) {
+  const newestHeld = getHeldBackLiveRowIds().slice(-1);
+  if (!newestHeld.length) return false;
+  return !newerPageReachesEnd({
+    pageHasMore: false,
+    pageMessageIds: (Array.isArray(response?.messages) ? response.messages : []).map((message) => message?.id),
+    heldBackIds: newestHeld,
+  });
+}
+
+// The jump-to-bottom button on a window in the middle of the history (and an
+// own send from one): the end of the conversation replaces it, scrolled to
+// the bottom.
 async function loadCurrentConversationEnd() {
   const currentId = String(currentConvId || '').trim();
   if (!currentId) return;
   const jumpEpoch = getTranscriptJumpEpoch();
-  const response = await loadConversation(currentId, { limit: 20 });
+  const load = () => loadConversation(currentId, { limit: 20 });
+  let response = await load();
   if (!response || String(currentConvId || '').trim() !== currentId) return;
   // A jump into the history while it was on its way wins.
   if (getTranscriptJumpEpoch() !== jumpEpoch) return;
+  // Asked once more, not until it has them: a held row deleted since would
+  // never come.
+  if (endAnswerLacksHeldBackRow(response)) {
+    const again = await load();
+    if (String(currentConvId || '').trim() !== currentId || getTranscriptJumpEpoch() !== jumpEpoch) return;
+    if (again) response = again;
+  }
   applyLoadedConversationState(currentId, response, { restoreScroll: false });
 }
 
@@ -4005,12 +4078,16 @@ async function refreshCurrentView() {
   const reading = preserveBottom || keepTranscript ? null : captureReadingBlock(messagesEl);
   let restoredAt = null;
   if (r) {
-    applyLoadedConversationState(currentId, r, {
+    const merge = keepTranscript ? null : reloadMergeFor(currentId, r);
+    applyLoadedConversationState(currentId, merge?.payload || r, {
       restoreScroll: !preserveBottom,
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
       followLiveUpdates: preserveBottom && !keepTranscript,
       keepTranscript,
+      mergeFrom: merge?.mergeFrom || null,
     });
+    // As in the live poll: a merge leaves the scrolling to the caller.
+    if (merge && preserveBottom && messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
     // At once, and again below once the cards are back on the page.
     restoreReadingBlock(messagesEl, reading);
     restoredAt = { scrollTop: messagesEl?.scrollTop };
@@ -4254,6 +4331,7 @@ function syncChatTitleControls() {
   if (title) {
     if (!convId || !conversation) {
       delete title.dataset.uiState;
+      delete title.dataset.working;
     } else {
       const pendingByConversation = getPendingQuestionCountsByConversation();
       const pendingCount = Number(pendingByConversation[convId] || 0);
@@ -4264,6 +4342,8 @@ function syncChatTitleControls() {
         hasPendingQuestion: pendingCount > 0,
       });
       title.dataset.uiState = uiState;
+      // Bright green while it works, the darker green while idle, as its row.
+      title.toggleAttribute('data-working', isConversationWorking(conversation));
     }
   }
   if (chatTitleEditingConversationId && chatTitleEditingConversationId !== convId) {
@@ -4519,6 +4599,7 @@ async function initApp() {
   if (!sharedMode) {
     syncSuspendHostVisibility();
     syncScrollOnSendToggle();
+    syncWindowRetentionSlider();
     initHostSuspendUi();
     initUsageLimitUi();
   }
@@ -4848,6 +4929,7 @@ async function initApp() {
   initComposerAttachmentInput();
   initMessageSearchView({ openConversation });
   initSubagentViewer();
+  initTaskConsole();
   initPinnedMessagesView({
     openConversation,
     focusMessage: focusConversationMessageById,
@@ -5007,11 +5089,19 @@ window.resetGrokAllowanceAccounting = resetGrokAllowanceAccounting;
 window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateScrollOnSendSetting = (enabled) => updateScrollOnSendSetting(enabled);
+window.previewConversationWindowRetention = (position) => previewWindowRetention(position);
+// A lower cap cuts the kept windows down now; the open conversation's is cut
+// when it is left.
+window.updateConversationWindowRetention = (position) => updateWindowRetention(position, {
+  onChange: (cap) => conversationPayloadCache.trimAll(cap, loadConversationReadingAnchor, { except: currentConvId }),
+});
 window.updateWindowsAutostartMode = updateWindowsAutostartMode;
 window.previewTurnCeilingSetting = previewTurnCeilingSetting;
 window.updateTurnCeilingSetting = updateTurnCeilingSetting;
 window.previewBackgroundTaskTimeoutSetting = previewBackgroundTaskTimeoutSetting;
 window.updateBackgroundTaskTimeoutSetting = updateBackgroundTaskTimeoutSetting;
+window.previewTaskStallMinutesSetting = previewTaskStallMinutesSetting;
+window.updateTaskStallMinutesSetting = updateTaskStallMinutesSetting;
 window.updateSubagentRecordRetentionSetting = updateSubagentRecordRetentionSetting;
 window.togglePushOnThisDevice = togglePushOnThisDevice;
 window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;

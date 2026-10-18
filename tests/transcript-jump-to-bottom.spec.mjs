@@ -406,6 +406,43 @@ for (const [name, device] of Object.entries(DEVICES)) {
         await relay.cleanup();
       }
     });
+
+    // The same case without its timing: a row is followed to the end, and
+    // before the next frame (which brings its scroll event and the resize
+    // round) the composer grows and the next update asks whether it follows.
+    // It runs in one task, so the order is the one a busy page sees at times.
+    test("an update between a scroll to the end and the next frame follows when the composer grew", async ({ page, request }) => {
+      test.setTimeout(90_000);
+      const relay = createRelay(request);
+      try {
+        for (let index = 0; index < 8; index += 1) await relay.turn(`Question ${index}. ${FILLER.repeat(3)}`);
+        await openConversation(page, relay.conversationId);
+        await expect(page.locator("#messages .msg[data-message-id]")).toHaveCount(16);
+        await page.evaluate(() => { const el = document.getElementById("messages"); el.scrollTop = el.scrollHeight; });
+        await expectAtBottom(page);
+        await page.waitForTimeout(300);
+        const asked = await page.evaluate(async () => {
+          const { followsTranscriptEnd } = await import("/app/transcript-jump-bottom-view.mjs");
+          const el = document.getElementById("messages");
+          const row = document.createElement("div");
+          row.style.height = "60px";
+          el.appendChild(row);
+          el.scrollTop = el.scrollHeight;
+          const grown = document.createElement("div");
+          grown.style.height = "200px";
+          document.getElementById("input-area").prepend(grown);
+          const distance = Math.round(el.scrollHeight - el.clientHeight - el.scrollTop);
+          const follows = followsTranscriptEnd();
+          row.remove();
+          grown.remove();
+          return { distance, follows };
+        });
+        expect(asked.distance).toBeGreaterThan(100);
+        expect(asked.follows).toBe(true);
+      } finally {
+        await relay.cleanup();
+      }
+    });
   });
 }
 

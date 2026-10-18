@@ -42,5 +42,6 @@ This relay itself is listed with "self": true when its owner switched agent sess
 - A new session knows nothing of this conversation: write a self-contained prompt. A Claude Cloud session works on a fresh clone in a sandbox at Anthropic, so name the branch it should work on and push.
 - Follow each session with `wait` (the message id comes back from `create_session` and `send`) and `read_session`; "wait_seconds" is limited to the maximum set on the relay (default 600).
 - Sessions run on the relay owner's accounts and cost their usage: start only what the task needs.
+- `read_task_output` ("session", "task_id" from `read_session`'s tasks, optional "lines") reads the end of a background shell or Monitor task's output, also for an hour after it ended: the last lines, minutes since its last output, and pass/fail counts for a test run. Credentials are scrubbed out.
 
 Write actions may first wait for the user's approval. If a result lists `pendingQuestions`, the other agent is waiting for an answer: ask the user (unless they told you to decide), then pass it on with `answer_question`. Always tell the user which relay and session you worked on.

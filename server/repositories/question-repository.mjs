@@ -174,6 +174,10 @@ export function createQuestionRepository(db) {
           WHERE response_message_id = ?
           ORDER BY created_at ASC, id ASC
         `),
+        // Every card of a conversation, for the shared view's link redaction:
+        // a paged transcript hydrates only its page's cards, yet a reply on
+        // the page may quote the link of a card outside it.
+        listPreviewCardJsonByConversation: db.prepare(`SELECT preview_json FROM preview_cards WHERE conversation_id = ?`),
         deleteConvPreviewCards: db.prepare(`DELETE FROM preview_cards WHERE conversation_id = ?`),
 
         // relay boards

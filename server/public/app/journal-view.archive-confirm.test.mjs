@@ -83,6 +83,15 @@ test('the rows show green for the live workers', async () => {
   assert.ok(document.querySelector('[data-conversation-id="conv_fixture_offline"]').classList.contains('worker-ui-offline'));
 });
 
+test('a working row is marked for the bright green, an idle one is not, and no dots follow a title', () => {
+  const rowOf = (id) => document.querySelector(`[data-conversation-id="${id}"]`);
+  assert.equal(rowOf('conv_fixture_busy').classList.contains('conv-working'), true);
+  assert.equal(rowOf('conv_fixture_green').classList.contains('conv-working'), false);
+  assert.equal(rowOf('conv_fixture_offline').classList.contains('conv-working'), false);
+  assert.equal(document.querySelectorAll('#conv-list .conv-processing-dots').length, 0);
+  assert.equal(rowOf('conv_fixture_busy').querySelector('.conv-title').textContent, 'Working chat');
+});
+
 test('a green chat asks first; Cancel keeps it', async () => {
   const pending = journal.archiveConv(null, 'conv_fixture_green');
   await flush();

@@ -447,6 +447,7 @@ test('what the input check hands on passes it again unchanged, for every action'
     { action: 'usage', relay: 'this' },
     { action: 'list_sessions', relay: 'this', scope: 'all', limit: 5, query: 'docs', cursor: 'c1' },
     { action: 'read_session', relay: 'this', session: 'conv-a', last: 3, max_chars: 900, include_activity: true, before: 'b1' },
+    { action: 'read_task_output', relay: 'this', session: 'conv-a', task_id: 'task-b7', lines: 40 },
     { action: 'wait', relay: 'this', session: 'conv-a', message_id: 'm-1', wait_seconds: 30 },
     { action: 'send', relay: 'this', session: 'conv-a', text: 'hello', mode: 'plan', effort: 'high', if_busy: 'fail', model: 'gpt-5.4-mini' },
     { action: 'create_session', relay: 'this', text: 'start', provider: 'claude', cwd: '/home/dev/project', title: 'docs pass' },
@@ -480,4 +481,18 @@ test('subscribe takes scope "all" as ["all"], and not together with session ids'
   assert.match(mixed.error, /either \["all"\] or a list of session ids/);
   // list_sessions' other scopes mean nothing to subscribe.
   assert.deepEqual(validateRemoteRelayToolInput({ action: 'subscribe', scope: 'recent', sessions: ['conv-a'] }).args, { relay: 'this', sessions: ['conv-a'] });
+});
+
+test('read_task_output: session and task_id required, lines defaulted and clamped, read permission', () => {
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'read_task_output', relay: 'this', session: 'conv-a', task_id: 'task-b7' }).args,
+    { relay: 'this', session: 'conv-a', task_id: 'task-b7', lines: 200 });
+  assert.equal(validateRemoteRelayToolInput({ action: 'read_task_output', relay: 'this', session: 'conv-a', task_id: 'task-b7', lines: 9000 }).args.lines, 500);
+  assert.match(validateRemoteRelayToolInput({ action: 'read_task_output', relay: 'this', session: 'conv-a' }).error, /needs task_id/);
+  assert.match(validateRemoteRelayToolInput({ action: 'read_task_output', relay: 'this', task_id: 'task-b7' }).error, /needs session/);
+  assert.match(validateRemoteRelayToolInput({ action: 'read_task_output', relay: 'this', session: 'conv-a', task_id: '../x' }).error, /not a task id/);
+  assert.match(validateRemoteRelayToolInput({ action: 'read_task_output', relay: 'this', session: 'conv-a', task_id: 't', lines: 'many' }).error, /lines must be a number/);
+  assert.equal(REMOTE_RELAY_ACTION_PERMISSION.read_task_output, 'read');
+  assert.equal(remoteRelayPermissionAllows('read', 'read_task_output'), true);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /read_task_output/);
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.lines.maximum, 500);
 });

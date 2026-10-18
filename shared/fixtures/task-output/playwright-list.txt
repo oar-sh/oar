@@ -1,0 +1,26 @@
+
+Running 2 tests using 1 worker
+
+  ✓  1 harbor.spec.mjs:2:1 › harbor gate opens (15ms)
+  ✘  2 harbor.spec.mjs:3:1 › harbor bell rings twice (11ms)
+
+
+  1) harbor.spec.mjs:3:1 › harbor bell rings twice ─────────────────────────────────────────────────
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: "twice"
+    Received: "once"
+
+      1 | import { test, expect } from '@playwright/test';
+      2 | test('harbor gate opens', async () => { expect(2 + 2).toBe(4); });
+    > 3 | test('harbor bell rings twice', async () => { expect('once').toBe('twice'); });
+        |                                                              ^
+      4 |
+        at /home/dev/lantern-kit/harbor.spec.mjs:3:62
+
+    Error Context: test-results/harbor-harbor-bell-rings-twice/error-context.md
+
+  1 failed
+    harbor.spec.mjs:3:1 › harbor bell rings twice ──────────────────────────────────────────────────
+  1 passed (1.4s)

@@ -85,6 +85,8 @@ export async function createGrokAgentHandle({
   model = '',
   AcpClientImpl = AcpClient,
   createHostServicesImpl = createAcpHostServices,
+  // Told about every terminal (the worker's background-tasks publisher).
+  taskObserver = null,
   dbg = () => {},
 } = {}) {
   const client = new AcpClientImpl({
@@ -109,7 +111,7 @@ export async function createGrokAgentHandle({
   // The terminal/fs handlers backing the capabilities initialize() advertises.
   // They must be attached before the first prompt, or the agent's first shell
   // command deadlocks the turn waiting on terminal/create.
-  const hostServices = createHostServicesImpl({ cwd, env, dbg });
+  const hostServices = createHostServicesImpl({ cwd, env, dbg, ...(taskObserver ? { taskObserver } : {}) });
   hostServices.attach(client);
 
   await client.initialize();

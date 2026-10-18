@@ -138,17 +138,24 @@ test.describe.serial("Change CWD picker on mobile", () => {
     const saveButton = page.locator("#change-cwd-actions button", { hasText: "Save next-launch CWD" });
     const trigger = page.locator("#change-cwd-menu-trigger");
     const options = page.locator("#change-cwd-menu .change-cwd-menu-item[data-path]");
+    // The line above the action row names the selected path. The default
+    // selection is the relay's own folder, so how many lines it wraps to
+    // depends on where the relay runs; picking another entry rewrites it.
+    // That is the one thing allowed to move the row, by its own height.
+    const details = page.locator("#change-cwd-details");
 
     const before = await saveButton.boundingBox();
+    const detailsBefore = await details.boundingBox();
     await trigger.tap();
     await expect(page.locator("#change-cwd-menu")).toBeVisible();
     const during = await saveButton.boundingBox();
     await options.nth(1).tap();
     await expect(page.locator("#change-cwd-menu")).toBeHidden();
     const after = await saveButton.boundingBox();
+    const detailsAfter = await details.boundingBox();
 
     expect(during.y).toBeCloseTo(before.y, 0);
-    expect(after.y).toBeCloseTo(before.y, 0);
+    expect(after.y - before.y).toBeCloseTo(detailsAfter.height - detailsBefore.height, 0);
   });
 
   test("the panel is not clipped by the dialog", async ({ page }) => {

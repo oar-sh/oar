@@ -21,7 +21,7 @@ import { createViewerHistory } from './viewer-history.mjs';
 import { getSocket } from './socket-handlers.js';
 import { createSubagentViewerWatch } from './subagent-viewer-watch.mjs';
 import { formatTaskModelLabel, formatTaskTokens } from './task-row-format.mjs';
-import { getConversationBackgroundTasks } from './background-tasks-view.mjs';
+import { getConversationBackgroundTasks, setSubagentStepCounter } from './background-tasks-view.mjs';
 import { formatRunDuration, isRunningSubagentStatus, subagentRowHtml, subagentStatusLabel } from './subagent-row.mjs';
 import {
   createTimelineState,
@@ -488,6 +488,12 @@ export function syncSubagentRowClock() {
 export function initSubagentViewer() {
   if (initialized) return;
   initialized = true;
+  // A sub-agent row without the worker's `steps` counts the run's activity
+  // lines, the number its reply bubble shows.
+  setSubagentStepCounter((runId) => {
+    const activities = getSubagentRun(runId)?.activities;
+    return Array.isArray(activities) ? activities.length : null;
+  });
   viewerHistory = createViewerHistory({
     history: window.history,
     mark: 'oarSubagentViewer',

@@ -2,14 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  CLAUDE_AUTO_BACKGROUND_TIMEOUT_MS,
+  CLAUDE_BASH_MAX_TIMEOUT_MS,
   CLAUDE_ULTRACODE_EFFORT,
   RELAY_MCP_SERVER_NAME,
   RELAY_MCP_TOOL_TIMEOUT_MS,
   applyThinkingDisplay,
+  claudeSpawnEnv,
   claudeSpawnSettings,
   claudeThinkingFlagSettings,
   claudeUltracodeFlagSettings,
   createCanUseTool,
+  longCommandInstructionText,
   normalizeClaudeEffort,
   permissionModeForRelayMode,
   startClaudeSession,
@@ -437,4 +441,68 @@ test('applyThinkingDisplay tolerates old CLIs and failures', async () => {
   );
   assert.equal(failures.length, 1);
   assert.match(failures[0], /nope/);
+});
+
+test('claudeSpawnEnv sets the three Bash timeouts on top of the base environment', () => {
+  const env = claudeSpawnEnv({
+    backgroundCommandLimitMs: 2 * 3_600_000,
+    baseEnv: { PATH: '/usr/bin', HOME: '/home/example', BASH_DEFAULT_TIMEOUT_MS: '5000' },
+  });
+  assert.deepEqual(env, {
+    PATH: '/usr/bin',
+    HOME: '/home/example',
+    BASH_DEFAULT_TIMEOUT_MS: '7200000',
+    BASH_MAX_TIMEOUT_MS: '28800000',
+    CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS: '120000',
+  });
+  assert.equal(CLAUDE_BASH_MAX_TIMEOUT_MS, 28_800_000);
+  assert.equal(CLAUDE_AUTO_BACKGROUND_TIMEOUT_MS, 120_000);
+});
+
+test('claudeSpawnEnv leaves the environment alone without a usable limit', () => {
+  for (const backgroundCommandLimitMs of [null, undefined, 0, -5, Number.NaN, 'abc']) {
+    assert.equal(claudeSpawnEnv({ backgroundCommandLimitMs, baseEnv: { PATH: '/usr/bin' } }), null);
+  }
+});
+
+test('startClaudeSession hands query() the merged environment and names the limit in the prompt', () => {
+  let captured = null;
+  startClaudeSession({
+    content: null,
+    cwd: '/workspace',
+    backgroundCommandLimitMs: 4 * 3_600_000,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  const { env } = captured.options;
+  assert.equal(env.BASH_DEFAULT_TIMEOUT_MS, '14400000');
+  assert.equal(env.BASH_MAX_TIMEOUT_MS, '28800000');
+  assert.equal(env.CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS, '120000');
+  // env replaces the subprocess environment, so the worker's own must be kept.
+  for (const key of Object.keys(process.env)) assert.equal(env[key] === undefined, false, key);
+  assert.match(captured.options.systemPrompt.append, /Background Bash commands are stopped after 4 h unless you pass a longer timeout \(up to 8 h\)/);
+});
+
+test('startClaudeSession without a limit passes no env', () => {
+  let captured = null;
+  startClaudeSession({
+    content: null,
+    cwd: '/workspace',
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.equal('env' in captured.options, false);
+  assert.doesNotMatch(captured.options.systemPrompt.append, /stopped after/);
+  assert.match(captured.options.systemPrompt.append, /For long background Bash commands, write the full output to a log file/);
+});
+
+test('the long command note asks for a log file and nohup, with the limit when known', () => {
+  const withLimit = longCommandInstructionText(150 * 60_000);
+  assert.match(withLimit, /^Background Bash commands are stopped after 2 h 30 min unless you pass a longer timeout/);
+  assert.match(withLimit, /write the full output to a log file instead of piping it into tail or head/);
+  assert.match(withLimit, /Start runs that must survive a session restart detached with nohup and a log file\.$/);
+  assert.match(longCommandInstructionText(null), /^For long background Bash commands, write the full output/);
+  for (const mode of ['plan', 'agent', 'ask', 'autopilot']) {
+    const { append } = systemPromptForRelayMode(mode, { backgroundCommandLimitMs: 2 * 3_600_000 });
+    assert.match(append, /stopped after 2 h/);
+    assert.match(append, /nohup/);
+  }
 });

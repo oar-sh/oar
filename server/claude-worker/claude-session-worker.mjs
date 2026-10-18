@@ -18,6 +18,10 @@ import { createControlPoller } from '../../shared/control-poller.mjs';
 import { resolveDeliveredAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import { resolveDeliveredThinking } from '../../shared/claude-thinking.mjs';
 import { resolveDeliveredAttribution } from '../../shared/claude-attribution.mjs';
+import {
+  DEFAULT_CLAUDE_BACKGROUND_COMMAND_LIMIT_MS,
+  resolveDeliveredClaudeBackgroundCommandLimitMs,
+} from '../../shared/claude-background-command-limit.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { createRunnerLinkBridge, failSettlingRowsOnShutdown } from './claude-worker-link-wiring.mjs';
@@ -70,6 +74,9 @@ async function main() {
   // What this session's commits and PRs say; same piggyback. null = the
   // CLI's own attribution (vanilla).
   let attribution = null;
+  // How long a backgrounded Bash command may run without its own timeout;
+  // same piggyback, applied when the CLI process is next spawned.
+  let backgroundCommandLimitMs = DEFAULT_CLAUDE_BACKGROUND_COMMAND_LIMIT_MS;
 
   const api = createApiClient({
     serverUrl,
@@ -116,6 +123,7 @@ async function main() {
     getAutoCompactWindow: () => autoCompactWindow,
     getThinking: () => thinking,
     getAttribution: () => attribution,
+    getBackgroundCommandLimitMs: () => backgroundCommandLimitMs,
     // A readiness flip is a hold starting or ending (question card,
     // compaction, a turn-opening delivery): the steering snapshot changed
     // with it, so it goes out now rather than on the next 10 s heartbeat.
@@ -190,6 +198,7 @@ async function main() {
       // user choosing Host default.
       thinking = resolveDeliveredThinking(thinking, pending?.settings);
       attribution = resolveDeliveredAttribution(attribution, pending?.settings);
+      backgroundCommandLimitMs = resolveDeliveredClaudeBackgroundCommandLimitMs(backgroundCommandLimitMs, pending?.settings);
       try {
         return await turnRunner.handlePendingPayload(pending);
       } catch (error) {
@@ -203,6 +212,14 @@ async function main() {
         const taskId = String(control?.taskId || '').trim();
         dbg('stop background task control', taskId);
         await turnRunner.stopBackgroundTask(taskId);
+        return;
+      }
+      if (type === 'task_output_snapshot') {
+        // A console opened on a shell task with no output file: the CLI's
+        // last 8 KiB goes to the relay, which serves it as a static tail.
+        const taskId = String(control?.taskId || '').trim();
+        dbg('task output snapshot control', taskId);
+        await turnRunner.snapshotTaskOutput(taskId);
         return;
       }
       dbg('unknown worker control ignored', type || '(none)');

@@ -1,0 +1,33 @@
+[32m✔ lantern glows when lit [90m(0.938752ms)[39m[39m
+[31m✖ lantern dims at dawn [90m(1.094257ms)[39m[39m
+[34mℹ tests 2[39m
+[34mℹ suites 0[39m
+[34mℹ pass 1[39m
+[34mℹ fail 1[39m
+[34mℹ cancelled 0[39m
+[34mℹ skipped 0[39m
+[34mℹ todo 0[39m
+[34mℹ duration_ms 101.652415[39m
+
+[31m✖ failing tests:[39m
+
+test at lantern.test.mjs:4:1
+[31m✖ lantern dims at dawn [90m(1.094257ms)[39m[39m
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'dim' !== 'bright'
+  
+      at TestContext.<anonymous> [90m(file:///home/dev/lantern-kit/[39mlantern.test.mjs:4:45[90m)[39m
+  [90m    at Test.runInAsyncScope (node:async_hooks:227:14)[39m
+  [90m    at Test.run (node:internal/test_runner/test:1306:25)[39m
+  [90m    at Test.processPendingSubtests (node:internal/test_runner/test:897:18)[39m
+  [90m    at Test.postRun (node:internal/test_runner/test:1447:19)[39m
+  [90m    at Test.run (node:internal/test_runner/test:1372:12)[39m
+  [90m    at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)[39m {
+    generatedMessage: [33mtrue[39m,
+    code: [32m'ERR_ASSERTION'[39m,
+    actual: [32m'dim'[39m,
+    expected: [32m'bright'[39m,
+    operator: [32m'strictEqual'[39m,
+    diff: [32m'simple'[39m
+  }

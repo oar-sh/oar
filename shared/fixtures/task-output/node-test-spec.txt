@@ -1,0 +1,33 @@
+✔ lantern glows when lit (1.052648ms)
+✖ lantern dims at dawn (2.541615ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 1
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 176.696194
+
+✖ failing tests:
+
+test at lantern.test.mjs:4:1
+✖ lantern dims at dawn (2.541615ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'dim' !== 'bright'
+  
+      at TestContext.<anonymous> (file:///home/dev/lantern-kit/lantern.test.mjs:4:45)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1306:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:897:18)
+      at Test.postRun (node:internal/test_runner/test:1447:19)
+      at Test.run (node:internal/test_runner/test:1372:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'dim',
+    expected: 'bright',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

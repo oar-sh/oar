@@ -396,6 +396,33 @@ test('a block read in the live bubble is found in the reply that takes its place
   assert.equal(el.blockTop('a1', 'reply 3'), before);
 });
 
+test('restored twice in a row on whole-pixel scrolling, the block stays within half a pixel of where it was read', () => {
+  const rows = (lead) => [{ id: 'm0', lead, blocks: paragraphs('old', 6) }, { id: 'm1', lead: 30, blocks: paragraphs('new', 6) }];
+  const el = makeBlockTranscript({ rows: rows(30.25), scrollTop: 790 });
+  // As in the browser: scrollTop takes whole pixels.
+  let scrollTop = 790;
+  Object.defineProperty(el, 'scrollTop', { get: () => scrollTop, set: (value) => { scrollTop = Math.round(value); } });
+  const first = captureReadingBlock(el);
+  assert.equal(first.text, 'new 2');
+  const read = el.blockTop('m1', 'new 2');
+  // The reply takes the live bubble's place and the rows above come back
+  // taller: the block lands 0.375 px above where it was read.
+  el.rows = rows(96.875);
+  assert.equal(restoreReadingBlock(el, first), true);
+  assert.equal(el.blockTop('m1', 'new 2') - read, -0.375);
+  // The reload after the turn captures and rebuilds once more. The block is
+  // put back where it was read, not where the first restore left it, which
+  // would take it 0.75 px off.
+  const again = captureReadingBlock(el);
+  assert.equal(again.offset, first.offset);
+  el.rows = rows(97.5);
+  assert.equal(restoreReadingBlock(el, again), true);
+  assert.ok(Math.abs(el.blockTop('m1', 'new 2') - read) <= 0.5);
+  // A reader who scrolls since is read where they are.
+  el.scrollTop += 3;
+  assert.equal(captureReadingBlock(el).offset, el.blockTop('m1', 'new 2'));
+});
+
 test('the same line twice in a row: the one that was read is restored', () => {
   const blocks = [{ tag: 'p', text: 'again', height: 100 }, { tag: 'p', text: 'between', height: 300 }, { tag: 'p', text: 'again', height: 100 }, { tag: 'p', text: 'tail', height: 600 }];
   const el = makeBlockTranscript({ rows: [{ id: 'm0', blocks }], scrollTop: 380 });

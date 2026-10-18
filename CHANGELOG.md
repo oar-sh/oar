@@ -3,6 +3,132 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.12] — 2026-10-18
+
+Highlights: a background command or monitor in the task panel opens a
+console with its output, live, in colour and with secrets blanked, paging
+back through the whole log and with its own **Stop**. Task rows say when a
+task has gone quiet ("no output for 12 min", amber after a time you set in
+Settings) and show a **✓ 412 ✘ 2** chip when the output is a test run;
+sub-agent rows count their steps, and agents read a task's output on a
+paired relay with `remote_relay` `read_task_output`. Long conversations open
+and page back fast, and switching away and back, or reloading, returns to
+the message you were reading, older pages included; new messages wait below
+a place far up the history instead of skipping the ones in between.
+
+### Upgrade notes
+
+- Migration 0017 (two indexes for the history of long conversations) runs by
+  itself on the first start. The Node.js requirement is unchanged (22.13 or
+  newer), and no setting or config key needs changing.
+- Two new settings in **Settings › General**: **Mark a background task as
+  quiet after** (10 minutes by default, for the relay) and **Messages kept
+  per conversation for switching back** (200 by default, per browser).
+- **Claude background commands may run for 2 hours** before Claude Code
+  stops them, and up to 8 hours when Claude asks; **Settings › Providers ›
+  Claude** sets the limit. OAR now sets `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS` and
+  `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS` for the Claude sessions it starts,
+  so values of these in the relay's environment no longer apply. Commands
+  that start with `sleep`, and sub-agents' commands, are not moved to the
+  background after 2 minutes and may block a turn up to the limit.
+
+### Added
+
+- **Click a background command to watch its output.** A backgrounded shell
+  command or monitor in the composer's task panel opens a console: the last
+  2,000 lines, following live, with **Load earlier** paging back through the
+  whole log (about 5 MB at most). Progress-bar redraws collapse to their last
+  state, repeated lines fold into one with ×N, colours are kept and other
+  control codes dropped, secrets are blanked, and the console has its own
+  **Stop**. A finished command keeps a dimmed ✓/✘ row for an hour so a failed
+  run can still be read. Claude reads the file its CLI writes for the command,
+  Copilot a detached shell's log or an attached shell's recent output, and
+  Grok now lists its terminals as tasks. A session started before this
+  release names no output file; its console says so and that a restart of
+  the session helps.
+- **Task rows say when a task has gone quiet** ("no output for 12 min", amber
+  after **Settings › General › Mark a background task as quiet after**, 10
+  minutes by default) and show a **✓ 412 ✘ 2** chip when the output is a
+  vitest, Playwright, node:test, jest, pytest or turbo run (also through
+  pnpm); the console header's chip jumps to the first failure, and a run
+  that ends shows its final counts within a moment.
+- **Sub-agent rows in the task panel show their step count** ("22 steps"), as
+  the rows in the reply already did.
+- **Settings › Providers › Claude › Claude background command limit** (30
+  minutes to 8 hours, 2 hours by default) sets how long a command Claude runs
+  in the background may take before Claude Code stops it, when Claude gives it
+  no timeout of its own; Claude may still ask for up to 8 hours for one
+  command. A foreground command moves to the background after 2 minutes, so
+  the turn goes on while it runs. Claude is also told to write the output of
+  long runs to a log file instead of piping it into `tail`, and to start runs
+  that must survive a session restart with `nohup`. A change applies to Claude
+  sessions started afterwards; Claude Cloud is not affected.
+- **`remote_relay` action `read_task_output`** gives agents the same tail,
+  quiet time and counts of a task on a relay they may read; `read_session`
+  lists the task ids with that health.
+
+### Changed
+
+- **Long conversations open and scroll back fast.** A history page used to
+  load and prepare every message of the conversation, so a chat with a few
+  thousand messages took about two seconds per page and per live refresh. The
+  relay now reads only the requested page from the database (migration 0017
+  adds the indexes for it), so a page loads in well under a tenth of a second
+  however long the conversation is.
+- Switching back to a conversation already viewed in this tab draws it at
+  once from what the page kept of it; the relay's fresh answer is merged into
+  it when it arrives.
+- **Settings › General › Messages kept per conversation for switching back**
+  (200 by default, 100 to 1,000 or no limit, saved in this browser) sets how
+  many loaded messages each of the last eight conversations keeps.
+- **The conversation list shows activity by the title's colour.** The three
+  animated dots after a working session's title are gone: a ready session
+  that runs a turn or background work keeps the bright green title, an idle
+  one turns a darker green (a muted green in the light theme), and the chat
+  header follows the same rule. Question, error, offline and archived titles
+  keep their colours.
+- The npm package guard allows 7.5 MiB unpacked and 510 entries (was 7.25
+  MiB and 490); the task console, the transcript's handling of new
+  messages below a place far up the history, the Copilot task report and the
+  Claude background command limit grew the server and the app to about 7.37
+  MiB and 505 entries.
+
+### Fixed
+
+- **Copilot background tasks report how they ended.** Finished shells and
+  sub-agents of Copilot's SDK engine showed the status *unknown* and no exit
+  code, in the task data agents read and wherever the end is shown. The
+  worker now reports completed, failed or cancelled, a shell's exit code, and
+  a sub-agent's result (or its error) as its summary; a passing status line
+  such as *Thinking…* is no longer kept as the final summary.
+- **Cancel on a usage-limit pause removes the relay's held follow-up from the
+  open conversation at once.** The *Automatic message from OAR* row was
+  deleted on the relay but stayed on the page, and in what the page kept for
+  switching back, until a reload. A row deleted while you were elsewhere
+  leaves too, also when it was the conversation's newest.
+
+- **Switching away from a long conversation and back keeps your place.** After
+  loading older messages and scrolling back into them, a switch to another
+  conversation and back lost the reading position: with more than 100 messages
+  loaded the oldest were dropped, and messages written meanwhile moved the view
+  by as many rows. The page now remembers the message you were reading and
+  keeps the loaded messages, so you come back to the same message at the same
+  place, older pages included; after a reload it opens at that message too.
+- **New messages no longer skip the ones in between while you read far up.**
+  Opened at a pin, a search result or the place you were reading after a
+  reload, a conversation shows the messages around it. A message or reply that
+  arrived then was put right under them, and the messages between were never
+  loaded when you scrolled down, only the jump-to-bottom button brought them.
+  Now new messages wait: the button counts them, and scrolling down loads
+  every message in between, in order, before them. A reply still being
+  written shows once you are there. A message you send from there takes you
+  to the end, where it, its reply and everything in between show.
+- **Images that load late no longer push the message you are reading down.**
+  In a browser without scroll anchoring (Safari, for one), pictures above
+  your place that arrived after a switch back, a reload or an older page moved
+  the text by their height. The transcript now holds your place while they
+  load, and lets go as soon as you scroll.
+
 ## [0.9.11] — 2026-10-17
 
 Highlights: sessions an agent starts now sit in a group under the session

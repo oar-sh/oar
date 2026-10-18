@@ -1,0 +1,35 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.4, pluggy-1.5.0
+rootdir: /home/dev/compass-py
+collected 414 items
+
+tests/test_needle.py ............                                        [  2%]
+tests/test_bearing.py ..F.F                                              [  4%]
+tests/test_legend.py ...........................................................  [ 18%]
+................................................................................[ 37%]
+................................................................................[ 56%]
+................................................................................[ 75%]
+................................................................................[ 94%]
+..................                                                              [100%]
+
+=================================== FAILURES ===================================
+____________________________ test_rounds_to_degree _____________________________
+
+    def test_rounds_to_degree():
+>       assert round_bearing(41.4) == 42
+E       assert 41 == 42
+E        +  where 41 = round_bearing(41.4)
+
+tests/test_bearing.py:9: AssertionError
+____________________________ test_wraps_past_north _____________________________
+
+    def test_wraps_past_north():
+>       assert normalize_bearing(361) == 1
+E       assert 361 == 1
+E        +  where 361 = normalize_bearing(361)
+
+tests/test_bearing.py:14: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_bearing.py::test_rounds_to_degree - assert 41 == 42
+FAILED tests/test_bearing.py::test_wraps_past_north - assert 361 == 1
+========================= 2 failed, 412 passed in 3.21s =========================

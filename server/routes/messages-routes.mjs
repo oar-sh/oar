@@ -42,6 +42,14 @@ import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { normalizeBackgroundTaskDigest } from '../../shared/worker-runtime/background-task-digest.mjs';
+import {
+  DEFAULT_TASK_STALL_MINUTES,
+  TASK_OUTPUT_LIMITS,
+  normalizeTaskOutputKind,
+  normalizeTaskOutputPath,
+} from '../../shared/task-output-text.mjs';
+import { readBefore, readTail, shapeSnapshot, taskOutputSource } from '../services/task-output-service.mjs';
+import { taskKindOf } from '../services/session-activity-tracker.mjs';
 import { ANSWERED_ELSEWHERE_KIND, STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { isLiveResend } from '../services/steer-resend.mjs';
 import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
@@ -1779,6 +1787,12 @@ export function registerMessagesRoutes(app, deps) {
     buildRelayReadyBannerData,
     backgroundTaskStore,
     backgroundWorkView = null,
+    // The 8 KiB a worker posts for a task without an output file
+    // (services/task-output-service.mjs createTaskOutputSnapshots).
+    taskOutputSnapshots = null,
+    // Has the health poller read soon (a task with a console ended).
+    pokeTaskHealth = null,
+    getTaskStallMinutes = () => DEFAULT_TASK_STALL_MINUTES,
     sendWorkerControl,
     ensureSessionId,
     touchCli,
@@ -5468,6 +5482,7 @@ export function registerMessagesRoutes(app, deps) {
           io.emit('background_tasks', {
             conversationId: requesterSessionId,
             tasks: backgroundWorkView.panelTasks(requesterSessionId, requesterConversationId),
+            endedTasks: backgroundTaskStore?.ended?.(requesterSessionId) || [],
           });
         }
       }
@@ -7629,6 +7644,34 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true, messageId, conversationId, attemptId });
   });
 
+  // An integer from a worker's post, or undefined (dropped from the row).
+  function wholeNumber(value, { min = Number.MIN_SAFE_INTEGER } = {}) {
+    if (value === null || value === undefined || value === '' || typeof value === 'boolean') return undefined;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= min ? number : undefined;
+  }
+
+  // A task row's console fields as the publish route keeps them.
+  function taskOutputFields(task) {
+    const outputPath = normalizeTaskOutputPath(task?.outputPath);
+    const requestedKind = String(task?.outputKind || '').trim();
+    if (!outputPath && !requestedKind) return {};
+    const outputKind = normalizeTaskOutputKind(requestedKind, outputPath);
+    // A file kind without a readable path has nothing to show.
+    if ((outputKind === 'file' || outputKind === 'spool') && !outputPath) return { outputKind: 'none' };
+    return { ...(outputPath ? { outputPath } : {}), outputKind };
+  }
+
+  // `background_tasks` with the health readings on the live rows and the
+  // ended rows beside them, for the key the worker posts under.
+  function emitBackgroundTasks(key, tasks = backgroundTaskStore?.get?.(key) || []) {
+    io.emit('background_tasks', {
+      conversationId: key,
+      tasks: backgroundTaskStore?.withHealth ? backgroundTaskStore.withHealth(tasks, key) : tasks,
+      endedTasks: backgroundTaskStore?.ended?.(key) || [],
+    });
+  }
+
   function resolveTaskConversationId(id) {
     const key = String(id || '').trim();
     if (!key) return '';
@@ -7648,14 +7691,34 @@ export function registerMessagesRoutes(app, deps) {
     const conversationId = resolveTaskConversationId(req.body?.conversationId);
     const taskId = String(req.body?.taskId || '').trim();
     if (!conversationId || !taskId) return res.status(400).json({ error: 'Missing conversationId or taskId' });
-    const exitCode = Number(req.body?.exitCode);
+    // Only a number the worker sent: a missing or null exit code stays null
+    // (Number(null) would read as a clean exit).
+    const exitCode = wholeNumber(req.body?.exitCode);
     const settledDescription = String(req.body?.description || '').trim().slice(0, 500);
+    // The store is keyed as the worker posts. A task with a console stays
+    // viewable as an ended row; one that ended while this runtime was away
+    // becomes one when the post names its output.
+    const settledOutputPath = normalizeTaskOutputPath(req.body?.outputPath);
+    const endedRow = backgroundTaskStore?.settle?.(String(req.body?.conversationId || '').trim(), taskId, {
+      status: req.body?.status,
+      exitCode: exitCode ?? null,
+      steps: wholeNumber(req.body?.steps, { min: 0 }),
+      outputPath: settledOutputPath || undefined,
+      outputKind: settledOutputPath ? normalizeTaskOutputKind(req.body?.outputKind, settledOutputPath) : undefined,
+      description: settledDescription,
+      taskType: String(req.body?.taskType || '').trim().slice(0, 80),
+      startedAt: Number(req.body?.startedAt) || null,
+    }) || null;
+    if (endedRow) {
+      emitBackgroundTasks(String(req.body?.conversationId || '').trim());
+      pokeTaskHealth?.();
+    }
     sessionActivityTracker?.noteTaskSettled?.(conversationId, {
       taskId,
       toolUseId: sanitizeSubagentRunId(req.body?.toolUseId) || null,
       status: String(req.body?.status || '').trim().slice(0, 40) || 'completed',
       summary: String(req.body?.summary || '').trim().slice(0, 500) || null,
-      exitCode: Number.isInteger(exitCode) ? exitCode : null,
+      exitCode: exitCode ?? null,
       // What the task was, from a worker that sends it: the end of a task
       // this runtime never knew (it ended while the relay was away) is
       // still an event then.
@@ -7702,8 +7765,23 @@ export function registerMessagesRoutes(app, deps) {
         // The spawning tool_use id: the sub-agent run this task is. The panel
         // opens the run's viewer from it.
         toolUseId: sanitizeSubagentRunId(task?.toolUseId) || undefined,
+        // The console (shell and Monitor tasks): the file holding the
+        // output, how it is obtained ('none': the provider has none to give).
+        ...taskOutputFields(task),
+        // Tool calls a sub-agent made so far.
+        steps: wholeNumber(task?.steps, { min: 0 }),
+        exitCode: wholeNumber(task?.exitCode),
       }))
       .filter((task) => task.taskId);
+    // The first path a task names wins: a later post cannot point a live
+    // task's console at another file.
+    for (const task of tasks) {
+      const held = (backgroundTaskStore?.get?.(conversationId) || []).find((entry) => entry?.taskId === task.taskId);
+      if (held?.outputPath && task.outputPath !== held.outputPath) {
+        task.outputPath = held.outputPath;
+        task.outputKind = held.outputKind;
+      }
+    }
     const resync = req.body?.resync === true;
     // Posts can overtake each other on the way (an ordinary publish and the
     // answer to a resync, two publishes): a worker numbers its sets
@@ -7720,9 +7798,15 @@ export function registerMessagesRoutes(app, deps) {
       console.log(`[${typeof ts === 'function' ? ts() : new Date().toISOString()}] BG-TASKS set dropped (${setOrder.reason}) session=${conversationId.slice(0, 8)} epoch=${Number(req.body?.order?.epoch) || 0} seq=${Number(req.body?.order?.seq) || 0} tasks=${tasks.length}`);
       return res.json({ ok: true, count: tasks.length, stale: true, reason: setOrder.reason });
     }
+    // A task with a console that leaves the set ended: its file is read once
+    // more soon (its last output often lands after the poller's last look).
+    const nextIds = new Set(tasks.map((task) => task.taskId));
+    const endedWithConsole = (backgroundTaskStore?.get?.(conversationId) || [])
+      .some((task) => task?.outputPath && !nextIds.has(task.taskId));
     backgroundTaskStore?.replace?.(conversationId, tasks);
     backgroundTaskStore?.announce?.(conversationId, false);
-    io.emit('background_tasks', { conversationId, tasks });
+    if (endedWithConsole) pokeTaskHealth?.();
+    emitBackgroundTasks(conversationId, tasks);
     // The store is keyed as the worker posts (its SDK session id); the
     // tracker by the conversation.
     try {
@@ -7766,6 +7850,168 @@ export function registerMessagesRoutes(app, deps) {
     const sent = sendWorkerControl?.(sessionId, { type: 'stop_background_task', taskId });
     if (!sent) return res.status(409).json({ error: 'Session worker is not connected' });
     console.log(`[${ts()}] BG-TASK STOP ${taskId} conv=${conversationId.slice(0, 8)}`);
+    res.json({ ok: true });
+  });
+
+  // ─── Task console ──────────────────────────────────────────────────────────
+
+  // The task a conversation's console asks for: in the live or the ended set
+  // of the conversation, under its own id or its worker's session id (the
+  // key the worker posts under), as the stop route resolves it.
+  function findConversationTask(conversationId, taskId) {
+    const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+    if (!conversation) return { conversation: null, found: null, sessionId: '' };
+    const sessionId = String(conversation.sdk_session_id || conversationId);
+    const found = backgroundTaskStore?.findTask?.([conversationId, sessionId], taskId) || null;
+    return { conversation, found, sessionId };
+  }
+
+  // The providers whose workers name a shell task's output (a file, a spool
+  // or a snapshot). A task of theirs without one comes from a worker that
+  // started before the console existed.
+  const TASK_OUTPUT_PROVIDERS = new Set(['claude', 'github', 'copilot', 'grok']);
+  const SUBAGENT_OUTPUT_MESSAGE = 'Sub-agents have no shell output; open the sub-agent view.';
+
+  // Why a task has no output to show, for the console's `none` answer.
+  function noOutputMessage(conversationId, task) {
+    if (taskKindOf(task?.taskType) === 'subagent') return SUBAGENT_OUTPUT_MESSAGE;
+    let provider = '';
+    try {
+      provider = String(stmts.getRuntimeSessionByConversation?.get?.(conversationId)?.provider_type || '').trim().toLowerCase();
+    } catch {}
+    if (!provider || TASK_OUTPUT_PROVIDERS.has(provider)) {
+      return 'This session did not report an output file for this task. Sessions started before the task console need a restart to show output.';
+    }
+    return 'Output is not available for this provider.';
+  }
+
+  // A task the session's task list shows that the task store does not hold:
+  // a sub-agent (live or ended, its run is its record) or a task that ended
+  // without a console. The activity tracker knows it by its task or run id.
+  function trackedTask(conversationId, taskId) {
+    let view = null;
+    try { view = sessionActivityTracker?.describe?.(conversationId) || null; } catch {}
+    const tasks = Array.isArray(view?.tasks) ? view.tasks : [];
+    const found = tasks.find((task) => !task?.placeholder && (String(task?.id || '') === taskId || String(task?.runId || '') === taskId));
+    if (found) return found;
+    const run = stmts.getSubagentRun?.get?.(taskId) || null;
+    if (run && String(run.conversation_id || '') === conversationId) {
+      return { id: taskId, kind: 'subagent', type: run.subagent_type || null, description: run.display_name || '', status: run.status || null };
+    }
+    return null;
+  }
+
+  function taskStallMinutes() {
+    try {
+      return getTaskStallMinutes();
+    } catch {
+      return DEFAULT_TASK_STALL_MINUTES;
+    }
+  }
+
+  // GET /api/conversation/:conversationId/background-task/:taskId/output —
+  // the console's read of a shell or Monitor task's output. Without
+  // `before`: the last `lines` lines (default 2,000, at most 5,000) within
+  // 256 KB; with `before` (a startOffset of an earlier answer): the lines
+  // ending there. Everything is cleaned (controls out, colours kept,
+  // credentials scrubbed) for every reader. Another relay's agent reads it
+  // too (remote_relay read_task_output, read permission): no inbound switch,
+  // nothing it reads changes anything.
+  app.get('/api/conversation/:conversationId/background-task/:taskId/output', auth, async (req, res) => {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const taskId = String(req.params.taskId || '').trim();
+    if (!conversationId || !taskId) return res.status(400).json({ error: 'Missing conversationId or taskId' });
+    const { conversation, found, sessionId } = findConversationTask(conversationId, taskId);
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    if (!found) {
+      const tracked = trackedTask(conversationId, taskId);
+      if (!tracked) return res.status(404).json({ error: 'Task not found', code: 'task-not-found' });
+      const running = String(tracked.status || 'running') === 'running';
+      const subagent = tracked.kind !== 'shell';
+      return res.json({
+        ok: true,
+        taskId,
+        kind: 'none',
+        ended: !running,
+        status: running ? 'running' : String(tracked.status || 'unknown'),
+        exitCode: running ? null : (Number.isInteger(tracked.exitCode) ? tracked.exitCode : null),
+        health: null,
+        taskStallMinutes: taskStallMinutes(),
+        task: {
+          taskId,
+          taskType: tracked.type || (subagent ? 'local_agent' : 'local_bash'),
+          description: String(tracked.description || ''),
+          startedAt: Date.parse(tracked.startedAt) || null,
+          endedAt: Date.parse(tracked.endedAt) || null,
+          stoppable: false,
+        },
+        message: subagent ? SUBAGENT_OUTPUT_MESSAGE : noOutputMessage(conversationId, { taskType: 'local_bash' }),
+      });
+    }
+    const { task, ended, key } = found;
+    const { kind, path } = taskOutputSource(task);
+    const head = {
+      ok: true,
+      taskId,
+      kind,
+      ended,
+      status: ended ? task.status : 'running',
+      exitCode: ended ? (task.exitCode ?? null) : null,
+      health: task.health || null,
+      taskStallMinutes: taskStallMinutes(),
+      task: {
+        taskId,
+        taskType: task.taskType || null,
+        description: task.description || '',
+        startedAt: task.startedAt || null,
+        endedAt: task.endedAt || null,
+        stoppable: !ended && task.stoppable !== false,
+      },
+    };
+    if (kind === 'none') {
+      return res.json({ ...head, message: noOutputMessage(conversationId, task) });
+    }
+    if (kind === 'snapshot') {
+      // The worker answers a request with a post of the task's last 8 KiB;
+      // the console asks again every few seconds and gets the newest copy.
+      const cached = taskOutputSnapshots?.get?.([key, sessionId, conversationId], taskId) || null;
+      if (!ended) {
+        const sent = sendWorkerControl?.(sessionId, { type: 'task_output_snapshot', taskId });
+        if (!sent && !cached) return res.status(409).json({ error: 'Session worker is not connected', code: 'worker-not-connected' });
+      }
+      if (!cached) return res.json({ ...head, pending: true, text: '', lines: [], startOffset: 0, endOffset: 0, size: 0, mtime: null, hasMoreBefore: false });
+      return res.json({ ...head, ...shapeSnapshot(cached) });
+    }
+    if (!path) return res.json({ ...head, kind: 'none', message: 'Output is not available for this task.' });
+    const lines = req.query?.lines;
+    const before = req.query?.before;
+    const read = before !== undefined && before !== ''
+      ? await readBefore(path, { before, lines })
+      : await readTail(path, { lines });
+    if (!read.ok) {
+      // No file yet (a spool is named before its first byte) reads as no
+      // output yet; one the relay does not read (a symlink, a folder) is
+      // said so instead of failing.
+      const empty = { text: '', lines: [], startOffset: 0, endOffset: 0, size: 0, mtime: null, hasMoreBefore: false };
+      return res.json({ ...head, ...empty, ...(read.code === 'missing' ? {} : { unavailable: read.code }) });
+    }
+    return res.json({ ...head, ...read });
+  });
+
+  // POST /api/background-tasks/:taskId/output-snapshot — a worker's answer
+  // to `task_output_snapshot`: the task's latest output where it has no
+  // file (Claude's getTaskOutput, its last 8 KiB).
+  app.post('/api/background-tasks/:taskId/output-snapshot', auth, (req, res) => {
+    touchCli();
+    const key = String(req.body?.conversationId || '').trim();
+    const taskId = String(req.params.taskId || '').trim();
+    if (!key || !taskId) return res.status(400).json({ error: 'Missing conversationId or taskId' });
+    if (typeof req.body?.output !== 'string') return res.status(400).json({ error: 'output must be a string' });
+    taskOutputSnapshots?.set?.(key, taskId, {
+      output: req.body.output.slice(0, TASK_OUTPUT_LIMITS.chunkBytes),
+      totalBytes: req.body?.totalBytes,
+      truncated: req.body?.truncated === true,
+    });
     res.json({ ok: true });
   });
 

@@ -81,6 +81,8 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   subscription_id: text('subscription_id'),
   watcher: text('watcher'),
   from: text('from'),
+  task_id: text('task_id'),
+  lines: number('lines'),
 };
 
 export function createRemoteRelayToolDefinition({ api, getConversationId = () => '', dbg = () => {} } = {}) {

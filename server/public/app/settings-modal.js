@@ -29,6 +29,8 @@ import {
   updateTurnCeilingSetting as requestTurnCeilingSetting,
   loadBackgroundTaskTimeoutSetting,
   updateBackgroundTaskTimeoutSetting as requestBackgroundTaskTimeoutSetting,
+  loadTaskStallMinutesSetting,
+  updateTaskStallMinutesSetting as requestTaskStallMinutesSetting,
   loadSubagentRecordRetentionSetting,
   updateSubagentRecordRetentionSetting as requestSubagentRecordRetentionSetting,
   loadFeatureFlagSettings,
@@ -36,6 +38,12 @@ import {
   requestRelayRestart,
 } from './api-client.js';
 import { DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES } from './background-task-timeout-options.mjs';
+import {
+  DEFAULT_CLAUDE_BACKGROUND_COMMAND_LIMIT_MINUTES,
+  formatClaudeBackgroundCommandLimitLabel,
+} from './claude-background-command-limit-options.mjs';
+import { DEFAULT_TASK_STALL_MINUTES } from './task-console-render.mjs';
+import { setTaskStallThreshold } from './background-tasks-view.mjs';
 import { describeRelayRestartError } from './relay-restart-error.mjs';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncInstalledAppUiState, syncPwaAppNameInput } from './pwa-install.js';
@@ -51,6 +59,7 @@ import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
 import { refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
 import { refreshSharedConversationsSection } from './shared-conversations-settings.js';
 import { syncScrollOnSendToggle } from './transcript-jump-bottom.mjs';
+import { syncWindowRetentionSlider } from './conversation-window-retention.mjs';
 import {
   getPreviews,
   renderPreviewRowsInto,
@@ -199,6 +208,74 @@ export async function refreshBackgroundTaskTimeoutSetting() {
     // Leave the slider at its last known value; the setting is not critical.
   } finally {
     syncBackgroundTaskTimeoutSlider();
+  }
+}
+
+// Minutes without output after which a background task's row turns amber.
+// Starts at the relay's default; bounds come from the API response.
+let taskStallMinutes = DEFAULT_TASK_STALL_MINUTES;
+let taskStallMinutesUpdateInFlight = false;
+
+export function formatTaskStallMinutesLabel(value) {
+  const minutes = Math.max(1, Math.round(Number(value) || DEFAULT_TASK_STALL_MINUTES));
+  return `${minutes} min`;
+}
+
+function syncTaskStallMinutesSlider() {
+  const slider = document.getElementById('task-stall-minutes-slider');
+  const label = document.getElementById('task-stall-minutes-value');
+  if (slider instanceof HTMLInputElement) {
+    slider.value = String(taskStallMinutes);
+    slider.disabled = taskStallMinutesUpdateInFlight;
+  }
+  if (label) label.textContent = formatTaskStallMinutesLabel(taskStallMinutes);
+}
+
+/** Live label feedback while dragging; nothing is persisted until change fires. */
+export function previewTaskStallMinutesSetting(value) {
+  const label = document.getElementById('task-stall-minutes-value');
+  if (label) label.textContent = formatTaskStallMinutesLabel(value);
+}
+
+export async function refreshTaskStallMinutesSetting() {
+  syncTaskStallMinutesSlider();
+  try {
+    const result = await loadTaskStallMinutesSetting();
+    if (!result || !Number.isFinite(Number(result.minutes))) return;
+    taskStallMinutes = Number(result.minutes);
+    setTaskStallThreshold(taskStallMinutes);
+    const slider = document.getElementById('task-stall-minutes-slider');
+    if (slider instanceof HTMLInputElement) {
+      if (Number.isFinite(Number(result.min))) slider.min = String(result.min);
+      if (Number.isFinite(Number(result.max))) slider.max = String(result.max);
+    }
+  } catch {
+    // Keep the last known value; the setting is not critical.
+  } finally {
+    syncTaskStallMinutesSlider();
+  }
+}
+
+export async function updateTaskStallMinutesSetting(value) {
+  if (taskStallMinutesUpdateInFlight) {
+    syncTaskStallMinutesSlider();
+    return;
+  }
+  const requested = Math.max(1, Math.round(Number(value) || DEFAULT_TASK_STALL_MINUTES));
+  taskStallMinutesUpdateInFlight = true;
+  syncTaskStallMinutesSlider();
+  try {
+    const result = await requestTaskStallMinutesSetting(requested);
+    if (!result) throw new Error('Failed to update when a background task counts as quiet.');
+    taskStallMinutes = Number.isFinite(Number(result.minutes)) ? Number(result.minutes) : requested;
+    // The open conversation's rows follow at once, not on the next load.
+    setTaskStallThreshold(taskStallMinutes);
+    showTransientRelayNotice(`Background tasks are marked as quiet after ${formatTaskStallMinutesLabel(taskStallMinutes)} without output.`);
+  } catch (error) {
+    alert(error?.message || 'Failed to update when a background task counts as quiet.');
+  } finally {
+    taskStallMinutesUpdateInFlight = false;
+    syncTaskStallMinutesSlider();
   }
 }
 
@@ -479,6 +556,7 @@ let claudeSettingsState = {
   enabled: false,
   model: 'claude-sonnet-5',
   models: [],
+  backgroundCommandLimitMinutes: DEFAULT_CLAUDE_BACKGROUND_COMMAND_LIMIT_MINUTES,
 };
 let claudeSettingsInputsDirty = false;
 
@@ -492,7 +570,7 @@ function ensureClaudeSettingsInputTracking() {
 }
 
 function setClaudeSettingsControlsDisabled(disabled) {
-  for (const id of ['claude-model-input', 'claude-enabled-toggle', 'claude-attribution-select', 'claude-save-btn']) {
+  for (const id of ['claude-model-input', 'claude-enabled-toggle', 'claude-attribution-select', 'claude-background-command-limit-slider', 'claude-save-btn']) {
     const element = document.getElementById(id);
     if (element) element.disabled = disabled;
   }
@@ -507,6 +585,9 @@ export function applyClaudeSettingsState(settings = {}, { resetInputs = false } 
     models: Array.isArray(settings?.models) ? settings.models : claudeSettingsState.models,
     attributionMode: ['oar', 'vanilla', 'off'].includes(settings?.attributionMode) ? settings.attributionMode : (claudeSettingsState.attributionMode || 'oar'),
     attributionExample: String(settings?.attributionExample || claudeSettingsState.attributionExample || '').trim(),
+    backgroundCommandLimitMinutes: Number(settings?.backgroundCommandLimitMinutes) > 0
+      ? Number(settings.backgroundCommandLimitMinutes)
+      : (claudeSettingsState.backgroundCommandLimitMinutes || DEFAULT_CLAUDE_BACKGROUND_COMMAND_LIMIT_MINUTES),
   };
   const modelInput = document.getElementById('claude-model-input');
   const toggle = document.getElementById('claude-enabled-toggle');
@@ -514,6 +595,15 @@ export function applyClaudeSettingsState(settings = {}, { resetInputs = false } 
   const attributionSelect = document.getElementById('claude-attribution-select');
   if (attributionSelect && (!claudeSettingsInputsDirty || resetInputs)) attributionSelect.value = claudeSettingsState.attributionMode;
   renderClaudeAttributionExample(attributionSelect?.value || claudeSettingsState.attributionMode);
+  const limitSlider = document.getElementById('claude-background-command-limit-slider');
+  if (limitSlider instanceof HTMLInputElement) {
+    // Bounds come from the relay; the markup's are only the pre-load copy.
+    for (const [attribute, field] of [['min', 'backgroundCommandLimitMinMinutes'], ['max', 'backgroundCommandLimitMaxMinutes'], ['step', 'backgroundCommandLimitStepMinutes']]) {
+      if (Number(settings?.[field]) > 0) limitSlider[attribute] = String(settings[field]);
+    }
+    if (!claudeSettingsInputsDirty || resetInputs) limitSlider.value = String(claudeSettingsState.backgroundCommandLimitMinutes);
+  }
+  renderClaudeBackgroundCommandLimitLabel(limitSlider?.value || claudeSettingsState.backgroundCommandLimitMinutes);
   if (modelInput && (!claudeSettingsInputsDirty || resetInputs)) modelInput.value = claudeSettingsState.model;
   if (resetInputs) claudeSettingsInputsDirty = false;
   if (toggle) {
@@ -561,6 +651,19 @@ function renderClaudeAttributionExample(mode) {
   example.textContent = claudeAttributionExampleText(mode, claudeSettingsState.attributionExample);
 }
 
+function renderClaudeBackgroundCommandLimitLabel(minutes) {
+  const label = document.getElementById('claude-background-command-limit-value');
+  if (label) label.textContent = formatClaudeBackgroundCommandLimitLabel(minutes);
+}
+
+/** Live label feedback while dragging; saved with the other Claude settings. */
+export function previewClaudeBackgroundCommandLimit(value) {
+  claudeSettingsInputsDirty = true;
+  renderClaudeBackgroundCommandLimitLabel(value);
+}
+
+window.previewClaudeBackgroundCommandLimit = previewClaudeBackgroundCommandLimit;
+
 window.previewClaudeAttribution = (mode) => {
   claudeSettingsInputsDirty = true;
   renderClaudeAttributionExample(mode);
@@ -572,10 +675,12 @@ export async function saveClaudeSettings() {
   const model = String(modelInput?.value || '').trim() || 'claude-sonnet-5';
   const attributionSelect = document.getElementById('claude-attribution-select');
   const attributionMode = ['oar', 'vanilla', 'off'].includes(attributionSelect?.value) ? attributionSelect.value : undefined;
+  const limitSlider = document.getElementById('claude-background-command-limit-slider');
+  const backgroundCommandLimitMinutes = Number(limitSlider?.value) > 0 ? Number(limitSlider.value) : undefined;
   claudeSettingsUpdateInFlight = true;
   setClaudeSettingsControlsDisabled(true);
   try {
-    const result = await updateClaudeSettings({ model, attributionMode });
+    const result = await updateClaudeSettings({ model, attributionMode, backgroundCommandLimitMinutes });
     if (!result) throw new Error('Failed to save Claude settings.');
     applyClaudeSettingsState(result, { resetInputs: true });
     showTransientRelayNotice(
@@ -1757,6 +1862,7 @@ export function openSettingsModal(tab, providerTab) {
   }
   syncSuspendHostVisibility();
   syncScrollOnSendToggle();
+  syncWindowRetentionSlider();
   syncFontScaleSelect();
   syncPwaAppNameInput();
   syncDefaultSessionWorkspaceRootInput();
@@ -1789,6 +1895,8 @@ export function openSettingsModal(tab, providerTab) {
   void refreshTurnCeilingSetting();
   syncBackgroundTaskTimeoutSlider();
   void refreshBackgroundTaskTimeoutSetting();
+  syncTaskStallMinutesSlider();
+  void refreshTaskStallMinutesSetting();
   syncSubagentRecordRetentionSelect();
   void refreshSubagentRecordRetentionSetting();
   void refreshPushSettingsSection();

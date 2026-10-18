@@ -2,11 +2,24 @@
 // subagents, monitors, workflows) still running inside a conversation's
 // persistent Claude CLI process. Fed by the `background_tasks` socket event
 // (REPLACE semantics per conversation) and the conversation payload's
-// `backgroundTasks` on reload; hidden whenever the set is empty.
+// `backgroundTasks` on reload; hidden whenever the set is empty. Tasks that
+// ended within the relay's hour (`endedTasks` / `endedBackgroundTasks`) stay
+// as dimmed rows; shell and Monitor rows open their output in the task
+// console (task-console.mjs) and show the relay's health: a stall hint and a
+// test runner's pass/fail chip.
 
 import { apiFetch } from './api-client.js';
 import { formatTaskModelLabel, formatTaskTokens } from './task-row-format.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
+import {
+  endedOutcome,
+  normalizeStallThreshold,
+  runnerChip,
+  stallHint,
+  stepsLabel,
+  taskHasConsole,
+  taskOutputUnavailable,
+} from './task-console-render.mjs';
 
 // Shared with the sub-agent rows (subagent-row.mjs); re-exported for the
 // transcript's finished-workflow card and the existing importers.
@@ -18,6 +31,21 @@ import {
 } from './preview-cards.mjs';
 
 const tasksByConversation = new Map();
+// Tasks that ended within the relay's hour (`endedTasks`): dimmed rows with
+// ✓/✘ whose output still opens. A dismissed one stays hidden on this page.
+const endedByConversation = new Map();
+const dismissedEndedTasks = new Set();
+// The relay's health poller (`background_tasks_health`, and `health` on each
+// task of the payload): last output time and a test runner's counts.
+const healthByConversation = new Map();
+// Minutes of quiet after which a row's stall hint turns amber: the relay's
+// setting, as the conversation payload (`taskStallMinutes`) or Settings
+// last said. One value for the whole relay.
+let stallThresholdMinutes = normalizeStallThreshold(null);
+const changeListeners = new Set();
+// Counts a sub-agent run's activity lines when its row names no `steps`
+// (set by the page; the panel itself does not read the run store).
+let subagentStepCounter = null;
 const stopsInFlight = new Set();
 // Manual chevron choices for workflow progress trees, keyed by taskId so a
 // user's fold survives the ~2s background_tasks replace re-renders.
@@ -310,10 +338,40 @@ export function buildWorkflowRunCard(run) {
   return details;
 }
 
-export function setConversationBackgroundTasks(conversationId, tasks) {
+function normalizeTaskList(tasks) {
+  return (Array.isArray(tasks) ? tasks : []).filter((task) => task?.taskId);
+}
+
+function healthMapFor(conversationId, create = false) {
+  let map = healthByConversation.get(conversationId);
+  if (!map && create) {
+    map = new Map();
+    healthByConversation.set(conversationId, map);
+  }
+  return map || null;
+}
+
+function rememberTaskHealth(conversationId, tasks) {
+  for (const task of tasks) {
+    if (task?.health && typeof task.health === 'object') healthMapFor(conversationId, true).set(String(task.taskId), task.health);
+  }
+}
+
+function notifyChange(conversationId) {
+  for (const listener of changeListeners) {
+    try { listener(conversationId); } catch (error) { console.warn('background task listener failed', error?.message || error); }
+  }
+}
+
+/**
+ * The live set (REPLACE semantics). `endedTasks`, when the event or payload
+ * carries it, replaces the ended set too; an older relay's event without it
+ * leaves the ended rows alone.
+ */
+export function setConversationBackgroundTasks(conversationId, tasks, { endedTasks } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return;
-  const normalized = (Array.isArray(tasks) ? tasks : []).filter((task) => task?.taskId);
+  const normalized = normalizeTaskList(tasks);
   // Drop fold choices for tasks that left this conversation's set so the map
   // cannot grow across long sessions.
   const surviving = new Set(normalized.map((task) => String(task.taskId)));
@@ -322,11 +380,106 @@ export function setConversationBackgroundTasks(conversationId, tasks) {
   }
   if (normalized.length) tasksByConversation.set(id, normalized);
   else tasksByConversation.delete(id);
+  rememberTaskHealth(id, normalized);
+  if (Array.isArray(endedTasks)) storeEndedTasks(id, endedTasks);
   if (id === currentConversationId) renderBackgroundTasksPanel();
+  notifyChange(id);
+}
+
+function storeEndedTasks(id, endedTasks) {
+  const normalized = normalizeTaskList(endedTasks);
+  if (normalized.length) endedByConversation.set(id, normalized);
+  else endedByConversation.delete(id);
+  rememberTaskHealth(id, normalized);
+}
+
+/** The ended set alone (the conversation payload's `endedBackgroundTasks`). */
+export function setConversationEndedBackgroundTasks(conversationId, endedTasks) {
+  const id = String(conversationId || '').trim();
+  if (!id) return;
+  storeEndedTasks(id, endedTasks);
+  if (id === currentConversationId) renderBackgroundTasksPanel();
+  notifyChange(id);
+}
+
+/** `background_tasks_health`: merged per task, the rest stays. */
+export function setConversationTaskHealth(conversationId, health) {
+  const id = String(conversationId || '').trim();
+  if (!id || !health || typeof health !== 'object') return;
+  const map = healthMapFor(id, true);
+  for (const [taskId, entry] of Object.entries(health)) {
+    if (entry && typeof entry === 'object') map.set(String(taskId), entry);
+  }
+  if (id === currentConversationId) renderBackgroundTasksPanel();
+  notifyChange(id);
+}
+
+export function setConversationTaskStallMinutes(conversationId, minutes) {
+  setTaskStallThreshold(minutes);
+}
+
+/** The relay's stall setting changed (a payload, or Settings). */
+export function setTaskStallThreshold(minutes) {
+  if (minutes === undefined || minutes === null) return;
+  const next = normalizeStallThreshold(minutes);
+  if (next === stallThresholdMinutes) return;
+  stallThresholdMinutes = next;
+  renderBackgroundTasksPanel();
+  notifyChange(currentConversationId);
+}
+
+// The conversation is accepted for symmetry with the other getters; the
+// setting is relay-wide.
+export function getTaskStallMinutes(_conversationId) {
+  return stallThresholdMinutes;
+}
+
+export function getBackgroundTaskHealth(conversationId, taskId) {
+  const id = String(conversationId || '').trim();
+  const fromMap = healthMapFor(id)?.get(String(taskId || ''));
+  if (fromMap) return fromMap;
+  const found = findBackgroundTask(id, taskId);
+  return found?.task?.health || null;
 }
 
 export function getConversationBackgroundTasks(conversationId) {
   return tasksByConversation.get(String(conversationId || '').trim()) || [];
+}
+
+export function getConversationEndedBackgroundTasks(conversationId) {
+  return endedByConversation.get(String(conversationId || '').trim()) || [];
+}
+
+/** A task of the live or the ended set: `{ task, ended }`, or null. */
+export function findBackgroundTask(conversationId, taskId) {
+  const id = String(taskId || '');
+  if (!id) return null;
+  const live = getConversationBackgroundTasks(conversationId).find((task) => String(task.taskId) === id);
+  if (live) return { task: live, ended: false };
+  const ended = getConversationEndedBackgroundTasks(conversationId).find((task) => String(task.taskId) === id);
+  return ended ? { task: ended, ended: true } : null;
+}
+
+/** Called with the conversation id after any change of tasks or health. */
+export function subscribeBackgroundTasks(listener) {
+  changeListeners.add(listener);
+  return () => changeListeners.delete(listener);
+}
+
+export function setSubagentStepCounter(counter) {
+  subagentStepCounter = typeof counter === 'function' ? counter : null;
+}
+
+export function dismissEndedBackgroundTask(taskId) {
+  const id = String(taskId || '').trim();
+  if (!id) return;
+  dismissedEndedTasks.add(id);
+  renderBackgroundTasksPanel();
+}
+
+function visibleEndedTasks(conversationId) {
+  return getConversationEndedBackgroundTasks(conversationId)
+    .filter((task) => !dismissedEndedTasks.has(String(task.taskId)));
 }
 
 export function setBackgroundTasksConversation(conversationId) {
@@ -334,11 +487,18 @@ export function setBackgroundTasksConversation(conversationId) {
   renderBackgroundTasksPanel();
 }
 
-async function stopBackgroundTask(conversationId, taskId) {
+export function isBackgroundTaskStopping(conversationId, taskId) {
+  return stopsInFlight.has(`${conversationId}:${taskId}`);
+}
+
+// The task console's Stop goes through here too, so the row and the console
+// show the same "Stopping…" state.
+export async function stopBackgroundTask(conversationId, taskId) {
   const key = `${conversationId}:${taskId}`;
   if (stopsInFlight.has(key)) return;
   stopsInFlight.add(key);
   renderBackgroundTasksPanel();
+  notifyChange(conversationId);
   try {
     await apiFetch(`/api/conversation/${encodeURIComponent(conversationId)}/background-task/${encodeURIComponent(taskId)}/stop`, {
       method: 'POST',
@@ -349,10 +509,12 @@ async function stopBackgroundTask(conversationId, taskId) {
     setTimeout(() => {
       stopsInFlight.delete(key);
       renderBackgroundTasksPanel();
+      notifyChange(conversationId);
     }, 15_000);
   } catch (error) {
     stopsInFlight.delete(key);
     renderBackgroundTasksPanel();
+    notifyChange(conversationId);
     console.warn('background task stop failed', error?.message || error);
   }
 }
@@ -367,7 +529,48 @@ export function subagentRunIdForTask(task) {
   return type === 'local_agent' || type === 'agent' || type === 'subagent' ? runId : '';
 }
 
-function renderTaskRow(conversationId, task) {
+// The row's title: a sub-agent opens its record, a shell or Monitor task its
+// console; a task whose provider publishes no output says so on hover.
+function taskTitleHtml(task) {
+  const text = escHtml(task.description || task.taskId);
+  const runId = subagentRunIdForTask(task);
+  if (runId) {
+    return `<button type="button" class="subagent-open bg-task-desc" data-subagent-open="${escHtml(runId)}" title="Open this sub-agent's thoughts, tool calls and reply">${text}</button>`;
+  }
+  if (taskOutputUnavailable(task)) {
+    return `<span class="bg-task-desc bg-task-desc-no-output" title="output not available for this provider">${text}</span>`;
+  }
+  if (taskHasConsole(task)) {
+    return `<button type="button" class="task-console-open bg-task-desc" data-task-console="${escHtml(task.taskId)}" title="Open this task's output">${text}</button>`;
+  }
+  return `<span class="bg-task-desc">${text}</span>`;
+}
+
+function chipHtml(health) {
+  const chip = runnerChip(health);
+  if (!chip) return '';
+  return `<span class="bg-task-chip${chip.failed ? ' bg-task-chip-fail' : ''}" title="${escHtml(chip.title)}">${escHtml(chip.text)}</span>`;
+}
+
+// Always present on a live row (hidden while output is fresh) so the 1 s
+// timer can update it in place.
+function stallHtml(hint) {
+  const classes = `bg-task-stall${hint?.warn ? ' bg-task-stall-warn' : ''}`;
+  return `<span class="${classes}"${hint ? '' : ' hidden'}>${hint ? escHtml(hint.text) : ''}</span>`;
+}
+
+function taskSteps(task) {
+  const label = stepsLabel(task?.steps);
+  if (label || !subagentRunIdForTask(task) || !subagentStepCounter) return label;
+  try {
+    const counted = subagentStepCounter(String(task.toolUseId));
+    return Number.isFinite(Number(counted)) && Number(counted) > 0 ? stepsLabel(counted) : '';
+  } catch {
+    return '';
+  }
+}
+
+export function renderTaskRow(conversationId, task) {
   const key = `${conversationId}:${task.taskId}`;
   const stopping = stopsInFlight.has(key);
   const elapsed = formatElapsed(task.startedAt);
@@ -377,6 +580,11 @@ function renderTaskRow(conversationId, task) {
   const modelLabel = formatTaskModelLabel(task.model);
   const modelTitle = task.modelInherited === true ? `${task.model} (inherited from the session)` : task.model;
   const tokens = formatTaskTokens(task.totalTokens);
+  const steps = taskSteps(task);
+  const health = getBackgroundTaskHealth(conversationId, task.taskId);
+  const stall = taskHasConsole(task)
+    ? stallHint(health?.lastOutputAt, getTaskStallMinutes(conversationId))
+    : null;
   // Workflow rows with a digest get a fold chevron plus an (initially empty)
   // tree container right below the row; renderBackgroundTasksPanel fills the
   // container with DOM nodes after this markup lands, so digest text never
@@ -393,9 +601,7 @@ function renderTaskRow(conversationId, task) {
     <div class="bg-task-row" data-task-id="${escHtml(task.taskId)}">
       ${foldButton}<span class="bg-task-icon" title="${escHtml(task.taskType || 'task')}">${taskIcon(task.taskType)}</span>
       <span class="bg-task-main">
-        ${subagentRunIdForTask(task)
-          ? `<button type="button" class="subagent-open bg-task-desc" data-subagent-open="${escHtml(subagentRunIdForTask(task))}" title="Open this sub-agent's thoughts, tool calls and reply">${escHtml(task.description || task.taskId)}</button>`
-          : `<span class="bg-task-desc">${escHtml(task.description || task.taskId)}</span>`}
+        ${taskTitleHtml(task)}
         ${activity.text ? `<span class="bg-task-detail${activity.toolCall ? ' bg-task-toolcall' : ''}" title="${escHtml(activity.text)}">${escHtml(activity.text)}</span>` : ''}
       </span>
       <span class="bg-task-side">
@@ -405,6 +611,9 @@ function renderTaskRow(conversationId, task) {
         </span>
         <span class="bg-task-side-status">
           ${tokens ? `<span class="bg-task-tokens">${escHtml(tokens)}</span>` : ''}
+          ${steps ? `<span class="bg-task-steps">${escHtml(steps)}</span>` : ''}
+          ${chipHtml(health)}
+          ${taskHasConsole(task) ? stallHtml(stall) : ''}
           <span class="bg-task-elapsed">${escHtml(elapsed)}</span>
           ${task.stoppable === false ? '' : `<button type="button" class="bg-task-stop" data-task-id="${escHtml(task.taskId)}" ${stopping ? 'disabled' : ''}>${stopping ? 'Stopping…' : 'Stop'}</button>`}
         </span>
@@ -412,11 +621,49 @@ function renderTaskRow(conversationId, task) {
     </div>${treeHolder}`;
 }
 
-// "2 background tasks running", "1 preview", or both — the panel is shared, so
-// the summary has to name whatever is actually in it.
-function panelSummaryText(taskCount, previewCount) {
+function endedDuration(task) {
+  const started = Number(task.startedAt);
+  const endedAt = Number.isFinite(Number(task.endedAt)) ? Number(task.endedAt) : Date.parse(String(task.endedAt || ''));
+  if (!Number.isFinite(started) || started <= 0 || !Number.isFinite(endedAt) || endedAt < started) return '';
+  const seconds = Math.floor((endedAt - started) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** A task that ended within the hour: dimmed, ✓/✘, no Stop, a dismiss ×. */
+export function renderEndedTaskRow(conversationId, task) {
+  const outcome = endedOutcome(task);
+  const health = getBackgroundTaskHealth(conversationId, task.taskId);
+  const duration = endedDuration(task);
+  return `
+    <div class="bg-task-row bg-task-row-ended" data-task-id="${escHtml(task.taskId)}">
+      <span class="bg-task-icon" title="${escHtml(task.taskType || 'task')}">${taskIcon(task.taskType)}</span>
+      <span class="bg-task-main">
+        ${taskTitleHtml(task)}
+      </span>
+      <span class="bg-task-side">
+        <span class="bg-task-side-head">
+          <span class="bg-task-badge">${escHtml(taskKindLabel(task))}</span>
+        </span>
+        <span class="bg-task-side-status">
+          ${chipHtml(health)}
+          <span class="bg-task-outcome${outcome.failed ? ' bg-task-outcome-fail' : outcome.ok ? ' bg-task-outcome-ok' : ''}" title="${escHtml(outcome.label)}">${outcome.icon}</span>
+          ${duration ? `<span class="bg-task-elapsed">${escHtml(duration)}</span>` : ''}
+          <button type="button" class="bg-task-dismiss" data-task-id="${escHtml(task.taskId)}" aria-label="Dismiss" title="Hide this finished task">×</button>
+        </span>
+      </span>
+    </div>`;
+}
+
+// "2 background tasks running · 1 finished", "1 preview", or a mix — the
+// panel is shared, so the summary has to name whatever is actually in it.
+// Only live tasks count as running.
+export function panelSummaryText(taskCount, previewCount, endedCount = 0) {
   const parts = [];
   if (taskCount) parts.push(`${taskCount} background task${taskCount === 1 ? '' : 's'} running`);
+  if (endedCount) parts.push(`${endedCount} finished`);
   if (previewCount) parts.push(`${previewCount} preview${previewCount === 1 ? '' : 's'}`);
   return parts.join(' · ');
 }
@@ -426,12 +673,16 @@ export function renderBackgroundTasksPanel() {
   if (!panel) return;
   const conversationId = currentConversationId;
   const tasks = conversationId ? (tasksByConversation.get(conversationId) || []) : [];
+  const ended = conversationId ? visibleEndedTasks(conversationId) : [];
   const previews = conversationId ? getPreviewsForConversation(conversationId) : [];
   // Previews outlive the task that started the dev server, so the panel stays
   // up for them even once every background task has finished.
-  if (!tasks.length && !previews.length) {
+  if (!tasks.length && !ended.length && !previews.length) {
     panel.hidden = true;
     panel.removeAttribute('open');
+    // No stale rows behind the hidden panel (a dismissed last row is gone).
+    const staleList = panel.querySelector('#background-tasks-list');
+    if (staleList) staleList.innerHTML = '';
     stopElapsedTimer();
     return;
   }
@@ -440,7 +691,7 @@ export function renderBackgroundTasksPanel() {
   const summary = panel.querySelector('#background-tasks-summary');
   if (summary) {
     const spinner = tasks.length ? '<span class="bg-task-spinner"></span> ' : '';
-    summary.innerHTML = `${spinner}${escHtml(panelSummaryText(tasks.length, previews.length))}`;
+    summary.innerHTML = `${spinner}${escHtml(panelSummaryText(tasks.length, previews.length, ended.length))}`;
   }
   const previewList = panel.querySelector('#background-previews-list');
   if (previewList) {
@@ -450,11 +701,18 @@ export function renderBackgroundTasksPanel() {
   }
   const list = panel.querySelector('#background-tasks-list');
   if (list) {
-    list.innerHTML = tasks.map((task) => renderTaskRow(conversationId, task)).join('');
+    list.innerHTML = tasks.map((task) => renderTaskRow(conversationId, task)).join('')
+      + ended.map((task) => renderEndedTaskRow(conversationId, task)).join('');
     for (const button of list.querySelectorAll('.bg-task-stop')) {
       button.addEventListener('click', (event) => {
         event.preventDefault();
         void stopBackgroundTask(conversationId, button.dataset.taskId);
+      });
+    }
+    for (const button of list.querySelectorAll('.bg-task-dismiss')) {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        dismissEndedBackgroundTask(button.dataset.taskId);
       });
     }
     // Fill expanded workflow trees (collapsed holders stay empty — the toggle
@@ -486,12 +744,23 @@ function startElapsedTimer() {
   elapsedTimer = setInterval(() => {
     const panel = document.getElementById('background-tasks-panel');
     if (!panel || panel.hidden || !panel.hasAttribute('open')) return;
-    const tasks = currentConversationId ? (tasksByConversation.get(currentConversationId) || []) : [];
+    const conversationId = currentConversationId;
+    const tasks = conversationId ? (tasksByConversation.get(conversationId) || []) : [];
+    const threshold = getTaskStallMinutes(conversationId);
     for (const task of tasks) {
-      const row = panel.querySelector(`.bg-task-row[data-task-id="${CSS.escape(task.taskId)}"] .bg-task-elapsed`);
+      const rowSelector = `.bg-task-row:not(.bg-task-row-ended)[data-task-id="${CSS.escape(task.taskId)}"]`;
+      const row = panel.querySelector(`${rowSelector} .bg-task-elapsed`);
       if (row) row.textContent = formatElapsed(task.startedAt);
+      const stallEl = panel.querySelector(`${rowSelector} .bg-task-stall`);
+      if (stallEl) applyStallHint(stallEl, stallHint(getBackgroundTaskHealth(conversationId, task.taskId)?.lastOutputAt, threshold));
     }
   }, 1000);
+}
+
+function applyStallHint(element, hint) {
+  element.hidden = !hint;
+  element.textContent = hint ? hint.text : '';
+  element.className = `bg-task-stall${hint?.warn ? ' bg-task-stall-warn' : ''}`;
 }
 
 function stopElapsedTimer() {

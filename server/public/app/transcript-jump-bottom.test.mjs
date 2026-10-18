@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  HELD_BACK_ROWS_BADGE,
   JUMP_BUTTON_SHOW_SCREENS,
   JUMP_SMOOTH_MAX_SCREENS,
   countNewRows,
+  followsEndThroughResize,
   isNearBottom,
   jumpBadgeText,
   jumpButtonPresentation,
@@ -43,7 +45,7 @@ test('once shown it stays on the way back down and fades out only at the bottom'
   state = nextJumpButtonState(state, at(NEAR + 1));
   assert.equal(state.visible, true);
   state = nextJumpButtonState(state, at(NEAR));
-  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false });
+  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false, waiting: 0 });
 });
 
 test('a transcript with no height never shows the button', () => {
@@ -131,6 +133,24 @@ test('a resize re-pins a reader who was following while scrollTop has not moved 
   assert.equal(shouldRepinOnResize({ pinned: false, pinnedScrollTop: 1200, scrollTop: 1200, nearBottomNow: true }), false);
 });
 
+test('a live update that lands before the re-pin still follows the end', () => {
+  const grown = { clientHeight: 351, observedClientHeight: 543, nearBottomPxAtObservedHeight: 43 };
+  // At the end now: followed.
+  assert.equal(followsEndThroughResize({ nearBottomNow: true, clientHeight: 500, observedClientHeight: 500, distanceAtObservedHeight: 0, nearBottomPxAtObservedHeight: 40 }), true);
+  // The panel grew (543 to 351) and the observer has not had its round: at
+  // the height it saw, the reader is at the end, so a reply streaming in now
+  // follows too, whether or not the scroll that took them there was noted.
+  assert.equal(followsEndThroughResize({ ...grown, nearBottomNow: false, distanceAtObservedHeight: 0 }), true);
+  assert.equal(followsEndThroughResize({ ...grown, nearBottomNow: false, distanceAtObservedHeight: 43 }), true);
+  // A reader who was above the end before the shrink is not taken along.
+  assert.equal(followsEndThroughResize({ ...grown, nearBottomNow: false, distanceAtObservedHeight: 44 }), false);
+  assert.equal(followsEndThroughResize({ ...grown, nearBottomNow: false, distanceAtObservedHeight: 900 }), false);
+  // No shrink pending: a reader away from the end is away from it.
+  assert.equal(followsEndThroughResize({ ...grown, clientHeight: 543, nearBottomNow: false, distanceAtObservedHeight: 0 }), false);
+  assert.equal(followsEndThroughResize({ ...grown, clientHeight: 700, nearBottomNow: false, distanceAtObservedHeight: 0 }), false);
+  assert.equal(followsEndThroughResize({ ...grown, observedClientHeight: null, nearBottomNow: false, distanceAtObservedHeight: null }), false);
+});
+
 test('a new row shows the button at any distance from the end', () => {
   // Half a screen up: the plain button would not show yet.
   let state = nextJumpButtonState(null, at(SCREEN / 2, ['msg:a']));
@@ -159,7 +179,7 @@ test('an update that was not followed marks the button until the bottom, without
     announcement: 'New messages below.',
   });
   state = nextJumpButtonState(state, at(0, ['msg:a', 'live:a']));
-  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false });
+  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false, waiting: 0 });
 });
 
 test('a waiting question shows the button and clears with the question, not with the distance', () => {
@@ -174,7 +194,7 @@ test('a waiting question shows the button and clears with the question, not with
   assert.equal(jumpButtonPresentation(state).state, 'plain');
   // At the bottom a question is on screen: nothing to mark.
   state = nextJumpButtonState(state, { ...at(NEAR, ['msg:a']), question: true });
-  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false });
+  assert.deepEqual(state, { visible: false, baseline: null, count: 0, unseen: false, question: false, waiting: 0 });
 });
 
 test('how each state looks and reads', () => {
@@ -199,4 +219,48 @@ test('how each state looks and reads', () => {
     dot: false,
     announcement: 'A question is waiting for your answer below.',
   });
+});
+
+test('rows held back below a window above the end keep the button, counted, at the bottom of the page too', () => {
+  // The reader is at the bottom of the window: not at the end.
+  let state = nextJumpButtonState(null, { ...at(0, ['msg:a']), windowAtTail: false, waiting: 3 });
+  assert.equal(state.visible, true);
+  assert.equal(state.waiting, 3);
+  assert.equal(state.count, 0);
+  assert.deepEqual(jumpButtonPresentation(state), {
+    state: 'new',
+    label: 'Jump to the latest message (3 new)',
+    badge: '3',
+    dot: false,
+    announcement: 'New messages below.',
+  });
+  // The newer pages put on the page are history: not counted, and no
+  // baseline is taken from them.
+  state = nextJumpButtonState(state, { ...at(SCREEN * 2, ['msg:a', 'msg:b', 'msg:c']), windowAtTail: false, waiting: 3 });
+  assert.equal(state.count, 0);
+  assert.equal(state.baseline, null);
+  assert.equal(jumpButtonPresentation(state).badge, '3');
+  // The window meets the end: what waited is on the page, the baseline is
+  // the page as it is, and a row after it counts as before.
+  state = nextJumpButtonState(state, { ...at(SCREEN * 2, ['msg:a', 'msg:b', 'msg:c', 'msg:d']), windowAtTail: true, waiting: 3 });
+  assert.equal(state.waiting, 0);
+  assert.deepEqual(state.baseline, ['msg:a', 'msg:b', 'msg:c', 'msg:d']);
+  assert.equal(jumpButtonPresentation(state).badge, '');
+  state = nextJumpButtonState(state, at(SCREEN * 2, ['msg:a', 'msg:b', 'msg:c', 'msg:d', 'msg:e']));
+  assert.equal(jumpButtonPresentation(state).badge, '1');
+  // Without anything waiting, the bottom of a window above the end hides the
+  // button as before.
+  assert.equal(nextJumpButtonState(null, { ...at(0, ['msg:a']), windowAtTail: false, waiting: 0 }).visible, false);
+});
+
+test('held-back rows are a count by default; the dot is one switch away', () => {
+  assert.equal(HELD_BACK_ROWS_BADGE, 'count');
+  const state = { visible: true, count: 1, waiting: 2 };
+  assert.equal(jumpButtonPresentation(state).badge, '3');
+  const dot = jumpButtonPresentation({ visible: true, waiting: 2 }, { heldBackRowsBadge: 'dot' });
+  assert.equal(dot.badge, '');
+  assert.equal(dot.dot, true);
+  assert.equal(dot.state, 'new');
+  // A question still wins.
+  assert.equal(jumpButtonPresentation({ visible: true, waiting: 2, question: true }).badge, '?');
 });

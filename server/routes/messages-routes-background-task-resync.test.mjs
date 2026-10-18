@@ -129,7 +129,7 @@ test('a heartbeat digest that differs from the held set asks for the set again; 
   assert.equal(view.state, 'background_only');
   assert.equal(view.tasks[0].startedAt, new Date(BOOT - 60_000).toISOString());
   assert.deepEqual(fx.edges, [], 'no second task_started');
-  assert.deepEqual(fx.taskEvents().at(-1), { conversationId: SESSION, tasks: fx.store.get(SESSION) }, 'the pages get the set again');
+  assert.deepEqual(fx.taskEvents().at(-1), { conversationId: SESSION, tasks: fx.store.get(SESSION), endedTasks: [] }, 'the pages get the set again');
   assert.equal(fx.store.get(SESSION)[0].taskId, 'task_fixture_shell');
 
   // The relay holds a set, the worker reports none: asked, and the empty answer clears it.
@@ -168,7 +168,7 @@ test('no digest and backgroundWork on the heartbeat gives the placeholder, until
   // The flag goes false with no set ever sent: the pages are told it is gone.
   await fx.beat({ steering: steering(false) });
   assert.equal(fx.tracker.describe(SESSION).state, 'idle');
-  assert.deepEqual(fx.taskEvents().at(-1), { conversationId: SESSION, tasks: [] });
+  assert.deepEqual(fx.taskEvents().at(-1), { conversationId: SESSION, tasks: [], endedTasks: [] });
 
   // Back, then replaced by the worker's own set (a progress update).
   await fx.beat({ steering: steering(true) });

@@ -129,6 +129,28 @@ test('the settled notice gives the end its status and exit code, once', () => {
   assert.equal(view.tasks[0].exitCode, 1);
 });
 
+test('the settled notice replaces the live progress line: its summary, or none', () => {
+  const { tracker } = setup();
+  tracker.noteTaskSet(CONV, [agentTask({ summary: '⟳ Thinking…' }), shellTask({ summary: 'running suite 3' })]);
+  tracker.noteTaskSettled(CONV, { taskId: 'task-agent-1', status: 'completed', summary: null });
+  tracker.noteTaskSettled(CONV, { taskId: 'task-shell-1', status: 'completed', summary: 'Exit code 0' });
+  tracker.noteTaskSet(CONV, []);
+  const byId = Object.fromEntries(tracker.describe(CONV).tasks.map((task) => [task.id, task]));
+  assert.equal(byId['task-agent-1'].summary ?? null, null);
+  assert.equal(byId['task-shell-1'].summary, 'Exit code 0');
+});
+
+test('a settle without a summary after an end by absence clears the progress line too', () => {
+  const t = setup();
+  t.tracker.noteTaskSet(CONV, [agentTask({ summary: '⟳ Thinking…' })]);
+  t.tracker.noteTaskSet(CONV, []);
+  t.advance(TASK_END_GRACE_MS + 1);
+  t.tracker.noteTaskSettled(CONV, { taskId: 'task-agent-1', status: 'completed' });
+  const [ended] = t.tracker.describe(CONV).tasks;
+  assert.equal(ended.status, 'completed');
+  assert.equal(ended.summary ?? null, null);
+});
+
 test('a task that leaves without word ends after the grace, outcome not reported', () => {
   const { tracker, edges, advance } = setup();
   tracker.noteTaskSet(CONV, [shellTask()]);

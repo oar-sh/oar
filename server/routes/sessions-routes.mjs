@@ -9,10 +9,19 @@ import { randomUUID } from 'crypto';
 import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { serveFileWithRangeSupport } from '../services/file-serving.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
+import {
+  buildConversationHistoryPageInfo,
+  normalizeConversationHistoryLimit,
+  normalizeConversationTimestampMs,
+} from '../services/conversation-history-page.mjs';
 import { MESSAGE_PIN_LIMIT, buildPinList } from '../services/message-pin-list.mjs';
 import { buildHiddenMessageList } from '../services/hidden-message-list.mjs';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
 import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
+import {
+  claudeBackgroundCommandLimitSettingsFields,
+  parseClaudeBackgroundCommandLimitUpdate,
+} from '../../shared/claude-background-command-limit.mjs';
 import { CLAUDE_ATTRIBUTION_MODES, DEFAULT_CLAUDE_ATTRIBUTION_MODE, claudeAttributionModelLabel, claudeAttributionTrailer, normalizeClaudeAttributionMode, resolveClaudeAttributionMode } from '../../shared/claude-attribution.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
 import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
@@ -97,6 +106,12 @@ import {
   BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
   parseBackgroundTaskTimeoutUpdate,
 } from '../../shared/background-task-timeout.mjs';
+import {
+  DEFAULT_TASK_STALL_MINUTES,
+  TASK_STALL_MINUTES_MAX,
+  TASK_STALL_MINUTES_MIN,
+  parseTaskStallMinutesUpdate,
+} from '../../shared/task-output-text.mjs';
 import {
   PWA_APP_NAME_DEFAULT,
   PWA_APP_NAME_MAX_LENGTH,
@@ -286,8 +301,15 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
   const hasEnabledModels = Array.isArray(payload.enabledModels);
   const hasAttributionMode = Object.prototype.hasOwnProperty.call(payload, 'attributionMode');
   const attributionMode = hasAttributionMode ? normalizeClaudeAttributionMode(payload.attributionMode) : undefined;
-  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels && !hasAttributionMode) {
+  const hasBackgroundCommandLimit = Object.prototype.hasOwnProperty.call(payload, 'backgroundCommandLimitMinutes');
+  const backgroundCommandLimit = hasBackgroundCommandLimit
+    ? parseClaudeBackgroundCommandLimitUpdate(payload.backgroundCommandLimitMinutes)
+    : null;
+  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels && !hasAttributionMode && !hasBackgroundCommandLimit) {
     return { ok: false, error: 'No Claude settings update provided' };
+  }
+  if (backgroundCommandLimit && !backgroundCommandLimit.ok) {
+    return { ok: false, error: backgroundCommandLimit.error };
   }
   if (hasModel && !isSafeClaudeModelId(model)) {
     return { ok: false, error: 'Invalid Claude model ID' };
@@ -302,6 +324,8 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
     ...(hasModels ? { models: payload.models } : {}),
     ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
     ...(hasAttributionMode ? { attributionMode } : {}),
+    // Clamped to 30 min … 8 h and snapped to 30-minute steps.
+    ...(backgroundCommandLimit ? { backgroundCommandLimitMinutes: backgroundCommandLimit.minutes } : {}),
   };
 }
 
@@ -1504,19 +1528,6 @@ function isLikelyCanonicalDuplicateMessage(a, b, timestampWindowMs = 30_000) {
   return Math.abs(aTs - bTs) <= Math.max(1_000, Number(timestampWindowMs) || 30_000);
 }
 
-function normalizeConversationTimestampMs(value) {
-  const text = String(value || '').trim();
-  if (!text) return 0;
-  const sqliteUtcLike = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)$/;
-  const hasExplicitTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
-  let normalized = text;
-  if (!hasExplicitTimezone && sqliteUtcLike.test(text)) {
-    const [, day, time] = text.match(sqliteUtcLike) || [];
-    normalized = `${day}T${time}Z`;
-  }
-  const parsed = Date.parse(normalized);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
 
 function normalizeConversationTimestampIso(value, fallback = null) {
   const ms = normalizeConversationTimestampMs(value);
@@ -1563,11 +1574,7 @@ function compareConversationMessageOrder(a, b) {
   return aId.localeCompare(bId);
 }
 
-export function normalizeConversationHistoryLimit(value, fallback = 20) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return fallback;
-  return Math.min(100, Math.max(1, Math.trunc(numeric)));
-}
+export { normalizeConversationHistoryLimit };
 
 function resolveConversationHistoryCursor(messages = [], {
   messageId = '',
@@ -1672,26 +1679,9 @@ export function selectConversationHistoryPage(messages = [], {
   }
   const hasMoreOlder = firstIdx > 0;
   const hasMoreNewer = lastIdx >= 0 && lastIdx < (ordered.length - 1);
-  const oldestMessage = pageMessages[0] || null;
   return {
     messages: pageMessages,
-    pageInfo: {
-      hasMore: hasMoreOlder,
-      hasMoreOlder,
-      hasMoreNewer,
-      nextCursor: oldestMessage ? {
-        beforeMessageId: String(oldestMessage.id || '').trim(),
-        beforeTimestamp: String(oldestMessage.timestamp || '').trim() || null,
-      } : null,
-      olderCursor: oldestMessage ? {
-        beforeMessageId: String(oldestMessage.id || '').trim(),
-        beforeTimestamp: String(oldestMessage.timestamp || '').trim() || null,
-      } : null,
-      newerCursor: lastMessage ? {
-        afterMessageId: String(lastMessage.id || '').trim(),
-        afterTimestamp: String(lastMessage.timestamp || '').trim() || null,
-      } : null,
-    },
+    pageInfo: buildConversationHistoryPageInfo(pageMessages, { hasMoreOlder, hasMoreNewer }),
   };
 }
 
@@ -1762,6 +1752,10 @@ export function buildConversationMessages({
   responseMessageToSourceId = new Map(),
   queueRows = [],
   usageByResponseMessageId = new Map(),
+  // When dbMessages is one page: the conversation's rows liveResendsByOriginal
+  // reads (id, role, source_message_id, resend_of_message_id), since a stopped
+  // marker on the page may have its Resend outside it.
+  resendIndexMessages = null,
 } = {}) {
   const queueRowsById = new Map(
     (Array.isArray(queueRows) ? queueRows : [])
@@ -1770,7 +1764,7 @@ export function buildConversationMessages({
   );
   // A stopped steer's marker says "Resent" from the data, so it holds across
   // reloads and devices (the relay refuses a second Resend on the same basis).
-  const liveResends = liveResendsByOriginal(dbMessages, queueRows);
+  const liveResends = liveResendsByOriginal(Array.isArray(resendIndexMessages) ? resendIndexMessages : dbMessages, queueRows);
   const normalizedDbMessages = Array.isArray(dbMessages)
     ? dbMessages.map((message) => {
         const id = String(message?.id || '').trim();
@@ -2143,6 +2137,8 @@ export function registerSessionsRoutes(app, deps) {
     setPwaAppName = () => ({ ok: false, status: 500, error: 'App name settings are unavailable' }),
     getBackgroundTaskTimeoutMinutes = () => DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     setBackgroundTaskTimeoutMinutes = () => ({ ok: false, error: 'Background task timeout settings are unavailable' }),
+    getTaskStallMinutes = () => DEFAULT_TASK_STALL_MINUTES,
+    setTaskStallMinutes = () => ({ ok: false, error: 'Task stall settings are unavailable' }),
     markSharedViewerPresence,
     getSharedWatcherCount,
     statusEventService,
@@ -2790,6 +2786,36 @@ export function registerSessionsRoutes(app, deps) {
     };
   }
 
+  // One history page selected in SQL (conversation-history-page.mjs), so
+  // only the page is hydrated; null when the statements are absent or the
+  // conversation cannot be paged in SQL, and the caller loads every row.
+  function selectConversationHistoryPageRows(conversationId, cursor = {}, { sharedOnly = false } = {}) {
+    const pager = stmts.conversationHistoryPage;
+    if (!pager || typeof pager.selectConversationHistoryPage !== 'function') return null;
+    return pager.selectConversationHistoryPage(conversationId, { ...cursor, sharedOnly }) || null;
+  }
+
+  // The usage snapshots of a page's replies, keyed by reply id.
+  function usageSnapshotsForPage(conversationId, pageRows = []) {
+    const usage = new Map();
+    if (!stmts.getMessageUsageSnapshotByResponse) return usage;
+    for (const row of pageRows) {
+      if (row?.role !== 'assistant') continue;
+      const id = String(row?.id || '').trim();
+      const snapshot = id ? mapUsageSnapshotRow(stmts.getMessageUsageSnapshotByResponse.get(id, conversationId)) : null;
+      if (snapshot) usage.set(id, snapshot);
+    }
+    return usage;
+  }
+
+  // What liveResendsByOriginal needs beyond a page: only read when the page
+  // holds a stopped marker, the one place its result is shown.
+  function resendIndexForPage(conversationId, pageRows = [], { sharedOnly = false } = {}) {
+    const hasStoppedMarker = pageRows.some((row) => row?.role === 'assistant' && row?.kind === 'stopped');
+    if (!hasStoppedMarker) return [];
+    return stmts.conversationHistoryPage?.listConversationResendIndex?.(conversationId, { sharedOnly }) || [];
+  }
+
   // A shared attachment is served by its share URL: the host path it is
   // stored at (and the `@path` reference built from it) stays on the relay.
   function shareSafeAttachment(attachment, shareToken) {
@@ -2820,9 +2846,11 @@ export function registerSessionsRoutes(app, deps) {
     });
     const inFlight = inFlightStateForConversation(resolvedConversationId);
     const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
-    const dbMessages = filterMessagesVisibleToSharedView(
-      (stmts.getSharedMessages || stmts.getMessages).all(resolvedConversationId),
-    );
+    const historyCursor = { limit, beforeMessageId, beforeTimestamp, afterMessageId, afterTimestamp, aroundMessageId };
+    const sqlPage = selectConversationHistoryPageRows(resolvedConversationId, historyCursor, { sharedOnly: true });
+    const dbMessages = filterMessagesVisibleToSharedView(sqlPage
+      ? sqlPage.rows
+      : (stmts.getSharedMessages || stmts.getMessages).all(resolvedConversationId));
     const queueRows = db.prepare(`
       SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model, status
       FROM queue
@@ -2853,6 +2881,20 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, workflowRunsForResponse ? workflowRunsForResponse(m.id) : []]),
     );
+    // The page hydrates only its own cards, but the tokens to redact are the
+    // whole conversation's: a reply on this page can quote a card's link from
+    // outside it. The page's cards below add theirs too (a relay without the
+    // statement still redacts what it shows).
+    if (previewTokens) {
+      for (const row of stmts.listPreviewCardJsonByConversation?.all(resolvedConversationId) || []) {
+        try {
+          const token = JSON.parse(String(row?.preview_json || ''))?.token;
+          if (token) previewTokens.add?.(String(token));
+        } catch {
+          // An unreadable snapshot renders no card, so it has no link to quote.
+        }
+      }
+    }
     // A preview link is a capability that now outlives the turn and the
     // restart: a public transcript keeps only the label, never token or link.
     const previewCardsByMessageId = new Map(
@@ -2870,7 +2912,7 @@ export function registerSessionsRoutes(app, deps) {
             redacted: true,
           }))]),
     );
-    const usageByResponseMessageId = new Map(
+    const usageByResponseMessageId = sqlPage ? usageSnapshotsForPage(conv.id, dbMessages) : new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
         .filter(([messageId, usage]) => !!messageId && !!usage),
@@ -2892,6 +2934,7 @@ export function registerSessionsRoutes(app, deps) {
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
+      resendIndexMessages: sqlPage ? resendIndexForPage(resolvedConversationId, dbMessages, { sharedOnly: true }) : null,
     });
     messages = messages.map((message) => {
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
@@ -2909,14 +2952,9 @@ export function registerSessionsRoutes(app, deps) {
         ? nextMessage
         : { ...nextMessage, attachments };
     });
-    const history = selectConversationHistoryPage(messages, {
-      limit,
-      beforeMessageId,
-      beforeTimestamp,
-      afterMessageId,
-      afterTimestamp,
-      aroundMessageId,
-    });
+    const history = sqlPage
+      ? { messages, pageInfo: sqlPage.pageInfo }
+      : selectConversationHistoryPage(messages, historyCursor);
     return {
       id: resolvedConversationId,
       sdkSessionId: conv.sdk_session_id || null,
@@ -4377,7 +4415,10 @@ export function registerSessionsRoutes(app, deps) {
       resolveClaudeSessionRoot,
       resolveCursorSessionRoot,
     });
-    const dbMessages = stmts.getMessages.all(resolvedConversationId);
+    const historyCursor = { limit, beforeMessageId, beforeTimestamp, afterMessageId, afterTimestamp, aroundMessageId };
+    // The page's rows only: every later lookup is per page, not per conversation.
+    const sqlPage = selectConversationHistoryPageRows(resolvedConversationId, historyCursor);
+    const dbMessages = sqlPage ? sqlPage.rows : stmts.getMessages.all(resolvedConversationId);
     const queueRows = db.prepare(`
       SELECT id, response_message_id, text, timestamp, retry_count, reasoning_effort, model, status
       FROM queue
@@ -4413,7 +4454,7 @@ export function registerSessionsRoutes(app, deps) {
         .filter((m) => m.role === 'assistant')
         .map((m) => [m.id, previewCardsForResponse ? previewCardsForResponse(m.id) : []]),
     );
-    const usageByResponseMessageId = new Map(
+    const usageByResponseMessageId = sqlPage ? usageSnapshotsForPage(conv.id, dbMessages) : new Map(
       (stmts.listMessageUsageSnapshotsByConversation?.all(conv.id) || [])
         .map((row) => [String(row?.response_message_id || '').trim(), mapUsageSnapshotRow(row)])
         .filter(([messageId, usage]) => !!messageId && !!usage),
@@ -4432,20 +4473,16 @@ export function registerSessionsRoutes(app, deps) {
       responseMessageToSourceId,
       queueRows,
       usageByResponseMessageId,
+      resendIndexMessages: sqlPage ? resendIndexForPage(resolvedConversationId, dbMessages, { sharedOnly: false }) : null,
     });
     messages = messages.map((message) => {
       if (message.role !== 'assistant') return message;
       const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
       return sourceMessageId ? { ...message, sourceMessageId } : message;
     });
-    const history = selectConversationHistoryPage(messages, {
-      limit,
-      beforeMessageId,
-      beforeTimestamp,
-      afterMessageId,
-      afterTimestamp,
-      aroundMessageId,
-    });
+    const history = sqlPage
+      ? { messages, pageInfo: sqlPage.pageInfo }
+      : selectConversationHistoryPage(messages, historyCursor);
     res.json({
       id: conv.id,
       sdkSessionId: conv.sdk_session_id || null,
@@ -4483,9 +4520,20 @@ export function registerSessionsRoutes(app, deps) {
       ...(describeSessionActivity(resolvedConversationId) || {}),
       // The published set, else the placeholder for background work a live
       // worker reports without this runtime knowing its details.
-      backgroundTasks: backgroundWorkView
-        ? backgroundWorkView.panelTasks(resolvedConversationId, runtimeSession?.sdk_session_id)
-        : (backgroundTaskStore?.get?.(resolvedConversationId) || []),
+      // Each with the health poller's last reading (`health`); the tasks
+      // that ended within the hour with a console beside them.
+      backgroundTasks: (() => {
+        const taskKeys = [resolvedConversationId, runtimeSession?.sdk_session_id];
+        const tasks = backgroundWorkView
+          ? backgroundWorkView.panelTasks(...taskKeys)
+          : (backgroundTaskStore?.get?.(resolvedConversationId) || []);
+        return backgroundTaskStore?.withHealth ? backgroundTaskStore.withHealth(tasks, ...taskKeys) : tasks;
+      })(),
+      endedBackgroundTasks: backgroundTaskStore?.ended?.(resolvedConversationId, runtimeSession?.sdk_session_id) || [],
+      // Minutes without output after which the panel calls a task quiet.
+      taskStallMinutes: (() => {
+        try { return getTaskStallMinutes(); } catch { return DEFAULT_TASK_STALL_MINUTES; }
+      })(),
       usageLimitPause: usageLimitPauseService?.getPause?.(resolvedConversationId) || null,
       previews: listConversationPreviews?.(resolvedConversationId) || [],
       // Every pin of the conversation, also those outside this history page.
@@ -6291,6 +6339,7 @@ export function registerSessionsRoutes(app, deps) {
       models: Array.isArray(settings?.models) ? settings.models : [],
       availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
       ...claudeAttributionSettingsFields(settings),
+      ...claudeBackgroundCommandLimitSettingsFields(settings),
     });
   });
 
@@ -6340,6 +6389,7 @@ export function registerSessionsRoutes(app, deps) {
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
       availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
       ...claudeAttributionSettingsFields(currentSettings),
+      ...claudeBackgroundCommandLimitSettingsFields(currentSettings),
       reconciliation,
     };
     io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
@@ -7073,6 +7123,26 @@ export function registerSessionsRoutes(app, deps) {
       stepMinutes: BACKGROUND_TASK_TIMEOUT_STEP_MINUTES,
       defaultMinutes: DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
     });
+  });
+
+  // "Mark a background task as quiet after N minutes" (task_stall_minutes).
+  const taskStallMinutesPayload = (minutes) => ({
+    minutes,
+    min: TASK_STALL_MINUTES_MIN,
+    max: TASK_STALL_MINUTES_MAX,
+    default: DEFAULT_TASK_STALL_MINUTES,
+  });
+
+  app.get('/api/settings/task-stall-minutes', auth, (_req, res) => {
+    res.json(taskStallMinutesPayload(getTaskStallMinutes()));
+  });
+
+  app.post('/api/settings/task-stall-minutes', auth, (req, res) => {
+    const parsed = parseTaskStallMinutesUpdate(req.body?.minutes);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setTaskStallMinutes(parsed.minutes);
+    if (!result.ok) return res.status(500).json({ error: result.error });
+    return res.json(taskStallMinutesPayload(result.minutes));
   });
 
   const pwaAppNamePayload = (appName) => ({

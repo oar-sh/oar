@@ -4,7 +4,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 // Structural pins for wiring outside the transcript (repo-tree refresh paths,
-// the live poll's arming and deferral, the sidebar spinner) — the pattern used
+// the live poll's arming and deferral, the sidebar's working mark) — the pattern used
 // by attachments-view.repo-refresh.test.mjs. The live turn's rendering itself
 // (live bubble, pending bubbles, status teardown, stream muting) is pinned by
 // behaviour on a real DOM in conversation-view.transcript-dom.test.mjs.
@@ -72,7 +72,7 @@ test('the live poll leaves a window in the middle of the history alone, also whe
   );
   assert.ok(
     poll.indexOf('if (transcriptIsInHistory(currentId)) return;') >= 0
-      && poll.indexOf('if (transcriptIsInHistory(currentId)) return;') < poll.indexOf('await loadConversation('),
+      && poll.indexOf('if (transcriptIsInHistory(currentId)) return;') < poll.indexOf('loadConversation(currentId, { limit: requestLimit })'),
     'no request is made for a window that will not be replaced',
   );
   // An answer that was on its way during the jump is dropped.
@@ -83,7 +83,8 @@ test('the live poll leaves a window in the middle of the history alone, also whe
   // Only a jump counts, and it counts when its window is put on the page: an
   // ordinary reload must still be able to correct another one.
   const open = functionBody(readSource('./journal-view.js'), 'openConversation');
-  assert.match(open, /if \(forceFreshWindow\) noteTranscriptJump\(\);\s*\n\s*applyLoadedConversationState\(id, r, \{ restoreScroll, savedScrollTop \}\);/);
+  // A window centred on the place read after a reload is one such jump.
+  assert.match(open, /if \(forceFreshWindow \|\| anchorFound\) noteTranscriptJump\(\);\s*\n\s*applyLoadedConversationState\(id, r, \{/);
   assert.doesNotMatch(functionBody(readSource('./conversation-view.js'), 'renderMessages'), /transcriptJumpEpoch/);
   assert.match(
     readSource('./conversation-view.js'),
@@ -105,14 +106,14 @@ test('a view refresh after a jump into the history refreshes everything but the 
   assert.match(refresh, /followLiveUpdates: preserveBottom && !keepTranscript,\s*\n\s*keepTranscript,/);
   assert.match(refresh, /if \(messagesEl && !keepTranscript && /, 'the saved scroll position is not put back over the jump');
   const apply = functionBody(readSource('./journal-view.js'), 'applyLoadedConversationState');
-  assert.match(apply, /const didRenderMessages = keepTranscript\s*\n\s*\? false\s*\n\s*: renderMessages\(response\.messages, !restoreScroll, response\);/);
+  assert.match(apply, /let didRenderMessages = false;\s*\n\s*if \(!keepTranscript\) \{\s*\n\s*didRenderMessages = mergeFrom\s*\n\s*\? mergeMessagesIntoTranscript\(mergeFrom, response\.messages, response\)\s*\n\s*: renderMessages\(response\.messages, !restoreScroll, response\);/);
   assert.match(apply, /setConversationBackgroundTasks\(id, response\.backgroundTasks \|\| \[\]\);/, 'the rest still applies');
 });
 
-test('the sidebar spinner tick updates only the dot spans', () => {
-  const body = functionBody(readSource('./journal-view.js'), 'ensureProcessingDotTimer');
-  assert.doesNotMatch(body, /renderConvList\(\)/);
-  assert.match(body, /conv-processing-dots/);
+test('the sidebar shows work by title colour: no dot spans and no timer for them', () => {
+  const source = readSource('./journal-view.js');
+  assert.doesNotMatch(source, /conv-processing-dots|ensureProcessingDotTimer/);
+  assert.match(functionBody(source, 'paintConvList'), /view\.working \? ' conv-working' : ''/);
 });
 
 test('every row the socket puts on the page moves the live-row count the reloads check', () => {
@@ -127,4 +128,27 @@ test('every row the socket puts on the page moves the live-row count the reloads
   for (const name of ['pollAuthenticatedCurrentConversationLive', 'refreshCurrentView', 'refreshSharedConversation']) {
     assert.match(functionBody(bootstrap, name), /await loadKeepingLiveRows\(/, `${name} reloads through the guard`);
   }
+});
+
+test('the live poll and a view refresh merge a capped answer into a larger loaded window', () => {
+  const bootstrap = readSource('./bootstrap.js');
+  const merge = functionBody(bootstrap, 'reloadMergeFor');
+  assert.match(merge, /mergeReloadIntoWindow\(conversationPayloadCache\.peekWindow\(conversationId\), response, \{ windowPredatesPage: true \}\)/);
+  assert.match(merge, /canMergeIntoTranscript\(merge\.mergeFrom, conversationId\)/, 'the full render where a merge cannot be placed');
+  const poll = functionBody(bootstrap, 'pollAuthenticatedCurrentConversationLive');
+  assert.match(poll, /const merge = reloadMergeFor\(currentId, response\);\s*\n\s*applyLoadedConversationState\(currentId, merge\?\.payload \|\| response, \{[\s\S]*?mergeFrom: merge\?\.mergeFrom \|\| null,/);
+  const refresh = functionBody(bootstrap, 'refreshCurrentView');
+  assert.match(refresh, /const merge = keepTranscript \? null : reloadMergeFor\(currentId, r\);\s*\n\s*applyLoadedConversationState\(currentId, merge\?\.payload \|\| r, \{[\s\S]*?mergeFrom: merge\?\.mergeFrom \|\| null,/);
+  for (const body of [poll, refresh]) {
+    assert.match(body, /if \(merge && preserveBottom && messagesEl\) messagesEl\.scrollTop = messagesEl\.scrollHeight;/, 'a merge does not scroll by itself');
+  }
+});
+
+test('an in-place rewrite updates the kept window on screen and drops the others', () => {
+  const handlers = readSource('./socket-handlers.js');
+  const start = handlers.indexOf("socket.on('message_updated'");
+  const body = handlers.slice(start, handlers.indexOf('\n  });', start));
+  assert.match(body, /if \(!messageId \|\| conversationId !== currentConvId \|\| !message\) \{\s*\n\s*conversationPayloadCache\.forget\(conversationId\);\s*\n\s*return;\s*\n\s*\}/);
+  assert.match(body, /noteTranscriptLiveRow\(\);\s*\n\s*keepLiveRow\(conversationId, message, messageId\);/);
+  assert.equal(body.match(/conversationPayloadCache\.forget\(/g)?.length, 1, 'not forgotten for the conversation on screen');
 });

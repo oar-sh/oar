@@ -681,3 +681,44 @@ test('the inactivity watchdog asks the relay for an in-flight remote_relay call 
   assert.equal(await watchdog.holdStall(), false, 'nothing in flight: the stall is real');
   await runner.dispose();
 });
+
+test('the runner hands its terminal publisher to the agent handle and answers for its tasks', async () => {
+  const api = createMockApi();
+  const handleOptions = [];
+  const stopped = [];
+  const publisher = {
+    backgroundTaskIds: () => ['term-fixture-1'],
+    resync: async () => 'resynced',
+    stop: (taskId) => { stopped.push(taskId); return true; },
+    flushKeptSettles: async () => 0,
+  };
+  async function* fakeTurn() {
+    yield { channel: 'result', payload: { text: 'done', isError: false, errorMessage: '', stopReason: 'end_turn', model: 'grok-4.5' } };
+  }
+  fakeTurn.cancel = async () => {};
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-1',
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    oarMcpServer: null,
+    taskPublisher: publisher,
+    createAgentHandleImpl: async (options) => {
+      handleOptions.push(options);
+      return { sessionId: 'sess-1', model: 'grok-4.5', client: { off() {}, on() {}, sessionCancel() {} }, async close() {} };
+    },
+    startGrokTurnImpl: () => fakeTurn(),
+  });
+  await runner.handlePendingPayload({ message: { id: 'msg-t', conversationId: 'conv-1', text: 'run the tests', relayMode: 'agent', model: 'auto' } });
+  assert.equal(handleOptions[0].taskObserver, publisher);
+  assert.deepEqual(runner.backgroundTaskIds(), ['term-fixture-1']);
+  assert.equal(await runner.resyncBackgroundTasks(), 'resynced');
+  assert.equal(runner.stopBackgroundTask('term-fixture-1'), true);
+  assert.deepEqual(stopped, ['term-fixture-1']);
+  await runner.dispose();
+
+  // Without a publisher nothing is published and nothing breaks.
+  const bare = createGrokTurnRunner({ api, sdkSessionId: 'conv-1', cwd: process.cwd(), oarMcpServer: null });
+  assert.deepEqual(bare.backgroundTaskIds(), []);
+  assert.equal(bare.stopBackgroundTask('term-fixture-1'), false);
+});

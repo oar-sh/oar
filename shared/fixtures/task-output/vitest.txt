@@ -1,0 +1,55 @@
+ RUN  v2.1.8 /home/dev/compass-app
+
+ ✓ src/needle.test.ts (12 tests) 8ms
+ ❯ src/bearing.test.ts (5 tests | 2 failed) 14ms
+   × bearing > rounds to the nearest degree 6ms
+     → expected 41 to be 42 // Object.is equality
+   × bearing > wraps past north 2ms
+     → expected 361 to be 1 // Object.is equality
+ ✓ src/legend.test.ts (397 tests) 120ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/bearing.test.ts > bearing > rounds to the nearest degree
+AssertionError: expected 41 to be 42 // Object.is equality
+
+- Expected
++ Received
+
+- 42
++ 41
+
+ ❯ src/bearing.test.ts:9:19
+      7|   it('rounds to the nearest degree', () => {
+      8|     const value = roundBearing(41.4);
+      9|     expect(value).toBe(42);
+       |                   ^
+     10|   });
+     11| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/bearing.test.ts > bearing > wraps past north
+AssertionError: expected 361 to be 1 // Object.is equality
+
+- Expected
++ Received
+
+- 1
++ 361
+
+ ❯ src/bearing.test.ts:14:30
+     12|   it('wraps past north', () => {
+     13|     const value = normalizeBearing(361);
+     14|     expect(value).toBe(1);
+       |                   ^
+     15|   });
+     16| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+ Test Files  1 failed | 2 passed (3)
+      Tests  2 failed | 412 passed (414)
+   Start at  14:02:11
+   Duration  1.32s (transform 88ms, setup 0ms, collect 140ms, tests 142ms, environment 0ms, prepare 210ms)
+

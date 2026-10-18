@@ -3136,3 +3136,178 @@ test('a relay without plan usage answers a clear error', async () => {
   assert.equal(legacy.body.code, CODES.unsupported);
   assert.match(legacy.body.error, /older shape/);
 });
+
+// ─── read_task_output ────────────────────────────────────────────────────────
+
+const OUTPUT_PATH = '/api/conversation/conv-1/background-task/task-b7/output';
+
+// The output route of the target relay; `answer` is its JSON or an Error.
+function withTaskOutputRoute(target, answer) {
+  const original = target.request.bind(target);
+  target.request = async (relay, method, path, options = {}) => {
+    if (method === 'GET' && path.includes('/background-task/')) {
+      target.calls.push({ relay: relay.name, method, path, query: options.query });
+      if (answer instanceof Error) throw answer;
+      return answer;
+    }
+    return original(relay, method, path, options);
+  };
+}
+
+const RUNNING_OUTPUT = Object.freeze({
+  ok: true,
+  taskId: 'task-b7',
+  kind: 'file',
+  ended: false,
+  status: 'running',
+  exitCode: null,
+  taskStallMinutes: 10,
+  health: {
+    lastOutputAt: Date.parse('2026-09-20T09:48:00.000Z'),
+    size: 5000,
+    counts: { passed: 412, failed: 2, skipped: 0 },
+    runner: 'vitest',
+    final: false,
+    firstFailureOffset: 1200,
+  },
+  task: { taskId: 'task-b7', taskType: 'local_bash', description: 'npm test', startedAt: 1_758_355_000_000, stoppable: true },
+  text: 'ignored by the action',
+  lines: [
+    { text: '\x1b[32m ✓\x1b[39m src/needle.test.ts (12 tests) 8ms', count: 1, ansi: true },
+    { text: 'waiting for the compass server', count: 3, ansi: false },
+    // A relay that forgot to scrub still gets scrubbed here.
+    // Put together at run time: the hygiene scan refuses token shapes in the source.
+    { text: `GITHUB_TOKEN=${['gh', 'p_', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('')}`, count: 1, ansi: false },
+  ],
+  startOffset: 4000,
+  endOffset: 5000,
+  size: 5000,
+  mtime: Date.parse('2026-09-20T09:48:00.000Z'),
+  hasMoreBefore: true,
+});
+
+test('read_task_output reads the tail of a task on a read-only relay: plain lines, quiet minutes, counts', async () => {
+  const { run, remote } = setup();
+  withTaskOutputRoute(remote, RUNNING_OUTPUT);
+  const result = await run('read_task_output', { relay: 'spare-test', session: 'conv-1', task_id: 'task-b7', lines: 50 });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const call = remote.calls.find((entry) => entry.path === OUTPUT_PATH);
+  assert.deepEqual([call.relay, call.query], ['spare-test', { lines: 50 }]);
+  assert.deepEqual(result.body.tail, [
+    ' ✓ src/needle.test.ts (12 tests) 8ms',
+    'waiting for the compass server  [×3]',
+    'GITHUB_TOKEN=[redacted]',
+  ]);
+  assert.deepEqual(result.body.stall, { minutes: 12, since: '2026-09-20T09:48:00.000Z', quiet: true, quietAfterMinutes: 10 });
+  assert.deepEqual(result.body.counts, { runner: 'vitest', passed: 412, failed: 2, skipped: 0, final: false });
+  assert.deepEqual(result.body.task, { id: 'task-b7', description: 'npm test', type: 'local_bash', startedAt: 1_758_355_000_000, status: 'running', exitCode: null });
+  assert.equal(result.body.truncated, true);
+  assert.match(result.body.summary, /^read_task_output → spare-test session conv-1 task task-b7: 3 lines, running, last output 12 min ago, 412 passed, 2 failed$/);
+  assert.equal(JSON.stringify(result.body).includes('ghp_abcdef'), false);
+});
+
+test('read_task_output of an ended task: its status and exit code, counts from the lines, no stall', async () => {
+  const { run, local } = setupLocal();
+  withTaskOutputRoute(local, {
+    ok: true,
+    taskId: 'task-b7',
+    kind: 'file',
+    ended: true,
+    status: 'failed',
+    exitCode: 1,
+    health: null,
+    taskStallMinutes: 10,
+    task: { taskId: 'task-b7', taskType: 'local_bash', description: 'npm test', endedAt: 1_758_362_000_000 },
+    lines: [
+      { text: 'ℹ tests 2', count: 1 },
+      { text: 'ℹ pass 1', count: 1 },
+      { text: 'ℹ fail 1', count: 1 },
+      { text: 'ℹ duration_ms 12.5', count: 1 },
+    ],
+    mtime: Date.parse('2026-09-20T09:00:00.000Z'),
+    hasMoreBefore: false,
+  });
+  const result = await run('read_task_output', { relay: 'this', session: 'conv-1', task_id: 'task-b7' });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(local.calls.find((entry) => entry.path === OUTPUT_PATH).query.lines, 200);
+  assert.equal(result.body.stall, null);
+  assert.deepEqual([result.body.task.status, result.body.task.exitCode, result.body.task.endedAt], ['failed', 1, 1_758_362_000_000]);
+  assert.deepEqual(result.body.counts, { runner: 'node:test', passed: 1, failed: 1, skipped: 0, final: true });
+  assert.equal(result.body.truncated, false);
+});
+
+test('read_task_output keeps to its line count and 32 KB, newest lines last', async () => {
+  const { run, remote } = setup();
+  const lines = Array.from({ length: 400 }, (_, index) => ({ text: `${String(index).padStart(4, '0')} ${'x'.repeat(120)}`, count: 1 }));
+  withTaskOutputRoute(remote, { ...RUNNING_OUTPUT, lines, hasMoreBefore: false });
+  const result = await run('read_task_output', { relay: 'spare-test', session: 'conv-1', task_id: 'task-b7', lines: 500 });
+  assert.equal(result.body.truncated, true);
+  assert.ok(Buffer.byteLength(result.body.tail.join('\n')) <= 32 * 1024);
+  assert.match(result.body.tail.at(-1), /^0399 /);
+  const few = await run('read_task_output', { relay: 'spare-test', session: 'conv-1', task_id: 'task-b7', lines: 5 });
+  assert.equal(few.body.tail.length, 5);
+});
+
+test('read_task_output says why there is nothing: no output for the provider, an unknown task, an older relay', async () => {
+  const { run, remote } = setup();
+  withTaskOutputRoute(remote, { ok: true, taskId: 'task-b7', kind: 'none', ended: false, message: 'Output is not available for this provider.', task: {} });
+  const none = await run('read_task_output', { relay: 'spare-test', session: 'conv-1', task_id: 'task-b7' });
+  assert.equal(none.status, 200);
+  assert.deepEqual(none.body.tail, []);
+  assert.equal(none.body.note, 'Output is not available for this provider.');
+
+  withTaskOutputRoute(remote, remoteError(`${CODES.httpPrefix}404`, 'Relay answered HTTP 404', 404, { error: 'Task not found', code: 'task-not-found' }));
+  const unknown = await run('read_task_output', { relay: 'spare-test', session: 'conv-1', task_id: 'task-b7' });
+  assert.equal(unknown.status, 404);
+  assert.equal(unknown.body.code, CODES.notFound);
+  assert.match(unknown.body.error, /Task task-b7 is not running in session conv-1 on relay "spare-test"/);
+
+  withTaskOutputRoute(remote, remoteError(`${CODES.httpPrefix}404`, 'Relay answered HTTP 404', 404, { error: 'Not found' }));
+  const older = await run('read_task_output', { relay: 'spare-test', session: 'conv-1', task_id: 'task-b7' });
+  assert.equal(older.body.code, CODES.unsupported);
+
+  withTaskOutputRoute(remote, remoteError(`${CODES.httpPrefix}404`, 'Relay answered HTTP 404', 404, { error: 'Conversation not found' }));
+  const noSession = await run('read_task_output', { relay: 'spare-test', session: 'conv-1', task_id: 'task-b7' });
+  assert.equal(noSession.body.code, CODES.notFound);
+  assert.match(noSession.body.error, /Session conv-1 was not found/);
+});
+
+test('read_session gives each task its taskId, whether it has output, and its health', async () => {
+  const { run, local } = setupLocal();
+  withLocalSession(local, {
+    sessionState: 'background_only',
+    sessionTasks: [
+      { id: 'task-b7', kind: 'shell', description: 'npm test', startedAt: '2026-09-20T09:00:00.000Z', status: 'running' },
+      { id: 'task-c8', kind: 'shell', description: 'npm run build', status: 'completed', exitCode: 0, endedAt: '2026-09-20T09:30:00.000Z' },
+      { id: 'agent-d9', kind: 'subagent', description: 'review', status: 'running' },
+    ],
+    backgroundTasks: [
+      { taskId: 'task-b7', outputPath: '/tmp/out/task-b7.log', outputKind: 'file', health: RUNNING_OUTPUT.health },
+      { taskId: 'agent-d9', outputKind: 'none' },
+    ],
+  });
+  const original = local.request.bind(local);
+  local.request = async (relay, method, path, options = {}) => {
+    const answer = await original(relay, method, path, options);
+    if (method === 'GET' && path === '/api/conversation/conv-1') {
+      return { ...answer, taskStallMinutes: 15, endedBackgroundTasks: [{ taskId: 'task-c8', outputPath: '/tmp/out/task-c8.log', status: 'completed', exitCode: 0 }] };
+    }
+    return answer;
+  };
+  const read = await run('read_session', { relay: 'this', session: 'conv-1' });
+  assert.equal(read.status, 200, JSON.stringify(read.body));
+  const [running, built, agent] = read.body.session.tasks;
+  assert.equal(running.taskId, 'task-b7');
+  assert.equal(running.output, true);
+  assert.deepEqual(running.health, {
+    minutesSinceOutput: 12,
+    quiet: false,
+    quietAfterMinutes: 15,
+    counts: { runner: 'vitest', passed: 412, failed: 2, skipped: 0 },
+  });
+  assert.deepEqual([built.taskId, built.output, built.health], ['task-c8', true, undefined]);
+  assert.deepEqual([agent.taskId, agent.output], ['agent-d9', false]);
+  // list_sessions stays as it was.
+  const listed = await run('list_sessions', { relay: 'this' });
+  assert.equal(listed.body.sessions[0].tasks[0].taskId, undefined);
+});

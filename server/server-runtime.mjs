@@ -79,6 +79,11 @@ import { createBackgroundWorkView } from './services/background-work-view.mjs';
 import { createRelayEventService } from './services/relay-event-service.mjs';
 import { createRelayEventLinkService } from './services/relay-event-link-service.mjs';
 import { buildClaudeAttributionSettings, normalizeClaudeAttributionMode, resolveClaudeAttributionMode, DEFAULT_CLAUDE_ATTRIBUTION_MODE } from '../shared/claude-attribution.mjs';
+import {
+  claudeBackgroundCommandLimitMinutesToMs,
+  parseClaudeBackgroundCommandLimitUpdate,
+  readClaudeBackgroundCommandLimitSetting,
+} from '../shared/claude-background-command-limit.mjs';
 import { createWorkerLaunchNoteService } from './services/worker-launch-note-service.mjs';
 import { createGitHubCiActivityService } from './services/github-ci-activity-service.mjs';
 import { runHostSuspendToRam } from './services/host-suspend-command.mjs';
@@ -145,6 +150,8 @@ import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-acces
 import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
 import { createTmuxInspectorSocketService } from './services/tmux-inspector-socket-service.mjs';
 import { createSubagentViewerRooms } from './services/subagent-viewer-rooms.mjs';
+import { createTaskOutputRooms } from './services/task-output-rooms.mjs';
+import { createTaskHealthPoller, createTaskOutputSnapshots } from './services/task-output-service.mjs';
 import {
   resolveDefaultSessionWorkspaceRootState as resolveDefaultSessionWorkspaceRootStateFromService,
   resolveLaunchWorkspaceRootPath,
@@ -208,6 +215,11 @@ import {
   readBackgroundTaskTimeoutSetting,
   backgroundTaskTimeoutMinutesToMs,
 } from '../shared/background-task-timeout.mjs';
+import {
+  TASK_STALL_MINUTES_SETTING_KEY,
+  parseTaskStallMinutesUpdate,
+  readTaskStallMinutesSetting,
+} from '../shared/task-output-text.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
 import { capRelayActivityEntries } from './public/app/activity-replay-state.mjs';
 import {
@@ -504,8 +516,13 @@ function getClaudeProviderSettings() {
     effortsByModel,
     modelsDiscovered,
     attributionMode: normalizeClaudeAttributionMode(readAppSettingValue(CLAUDE_ATTRIBUTION_SETTING_KEY)) || DEFAULT_CLAUDE_ATTRIBUTION_MODE,
+    backgroundCommandLimitMinutes: getClaudeBackgroundCommandLimitMinutes(),
     providerType: 'claude',
   };
+}
+
+function getClaudeBackgroundCommandLimitMinutes() {
+  return readClaudeBackgroundCommandLimitSetting(readAppSettingValue(CLAUDE_BACKGROUND_COMMAND_LIMIT_SETTING_KEY));
 }
 
 function setClaudeProviderSettings(update = {}) {
@@ -528,12 +545,21 @@ function setClaudeProviderSettings(update = {}) {
   if (attributionMode === null) {
     return { ok: false, error: 'Invalid Claude attribution mode' };
   }
+  const backgroundCommandLimit = payload.backgroundCommandLimitMinutes === undefined
+    ? null
+    : parseClaudeBackgroundCommandLimitUpdate(payload.backgroundCommandLimitMinutes);
+  if (backgroundCommandLimit && !backgroundCommandLimit.ok) {
+    return { ok: false, error: backgroundCommandLimit.error };
+  }
   const nowIso = new Date().toISOString();
   const nextEnabled = typeof enabled === 'boolean' ? enabled : existing.enabled;
   stmts.upsertAppSetting.run(CLAUDE_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
   stmts.upsertAppSetting.run(CLAUDE_MODEL_SETTING_KEY, normalizedModel, nowIso);
   if (attributionMode) {
     stmts.upsertAppSetting.run(CLAUDE_ATTRIBUTION_SETTING_KEY, attributionMode, nowIso);
+  }
+  if (backgroundCommandLimit) {
+    stmts.upsertAppSetting.run(CLAUDE_BACKGROUND_COMMAND_LIMIT_SETTING_KEY, String(backgroundCommandLimit.minutes), nowIso);
   }
   if (Array.isArray(models)) {
     const normalizedModels = models
@@ -1404,6 +1430,9 @@ const CLAUDE_MODEL_EFFORTS_SETTING_KEY = 'claude_model_efforts';
 // oar | vanilla | off — what commits and PRs made in Claude sessions say
 // (shared/claude-attribution.mjs); absent means oar.
 const CLAUDE_ATTRIBUTION_SETTING_KEY = 'claude_attribution_mode';
+// Minutes a backgrounded Bash command of a Claude session may run without its
+// own timeout (shared/claude-background-command-limit.mjs); absent means 2 h.
+const CLAUDE_BACKGROUND_COMMAND_LIMIT_SETTING_KEY = 'claude_background_command_limit_minutes';
 // The set of levels the SDK itself can report/accept as EffortLevel values.
 // Discovery results are filtered through this, so it must NOT contain the
 // relay's derived 'ultracode' sentinel — supportedModels() never reports it
@@ -2156,6 +2185,21 @@ function setBackgroundTaskTimeoutMinutes(value) {
   if (!parsed.ok) return parsed;
   stmts.upsertAppSetting.run(BACKGROUND_TASK_TIMEOUT_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
   return { ok: true, timeoutMinutes: parsed.minutes };
+}
+
+// "Mark a background task as quiet after N minutes": the panel's stall hint.
+function getTaskStallMinutes() {
+  return readTaskStallMinutesSetting(readAppSettingValue(TASK_STALL_MINUTES_SETTING_KEY));
+}
+
+function setTaskStallMinutes(value) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Task stall settings are unavailable' };
+  }
+  const parsed = parseTaskStallMinutesUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(TASK_STALL_MINUTES_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
+  return { ok: true, minutes: parsed.minutes };
 }
 
 function resolveDefaultSessionWorkspaceRootState() {
@@ -5208,6 +5252,9 @@ function previewCardsForResponse(responseMessageId) {
 // only: after a runtime start the heartbeat's digest brings each set back
 // (services/background-task-store.mjs).
 const backgroundTaskStore = createBackgroundTaskStore();
+// The output a worker posts for a task with no output file (the console's
+// fallback); memory only, an hour.
+const taskOutputSnapshots = createTaskOutputSnapshots();
 
 // ─── Deferred host suspend ───────────────────────────────────────────────────
 // "💤 Suspend host" waits until nothing runs any more: no queued/processing
@@ -6274,6 +6321,12 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
               attribution: claudeAttributionForConversation(conv, out.providerModel || out.model, {
                 relayFolderFallback: deliveredProvider === 'claude',
               }),
+              // The Claude tab's background command limit; the worker
+              // hands it to the CLI it spawns next. Claude Cloud runs no
+              // local CLI, so it does not get one.
+              ...(deliveredProvider === 'claude'
+                ? { claudeBackgroundCommandLimitMs: claudeBackgroundCommandLimitMinutesToMs(getClaudeBackgroundCommandLimitMinutes()) }
+                : {}),
             };
           })()),
         };
@@ -6959,6 +7012,11 @@ const sharedRouteDeps = {
   resolveLiveTurnQueueRow,
   backgroundTaskStore,
   backgroundWorkView,
+  taskOutputSnapshots,
+  // A closure: the poller is built further down the file.
+  pokeTaskHealth: () => taskHealthPoller.poke(),
+  getTaskStallMinutes,
+  setTaskStallMinutes,
   // A closure, not the registry itself: this deps object is built before the
   // preview lane is constructed further down the file.
   listConversationPreviews: (conversationId) => previewRegistry.listForConversation(conversationId),
@@ -7487,6 +7545,22 @@ function sanitizeRelayQuestionContext(rawContext) {
 const subagentViewerRooms = createSubagentViewerRooms({
   getRun: (runId) => stmts.getSubagentRun?.get?.(runId) || null,
 });
+// A background task's output goes live only to the pages whose console shows
+// it; the task must be in the conversation's live or ended set, under the
+// conversation's id or its worker's session id (as the output route checks).
+const taskOutputRooms = createTaskOutputRooms({
+  io,
+  resolveTask: (conversationId, taskId) => {
+    const conversation = stmts.getConvAnyStatus?.get?.(conversationId) || null;
+    if (!conversation) return null;
+    const keys = [conversationId, String(conversation.sdk_session_id || conversationId)];
+    return backgroundTaskStore.findTask(keys, taskId);
+  },
+});
+// The stall hint and the pass/fail chip of the panel's rows: every 10 s over
+// the live tasks with an output file.
+const taskHealthPoller = createTaskHealthPoller({ store: backgroundTaskStore, io });
+taskHealthPoller.start();
 // The handshake presents the token as `auth.token` or the cookie; a query
 // `token` is not read (see services/relay-auth.mjs).
 io.use(relayAuth.socketMiddleware);
@@ -7524,6 +7598,7 @@ io.on('connection', (socket) => {
   activeDeviceTracker.registerSocket(socket);
   tmuxInspectorSocketService.registerSocket(socket);
   subagentViewerRooms.registerSocket(socket);
+  taskOutputRooms.registerSocket(socket);
 });
 
 // ─── SSH Reverse Tunnel ────────────────────────────────────────────────────────
@@ -7656,6 +7731,8 @@ function clearRuntimeTimers() {
     try { clearInterval(timer); } catch {}
   }
   subagentRecordRetention?.stop();
+  try { taskHealthPoller.stop(); } catch {}
+  try { taskOutputRooms.stop(); } catch {}
   runtimeTimers.cliStatus = null;
   runtimeTimers.ownerWatchdog = null;
   runtimeTimers.staleRecovery = null;

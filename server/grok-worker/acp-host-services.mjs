@@ -11,6 +11,7 @@
  * If a capability is dropped here, drop it from the initialize payload too.
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { windowsSystemToolPath } from '../../shared/windows-system-tools.mjs';
 
@@ -37,10 +38,18 @@ export function createAcpHostServices({
   spawnImpl = spawn,
   spawnSyncImpl = spawnSync,
   fsImpl = fs,
+  // Told about every terminal's life (grok-background-tasks.mjs publishes
+  // them as background tasks): `started`, `output`, `killed`, `released`,
+  // `exited`. Advisory: an observer that throws never disturbs a terminal.
+  taskObserver = null,
   dbg = () => {},
 } = {}) {
   const terminals = new Map();
   let nextTerminalId = 1;
+  // Terminal ids become task ids and spool file names on the relay side: a
+  // fresh set of host services (the handle is rebuilt after a failed turn)
+  // must not reuse the ids of the one before it.
+  const terminalIdPrefix = `term-${randomBytes(3).toString('hex')}`;
   let inflightRequests = 0;
   let cachedWindowsShell = '';
   let disposed = false;
@@ -77,9 +86,21 @@ export function createAcpHostServices({
     return { file: shell, args: ['-c', command] };
   }
 
+  function tell(hook, ...args) {
+    const fn = taskObserver?.[hook];
+    if (typeof fn !== 'function') return;
+    try {
+      const result = fn(...args);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch (error) {
+      dbg('terminal observer failed', hook, error?.message || String(error));
+    }
+  }
+
   function appendOutput(entry, chunk) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
     entry.lastActivityAt = Date.now();
+    tell('output', entry.terminalId, buf);
     entry.chunks.push(buf);
     entry.byteLength += buf.length;
     // ACP truncates from the start of the output: the most recent bytes win.
@@ -101,6 +122,7 @@ export function createAcpHostServices({
     if (entry.exitStatus) return;
     entry.exitStatus = exitStatus;
     for (const resolve of entry.exitWaiters.splice(0)) resolve(exitStatus);
+    tell('exited', entry.terminalId, exitStatus);
   }
 
   function getTerminal(terminalId) {
@@ -125,9 +147,12 @@ export function createAcpHostServices({
       windowsHide: true,
       shell: false,
     });
-    const terminalId = `term-${nextTerminalId++}`;
+    const terminalId = `${terminalIdPrefix}-${nextTerminalId++}`;
     const entry = {
       terminalId,
+      // What the task panel shows for it.
+      command: [command, ...(Array.isArray(params.args) ? params.args.map(String) : [])].join(' '),
+      startedAt: Date.now(),
       proc,
       chunks: [],
       byteLength: 0,
@@ -152,6 +177,12 @@ export function createAcpHostServices({
       });
     });
     terminals.set(terminalId, entry);
+    tell('started', {
+      terminalId,
+      command: entry.command,
+      startedAt: entry.startedAt,
+      kill: () => killEntryProcess(entry),
+    });
     dbg('terminal/create', terminalId, command.slice(0, 160));
     return { terminalId };
   }
@@ -188,15 +219,19 @@ export function createAcpHostServices({
   }
 
   function terminalKill(params = {}) {
-    killEntryProcess(getTerminal(params.terminalId));
+    const entry = getTerminal(params.terminalId);
+    if (!entry.exitStatus) tell('killed', entry.terminalId);
+    killEntryProcess(entry);
     return null;
   }
 
   function terminalRelease(params = {}) {
     const entry = terminals.get(String(params?.terminalId || ''));
     if (!entry) return null;
+    if (!entry.exitStatus) tell('killed', entry.terminalId);
     killEntryProcess(entry);
     terminals.delete(entry.terminalId);
+    tell('released', entry.terminalId);
     return null;
   }
 
@@ -270,7 +305,11 @@ export function createAcpHostServices({
 
   function disposeAll() {
     disposed = true;
-    for (const entry of terminals.values()) killEntryProcess(entry);
+    for (const entry of terminals.values()) {
+      if (!entry.exitStatus) tell('killed', entry.terminalId);
+      killEntryProcess(entry);
+      tell('released', entry.terminalId);
+    }
     terminals.clear();
   }
 

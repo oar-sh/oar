@@ -113,6 +113,8 @@ test('background agents and shells from the registry become stoppable cards with
     lastToolCall: 'Tool (bash): sleep 6 && echo sub-tool-done',
     totalTokens: 20,
     summary: '▸ bash sub work',
+    // One tool.execution_start of the agent so far.
+    steps: 1,
   });
   assert.ok(Number.isFinite(agent.startedAt));
   assert.deepEqual(shell, {
@@ -121,6 +123,9 @@ test('background agents and shells from the registry become stoppable cards with
     description: 'timer',
     startedAt: shell.startedAt,
     stoppable: true,
+    // A detached shell's console is its own log.
+    outputPath: '/tmp/copilot-detached-0.log',
+    outputKind: 'file',
   });
   // The runtime's task registry, not the event-scraped shell set, is the truth.
   assert.equal(client.session.rpc.tasks.listCalls > 0, true);
@@ -864,5 +869,71 @@ test('root work that starts while a background question is open merges into its 
   await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'continuation settled' });
   assert.equal(responsesFor(stub, 'cont-1')[0].text, 'Root follow-up while you decide.');
   assert.equal(stub.bodiesFor('/api/continuation-turn').length, 1, 'one row for the question and the work');
+  await runner.dispose();
+});
+
+const settlesFor = (stub) => stub.bodiesFor('/api/background-task-settled');
+
+test('a finished agent and shell are settled with the registry status, the agent result and the shell exit code', async () => {
+  const { stub, client, runner } = setup({
+    taskList: [agentTask(), shellTask()],
+    taskProgress: { [AGENT_ID]: { type: 'agent', recentActivity: [{ message: '⟳ Thinking…', timestamp: startedAtIso(0) }] } },
+  });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  await runner.whenTasksRefreshed();
+  await waitFor(() => (lastTasks(stub) || []).length === 2, { label: 'two cards' });
+  // A spinner line is no progress summary either.
+  assert.equal('summary' in lastTasks(stub).find((card) => card.taskId === AGENT_ID), false);
+
+  client.session.taskList[0].status = 'completed';
+  client.session.taskList[0].result = 'Probe finished: 3 files checked.';
+  client.session.taskList[1].status = 'completed';
+  client.session.emit({ type: 'session.background_tasks_changed', data: {} });
+  await tick(5);
+  await runner.whenTasksRefreshed();
+  await waitFor(() => settlesFor(stub).some((body) => body.taskId === AGENT_ID), { label: 'agent settled' });
+  const agent = settlesFor(stub).find((body) => body.taskId === AGENT_ID);
+  assert.equal(agent.status, 'completed');
+  assert.equal(agent.summary, 'Probe finished: 3 files checked.');
+  assert.equal(agent.taskType, 'local_agent');
+  assert.equal('exitCode' in agent, false);
+  const shell = settlesFor(stub).find((body) => body.taskId === '0');
+  // The registry says completed; no event gave a code yet.
+  assert.equal(shell.status, 'completed');
+  assert.equal('exitCode' in shell, false);
+  assert.equal(shell.outputPath, '/tmp/copilot-detached-0.log');
+
+  // The model reads the shell: its result text carries the exit code, which is posted then.
+  client.session.emit({
+    type: 'tool.execution_complete',
+    data: { toolCallId: 'call_9_0', success: true, result: { content: 'timer-fired\n<detached command with shellId: 0 completed with exit code 3>' } },
+  });
+  await waitFor(() => settlesFor(stub).filter((body) => body.taskId === '0').length === 2, { label: 'exit code posted' });
+  const withCode = settlesFor(stub).filter((body) => body.taskId === '0').at(-1);
+  assert.equal(withCode.status, 'failed');
+  assert.equal(withCode.exitCode, 3);
+  assert.equal(withCode.summary, 'exit code 3');
+  await runner.dispose();
+});
+
+test('an attached shell settles with the code of its shell_completed notification, and a vanished one waits for a code', async () => {
+  const { stub, client, runner } = setup({ taskList: [shellTask({ id: '1', attachmentMode: 'attached' }), shellTask({ id: '2' })] });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  await runner.whenTasksRefreshed();
+  await waitFor(() => (lastTasks(stub) || []).length === 2, { label: 'two cards' });
+
+  client.session.emit({ type: 'system.notification', data: { content: 'done', kind: { type: 'shell_completed', shellId: '1', exitCode: 0 } } });
+  client.session.taskList[0].status = 'completed';
+  // Shell 2 leaves the list without a finished entry: nothing says how it ended.
+  client.session.taskList.splice(1, 1);
+  client.session.emit({ type: 'session.background_tasks_changed', data: {} });
+  await tick(5);
+  await runner.whenTasksRefreshed();
+  await waitFor(() => settlesFor(stub).some((body) => body.taskId === '1'), { label: 'attached shell settled' });
+  const attached = settlesFor(stub).find((body) => body.taskId === '1');
+  assert.equal(attached.status, 'completed');
+  assert.equal(attached.exitCode, 0);
+  await tick(10);
+  assert.equal(settlesFor(stub).some((body) => body.taskId === '2'), false);
   await runner.dispose();
 });

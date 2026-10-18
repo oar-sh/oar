@@ -343,15 +343,18 @@ function blockTop(page, tag, prefix) {
   }, { selector: tag, starts: prefix });
 }
 
-// The block is `offset` pixels below the top edge. On a phone's screen of
-// three device pixels to one it may sit a fraction of a pixel off (the page
-// leaves half a pixel alone), never a whole one.
-async function expectBlockAt(page, tag, prefix, offset = 40) {
+// The block is `offset` pixels below the top edge. scrollTop takes whole
+// pixels and text sits on fractions of one, so the page puts a block back up
+// to half a pixel off (and leaves half a pixel alone), never a whole one.
+async function expectBlockAt(page, tag, prefix, offset) {
   const top = await blockTop(page, tag, prefix);
   expect(top).not.toBeNull();
   expect(Math.abs(top - offset)).toBeLessThan(1);
 }
 
+// Scrolls the block to about `offset` pixels below the top edge and returns
+// where it is: the whole-pixel scrollTop puts it a fraction of a pixel off
+// that, and what has to stay put is where the reader reads it.
 async function readBlockAt(page, tag, prefix, offset = 40) {
   await page.evaluate(({ selector, starts, at }) => {
     const el = document.getElementById("messages");
@@ -359,7 +362,10 @@ async function readBlockAt(page, tag, prefix, offset = 40) {
     el.scrollTop += node.getBoundingClientRect().top - el.getBoundingClientRect().top - at;
   }, { selector: tag, starts: prefix, at: offset });
   await page.waitForTimeout(500);
-  await expectBlockAt(page, tag, prefix, offset);
+  const top = await blockTop(page, tag, prefix);
+  expect(top).not.toBeNull();
+  expect(Math.abs(top - offset)).toBeLessThan(1);
+  return top;
 }
 
 // Marks the message rows on the page now. A render rebuilds them, so the
@@ -665,15 +671,15 @@ for (const [name, device] of Object.entries(DEVICES)) {
 
         const selector = block === "code block" ? "pre" : "p";
         const starts = block === "code block" ? "const fixture0" : "Paragraph 3.";
-        await readBlockAt(page, selector, starts);
+        const read = await readBlockAt(page, selector, starts);
         expect(await distanceFromEnd(page)).toBeGreaterThan(200);
 
         await reloadAfter(page, reader.conversationId, () => reader.answer(running, text));
         await expect(page.locator("#thinking-indicator")).toHaveCount(0);
         await expect(page.locator("#messages .msg.assistant").last()).toContainText("Paragraph 13.");
-        await expectBlockAt(page, selector, starts);
+        await expectBlockAt(page, selector, starts, read);
         await page.waitForTimeout(1_200);
-        await expectBlockAt(page, selector, starts);
+        await expectBlockAt(page, selector, starts, read);
       });
     }
 
@@ -732,15 +738,15 @@ for (const [name, device] of Object.entries(DEVICES)) {
       const grow = await growEarlierMessage(page, reader.conversationId);
       await openConversation(page, reader.conversationId);
       await goToEnd(page);
-      await readBlockAt(page, "p", "Paragraph 9.");
+      const read = await readBlockAt(page, "p", "Paragraph 9.");
 
       // Opened again, the question above the reader has grown.
       grow.start();
       await reloadAfter(page, reader.conversationId, () => reader.bind());
       await expect(page.locator("#messages .msg[data-message-id]").first()).toContainText("Added since.");
-      await expectBlockAt(page, "p", "Paragraph 9.");
+      await expectBlockAt(page, "p", "Paragraph 9.", read);
       await page.waitForTimeout(1_200);
-      await expectBlockAt(page, "p", "Paragraph 9.");
+      await expectBlockAt(page, "p", "Paragraph 9.", read);
     });
 
     test("Hide on a message while scrolled up leaves the reader where they are", async ({ page }) => {

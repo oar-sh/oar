@@ -23,15 +23,19 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // 2026-10-16; share management (migration 0016, the share repository, the
 // access log, the share list and the Sharing tab) took it to 473. 480 until
 // 2026-10-16; path privacy in shared views and About OAR (its service, route,
-// view and modal) took it to 482.
-const MAX_ENTRIES = 490;
+// view and modal) took it to 482. 490 until 2026-10-17; the task console (the
+// text pipeline, the output service and rooms, the spool, the console modules,
+// the Claude, Copilot and Grok task-output pieces) took it to 501, and the
+// transcript island module to 502.
+const MAX_ENTRIES = 510;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
 // their reach across paired relays took it to 6.54 MiB. 6.75 MiB until
 // 2026-10-13; the same four changes together took it to about 6.9 MiB. 7 MiB
-// until 2026-10-16; share management took it to 7.02 MiB.
-const MAX_UNPACKED_BYTES = 7.25 * 1024 * 1024;
+// until 2026-10-16; share management took it to 7.02 MiB. 7.25 MiB until
+// 2026-10-17; the task console took it to 7.31 MiB.
+const MAX_UNPACKED_BYTES = 7.5 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },

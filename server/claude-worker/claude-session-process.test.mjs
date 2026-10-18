@@ -6694,6 +6694,52 @@ test('the commit attribution reaches the spawn and follows the delivery when it 
   await settled(runner);
 });
 
+test('the background command limit is read at spawn and a later change waits for the next one', async () => {
+  const stub = makeApiStub();
+  const spawns = [];
+  const turn = scriptedTurn({ echoPushes: true });
+  let limitMs = 4 * 3_600_000;
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      spawns.push(params);
+      return turn;
+    },
+    getBackgroundCommandLimitMs: () => limitMs,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(spawns[0].backgroundCommandLimitMs, 4 * 3_600_000);
+
+  // The CLI reads its environment once; the running process keeps its limit.
+  limitMs = 3_600_000;
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'second push' });
+  turn.emit(resultMessage('second', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(spawns.length, 1, 'no respawn for a changed limit');
+
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a runner without a limit getter spawns without one', async () => {
+  const stub = makeApiStub();
+  const spawns = [];
+  const turn = scriptedTurn({ echoPushes: true });
+  const runner = makeRunner({ stub, startImpl: (params) => { spawns.push(params); return turn; } });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+  assert.equal(spawns[0].backgroundCommandLimitMs, null);
+  turn.endInput();
+  await settled(runner);
+});
+
 test('back to vanilla means a fresh process without the key, taken when nothing is live', async () => {
   // A value the CLI was spawned with cannot be unset through the flag layer
   // (probe 2026-10-01), so the runner recycles the idle process instead.

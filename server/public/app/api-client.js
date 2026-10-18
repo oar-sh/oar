@@ -328,12 +328,14 @@ export async function updateClaudeSettings({
   model = undefined,
   enabledModels = undefined,
   attributionMode = undefined,
+  backgroundCommandLimitMinutes = undefined,
 } = {}) {
   const payload = {};
   if (typeof enabled === 'boolean') payload.enabled = enabled;
   if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
   if (typeof attributionMode === 'string' && attributionMode.trim()) payload.attributionMode = attributionMode.trim();
+  if (Number.isFinite(backgroundCommandLimitMinutes)) payload.backgroundCommandLimitMinutes = backgroundCommandLimitMinutes;
   return settingsRequest('/api/settings/claude', payload, 'Failed to update Claude settings');
 }
 
@@ -569,6 +571,17 @@ export async function updateBackgroundTaskTimeoutSetting(timeoutMinutes) {
   return apiFetch('/api/settings/background-task-timeout', {
     method: 'POST',
     body: JSON.stringify({ timeoutMinutes: Number(timeoutMinutes) }),
+  });
+}
+
+export async function loadTaskStallMinutesSetting() {
+  return apiFetch('/api/settings/task-stall-minutes');
+}
+
+export async function updateTaskStallMinutesSetting(minutes) {
+  return apiFetch('/api/settings/task-stall-minutes', {
+    method: 'POST',
+    body: JSON.stringify({ minutes: Number(minutes) }),
   });
 }
 

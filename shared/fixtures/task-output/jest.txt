@@ -1,0 +1,41 @@
+PASS src/needle.test.js
+FAIL src/bearing.test.js
+  ● bearing › rounds to the nearest degree
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 42
+    Received: 41
+
+       7 |   it('rounds to the nearest degree', () => {
+       8 |     const value = roundBearing(41.4);
+    >  9 |     expect(value).toBe(42);
+         |                   ^
+      10 |   });
+      11 |
+
+      at Object.toBe (src/bearing.test.js:9:19)
+
+  ● bearing › wraps past north
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 361
+
+      12 |   it('wraps past north', () => {
+      13 |     const value = normalizeBearing(361);
+    > 14 |     expect(value).toBe(1);
+         |                   ^
+      15 |   });
+      16 | });
+
+      at Object.toBe (src/bearing.test.js:14:19)
+
+PASS src/legend.test.js
+
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       2 failed, 412 passed, 414 total
+Snapshots:   0 total
+Time:        2.481 s
+Ran all test suites.

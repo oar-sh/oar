@@ -77,12 +77,17 @@ function whitespaceFlexiblePattern(value) {
     .join('\\s+');
 }
 
+// The patterns depend only on the mode, so they are built once per mode and
+// reused: a long conversation sanitises every message on each history load.
+const PROMPT_PREFIX_PATTERN_CACHE = new Map();
+
 function buildPromptPrefixPatterns(mode) {
   const requestedMode = String(mode || '').trim().toLowerCase();
-  const modes = requestedMode && MODE_MARKERS[requestedMode]
-    ? [requestedMode]
-    : Object.keys(MODE_MARKERS);
-  return modes.flatMap((key) => {
+  const cacheKey = requestedMode && MODE_MARKERS[requestedMode] ? requestedMode : '';
+  const cached = PROMPT_PREFIX_PATTERN_CACHE.get(cacheKey);
+  if (cached) return cached;
+  const modes = cacheKey ? [cacheKey] : Object.keys(MODE_MARKERS);
+  const patterns = modes.flatMap((key) => {
     const marker = MODE_MARKERS[key];
     const currentFullPrefix = `${marker} ${MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`;
     const legacyFullPrefix = `${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`;
@@ -92,6 +97,8 @@ function buildPromptPrefixPatterns(mode) {
       new RegExp(`^${whitespaceFlexiblePattern(marker)}\\s*`, 'i'),
     ];
   });
+  PROMPT_PREFIX_PATTERN_CACHE.set(cacheKey, patterns);
+  return patterns;
 }
 
 function stripAttachmentPromptArtifacts(text) {

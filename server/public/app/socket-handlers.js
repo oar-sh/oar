@@ -30,6 +30,7 @@ import {
   applySessionWorkerSteering,
   refreshSummaryModal,
   summaryModalState,
+  IS_SHARED_VIEW,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { capLiveActivityEntries } from './activity-replay-state.mjs';
@@ -43,7 +44,8 @@ import {
   updatePendingQuestionBanner,
 } from './ask-user-view.js';
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
-import { setConversationBackgroundTasks } from './background-tasks-view.mjs';
+import { setConversationBackgroundTasks, setConversationTaskHealth } from './background-tasks-view.mjs';
+import { handleTaskConsoleReconnect, handleTaskOutputChunk } from './task-console.mjs';
 import { setConversationPins } from './pinned-messages-view.mjs';
 import { setConversationHiddenMessages } from './hidden-messages-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
@@ -83,6 +85,8 @@ import {
   noteTranscriptLiveRow,
   applyIncomingConversationDraftUpdate,
   getRenderedConversationMessageFingerprints,
+  holdBackLiveRow,
+  isConversationWindowAtTail,
   clearBubbleCancelState,
   removeUserBubbleCancelButton,
   updateSubagentBubbleFromStatus,
@@ -96,6 +100,17 @@ import { clearMessageSearchRuntimeState } from './message-search-view.js';
 import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
 import { mergeRelayThoughts } from './relay-thoughts.mjs';
+import { conversationPayloadCache } from './conversation-payload-cache.mjs';
+
+// A live row of the conversation on screen joins its kept window, so a
+// switch away and back still shows it. Rows of other conversations do not:
+// their kept copy is what the reader saw, and the switch back fetches the rest.
+function keepLiveRow(conversationId, message, messageId) {
+  if (IS_SHARED_VIEW || !message || typeof message !== 'object') return;
+  const id = String(message.id || messageId || '').trim();
+  if (!id) return;
+  conversationPayloadCache.upsertMessage(conversationId, message.id ? message : { ...message, id });
+}
 import {
   handleSubagentStatusEventForViewer,
   handleSubagentTimelineEvent,
@@ -335,6 +350,9 @@ export async function connectSocket(overrideDeps) {
     // session, whose restored socket.data the server deliberately resets.
     emitDeviceVisibility(document.visibilityState === 'visible');
     clearMessageSearchRuntimeState();
+    // Events missed while the socket was down may have changed any of the
+    // conversations kept for a quick switch back.
+    conversationPayloadCache.clear();
     setRelayOnline(true);
     setCliOnline(true);
     renderConvList();
@@ -346,6 +364,8 @@ export async function connectSocket(overrideDeps) {
     refreshModelCatalog().catch(() => {});
     // An open sub-agent viewer fetches whatever it missed while away.
     handleSubagentViewerReconnect();
+    // An open task console watches again and reads what it missed.
+    void handleTaskConsoleReconnect();
     // Subscriptions that changed while away.
     void loadRelayEventSubscriptions();
     // Shares made or stopped while away.
@@ -519,11 +539,15 @@ export async function connectSocket(overrideDeps) {
       })) {
         return;
       }
+      // A window that ends above the conversation's end takes no live row:
+      // the newer pages bring it, and the jump-to-bottom badge counts it.
+      if (holdBackLiveRow(conversationId, messageId || normalizedMessage.id)) return;
       // Another client's message (an agent's prompt included) follows the
       // end like any live row: a reader scrolled up stays where they are,
       // and the jump-to-bottom badge counts it.
       appendMessage(normalizedMessage, followsTranscriptEnd(), messageId);
       noteTranscriptLiveRow();
+      keepLiveRow(conversationId, normalizedMessage, messageId);
     }
   });
   socket.on('assistant_message', ({ conversationId, message, messageId, sourceMessageId }) => {
@@ -554,12 +578,15 @@ export async function connectSocket(overrideDeps) {
       restoreLiveReplyReadingPosition(reading);
       return;
     }
-    if (isCurrentConversation) {
+    // Held back under a window that ends above the conversation's end, as
+    // in user_message.
+    if (isCurrentConversation && !holdBackLiveRow(conversationId, messageId || message?.id)) {
       appendMessage(message, autoScroll, messageId || null, false, sourceMessageId || null);
       restoreLiveReplyReadingPosition(reading);
       noteTranscriptLiveRow();
-      scheduleContextUsageRefresh(conversationId, 120);
+      keepLiveRow(conversationId, message, messageId);
     }
+    if (isCurrentConversation) scheduleContextUsageRefresh(conversationId, 120);
     if (sourceMessageId) relayActivities.delete(sourceMessageId);
     if (sourceMessageId) relayThoughts.delete(sourceMessageId);
     if (sourceMessageId) clearRelayStreamStateForMessage(sourceMessageId);
@@ -574,11 +601,22 @@ export async function connectSocket(overrideDeps) {
   // cannot be started): same id, new text or kind. Not on the page yet (the
   // conversation was opened after it was written): appended like any other.
   socket.on('message_updated', ({ conversationId, messageId, message }) => {
-    if (!messageId || conversationId !== currentConvId || !message) return;
+    // A row rewritten in place. Another conversation's kept window would show
+    // the old one: it is dropped. The window on screen takes the new row as
+    // the page does, so a switch away and back keeps both the row and the
+    // window around it.
+    if (!messageId || conversationId !== currentConvId || !message) {
+      conversationPayloadCache.forget(conversationId);
+      return;
+    }
     if (!replaceRenderedMessage(message, messageId)) {
+      // A row outside a window that ends above the conversation's end: the
+      // newer pages bring it as it is now.
+      if (!isConversationWindowAtTail()) return;
       appendMessage(message, followsTranscriptEnd(), messageId, false);
     }
     noteTranscriptLiveRow();
+    keepLiveRow(conversationId, message, messageId);
   });
   socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
   socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
@@ -594,8 +632,8 @@ export async function connectSocket(overrideDeps) {
   socket.on('relay_event_subscriptions', ({ subscriptions }) => {
     applyRelayEventSubscriptions(subscriptions);
   });
-  socket.on('background_tasks', ({ conversationId, tasks }) => {
-    setConversationBackgroundTasks(conversationId, tasks);
+  socket.on('background_tasks', ({ conversationId, tasks, endedTasks }) => {
+    setConversationBackgroundTasks(conversationId, tasks, { endedTasks });
     // The sidebar's row (and its group's head) count background work as
     // running; the set arrives under the conversation or its session id.
     const id = String(conversationId || '').trim();
@@ -603,6 +641,16 @@ export async function connectSocket(overrideDeps) {
       || Object.values(conversations).find((conversation) => String(conversation?.sdkSessionId || '') === id)
       || null;
     if (record && applyBackgroundTasksToConversation(record, tasks)) renderConvList();
+  });
+  // The relay's health poller: last output time and test-runner counts of
+  // shell and Monitor tasks, only when they changed.
+  socket.on('background_tasks_health', ({ conversationId, health }) => {
+    setConversationTaskHealth(conversationId, health);
+  });
+  // New bytes of the task the console shows; the relay sends them only while
+  // this page's console watches that task.
+  socket.on('task_output_chunk', (payload) => {
+    handleTaskOutputChunk(payload);
   });
   // A message was pinned or unpinned (any client): the conversation's whole
   // pin list, replacing what this page had.
@@ -738,6 +786,8 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('conversation_compacted', async ({ sourceConversationId, targetConversationId }) => {
     if (!sourceConversationId || !targetConversationId) return;
+    conversationPayloadCache.forget(sourceConversationId);
+    conversationPayloadCache.forget(targetConversationId);
     await refreshConversations();
     if (currentConvId === sourceConversationId) {
       await openConversation(targetConversationId);
@@ -827,7 +877,7 @@ export async function connectSocket(overrideDeps) {
     applyConversationTurnStatus({ conversationId, messageId, status });
     if (conversationId && conversations[conversationId]) {
       const conversation = conversations[conversationId];
-      // The row's turn fields follow the event, open or not: the dots, a
+      // The row's turn fields follow the event, open or not: the title colour, a
       // group head's pill and its fold read them between list fetches.
       applyTurnStatusToConversation(conversation, normalizedStatus);
       if (normalizedStatus === 'processing') {
@@ -892,6 +942,7 @@ export async function connectSocket(overrideDeps) {
     if (!id) return;
     const conversation = conversations[id];
     if (conversation) conversation.archived = archived !== false;
+    conversationPayloadCache.forget(id);
     renderConvList();
     if (currentConvId === id) {
       syncChatTitleControls();
@@ -900,6 +951,7 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('conversation_deleted', ({ conversationId }) => {
     delete conversations[conversationId];
+    conversationPayloadCache.forget(conversationId);
     for (const [id, question] of relayQuestions.entries()) {
       if (question?.conversationId === conversationId) relayQuestions.delete(id);
     }

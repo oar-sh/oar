@@ -1,0 +1,31 @@
+• Packages in scope: compass-core, compass-docs, compass-ui, compass-web
+• Running test in 4 packages
+• Remote caching disabled
+compass-core:test: cache hit, replaying logs 4f1c2a9b7d3e8a10
+compass-core:test: 
+compass-core:test: > compass-core@0.4.1 test /home/dev/compass/packages/core
+compass-core:test: > node --test
+compass-core:test: 
+compass-core:test: ℹ tests 38
+compass-core:test: ℹ pass 38
+compass-core:test: ℹ fail 0
+compass-ui:test: cache miss, executing 9e8d7c6b5a4f3e21
+compass-docs:test: cache miss, executing 2b3c4d5e6f708192
+compass-web:test: cache miss, executing 7a6b5c4d3e2f1a09
+compass-web:test: 
+compass-web:test: > compass-web@0.4.1 test /home/dev/compass/apps/web
+compass-web:test: > vitest run
+compass-web:test: 
+compass-web:test:  Test Files  1 failed | 5 passed (6)
+compass-web:test:       Tests  1 failed | 64 passed (65)
+compass-web:test:  ELIFECYCLE  Test failed. See above for more details.
+compass-web:test: ERROR: command finished with error: command (/home/dev/compass/apps/web) /usr/local/bin/pnpm run test exited (1)
+compass-ui:test: 
+compass-docs:test: 
+
+ Tasks:    3 successful, 4 total
+Cached:    1 cached, 4 total
+  Time:    8.412s 
+Failed:    compass-web#test
+
+ ERROR  run failed: command  exited (1)

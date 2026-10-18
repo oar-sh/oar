@@ -27,6 +27,7 @@ import {
 import { schemaFields } from '../../shared/question-schema.mjs';
 import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 import { RELAY_EVENT_DEFAULT_TYPES } from '../../shared/relay-events.mjs';
+import { cleanTaskOutput, parseRunnerSummary, stallMinutes, stripSgr } from '../../shared/task-output-text.mjs';
 import {
   RELAY_EVENT_REMOTE_PULL_PATH,
   RELAY_EVENT_REMOTE_SUBSCRIBE_PATH,
@@ -1281,7 +1282,37 @@ export function createRemoteRelayDispatcher({
    * `lastActivityAt` of a session, from the relay's `sessionState` /
    * `sessionTasks`. A relay that predates them gives none.
    */
-  function sessionActivityFields(row) {
+  /**
+   * The console facts read_session adds to a task (`row` is the conversation
+   * payload): `taskId` for read_task_output, `output` whether there is any to
+   * read, and `health` (minutes since the last output, the quiet threshold,
+   * test-run counts) for a task with an output file.
+   */
+  function taskConsoleFields(row, id) {
+    const taskId = toText(id);
+    if (!taskId || !isPlainObject(row)) return {};
+    const live = (Array.isArray(row.backgroundTasks) ? row.backgroundTasks : []).find((task) => toText(task?.taskId) === taskId);
+    const ended = live ? null : (Array.isArray(row.endedBackgroundTasks) ? row.endedBackgroundTasks : []).find((task) => toText(task?.taskId) === taskId);
+    const task = live || ended;
+    if (!task) return {};
+    const kind = toText(task.outputKind) || (toText(task.outputPath) ? 'file' : 'none');
+    const health = isPlainObject(task.health) ? task.health : null;
+    const quietAfter = Number(row.taskStallMinutes) || null;
+    const minutes = live && health ? stallMinutes(health.lastOutputAt, now()) : null;
+    return {
+      taskId,
+      output: kind !== 'none',
+      ...(health ? {
+        health: {
+          ...(minutes !== null ? { minutesSinceOutput: minutes } : {}),
+          ...(quietAfter && minutes !== null ? { quiet: minutes >= quietAfter, quietAfterMinutes: quietAfter } : {}),
+          ...(isPlainObject(health.counts) ? { counts: { runner: toText(health.runner) || null, ...health.counts } } : {}),
+        },
+      } : {}),
+    };
+  }
+
+  function sessionActivityFields(row, { console: withConsole = false } = {}) {
     const state = toText(row?.sessionState);
     if (!SESSION_STATES.has(state)) return {};
     const tasks = (Array.isArray(row?.sessionTasks) ? row.sessionTasks : [])
@@ -1298,6 +1329,7 @@ export function createRemoteRelayDispatcher({
         ...(toText(task.summary) && toText(task.status) !== 'running' ? { summary: clipLine(task.summary, 200) } : {}),
         ...(task.endedAt ? { endedAt: task.endedAt } : {}),
         ...(toText(task.id) ? { id: toText(task.id) } : {}),
+        ...(withConsole ? taskConsoleFields(row, task.id) : {}),
       }));
     return {
       state,
@@ -1487,7 +1519,7 @@ export function createRemoteRelayDispatcher({
         cwd: toText(conversation?.currentWorkspaceRootPath) || null,
         archived: conversation?.archived === true,
         active: conversation?.activeTurn === true || isBusyState(conversation?.sessionState),
-        ...sessionActivityFields(conversation),
+        ...sessionActivityFields(conversation, { console: true }),
         ...(via ? { via } : {}),
         ...(group ? { group } : {}),
         openUrl: remoteConversationUrl(ctx.relay.url, conversationId) || null,
@@ -1497,6 +1529,101 @@ export function createRemoteRelayDispatcher({
       pendingQuestions,
       ...(olderCursor ? { olderCursor } : {}),
       ...(omitted > 0 ? { note: `${omitted} older message${omitted === 1 ? '' : 's'} left out to stay within max_chars; pass olderCursor as before to read them.` } : {}),
+    };
+  }
+
+  /**
+   * read_task_output: the end of a background shell or Monitor task's
+   * output (GET …/background-task/:taskId/output on the target relay, which
+   * scrubs it), as plain lines without colours, at most `lines` lines and
+   * 32 KB; minutes since its last output; test-run counts when it is one.
+   */
+  async function readTaskOutput(ctx, args) {
+    let answer;
+    try {
+      answer = await call(ctx, 'GET', sessionPath(args.session, `/background-task/${encodeURIComponent(args.task_id)}/output`), {
+        query: { lines: args.lines },
+      });
+    } catch (error) {
+      const status = Number(error?.status) || null;
+      if (isRemoteRelayError(error) && (status === 404 || toText(error.code) === REMOTE_RELAY_ERROR_CODES.notFound)) {
+        const body = isPlainObject(error.remoteBody) ? error.remoteBody : {};
+        if (toText(body.code) === 'task-not-found') {
+          throw new DispatchFailure(404, REMOTE_RELAY_ERROR_CODES.notFound,
+            `Task ${args.task_id} is not running in session ${args.session} on relay "${ctx.relay.name}" and did not end there within the last hour; read_session lists the session's tasks.`);
+        }
+        if (!/conversation not found/i.test(toText(body.error))) {
+          throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unsupported,
+            `Relay "${ctx.relay.name}" cannot show background task output (it runs an older OAR version).`);
+        }
+      }
+      throw error;
+    }
+    const model = Array.isArray(answer?.lines) ? answer.lines : [];
+    const task = isPlainObject(answer?.task) ? answer.task : {};
+    const ended = answer?.ended === true;
+    // Plain text, a repeat folded as ×N; cleaned again, whatever the other
+    // side did.
+    const rendered = model.map((line) => {
+      const text = stripSgr(cleanTaskOutput(String(line?.text ?? '')));
+      const count = Number(line?.count) > 1 ? Number(line.count) : 1;
+      return count > 1 ? `${text}  [×${count}]` : text;
+    });
+    let tail = rendered.slice(-args.lines);
+    let cut = tail.length < rendered.length;
+    let bytes = 0;
+    let keepFrom = tail.length;
+    for (let index = tail.length - 1; index >= 0; index -= 1) {
+      bytes += Buffer.byteLength(tail[index], 'utf8') + 1;
+      if (bytes > REMOTE_RELAY_LIMITS.taskOutputBytesMax) break;
+      keepFrom = index;
+    }
+    if (keepFrom > 0) {
+      tail = tail.slice(keepFrom);
+      cut = true;
+    }
+    const health = isPlainObject(answer?.health) ? answer.health : null;
+    const lastOutputAt = Number(health?.lastOutputAt) || Number(answer?.mtime) || null;
+    const minutes = !ended && lastOutputAt ? stallMinutes(lastOutputAt, now()) : null;
+    const quietAfter = Number(answer?.taskStallMinutes) || null;
+    let counts = null;
+    if (isPlainObject(health?.counts)) {
+      counts = { runner: toText(health.runner) || null, ...health.counts, final: health.final === true };
+    } else {
+      const parsed = parseRunnerSummary(model);
+      if (parsed) counts = { runner: parsed.runner, passed: parsed.passed, failed: parsed.failed, skipped: parsed.skipped, final: parsed.final };
+    }
+    const kind = toText(answer?.kind) || 'file';
+    let note = null;
+    if (kind === 'none') note = toText(answer?.message) || 'Output is not available for this provider.';
+    else if (answer?.pending) note = 'The session\'s worker was asked for the output; call again in a few seconds.';
+    else if (answer?.unavailable) note = 'The output file is not there any more (the provider cleaned it up).';
+    else if (kind === 'snapshot') note = 'Only the end of this task\'s output is available (its provider keeps no file).';
+    const status = ended ? (toText(answer?.status) || 'unknown') : 'running';
+    const exitCode = Number.isInteger(answer?.exitCode) ? answer.exitCode : null;
+    const parts = [`${tail.length} line${tail.length === 1 ? '' : 's'}`, ended ? `ended (${status}${exitCode !== null ? `, exit ${exitCode}` : ''})` : 'running'];
+    if (minutes !== null) parts.push(`last output ${minutes} min ago`);
+    if (counts) parts.push(`${counts.passed} passed, ${counts.failed} failed`);
+    return {
+      summary: `read_task_output → ${ctx.relay.name} session ${shortId(args.session)} task ${shortId(args.task_id)}: ${parts.join(', ')}`,
+      task: {
+        id: args.task_id,
+        description: toText(task.description),
+        type: toText(task.taskType) || null,
+        startedAt: task.startedAt || null,
+        status,
+        exitCode,
+        ...(task.endedAt ? { endedAt: task.endedAt } : {}),
+      },
+      stall: minutes === null ? null : {
+        minutes,
+        since: new Date(lastOutputAt).toISOString(),
+        ...(quietAfter ? { quiet: minutes >= quietAfter, quietAfterMinutes: quietAfter } : {}),
+      },
+      counts,
+      tail,
+      truncated: cut || answer?.hasMoreBefore === true,
+      ...(note ? { note } : {}),
     };
   }
 
@@ -2272,6 +2399,7 @@ export function createRemoteRelayDispatcher({
     usage: usageAction,
     list_sessions: listSessions,
     read_session: readSession,
+    read_task_output: readTaskOutput,
     wait: waitAction,
     send,
     create_session: createSession,

@@ -329,14 +329,15 @@ for (const profile of [
       await openSidebar(page);
       const pill = row(page, seeded.lead).locator(".conv-group-summary");
       await expect(pill).toHaveText("3 · 3 running");
-      await expect(row(page, seeded.tests).locator(".conv-processing-dots")).toHaveCount(1);
+      await expect(row(page, seeded.tests)).toHaveClass(/conv-working/);
+      await expect(page.locator("#conv-list .conv-processing-dots")).toHaveCount(0);
       // The tests member answers: its turn ends while the lone chat is open.
-      // No list fetch follows; the pill, the dots and the menu must follow
+      // No list fetch follows; the pill, the working mark and the menu must follow
       // the live event alone.
       const replied = await api("/api/response", { method: "POST", body: { messageId: seeded.testsMessage, conversationId: seeded.tests, text: "all green", model: "gpt-5.4-mini", mode: "agent" } });
       expect(replied.status).toBe(200);
       await expect(pill).toHaveText("3 · 2 running", { timeout: 10_000 });
-      await expect(row(page, seeded.tests).locator(".conv-processing-dots")).toHaveCount(0);
+      await expect(row(page, seeded.tests)).not.toHaveClass(/conv-working/);
       const menu = await openRowMenu(page, row(page, seeded.lead));
       await expect(menu.locator('[data-menu-item="group-stop"]')).toHaveText("Stop all running (2)");
       await page.keyboard.press("Escape");
@@ -350,12 +351,14 @@ for (const profile of [
       const published = await api("/api/background-tasks", { method: "POST", body: { conversationId: seeded.tests, tasks: [{ taskId: "task-build", taskType: "shell", description: "npm run build", startedAt: Date.now() }] } });
       expect(published.status).toBe(200);
       await expect(pill).toHaveText("3 · 3 running", { timeout: 10_000 });
+      await expect(row(page, seeded.tests)).toHaveClass(/conv-working/);
       const withTask = await openRowMenu(page, row(page, seeded.lead));
       await expect(withTask.locator('[data-menu-item="group-stop"]')).toHaveText("Stop all running (3)");
       await page.keyboard.press("Escape");
       const cleared = await api("/api/background-tasks", { method: "POST", body: { conversationId: seeded.tests, tasks: [] } });
       expect(cleared.status).toBe(200);
       await expect(pill).toHaveText("3 · 2 running", { timeout: 10_000 });
+      await expect(row(page, seeded.tests)).not.toHaveClass(/conv-working/);
     });
 
     test("a member's activity lifts the group above the newer lone chat; the filter shows a member under its head", async ({ page }) => {

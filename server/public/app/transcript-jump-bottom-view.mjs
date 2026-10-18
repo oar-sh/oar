@@ -15,10 +15,12 @@
 // (the background-task panel appears or opens, a banner, a taller draft) the
 // transcript shrinks from below, scrollTop stays and no scroll event fires,
 // so the reader is left that many pixels above the end and the next update
-// stops following. The ResizeObserver here puts them back before paint.
+// stops following. The ResizeObserver here puts them back before paint, and
+// an update that lands before its round still follows (a reply streaming in
+// right after the panel grew).
 
 import { currentConvId, isMessagesNearBottom, scrollBottom } from './store.js';
-import { isConversationWindowAtTail } from './conversation-view.js';
+import { getHeldBackLiveRowCount, isConversationWindowAtTail, releaseReadingAnchorHold } from './conversation-view.js';
 import { disarmThinkingFollow, getThinkingFollowMode, syncThinkingFollowButtons } from './thinking-follow.js';
 import { resolveNearBottomThresholdPx } from './transcript-viewport-anchor.mjs';
 import {
@@ -28,6 +30,7 @@ import {
 } from './composer-keyboard.mjs';
 import {
   isScrollOnSendEnabled,
+  followsEndThroughResize,
   isNearBottom,
   jumpButtonPresentation,
   jumpScrollBehavior,
@@ -156,6 +159,8 @@ function update() {
     nearBottomPx,
     rowKeys: away ? rowKeys(el) : [],
     question: away && questionWaitingBelow(el),
+    windowAtTail: isConversationWindowAtTail(),
+    waiting: getHeldBackLiveRowCount(),
   });
   render(state);
 }
@@ -187,7 +192,18 @@ export function onTranscriptEndLeft(listener) {
  * so itself (a row is counted, anything else calls noteTranscriptNews()).
  */
 export function followsTranscriptEnd() {
-  return isMessagesNearBottom();
+  // The bottom of a window that ends above the conversation's end is not the
+  // end: nothing live is drawn there, and nothing scrolls to it.
+  if (!isConversationWindowAtTail()) return false;
+  const el = scroller();
+  const height = jump ? null : observedClientHeight;
+  return followsEndThroughResize({
+    nearBottomNow: isMessagesNearBottom(),
+    clientHeight: el?.clientHeight,
+    observedClientHeight: height,
+    distanceAtObservedHeight: el && height !== null ? Math.max(0, el.scrollHeight - height - el.scrollTop) : null,
+    nearBottomPxAtObservedHeight: height !== null ? resolveNearBottomThresholdPx(height) : 0,
+  });
 }
 
 /**
@@ -257,7 +273,13 @@ export function ownSendFollows(send) {
  * shrinking back): each step asks again.
  */
 export function scrollAfterOwnSend(send) {
-  const step = () => { if (ownSendFollows(send)) scrollBottom(); };
+  const step = () => {
+    if (!ownSendFollows(send)) return;
+    // A place held while images load would take this scroll for the reader's
+    // and let go only then; the send moves the reader, so it lets go first.
+    releaseReadingAnchorHold();
+    scrollBottom();
+  };
   step();
   requestAnimationFrame(step);
   setTimeout(step, 120);
@@ -331,10 +353,18 @@ function prefersReducedMotion() {
   try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch { return false; }
 }
 
+/**
+ * Takes the reader to the end. From a window that ends above the
+ * conversation's end, the end is loaded first: the promise settles once it
+ * is on the page (or the load failed), which an own send from such a window
+ * waits for.
+ */
 export function jumpTranscriptToBottom() {
   const el = scroller();
-  if (!el) return;
-  // The end wins over a followed section of the live bubble.
+  if (!el) return Promise.resolve();
+  // The end wins over a place held while images load, as over a followed
+  // section of the live bubble.
+  releaseReadingAnchorHold();
   if (getThinkingFollowMode()) {
     disarmThinkingFollow();
     syncThinkingFollowButtons(document, null);
@@ -346,11 +376,10 @@ export function jumpTranscriptToBottom() {
   if (loadConversationEnd && !isConversationWindowAtTail()) {
     endJump();
     jump = { cleanup() {} };
-    void Promise.resolve()
+    return Promise.resolve()
       .then(() => loadConversationEnd())
       .catch(() => {})
       .finally(finishJump);
-    return;
   }
   const behavior = jumpScrollBehavior({
     distance: distanceFromBottom(el),
@@ -359,6 +388,7 @@ export function jumpTranscriptToBottom() {
   });
   if (behavior === 'smooth') startSmoothJump(el);
   else finishJump();
+  return Promise.resolve();
 }
 
 function handleScroll() {

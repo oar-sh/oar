@@ -127,6 +127,24 @@ function isReadable(block, rect) {
   return typeof block.closest !== 'function' || !block.closest('details:not([open]) > :not(summary)');
 }
 
+// Where restoreReadingBlock last put a block, per scroller. scrollTop takes
+// whole pixels, so the block lands up to half a pixel off the offset it was
+// asked for. Rows are rebuilt twice in a row when a turn ends (the reply
+// takes the live bubble's place, then the reload after the turn), and each
+// capture would take the last landing as the truth: the halves added up to
+// more than a pixel.
+const lastRestored = new WeakMap();
+
+// The offset the block was put at, while the reader is still there: the
+// same block, scrollTop as it was left, and the block no further off than
+// the rounding.
+function intendedOffset(el, tag, text, measured) {
+  const restored = lastRestored.get(el);
+  if (!restored || restored.tag !== tag || restored.text !== text) return measured;
+  if (Number(el.scrollTop || 0) !== restored.scrollTop) return measured;
+  return Math.abs(measured - restored.offset) <= 0.5 ? restored.offset : measured;
+}
+
 /**
  * The block of text the reader is at: the first one that starts inside the
  * viewport, else the one that reaches into it from above (a code block
@@ -167,7 +185,7 @@ export function captureReadingBlock(el, { scope = null } = {}) {
   const tag = String(block.tagName || '').toLowerCase();
   const text = blockText(block);
   const height = Math.max(0, rect.bottom - rect.top);
-  const offset = rect.top - view.top;
+  const offset = intendedOffset(el, tag, text, rect.top - view.top);
   return {
     messageId: String(foundScope?.dataset?.messageId || '').trim() || null,
     // Read in the live bubble: the reply that replaces it is another row.
@@ -220,6 +238,7 @@ export function restoreReadingBlock(el, anchor, { scope = null } = {}) {
     : Number(anchor.offsetFraction) * Math.max(0, rect.bottom - rect.top);
   const delta = rect.top - view.top - target;
   if (Math.abs(delta) > 0.5) el.scrollTop = Number(el.scrollTop || 0) + delta;
+  lastRestored.set(el, { tag: anchor.tag, text: anchor.text, offset: target, scrollTop: Number(el.scrollTop || 0) });
   return true;
 }
 

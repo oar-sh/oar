@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
+import { createQuestionRepository } from '../repositories/question-repository.mjs';
 import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { createPreviewRegistry, normalizePreviewsConfig } from '../services/preview-registry-service.mjs';
@@ -98,11 +99,18 @@ function setup({
   knownTokens = [PREVIEW_TOKEN, LISTED_TOKEN, FOREIGN_TOKEN],
   // (db) => registry: the real registry on the test database instead of stubs.
   makeRegistry = null,
+  // The preview_cards statements of the question repository, for cards
+  // written to the test database itself.
+  previewCardStatements = false,
 } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   const registry = makeRegistry ? makeRegistry(db) : null;
-  const stmts = { ...createSessionRepository(db), ...createMessageRepository(db) };
+  const stmts = {
+    ...createSessionRepository(db),
+    ...createMessageRepository(db),
+    ...(previewCardStatements ? createQuestionRepository(db) : {}),
+  };
   const emitted = [];
   const app = createMockApp();
   registerSessionsRoutes(app, {
@@ -511,4 +519,31 @@ test('the runtime hands the share route the registry\'s known tokens', () => {
   const runtimeSource = fs.readFileSync(new URL('../server-runtime.mjs', import.meta.url), 'utf8');
   assert.match(runtimeSource, /listKnownPreviewTokens: \(\) => previewRegistry\.knownTokens\(\),/);
   assert.match(runtimeSource, /listConversationPreviews: \(conversationId\) => previewRegistry\.listForConversation\(conversationId\),/);
+});
+
+// A preview that is closed and forgotten: no registry lists it any more, and
+// only its card on an old reply still names the token. A whole link is
+// redacted by its shape; a bare token only when it is known, so the reply
+// below quotes the bare token.
+const DEAD_TOKEN = '9f8e7d6c5b4a39281706f5e4d3c2b1a0';
+
+test('a shared page redacts the link of a card on a reply outside the page', async () => {
+  const fx = setup({ previewCardStatements: true });
+  fx.insertConversation('conv-1');
+  fx.insertMessage('conv-1', 'user-old', 'user', 'Publish the old site.', '2026-10-05T08:00:00.000Z');
+  fx.insertMessage('conv-1', 'reply-old', 'assistant', 'Published.', '2026-10-05T08:00:05.000Z');
+  fx.db.prepare(`
+    INSERT INTO preview_cards (id, queue_message_id, response_message_id, conversation_id, preview_json, created_at)
+    VALUES ('card-old', 'user-old', 'reply-old', 'conv-1', ?, '2026-10-05T08:00:04.000Z')
+  `).run(JSON.stringify({ ...PREVIEW_SNAPSHOT, token: DEAD_TOKEN, label: 'old site' }));
+  for (let index = 0; index < 6; index += 1) {
+    fx.insertMessage('conv-1', `filler-${index}`, index % 2 ? 'assistant' : 'user', `Step ${index}.`, `2026-10-05T09:0${index}:00.000Z`);
+  }
+  fx.insertMessage('conv-1', 'user-new', 'user', 'Where was the old one?', '2026-10-05T10:00:00.000Z');
+  fx.insertMessage('conv-1', 'reply-new', 'assistant', `Its token was ${DEAD_TOKEN}.`, '2026-10-05T10:00:05.000Z');
+  const share = await fx.call('POST /api/conversation/:id/share', { params: { id: 'conv-1' } });
+  const shared = await fx.call('GET /api/shared/:token', { params: { token: share.body.token }, query: { limit: '2' } });
+  assert.equal(shared.status, 200);
+  assert.deepEqual(shared.body.messages.map((message) => message.id), ['user-new', 'reply-new']);
+  assert.ok(!JSON.stringify(shared.body).toLowerCase().includes(DEAD_TOKEN), 'the dead token escaped redaction');
 });

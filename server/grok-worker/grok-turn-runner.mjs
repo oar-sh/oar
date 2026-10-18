@@ -122,8 +122,12 @@ export function createGrokTurnRunner({
   // gets through ACP `mcpServers`; undefined builds the default for this
   // worker's conversation, null leaves Grok without it.
   oarMcpServer = undefined,
+  // The terminals' background-task rows (grok-background-tasks.mjs), built
+  // by the worker entry; without one no terminal is published.
+  taskPublisher = null,
   dbg = () => {},
 } = {}) {
+  const terminalTasks = taskPublisher;
   // The OAR MCP server gives Grok the relay's real tools — `preview`, and
   // `remote_relay` when remotes are paired — bound to this conversation.
   // `OAR_MCP_SERVER=0` is the operator's way back to the preview instruction
@@ -203,6 +207,7 @@ export function createGrokTurnRunner({
       alwaysApprove,
       nativeSessionId: resumeId,
       model,
+      ...(terminalTasks ? { taskObserver: terminalTasks } : {}),
       // The adapter builds the ACP client and opens the session in one step,
       // so the client it builds must already carry the MCP servers — for
       // session/new and for session/load alike.
@@ -611,6 +616,12 @@ export function createGrokTurnRunner({
     getActiveQueueAttempt,
     isTurnActive,
     dispose,
+    // The terminals as background tasks: the heartbeat's digest and resync,
+    // the panel's Stop, kept settle notices.
+    backgroundTaskIds: () => terminalTasks?.backgroundTaskIds() || [],
+    resyncBackgroundTasks: () => terminalTasks?.resync(),
+    stopBackgroundTask: (taskId) => terminalTasks?.stop(taskId) || false,
+    flushKeptTaskSettles: () => terminalTasks?.flushKeptSettles(),
     setTurnCeilingMs(value) {
       const ms = Number(value);
       turnCeilingMs = Number.isFinite(ms) && ms >= 0 ? ms : null;

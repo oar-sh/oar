@@ -374,20 +374,25 @@ test('a fetched row is the truth and a gone worker ends its background work; the
   assert.equal(store.conversations['conv-docs'].backgroundTaskCount, 1);
   let items = menuOf(headRow('conv-lead'));
   assert.deepEqual(items.find(([id]) => id === 'group-stop').slice(1), [false, 'Stop all running (1)'], 'background work counts');
+  const docsWorking = () => document.querySelector('#conv-list [data-conversation-id="conv-docs"]').classList.contains('conv-working');
+  assert.equal(docsWorking(), true, 'background work keeps the title bright');
   // The status poll answers without a worker for it: the work is gone with the worker.
   store.setSessionWorkerStatesFromStatusPayload({ workers: [] });
   journal.renderConvList();
   items = menuOf(headRow('conv-lead'));
   assert.deepEqual(items.find(([id]) => id === 'group-stop').slice(1), [true, 'Stop all running (0)'], 'no live worker, no background work');
+  assert.equal(docsWorking(), false);
   // A live worker brings it back.
   store.setSessionWorkerStatesFromStatusPayload({ workers: [{ sdkSessionId: 'conv-docs', status: 'ready' }] });
   journal.renderConvList();
   assert.deepEqual(menuOf(headRow('conv-lead')).find(([id]) => id === 'group-stop').slice(1), [false, 'Stop all running (1)']);
+  assert.equal(docsWorking(), true);
   // A reconnect fetches the list again: what the relay says replaces what the events left.
   rows[1].sessionState = 'idle';
   rows[1].sessionTasks = [];
   await journal.refreshLoadedConversations();
   assert.deepEqual(menuOf(headRow('conv-lead')).find(([id]) => id === 'group-stop').slice(1), [true, 'Stop all running (0)']);
+  assert.equal(docsWorking(), false);
   delete rows[1].activeTurn;
   delete rows[1].sessionState;
   delete rows[1].sessionTasks;

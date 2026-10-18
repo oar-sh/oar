@@ -297,4 +297,47 @@ test.describe("tabbed settings modal", () => {
     await expectActiveTab(page, "providers");
     await expectActiveProviderTab(page, "claude");
   });
+
+  test("the Claude background command limit slider saves and survives a reload", async ({ page }) => {
+    const authorization = { Authorization: `Bearer ${relayToken()}` };
+    const readLimit = async () => {
+      const response = await page.request.get("/api/settings/claude", { headers: authorization });
+      expect(response.ok()).toBe(true);
+      return (await response.json()).backgroundCommandLimitMinutes;
+    };
+    const writeLimit = (minutes) => page.request.post("/api/settings/claude", {
+      headers: authorization,
+      data: { backgroundCommandLimitMinutes: minutes },
+    });
+
+    try {
+      expect((await writeLimit(120)).ok()).toBe(true);
+      await loadApp(page);
+      await openSettings(page, "providers", "claude");
+      const slider = page.locator("#claude-background-command-limit-slider");
+      const value = page.locator("#claude-background-command-limit-value");
+      await expect(slider).toBeVisible();
+      await expect(slider).toHaveValue("120");
+      await expect(value).toHaveText("2 h");
+      await expect(providerPanel(page, "claude")).toContainText("Applies to Claude sessions started after you save");
+
+      await slider.fill("240");
+      await expect(value).toHaveText("4 h");
+      await page.locator("#claude-save-btn").click();
+      await expect.poll(readLimit).toBe(240);
+
+      await loadApp(page);
+      await openSettings(page, "providers", "claude");
+      await expect(slider).toHaveValue("240");
+      await expect(value).toHaveText("4 h");
+
+      // The relay clamps to 30 min … 8 h on 30-minute steps.
+      const clamped = await writeLimit(1000);
+      expect((await clamped.json()).backgroundCommandLimitMinutes).toBe(480);
+      expect((await (await writeLimit(100)).json()).backgroundCommandLimitMinutes).toBe(90);
+      expect((await writeLimit("soon")).status()).toBe(400);
+    } finally {
+      await writeLimit(120);
+    }
+  });
 });

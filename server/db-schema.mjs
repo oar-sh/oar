@@ -22,6 +22,7 @@ import { migratePreviews } from './migrations/0013-previews.mjs';
 import { migrateConversationGroups } from './migrations/0014-conversation-groups.mjs';
 import { migrateConversationGroupPosition } from './migrations/0015-conversation-group-position.mjs';
 import { migrateShareAccessLog } from './migrations/0016-share-access-log.mjs';
+import { migrateConversationHistoryIndexes } from './migrations/0017-conversation-history-indexes.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -834,6 +835,14 @@ try {
   migrateShareAccessLog(db);
 } catch (error) {
   console.warn(`[shares] migration 0016 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Two indexes for the history of long conversations. Only speed depends on
+// them, so a failure is logged and retried next boot like 0016.
+try {
+  migrateConversationHistoryIndexes(db);
+} catch (error) {
+  console.warn(`[history] migration 0017 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

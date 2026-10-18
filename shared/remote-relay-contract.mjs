@@ -37,6 +37,7 @@ export const REMOTE_RELAY_ACTIONS = Object.freeze([
   'usage',
   'list_sessions',
   'read_session',
+  'read_task_output',
   'wait',
   'send',
   'create_session',
@@ -63,6 +64,7 @@ export const REMOTE_RELAY_ACTION_PERMISSION = Object.freeze({
   usage: 'read',
   list_sessions: 'read',
   read_session: 'read',
+  read_task_output: 'read',
   wait: 'read',
   send: 'prompt',
   create_session: 'full',
@@ -120,6 +122,11 @@ export const REMOTE_RELAY_LIMITS = Object.freeze({
   listMax: 100,
   readDefault: 10,
   readMax: 50,
+  // read_task_output: lines of a background task's output, and the most
+  // text one call returns.
+  taskOutputLinesDefault: 200,
+  taskOutputLinesMax: 500,
+  taskOutputBytesMax: 32 * 1024,
   maxCharsDefault: 12000,
   maxCharsMax: 50000,
   perMessageChars: 4000,
@@ -235,6 +242,9 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'usage reports what the provider plans of a relay have left (Copilot, Claude, Claude Cloud, Cursor, Grok: '
   + 'meters with used, allowance, remaining, utilization and reset time; providers not set up or not tracked say so) '
   + 'and whether a Claude usage limit has paused turns there, before you start work that costs. '
+  + 'read_task_output {session, task_id} reads the end of a background shell or Monitor task\'s output there '
+  + '(task ids from read_session\'s tasks; also for an hour after the task ended): the last lines, minutes '
+  + 'since its last output, and pass/fail counts when it is a test run; credentials are scrubbed. '
   + 'Event subscriptions: subscribe to sessions of this relay or of a paired relay (ids, or "all" for every '
   + 'session there, later ones too) and the relay wakes you with a message when something happens there: '
   + 'question_asked (with the question and its options), error (failed turn, usage limit, worker died), '
@@ -263,7 +273,8 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
       type: 'string',
       enum: [...REMOTE_RELAY_ACTIONS],
       description: 'list_relays: the relays (this one included when allowed) and whether each is unlocked here. relay_info: providers, models, '
-        + 'workspaces of a relay. usage: what each provider\'s plan has left there and any usage-limit pause. list_sessions / read_session: discover and read sessions. send: prompt an '
+        + 'workspaces of a relay. usage: what each provider\'s plan has left there and any usage-limit pause. list_sessions / read_session: discover and read sessions. '
+        + 'read_task_output: the end of a background shell task\'s output. send: prompt an '
         + 'existing session. create_session: start a new session with a first prompt. wait: keep waiting for '
         + 'a reply. answer_question: answer a question the remote agent asked. stop: stop the running turn. '
         + 'archive: archive a session. subscribe / unsubscribe / list_subscriptions / transfer_subscriptions: '
@@ -371,6 +382,13 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     subscription_id: { type: 'string', description: 'unsubscribe: the id subscribe returned, or "all".' },
     watcher: { type: 'string', description: 'list_subscriptions: another conversation\'s id, to see its subscriptions (default: this one).' },
     from: { type: 'string', description: 'transfer_subscriptions: the id of the conversation whose subscriptions move here.' },
+    task_id: { type: 'string', description: 'read_task_output: the background task\'s id (taskId in read_session\'s tasks).' },
+    lines: {
+      type: 'integer',
+      minimum: 1,
+      maximum: REMOTE_RELAY_LIMITS.taskOutputLinesMax,
+      description: `read_task_output: how many of the last output lines (default ${REMOTE_RELAY_LIMITS.taskOutputLinesDefault}).`,
+    },
   },
   required: ['action'],
 });
@@ -390,7 +408,7 @@ function invalid(error) {
   return { ok: false, code: REMOTE_RELAY_ERROR_CODES.invalidInput, error };
 }
 
-const SESSION_ACTIONS = new Set(['read_session', 'wait', 'send', 'stop', 'archive']);
+const SESSION_ACTIONS = new Set(['read_session', 'read_task_output', 'wait', 'send', 'stop', 'archive']);
 
 /**
  * The longest wait a relay may be set to allow, from whatever was stored or
@@ -495,6 +513,18 @@ export function validateRemoteRelayToolInput(input = {}, { maxWaitSeconds } = {}
     args.max_chars = maxChars;
     args.include_activity = input?.include_activity === true || toText(input?.include_activity).toLowerCase() === 'true';
     optionalText('before', 1000);
+  } else if (action === 'read_task_output') {
+    const taskId = toText(input?.task_id);
+    if (!taskId) return invalid('read_task_output needs task_id (a taskId from read_session\'s tasks)');
+    if (taskId.length > 200 || /[\s/\\]/.test(taskId)) return invalid('task_id is not a task id');
+    args.task_id = taskId;
+    const lines = clampInteger(input?.lines, {
+      min: 1,
+      max: REMOTE_RELAY_LIMITS.taskOutputLinesMax,
+      fallback: REMOTE_RELAY_LIMITS.taskOutputLinesDefault,
+    });
+    if (lines === null) return invalid('lines must be a number');
+    args.lines = lines;
   } else if (action === 'wait') {
     const messageId = toText(input?.message_id);
     if (!messageId) return invalid('wait needs message_id (from send or create_session)');

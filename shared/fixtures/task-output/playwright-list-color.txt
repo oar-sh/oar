@@ -1,0 +1,26 @@
+
+[2mRunning [22m2[2m tests using [22m1[2m worker[22m
+
+  [32m✓[39m  [2m1 [22mharbor.spec.mjs:2:1 › harbor gate opens[2m (20ms)[22m
+  [31m✘[39m  [2m2 [22m[31mharbor.spec.mjs:3:1 › harbor bell rings twice[39m[2m (8ms)[22m
+
+
+[31m  1) harbor.spec.mjs:3:1 › harbor bell rings twice [2m─────────────────────────────────────────────────[22m[39m
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"[7mtwi[27mce"[39m
+    Received: [31m"[7mon[27mce"[39m
+
+    [0m [90m 1 |[39m [36mimport[39m { test[33m,[39m expect } [36mfrom[39m [32m'@playwright/test'[39m[33m;[39m
+     [90m 2 |[39m test([32m'harbor gate opens'[39m[33m,[39m [36masync[39m () [33m=>[39m { expect([35m2[39m [33m+[39m [35m2[39m)[33m.[39mtoBe([35m4[39m)[33m;[39m })[33m;[39m
+    [31m[1m>[22m[39m[90m 3 |[39m test([32m'harbor bell rings twice'[39m[33m,[39m [36masync[39m () [33m=>[39m { expect([32m'once'[39m)[33m.[39mtoBe([32m'twice'[39m)[33m;[39m })[33m;[39m
+     [90m   |[39m                                                              [31m[1m^[22m[39m
+     [90m 4 |[39m[0m
+    [2m    at /home/dev/lantern-kit/harbor.spec.mjs:3:62[22m
+
+[2m    Error Context: test-results/harbor-harbor-bell-rings-twice/error-context.md[22m
+
+[31m  1 failed[39m
+[31m    harbor.spec.mjs:3:1 › harbor bell rings twice [2m──────────────────────────────────────────────────[22m[39m
+[32m  1 passed[39m[2m (1.2s)[22m
